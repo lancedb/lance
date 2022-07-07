@@ -19,6 +19,6 @@ setup(
     ],
     license='Apache License, Version 2.0',
     url = "https://github.com/opusdata/opus",
-    packages=[],
-    long_description=read('README'),
+    packages=['opus'],
+    long_description=read('README.md'),
 )

@@ -34,3 +34,5 @@
 
 **/*~
 **/__pycache__
+build/
+dist/
