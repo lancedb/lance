@@ -41,7 +41,7 @@ void Metadata::AddChunkOffset(int32_t chunk_length) {
 }
 
 int32_t Metadata::GetChunkLength(int32_t chunk_id) const {
-  assert (chunk_id <= pb_.chunk_offsets_size());
+  assert(chunk_id <= pb_.chunk_offsets_size());
   return pb_.chunk_offsets(chunk_id + 1) - pb_.chunk_offsets(chunk_id);
 }
 
@@ -55,7 +55,7 @@ int32_t Metadata::GetChunkLength(int32_t chunk_id) const {
     return ::arrow::Status::IndexError("Chunk index out of range {} of {}", idx, len);
   }
   int32_t bound_idx = std::distance(pb_.chunk_offsets().begin(), it);
-  assert (bound_idx >= 0);
+  assert(bound_idx >= 0);
   bound_idx = std::max(0, bound_idx - 1);
   int32_t idx_in_chunk = idx - pb_.chunk_offsets(bound_idx);
   return std::tuple(bound_idx, idx_in_chunk);
@@ -70,8 +70,6 @@ int32_t Metadata::GetChunkLength(int32_t chunk_id) const {
   return Manifest::Parse(in, pb_.manifest_position());
 }
 
-void Metadata::SetChunkPosition(int64_t position) {
-  pb_.set_chunk_position(position);
-}
+void Metadata::SetChunkPosition(int64_t position) { pb_.set_chunk_position(position); }
 
-}  // namespace nft::format
+}  // namespace lance::format

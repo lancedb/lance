@@ -92,7 +92,10 @@ if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
 endif ()
 
 set(lance_objects
-        $<TARGET_OBJECTS:lance_encodings>
+        $<TARGET_OBJECTS:arrow>
+        $<TARGET_OBJECTS:encodings>
+        $<TARGET_OBJECTS:format>
+        $<TARGET_OBJECTS:io>
         )
 
 add_subdirectory(src)

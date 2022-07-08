@@ -20,7 +20,7 @@ protobuf_generate_cpp(
 )
 
 add_library(
-        lance_format
+        format
         OBJECT
         format.cc
         format.h
@@ -35,8 +35,7 @@ add_library(
         ${PROTO_SRCS}
         ${PROTO_HDRS}
 )
-set(lance_objects ${lance_objects} $<TARGET_OBJECTS:lance_format> PARENT_SCOPE)
-target_include_directories(lance_format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
+target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(lookup_table_test)
 add_lance_test(metadata_test)

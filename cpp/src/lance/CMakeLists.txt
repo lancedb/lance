@@ -12,5 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+add_subdirectory(arrow)
 add_subdirectory(encodings)
 add_subdirectory(format)
+add_subdirectory(io)

@@ -12,7 +12,7 @@
 using arrow::Result;
 using arrow::Status;
 
-namespace nft::format {
+namespace lance::format {
 
 Manifest::Manifest(const std::string& primary_key, std::shared_ptr<Schema> schema)
     : primary_key_(primary_key), schema_(std::move(schema)) {
@@ -39,7 +39,7 @@ Manifest::~Manifest() {}
 }
 
 ::arrow::Result<int64_t> Manifest::Write(std::shared_ptr<::arrow::io::OutputStream> out) const {
-  nft::format::pb::Manifest pb;
+  lance::format::pb::Manifest pb;
   pb.set_primary_key(primary_key_);
   for (auto field : schema_->ToProto()) {
     auto pb_field = pb.add_fields();
@@ -48,10 +48,8 @@ Manifest::~Manifest() {}
   return io::WriteProto(out, pb);
 }
 
-int32_t Manifest::num_physical_columns() const { return num_physical_columns_; }
-
 std::string Manifest::primary_key() const { return primary_key_; }
 
 const Schema& Manifest::schema() const { return *schema_; }
 
-}  // namespace nft::format
+}  // namespace lance::format

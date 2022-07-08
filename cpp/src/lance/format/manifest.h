@@ -52,4 +52,4 @@ class Manifest final {
   int32_t num_physical_columns_;
 };
 
-}  // namespace nft::format
+}  // namespace lance::format

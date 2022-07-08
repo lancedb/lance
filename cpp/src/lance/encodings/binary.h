@@ -134,4 +134,4 @@ template <ArrowType T>
   return std::make_shared<ArrayType>(*length, value_offsets->values(), data_buf);
 }
 
-}  // namespace nft::encodings
+}  // namespace lance::encodings

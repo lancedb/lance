@@ -20,7 +20,7 @@
 #include <arrow/io/type_fwd.h>
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
-#include <lance/arrow/format.h>
+#include <lance/arrow/file_lance.h>
 
 #include <optional>
 

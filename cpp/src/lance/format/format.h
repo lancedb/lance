@@ -11,4 +11,4 @@ class Metadata;
 class Manifest;
 class Schema;
 
-}  // namespace nft::format
+}  // namespace lance::format
