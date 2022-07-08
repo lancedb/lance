@@ -1,7 +1,9 @@
 # Lance: A Columnar File Format
 
 
-## Development
+# Development
+
+## Code Style
 
 The core of `Lance` data format is developed in `C++20`.
 
@@ -11,9 +13,11 @@ With exceptions:
 
 The code style is enforced via [`clang-format`](https://clang.llvm.org/docs/ClangFormat.html). Please make sure `clang-format` has been set up appropriately in the IDE.
 
-The code is developed on `macOS 12+` and recent Linux (`Ubuntu 22.04`). Feel free to file bugs or contribute if you encounter issues with other Linux flavors.
+## Build
 
-The C++ codebase is on C++20, so a recent compiler is expected, the toolchain that is tested:
+The code is developed on `macOS 12+` and a recent Linux (`Ubuntu 22.04`). Please file bugs or contribute fixes if you encounter issues with other Linux flavors.
+
+A recent C++ compiler that supports C++20 is needed. The toolchain that has been tested is:
 
 * AppleClang >= 13.1.6
 * GCC >= 11.2
@@ -24,6 +28,8 @@ The C++ codebase is on C++20, so a recent compiler is expected, the toolchain th
 ```sh
 # On macOS 12+
 brew install apache-arrow cmake protobuf
+# Optionally, build document
+brew install doxygen
 ```
 
 ```sh
@@ -37,12 +43,13 @@ sudo apt update
 
 # Install arrow, protobuf, cmake
 sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev cmake libprotobuf-dev protobuf-compiler
+# Optionally, build document
+sudo apt install -y -V install doxygen
 ```
 
 Once the installation is completed, we can check out `lance` from github and start building.
 
 ```sh
-
 git clone git@github.com:eto-ai/lance.git
 cd lance/cpp
 mkdir -p build
@@ -50,6 +57,6 @@ cmake -B build
 cd build
 make -j
 
-# Run unit test
+# Run unit tests
 make test
 ```
