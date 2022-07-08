@@ -1,5 +1,10 @@
+from typing import Union
+
+import pyarrow as pa
 import pyarrow.dataset as ds
 from lance.lib import LanceFileFormat
+
+__all__ = ["dataset", "write_table"]
 
 
 def dataset(uri: str):
@@ -13,3 +18,16 @@ def dataset(uri: str):
     """
     fmt = LanceFileFormat()
     return ds.dataset(uri, format=fmt)
+
+
+def write_table(table: pa.Table, destination: str):
+    """Write an Arrow Table into the destination.
+
+    Parameters
+    ----------
+    table : pa.Table
+        Apache Arrow Table
+    sink : 
+
+    """
+    pass
