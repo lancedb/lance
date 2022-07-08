@@ -41,7 +41,7 @@ class PlainDecoder : public Decoder {
  public:
   using Decoder::Decoder;
 
-  virtual ~PlainDecoder() = default;
+  virtual ~PlainDecoder() override = default;
 
   /** Get a Value without scanning the full row group. */
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override {

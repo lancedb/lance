@@ -31,26 +31,28 @@ namespace lance::encodings {
 template <typename T>
 concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
 
+/// Encoder. Encodes an array and write it to the output stream.
+///
 class Encoder {
  public:
   Encoder(std::shared_ptr<::arrow::io::OutputStream> out) : out_(out) {}
 
-  /**
-   * Write an Arrow Array and returns the start offset of
-   * the column metadata.
-   *
-   * @param arr an array to write with the encoding.
-   * @return offset of metadata
-   */
+  /// Write an Arrow Array and returns the start offset of the column metadata.
+  ///
+  /// \param arr an array to write with the encoding.
+  /// \return offset of metadata
   virtual ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) = 0;
 
+  /// Debug String
   virtual std::string ToString() const = 0;
 
  protected:
   std::shared_ptr<::arrow::io::OutputStream> out_;
 };
 
-/** Column / Array decoder */
+/// Decoder base class.
+/// Array / column decoder.
+///
 class Decoder {
  public:
   inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
@@ -68,10 +70,14 @@ class Decoder {
     length_ = length;
   }
 
-  /** Get a Value without scanning the full row group. */
+  /// Get a Value without scanning the full row group.
   virtual ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const = 0;
 
-  /** Read the full array. */
+  /// Read the array.
+  ///
+  /// \param start the start index to read. Must be smaller than the size of the array.
+  /// \param length the length of the array to read
+  /// \return an array if success.
   virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const = 0;
 

@@ -12,8 +12,6 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-// Test cases for Plain encoding.
-
 #include "lance/encodings/plain.h"
 
 #include <arrow/array.h>

@@ -26,7 +26,9 @@
 
 namespace lance::arrow {
 
-// Modeled after arrow's CVS / Parquet readers
+/// Lance File format reader.
+///
+///
 class FileReader final {
  public:
   FileReader() = delete;

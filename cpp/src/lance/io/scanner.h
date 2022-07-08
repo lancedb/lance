@@ -19,24 +19,30 @@ namespace lance::io {
 
 class FileReader;
 
-/// lance Scanner
+/// Lance Scanner
 class Scanner {
  public:
+  /// Constructor.
   Scanner(std::shared_ptr<FileReader> reader,
           std::shared_ptr<::arrow::dataset::ScanOptions> options);
 
   /// Move constructor.
   Scanner(Scanner&& other) noexcept;
 
+  /// Copy constructor.
   Scanner(const Scanner&);
 
   ~Scanner() = default;
 
+  /// Open the Scanner. Must call it before start iterating.
   ::arrow::Status Open();
 
+  /// Returns the next record batch if any.
+  ///
+  /// \return A record batch. Returns `nullptr` if reaches the end.
   ::arrow::Result<::std::shared_ptr<::arrow::RecordBatch>> Next();
 
-  /// Async read, to match lanceFileFormat::ScanBatchesAsync()
+  /// Async read, to match LanceFileFormat::ScanBatchesAsync()
   ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> operator()();
 
  private:

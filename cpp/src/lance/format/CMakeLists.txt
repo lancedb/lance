@@ -22,7 +22,6 @@ protobuf_generate_cpp(
 add_library(
         format
         OBJECT
-        format.cc
         format.h
         lookup_table.cc
         lookup_table.h

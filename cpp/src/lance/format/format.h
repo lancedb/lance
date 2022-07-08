@@ -19,7 +19,7 @@ namespace lance::format {
 /// File magic number, placed in the end of a file.
 constexpr char kMagic[] = "LANC";
 
-/// Forward declaration.
+// Forward declaration.
 class Field;
 class Metadata;
 class Manifest;
