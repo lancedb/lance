@@ -39,3 +39,4 @@ dist/
 
 .idea
 cmake-build-*
+.vscode

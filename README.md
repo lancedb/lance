@@ -1,1 +1,1 @@
-# Lance: A Columnar Data Foramt
+# Lance: A Columnar Data Format
