@@ -1,4 +1,4 @@
-# Lance: A Columnar File Format
+# Lance: A Columnar Data Format
 
 
 # Development
@@ -34,15 +34,10 @@ brew install doxygen
 
 ```sh
 # On Ubuntu 22.04
-# Follow https://arrow.apache.org/install/
-sudo apt update
-sudo apt install -y -V ca-certificates lsb-release wget
-wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-sudo apt update
+# Step 1. Follow https://arrow.apache.org/install/
 
-# Install arrow, protobuf, cmake
-sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev cmake libprotobuf-dev protobuf-compiler
+# Step 2. Install arrow, protobuf, cmake
+sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev cmake libprotobuf-dev
 # Optionally, build document
 sudo apt install -y -V install doxygen
 ```
