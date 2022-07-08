@@ -96,9 +96,7 @@ class Schema final {
   std::map<int32_t, std::shared_ptr<Field>> fields_map_;
 };
 
-/// Field is the metadata of a persisted column on disk.
-///
-/// It
+/// \brief Field is the metadata of a column on disk.
 class Field final {
  public:
   /// Default constructor
