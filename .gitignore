@@ -36,3 +36,6 @@
 **/__pycache__
 build/
 dist/
+
+.idea
+cmake-build-*

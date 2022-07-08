@@ -1,0 +1,31 @@
+name: C++
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./cpp
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run lint
+        run: clang-format-14 --Werror `find src -name '*.h' -or -name '*.cc'` > /dev/null
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y -V ca-certificates lsb-release wget
+          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt update
+          sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev
+      - name: Cmake
+        run: cmake -B build
+      - name: Build
+        run: make -C build -j
+      - name: Test
+        run: make -C build test

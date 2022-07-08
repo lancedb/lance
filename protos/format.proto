@@ -1,0 +1,140 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ * <p>
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * <p>
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package lance.format.pb;
+
+/*
+
+Format:
+
++----------------------------------------+
+|       Encoded Column 0, Chunk 0        |
+           ...
+|       Encoded Column M, Chunk N - 1    |
+|       Encoded Column M, Chunk N        |
+|       Indices ...                      |
+|       Chunk Position (M x N x 8)        |
+|         Manifest                       |
+|         Metadata                       |
+|        <metadata position>             |
+| MAJOR_VERSION | MINOR_VERSION | "NFFT" |
++----------------------------------------+
+ */
+
+//option optimize_for = LITE_RUNTIME;
+
+/**
+ File-level Metadata, at the end of a file:.
+*/
+message Metadata {
+  // The start row id of this file. Row ID is a monotonic increasing number,
+  // used to identify a row globally.
+  uint64 start_row_id = 1;
+
+  /**
+   Position the manifest in the file.
+   If it is zero, the manifest is stored externally.
+  */
+  uint64 manifest_position = 2;
+
+  /** Logical offsets of each chunk group, i.e., number of the rows in each chunk. */
+  repeated int32 chunk_offsets = 3;
+
+  /**
+    The position in the file, where the lookup up table of all columns is stored.
+
+    The lookup table of each column is stored as an NxM int64_t array:
+      - chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
+   */
+  uint64 chunk_position = 4;
+
+  /// The physical length of each chunk (page).
+  ///
+  /// Put page count here for now, not final decision?
+  /// This should be a M * N array.
+  /// Not sure whether we want store the
+  repeated int64 page_lengths = 5;
+}
+
+/*
+ * Manifest is a global section shared between all the files.
+ */
+message Manifest {
+  string primary_key = 1;
+
+  /* All fields in the dataset */
+  repeated Field fields = 2;
+}
+
+message Index {
+  enum Type {
+    BLOOM_FILTER = 0;
+  }
+  uint64 start_offset = 1;
+  uint64 length = 2;
+}
+
+enum DataType {
+  BOOLEAN = 0;
+
+  INT32 = 1;
+  INT64 = 2;
+  FLOAT32 = 4;
+  FLOAT64 = 5;
+  BYTES = 6;
+  FIXED_SIZE_BYTES = 7;
+}
+
+enum Encoding {
+  NONE = 0;
+  PLAIN = 1;
+  VAR_BINARY = 2;
+  DICTIONARY = 3;
+}
+
+/**
+  Field metadata.
+*/
+message Field {
+  enum Type {
+    PARENT = 0;
+    REPEATED = 1;
+    LEAF = 2;
+  }
+  Type type = 1;
+
+  // Fully qualified name.
+  string name = 2;
+  /// Column id.
+  int32 id = 3;
+  /// Parent Field ID. If not set
+  int32 parent_id = 4;
+
+  // Physical types.
+  DataType data_type = 5;
+  // Logical types, support parameterized Arrow Type.
+  string logical_type = 6;
+  // If this field is nullable.
+  bool nullable = 7;
+
+  Encoding encoding = 8;
+
+  map<string, string> metadata = 10;
+}
