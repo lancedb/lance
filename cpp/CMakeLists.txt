@@ -59,17 +59,15 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif ()
 
 find_package(Arrow REQUIRED)
-
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     find_package(Zstd REQUIRED)
     list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
 endif ()
 
 find_package(ArrowDataset REQUIRED)
-include_directories(src)
-
-include_directories(${CMAKE_BINARY_DIR}/src)
 include_directories(include)
+include_directories(src)
+include_directories(${CMAKE_BINARY_DIR}/src)  # for format.pb.{h/cc}
 
 function(add_lance_test test_name)
     if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")

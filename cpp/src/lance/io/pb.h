@@ -31,11 +31,8 @@ template <ProtoMessage P>
                               int64_t offset) {
   ARROW_ASSIGN_OR_RAISE(auto pb_size, ReadInt<int32_t>(source, offset));
   P proto;
-  auto buf = source->ReadAt(offset + sizeof(pb_size), pb_size);
-  if (!buf.ok()) {
-    return buf.status();
-  };
-  if (!proto.ParseFromArray((*buf)->data(), (*buf)->size())) {
+  ARROW_ASSIGN_OR_RAISE(auto buf, source->ReadAt(offset + sizeof(pb_size), pb_size));
+  if (!proto.ParseFromArray(buf->data(), buf->size())) {
     return ::arrow::Status::Invalid("Failed to parse protobuf");
   };
   return proto;

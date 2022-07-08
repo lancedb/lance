@@ -1,7 +1,6 @@
 #include "lance/arrow/file_lance.h"
 
 #include <arrow/dataset/file_base.h>
-#include <arrow/util/future.h>
 #include <fmt/format.h>
 
 #include <memory>
