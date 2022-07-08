@@ -1,2 +1,1 @@
-# opus
-Opus: A Columnar Data Format
+# Lance: A Columnar Data Foramt
