@@ -35,7 +35,7 @@ def dataset(uri: str):
     return ds.dataset(uri, format=fmt)
 
 
-def write_table(table: pa.Table, destination: Union[str, Path]):
+def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str):
     """Write an Arrow Table into the destination.
 
     Parameters
@@ -45,5 +45,4 @@ def write_table(table: pa.Table, destination: Union[str, Path]):
     sink : str or `Path`
         the destination to write dataset to.
     """
-    status = WriteTable(table, destination)
-    return status.ok()
+    WriteTable(table, destination, primary_key)

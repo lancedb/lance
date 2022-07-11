@@ -1,12 +1,18 @@
 # distutils: language = c++
 
+from typing import Union
+
+from cython.operator cimport dereference as deref
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr
 from libcpp.string cimport string
-from pyarrow.includes.common cimport *
-from pyarrow.includes.libarrow_dataset cimport CFileFormat
-from pyarrow.includes.libarrow cimport CTable, COutputStream
+from pathlib import Path
+from pyarrow import Table
 from pyarrow._dataset cimport FileFormat
+from pyarrow.includes.common cimport *
+from pyarrow.includes.libarrow cimport CTable, COutputStream
+from pyarrow.includes.libarrow_dataset cimport CFileFormat
+from pyarrow.lib cimport pyarrow_unwrap_table, check_status, get_writer
 
 
 cdef extern from "<optional>" namespace "std" nogil:
@@ -14,6 +20,8 @@ cdef extern from "<optional>" namespace "std" nogil:
     # before cython 3.0 release
     cdef cppclass nullopt_t:
         nullopt_t()
+
+    cdef nullopt_t nullopt
 
     cdef cppclass optional[T]:
         ctypedef T value_type
@@ -42,10 +50,11 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
 
 
 cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
-    CStatus WriteTable(const CTable& table,
-                       shared_ptr[COutputStream] sink,
-                       const string& primary_key,
-                       optional[CFileWriteOptions] options)
+    CStatus CWriteTable "::lance::arrow::WriteTable"(
+            const CTable& table,
+            shared_ptr[COutputStream] sink,
+            const c_string& primary_key,
+            optional[CFileWriteOptions] options)
 
 
 cdef class LanceFileFormat(FileFormat):
@@ -61,3 +70,15 @@ cdef class LanceFileFormat(FileFormat):
 
     def __reduce__(self):
         return LanceFileFormat, tuple()
+
+def WriteTable(table: Table,
+               sink: Union[str, Path],
+               primary_key: str):
+    arrow_table = pyarrow_unwrap_table(table)
+    cdef shared_ptr[COutputStream] out
+    get_writer(sink, &out)
+    cdef string pk = primary_key.encode("utf-8")
+
+    cdef optional[CFileWriteOptions] options = nullopt
+    with nogil:
+        check_status(CWriteTable(deref(arrow_table), out, pk, options))

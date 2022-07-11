@@ -21,5 +21,6 @@ from lance import write_table
 
 def test_write_table(tmp_path: Path):
     table = pa.Table.from_pandas(pd.DataFrame({"label": [123]}))
-    write_table(table, tmp_path)
-    pass
+    write_table(table, tmp_path / "test.lance", "label")
+
+    assert (tmp_path / "test.lance").exists()
