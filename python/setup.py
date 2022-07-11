@@ -15,13 +15,13 @@ lance_libs = str(lance_cpp / 'build')
 
 
 extensions = [Extension(
-    "pylance.lib",
-    ["pylance/_lib.pyx"],
+    "lance.lib",
+    ["lance/_lib.pyx"],
     include_dirs=[lance_includes, arrow_includes, numpy_includes],
     libraries=['lance'],
     library_dirs=[lance_libs],
     language="c++",
-    extra_compile_args=["-Wall", "-Wextra", "-Wc++20-compat", "-std=c++20"],
+    extra_compile_args=["-Wall", "-std=c++20", "-O3"],
     extra_link_args=["-Wl,-rpath", lance_libs]
 )]
 
@@ -35,9 +35,9 @@ setup(
     author_email="contact@eto.ai",
     description="Python extension for lance",
     long_description="",
-    ext_modules=cythonize(extensions),
+    ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     extras_require={"test": ["pytest>=6.0"]},
-    python_requires=">=3.9",
+    python_requires=">=3.8",
     packages=find_packages()
 )

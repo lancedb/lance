@@ -42,3 +42,5 @@ dist/
 cmake-build-*
 .vscode
 
+python/lance/_lib.cpp
+

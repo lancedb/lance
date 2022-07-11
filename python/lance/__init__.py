@@ -1,5 +1,5 @@
 import pyarrow.dataset as ds
-from pylance.lib import LanceFileFormat
+from lance.lib import LanceFileFormat
 
 
 def dataset(uri: str):
