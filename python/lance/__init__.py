@@ -22,7 +22,7 @@ from lance.lib import LanceFileFormat, WriteTable
 __all__ = ["dataset", "write_table"]
 
 
-def dataset(uri: str):
+def dataset(uri: str) -> ds.Dataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
@@ -43,6 +43,8 @@ def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str
     table : pa.Table
         Apache Arrow Table
     sink : str or `Path`
-        the destination to write dataset to.
+        The destination to write dataset to.
+    primary_key : str
+        The column name of the primary key.
     """
     WriteTable(table, destination, primary_key)

@@ -13,14 +13,20 @@
 # limitations under the License.
 
 
+from pathlib import Path
+
 import pandas as pd
 import pyarrow as pa
-from pathlib import Path
-from lance import write_table
+from lance import write_table, dataset
 
 
-def test_write_table(tmp_path: Path):
-    table = pa.Table.from_pandas(pd.DataFrame({"label": [123]}))
+def test_simple_round_trips(tmp_path: Path):
+    table = pa.Table.from_pandas(pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]}))
     write_table(table, tmp_path / "test.lance", "label")
 
     assert (tmp_path / "test.lance").exists()
+
+    ds = dataset(str(tmp_path / "test.lance"))
+    actual = ds.to_table()
+
+    assert (table == actual)
