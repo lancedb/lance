@@ -36,7 +36,11 @@
 **/__pycache__
 build/
 dist/
+*.egg-info/
 
 .idea
 cmake-build-*
 .vscode
+
+python/lance/_lib.cpp
+
