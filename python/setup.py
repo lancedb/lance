@@ -37,7 +37,7 @@ setup(
     long_description="",
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
-    extras_require={"test": ["pytest>=6.0"]},
+    extras_require={"test": ["pytest>=6.0", "pandas"]},
     python_requires=">=3.8",
     packages=find_packages()
 )
