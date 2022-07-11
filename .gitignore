@@ -30,7 +30,6 @@
 *.exe
 *.out
 *.app
-python/pylance/_lib.cpp
 
 
 **/*~
