@@ -42,7 +42,7 @@ def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str
     ----------
     table : pa.Table
         Apache Arrow Table
-    sink : str or `Path`
+    destination : str or `Path`
         The destination to write dataset to.
     primary_key : str
         The column name of the primary key.
