@@ -27,8 +27,6 @@ endif ()
 add_compile_options(-Wall -Wextra -fPIC)
 
 # TODO: Fix on linux
-set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@1.1/)
-
 Include(FetchContent)
 
 # TODO: We can remove this package once std::format is available.
@@ -59,10 +57,12 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif ()
 
 find_package(Arrow REQUIRED)
-if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+
+if (APPLE)
+    set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@1.1/)
     find_package(Zstd REQUIRED)
     list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
-endif ()
+endif (APPLE)
 
 find_package(ArrowDataset REQUIRED)
 include_directories(include)
