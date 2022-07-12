@@ -82,3 +82,19 @@ TEST_CASE("List schema") {
   CHECK(result.ok());
   CHECK((*actual_schema)->Equals(schema));
 }
+
+TEST_CASE("Parse dictionary type") {
+  auto dict_type = arrow::dictionary(arrow::uint16(), arrow::utf8(), false);
+  auto logical_type = lance::arrow::ToLogicalType(dict_type).ValueOrDie();
+  CHECK(logical_type == "dict:string:uint16:false");
+
+  auto actual = lance::arrow::FromLogicalType(logical_type).ValueOrDie();
+  CHECK(dict_type->Equals(actual));
+
+  dict_type = arrow::dictionary(arrow::int32(), arrow::utf8(), true);
+  logical_type = lance::arrow::ToLogicalType(dict_type).ValueOrDie();
+  CHECK(logical_type == "dict:string:int32:true");
+
+  actual = lance::arrow::FromLogicalType(logical_type).ValueOrDie();
+  CHECK(dict_type->Equals(actual));
+}

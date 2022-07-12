@@ -82,7 +82,8 @@ namespace pb = ::lance::format::pb;
     }
     ARROW_ASSIGN_OR_RAISE(auto value_type, FromLogicalType(components[1]));
     ARROW_ASSIGN_OR_RAISE(auto index_value, FromLogicalType(components[2]));
-    return ::arrow::dictionary(index_value, value_type);
+    auto ordered = components[3] == "true";
+    return ::arrow::dictionary(index_value, value_type, ordered);
   }
   return ::arrow::Status::NotImplemented(fmt::format(
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));

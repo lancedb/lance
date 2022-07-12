@@ -60,6 +60,7 @@ inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
   return dtype->id() == ::arrow::Type::MAP;
 }
 
+/// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
