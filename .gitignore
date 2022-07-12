@@ -37,6 +37,7 @@
 build/
 dist/
 *.egg-info/
+.python-version
 
 .idea
 cmake-build-*
