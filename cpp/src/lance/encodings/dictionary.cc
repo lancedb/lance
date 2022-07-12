@@ -17,6 +17,7 @@
 #include <arrow/array.h>
 #include <arrow/io/api.h>
 #include <arrow/result.h>
+#include <arrow/scalar.h>
 #include <arrow/type_traits.h>
 
 #include <memory>
@@ -37,14 +38,26 @@ DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> 
 std::string DictionaryEncoder::ToString() const { return "Encoder(type=dictionary)"; }
 
 DictionaryDecoder::DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                                     std::shared_ptr<::arrow::DataType> type,
+                                     std::shared_ptr<::arrow::DictionaryType> type,
                                      std::shared_ptr<::arrow::Array> dict)
-    : Decoder(infile, type), dict_(dict) {}
+    : Decoder(infile, type),
+      dict_(dict),
+      plain_decoder_(std::make_unique<PlainDecoder>(infile, type->value_type())) {}
 
-::arrow::Result<std::shared_ptr<::arrow::Scalar>> DictionaryDecoder::GetScalar(int64_t idx) const {}
+void DictionaryDecoder::Reset(int64_t position, int32_t length) {
+  Decoder::Reset(position, length);
+  plain_decoder_->Reset(position, length);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Scalar>> DictionaryDecoder::GetScalar(int64_t idx) const {
+  ARROW_ASSIGN_OR_RAISE(auto index_scalar, plain_decoder_->GetScalar(idx));
+  return ::arrow::DictionaryScalar::Make(index_scalar, dict_);
+}
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> DictionaryDecoder::ToArray(
-    int32_t start, std::optional<int32_t> length) const {}
-
+    int32_t start, std::optional<int32_t> length) const {
+  ARROW_ASSIGN_OR_RAISE(auto index_arr, plain_decoder_->ToArray(start, length));
+  return ::arrow::DictionaryArray::FromArrays(index_arr, dict_);
+}
 
 }  // namespace lance::encodings

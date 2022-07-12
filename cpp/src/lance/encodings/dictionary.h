@@ -53,10 +53,12 @@ class DictionaryDecoder : public Decoder {
   /// See https://arrow.apache.org/docs/cpp/api/array.html#dictionary-encoded for details w.r.t
   /// of DictionaryType.
   DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                    std::shared_ptr<::arrow::DataType> type,
+                    std::shared_ptr<::arrow::DictionaryType> type,
                     std::shared_ptr<::arrow::Array> dict);
 
-  virtual ~DictionaryDecoder() = default;
+  ~DictionaryDecoder() override = default;
+
+  void Reset(int64_t position, int32_t length) override;
 
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
 
