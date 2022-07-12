@@ -83,14 +83,6 @@ message Manifest {
   repeated Field fields = 2;
 }
 
-message Index {
-  enum Type {
-    BLOOM_FILTER = 0;
-  }
-  uint64 start_offset = 1;
-  uint64 length = 2;
-}
-
 /// Supported encodings.
 enum Encoding {
   NONE = 0;
