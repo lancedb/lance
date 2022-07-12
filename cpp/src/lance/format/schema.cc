@@ -163,9 +163,13 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     } else if (logical_type_ == "binary") {
       return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile);
     }
+  } else if (encoding_ == pb::Encoding::DICTIONARY) {
+
   }
-  return ::arrow::Status::NotImplemented(fmt::format(
-      "Field::GetDecoder(): encoding={} logic_type={} is not supported.", "plain", logical_type_));
+  return ::arrow::Status::NotImplemented(
+      fmt::format("Field::GetDecoder(): encoding={} logic_type={} is not supported.",
+                  encoding(),
+                  logical_type_));
 }
 
 std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }
