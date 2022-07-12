@@ -13,6 +13,8 @@ jobs:
         working-directory: ./cpp
     steps:
       - uses: actions/checkout@v2
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
       - name: Run lint
         run: clang-format-14 --Werror `find src -name '*.h' -or -name '*.cc'` > /dev/null
       - name: Install dependencies
