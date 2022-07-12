@@ -60,9 +60,6 @@ inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
   return dtype->id() == ::arrow::Type::MAP;
 }
 
-::arrow::Result<::lance::format::pb::DataType> ToPhysicalType(
-    std::shared_ptr<::arrow::DataType> dtype);
-
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(

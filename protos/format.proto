@@ -91,17 +91,7 @@ message Index {
   uint64 length = 2;
 }
 
-enum DataType {
-  BOOLEAN = 0;
-
-  INT32 = 1;
-  INT64 = 2;
-  FLOAT32 = 4;
-  FLOAT64 = 5;
-  BYTES = 6;
-  FIXED_SIZE_BYTES = 7;
-}
-
+/// Supported encodings.
 enum Encoding {
   NONE = 0;
   PLAIN = 1;
@@ -126,15 +116,13 @@ message Field {
   int32 id = 3;
   /// Parent Field ID. If not set
   int32 parent_id = 4;
-
-  // Physical types.
-  DataType data_type = 5;
+  
   // Logical types, support parameterized Arrow Type.
-  string logical_type = 6;
+  string logical_type = 5;
   // If this field is nullable.
-  bool nullable = 7;
+  bool nullable = 6;
 
-  Encoding encoding = 8;
+  Encoding encoding = 7;
 
-  map<string, string> metadata = 10;
+  map<string, string> metadata = 8;
 }

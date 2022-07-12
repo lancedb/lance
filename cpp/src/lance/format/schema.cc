@@ -24,7 +24,6 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
     : id_(0),
       parent_(-1),
       name_(field->name()),
-      physical_type_(arrow::ToPhysicalType(field->type()).ValueOrDie()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
       encoding_(pb::NONE) {
   if (::lance::arrow::is_struct(field->type())) {
@@ -50,10 +49,8 @@ Field::Field(const pb::Field& pb)
     : id_(pb.id()),
       parent_(pb.parent_id()),
       name_(pb.name()),
-      physical_type_(pb.data_type()),
       logical_type_(pb.logical_type()),
-      encoding_(pb.encoding()) {
-}
+      encoding_(pb.encoding()) {}
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
@@ -164,7 +161,6 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_parent_id(parent_);
   field.set_id(id_);
   field.set_logical_type(logical_type_);
-  field.set_data_type(physical_type_);
   field.set_encoding(encoding_);
 
   if (logical_type_ == "struct") {
@@ -227,7 +223,6 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
   new_field->id_ = id_;
   new_field->parent_ = parent_;
   new_field->name_ = name_;
-  new_field->physical_type_ = physical_type_;
   new_field->logical_type_ = logical_type_;
   new_field->encoding_ = encoding_;
 
@@ -257,8 +252,8 @@ bool Field::Equals(const Field& other, bool check_id) const {
   if (check_id && (id_ != other.id_ || parent_ != other.parent_)) {
     return false;
   }
-  if (name_ != other.name_ || physical_type_ != other.physical_type_ ||
-      logical_type_ != other.logical_type_ || encoding_ != other.encoding_) {
+  if (name_ != other.name_ || logical_type_ != other.logical_type_ ||
+      encoding_ != other.encoding_) {
     return false;
   }
   if (children_.size() != other.children_.size()) {

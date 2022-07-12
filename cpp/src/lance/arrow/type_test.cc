@@ -49,7 +49,6 @@ TEST_CASE("Arrow Schema (simple)") {
   pb::Field expected;
   expected.set_id(0);
   expected.set_type(pb::Field::LEAF);
-  expected.set_data_type(pb::BYTES);
   expected.set_logical_type("string");
   expected.set_name("pk");
   expected.set_parent_id(-1);
@@ -59,7 +58,6 @@ TEST_CASE("Arrow Schema (simple)") {
 
   expected.set_id(1);
   expected.set_type(pb::Field::LEAF);
-  expected.set_data_type(pb::INT64);
   expected.set_logical_type("int64");
   expected.set_name("value");
   expected.set_parent_id(-1);

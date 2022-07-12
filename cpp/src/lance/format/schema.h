@@ -183,7 +183,6 @@ class Field final {
   int32_t id_ = -1;
   int32_t parent_ = -1;
   std::string name_;
-  lance::format::pb::DataType physical_type_;
   std::string logical_type_;
   lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
 

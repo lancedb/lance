@@ -13,43 +13,6 @@ namespace lance::arrow {
 
 namespace pb = ::lance::format::pb;
 
-::arrow::Result<::lance::format::pb::DataType> ToPhysicalType(
-    std::shared_ptr<::arrow::DataType> dtype) {
-  if (dtype->Equals(::arrow::boolean())) {
-    return pb::BOOLEAN;
-  }
-  if (::arrow::is_integer(dtype->id())) {
-    switch (::arrow::bit_width(dtype->id())) {
-      case 8:
-      case 16:
-      case 32:
-        return pb::INT32;
-      case 64:
-        return pb::INT64;
-    };
-  } else if (::arrow::is_floating(dtype->id())) {
-    switch (::arrow::bit_width(dtype->id())) {
-      case 16:
-      case 32:
-        return pb::FLOAT32;
-      case 64:
-        return pb::FLOAT64;
-    }
-  } else if (::arrow::is_binary_like(dtype->id())) {
-    return pb::BYTES;
-  } else if (is_list(dtype)) {
-    // Offset type
-    return pb::INT32;
-  } else if (is_struct(dtype)) {
-    // We do not actually store it.
-    return pb::INT32;
-  } else if (::arrow::is_dictionary(dtype->id())) {
-    return pb::INT32;
-  }
-  return ::arrow::Status::NotImplemented(
-      fmt::format("data type {} is not supported yet", dtype->ToString()));
-}
-
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype) {
   if (is_list(dtype)) {
     auto list_type = std::reinterpret_pointer_cast<::arrow::ListType>(dtype);
