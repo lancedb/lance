@@ -137,7 +137,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     case pb::Encoding::VAR_BINARY:
       return std::make_shared<lance::encodings::VarBinaryEncoder>(sink);
     default:
-      fmt::print(stderr, "Encoding {} is not supported", encoding_);
+      fmt::print(stderr, "Encoding {} is not supported\n", encoding_);
       assert(false);
   }
 }

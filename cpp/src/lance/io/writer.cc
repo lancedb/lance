@@ -89,8 +89,11 @@ FileWriter::~FileWriter() {}
     return WriteStructArray(field, arr);
   } else if (lance::arrow::is_list(arr->type())) {
     return WriteListArray(field, arr);
+  } else if (::arrow::is_dictionary(arr->type_id())) {
+    return WriteDictionaryArray(field, arr);
   }
-  assert(false);
+  return ::arrow::Status::Invalid(
+      fmt::format("WriteArray: unsupported data type: {}", arr->type()->ToString()));
 }
 
 ::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
@@ -124,6 +127,13 @@ FileWriter::~FileWriter() {}
   ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, list_arr->offsets()));
   auto child_field = field->field(0);
   return WriteArray(child_field, list_arr->values());
+}
+
+::arrow::Status FileWriter::WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
+                                                 const std::shared_ptr<::arrow::Array>& arr) {
+  assert(field->logical_type().starts_with("dict:"));
+  auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  return WritePrimitiveArray(field, dict_arr->indices());
 }
 
 ::arrow::Status FileWriter::WriteFooter() {
