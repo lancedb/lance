@@ -56,6 +56,8 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
     encoding_ = pb::VAR_BINARY;
   } else if (::arrow::is_primitive(field->type()->id())) {
     encoding_ = pb::PLAIN;
+  } else if (::arrow::is_dictionary(field->type()->id())) {
+    encoding_ = pb::DICTIONARY;
   }
 }
 
@@ -133,6 +135,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
     case pb::Encoding::PLAIN:
+    case pb::Encoding::DICTIONARY:
       return std::make_shared<lance::encodings::PlainEncoder>(sink);
     case pb::Encoding::VAR_BINARY:
       return std::make_shared<lance::encodings::VarBinaryEncoder>(sink);

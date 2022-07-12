@@ -37,13 +37,37 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
   ARROW_ASSIGN_OR_RAISE(auto value_offset, out_->Tell());
   // TODO: support more types.
   switch (data_type->id()) {
+    case ::arrow::Type::INT8:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::Int8Array>(arr)->values()));
+      break;
+    case ::arrow::Type::UINT8:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::UInt8Array>(arr)->values()));
+      break;
+    case ::arrow::Type::INT16:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::Int16Array>(arr)->values()));
+      break;
+    case ::arrow::Type::UINT16:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::UInt16Array>(arr)->values()));
+      break;
     case ::arrow::Type::INT32:
       ARROW_RETURN_NOT_OK(
           out_->Write(std::reinterpret_pointer_cast<::arrow::Int32Array>(arr)->values()));
       break;
+    case ::arrow::Type::UINT32:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::UInt32Array>(arr)->values()));
+      break;
     case ::arrow::Type::INT64:
       ARROW_RETURN_NOT_OK(
           out_->Write(std::reinterpret_pointer_cast<::arrow::Int64Array>(arr)->values()));
+      break;
+    case ::arrow::Type::UINT64:
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::UInt64Array>(arr)->values()));
       break;
     case ::arrow::Type::FLOAT:
       ARROW_RETURN_NOT_OK(
