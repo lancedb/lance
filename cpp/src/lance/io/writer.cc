@@ -137,6 +137,8 @@ FileWriter::~FileWriter() {}
 }
 
 ::arrow::Status FileWriter::WriteFooter() {
+  // Write dictionary values first.
+
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
   metadata_->SetChunkPosition(pos);
   lookup_table_.WritePageLengthTo(&metadata_->pb());

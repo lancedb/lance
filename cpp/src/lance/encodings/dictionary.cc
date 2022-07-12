@@ -19,9 +19,11 @@
 #include <arrow/result.h>
 #include <arrow/scalar.h>
 #include <arrow/type_traits.h>
+#include <fmt/format.h>
 
 #include <memory>
 
+#include "lance/encodings/binary.h"
 #include "lance/encodings/plain.h"
 
 namespace lance::encodings {
@@ -33,6 +35,16 @@ DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> 
   assert(::arrow::is_dictionary(arr->type_id()));
   auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
   return plain_encoder_->Write(dict_arr->indices());
+}
+
+::arrow::Result<int64_t> DictionaryEncoder::WriteValueArray(std::shared_ptr<::arrow::Array> arr) {
+  if (::arrow::is_primitive(arr->type_id())) {
+    return PlainEncoder(out_).Write(arr);
+  } else if (arr->type_id() == ::arrow::Type::STRING) {
+    return VarBinaryEncoder(out_).Write(arr);
+  }
+  return ::arrow::Status::Invalid(
+      fmt::format("Does not support dictionary with value type: {}", arr->type()->ToString()));
 }
 
 std::string DictionaryEncoder::ToString() const { return "Encoder(type=dictionary)"; }

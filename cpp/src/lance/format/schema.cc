@@ -14,6 +14,8 @@
 
 #include "lance/format/schema.h"
 
+#include <arrow/status.h>
+#include <arrow/type.h>
 #include <arrow/util/string.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -40,8 +42,7 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
-      encoding_(pb::NONE),
-      dictionary_offset_(-1) {
+      encoding_(pb::NONE) {
   if (::lance::arrow::is_struct(field->type())) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(field->type());
     for (auto& arrow_field : struct_type->fields()) {
@@ -69,7 +70,8 @@ Field::Field(const pb::Field& pb)
       name_(pb.name()),
       logical_type_(pb.logical_type()),
       encoding_(pb.encoding()),
-      dictionary_offset_(pb.dictionary_offset()) {}
+      dictionary_offset_(pb.dictionary_offset()),
+      dictionary_page_length_(pb.dictionary_page_length()) {}
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
@@ -136,6 +138,14 @@ void Field::set_encoding(lance::format::pb::Encoding encoding) { encoding_ = enc
 
 const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
 
+::arrow::Status Field::LoadDictionary() {
+  assert(::arrow::is_dictionary(type()->id()));
+  auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
+  ///
+  assert (dict_type->value_type()->Equals(::arrow::utf8()));
+  return ::arrow::Status::OK();
+}
+
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
@@ -169,6 +179,10 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
     auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
+    if (!dictionary()) {
+      /// Fetch dictionary on demand?
+      ARROW_RETURN_NOT_OK(LoadDictionary());
+    }
     return std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
   }
   return ::arrow::Status::NotImplemented(
@@ -189,6 +203,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_logical_type(logical_type_);
   field.set_encoding(encoding_);
   field.set_dictionary_offset(dictionary_offset_);
+  field.set_dictionary_page_length(dictionary_page_length_);
 
   if (logical_type_ == "struct") {
     field.set_type(pb::Field::PARENT);
@@ -303,20 +318,7 @@ bool Field::Equals(const std::shared_ptr<Field>& other, bool check_id) const {
 
 bool Field::operator==(const Field& other) const { return Equals(other, true); }
 
-::arrow::Status ToArrowVisitor::Visit(std::shared_ptr<Field> root) {
-  for (auto& child : root->children_) {
-    ARROW_ASSIGN_OR_RAISE(auto arrow_field, DoVisit(child));
-    arrow_fields_.push_back(arrow_field);
-  }
-  return ::arrow::Status::OK();
-}
 
-std::shared_ptr<::arrow::Schema> ToArrowVisitor::Finish() { return ::arrow::schema(arrow_fields_); }
-
-::arrow::Result<::std::shared_ptr<::arrow::Field>> ToArrowVisitor::DoVisit(
-    std::shared_ptr<Field> node) {
-  return std::make_shared<::arrow::Field>(node->name(), node->type());
-}
 
 //------ Schema
 

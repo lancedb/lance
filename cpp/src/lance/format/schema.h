@@ -23,27 +23,11 @@
 
 #include "lance/encodings/encoder.h"
 #include "lance/format/format.pb.h"
+#include "lance/format/visitors.h"
 
 namespace lance::format {
 
 class Field;
-
-class FieldVisitor {
- public:
-  virtual ::arrow::Status Visit(std::shared_ptr<Field> field) = 0;
-};
-
-class ToArrowVisitor : public FieldVisitor {
- public:
-  ::arrow::Status Visit(std::shared_ptr<Field> root) override;
-
-  std::shared_ptr<::arrow::Schema> Finish();
-
- private:
-  ::arrow::Result<::std::shared_ptr<::arrow::Field>> DoVisit(std::shared_ptr<Field> node);
-
-  std::vector<::std::shared_ptr<::arrow::Field>> arrow_fields_;
-};
 
 /// Schema is a tree representation of on-disk columns.
 ///
@@ -147,7 +131,9 @@ class Field final {
 
   const std::shared_ptr<::arrow::Array>& dictionary() const;
 
-  lance::format::pb::Encoding encoding() { return encoding_; };
+  ::arrow::Status set_dictionary(std::shared_ptr<::arrow::Array> dict_arr);
+
+  lance::format::pb::Encoding encoding() const { return encoding_; };
 
   ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> GetDecoder(
       std::shared_ptr<::arrow::io::RandomAccessFile> infile);
@@ -196,6 +182,9 @@ class Field final {
   /// Project an arrow field to this field.
   std::shared_ptr<Field> Project(const std::shared_ptr<::arrow::Field>& arrow_field) const;
 
+  /// Load dictionary array from disk.
+  ::arrow::Status LoadDictionary();
+
   int32_t id_ = -1;
   int32_t parent_ = -1;
   std::string name_;
@@ -203,7 +192,8 @@ class Field final {
   lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
 
   // Dictionary type
-  int64_t dictionary_offset_;
+  int64_t dictionary_offset_ = -1;
+  int64_t dictionary_page_length_ = 0;
   std::shared_ptr<::arrow::Array> dictionary_;
 
   friend class FieldVisitor;

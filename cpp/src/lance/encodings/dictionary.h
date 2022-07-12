@@ -34,6 +34,11 @@ class DictionaryEncoder : public Encoder {
 
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) override;
 
+  /// Write value array.
+  ///
+  /// It should be only called once per dataset / file.
+  ::arrow::Result<int64_t> WriteValueArray(std::shared_ptr<::arrow::Array> arr);
+
   std::string ToString() const override;
 
  private:

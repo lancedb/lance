@@ -120,9 +120,6 @@ message Field {
   /// It is only valid if encoding is DICTIONARY.
   ///
   /// The logic type presents the value type of the column, i.e., string value.
-  ///
-  ///
   int64 dictionary_offset = 8;
-
-  map<string, string> metadata = 9;
+  int64 dictionary_page_length = 9;
 }

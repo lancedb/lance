@@ -33,7 +33,7 @@ add_library(
         schema.h
         ${PROTO_SRCS}
         ${PROTO_HDRS}
-)
+        visitors.h visitors.cc)
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(lookup_table_test)
