@@ -138,7 +138,7 @@ TEST_CASE("Write dictionary type") {
   CHECK(builder.Append("person").ok());
 
   auto arr = builder.Finish().ValueOrDie();
-  fmt::print("ARR is : {}\n", arr->ToString());
+  INFO("array is " << arr->ToString());
 
   auto schema = arrow::schema({arrow::field("label", label_type)});
   auto table = arrow::Table::Make(schema, {arr});

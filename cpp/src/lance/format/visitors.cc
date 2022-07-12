@@ -18,7 +18,6 @@
 #include <arrow/type.h>
 #include <arrow/type_traits.h>
 
-#include <iostream>
 #include <memory>
 
 #include "lance/encodings/dictionary.h"
@@ -52,8 +51,6 @@ WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::Outp
     : out_(out) {}
 
 ::arrow::Status WriteDictionaryVisitor::Visit(std::shared_ptr<Field> root) {
-  std::cout << "I am writing NON_DICT values: root->type " << root->ToString() << " " << root->dictionary_offset_
-            << " len=" << root->dictionary_page_length_ << "\n";
   if (::arrow::is_dictionary(root->type()->id())) {
     assert(root->dictionary());
     auto decoder =
@@ -61,8 +58,6 @@ WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::Outp
     ARROW_ASSIGN_OR_RAISE(auto offset, decoder->WriteValueArray(root->dictionary()));
     root->dictionary_offset_ = offset;
     root->dictionary_page_length_ = root->dictionary()->length();
-    std::cout << "I am writing dictionary values: " << root->dictionary_offset_
-              << " len=" << root->dictionary_page_length_ << "\n";
   }
   for (auto& child : root->fields()) {
     ARROW_RETURN_NOT_OK(Visit(child));

@@ -280,6 +280,8 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
   new_field->name_ = name_;
   new_field->logical_type_ = logical_type_;
   new_field->encoding_ = encoding_;
+  new_field->dictionary_offset_ = dictionary_offset_;
+  new_field->dictionary_page_length_ = dictionary_page_length_;
 
   if (include_children) {
     for (const auto& child : children_) {
