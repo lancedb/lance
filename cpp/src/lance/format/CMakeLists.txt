@@ -22,6 +22,8 @@ protobuf_generate_cpp(
 add_library(
         format
         OBJECT
+        ${PROTO_HDRS}
+        ${PROTO_SRCS}
         format.h
         lookup_table.cc
         lookup_table.h
@@ -31,9 +33,9 @@ add_library(
         metadata.h
         schema.cc
         schema.h
-        ${PROTO_SRCS}
-        ${PROTO_HDRS}
-        visitors.h visitors.cc)
+        visitors.cc
+        visitors.h
+)
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(lookup_table_test)
