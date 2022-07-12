@@ -54,7 +54,9 @@ DictionaryDecoder::DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFi
                                      std::shared_ptr<::arrow::Array> dict)
     : Decoder(infile, type),
       dict_(dict),
-      plain_decoder_(std::make_unique<PlainDecoder>(infile, type->value_type())) {}
+      plain_decoder_(std::make_unique<PlainDecoder>(infile, type->index_type())) {
+  assert(dict);
+}
 
 void DictionaryDecoder::Reset(int64_t position, int32_t length) {
   Decoder::Reset(position, length);

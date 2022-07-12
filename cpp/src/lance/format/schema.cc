@@ -138,12 +138,25 @@ void Field::set_encoding(lance::format::pb::Encoding encoding) { encoding_ = enc
 
 const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
 
-::arrow::Status Field::LoadDictionary() {
+::arrow::Status Field::set_dictionary(std::shared_ptr<::arrow::Array> dict_arr) {
+  if (!dictionary_) {
+    dictionary_ = dict_arr;
+    return ::arrow::Status::OK();
+  }
+  return ::arrow::Status::Invalid("Field::dictionary has already been set");
+}
+
+::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   assert(::arrow::is_dictionary(type()->id()));
   auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
   ///
   assert (dict_type->value_type()->Equals(::arrow::utf8()));
-  return ::arrow::Status::OK();
+
+  auto decoder = lance::encodings::VarBinaryDecoder<::arrow::StringType>(infile, ::arrow::utf8());
+  decoder.Reset(dictionary_offset_, dictionary_page_length_);
+
+  ARROW_ASSIGN_OR_RAISE(auto dict_arr, decoder.ToArray());
+  return set_dictionary(dict_arr);
 }
 
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
@@ -181,7 +194,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
     if (!dictionary()) {
       /// Fetch dictionary on demand?
-      ARROW_RETURN_NOT_OK(LoadDictionary());
+      ARROW_RETURN_NOT_OK(LoadDictionary(infile));
     }
     return std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
   }

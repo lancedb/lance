@@ -25,6 +25,7 @@
 #include "lance/format/manifest.h"
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
+#include "lance/format/visitors.h"
 #include "lance/io/pb.h"
 
 namespace lance::io {
@@ -132,12 +133,22 @@ FileWriter::~FileWriter() {}
 ::arrow::Status FileWriter::WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
                                                  const std::shared_ptr<::arrow::Array>& arr) {
   assert(field->logical_type().starts_with("dict:"));
+  auto encoder = field->GetEncoder(destination_);
   auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
-  return WritePrimitiveArray(field, dict_arr->indices());
+  if (!field->dictionary()) {
+    ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
+  }
+  auto field_id = field->id();
+  lookup_table_.AddPageLength(field_id, chunk_id_, arr->length());
+  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
+  lookup_table_.AddOffset(field_id, chunk_id_, pos);
+  return ::arrow::Status::OK();
 }
 
 ::arrow::Status FileWriter::WriteFooter() {
   // Write dictionary values first.
+  auto visitor = format::WriteDictionaryVisitor(destination_);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(lance_schema_));
 
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
   metadata_->SetChunkPosition(pos);

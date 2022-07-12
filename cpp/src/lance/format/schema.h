@@ -183,7 +183,7 @@ class Field final {
   std::shared_ptr<Field> Project(const std::shared_ptr<::arrow::Field>& arrow_field) const;
 
   /// Load dictionary array from disk.
-  ::arrow::Status LoadDictionary();
+  ::arrow::Status LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile);
 
   int32_t id_ = -1;
   int32_t parent_ = -1;
@@ -198,6 +198,7 @@ class Field final {
 
   friend class FieldVisitor;
   friend class ToArrowVisitor;
+  friend class WriteDictionaryVisitor;
   friend class Schema;
   friend ::arrow::Status CopyField(std::shared_ptr<Field> new_field,
                                    std::shared_ptr<Field> field,

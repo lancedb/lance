@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <arrow/io/type_fwd.h>
 #include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
@@ -23,11 +24,16 @@ namespace lance::format {
 
 /// Forward Declaration.
 class Field;
+class Schema;
 
 /// Visitor over Field.
 class FieldVisitor {
  public:
+  virtual ~FieldVisitor() = default;
+
   virtual ::arrow::Status Visit(std::shared_ptr<Field> field) = 0;
+
+  ::arrow::Status VisitSchema(std::shared_ptr<Schema> schema);
 };
 
 /// A Visitor to convert Field / Schema to an arrow::Schema
@@ -41,6 +47,17 @@ class ToArrowVisitor : public FieldVisitor {
   ::arrow::Result<::std::shared_ptr<::arrow::Field>> DoVisit(std::shared_ptr<Field> node);
 
   std::vector<::std::shared_ptr<::arrow::Field>> arrow_fields_;
+};
+
+/// A Visitor to write the dictionary value array into output stream.
+class WriteDictionaryVisitor : public FieldVisitor {
+ public:
+  WriteDictionaryVisitor(std::shared_ptr<::arrow::io::OutputStream> out);
+
+  ::arrow::Status Visit(std::shared_ptr<Field> root) override;
+
+ private:
+  std::shared_ptr<::arrow::io::OutputStream> out_;
 };
 
 }  // namespace lance::format
