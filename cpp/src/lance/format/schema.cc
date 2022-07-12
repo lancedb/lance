@@ -40,7 +40,8 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
-      encoding_(pb::NONE) {
+      encoding_(pb::NONE),
+      dictionary_offset_(-1) {
   if (::lance::arrow::is_struct(field->type())) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(field->type());
     for (auto& arrow_field : struct_type->fields()) {
@@ -67,7 +68,8 @@ Field::Field(const pb::Field& pb)
       parent_(pb.parent_id()),
       name_(pb.name()),
       logical_type_(pb.logical_type()),
-      encoding_(pb.encoding()) {}
+      encoding_(pb.encoding()),
+      dictionary_offset_(pb.dictionary_offset()) {}
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
@@ -132,6 +134,8 @@ std::string Field::name() const {
 
 void Field::set_encoding(lance::format::pb::Encoding encoding) { encoding_ = encoding; }
 
+const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
+
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
@@ -157,11 +161,15 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile, type());
+      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile,
+                                                                                       type());
     } else if (logical_type_ == "binary") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile, type());
+      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile,
+                                                                                       type());
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
+    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
+    return std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
   }
   return ::arrow::Status::NotImplemented(
       fmt::format("Field::GetDecoder(): encoding={} logic_type={} is not supported.",
@@ -180,6 +188,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_id(id_);
   field.set_logical_type(logical_type_);
   field.set_encoding(encoding_);
+  field.set_dictionary_offset(dictionary_offset_);
 
   if (logical_type_ == "struct") {
     field.set_type(pb::Field::PARENT);

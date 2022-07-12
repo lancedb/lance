@@ -47,7 +47,6 @@ class ToArrowVisitor : public FieldVisitor {
 
 /// Schema is a tree representation of on-disk columns.
 ///
-///
 class Schema final {
  public:
   Schema() = default;
@@ -146,6 +145,8 @@ class Field final {
 
   void set_encoding(lance::format::pb::Encoding encoding);
 
+  const std::shared_ptr<::arrow::Array>& dictionary() const;
+
   lance::format::pb::Encoding encoding() { return encoding_; };
 
   ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> GetDecoder(
@@ -200,6 +201,10 @@ class Field final {
   std::string name_;
   std::string logical_type_;
   lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
+
+  // Dictionary type
+  int64_t dictionary_offset_;
+  std::shared_ptr<::arrow::Array> dictionary_;
 
   friend class FieldVisitor;
   friend class ToArrowVisitor;

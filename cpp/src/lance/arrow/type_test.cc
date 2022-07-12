@@ -52,6 +52,7 @@ TEST_CASE("Arrow Schema (simple)") {
   expected.set_logical_type("string");
   expected.set_name("pk");
   expected.set_parent_id(-1);
+  expected.set_dictionary_offset(-1);
   expected.set_encoding(pb::Encoding::VAR_BINARY);
 
   CHECK(MessageDifferencer::Equals(expected, fields.at(0)));
@@ -61,6 +62,7 @@ TEST_CASE("Arrow Schema (simple)") {
   expected.set_logical_type("int64");
   expected.set_name("value");
   expected.set_parent_id(-1);
+  expected.set_dictionary_offset(-1);
   expected.set_encoding(pb::Encoding::PLAIN);
 
   INFO("Actual fields: " << fields[1].DebugString() << " expect: " << expected.DebugString());
