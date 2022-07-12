@@ -63,7 +63,7 @@ inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
-    const std::string& logical_type);
+    ::arrow::util::string_view logical_type);
 
 /// Convert arrow schema.
 ::arrow::Result<std::vector<lance::format::pb::Field>> FromArrowSchema(

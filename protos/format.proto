@@ -92,8 +92,8 @@ enum Encoding {
 }
 
 /**
-  Field metadata.
-*/
+ * Field metadata for a column.
+ */
 message Field {
   enum Type {
     PARENT = 0;
@@ -104,11 +104,11 @@ message Field {
 
   // Fully qualified name.
   string name = 2;
-  /// Column id.
+  /// Field Id.
   int32 id = 3;
-  /// Parent Field ID. If not set
+  /// Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
-  
+
   // Logical types, support parameterized Arrow Type.
   string logical_type = 5;
   // If this field is nullable.
@@ -116,5 +116,13 @@ message Field {
 
   Encoding encoding = 7;
 
-  map<string, string> metadata = 8;
+  /// The file offset for storing the dictionary value.
+  /// It is only valid if encoding is DICTIONARY.
+  ///
+  /// The logic type presents the value type of the column, i.e., string value.
+  ///
+  ///
+  int64 dictionary_offset = 8;
+
+  map<string, string> metadata = 9;
 }

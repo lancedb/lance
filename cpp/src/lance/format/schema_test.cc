@@ -72,3 +72,7 @@ TEST_CASE("Get projection via arrow schema") {
                          << "\n Actual schema: " << projection->ToString());
   CHECK(expect_schema.Equals(projection, false));
 }
+
+TEST_CASE("Write dictionary type") {
+
+}
