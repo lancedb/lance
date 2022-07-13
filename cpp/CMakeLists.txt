@@ -63,13 +63,17 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND CMAKE_MODULE_PATH /usr/lib/x86_64-linux-gnu/cmake/arrow)
 endif ()
 
-find_package(Arrow REQUIRED)
-
 if (APPLE)
-    set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@1.1/)
+    execute_process(COMMAND brew --prefix openssl@1.1 OUTPUT_VARIABLE OPENSSL_PREFIX)
+    string(STRIP ${OPENSSL_PREFIX} OPENSSL_ROOT_DIR)
     find_package(Zstd REQUIRED)
-    list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
+    list(APPEND CMAKE_MODULE_PATH
+            /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
+            /usr/local/opt/apache-arrow/lib/cmake/arrow)
+    message("FOUND OPENSSL is : ${OPENSSL_ROOT_DIR}]")
 endif (APPLE)
+
+find_package(Arrow REQUIRED)
 
 find_package(ArrowDataset REQUIRED)
 include_directories(include)

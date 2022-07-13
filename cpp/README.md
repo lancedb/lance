@@ -27,7 +27,7 @@ A recent C++ compiler that supports C++20 is needed. The toolchain that has been
 
 ```sh
 # On macOS 12+
-brew install apache-arrow cmake protobuf
+brew install apache-arrow cmake protobuf openssl@1.1
 # Optionally, build document
 brew install doxygen
 ```
