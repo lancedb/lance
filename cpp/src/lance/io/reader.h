@@ -103,7 +103,12 @@ class FileReader {
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetStructScalar(
       const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const;
 
-  int64_t GetChunkPosition(int64_t field_id, int64_t chunk_id) const;
+  /// Get the file offset of a chunk for a column.
+  ///
+  /// \param field_id the field / column Id
+  /// \param chunk_id the chunk index in the file
+  /// \return the offset where the chunk starts. Returns Status::Invalid otherwise.
+  ::arrow::Result<int64_t> GetChunkOffset(int64_t field_id, int64_t chunk_id) const;
 
  private:
   std::shared_ptr<::arrow::io::RandomAccessFile> file_;
