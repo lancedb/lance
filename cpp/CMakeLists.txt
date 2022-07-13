@@ -67,6 +67,7 @@ if (APPLE)
     set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3/)
     find_package(Zstd REQUIRED)
     list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
+    message("Setting openssl to: ${OPENSSL_ROOT_DIR}")
 endif (APPLE)
 
 
