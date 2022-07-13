@@ -67,7 +67,9 @@ find_package(Arrow REQUIRED)
 
 if (APPLE)
     find_package(Zstd REQUIRED)
-    list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
+    list(APPEND CMAKE_MODULE_PATH
+            /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
+            /usr/local/opt/apache-arrow/lib/cmake/arrow)
 endif (APPLE)
 
 
