@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: brew install apache-arrow protobuf openssl@3
       - name: Cmake
-        run: cmake -B build
+        run: cmake -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3 -B build
       - name: Build
         run: make -C build -j
       - name: Test
