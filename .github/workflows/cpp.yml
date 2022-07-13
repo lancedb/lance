@@ -40,9 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Install dependencies
-        run: brew install apache-arrow protobuf openssl@3
+        run: brew install apache-arrow protobuf
       - name: Cmake
-        run: cmake -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3 -B build
+        run: cmake -B build
       - name: Build
         run: make -C build -j
       - name: Test
