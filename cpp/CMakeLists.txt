@@ -63,9 +63,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND CMAKE_MODULE_PATH /usr/lib/x86_64-linux-gnu/cmake/arrow)
 endif ()
 
-
 if (APPLE)
-    set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@1.1/)
+    set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3/)
     find_package(Zstd REQUIRED)
     list(APPEND CMAKE_MODULE_PATH /opt/homebrew/opt/apache-arrow/lib/cmake/arrow)
 endif (APPLE)
