@@ -27,9 +27,7 @@ bool PlanNode::Equals(const std::shared_ptr<PlanNode>& other) const {
   return other && Equals(*other);
 }
 
-bool PlanNode::operator==(const PlanNode& other) const {
-  return Equals(other);
-}
+bool PlanNode::operator==(const PlanNode& other) const { return Equals(other); }
 
 std::string Scan::type_name() const { return "Scan"; }
 
