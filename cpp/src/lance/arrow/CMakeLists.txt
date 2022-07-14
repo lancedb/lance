@@ -20,10 +20,11 @@ add_library(
         OBJECT
         file_lance.cc
         reader.cc
+        stl.h
         type.cc
         type.h
         writer.cc
-        stl.h)
+)
 target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(api_test)
