@@ -31,20 +31,45 @@ class PlanNode {
  public:
   virtual ~PlanNode() = default;
 
+  virtual ::arrow::Result<::arrow::Array> Execute() = 0;
+
   /// Short node name.
-  virtual std::string name() const = 0;
+  virtual std::string type_name() const = 0;
 
   /// Debug String.
   virtual std::string ToString() const = 0;
 
   /// Validate the plan.
-  virtual ::arrow::Status Validate() const = 0;
+  virtual ::arrow::Status Validate() const {
+    return ::arrow::Status::OK();
+  }
 
   /// Returns True if two plans are the same.
   virtual bool Equals(const PlanNode& other) const = 0;
 
   /// Returns True if two plans are the same.
-  virtual bool Equals(const std::shared_ptr<PlanNode>& other) const = 0;
+  virtual bool Equals(const std::shared_ptr<PlanNode>& other) const;
+};
+
+class Filter : public PlanNode {
+ public:
+  std::string type_name() const override;
+
+  ::arrow::Result<::arrow::Array> Execute() override;
+};
+
+/// Scan node.
+class Scan : public PlanNode {
+ public:
+  ::arrow::Result<::arrow::Array> Execute() override;
+
+  std::string type_name() const override;
+
+  std::string ToString() const override;
+
+  bool Equals(const PlanNode& other) const override;
+
+ private:
 };
 
 /// Make (and optimize) a plan tree.

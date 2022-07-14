@@ -15,14 +15,14 @@
 
 # Internal I/O
 
+add_subdirectory(exec)
+
 add_library(
         io
         OBJECT
         endian.h
         filter.cc
         filter.h
-        exec.cc
-        exec.h
         pb.cc
         pb.h
         reader.cc
