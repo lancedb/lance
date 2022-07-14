@@ -26,24 +26,28 @@ bool PlanNode::Equals(const std::shared_ptr<PlanNode>& other) const {
   return other && Equals(*other);
 }
 
-class LimitOffset : PlanNode {};
 
-class Project : PlanNode {};
+std::string Scan::type_name() const { return "Scan"; }
 
-std::string Scan::type_name() const {
-  return "Scan";
-}
-
-::arrow::Result<::arrow::Array> Scan::Execute() {
+::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(std::shared_ptr<FileReader> reader,
+                                                               int32_t chunk_idx) {
   return ::arrow::Status::NotImplemented("Scan::Execute not implemented yet");
 }
 
-std::string Scan::ToString() const {
-  return "Scan()";
+::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(
+    std::shared_ptr<FileReader> reader, int32_t chunk_id, std::shared_ptr<::arrow::Array> indices) {
+  return ::arrow::Status::NotImplemented("Scan::Execute(indices) not implemented yet");
 }
 
-bool Scan::Equals(const PlanNode& other) const {
-  return type_name() == other.type_name();
+std::string Scan::ToString() const { return "Scan()"; }
+
+bool Scan::Equals(const PlanNode& other) const { return type_name() == other.type_name(); }
+
+::arrow::Status Scan::Validate() const {
+  if (!field_) {
+    return ::arrow::Status::Invalid("Scan does not bind to a field");
+  }
+  return ::arrow::Status::OK();
 }
 
 ::arrow::Result<std::shared_ptr<PlanNode>> Make(

@@ -14,6 +14,7 @@
 
 #include "exec.h"
 
+#include <arrow/compute/exec/expression.h>
 #include <arrow/dataset/dataset.h>
 #include <arrow/dataset/scanner.h>
 #include <arrow/table.h>
@@ -23,7 +24,7 @@
 
 #include "catch2/catch_test_macros.hpp"
 
-auto DatasetSchema() {
+auto TestSchema() {
   return ::arrow::schema({
       ::arrow::field("pk", ::arrow::utf8()),
       ::arrow::field("label", ::arrow::utf8()),
@@ -31,17 +32,27 @@ auto DatasetSchema() {
   });
 }
 
-auto CreateDataset() {
-  auto table = ::arrow::Table::MakeEmpty(DatasetSchema()).ValueOrDie();
+auto TestDataset() {
+  auto table = ::arrow::Table::MakeEmpty(TestSchema()).ValueOrDie();
   return std::make_shared<::arrow::dataset::InMemoryDataset>(table);
 }
 
 TEST_CASE("SELECT * FROM dataset") {
-  auto builder = ::arrow::dataset::ScannerBuilder(CreateDataset());
+  auto builder = ::arrow::dataset::ScannerBuilder(TestDataset());
   auto scanner = builder.Finish().ValueOrDie();
 
   auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
   INFO(plan->ToString());
 }
 
-TEST_CASE("SELECT pk WHERE label = 'car'") {}
+TEST_CASE("SELECT pk WHERE label = 'car'") {
+  auto builder = ::arrow::dataset::ScannerBuilder(TestDataset());
+  CHECK(builder.Project({"pk"}).ok());
+  CHECK(builder
+            .Filter(::arrow::compute::equal(::arrow::compute::field_ref("label"),
+                                            ::arrow::compute::literal("car")))
+            .ok());
+  auto scanner = builder.Finish().ValueOrDie();
+
+  auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
+}
