@@ -1,3 +1,17 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #include "lance/io/reader.h"
 
 #include <arrow/array/concatenate.h>
@@ -101,7 +115,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const {
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
-  auto pos = GetChunkPosition(field_id, chunk_id);
+  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto length, lookup_table_->GetPageLength(field_id, chunk_id));
   decoder->Reset(pos, length);
   return decoder->GetScalar(idx);
@@ -137,7 +151,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const {
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
-  auto pos = GetChunkPosition(field_id, chunk_id);
+  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto length, lookup_table_->GetPageLength(field_id, chunk_id));
   decoder->Reset(pos, length);
   ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
@@ -255,8 +269,13 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ReadBatch(offset, length, *projection);
 }
 
-int64_t FileReader::GetChunkPosition(int64_t field_id, int64_t chunk_id) const {
-  return lookup_table_->GetOffset(field_id, chunk_id);
+::arrow::Result<int64_t> FileReader::GetChunkOffset(int64_t field_id, int64_t chunk_id) const {
+  auto offset = lookup_table_->GetOffset(field_id, chunk_id);
+  if (offset.has_value()) {
+    return offset.value();
+  }
+  return ::arrow::Status::Invalid(
+      fmt::format("Invalid access for chunk offset: field={} chunk={}", field_id, chunk_id));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(
@@ -297,14 +316,14 @@ int64_t FileReader::GetChunkPosition(int64_t field_id, int64_t chunk_id) const {
     std::optional<int32_t> length) const {
   /// Consolidate this with primitive Array
   auto field_id = field->id();
-  auto pos = GetChunkPosition(field_id, chunk_id);
+  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
   if (!length.has_value()) {
     length = chunk_length - start;
   }
 
-  auto decoder =
-      std::make_shared<lance::encodings::PlainDecoder<::arrow::Int32Type>>(file_, pos, chunk_length);
+  auto decoder = std::make_shared<lance::encodings::PlainDecoder<::arrow::Int32Type>>(
+      file_, pos, chunk_length);
   // TODO: fix this
   auto l = std::min(static_cast<int64_t>(*length + 1), chunk_length - start);
   ARROW_ASSIGN_OR_RAISE(auto offsets, decoder->ToArray(start, l));
@@ -334,7 +353,7 @@ int64_t FileReader::GetChunkPosition(int64_t field_id, int64_t chunk_id) const {
     int32_t start,
     std::optional<int32_t> length) const {
   auto field_id = field->id();
-  auto pos = GetChunkPosition(field_id, chunk_id);
+  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
   decoder->Reset(pos, chunk_length);

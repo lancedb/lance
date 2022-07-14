@@ -31,6 +31,10 @@ if (CCACHE_FOUND)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif (CCACHE_FOUND)
 
+if (CMAKE_BUILD_TYPE STREQUAL Debug)
+    SET(LANCE_BUILD_BENCHMARKS ON)
+endif ()
+
 add_compile_options(-Wall -Wextra -fPIC)
 
 # TODO: Fix on linux
@@ -108,6 +112,9 @@ set(lance_objects
         )
 
 add_subdirectory(src)
+if (LANCE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif ()
 
 add_library(lance SHARED ${lance_objects})
 target_link_libraries(lance PUBLIC
