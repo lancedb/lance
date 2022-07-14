@@ -21,6 +21,8 @@ add_library(
         endian.h
         filter.cc
         filter.h
+        exec.cc
+        exec.h
         pb.cc
         pb.h
         reader.cc
