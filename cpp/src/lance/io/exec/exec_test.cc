@@ -43,6 +43,7 @@ TEST_CASE("SELECT * FROM dataset") {
 
   auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
   INFO(plan->ToString());
+  CHECK(plan->Validate().ok());
 }
 
 TEST_CASE("SELECT pk WHERE label = 'car'") {
@@ -55,4 +56,5 @@ TEST_CASE("SELECT pk WHERE label = 'car'") {
   auto scanner = builder.Finish().ValueOrDie();
 
   auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
+  CHECK(plan->Validate().ok());
 }

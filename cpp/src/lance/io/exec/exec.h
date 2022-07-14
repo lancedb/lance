@@ -53,6 +53,8 @@ class PlanNode {
 
   /// Returns True if two plans are the same.
   virtual bool Equals(const std::shared_ptr<PlanNode>& other) const;
+
+  bool operator==(const PlanNode& other) const;
 };
 
 ///
@@ -64,6 +66,7 @@ class Filter : public PlanNode {
                                                            int32_t chunk_idx) override;
 
  private:
+  std::unique_ptr<PlanNode> child_;
 };
 
 /// Scan. The leaf node to actual read a page from storage.
@@ -77,7 +80,7 @@ class Scan : public PlanNode {
   /// \param reader a Lance FileReader
   /// \param chunk_id
   /// \param indices the indices array.
-  /// \return
+  /// \return The result array.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
                                                            int32_t chunk_id,
                                                            std::shared_ptr<::arrow::Array> indices);
@@ -106,6 +109,7 @@ class Project : public PlanNode {
 
  private:
   std::vector<Filter> filters_;
+  std::vector<PlanNode> children_;
 };
 
 /// Make (and optimize) a plan tree.

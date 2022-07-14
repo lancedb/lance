@@ -27,6 +27,10 @@ bool PlanNode::Equals(const std::shared_ptr<PlanNode>& other) const {
   return other && Equals(*other);
 }
 
+bool PlanNode::operator==(const PlanNode& other) const {
+  return Equals(other);
+}
+
 std::string Scan::type_name() const { return "Scan"; }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(std::shared_ptr<FileReader> reader,
@@ -70,6 +74,27 @@ bool Scan::Equals(const PlanNode& other) const {
              scan_options->projected_schema ? scan_options->projected_schema->ToString() : "{}",
              scan_options->filter.ToString());
   return std::make_shared<Scan>();
+}
+
+//----- Project
+
+std::string Project::type_name() const { return "Project"; }
+
+std::string Project::ToString() const { return fmt::format("Project(children=)"); }
+
+::arrow::Status Project::Validate() const {
+  if (!children_.empty()) {
+    return ::arrow::Status::Invalid("Invalid Project: children is empty");
+  }
+  return ::arrow::Status::OK();
+}
+
+bool Project::Equals(const PlanNode& other) const {
+  if (type_name() != other.type_name()) {
+    return false;
+  }
+  const auto& other_proj = dynamic_cast<const Project&>(other);
+  return children_ == other_proj.children_ && filters_ == other_proj.filters_;
 }
 
 }  // namespace lance::io::exec
