@@ -20,12 +20,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "lance/arrow/stl.h"
+
 using arrow::Int32Builder;
 
 TEST_CASE("Test Write Int32 array") {
-  Int32Builder builder;
-  CHECK(builder.AppendValues({1, 2, 3, 4, 5, 6, 7, 8}).ok());
-  auto arr = builder.Finish().ValueOrDie();
+  auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5, 6, 7, 8}).ValueOrDie();
   CHECK(arr->length() == 8);
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
@@ -57,10 +57,7 @@ TEST_CASE("Test take plain values") {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   lance::encodings::PlainDecoder<::arrow::Int32Type> decoder(infile, offset, arr->length());
 
-  arrow::Int32Builder index_builder;
-  CHECK(index_builder.AppendValues({8, 12, 16, 20, 45}).ok());
-  auto indices = std::static_pointer_cast<::arrow::Int32Array>(index_builder.Finish().ValueOrDie());
-
+  auto indices = lance::arrow::ToArray({8, 12, 16, 20, 45}).ValueOrDie();
   auto actual = decoder.Take(indices).ValueOrDie();
   INFO("Indices " << indices->ToString() << " Actual " << actual->ToString());
   CHECK(actual->Equals(indices));
