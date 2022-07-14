@@ -18,6 +18,11 @@
 
 #include <memory>
 #include <optional>
+#include <string>
+
+namespace lance::format {
+class Schema;
+}
 
 namespace lance::arrow {
 
@@ -26,11 +31,22 @@ namespace lance::arrow {
 /// Add limit and offset pushdown supports.
 class ScanOptions {
  public:
-  ScanOptions(std::shared_ptr<::arrow::dataset::ScanOptions> arrow_opts,
+  ScanOptions(std::shared_ptr<lance::format::Schema> schema,
+              std::shared_ptr<::arrow::dataset::ScanOptions> arrow_opts,
               std::optional<int64_t> limit = std::nullopt,
               std::optional<int64_t> offset = std::nullopt);
 
+  /// Lance Dataset Schema.
+  const std::shared_ptr<lance::format::Schema>& schema() const;
+
+  /// Arrow's ScanOptions
+  const std::shared_ptr<::arrow::dataset::ScanOptions>& arrow_options() const;
+
+  /// Debug String
+  std::string ToString() const;
+
  private:
+  std::shared_ptr<lance::format::Schema> schema_;
   std::shared_ptr<::arrow::dataset::ScanOptions> arrow_options_;
 
   std::optional<int64_t> limit_;

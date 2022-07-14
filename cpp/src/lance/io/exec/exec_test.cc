@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "exec.h"
+#include "lance/io/exec/exec.h"
 
 #include <arrow/compute/exec/expression.h>
 #include <arrow/dataset/dataset.h>
@@ -23,6 +23,8 @@
 #include <memory>
 
 #include "catch2/catch_test_macros.hpp"
+#include "lance/arrow/scan_options.h"
+#include "lance/format/schema.h"
 
 auto TestSchema() {
   return ::arrow::schema({
@@ -41,7 +43,11 @@ TEST_CASE("SELECT * FROM dataset") {
   auto builder = ::arrow::dataset::ScannerBuilder(TestDataset());
   auto scanner = builder.Finish().ValueOrDie();
 
-  auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
+  auto options = std::make_shared<lance::arrow::ScanOptions>(
+      std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema),
+      scanner->options());
+
+  auto plan = lance::io::exec::Make(options).ValueOrDie();
   INFO(plan->ToString());
   CHECK(plan->Validate().ok());
   CHECK(plan->type_name() == "project");
@@ -56,6 +62,10 @@ TEST_CASE("SELECT pk WHERE label = 'car'") {
             .ok());
   auto scanner = builder.Finish().ValueOrDie();
 
-  auto plan = lance::io::exec::Make(scanner->options()).ValueOrDie();
+  auto options = std::make_shared<lance::arrow::ScanOptions>(
+      std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema),
+      scanner->options());
+
+  auto plan = lance::io::exec::Make(options).ValueOrDie();
   CHECK(plan->Validate().ok());
 }

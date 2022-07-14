@@ -91,12 +91,9 @@ bool Project::Equals(const PlanNode& other) const {
 }
 
 ::arrow::Result<std::shared_ptr<PlanNode>> Make(
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
-  fmt::print("Scan Options: dataset={}\nproject={}\nfilter={}\n",
-             scan_options->dataset_schema->ToString(),
-             scan_options->projected_schema ? scan_options->projected_schema->ToString() : "{}",
-             scan_options->filter.ToString());
-  return std::make_shared<Scan>();
+    std::shared_ptr<lance::arrow::ScanOptions> scan_options) {
+  fmt::print("Scan Options: {}\n", scan_options->ToString());
+  return ::arrow::Status::NotImplemented("");
 }
 
 }  // namespace lance::io::exec

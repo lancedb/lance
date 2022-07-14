@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "lance/arrow/scan_options.h"
 #include "lance/format/format.h"
 #include "lance/io/reader.h"
 
@@ -117,6 +118,6 @@ class Project : public PlanNode {
 
 /// Make (and optimize) a plan tree.
 ::arrow::Result<std::shared_ptr<PlanNode>> Make(
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
+    std::shared_ptr<lance::arrow::ScanOptions> scan_options);
 
 }  // namespace lance::io::exec

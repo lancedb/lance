@@ -13,3 +13,37 @@
 //  limitations under the License.
 
 #include "lance/arrow/scan_options.h"
+
+#include <arrow/dataset/scanner.h>
+#include <fmt/format.h>
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+
+#include "lance/format/schema.h"
+
+namespace lance::arrow {
+
+ScanOptions::ScanOptions(std::shared_ptr<lance::format::Schema> schema,
+                         std::shared_ptr<::arrow::dataset::ScanOptions> arrow_opts,
+                         std::optional<int64_t> limit,
+                         std::optional<int64_t> offset)
+    : schema_(schema), arrow_options_(arrow_opts), limit_(limit), offset_(offset) {}
+
+const std::shared_ptr<lance::format::Schema>& ScanOptions::schema() const { return schema_; }
+
+const std::shared_ptr<::arrow::dataset::ScanOptions>& ScanOptions::arrow_options() const {
+  return arrow_options_;
+}
+
+std::string ScanOptions::ToString() const {
+  return fmt::format("ScanOptions(dataset={},\n, project={}\n, filter={}\n, limit={}\noffset={})",
+                     schema_->ToString(),
+                     arrow_options_->projected_schema->ToString(),
+                     arrow_options_->filter.ToString(),
+                     limit_.value_or(-1),
+                     offset_.value_or(-1));
+}
+
+}  // namespace lance::arrow
