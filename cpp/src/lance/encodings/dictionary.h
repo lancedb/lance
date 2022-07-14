@@ -63,12 +63,17 @@ class DictionaryDecoder : public Decoder {
 
   ~DictionaryDecoder() override = default;
 
+  ::arrow::Status Init() override;
+
   void Reset(int64_t position, int32_t length) override;
 
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override;
 
  private:
   std::shared_ptr<::arrow::Array> dict_;

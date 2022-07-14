@@ -35,6 +35,7 @@ TEST_CASE("Test Write Int32 array") {
   // Read it back
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   lance::encodings::PlainDecoder decoder(infile, arrow::int32());
+  CHECK(decoder.Init().ok());
   decoder.Reset(offset, arr->length());
   auto actual = decoder.ToArray().ValueOrDie();
   CHECK(arr->Equals(actual));
@@ -57,6 +58,7 @@ TEST_CASE("Test take plain values") {
 
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   lance::encodings::PlainDecoder decoder(infile, arr->type());
+  CHECK(decoder.Init().ok());
   decoder.Reset(offset, arr->length());
 
   auto indices = lance::arrow::ToArray({8, 12, 16, 20, 45}).ValueOrDie();

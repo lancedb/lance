@@ -325,6 +325,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   }
 
   auto decoder = std::make_shared<lance::encodings::PlainDecoder>(file_, ::arrow::int32());
+  ARROW_RETURN_NOT_OK(decoder->Init());
   decoder->Reset(pos, chunk_length);
 
   // TODO: fix this

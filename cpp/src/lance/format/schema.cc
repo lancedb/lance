@@ -176,19 +176,20 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
+  std::shared_ptr<lance::encodings::Decoder> decoder;
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
-      return std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else {
-      return std::make_shared<lance::encodings::PlainDecoder>(infile, type());
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile,
-                                                                                       type());
+      decoder =
+          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile, type());
     } else if (logical_type_ == "binary") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile,
-                                                                                       type());
+      decoder =
+          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile, type());
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
     auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
@@ -196,12 +197,22 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
       /// Fetch dictionary on demand?
       ARROW_RETURN_NOT_OK(LoadDictionary(infile));
     }
-    return std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
+    decoder =
+        std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
   }
-  return ::arrow::Status::NotImplemented(
-      fmt::format("Field::GetDecoder(): encoding={} logic_type={} is not supported.",
-                  encoding(),
-                  logical_type_));
+
+  if (decoder) {
+    auto status = decoder->Init();
+    if (!status.ok()) {
+      return status;
+    }
+    return decoder;
+  } else {
+    return ::arrow::Status::NotImplemented(
+        fmt::format("Field::GetDecoder(): encoding={} logic_type={} is not supported.",
+                    encoding(),
+                    logical_type_));
+  }
 }
 
 std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }

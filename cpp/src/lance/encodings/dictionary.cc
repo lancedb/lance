@@ -58,6 +58,10 @@ DictionaryDecoder::DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFi
   assert(dict);
 }
 
+::arrow::Status DictionaryDecoder::Init() {
+  return plain_decoder_->Init();
+}
+
 void DictionaryDecoder::Reset(int64_t position, int32_t length) {
   Decoder::Reset(position, length);
   plain_decoder_->Reset(position, length);
@@ -71,6 +75,12 @@ void DictionaryDecoder::Reset(int64_t position, int32_t length) {
 ::arrow::Result<std::shared_ptr<::arrow::Array>> DictionaryDecoder::ToArray(
     int32_t start, std::optional<int32_t> length) const {
   ARROW_ASSIGN_OR_RAISE(auto index_arr, plain_decoder_->ToArray(start, length));
+  return ::arrow::DictionaryArray::FromArrays(index_arr, dict_);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> DictionaryDecoder::Take(
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  ARROW_ASSIGN_OR_RAISE(auto index_arr, plain_decoder_->Take(indices));
   return ::arrow::DictionaryArray::FromArrays(index_arr, dict_);
 }
 

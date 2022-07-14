@@ -46,6 +46,9 @@ class PlainDecoder : public Decoder {
 
   ~PlainDecoder() override;
 
+  /// Initialize PlainDecoder.
+  ::arrow::Status Init() override;
+
   void Reset(int64_t position, int32_t length) override;
 
   /// Get one single scalar from the page.

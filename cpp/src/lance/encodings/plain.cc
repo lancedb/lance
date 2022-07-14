@@ -149,46 +149,50 @@ class PlainDecoderImpl : public Decoder {
 
 PlainDecoder::PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
                            std::shared_ptr<::arrow::DataType> type)
-    : Decoder(infile, type) {
-  switch (type_->id()) {
-    case ::arrow::Type::BOOL:
-      impl_.reset(new PlainDecoderImpl<::arrow::BooleanType>(infile, type));
-      break;
-    case ::arrow::Type::INT8:
-      impl_.reset(new PlainDecoderImpl<::arrow::Int8Type>(infile, type));
-      break;
-    case ::arrow::Type::UINT8:
-      impl_.reset(new PlainDecoderImpl<::arrow::UInt8Type>(infile, type));
-      break;
-    case ::arrow::Type::INT16:
-      impl_.reset(new PlainDecoderImpl<::arrow::Int16Type>(infile, type));
-      break;
-    case ::arrow::Type::UINT16:
-      impl_.reset(new PlainDecoderImpl<::arrow::UInt16Type>(infile, type));
-      break;
-    case ::arrow::Type::INT32:
-      impl_.reset(new PlainDecoderImpl<::arrow::Int32Type>(infile, type));
-      break;
-    case ::arrow::Type::UINT32:
-      impl_.reset(new PlainDecoderImpl<::arrow::UInt32Type>(infile, type));
-      break;
-    case ::arrow::Type::INT64:
-      impl_.reset(new PlainDecoderImpl<::arrow::Int64Type>(infile, type));
-      break;
-    case ::arrow::Type::UINT64:
-      impl_.reset(new PlainDecoderImpl<::arrow::UInt64Type>(infile, type));
-      break;
-    case ::arrow::Type::FLOAT:
-      impl_.reset(new PlainDecoderImpl<::arrow::FloatType>(infile, type));
-      break;
-    case ::arrow::Type::DOUBLE:
-      impl_.reset(new PlainDecoderImpl<::arrow::DoubleType>(infile, type));
-      break;
-    default : assert(false);
-  }
-}
+    : Decoder(infile, type) {}
 
 PlainDecoder::~PlainDecoder() {}
+
+::arrow::Status PlainDecoder::Init() {
+  switch (type_->id()) {
+    case ::arrow::Type::BOOL:
+      impl_.reset(new PlainDecoderImpl<::arrow::BooleanType>(infile_, type_));
+      break;
+    case ::arrow::Type::INT8:
+      impl_.reset(new PlainDecoderImpl<::arrow::Int8Type>(infile_, type_));
+      break;
+    case ::arrow::Type::UINT8:
+      impl_.reset(new PlainDecoderImpl<::arrow::UInt8Type>(infile_, type_));
+      break;
+    case ::arrow::Type::INT16:
+      impl_.reset(new PlainDecoderImpl<::arrow::Int16Type>(infile_, type_));
+      break;
+    case ::arrow::Type::UINT16:
+      impl_.reset(new PlainDecoderImpl<::arrow::UInt16Type>(infile_, type_));
+      break;
+    case ::arrow::Type::INT32:
+      impl_.reset(new PlainDecoderImpl<::arrow::Int32Type>(infile_, type_));
+      break;
+    case ::arrow::Type::UINT32:
+      impl_.reset(new PlainDecoderImpl<::arrow::UInt32Type>(infile_, type_));
+      break;
+    case ::arrow::Type::INT64:
+      impl_.reset(new PlainDecoderImpl<::arrow::Int64Type>(infile_, type_));
+      break;
+    case ::arrow::Type::UINT64:
+      impl_.reset(new PlainDecoderImpl<::arrow::UInt64Type>(infile_, type_));
+      break;
+    case ::arrow::Type::FLOAT:
+      impl_.reset(new PlainDecoderImpl<::arrow::FloatType>(infile_, type_));
+      break;
+    case ::arrow::Type::DOUBLE:
+      impl_.reset(new PlainDecoderImpl<::arrow::DoubleType>(infile_, type_));
+      break;
+    default:
+      return ::arrow::Status::Invalid(fmt::format("Unsupported type: {}", type_->ToString()));
+  }
+  return ::arrow::Status::OK();
+}
 
 void PlainDecoder::Reset(int64_t position, int32_t length) {
   Decoder::Reset(position, length);
