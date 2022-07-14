@@ -322,8 +322,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     length = chunk_length - start;
   }
 
-  auto decoder = std::make_shared<lance::encodings::PlainDecoder<::arrow::Int32Type>>(
-      file_, pos, chunk_length);
+  auto decoder =
+      std::make_shared<lance::encodings::PlainDecoder>(file_, ::arrow::int32());
+  decoder->Reset(pos, chunk_length);
+
   // TODO: fix this
   auto l = std::min(static_cast<int64_t>(*length + 1), chunk_length - start);
   ARROW_ASSIGN_OR_RAISE(auto offsets, decoder->ToArray(start, l));

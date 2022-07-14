@@ -34,8 +34,17 @@ DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> 
   return plain_encoder_->Write(dict_arr->indices());
 }
 
-std::string DictionaryEncoder::ToString() const {
-    return "Encoder(type=dictionary)";
-}
+std::string DictionaryEncoder::ToString() const { return "Encoder(type=dictionary)"; }
+
+DictionaryDecoder::DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
+                                     std::shared_ptr<::arrow::DataType> type,
+                                     std::shared_ptr<::arrow::Array> dict)
+    : Decoder(infile, type), dict_(dict) {}
+
+::arrow::Result<std::shared_ptr<::arrow::Scalar>> DictionaryDecoder::GetScalar(int64_t idx) const {}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> DictionaryDecoder::ToArray(
+    int32_t start, std::optional<int32_t> length) const {}
+
 
 }  // namespace lance::encodings

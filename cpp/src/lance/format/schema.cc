@@ -24,6 +24,7 @@
 
 #include "lance/arrow/type.h"
 #include "lance/encodings/binary.h"
+#include "lance/encodings/dictionary.h"
 #include "lance/encodings/plain.h"
 
 using std::make_shared;
@@ -135,10 +136,11 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
     case pb::Encoding::PLAIN:
-    case pb::Encoding::DICTIONARY:
       return std::make_shared<lance::encodings::PlainEncoder>(sink);
     case pb::Encoding::VAR_BINARY:
       return std::make_shared<lance::encodings::VarBinaryEncoder>(sink);
+    case pb::Encoding::DICTIONARY:
+      return std::make_shared<lance::encodings::DictionaryEncoder>(sink);
     default:
       fmt::print(stderr, "Encoding {} is not supported\n", encoding_);
       assert(false);
@@ -148,23 +150,18 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   if (encoding() == pb::Encoding::PLAIN) {
-    if (logical_type_ == "int32" || logical_type_ == "list" || logical_type_ == "list.struct") {
-      return std::make_shared<lance::encodings::PlainDecoder<::arrow::Int32Type>>(infile);
-    } else if (logical_type_ == "int64") {
-      return std::make_shared<lance::encodings::PlainDecoder<::arrow::Int64Type>>(infile);
-    } else if (logical_type_ == "float") {
-      return std::make_shared<lance::encodings::PlainDecoder<::arrow::FloatType>>(infile);
-    } else if (logical_type_ == "double") {
-      return std::make_shared<lance::encodings::PlainDecoder<::arrow::DoubleType>>(infile);
+    if (logical_type_ == "list" || logical_type_ == "list.struct") {
+      return std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
+    } else {
+      return std::make_shared<lance::encodings::PlainDecoder>(infile, type());
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile);
+      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile, type());
     } else if (logical_type_ == "binary") {
-      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile);
+      return std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile, type());
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
-
   }
   return ::arrow::Status::NotImplemented(
       fmt::format("Field::GetDecoder(): encoding={} logic_type={} is not supported.",

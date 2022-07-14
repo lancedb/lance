@@ -56,7 +56,8 @@ TEST_CASE("Write binary arrow") {
   auto infile = make_shared<arrow::io::BufferReader>(buf);
 
   {
-    VarBinaryDecoder<::arrow::StringType> decoder(infile, offset1, 3);
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, arrow::utf8());
+    decoder.Reset(offset1, 3);
 
     auto actual_arr = decoder.ToArray().ValueOrDie();
     CHECK(arr1->Equals(actual_arr));
@@ -68,7 +69,8 @@ TEST_CASE("Write binary arrow") {
   }
 
   {
-    VarBinaryDecoder<::arrow::StringType> decoder(infile, offset2, 4);
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, arrow::utf8());
+    decoder.Reset(offset2, 4);
 
     auto actual_arr = decoder.ToArray().ValueOrDie();
     INFO("ACTUAL ARR 2 " << actual_arr->ToString());
@@ -93,7 +95,8 @@ TEST_CASE("Take") {
   auto buf = out->Finish().ValueOrDie();
   auto infile = make_shared<arrow::io::BufferReader>(buf);
 
-  VarBinaryDecoder<::arrow::StringType> decoder(infile, offset, 100);
+  VarBinaryDecoder<::arrow::StringType> decoder(infile, ::arrow::utf8());
+  decoder.Reset(offset, 100);
   auto indices = lance::arrow::ToArray({5, 10, 20}).ValueOrDie();
   auto actual = decoder.Take(indices).ValueOrDie();
   auto expected = lance::arrow::ToArray({"5", "10", "20"}).ValueOrDie();

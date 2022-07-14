@@ -21,10 +21,9 @@
 #include <string>
 
 #include "lance/encodings/encoder.h"
+#include "lance/encodings/plain.h"
 
 namespace lance::encodings {
-
-class PlainEncoder;
 
 /// Dictionary Encoder.
 class DictionaryEncoder : public Encoder {
@@ -40,6 +39,33 @@ class DictionaryEncoder : public Encoder {
  private:
   /// A plain encoder is used to write index values.
   std::unique_ptr<PlainEncoder> plain_encoder_;
+};
+
+/// Dictionary Decoder.
+class DictionaryDecoder : public Decoder {
+ public:
+  /// Constructor for DictionaryDecoder.
+  ///
+  /// \param infile input file.
+  /// \param type data type.
+  /// \param dict the dictionary array.
+  ///
+  /// See https://arrow.apache.org/docs/cpp/api/array.html#dictionary-encoded for details w.r.t
+  /// of DictionaryType.
+  DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
+                    std::shared_ptr<::arrow::DataType> type,
+                    std::shared_ptr<::arrow::Array> dict);
+
+  virtual ~DictionaryDecoder() = default;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
+      int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;
+
+ private:
+  std::shared_ptr<::arrow::Array> dict_;
+  std::unique_ptr<PlainDecoder> plain_decoder_;
 };
 
 }  // namespace lance::encodings
