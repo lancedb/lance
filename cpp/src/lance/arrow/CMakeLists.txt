@@ -23,7 +23,7 @@ add_library(
         type.cc
         type.h
         writer.cc
-)
+        stl.h)
 target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(api_test)
