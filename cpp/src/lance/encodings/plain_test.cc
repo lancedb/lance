@@ -42,3 +42,26 @@ TEST_CASE("Test Write Int32 array") {
     CHECK(arr->GetScalar(i).ValueOrDie()->Equals(decoder.GetScalar(i).ValueOrDie()));
   }
 }
+
+TEST_CASE("Test take plain values") {
+  arrow::Int32Builder builder;
+  for (int i = 0; i < 100; i++) {
+    CHECK(builder.Append(i).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  lance::encodings::PlainEncoder encoder(sink);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  lance::encodings::PlainDecoder<::arrow::Int32Type> decoder(infile, offset, arr->length());
+
+  arrow::Int32Builder index_builder;
+  CHECK(index_builder.AppendValues({8, 12, 16, 20, 45}).ok());
+  auto indices = std::static_pointer_cast<::arrow::Int32Array>(index_builder.Finish().ValueOrDie());
+
+  auto actual = decoder.Take(indices).ValueOrDie();
+  INFO("Indices " << indices->ToString() << " Actual " << actual->ToString());
+  CHECK(actual->Equals(indices));
+}

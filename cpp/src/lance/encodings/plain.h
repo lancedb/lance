@@ -77,12 +77,15 @@ class PlainDecoder : public Decoder {
     }
     // For the simplicity, we read all data in batch to reduce random I/O.
     // And apply indices later.
+    // We can optimize this later if the indices are sparse and making small I/Os can bring
+    // benefits.
     ARROW_ASSIGN_OR_RAISE(auto raw_value_arr, ToArray(start, length));
     auto values = std::static_pointer_cast<ArrayType>(raw_value_arr);
     typename ::arrow::TypeTraits<T>::BuilderType builder;
     ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
     for (int64_t i = 0; i < indices->length(); i++) {
-      ARROW_RETURN_NOT_OK(builder.Append(values->Value(i - start)));
+      auto index = indices->Value(i);
+      ARROW_RETURN_NOT_OK(builder.Append(values->Value(index - start)));
     }
     return builder.Finish();
   };
