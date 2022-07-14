@@ -63,11 +63,8 @@ std::shared_ptr<::arrow::dataset::Scanner> OpenScanner(
 
 std::shared_ptr<::arrow::io::RandomAccessFile> OpenUri(const std::string& uri, bool ignore_error) {
   if (uri.starts_with("s3")) {
-    auto fs = arrow::fs::FileSystemFromUriOrPath(uri);
-    if (!fs.ok() && !ignore_error) {
-      fs.ValueOrDie();
-    };
-    auto file = (*fs)->OpenInputFile(uri.substr(std::string("s3://").size()));
+    auto fs = arrow::fs::FileSystemFromUriOrPath(uri).ValueOrDie();
+    auto file = fs->OpenInputFile(uri.substr(std::string("s3://").size()));
     if (!file.ok() && ignore_error) {
       return nullptr;
     }

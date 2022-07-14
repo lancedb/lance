@@ -30,7 +30,8 @@ using std::string;
 
 namespace fs = std::filesystem;
 
-arrow::Status Convert(const std::string& in_uri, const std::string& out) {
+/// Convert a Parquet file to lance file.
+arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) {
   auto uri = fs::absolute(in_uri);
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri).ValueOrDie();
   auto factory =
@@ -66,7 +67,7 @@ int main(int argc, char** argv) {
 
   auto input_file = parser.get("input");
   auto output_file = parser.get("output");
-  auto status = Convert(input_file, output_file);
+  auto status = ConvertParquet(input_file, output_file);
 
   if (!status.ok()) {
     std::cerr << status << std::endl;
