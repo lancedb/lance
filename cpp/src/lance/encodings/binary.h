@@ -74,6 +74,9 @@ class VarBinaryDecoder : public Decoder {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t idx = 0, std::optional<int32_t> length = std::nullopt) const override;
 
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override;
+
  private:
   using OffsetType = VarBinaryEncoder::OffsetType;
   using OffsetCType = typename VarBinaryEncoder::OffsetType::c_type;
@@ -132,6 +135,12 @@ template <ArrowType T>
   auto read_length = positions->Value(positions->length() - 1) - start_offset;
   ARROW_ASSIGN_OR_RAISE(auto data_buf, infile_->ReadAt(start_offset, read_length));
   return std::make_shared<ArrayType>(*length, value_offsets->values(), data_buf);
+}
+
+template <ArrowType T>
+::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::Take(
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  return ::arrow::Status::NotImplemented("VarBinaryDecoder::Take: not implemented");
 }
 
 }  // namespace lance::encodings
