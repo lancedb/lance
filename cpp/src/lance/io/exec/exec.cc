@@ -29,6 +29,10 @@ bool PlanNode::Equals(const std::shared_ptr<PlanNode>& other) const {
 
 bool PlanNode::operator==(const PlanNode& other) const { return Equals(other); }
 
+// -------- Scan ----------
+
+Scan::Scan(std::shared_ptr<format::Field> field) : field_(field) {}
+
 std::string Scan::type_name() const { return "Scan"; }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(std::shared_ptr<FileReader> reader,
@@ -65,15 +69,6 @@ bool Scan::Equals(const PlanNode& other) const {
   return ::arrow::Status::OK();
 }
 
-::arrow::Result<std::shared_ptr<PlanNode>> Make(
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
-  fmt::print("Scan Options: dataset={}\nproject={}\nfilter={}\n",
-             scan_options->dataset_schema->ToString(),
-             scan_options->projected_schema ? scan_options->projected_schema->ToString() : "{}",
-             scan_options->filter.ToString());
-  return std::make_shared<Scan>();
-}
-
 //----- Project
 
 std::string Project::type_name() const { return "Project"; }
@@ -93,6 +88,15 @@ bool Project::Equals(const PlanNode& other) const {
   }
   const auto& other_proj = dynamic_cast<const Project&>(other);
   return children_ == other_proj.children_ && filters_ == other_proj.filters_;
+}
+
+::arrow::Result<std::shared_ptr<PlanNode>> Make(
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
+  fmt::print("Scan Options: dataset={}\nproject={}\nfilter={}\n",
+             scan_options->dataset_schema->ToString(),
+             scan_options->projected_schema ? scan_options->projected_schema->ToString() : "{}",
+             scan_options->filter.ToString());
+  return std::make_shared<Scan>();
 }
 
 }  // namespace lance::io::exec

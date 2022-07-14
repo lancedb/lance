@@ -57,21 +57,12 @@ class PlanNode {
   bool operator==(const PlanNode& other) const;
 };
 
-///
-class Filter : public PlanNode {
- public:
-  std::string type_name() const override;
-
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
-                                                           int32_t chunk_idx) override;
-
- private:
-  std::unique_ptr<PlanNode> child_;
-};
-
 /// Scan. The leaf node to actual read a page from storage.
 class Scan : public PlanNode {
  public:
+  Scan(std::shared_ptr<format::Field> field);
+
+  /// Scan the full chunk.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
                                                            int32_t chunk_idx) override;
 
@@ -95,6 +86,18 @@ class Scan : public PlanNode {
 
  private:
   std::shared_ptr<format::Field> field_;
+};
+
+///
+class Filter : public PlanNode {
+ public:
+  std::string type_name() const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
+                                                           int32_t chunk_idx) override;
+
+ private:
+  std::unique_ptr<Scan> child_;
 };
 
 class Project : public PlanNode {
