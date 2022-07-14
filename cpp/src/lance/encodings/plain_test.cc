@@ -20,12 +20,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "lance/arrow/stl.h"
+
 using arrow::Int32Builder;
 
 TEST_CASE("Test Write Int32 array") {
-  Int32Builder builder;
-  CHECK(builder.AppendValues({1, 2, 3, 4, 5, 6, 7, 8}).ok());
-  auto arr = builder.Finish().ValueOrDie();
+  auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5, 6, 7, 8}).ValueOrDie();
   CHECK(arr->length() == 8);
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
@@ -41,4 +41,24 @@ TEST_CASE("Test Write Int32 array") {
   for (int i = 0; i < arr->length(); i++) {
     CHECK(arr->GetScalar(i).ValueOrDie()->Equals(decoder.GetScalar(i).ValueOrDie()));
   }
+}
+
+TEST_CASE("Test take plain values") {
+  arrow::Int32Builder builder;
+  for (int i = 0; i < 100; i++) {
+    CHECK(builder.Append(i).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  lance::encodings::PlainEncoder encoder(sink);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  lance::encodings::PlainDecoder<::arrow::Int32Type> decoder(infile, offset, arr->length());
+
+  auto indices = lance::arrow::ToArray({8, 12, 16, 20, 45}).ValueOrDie();
+  auto actual = decoder.Take(indices).ValueOrDie();
+  INFO("Indices " << indices->ToString() << " Actual " << actual->ToString());
+  CHECK(actual->Equals(indices));
 }

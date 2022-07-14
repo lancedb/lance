@@ -19,6 +19,7 @@
 #include <arrow/io/api.h>
 #include <arrow/scalar.h>
 #include <arrow/status.h>
+#include <arrow/stl_iterator.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -61,6 +62,7 @@ class VarBinaryEncoder : public Encoder {
   std::shared_ptr<::arrow::TypeTraits<OffsetType>::ArrayType> offsetsArr;
 };
 
+/// Decode for Var-length binary encoding.
 template <ArrowType T>
 class VarBinaryDecoder : public Decoder {
  public:
@@ -73,6 +75,9 @@ class VarBinaryDecoder : public Decoder {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t idx = 0, std::optional<int32_t> length = std::nullopt) const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override;
 
  private:
   using OffsetType = VarBinaryEncoder::OffsetType;
@@ -132,6 +137,22 @@ template <ArrowType T>
   auto read_length = positions->Value(positions->length() - 1) - start_offset;
   ARROW_ASSIGN_OR_RAISE(auto data_buf, infile_->ReadAt(start_offset, read_length));
   return std::make_shared<ArrayType>(*length, value_offsets->values(), data_buf);
+}
+
+template <ArrowType T>
+::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::Take(
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  typename ::arrow::TypeTraits<T>::BuilderType builder;
+  ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
+
+  for (auto index : *indices) {
+    assert(index.has_value());
+    ARROW_ASSIGN_OR_RAISE(auto scalar, GetScalar(index.value()));
+    auto binary_scalar =
+        std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ScalarType>(scalar);
+    ARROW_RETURN_NOT_OK(builder.Append(binary_scalar->view()));
+  }
+  return builder.Finish();
 }
 
 }  // namespace lance::encodings

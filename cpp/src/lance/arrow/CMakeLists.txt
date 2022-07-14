@@ -20,6 +20,7 @@ add_library(
         OBJECT
         file_lance.cc
         reader.cc
+        stl.h
         type.cc
         type.h
         writer.cc

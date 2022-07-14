@@ -81,6 +81,13 @@ class Decoder {
   virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const = 0;
 
+  /// Take the values by the indices.
+  ///
+  /// \param indices. The sorted array of indices within the page.
+  /// \return an array of value if success.
+  virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const = 0;
+
  protected:
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;
   int64_t position_;
