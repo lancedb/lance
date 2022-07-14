@@ -59,6 +59,9 @@ class FileWriter final : public ::arrow::dataset::FileWriter {
                                    const std::shared_ptr<::arrow::Array>& arr);
   ::arrow::Status WriteListArray(const std::shared_ptr<format::Field>& field,
                                  const std::shared_ptr<::arrow::Array>& arr);
+  /// Write Arrow DictionaryArray.
+  ::arrow::Status WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
+                                       const std::shared_ptr<::arrow::Array>& arr);
 
   std::shared_ptr<lance::format::Schema> lance_schema_;
   std::unique_ptr<lance::format::Metadata> metadata_;

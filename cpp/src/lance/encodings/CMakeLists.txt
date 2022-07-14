@@ -17,6 +17,8 @@ add_library(
         OBJECT
         binary.cc
         binary.h
+        dictionary.cc
+        dictionary.h
         encoder.h
         plain.cc
         plain.h

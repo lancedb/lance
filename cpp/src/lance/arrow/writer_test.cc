@@ -97,7 +97,6 @@ auto CocoDataset() {
   auto annotations = listBuilder.Finish().ValueOrDie();
   listBuilder.Reset();
 
-  auto sink = arrow::io::BufferOutputStream::Create();
   auto table = arrow::Table::Make(schema, {filenameArr, split, width, images, annotations});
   return table;
 }
@@ -127,4 +126,33 @@ TEST_CASE("Write COCO Dataset") {
   CHECK(row.ok());
   auto anno_scalar = std::static_pointer_cast<::arrow::ListScalar>((*row)[row->size() - 1]);
   CHECK(anno_scalar->value->length() == 2);
+}
+
+TEST_CASE("Write dictionary type") {
+  auto label_type = ::arrow::dictionary(arrow::int8(), arrow::utf8());
+
+  ::arrow::DictionaryBuilder<arrow::StringType> builder;
+  CHECK(builder.Append("cat").ok());
+  CHECK(builder.Append("dog").ok());
+  CHECK(builder.Append("cat").ok());
+  CHECK(builder.Append("person").ok());
+
+  auto arr = builder.Finish().ValueOrDie();
+  INFO("array is " << arr->ToString());
+
+  auto schema = arrow::schema({arrow::field("label", label_type)});
+  auto table = arrow::Table::Make(schema, {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink, "label").ok());
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  INFO(FileReader::Make(infile).status());
+  auto reader = FileReader::Make(infile).ValueOrDie();
+  CHECK(reader->primary_key() == "label");
+  CHECK(reader->num_chunks() == 1);
+  CHECK(reader->length() == 4);
+
+  auto actual_table = reader->ReadTable().ValueOrDie();
+  CHECK(table->Equals(*actual_table));
 }

@@ -16,45 +16,59 @@
 
 #include <arrow/array.h>
 #include <arrow/io/api.h>
-#include <arrow/type_traits.h>
-#include <fmt/format.h>
 
 #include <memory>
+#include <string>
 
 #include "lance/encodings/encoder.h"
+#include "lance/encodings/plain.h"
 
 namespace lance::encodings {
 
-/// Plain Encoder.
-///
-/// Encoding fixed sized values in an plain array.
-class PlainEncoder : public Encoder {
+/// Dictionary Encoder.
+class DictionaryEncoder : public Encoder {
  public:
-  explicit PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out);
+  DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out);
 
-  virtual ~PlainEncoder() = default;
+  virtual ~DictionaryEncoder() = default;
 
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) override;
 
-  std::string ToString() const override { return "Encoder(type=Plain)"; }
+  /// Write value array.
+  ///
+  /// It should be only called once per dataset / file.
+  ::arrow::Result<int64_t> WriteValueArray(std::shared_ptr<::arrow::Array> arr);
+
+  std::string ToString() const override;
+
+ private:
+  /// A plain encoder is used to write index values.
+  std::unique_ptr<PlainEncoder> plain_encoder_;
 };
 
-class PlainDecoder : public Decoder {
+/// Dictionary Decoder.
+class DictionaryDecoder : public Decoder {
  public:
-  PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-               std::shared_ptr<::arrow::DataType> type);
+  /// Constructor for DictionaryDecoder.
+  ///
+  /// \param infile input file.
+  /// \param type data type.
+  /// \param dict the dictionary array.
+  ///
+  /// See https://arrow.apache.org/docs/cpp/api/array.html#dictionary-encoded for details w.r.t
+  /// of DictionaryType.
+  DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
+                    std::shared_ptr<::arrow::DictionaryType> type,
+                    std::shared_ptr<::arrow::Array> dict);
 
-  ~PlainDecoder() override;
+  ~DictionaryDecoder() override = default;
 
-  /// Initialize PlainDecoder.
   ::arrow::Status Init() override;
 
   void Reset(int64_t position, int32_t length) override;
 
-  /// Get one single scalar from the page.
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
 
-  /// Read the buffer as array.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;
 
@@ -62,7 +76,8 @@ class PlainDecoder : public Decoder {
       std::shared_ptr<::arrow::Int32Array> indices) const override;
 
  private:
-  std::unique_ptr<Decoder> impl_;
+  std::shared_ptr<::arrow::Array> dict_;
+  std::unique_ptr<PlainDecoder> plain_decoder_;
 };
 
 }  // namespace lance::encodings

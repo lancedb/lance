@@ -56,14 +56,15 @@ class Encoder {
 class Decoder {
  public:
   inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                 int64_t position,
-                 int32_t length) noexcept
-      : infile_(infile), position_(position), length_(length){};
-
-  inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile) noexcept
-      : infile_(infile), position_(-1), length_(-1) {}
+                 std::shared_ptr<::arrow::DataType> type) noexcept
+      : infile_(infile), type_(type) {}
 
   virtual ~Decoder() = default;
+
+  /// Initialize the decoder.
+  virtual ::arrow::Status Init() {
+      return ::arrow::Status::OK();
+  };
 
   virtual void Reset(int64_t position, int32_t length) {
     position_ = position;
@@ -90,8 +91,9 @@ class Decoder {
 
  protected:
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;
-  int64_t position_;
-  int32_t length_;
+  std::shared_ptr<::arrow::DataType> type_;
+  int64_t position_ = -1;
+  int32_t length_ = -1;
 };
 
 }  // namespace lance::encodings

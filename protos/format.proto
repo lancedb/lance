@@ -83,25 +83,7 @@ message Manifest {
   repeated Field fields = 2;
 }
 
-message Index {
-  enum Type {
-    BLOOM_FILTER = 0;
-  }
-  uint64 start_offset = 1;
-  uint64 length = 2;
-}
-
-enum DataType {
-  BOOLEAN = 0;
-
-  INT32 = 1;
-  INT64 = 2;
-  FLOAT32 = 4;
-  FLOAT64 = 5;
-  BYTES = 6;
-  FIXED_SIZE_BYTES = 7;
-}
-
+/// Supported encodings.
 enum Encoding {
   NONE = 0;
   PLAIN = 1;
@@ -110,8 +92,8 @@ enum Encoding {
 }
 
 /**
-  Field metadata.
-*/
+ * Field metadata for a column.
+ */
 message Field {
   enum Type {
     PARENT = 0;
@@ -122,19 +104,22 @@ message Field {
 
   // Fully qualified name.
   string name = 2;
-  /// Column id.
+  /// Field Id.
   int32 id = 3;
-  /// Parent Field ID. If not set
+  /// Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
 
-  // Physical types.
-  DataType data_type = 5;
   // Logical types, support parameterized Arrow Type.
-  string logical_type = 6;
+  string logical_type = 5;
   // If this field is nullable.
-  bool nullable = 7;
+  bool nullable = 6;
 
-  Encoding encoding = 8;
+  Encoding encoding = 7;
 
-  map<string, string> metadata = 10;
+  /// The file offset for storing the dictionary value.
+  /// It is only valid if encoding is DICTIONARY.
+  ///
+  /// The logic type presents the value type of the column, i.e., string value.
+  int64 dictionary_offset = 8;
+  int64 dictionary_page_length = 9;
 }

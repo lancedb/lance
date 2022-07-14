@@ -106,6 +106,12 @@ class FileReader {
       int32_t start = 0,
       std::optional<int32_t> length = std::nullopt) const;
 
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetDictionaryArray(
+      const std::shared_ptr<lance::format::Field>& field,
+      int chunk_id,
+      int32_t start = 0,
+      std::optional<int32_t> length = std::nullopt) const;
+
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(
       int32_t idx, const lance::format::Schema& schema);
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetScalar(

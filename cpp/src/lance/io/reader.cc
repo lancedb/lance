@@ -288,6 +288,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     return GetStructArray(field, chunk_id, start, length);
   } else if (is_list(dtype)) {
     return GetListArray(field, chunk_id, start, length);
+  } else if (::arrow::is_dictionary(dtype->id())) {
+    return GetDictionaryArray(field, chunk_id, start, length);
   } else {
     return GetPrimitiveArray(field, chunk_id, start, length);
   }
@@ -322,8 +324,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     length = chunk_length - start;
   }
 
-  auto decoder = std::make_shared<lance::encodings::PlainDecoder<::arrow::Int32Type>>(
-      file_, pos, chunk_length);
+  auto decoder = std::make_shared<lance::encodings::PlainDecoder>(file_, ::arrow::int32());
+  ARROW_RETURN_NOT_OK(decoder->Init());
+  decoder->Reset(pos, chunk_length);
+
   // TODO: fix this
   auto l = std::min(static_cast<int64_t>(*length + 1), chunk_length - start);
   ARROW_ASSIGN_OR_RAISE(auto offsets, decoder->ToArray(start, l));
@@ -345,6 +349,15 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
                result.status().message());
   }
   return result;
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader ::GetDictionaryArray(
+    const std::shared_ptr<lance::format::Field>& field,
+    int chunk_id,
+    int32_t start,
+    std::optional<int32_t> length) const {
+  assert(::arrow::is_dictionary(field->type()->id()));
+  return GetPrimitiveArray(field, chunk_id, start, length);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetPrimitiveArray(

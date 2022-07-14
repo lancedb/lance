@@ -1,37 +1,35 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #pragma once
 
 #include <arrow/type.h>
 
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "lance/encodings/encoder.h"
 #include "lance/format/format.pb.h"
+#include "lance/format/visitors.h"
 
 namespace lance::format {
 
 class Field;
 
-class FieldVisitor {
- public:
-  virtual ::arrow::Status Visit(std::shared_ptr<Field> field) = 0;
-};
-
-class ToArrowVisitor : public FieldVisitor {
- public:
-  ::arrow::Status Visit(std::shared_ptr<Field> root) override;
-
-  std::shared_ptr<::arrow::Schema> Finish();
-
- private:
-  ::arrow::Result<::std::shared_ptr<::arrow::Field>> DoVisit(std::shared_ptr<Field> node);
-
-  std::vector<::std::shared_ptr<::arrow::Field>> arrow_fields_;
-};
-
 /// Schema is a tree representation of on-disk columns.
-///
 ///
 class Schema final {
  public:
@@ -131,7 +129,11 @@ class Field final {
 
   void set_encoding(lance::format::pb::Encoding encoding);
 
-  lance::format::pb::Encoding encoding() { return encoding_; };
+  const std::shared_ptr<::arrow::Array>& dictionary() const;
+
+  ::arrow::Status set_dictionary(std::shared_ptr<::arrow::Array> dict_arr);
+
+  lance::format::pb::Encoding encoding() const { return encoding_; };
 
   ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> GetDecoder(
       std::shared_ptr<::arrow::io::RandomAccessFile> infile);
@@ -180,15 +182,23 @@ class Field final {
   /// Project an arrow field to this field.
   std::shared_ptr<Field> Project(const std::shared_ptr<::arrow::Field>& arrow_field) const;
 
+  /// Load dictionary array from disk.
+  ::arrow::Status LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile);
+
   int32_t id_ = -1;
   int32_t parent_ = -1;
   std::string name_;
-  lance::format::pb::DataType physical_type_;
   std::string logical_type_;
   lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
 
+  // Dictionary type
+  int64_t dictionary_offset_ = -1;
+  int64_t dictionary_page_length_ = 0;
+  std::shared_ptr<::arrow::Array> dictionary_;
+
   friend class FieldVisitor;
   friend class ToArrowVisitor;
+  friend class WriteDictionaryVisitor;
   friend class Schema;
   friend ::arrow::Status CopyField(std::shared_ptr<Field> new_field,
                                    std::shared_ptr<Field> field,
