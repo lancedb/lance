@@ -53,6 +53,27 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       int32_t offset, int32_t length, const lance::format::Schema& schema) const;
 
+  /// Get an ARRAY from column / file at chunk.
+  ///
+  /// \param field the field (column) specification
+  /// \param chunk_id the index of the chunk in the file.
+  /// \param start start position
+  /// \param length the length of the array to fetch.
+  ///
+  /// \return An array if success.
+  /// TODO: use std::optional for length
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
+      const std::shared_ptr<lance::format::Field>& field,
+      int chunk_id,
+      int32_t start = 0,
+      std::optional<int32_t> length = std::nullopt) const;
+
+  /// Selectively read one chunk in the file.
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
+      const std::shared_ptr<lance::format::Field>& field,
+      int chunk_id,
+      std::shared_ptr<::arrow::Array> indices) const;
+
   /// Get file metadata.
   const lance::format::Metadata& metadata() const;
 
@@ -72,21 +93,6 @@ class FileReader {
   /// Read the table with the given schema.
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const lance::format::Schema& schema) const;
-
-  /// Get an ARRAY from column / file at chunk.
-  ///
-  /// \param field the field (column) specification
-  /// \param chunk_id the index of the chunk in the file.
-  /// \param start start position
-  /// \param length the length of the array to fetch.
-  ///
-  /// \return An array if success.
-  /// TODO: use std::optional for length
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
-      const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
       const std::shared_ptr<lance::format::Field>& field,

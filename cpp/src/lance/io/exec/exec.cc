@@ -12,13 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "exec.h"
+#include "lance/io/exec/exec.h"
 
 #include <arrow/dataset/scanner.h>
+#include <fmt/format.h>
 
 #include <string>
 
-#include "fmt/format.h"
+#include "lance/format/schema.h"
 
 namespace lance::io::exec {
 
@@ -26,26 +27,38 @@ bool PlanNode::Equals(const std::shared_ptr<PlanNode>& other) const {
   return other && Equals(*other);
 }
 
-
 std::string Scan::type_name() const { return "Scan"; }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(std::shared_ptr<FileReader> reader,
                                                                int32_t chunk_idx) {
-  return ::arrow::Status::NotImplemented("Scan::Execute not implemented yet");
+  ARROW_RETURN_NOT_OK(Validate());
+  return reader->GetArray(field_, chunk_idx);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(
     std::shared_ptr<FileReader> reader, int32_t chunk_id, std::shared_ptr<::arrow::Array> indices) {
-  return ::arrow::Status::NotImplemented("Scan::Execute(indices) not implemented yet");
+  ARROW_RETURN_NOT_OK(Validate());
+  return reader->GetArray(field_, chunk_id, indices);
 }
 
-std::string Scan::ToString() const { return "Scan()"; }
+std::string Scan::ToString() const {
+  return fmt::format("Scan({}, id={})", field_->name(), field_->id());
+}
 
-bool Scan::Equals(const PlanNode& other) const { return type_name() == other.type_name(); }
+bool Scan::Equals(const PlanNode& other) const {
+  if (type_name() != other.type_name()) {
+    return false;
+  }
+  auto other_scan = dynamic_cast<const Scan&>(other);
+  if (other_scan.field_ && field_->Equals(other_scan.field_)) {
+    return true;
+  }
+  return false;
+}
 
 ::arrow::Status Scan::Validate() const {
   if (!field_) {
-    return ::arrow::Status::Invalid("Scan does not bind to a field");
+    return ::arrow::Status::Invalid("Scan() does not bind to a field");
   }
   return ::arrow::Status::OK();
 }

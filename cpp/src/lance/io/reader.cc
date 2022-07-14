@@ -295,6 +295,13 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   }
 }
 
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(
+    const std::shared_ptr<lance::format::Field>& field,
+    int chunk_id,
+    std::shared_ptr<::arrow::Array> indices) const {
+  return ::arrow::Status::NotImplemented("FileReader::GetArray(indices) is not implemented");
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetStructArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
