@@ -42,6 +42,11 @@ dist/
 .idea
 cmake-build-*
 .vscode
+.DS_Store
 
 python/lance/_lib.cpp
 
+
+*.parquet
+*.parq
+*.lance
