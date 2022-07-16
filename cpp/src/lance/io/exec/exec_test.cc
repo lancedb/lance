@@ -19,10 +19,11 @@
 #include <arrow/dataset/scanner.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
+#include <fmt/format.h>
 
+#include <catch2/catch_test_macros.hpp>
 #include <memory>
 
-#include "catch2/catch_test_macros.hpp"
 #include "lance/arrow/scan_options.h"
 #include "lance/format/schema.h"
 
@@ -68,4 +69,19 @@ TEST_CASE("SELECT pk WHERE label = 'car'") {
 
   auto plan = lance::io::exec::Make(options).ValueOrDie();
   CHECK(plan->Validate().ok());
+}
+
+TEST_CASE("SELECT pk, filename WHERE label = 'car' OR label = 'dog'") {
+  auto builder = ::arrow::dataset::ScannerBuilder(TestDataset());
+  CHECK(builder.Project({"pk", "filename"}).ok());
+  CHECK(builder
+            .Filter(
+                ::arrow::compute::or_({::arrow::compute::equal(::arrow::compute::field_ref("label"),
+                                                               ::arrow::compute::literal("car")),
+                                       ::arrow::compute::equal(::arrow::compute::field_ref("label"),
+                                                               ::arrow::compute::literal("dog"))}))
+            .ok());
+  auto scanner = builder.Finish().ValueOrDie();
+
+  fmt::print("Scan options: filter={}\n", scanner->options()->filter.ToString());
 }

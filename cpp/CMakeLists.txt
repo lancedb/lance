@@ -117,10 +117,12 @@ if (LANCE_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif ()
 
+message("Protobuf llibs: ${Protobuf_LIBRARIES}, ${Protobuf_LITE_LIBRARIES}")
 add_library(lance SHARED ${lance_objects})
 target_link_libraries(lance PUBLIC
+        ${Protobuf_LITE_LIBRARIES}
+        ${Protobuf_LIBRARIES}
         ${ARROW_SHARED_LIB}
         ${ARROW_DATASET_SHARED_LIB}
         fmt::fmt
-        ${Protobuf_LIBRARIES}
         )
