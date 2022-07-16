@@ -20,3 +20,4 @@ add_library(
 )
 target_include_directories(lance_io_exec SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_lance_test(exec_test)
+add_dependencies(lance_io_exec format)

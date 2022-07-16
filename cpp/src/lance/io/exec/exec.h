@@ -49,10 +49,10 @@ class PlanNode {
   /// Validate the plan.
   virtual ::arrow::Status Validate() const = 0;
 
-  /// Returns True if two plans are the same.
+  /// Returns True if two plans are equal.
   virtual bool Equals(const PlanNode& other) const = 0;
 
-  /// Returns True if two plans are the same.
+  /// Returns True if two plans are equal.
   virtual bool Equals(const std::shared_ptr<PlanNode>& other) const;
 
   bool operator==(const PlanNode& other) const;
@@ -101,8 +101,15 @@ class Filter : public PlanNode {
   std::unique_ptr<Scan> child_;
 };
 
+/// Projection.
 class Project : public PlanNode {
  public:
+  /// Create Project node from schema.
+  Project(const std::shared_ptr<lance::format::Schema>& schema) noexcept;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(
+      std::shared_ptr<FileReader> reader, int32_t chunk_idx) override;
+
   std::string type_name() const override;
 
   std::string ToString() const override;
@@ -113,7 +120,7 @@ class Project : public PlanNode {
 
  private:
   std::vector<Filter> filters_;
-  std::vector<PlanNode> children_;
+  std::shared_ptr<lance::format::Schema> projected_schema_;
 };
 
 /// Make (and optimize) a plan tree.

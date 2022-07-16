@@ -15,8 +15,6 @@
 
 # Internal I/O
 
-add_subdirectory(exec)
-
 add_library(
         io
         OBJECT
@@ -37,3 +35,6 @@ target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(io format)
 
 add_lance_test(filter_test)
+
+add_subdirectory(exec)
+

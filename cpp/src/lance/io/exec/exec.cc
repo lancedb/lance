@@ -15,6 +15,7 @@
 #include "lance/io/exec/exec.h"
 
 #include <arrow/dataset/scanner.h>
+#include <arrow/record_batch.h>
 #include <fmt/format.h>
 
 #include <string>
@@ -69,15 +70,24 @@ bool Scan::Equals(const PlanNode& other) const {
   return ::arrow::Status::OK();
 }
 
-//----- Project
+//----- Project ----
+
+Project::Project(const std::shared_ptr<lance::format::Schema>& schema) noexcept
+    : projected_schema_(schema) {}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> Project::Execute(
+    std::shared_ptr<FileReader> reader, int32_t chunk_idx) {
+  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*projected_schema_, chunk_idx));
+  return batch->ToStructArray();
+}
 
 std::string Project::type_name() const { return "Project"; }
 
 std::string Project::ToString() const { return fmt::format("Project(children=)"); }
 
 ::arrow::Status Project::Validate() const {
-  if (!children_.empty()) {
-    return ::arrow::Status::Invalid("Invalid Project: children is empty");
+  if (!projected_schema_) {
+    return ::arrow::Status::Invalid("Projected schema is empty");
   }
   return ::arrow::Status::OK();
 }
@@ -87,13 +97,16 @@ bool Project::Equals(const PlanNode& other) const {
     return false;
   }
   const auto& other_proj = dynamic_cast<const Project&>(other);
-  return children_ == other_proj.children_ && filters_ == other_proj.filters_;
+  return projected_schema_->Equals(other_proj.projected_schema_) && filters_ == other_proj.filters_;
 }
 
 ::arrow::Result<std::shared_ptr<PlanNode>> Make(
     std::shared_ptr<lance::arrow::ScanOptions> scan_options) {
   fmt::print("Scan Options: {}\n", scan_options->ToString());
-  return ::arrow::Status::NotImplemented("");
+  ARROW_ASSIGN_OR_RAISE(
+      auto schema,
+      scan_options->schema()->Project(*scan_options->arrow_options()->projected_schema));
+  return std::make_shared<Project>(schema);
 }
 
 }  // namespace lance::io::exec

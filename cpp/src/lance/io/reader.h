@@ -53,6 +53,10 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       int32_t offset, int32_t length, const lance::format::Schema& schema) const;
 
+  /// Read a Batch
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
+      const lance::format::Schema& schema, int32_t chunk_id) const;
+
   /// Get an ARRAY from column / file at chunk.
   ///
   /// \param field the field (column) specification
