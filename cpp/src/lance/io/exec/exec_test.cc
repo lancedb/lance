@@ -50,7 +50,7 @@ TEST_CASE("SELECT * FROM dataset") {
   auto plan = lance::io::exec::Make(options).ValueOrDie();
   INFO(plan->ToString());
   CHECK(plan->Validate().ok());
-  CHECK(plan->type_name() == "project");
+  CHECK(plan->type_name() == "Project");
 }
 
 TEST_CASE("SELECT pk WHERE label = 'car'") {
