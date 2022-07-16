@@ -67,16 +67,6 @@ class Scan : public PlanNode {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
                                                            int32_t chunk_idx) override;
 
-  /// Executing Scan on a page with specified indices.
-  ///
-  /// \param reader a Lance FileReader
-  /// \param chunk_id
-  /// \param indices the indices array.
-  /// \return The result array.
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> Execute(std::shared_ptr<FileReader> reader,
-                                                           int32_t chunk_id,
-                                                           std::shared_ptr<::arrow::Array> indices);
-
   std::string type_name() const override;
 
   std::string ToString() const override;
@@ -89,7 +79,7 @@ class Scan : public PlanNode {
   std::shared_ptr<format::Field> field_;
 };
 
-///
+/// Filter
 class Filter : public PlanNode {
  public:
   std::string type_name() const override;

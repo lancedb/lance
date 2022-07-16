@@ -42,12 +42,6 @@ std::string Scan::type_name() const { return "Scan"; }
   return reader->GetArray(field_, chunk_idx);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::Array>> Scan::Execute(
-    std::shared_ptr<FileReader> reader, int32_t chunk_id, std::shared_ptr<::arrow::Array> indices) {
-  ARROW_RETURN_NOT_OK(Validate());
-  return reader->GetArray(field_, chunk_id, indices);
-}
-
 std::string Scan::ToString() const {
   return fmt::format("Scan({}, id={})", field_->name(), field_->id());
 }
