@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "filter.h"
+#include "lance/io/filter.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/api.h>
