@@ -31,13 +31,18 @@ class Filter {
  public:
   Filter() = delete;
 
-  /// Build a filter from arrow's filter expression.
+  /// Build a filter from arrow's filter expression and dataset schema.
   static ::arrow::Result<std::unique_ptr<Filter>> Make(const lance::format::Schema& schema,
                                                        const ::arrow::compute::Expression& filter);
 
   /// Execute the filter on an arrow RecordBatch.
   ///
   /// \return a tuple of [indices, filtered_array].
+  ///
+  /// For example, with a record batch of {"bar": [0, 2, 32, 5, 32]}, and filter "bar = 32",
+  /// this function returns:
+  ///
+  /// < UInt64Array({2, 4}), {"bar": [32, 32]} >
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::Array>>>
       Exec(std::shared_ptr<::arrow::RecordBatch>) const;
