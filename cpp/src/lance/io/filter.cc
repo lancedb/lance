@@ -19,6 +19,8 @@
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
 
+#include "lance/arrow/type.h"
+
 namespace lance::io {
 
 Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
