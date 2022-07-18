@@ -15,6 +15,7 @@
 #pragma once
 
 #include <arrow/array.h>
+#include <arrow/builder.h>
 #include <arrow/result.h>
 #include <arrow/type_fwd.h>
 #include <arrow/type_traits.h>
