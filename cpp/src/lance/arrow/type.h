@@ -23,8 +23,6 @@
 #include <string>
 #include <vector>
 
-#include "lance/format/format.pb.h"
-
 template <>
 struct fmt::formatter<::arrow::Scalar> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
@@ -79,12 +77,5 @@ inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type);
-
-/// Convert arrow schema.
-::arrow::Result<std::vector<lance::format::pb::Field>> FromArrowSchema(
-    std::shared_ptr<::arrow::Schema> schema);
-
-::arrow::Result<std::shared_ptr<::arrow::Schema>> ToArrowSchema(
-    const std::vector<lance::format::pb::Field>& fields);
 
 }  // namespace lance::arrow
