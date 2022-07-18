@@ -28,9 +28,12 @@
 using ::arrow::compute::equal;
 using ::arrow::compute::field_ref;
 using ::arrow::compute::literal;
+using ::arrow::compute::or_;
 
-const auto kSchema = lance::format::Schema(::arrow::schema(
-    {::arrow::field("pk", ::arrow::int32()), ::arrow::field("value", ::arrow::int32())}));
+const auto kSchema =
+    lance::format::Schema(::arrow::schema({::arrow::field("pk", ::arrow::int32()),
+                                           ::arrow::field("value", ::arrow::int32()),
+                                           ::arrow::field("label", ::arrow::utf8())}));
 
 TEST_CASE("Test without filter") {
   auto empty_filter =
@@ -63,5 +66,25 @@ TEST_CASE("value = 32") {
   struct_arr =
       ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
   batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
-  CHECK(output->Equals(batch->ToStructArray().ValueOrDie()));
+  CHECK(output->Equals(*batch));
+}
+
+TEST_CASE("label = cat or label = dog") {
+  auto expr =
+      or_(equal(field_ref("label"), literal("cat")), equal(field_ref("label"), literal("dog")));
+  auto labels =
+      lance::arrow::ToArray({"person", "dog", "cat", "car", "cat", "food", "hotdog"}).ValueOrDie();
+  auto struct_arr =
+      ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
+  auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
+
+  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto [indices, output] = filter->Exec(batch).ValueOrDie();
+  CHECK(indices->Equals(lance::arrow::ToArray<uint64_t>({1, 2, 4}).ValueOrDie()));
+
+  labels = lance::arrow::ToArray({"dog", "cat", "cat"}).ValueOrDie();
+  struct_arr =
+      ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
+  auto expected = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
+  CHECK(output->Equals(*expected));
 }

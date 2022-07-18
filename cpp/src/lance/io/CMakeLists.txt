@@ -19,6 +19,8 @@ add_library(
         io
         OBJECT
         endian.h
+        filter.cc
+        filter.h
         pb.cc
         pb.h
         reader.cc
@@ -27,7 +29,7 @@ add_library(
         scanner.h
         writer.cc
         writer.h
-        filter.h filter.cc)
+)
 target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 # Depend on lance::format to generate protobuf
 add_dependencies(io format)

@@ -44,7 +44,7 @@ class Filter {
   ///
   /// < UInt64Array({2, 4}), {"bar": [32, 32]} >
   ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::Array>>>
+      std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
       Exec(std::shared_ptr<::arrow::RecordBatch>) const;
 
   std::string ToString() const;

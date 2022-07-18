@@ -40,19 +40,22 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
   return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
 
-::arrow::Result<std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::Array>>>
+::arrow::Result<
+    std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
 Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
   ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
   ARROW_ASSIGN_OR_RAISE(auto mask,
                         ::arrow::compute::ExecuteScalarExpression(
                             filter_expr, *(batch->schema()), ::arrow::Datum(batch)));
-  ARROW_ASSIGN_OR_RAISE(auto values, batch->ToStructArray());
+  ARROW_ASSIGN_OR_RAISE(auto data, batch->ToStructArray());
   ARROW_ASSIGN_OR_RAISE(auto indices_datum,
                         ::arrow::compute::CallFunction("indices_nonzero", {mask}));
-  ARROW_ASSIGN_OR_RAISE(auto true_values, ::arrow::compute::CallFunction("filter", {values, mask}));
+  ARROW_ASSIGN_OR_RAISE(auto values, ::arrow::compute::CallFunction("filter", {data, mask}));
 
   auto indices = std::static_pointer_cast<::arrow::UInt64Array>(indices_datum.make_array());
-  return std::make_tuple(indices, true_values.make_array());
+  auto values_arr = values.make_array();
+  ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(values_arr));
+  return std::make_tuple(indices, result_batch);
 }
 
 std::string Filter::ToString() const { return filter_.ToString(); }
