@@ -60,6 +60,11 @@ Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
   return std::make_tuple(indices, result_batch);
 }
 
+::arrow::Result<std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
+Filter::Exec(std::shared_ptr<FileReader> reader, int32_t chunk_id) const {
+  return ::arrow::Status::NotImplemented("not implemented");
+}
+
 std::string Filter::ToString() const { return filter_.ToString(); }
 
 }  // namespace lance::io
