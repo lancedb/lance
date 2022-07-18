@@ -22,6 +22,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/arrow/stl.h"
+#include "lance/arrow/type.h"
 #include "lance/format/schema.h"
 
 using ::arrow::compute::equal;
@@ -38,22 +39,23 @@ TEST_CASE("Test without filter") {
 }
 
 TEST_CASE("Test with one condition") {
-  auto filter = lance::io::Filter::Make(kSchema, equal(field_ref("foo.bar"), literal("32")));
-  INFO("fileter " << filter.status().message());
+  auto filter = lance::io::Filter::Make(kSchema, equal(field_ref("value"), literal("32")));
+  INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 
-  filter = lance::io::Filter::Make(kSchema, equal(literal("32"), field_ref("foo.bar")));
-  INFO("fileter " << filter.status().message());
+  filter = lance::io::Filter::Make(kSchema, equal(literal("32"), field_ref("value")));
+  INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 }
 
 TEST_CASE("Test apply filter to array") {
-  auto filter = equal(literal(32), field_ref("bar"));
+  auto expr = equal(literal(32), field_ref("value"));
   auto bar = lance::arrow::ToArray({1, 2, 32, 0, 32}).ValueOrDie();
   auto struct_arr =
-      ::arrow::StructArray::Make({bar}, {::arrow::field("bar", ::arrow::int32())}).ValueOrDie();
+      ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
-  auto expr = filter.Bind(*batch->schema()).ValueOrDie();
-  auto output = ExecuteScalarExpression(expr, *batch->schema(), arrow::Datum(batch)).ValueOrDie();
-  fmt::print("Output is: {}\n", output.make_array()->ToString());
+
+  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto [mask, output] = filter->Exec(batch).ValueOrDie();
+  fmt::print("mask is: {}, Output is: {}\n", mask, output);
 }

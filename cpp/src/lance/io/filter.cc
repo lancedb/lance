@@ -15,6 +15,7 @@
 #include "filter.h"
 
 #include <arrow/array.h>
+#include <arrow/record_batch.h>
 #include <arrow/result.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -34,28 +35,32 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
     return nullptr;
   }
   fmt::print("Making filter: {}, type={}\n",
-             filter.ToString(),
+             filter,
              ::arrow::compute::ExpressionHasFieldRefs(filter));
   auto field_refs = ::arrow::compute::FieldsInExpression(filter);
-  fmt::print("Field_refs: {}\n", field_refs);
-  auto call = filter.call();
-  if (call != nullptr) {
-    if (call->function_name == "equal") {
-      fmt::print("This is an equal\n");
-    }
+  fmt::print("Filters= {}\n", field_refs);
+  std::vector<std::string> columns;
+  for (auto& ref : field_refs) {
+    columns.emplace_back(std::string(*ref.name()));
   }
-  auto field_ref = filter.field_ref();
-  if (field_ref == nullptr) {
-    fmt::print("This one does not have field_ref, {}\n", filter.ToString());
-  }
-  return nullptr;
+  fmt::print("All columns: {}\n", columns);
+  ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(columns));
+  return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
 
-::arrow::Result<std::tuple<::arrow::BooleanArray, ::arrow::Array>> Filter::Exec(
-    std::shared_ptr<::arrow::RecordBatch>) const {}
+::arrow::Result<std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
+Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
+  ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
+  ARROW_ASSIGN_OR_RAISE(auto mask,
+                        ::arrow::compute::ExecuteScalarExpression(
+                            filter_expr, *(batch->schema()), ::arrow::Datum(batch)));
+  ARROW_ASSIGN_OR_RAISE(auto values, batch->ToStructArray());
+  return std::make_tuple(std::static_pointer_cast<::arrow::BooleanArray>(mask.make_array()),
+                         values);
+}
 
-::arrow::Result<std::tuple<::arrow::BooleanArray, ::arrow::Array>> Filter::Exec(
-    std::shared_ptr<FileReader> reader, int32_t chunk_id) const {
+::arrow::Result<std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
+Filter::Exec(std::shared_ptr<FileReader> reader, int32_t chunk_id) const {
   return ::arrow::Status::NotImplemented("not implemented");
 }
 
