@@ -20,6 +20,7 @@
 #include <arrow/result.h>
 
 #include "lance/arrow/type.h"
+#include "lance/io/reader.h"
 
 namespace lance::io {
 
@@ -44,7 +45,7 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
-Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
+Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
   ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
   ARROW_ASSIGN_OR_RAISE(auto mask,
                         ::arrow::compute::ExecuteScalarExpression(
@@ -59,6 +60,14 @@ Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
   ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(values_arr));
   return std::make_tuple(indices, result_batch);
 }
+
+::arrow::Result<
+    std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
+Filter::Execute(std::shared_ptr<FileReader> reader, int32_t chunk_idx) const {
+  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*schema_, chunk_idx));
+}
+
+const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
 
 std::string Filter::ToString() const { return filter_.ToString(); }
 

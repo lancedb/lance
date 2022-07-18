@@ -53,9 +53,20 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       int32_t offset, int32_t length, const lance::format::Schema& schema) const;
 
-  /// Read a Batch
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      const lance::format::Schema& schema, int32_t chunk_id) const;
+  /// Read a chunk.
+  ///
+  /// While ReadBatch can read at any arbitrary offsets, ReadChunks always
+  /// starts at the chunk boundry.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema,
+      int32_t chunk_id,
+      std::optional<int32_t> length = std::nullopt) const;
+
+  /// Read a chunk with indices
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema,
+      int32_t chunk_id,
+      std::shared_ptr<::arrow::Array> indices) const;
 
   /// Get an ARRAY from column / file at chunk.
   ///

@@ -23,6 +23,8 @@ add_library(
         filter.h
         pb.cc
         pb.h
+        project.cc
+        project.h
         reader.cc
         reader.h
         scanner.cc
@@ -35,6 +37,3 @@ target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(io format)
 
 add_lance_test(filter_test)
-
-add_subdirectory(exec)
-

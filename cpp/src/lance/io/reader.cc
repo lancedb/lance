@@ -269,8 +269,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ReadBatch(offset, length, *projection);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    const lance::format::Schema& schema, int32_t chunk_id) const {
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema, int32_t chunk_id, std::optional<int32_t> length) const {
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   for (auto& field : schema.fields()) {
     ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id));
