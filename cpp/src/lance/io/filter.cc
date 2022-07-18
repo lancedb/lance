@@ -15,12 +15,9 @@
 #include "filter.h"
 
 #include <arrow/array.h>
+#include <arrow/compute/api.h>
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
-
-#include "lance/arrow/type.h"
 
 namespace lance::io {
 
@@ -34,36 +31,30 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
     /// All scalar?
     return nullptr;
   }
-  fmt::print("Making filter: {}, type={}\n",
-             filter,
-             ::arrow::compute::ExpressionHasFieldRefs(filter));
   auto field_refs = ::arrow::compute::FieldsInExpression(filter);
-  fmt::print("Filters= {}\n", field_refs);
   std::vector<std::string> columns;
   for (auto& ref : field_refs) {
     columns.emplace_back(std::string(*ref.name()));
   }
-  fmt::print("All columns: {}\n", columns);
   ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(columns));
   return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
 
-::arrow::Result<std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
+::arrow::Result<std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::Array>>>
 Filter::Exec(std::shared_ptr<::arrow::RecordBatch> batch) const {
   ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
   ARROW_ASSIGN_OR_RAISE(auto mask,
                         ::arrow::compute::ExecuteScalarExpression(
                             filter_expr, *(batch->schema()), ::arrow::Datum(batch)));
   ARROW_ASSIGN_OR_RAISE(auto values, batch->ToStructArray());
-  return std::make_tuple(std::static_pointer_cast<::arrow::BooleanArray>(mask.make_array()),
-                         values);
+  ARROW_ASSIGN_OR_RAISE(auto indices_datum,
+                        ::arrow::compute::CallFunction("indices_nonzero", {mask}));
+  ARROW_ASSIGN_OR_RAISE(auto true_values, ::arrow::compute::CallFunction("filter", {values, mask}));
+
+  auto indices = std::static_pointer_cast<::arrow::UInt64Array>(indices_datum.make_array());
+  return std::make_tuple(indices, true_values.make_array());
 }
 
-::arrow::Result<std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
-Filter::Exec(std::shared_ptr<FileReader> reader, int32_t chunk_id) const {
-  return ::arrow::Status::NotImplemented("not implemented");
-}
-
-std::string Filter::ToString() const { return ""; }
+std::string Filter::ToString() const { return filter_.ToString(); }
 
 }  // namespace lance::io

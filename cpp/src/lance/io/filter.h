@@ -35,15 +35,12 @@ class Filter {
   static ::arrow::Result<std::unique_ptr<Filter>> Make(const lance::format::Schema& schema,
                                                        const ::arrow::compute::Expression& filter);
 
-  /// Execute the filter on a batch.
+  /// Execute the filter on an arrow RecordBatch.
+  ///
+  /// \return a tuple of [indices, filtered_array].
   ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
+      std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::Array>>>
       Exec(std::shared_ptr<::arrow::RecordBatch>) const;
-
-  /// Execute the filter on a batch.
-  ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::BooleanArray>, std::shared_ptr<::arrow::Array>>>
-  Exec(std::shared_ptr<FileReader> reader, int32_t chunk_id) const;
 
   std::string ToString() const;
 

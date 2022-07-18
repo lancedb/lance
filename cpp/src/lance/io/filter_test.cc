@@ -48,7 +48,7 @@ TEST_CASE("Test with one condition") {
   CHECK(filter.ok());
 }
 
-TEST_CASE("Test apply filter to array") {
+TEST_CASE("value = 32") {
   auto expr = equal(literal(32), field_ref("value"));
   auto bar = lance::arrow::ToArray({1, 2, 32, 0, 32}).ValueOrDie();
   auto struct_arr =
@@ -56,6 +56,12 @@ TEST_CASE("Test apply filter to array") {
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
   auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
-  auto [mask, output] = filter->Exec(batch).ValueOrDie();
-  fmt::print("mask is: {}, Output is: {}\n", mask, output);
+  auto [indices, output] = filter->Exec(batch).ValueOrDie();
+  CHECK(indices->Equals(lance::arrow::ToArray<uint64_t>({2, 4}).ValueOrDie()));
+
+  bar = lance::arrow::ToArray({32, 32}).ValueOrDie();
+  struct_arr =
+      ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
+  batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
+  CHECK(output->Equals(batch->ToStructArray().ValueOrDie()));
 }
