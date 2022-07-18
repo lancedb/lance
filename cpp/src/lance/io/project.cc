@@ -50,6 +50,8 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
       return result.status();
     }
     auto [indices, values] = result.ValueOrDie();
+  } else {
+    // Read without filter.
   }
 }
 
