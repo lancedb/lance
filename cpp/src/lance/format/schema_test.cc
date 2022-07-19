@@ -81,7 +81,8 @@ TEST_CASE("Exclude schema") {
 
   auto excluded_arrow_schema = ::arrow::schema(
       {::arrow::field("pk", ::arrow::utf8()),
-       ::arrow::field("annotations", ::arrow::struct_({::arrow::field("label", ::arrow::utf8())}))});
+       ::arrow::field("annotations",
+                      ::arrow::struct_({::arrow::field("label", ::arrow::utf8())}))});
   auto expected = original.Project(*excluded_arrow_schema).ValueOrDie();
 
   INFO("Expected: " << expected->ToString() << "\nActual: " << excluded->ToString());

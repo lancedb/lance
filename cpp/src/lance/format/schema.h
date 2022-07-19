@@ -61,6 +61,9 @@ class Schema final {
   ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::Schema& arrow_schema) const;
 
   /// Exclude (subtract) the fields from the given schema.
+  ///
+  /// \param other the schema to be excluded. It must to be a strict subset of this schema.
+  /// \return The newly created schema, excluding any column in "other".
   ::arrow::Result<std::shared_ptr<Schema>> Exclude(std::shared_ptr<Schema> other) const;
 
   /// Add a new parent field.
