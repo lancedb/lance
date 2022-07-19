@@ -101,6 +101,10 @@ class FileReader {
     std::optional<std::shared_ptr<::arrow::UInt64Array>> indices = std::nullopt;
   };
 
+  /// Read a chunk using GetArrayParams.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema, int32_t chunk_id, const GetArrayParams& params) const;
+
   /// Get an ARRAY from column / file at chunk.
   ///
   /// \param field the field (column) specification

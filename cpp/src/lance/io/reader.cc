@@ -271,21 +271,21 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
     const lance::format::Schema& schema, int32_t chunk_id, std::optional<int32_t> length) const {
-  std::vector<std::shared_ptr<::arrow::Array>> arrs;
-  for (auto& field : schema.fields()) {
-    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, {0, length}));
-    arrs.emplace_back(arr);
-  }
-  return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
+  return ReadChunk(schema, chunk_id, GetArrayParams(0, length));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
     const lance::format::Schema& schema,
     int32_t chunk_id,
     std::shared_ptr<::arrow::UInt64Array> indices) const {
+  return ReadChunk(schema, chunk_id, GetArrayParams(indices));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema, int32_t chunk_id, const GetArrayParams& params) const {
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   for (auto& field : schema.fields()) {
-    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, indices));
+    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, params));
     arrs.emplace_back(arr);
   }
   return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
