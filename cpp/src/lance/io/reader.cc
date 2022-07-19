@@ -336,36 +336,34 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
     const GetArrayParams& params) const {
+
   if (params.indices.has_value()) {
-    return ::arrow::Status::NotImplemented("Get list array by indices is not implemented");
+    // TODO: GH-39. We should improve the read behavior to use indices to save some I/Os.
+    auto& indices = params.indices.value();
+    if (indices->length() == 0) {
+      return ::arrow::Status::IndexError(fmt::format(
+          "FileReader::GetListArray: indices is empty: field={}({})", field->name(), field->id()));
+    }
+    auto start = static_cast<int32_t>(indices->Value(0));
+    auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start);
+    ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr, GetListArray(field, chunk_id, {start, length}));
+    ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
+    return datum.make_array();
   }
+
   auto length = params.length;
   auto start = params.offset.value();
 
-  /// Consolidate this with primitive Array
-  auto field_id = field->id();
-  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
-  ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
-  if (!length.has_value()) {
-    length = chunk_length - start;
-  }
-
-  auto decoder = std::make_shared<lance::encodings::PlainDecoder>(file_, ::arrow::int32());
-  ARROW_RETURN_NOT_OK(decoder->Init());
-  decoder->Reset(pos, chunk_length);
-
-  // TODO: fix this
-  auto l = std::min(static_cast<int64_t>(*length + 1), chunk_length - start);
-  ARROW_ASSIGN_OR_RAISE(auto offsets, decoder->ToArray(start, l));
-  auto offsets_arr = std::static_pointer_cast<::arrow::Int32Array>(offsets);
-  int32_t start_pos = offsets_arr->Value(0);
-  int32_t array_length = offsets_arr->Value(offsets_arr->length() - 1) - start_pos;
+  ARROW_ASSIGN_OR_RAISE(auto offsets_arr, GetPrimitiveArray(field, chunk_id, params));
+  auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
+  int32_t start_pos = offsets->Value(0);
+  int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
   ARROW_ASSIGN_OR_RAISE(auto values,
                         GetArray(field->fields()[0], chunk_id, {start_pos, array_length}));
 
   // Realigned offsets
-  ARROW_ASSIGN_OR_RAISE(auto shiftted_offsets, ResetOffsets(offsets_arr));
-  auto result = ::arrow::ListArray::FromArrays(*shiftted_offsets, *values, pool_);
+  ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
+  auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
   if (!result.ok()) {
     fmt::print("GetListArray: field={}, chunk_id={}, start={}, length={}\nReason:{}\n",
                field->name(),
@@ -377,7 +375,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return result;
 }
 
-::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader ::GetDictionaryArray(
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetDictionaryArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
     const GetArrayParams& params) const {
