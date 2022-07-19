@@ -117,7 +117,7 @@ class PlainDecoderImpl : public Decoder {
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
-      std::shared_ptr<::arrow::Int32Array> indices) const override {
+      std::shared_ptr<::arrow::UInt64Array> indices) const override {
     int32_t start = indices->Value(0);
     int32_t length = indices->Value(indices->length() - 1) - start + 1;
     if (indices->length() == 0 || start < 0 || start + length > length_) {
@@ -209,7 +209,7 @@ void PlainDecoder::Reset(int64_t position, int32_t length) {
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> PlainDecoder::Take(
-    std::shared_ptr<::arrow::Int32Array> indices) const {
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
   return impl_->Take(indices);
 }
 

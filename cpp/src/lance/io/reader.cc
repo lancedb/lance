@@ -279,6 +279,18 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema,
+    int32_t chunk_id,
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
+  std::vector<std::shared_ptr<::arrow::Array>> arrs;
+  for (auto& field : schema.fields()) {
+    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, indices));
+    arrs.emplace_back(arr);
+  }
+  return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
+}
+
 ::arrow::Result<int64_t> FileReader::GetChunkOffset(int64_t field_id, int64_t chunk_id) const {
   auto offset = lookup_table_->GetOffset(field_id, chunk_id);
   if (offset.has_value()) {
@@ -308,7 +320,12 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    std::shared_ptr<::arrow::Array> indices) const {
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
+  auto dtype = field->type();
+  if (is_struct(dtype)) {
+  } else {
+    return GetPrimitiveArray(field, chunk_id, indices);
+  }
   return ::arrow::Status::NotImplemented("FileReader::GetArray(indices) is not implemented");
 }
 
@@ -394,6 +411,19 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
                                                    field->id(),
                                                    result.status().message()));
   }
+  return result;
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetPrimitiveArray(
+    const std::shared_ptr<lance::format::Field>& field,
+    int chunk_id,
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
+  auto field_id = field->id();
+  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
+  ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
+  ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
+  decoder->Reset(pos, chunk_length);
+  auto result = decoder->Take(indices);
   return result;
 }
 

@@ -77,7 +77,7 @@ class VarBinaryDecoder : public Decoder {
       int32_t idx = 0, std::optional<int32_t> length = std::nullopt) const override;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
-      std::shared_ptr<::arrow::Int32Array> indices) const override;
+      std::shared_ptr<::arrow::UInt64Array> indices) const override;
 
  private:
   using OffsetType = VarBinaryEncoder::OffsetType;
@@ -141,7 +141,7 @@ template <ArrowType T>
 
 template <ArrowType T>
 ::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::Take(
-    std::shared_ptr<::arrow::Int32Array> indices) const {
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
   typename ::arrow::TypeTraits<T>::BuilderType builder;
   ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
 

@@ -66,7 +66,7 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
       const lance::format::Schema& schema,
       int32_t chunk_id,
-      std::shared_ptr<::arrow::Array> indices) const;
+      std::shared_ptr<::arrow::UInt64Array> indices) const;
 
   /// Get an ARRAY from column / file at chunk.
   ///
@@ -87,7 +87,7 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      std::shared_ptr<::arrow::Array> indices) const;
+      std::shared_ptr<::arrow::UInt64Array> indices) const;
 
   /// Get file metadata.
   const lance::format::Metadata& metadata() const;
@@ -114,6 +114,11 @@ class FileReader {
       int chunk_id,
       int32_t start = 0,
       std::optional<int32_t> length = std::nullopt) const;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
+      const std::shared_ptr<lance::format::Field>& field,
+      int chunk_id,
+      std::shared_ptr<::arrow::UInt64Array> indices) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
       const std::shared_ptr<lance::format::Field>& field,
@@ -148,7 +153,8 @@ class FileReader {
   ///
   /// \param field_id the field / column Id
   /// \param chunk_id the chunk index in the file
-  /// \return the offset where the chunk starts. Returns Status::Invalid otherwise.
+  /// \return the offset where the chunk starts. Returns
+  /// Status::Invalid otherwise.
   ::arrow::Result<int64_t> GetChunkOffset(int64_t field_id, int64_t chunk_id) const;
 
  private:

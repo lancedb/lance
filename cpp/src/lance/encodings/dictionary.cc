@@ -79,7 +79,7 @@ void DictionaryDecoder::Reset(int64_t position, int32_t length) {
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> DictionaryDecoder::Take(
-    std::shared_ptr<::arrow::Int32Array> indices) const {
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
   ARROW_ASSIGN_OR_RAISE(auto index_arr, plain_decoder_->Take(indices));
   return ::arrow::DictionaryArray::FromArrays(index_arr, dict_);
 }

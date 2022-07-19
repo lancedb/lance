@@ -46,7 +46,7 @@ TEST_CASE("Test Write Int32 array") {
 }
 
 TEST_CASE("Test take plain values") {
-  arrow::Int32Builder builder;
+  arrow::UInt64Builder builder;
   for (int i = 0; i < 100; i++) {
     CHECK(builder.Append(i).ok());
   }
@@ -61,7 +61,7 @@ TEST_CASE("Test take plain values") {
   CHECK(decoder.Init().ok());
   decoder.Reset(offset, arr->length());
 
-  auto indices = lance::arrow::ToArray({8, 12, 16, 20, 45}).ValueOrDie();
+  auto indices = lance::arrow::ToArray<uint64_t>({8, 12, 16, 20, 45}).ValueOrDie();
   auto actual = decoder.Take(indices).ValueOrDie();
   INFO("Indices " << indices->ToString() << " Actual " << actual->ToString());
   CHECK(actual->Equals(indices));

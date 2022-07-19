@@ -19,6 +19,7 @@
 
 #include "lance/arrow/scan_options.h"
 #include "lance/io/filter.h"
+#include "lance/io/reader.h"
 
 namespace lance::io {
 
@@ -49,10 +50,12 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
     if (!result.ok()) {
       return result.status();
     }
-    auto [indices, values] = result.ValueOrDie();
+    auto [indices, values] = result.ValueUnsafe();
+    reader->ReadChunk(*projected_schema_, chunk_idx, indices);
   } else {
     // Read without filter.
   }
+  return ::arrow::Status::OK();
 }
 
 }  // namespace lance::io
