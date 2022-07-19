@@ -76,13 +76,12 @@ Field::Field(const pb::Field& pb)
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
 bool Field::RemoveChild(int32_t id) {
-  for (std::size_t i = 0; i < children_.size(); i++) {
-    auto& child = children_[i];
-    if (child->id() == id) {
-      children_.erase(children_.begin() + i);
+  for (auto it = children_.begin(); it != children_.end(); ++it) {
+    if ((*it)->id() == id) {
+      children_.erase(it);
       return true;
     }
-    if (child->RemoveChild(id)) {
+    if ((*it)->RemoveChild(id)) {
       return true;
     }
   }
@@ -426,7 +425,6 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
 }
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(std::shared_ptr<Schema> other) const {
-
   /// An visitor to remove fields in place.
   class SchemaExcludeVisitor : public FieldVisitor {
    public:
@@ -517,12 +515,12 @@ void Schema::AssignIds() {
 }
 
 bool Schema::RemoveField(int32_t id) {
-  for (std::size_t i = 0; i < fields_.size(); i++) {
-    if (fields_[i]->id() == id) {
-      fields_.erase(fields_.begin() + i);
+  for (auto it = fields_.begin(); it != fields_.end(); ++it) {
+    if ((*it)->id() == id) {
+      fields_.erase(it);
       return true;
     }
-    if (fields_[i]->RemoveChild(id)) {
+    if ((*it)->RemoveChild(id)) {
       return true;
     }
   }
