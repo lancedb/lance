@@ -12,9 +12,25 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include "lance/arrow/utils.h"
+
+#include <arrow/type.h>
+#include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
 
-TEST_CASE("Merge simple structs") {
+#include "lance/arrow/stl.h"
+#include "lance/arrow/type.h"
 
+TEST_CASE("Merge simple structs") {
+  auto a = lance::arrow::ToArray<int32_t>({1, 2, 3}).ValueOrDie();
+  auto left = ::arrow::StructArray::Make({a}, {"a"}).ValueOrDie();
+
+  auto b = lance::arrow::ToArray({"One", "Two", "Three"}).ValueOrDie();
+  auto right = ::arrow::StructArray::Make({b}, {"b"}).ValueOrDie();
+
+  auto merged = lance::arrow::Merge(left, right).ValueOrDie();
+  auto expected =
+      ::arrow::StructArray::Make({a, b}, std::vector<std::string>({"a", "b"})).ValueOrDie();
+  CHECK(merged->Equals(expected));
 }
