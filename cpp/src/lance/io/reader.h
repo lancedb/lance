@@ -68,27 +68,6 @@ class FileReader {
       int32_t chunk_id,
       std::shared_ptr<::arrow::UInt64Array> indices) const;
 
-  /// Get an ARRAY from column / file at chunk.
-  ///
-  /// \param field the field (column) specification
-  /// \param chunk_id the index of the chunk in the file.
-  /// \param start start position
-  /// \param length the length of the array to fetch.
-  ///
-  /// \return An array if success.
-  /// TODO: use std::optional for length
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
-      const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
-
-  /// Selectively read one chunk in the file.
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
-      const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
-      std::shared_ptr<::arrow::UInt64Array> indices) const;
-
   /// Get file metadata.
   const lance::format::Metadata& metadata() const;
 
@@ -109,39 +88,50 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const lance::format::Schema& schema) const;
 
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
+  /// Consolidate read by offset and read by indices parameters.
+  struct GetArrayParams {
+    GetArrayParams(int32_t offset);
+
+    GetArrayParams(int32_t offset, std::optional<int32_t> length);
+
+    GetArrayParams(std::shared_ptr<::arrow::UInt64Array> indices);
+
+    std::optional<int32_t> offset = std::nullopt;
+    std::optional<int32_t> length = std::nullopt;
+    std::optional<std::shared_ptr<::arrow::UInt64Array>> indices = std::nullopt;
+  };
+
+  /// Get an ARRAY from column / file at chunk.
+  ///
+  /// \param field the field (column) specification
+  /// \param chunk_id the index of the chunk in the file.
+  /// \param params Read parameters
+  ///
+  /// \return An array if success.
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const GetArrayParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      std::shared_ptr<::arrow::UInt64Array> indices) const;
+      const GetArrayParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
-
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
-      const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
-      std::shared_ptr<::arrow::UInt64Array> indices) const;
+      const GetArrayParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetListArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const GetArrayParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetDictionaryArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const GetArrayParams& params) const;
 
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(
       int32_t idx, const lance::format::Schema& schema);
