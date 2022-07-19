@@ -44,10 +44,14 @@ class Project {
  private:
   Project(std::shared_ptr<format::Schema> dataset_schema,
           std::shared_ptr<format::Schema> projected_schema,
+          std::shared_ptr<format::Schema> scan_schema,
           std::unique_ptr<Filter> filter);
 
   std::shared_ptr<format::Schema> dataset_schema_;
   std::shared_ptr<format::Schema> projected_schema_;
+  /// scan_schema_ equals to projected_schema_ - filters_.schema()
+  /// It includes the columns that are not read from the filters yet.
+  std::shared_ptr<format::Schema> scan_schema_;
   std::unique_ptr<Filter> filter_;
 };
 
