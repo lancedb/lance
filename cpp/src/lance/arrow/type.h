@@ -19,39 +19,31 @@
 #include <arrow/type_traits.h>
 #include <fmt/format.h>
 
+#include <concepts>
 #include <memory>
 #include <string>
 #include <vector>
 
-template <>
-struct fmt::formatter<::arrow::Scalar> : fmt::formatter<std::string_view> {
+
+template <typename T>
+concept HasToString = requires(T t) {
+                        { t.ToString() } -> std::same_as<std::string>;
+                      };
+
+template <HasToString T>
+struct fmt::formatter<T> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(const ::arrow::Scalar& scalar, FormatContext& ctx) -> decltype(ctx.out()) {
-    return fmt::format_to(ctx.out(), "{}", scalar.ToString());
+  auto format(const T& v, FormatContext& ctx) -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", v.ToString());
   }
 };
 
-template <>
-struct fmt::formatter<std::shared_ptr<::arrow::Scalar>> : fmt::formatter<std::string_view> {
+template <HasToString T>
+struct fmt::formatter<std::shared_ptr<T>> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(const std::shared_ptr<::arrow::Scalar>& scalar, FormatContext& ctx) -> decltype(ctx.out()) {
-    return fmt::format_to(ctx.out(), "{}", scalar->ToString());
-  }
-};
-
-template <>
-struct fmt::formatter<::arrow::Array> : fmt::formatter<std::string_view> {
-  template <typename FormatContext>
-  auto format(const ::arrow::Array& arr, FormatContext& ctx) -> decltype(ctx.out()) {
-    return fmt::format_to(ctx.out(), "{}", arr.ToString());
-  }
-};
-
-template <>
-struct fmt::formatter<std::shared_ptr<::arrow::Array>> : fmt::formatter<std::string_view> {
-  template <typename FormatContext>
-  auto format(const std::shared_ptr<::arrow::Array>& arr, FormatContext& ctx) -> decltype(ctx.out()) {
-    return fmt::format_to(ctx.out(), "{}", arr->ToString());
+  auto format(const std::shared_ptr<T>& v, FormatContext& ctx)
+      -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", v->ToString());
   }
 };
 
