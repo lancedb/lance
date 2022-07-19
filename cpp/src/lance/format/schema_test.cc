@@ -73,6 +73,18 @@ TEST_CASE("Get projection via arrow schema") {
   CHECK(expect_schema.Equals(projection, false));
 }
 
-TEST_CASE("Write dictionary type") {
+TEST_CASE("Exclude schema") {
+  auto original = lance::format::Schema(arrow_schema);
+  auto projected = original.Project({"split", "annotations.box"}).ValueOrDie();
+  INFO("Projected schema: " << projected->ToString());
+  auto excluded = original.Exclude(projected).ValueOrDie();
 
+  auto excluded_arrow_schema = ::arrow::schema(
+      {::arrow::field("pk", ::arrow::utf8()),
+       ::arrow::field("annotations",
+                      ::arrow::struct_({::arrow::field("label", ::arrow::utf8())}))});
+  auto expected = original.Project(*excluded_arrow_schema).ValueOrDie();
+
+  INFO("Expected: " << expected->ToString() << "\nActual: " << excluded->ToString());
+  CHECK(excluded->Equals(expected));
 }

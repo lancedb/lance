@@ -60,6 +60,12 @@ class Schema final {
   /// Use arrow::schema to create a project of the current schema.
   ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::Schema& arrow_schema) const;
 
+  /// Exclude (subtract) the fields from the given schema.
+  ///
+  /// \param other the schema to be excluded. It must to be a strict subset of this schema.
+  /// \return The newly created schema, excluding any column in "other".
+  ::arrow::Result<std::shared_ptr<Schema>> Exclude(std::shared_ptr<Schema> other) const;
+
   /// Add a new parent field.
   void AddField(std::shared_ptr<Field> f);
 
@@ -75,9 +81,6 @@ class Schema final {
   /// \return the field if found. Return nullptr if not found.
   std::shared_ptr<Field> GetField(const std::string& name) const;
 
-  /// (Re-)Assign Field IDs to all the fields.
-  void AssignIds();
-
   std::string ToString() const;
 
   bool Equals(const std::shared_ptr<Schema>& other, bool check_id = true) const;
@@ -88,10 +91,15 @@ class Schema final {
   bool operator==(const Schema& other) const;
 
  private:
-  std::vector<std::shared_ptr<Field>> fields_;
+  /// (Re-)Assign Field IDs to all the fields.
+  void AssignIds();
 
-  // for fast access.
-  std::map<int32_t, std::shared_ptr<Field>> fields_map_;
+  /// Make a full copy of the schema.
+  std::shared_ptr<Schema> Copy() const;
+
+  bool RemoveField(int32_t id);
+
+  std::vector<std::shared_ptr<Field>> fields_;
 };
 
 /// \brief Field is the metadata of a column on disk.
@@ -152,13 +160,6 @@ class Field final {
   /// Returns the direct child with the name. Returns nullptr if such field does not exist.
   const std::shared_ptr<Field> Get(const std::string_view& name) const;
 
-  /// TODO(make it private)
-  void SetId(int32_t parent_id, int32_t* current_id);
-
-  void SetId(int32_t parent_id,
-             int32_t* current_id,
-             std::map<int32_t, std::shared_ptr<Field>>* field_map);
-
   /// Check if two fields are equal.
   ///
   /// \param other the point to the other field to check against to.
@@ -184,6 +185,13 @@ class Field final {
 
   /// Load dictionary array from disk.
   ::arrow::Status LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile);
+
+  void SetId(int32_t parent_id, int32_t* current_id);
+
+  bool RemoveChild(int32_t id);
+
+  // TODO: use enum to replace protobuf enum.
+  pb::Field::Type GetNodeType() const;
 
   int32_t id_ = -1;
   int32_t parent_ = -1;

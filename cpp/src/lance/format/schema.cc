@@ -75,6 +75,19 @@ Field::Field(const pb::Field& pb)
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
+bool Field::RemoveChild(int32_t id) {
+  for (auto it = children_.begin(); it != children_.end(); ++it) {
+    if ((*it)->id() == id) {
+      children_.erase(it);
+      return true;
+    }
+    if ((*it)->RemoveChild(id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // TODO: lets use a map to speed up this. for now it is just O(n) scan.
 std::shared_ptr<Field> Field::Get(int32_t id) {
   for (auto& child : children_) {
@@ -150,7 +163,7 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
   assert(::arrow::is_dictionary(type()->id()));
   auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
   ///
-  assert (dict_type->value_type()->Equals(::arrow::utf8()));
+  assert(dict_type->value_type()->Equals(::arrow::utf8()));
 
   auto decoder = lance::encodings::VarBinaryDecoder<::arrow::StringType>(infile, ::arrow::utf8());
   decoder.Reset(dictionary_offset_, dictionary_page_length_);
@@ -228,14 +241,8 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_encoding(encoding_);
   field.set_dictionary_offset(dictionary_offset_);
   field.set_dictionary_page_length(dictionary_page_length_);
+  field.set_type(GetNodeType());
 
-  if (logical_type_ == "struct") {
-    field.set_type(pb::Field::PARENT);
-  } else if (logical_type_ == "list.struct" || logical_type_ == "list") {
-    field.set_type(pb::Field::REPEATED);
-  } else {
-    field.set_type(pb::Field::LEAF);
-  }
   pb_fields.emplace_back(field);
 
   for (auto& child : children_) {
@@ -271,16 +278,6 @@ void Field::SetId(int32_t parent_id, int32_t* current_id) {
   *current_id += 1;
   for (auto& child : children_) {
     child->SetId(id_, current_id);
-  }
-}
-
-void Field::SetId(int32_t parent_id,
-                  int32_t* current_id,
-                  std::map<int32_t, std::shared_ptr<Field>>* field_map) {
-  assert(field_map != nullptr);
-  SetId(parent_id, current_id);
-  for (auto& child : children_) {
-    field_map->emplace(id_, child);
   }
 }
 
@@ -344,8 +341,6 @@ bool Field::Equals(const std::shared_ptr<Field>& other, bool check_id) const {
 
 bool Field::operator==(const Field& other) const { return Equals(other, true); }
 
-
-
 //------ Schema
 
 Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields) {
@@ -358,8 +353,6 @@ Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Fie
       assert(parent);
       parent->AddChild(field);
     }
-
-    fields_map_.emplace(field->id(), field);
   }
 }
 
@@ -431,11 +424,49 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   return projection;
 }
 
+::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(std::shared_ptr<Schema> other) const {
+  /// An visitor to remove fields in place.
+  class SchemaExcludeVisitor : public FieldVisitor {
+   public:
+    SchemaExcludeVisitor(std::shared_ptr<Schema> excluded) : excluded_(excluded) {}
+
+    ::arrow::Status Visit(std::shared_ptr<Field> field) override {
+      for (auto& field : field->fields()) {
+        ARROW_RETURN_NOT_OK(Visit(field));
+      }
+      auto excluded_field = excluded_->GetField(field->id());
+      if (!excluded_field) {
+        return ::arrow::Status::OK();
+      }
+      if (field->fields().empty() ||
+          (excluded_field->GetNodeType() != pb::Field::LEAF && excluded_field->fields().empty())) {
+        excluded_->RemoveField(field->id());
+      }
+
+      return ::arrow::Status::OK();
+    }
+
+   private:
+    std::shared_ptr<Schema> excluded_;
+  };
+
+  auto excluded = Copy();
+  auto visitor = SchemaExcludeVisitor(excluded);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(other));
+  return excluded;
+}
+
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
 
 std::shared_ptr<Field> Schema::GetField(int32_t id) const {
-  if (auto it = fields_map_.find(id); it != fields_map_.end()) {
-    return it->second;
+  for (auto& field : fields_) {
+    if (field->id() == id) {
+      return field;
+    }
+    auto subfield = field->Get(id);
+    if (subfield) {
+      return subfield;
+    }
   }
   return nullptr;
 };
@@ -467,13 +498,33 @@ std::vector<lance::format::pb::Field> Schema::ToProto() const {
   return pb_fields;
 }
 
+/// Make a full copy of the schema.
+std::shared_ptr<Schema> Schema::Copy() const {
+  auto copy = std::make_shared<Schema>();
+  for (auto& field : fields_) {
+    copy->fields_.emplace_back(field->Copy(true));
+  };
+  return copy;
+}
+
 void Schema::AssignIds() {
   int cur_id = 0;
-  fields_map_.clear();
   for (auto& field : fields_) {
-    field->SetId(-1, &cur_id, &fields_map_);
-    fields_map_[field->id()] = field;
+    field->SetId(-1, &cur_id);
   }
+}
+
+bool Schema::RemoveField(int32_t id) {
+  for (auto it = fields_.begin(); it != fields_.end(); ++it) {
+    if ((*it)->id() == id) {
+      fields_.erase(it);
+      return true;
+    }
+    if ((*it)->RemoveChild(id)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool Schema::Equals(const Schema& other, bool check_id) const {
@@ -512,6 +563,16 @@ std::shared_ptr<::arrow::Schema> Schema::ToArrow() const {
     arrow_fields.emplace_back(f->ToArrow());
   }
   return ::arrow::schema(arrow_fields);
+}
+
+pb::Field::Type Field::GetNodeType() const {
+  if (logical_type_ == "struct") {
+    return pb::Field::PARENT;
+  } else if (logical_type_ == "list.struct" || logical_type_ == "list") {
+    return pb::Field::REPEATED;
+  } else {
+    return pb::Field::LEAF;
+  }
 }
 
 }  // namespace lance::format
