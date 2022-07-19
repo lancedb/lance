@@ -80,8 +80,8 @@ namespace lance::arrow {
       } else {
         return ::arrow::Status::Invalid(
             fmt::format("Dose not support merge between: left={} right={}",
-                        left_arr->type(),
-                        right_arr->type()));
+                        left_arr->type()->ToString(),
+                        right_arr->type()->ToString()));
       }
     }
     arrays.emplace_back(left_arr);
