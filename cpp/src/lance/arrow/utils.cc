@@ -34,6 +34,25 @@ namespace lance::arrow {
   return ::arrow::RecordBatch::FromStructArray(struct_arr);
 }
 
+::arrow::Result<std::shared_ptr<::arrow::Array>> MergeListArray(
+    const std::shared_ptr<::arrow::Array>& lhs,
+    const std::shared_ptr<::arrow::Array>& rhs,
+    ::arrow::MemoryPool* pool) {
+  assert(is_list(lhs->type()) && is_list(rhs->type()));
+  auto left_list_type = std::static_pointer_cast<::arrow::ListType>(lhs->type());
+  auto right_list_type = std::static_pointer_cast<::arrow::ListType>(rhs->type());
+  if (!is_struct(left_list_type->value_type()) || !is_struct(right_list_type->value_type())) {
+    return ::arrow::Status::Invalid(fmt::format(
+        "Can only merge list of structs: left={} right={}", left_list_type, right_list_type));
+  }
+  auto left_list = std::static_pointer_cast<::arrow::ListArray>(lhs);
+  auto right_list = std::static_pointer_cast<::arrow::ListArray>(rhs);
+  auto left_values = std::static_pointer_cast<::arrow::StructArray>(left_list->values());
+  auto right_values = std::static_pointer_cast<::arrow::StructArray>(right_list->values());
+  ARROW_ASSIGN_OR_RAISE(auto values, Merge(left_values, right_values, pool));
+  return ::arrow::ListArray::FromArrays(*left_list->offsets(), *values, pool);
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::StructArray>> Merge(
     const std::shared_ptr<::arrow::StructArray>& lhs,
     const std::shared_ptr<::arrow::StructArray>& rhs,
@@ -51,16 +70,19 @@ namespace lance::arrow {
 
     auto right_arr = rhs->GetFieldByName(name);
     if (right_arr) {
-      if (!is_struct(left_arr->type()) || !is_struct(right_arr->type())) {
+      if (is_struct(left_arr->type()) && is_struct(right_arr->type())) {
+        ARROW_ASSIGN_OR_RAISE(left_arr,
+                              Merge(std::static_pointer_cast<::arrow::StructArray>(left_arr),
+                                    std::static_pointer_cast<::arrow::StructArray>(right_arr),
+                                    pool));
+      } else if (is_list(left_arr->type()) && is_list(right_arr->type())) {
+        ARROW_ASSIGN_OR_RAISE(left_arr, MergeListArray(left_arr, right_arr, pool));
+      } else {
         return ::arrow::Status::Invalid(
-            fmt::format("Can only merge two struct types: left={} right={}",
+            fmt::format("Dose not support merge between: left={} right={}",
                         left_arr->type(),
                         right_arr->type()));
       }
-      ARROW_ASSIGN_OR_RAISE(left_arr,
-                            Merge(std::static_pointer_cast<::arrow::StructArray>(left_arr),
-                                  std::static_pointer_cast<::arrow::StructArray>(right_arr),
-                                  pool));
     }
     arrays.emplace_back(left_arr);
   }
