@@ -345,6 +345,20 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return arr;
 }
 
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetStructArray(
+    const std::shared_ptr<lance::format::Field>& field,
+    int chunk_id,
+    std::shared_ptr<::arrow::UInt64Array> indices) const {
+  ::arrow::ArrayVector children;
+  std::vector<std::string> field_names;
+  for (auto child : field->fields()) {
+    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(child, chunk_id, indices));
+    children.emplace_back(arr);
+    field_names.emplace_back(child->name());
+  }
+  return ::arrow::StructArray::Make(children, field_names);
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetListArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,

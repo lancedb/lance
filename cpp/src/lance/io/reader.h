@@ -126,6 +126,11 @@ class FileReader {
       int32_t start = 0,
       std::optional<int32_t> length = std::nullopt) const;
 
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
+      const std::shared_ptr<lance::format::Field>& field,
+      int chunk_id,
+      std::shared_ptr<::arrow::UInt64Array> indices) const;
+
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetListArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
