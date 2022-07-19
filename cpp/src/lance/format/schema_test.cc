@@ -76,7 +76,7 @@ TEST_CASE("Get projection via arrow schema") {
 TEST_CASE("Exclude schema") {
   auto original = lance::format::Schema(arrow_schema);
   auto projected = original.Project({"split", "annotations.box"}).ValueOrDie();
-  fmt::print("Project schema: {}\n", projected->ToString());
+  INFO("Projected schema: " << projected->ToString());
   auto excluded = original.Exclude(projected).ValueOrDie();
 
   auto excluded_arrow_schema = ::arrow::schema(
