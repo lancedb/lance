@@ -26,8 +26,6 @@
 
 namespace lance::arrow {
 
-namespace pb = ::lance::format::pb;
-
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype) {
   if (is_list(dtype)) {
     auto list_type = std::reinterpret_pointer_cast<::arrow::ListType>(dtype);
@@ -87,33 +85,6 @@ namespace pb = ::lance::format::pb;
   }
   return ::arrow::Status::NotImplemented(fmt::format(
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
-}
-
-::arrow::Result<std::vector<lance::format::pb::Field>> FromArrowSchema(
-    std::shared_ptr<::arrow::Schema> schema) {
-  auto root = format::Schema(schema);
-  return root.ToProto();
-}
-
-::arrow::Result<std::shared_ptr<::arrow::Schema>> ToArrowSchema(
-    const std::vector<lance::format::pb::Field>& fields) {
-  // TODO: better to build schema tree first.
-  std::vector<std::shared_ptr<lance::format::Field>> field_map;
-  auto root = std::make_shared<lance::format::Field>();
-  for (auto& pb_field : fields) {
-    auto parent = root;
-    if (pb_field.parent_id() >= 0) {
-      parent = root->Get(pb_field.parent_id());
-    }
-    if (!parent) {
-      return ::arrow::Status::Invalid(fmt::format("Not parent found for {}", pb_field.parent_id()));
-    }
-    ARROW_RETURN_NOT_OK(parent->Add(pb_field));
-  }
-
-  format::ToArrowVisitor visitor;
-  ARROW_RETURN_NOT_OK(visitor.Visit(root));
-  return visitor.Finish();
 }
 
 }  // namespace lance::arrow
