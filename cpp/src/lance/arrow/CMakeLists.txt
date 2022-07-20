@@ -20,8 +20,6 @@ add_library(
         OBJECT
         file_lance.cc
         reader.cc
-        scan_options.cc
-        scan_options.h
         stl.h
         type.cc
         type.h

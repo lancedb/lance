@@ -41,17 +41,6 @@ Scanner::Scanner(Scanner&& other) noexcept
 ::arrow::Status Scanner::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
   ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_));
-
-  std::set<std::string> columns;
-  for (auto& ref : options_->MaterializedFields()) {
-    // TODO: support nested columns later.
-    columns.insert(*ref.name());
-  }
-  /// TODO Make schema->Project takes generic container.
-  std::vector<std::string> column_vector(columns.begin(), columns.end());
-  if (!columns.empty()) {
-    ARROW_ASSIGN_OR_RAISE(schema_, schema_->Project(column_vector));
-  }
   return ::arrow::Status::OK();
 }
 

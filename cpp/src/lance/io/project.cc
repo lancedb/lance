@@ -17,7 +17,6 @@
 #include <arrow/api.h>
 #include <arrow/result.h>
 
-#include "lance/arrow/scan_options.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/filter.h"
 #include "lance/io/reader.h"
