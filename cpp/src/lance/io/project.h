@@ -14,14 +14,11 @@
 
 #pragma once
 
+#include <arrow/dataset/scanner.h>
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
 
 #include <memory>
-
-namespace lance::arrow {
-class ScanOptions;
-}
 
 namespace lance::format {
 class Schema;
@@ -32,11 +29,16 @@ namespace lance::io {
 class FileReader;
 class Filter;
 
+/// Projection over dataset.
+///
 class Project {
  public:
   Project() = delete;
 
-  static ::arrow::Result<Project> Make(std::shared_ptr<lance::arrow::ScanOptions> scan_options);
+  /// Make a Project from the full dataset schema and scan options.
+  static ::arrow::Result<std::unique_ptr<Project>> Make(
+      std::shared_ptr<format::Schema> schema,
+      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t chunk_idx);

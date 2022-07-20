@@ -13,6 +13,8 @@
 
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
+#include "lance/io/filter.h"
+#include "lance/io/project.h"
 #include "lance/io/reader.h"
 
 namespace lance::io {
@@ -38,11 +40,12 @@ Scanner::Scanner(Scanner&& other) noexcept
 
 ::arrow::Status Scanner::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
+  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_));
+
   std::set<std::string> columns;
   for (auto& ref : options_->MaterializedFields()) {
     // TODO: support nested columns later.
     columns.insert(*ref.name());
-    auto fields = ref.FindAll(*options_->dataset_schema);
   }
   /// TODO Make schema->Project takes generic container.
   std::vector<std::string> column_vector(columns.begin(), columns.end());

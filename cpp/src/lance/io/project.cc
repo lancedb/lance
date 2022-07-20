@@ -18,6 +18,7 @@
 #include <arrow/result.h>
 
 #include "lance/arrow/scan_options.h"
+#include "lance/arrow/utils.h"
 #include "lance/io/filter.h"
 #include "lance/io/reader.h"
 
@@ -32,18 +33,18 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
       scan_schema_(scan_schema),
       filter_(std::move(filter)) {}
 
-::arrow::Result<Project> Project::Make(std::shared_ptr<lance::arrow::ScanOptions> scan_options) {
-  ARROW_ASSIGN_OR_RAISE(
-      auto filter, Filter::Make(*scan_options->schema(), scan_options->arrow_options()->filter));
-  ARROW_ASSIGN_OR_RAISE(
-      auto schema,
-      scan_options->schema()->Project(*scan_options->arrow_options()->projected_schema));
-  auto scan_schema = schema;
+::arrow::Result<std::unique_ptr<Project>> Project::Make(
+    std::shared_ptr<format::Schema> schema,
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
+  ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(*schema, scan_options->filter));
+  ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema->Project(*scan_options->projected_schema));
+  auto scan_schema = projected_schema;
   if (filter) {
     // Remove the columns in filter from the project schema, to avoid duplicated scan
-    ARROW_ASSIGN_OR_RAISE(scan_schema, schema->Exclude(filter->schema()));
+    ARROW_ASSIGN_OR_RAISE(scan_schema, projected_schema->Exclude(filter->schema()));
   }
-  return Project(scan_options->schema(), schema, scan_schema, std::move(filter));
+  return std::unique_ptr<Project>(
+      new Project(schema, projected_schema, scan_schema, std::move(filter)));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
@@ -56,7 +57,8 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
     auto [indices, values] = result.ValueUnsafe();
     ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*scan_schema_, chunk_idx, indices));
     assert(values->num_rows() == batch->num_rows());
-    // Merge value and batch
+    ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
+    return merged;
   } else {
     // Read without filter.
     return reader->ReadChunk(*scan_schema_, chunk_idx);

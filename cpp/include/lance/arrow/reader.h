@@ -18,16 +18,17 @@
 #pragma once
 
 #include <arrow/io/api.h>
+#include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace lance::arrow {
 
 /// Lance File format reader.
-///
 ///
 class FileReader final {
  public:
