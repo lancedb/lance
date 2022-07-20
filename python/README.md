@@ -6,7 +6,7 @@
 
 ```bash
 sudo apt install python3-pip python3-venv python3-dev
-python3 -m venv ${HOME}/.venv/nft
+python3 -m venv ${HOME}/.venv/lance
 ```
 
 # Arrow C++ libs
@@ -21,7 +21,7 @@ separately.
 Assume CWD is where you want to put the repo:
 
 ```bash
-source ${HOME}/.venv/nft/bin/activate
+source ${HOME}/.venv/lance/bin/activate
 cd /path/to/lance/python/thirdparty
 ./build.sh
 ```
@@ -41,7 +41,7 @@ Assume CWD is where you want to put the repo:
 ```bash
 git clone git@github.com:eto-ai/lance
 
-pushd nft/cpp
+pushd lance/cpp
 cmake . -B build
 pushd build
 make -j
@@ -49,7 +49,7 @@ popd
 popd
 
 pushd python
-source ${HOME}/.venv/nft/bin/activate
+source ${HOME}/.venv/lance/bin/activate
 python setup.py develop
 ```
 
