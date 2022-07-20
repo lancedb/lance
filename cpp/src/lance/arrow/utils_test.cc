@@ -30,7 +30,7 @@ TEST_CASE("Merge simple structs") {
   auto b = lance::arrow::ToArray({"One", "Two", "Three"}).ValueOrDie();
   auto right = ::arrow::StructArray::Make({b}, {"b"}).ValueOrDie();
 
-  auto merged = lance::arrow::Merge(left, right).ValueOrDie();
+  auto merged = lance::arrow::MergeStructArrays(left, right).ValueOrDie();
   auto expected =
       ::arrow::StructArray::Make({a, b}, std::vector<std::string>({"a", "b"})).ValueOrDie();
   CHECK(merged->Equals(expected));
@@ -68,7 +68,7 @@ TEST_CASE("Merge nested structs") {
   auto y = points_y_builder.Finish().ValueOrDie();
   auto points_y = ::arrow::StructArray::Make({y}, {"points"}).ValueOrDie();
 
-  auto points = lance::arrow::Merge(points_x, points_y).ValueOrDie();
+  auto points = lance::arrow::MergeStructArrays(points_x, points_y).ValueOrDie();
   INFO("Points array: " << points->ToString());
   auto expected_schema = ::arrow::struct_(
       {::arrow::field("points",
