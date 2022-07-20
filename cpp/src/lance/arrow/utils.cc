@@ -24,17 +24,17 @@
 
 namespace lance::arrow {
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Merge(
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
     const std::shared_ptr<::arrow::RecordBatch>& lhs,
     const std::shared_ptr<::arrow::RecordBatch>& rhs,
     ::arrow::MemoryPool* pool) {
   ARROW_ASSIGN_OR_RAISE(auto left_struct, lhs->ToStructArray());
   ARROW_ASSIGN_OR_RAISE(auto right_struct, rhs->ToStructArray());
-  ARROW_ASSIGN_OR_RAISE(auto struct_arr, Merge(left_struct, right_struct, pool));
+  ARROW_ASSIGN_OR_RAISE(auto struct_arr, MergeStructArrays(left_struct, right_struct, pool));
   return ::arrow::RecordBatch::FromStructArray(struct_arr);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::Array>> MergeListArray(
+::arrow::Result<std::shared_ptr<::arrow::Array>> MergeListArrays(
     const std::shared_ptr<::arrow::Array>& lhs,
     const std::shared_ptr<::arrow::Array>& rhs,
     ::arrow::MemoryPool* pool) {
@@ -49,11 +49,11 @@ namespace lance::arrow {
   auto right_list = std::static_pointer_cast<::arrow::ListArray>(rhs);
   auto left_values = std::static_pointer_cast<::arrow::StructArray>(left_list->values());
   auto right_values = std::static_pointer_cast<::arrow::StructArray>(right_list->values());
-  ARROW_ASSIGN_OR_RAISE(auto values, Merge(left_values, right_values, pool));
+  ARROW_ASSIGN_OR_RAISE(auto values, MergeStructArrays(left_values, right_values, pool));
   return ::arrow::ListArray::FromArrays(*left_list->offsets(), *values, pool);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::StructArray>> Merge(
+::arrow::Result<std::shared_ptr<::arrow::StructArray>> MergeStructArrays(
     const std::shared_ptr<::arrow::StructArray>& lhs,
     const std::shared_ptr<::arrow::StructArray>& rhs,
     ::arrow::MemoryPool* pool) {
@@ -71,12 +71,13 @@ namespace lance::arrow {
     auto right_arr = rhs->GetFieldByName(name);
     if (right_arr) {
       if (is_struct(left_arr->type()) && is_struct(right_arr->type())) {
-        ARROW_ASSIGN_OR_RAISE(left_arr,
-                              Merge(std::static_pointer_cast<::arrow::StructArray>(left_arr),
-                                    std::static_pointer_cast<::arrow::StructArray>(right_arr),
-                                    pool));
+        ARROW_ASSIGN_OR_RAISE(
+            left_arr,
+            MergeStructArrays(std::static_pointer_cast<::arrow::StructArray>(left_arr),
+                              std::static_pointer_cast<::arrow::StructArray>(right_arr),
+                              pool));
       } else if (is_list(left_arr->type()) && is_list(right_arr->type())) {
-        ARROW_ASSIGN_OR_RAISE(left_arr, MergeListArray(left_arr, right_arr, pool));
+        ARROW_ASSIGN_OR_RAISE(left_arr, MergeListArrays(left_arr, right_arr, pool));
       } else {
         return ::arrow::Status::Invalid(
             fmt::format("Dose not support merge between: left={} right={}",

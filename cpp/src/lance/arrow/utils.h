@@ -23,12 +23,12 @@
 namespace lance::arrow {
 
 /// Merge two same-length record batches into one.
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Merge(
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
     const std::shared_ptr<::arrow::RecordBatch>& lhs,
     const std::shared_ptr<::arrow::RecordBatch>& rhs,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
-::arrow::Result<std::shared_ptr<::arrow::StructArray>> Merge(
+::arrow::Result<std::shared_ptr<::arrow::StructArray>> MergeStructArrays(
     const std::shared_ptr<::arrow::StructArray>& lhs,
     const std::shared_ptr<::arrow::StructArray>& rhs,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
