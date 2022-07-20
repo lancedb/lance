@@ -50,6 +50,9 @@ namespace lance::arrow {
   auto left_values = std::static_pointer_cast<::arrow::StructArray>(left_list->values());
   auto right_values = std::static_pointer_cast<::arrow::StructArray>(right_list->values());
   ARROW_ASSIGN_OR_RAISE(auto values, MergeStructArrays(left_values, right_values, pool));
+  if (!left_list->offsets()->Equals(right_list->offsets())) {
+    return ::arrow::Status::Invalid("Attempt to merge two lists with different offsets");
+  }
   return ::arrow::ListArray::FromArrays(*left_list->offsets(), *values, pool);
 }
 
