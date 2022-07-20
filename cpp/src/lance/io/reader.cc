@@ -229,8 +229,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ::arrow::Table::Make(schema.ToArrow(), columns);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    int32_t offset, int32_t length, const lance::format::Schema& schema) const {
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
+    const lance::format::Schema& schema, int32_t offset, int32_t length) const {
   ARROW_ASSIGN_OR_RAISE(auto chunk_and_idx, metadata_->LocateChunk(offset));
   auto [chunk_id, idx_in_chunk] = chunk_and_idx;
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
@@ -259,14 +259,6 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     }
   }
   return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
-}
-
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    int32_t offset, int32_t length, const std::vector<std::string>& columns) const {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
-
-  return ReadBatch(offset, length, *projection);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
@@ -336,7 +328,6 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
     const GetArrayParams& params) const {
-
   if (params.indices.has_value()) {
     // TODO: GH-39. We should improve the read behavior to use indices to save some I/Os.
     auto& indices = params.indices.value();
@@ -347,7 +338,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     auto start = static_cast<int32_t>(indices->Value(0));
     auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start);
     ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr, GetListArray(field, chunk_id, {start, length}));
-    ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
+    ARROW_ASSIGN_OR_RAISE(auto datum,
+                          ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
     return datum.make_array();
   }
 

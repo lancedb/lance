@@ -47,15 +47,14 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const std::vector<std::string>& columns);
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      int32_t offset, int32_t length, const std::vector<std::string>& columns) const;
-
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      int32_t offset, int32_t length, const lance::format::Schema& schema) const;
+  /// Read a RecordBatch at the offset.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadAt(const lance::format::Schema& schema,
+                                                                int32_t offset,
+                                                                int32_t length) const;
 
   /// Read a chunk.
   ///
-  /// While ReadBatch can read at any arbitrary offsets, ReadChunks always
+  /// While ReadAt can read at any arbitrary offsets, ReadChunks always
   /// starts at the chunk boundry.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
       const lance::format::Schema& schema,

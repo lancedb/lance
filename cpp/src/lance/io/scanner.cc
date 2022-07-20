@@ -52,7 +52,7 @@ void Scanner::AddPrefetchTask() {
         std::min(static_cast<int64_t>(options_->batch_size), reader_->metadata().length() - start));
     auto f = std::async(
         [&](int32_t start, int32_t length) {
-          auto batch = reader_->ReadBatch(start, length, *schema_);
+          auto batch = reader_->ReadAt(*schema_, start, length);
           if (!batch.ok()) {
             fmt::print(
                 "Bad batch: start={}, length={}: {}\n", start, length, batch.status().message());
