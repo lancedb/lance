@@ -61,7 +61,7 @@ Scanner::Scanner(Scanner&& other) noexcept
 void Scanner::AddPrefetchTask() {
   while (q_.size() < static_cast<std::size_t>(options_->batch_readahead) &&
          current_chunk_ < reader_->metadata().num_chunks()) {
-    auto chunk_id = current_chunk_;
+    auto chunk_id = current_chunk_++;
     auto f = std::async(
         [&](int32_t chunk_id) {
           auto result = project_->Execute(reader_, chunk_id);
