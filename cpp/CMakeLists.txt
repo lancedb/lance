@@ -74,7 +74,6 @@ if (APPLE)
     list(APPEND CMAKE_MODULE_PATH
             /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
             /usr/local/opt/apache-arrow/lib/cmake/arrow)
-    message("FOUND OPENSSL is : ${OPENSSL_ROOT_DIR}]")
 endif (APPLE)
 
 find_package(Arrow REQUIRED)
@@ -116,10 +115,8 @@ if (LANCE_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif ()
 
-message("Protobuf llibs: ${Protobuf_LIBRARIES}, ${Protobuf_LITE_LIBRARIES}")
 add_library(lance SHARED ${lance_objects})
 target_link_libraries(lance PUBLIC
-        ${Protobuf_LITE_LIBRARIES}
         ${Protobuf_LIBRARIES}
         ${ARROW_SHARED_LIB}
         ${ARROW_DATASET_SHARED_LIB}

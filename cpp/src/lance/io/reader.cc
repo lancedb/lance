@@ -276,7 +276,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
     const lance::format::Schema& schema, int32_t chunk_id, const GetArrayParams& params) const {
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
-  /// TODO: Read field in parallel.
+  /// TODO: GH-43. Read field in parallel.
   for (auto& field : schema.fields()) {
     ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, params));
     arrs.emplace_back(arr);
