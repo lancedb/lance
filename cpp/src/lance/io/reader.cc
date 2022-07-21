@@ -156,10 +156,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   decoder->Reset(pos, length);
   ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
-  ARROW_ASSIGN_OR_RAISE(
-      auto values,
-      GetArray(
-          field->fields()[0], chunk_id, offsets->Value(0), offsets->Value(1) - offsets->Value(0)));
+  ARROW_ASSIGN_OR_RAISE(auto values,
+                        GetArray(field->fields()[0],
+                                 chunk_id,
+                                 {offsets->Value(0), offsets->Value(1) - offsets->Value(0)}));
   ARROW_ASSIGN_OR_RAISE(offsets, ResetOffsets(offsets));
   auto rst = ::arrow::ListArray::FromArrays(field->type(), *offsets, *values);
   if (!rst.ok()) {
@@ -221,7 +221,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   for (auto& field : schema.fields()) {
     ::arrow::ArrayVector chunks;
     for (int i = 0; i < metadata_->num_chunks(); i++) {
-      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, i));
+      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, i, 0));
       chunks.emplace_back(arr);
     }
     columns.emplace_back(std::make_shared<::arrow::ChunkedArray>(chunks));
@@ -229,8 +229,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ::arrow::Table::Make(schema.ToArrow(), columns);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    int32_t offset, int32_t length, const lance::format::Schema& schema) const {
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
+    const lance::format::Schema& schema, int32_t offset, int32_t length) const {
   ARROW_ASSIGN_OR_RAISE(auto chunk_and_idx, metadata_->LocateChunk(offset));
   auto [chunk_id, idx_in_chunk] = chunk_and_idx;
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
@@ -244,7 +244,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     while (len > 0 && ckid < metadata_->num_chunks()) {
       auto page_length = metadata_->GetChunkLength(chunk_id);
       auto length_in_chunk = std::min(len, page_length - ck_index);
-      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, ckid, ck_index, length_in_chunk));
+      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, ckid, {ck_index, length_in_chunk}));
       len -= length_in_chunk;
       ckid++;
       ck_index = 0;
@@ -261,12 +261,27 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    int32_t offset, int32_t length, const std::vector<std::string>& columns) const {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema, int32_t chunk_id, std::optional<int32_t> length) const {
+  return ReadChunk(schema, chunk_id, ArrayReadParams(0, length));
+}
 
-  return ReadBatch(offset, length, *projection);
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema,
+    int32_t chunk_id,
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  return ReadChunk(schema, chunk_id, ArrayReadParams(indices));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+    const lance::format::Schema& schema, int32_t chunk_id, const ArrayReadParams& params) const {
+  std::vector<std::shared_ptr<::arrow::Array>> arrs;
+  /// TODO: GH-43. Read field in parallel.
+  for (auto& field : schema.fields()) {
+    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, chunk_id, params));
+    arrs.emplace_back(arr);
+  }
+  return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
 ::arrow::Result<int64_t> FileReader::GetChunkOffset(int64_t field_id, int64_t chunk_id) const {
@@ -281,29 +296,27 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    int32_t start,
-    std::optional<int32_t> length) const {
+    const ArrayReadParams& params) const {
   auto dtype = field->type();
   if (is_struct(dtype)) {
-    return GetStructArray(field, chunk_id, start, length);
+    return GetStructArray(field, chunk_id, params);
   } else if (is_list(dtype)) {
-    return GetListArray(field, chunk_id, start, length);
+    return GetListArray(field, chunk_id, params);
   } else if (::arrow::is_dictionary(dtype->id())) {
-    return GetDictionaryArray(field, chunk_id, start, length);
+    return GetDictionaryArray(field, chunk_id, params);
   } else {
-    return GetPrimitiveArray(field, chunk_id, start, length);
+    return GetPrimitiveArray(field, chunk_id, params);
   }
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetStructArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    int32_t start,
-    std::optional<int32_t> length) const {
+    const ArrayReadParams& params) const {
   ::arrow::ArrayVector children;
   std::vector<std::string> field_names;
   for (auto child : field->fields()) {
-    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(child, chunk_id, start, length));
+    ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(child, chunk_id, params));
     children.emplace_back(arr);
     field_names.emplace_back(child->name());
   }
@@ -314,32 +327,35 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetListArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    int32_t start,
-    std::optional<int32_t> length) const {
-  /// Consolidate this with primitive Array
-  auto field_id = field->id();
-  ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
-  ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
-  if (!length.has_value()) {
-    length = chunk_length - start;
+    const ArrayReadParams& params) const {
+  if (params.indices.has_value()) {
+    // TODO: GH-39. We should improve the read behavior to use indices to save some I/Os.
+    auto& indices = params.indices.value();
+    if (indices->length() == 0) {
+      return ::arrow::Status::IndexError(fmt::format(
+          "FileReader::GetListArray: indices is empty: field={}({})", field->name(), field->id()));
+    }
+    auto start = static_cast<int32_t>(indices->Value(0));
+    auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start);
+    ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr, GetListArray(field, chunk_id, {start, length}));
+    ARROW_ASSIGN_OR_RAISE(auto datum,
+                          ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
+    return datum.make_array();
   }
 
-  auto decoder = std::make_shared<lance::encodings::PlainDecoder>(file_, ::arrow::int32());
-  ARROW_RETURN_NOT_OK(decoder->Init());
-  decoder->Reset(pos, chunk_length);
+  auto length = params.length;
+  auto start = params.offset.value();
 
-  // TODO: fix this
-  auto l = std::min(static_cast<int64_t>(*length + 1), chunk_length - start);
-  ARROW_ASSIGN_OR_RAISE(auto offsets, decoder->ToArray(start, l));
-  auto offsets_arr = std::static_pointer_cast<::arrow::Int32Array>(offsets);
-  int32_t start_pos = offsets_arr->Value(0);
-  int32_t array_length = offsets_arr->Value(offsets_arr->length() - 1) - start_pos;
+  ARROW_ASSIGN_OR_RAISE(auto offsets_arr, GetPrimitiveArray(field, chunk_id, params));
+  auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
+  int32_t start_pos = offsets->Value(0);
+  int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
   ARROW_ASSIGN_OR_RAISE(auto values,
-                        GetArray(field->fields()[0], chunk_id, start_pos, array_length));
+                        GetArray(field->fields()[0], chunk_id, {start_pos, array_length}));
 
   // Realigned offsets
-  ARROW_ASSIGN_OR_RAISE(auto shiftted_offsets, ResetOffsets(offsets_arr));
-  auto result = ::arrow::ListArray::FromArrays(*shiftted_offsets, *values, pool_);
+  ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
+  auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
   if (!result.ok()) {
     fmt::print("GetListArray: field={}, chunk_id={}, start={}, length={}\nReason:{}\n",
                field->name(),
@@ -351,33 +367,36 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return result;
 }
 
-::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader ::GetDictionaryArray(
+::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetDictionaryArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    int32_t start,
-    std::optional<int32_t> length) const {
+    const ArrayReadParams& params) const {
   assert(::arrow::is_dictionary(field->type()->id()));
-  return GetPrimitiveArray(field, chunk_id, start, length);
+  return GetPrimitiveArray(field, chunk_id, params);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetPrimitiveArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    int32_t start,
-    std::optional<int32_t> length) const {
+    const ArrayReadParams& params) const {
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
   decoder->Reset(pos, chunk_length);
-  auto result = decoder->ToArray(start, length);
-  if (!result.ok()) {
-    return result.status().WithMessage(fmt::format("FileReader::GetPrimitiveArray: field={}({}) {}",
-                                                   field->name(),
-                                                   field->id(),
-                                                   result.status().message()));
+  decltype(decoder->ToArray()) result;
+  if (params.indices) {
+    result = decoder->Take(params.indices.value());
+  } else {
+    result = decoder->ToArray(params.offset.value(), params.length);
   }
   return result;
 }
+
+FileReader::ArrayReadParams::ArrayReadParams(int32_t off, std::optional<int32_t> len)
+    : offset(off), length(len) {}
+
+FileReader::ArrayReadParams::ArrayReadParams(std::shared_ptr<::arrow::Int32Array> idx)
+    : indices(idx) {}
 
 }  // namespace lance::io

@@ -1,3 +1,17 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #include "lance/io/scanner.h"
 
 #include <arrow/dataset/scanner.h>
@@ -13,64 +27,52 @@
 
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
+#include "lance/io/filter.h"
+#include "lance/io/project.h"
 #include "lance/io/reader.h"
 
 namespace lance::io {
 
 Scanner::Scanner(std::shared_ptr<FileReader> reader,
-                 std::shared_ptr<arrow::dataset::ScanOptions> options)
+                 std::shared_ptr<arrow::dataset::ScanOptions> options) noexcept
     : reader_(reader), options_(options) {}
 
-Scanner::Scanner(const Scanner& other)
+Scanner::Scanner(const Scanner& other) noexcept
     : reader_(other.reader_),
       options_(other.options_),
       schema_(other.schema_),
-      current_offset_(other.current_offset_),
-      prefetch_offset_(other.prefetch_offset_) {}
+      project_(other.project_),
+      current_chunk_(other.current_chunk_) {}
 
 Scanner::Scanner(Scanner&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
       schema_(std::move(other.schema_)),
-      current_offset_(other.current_offset_),
-      prefetch_offset_(other.prefetch_offset_),
+      project_(std::move(other.project_)),
+      current_chunk_(other.current_chunk_),
       q_(std::move(other.q_)) {}
 
 ::arrow::Status Scanner::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
-  std::set<std::string> columns;
-  for (auto& ref : options_->MaterializedFields()) {
-    // TODO: support nested columns later.
-    columns.insert(*ref.name());
-    auto fields = ref.FindAll(*options_->dataset_schema);
-  }
-  /// TODO Make schema->Project takes generic container.
-  std::vector<std::string> column_vector(columns.begin(), columns.end());
-  if (!columns.empty()) {
-    ARROW_ASSIGN_OR_RAISE(schema_, schema_->Project(column_vector));
-  }
+  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_));
   return ::arrow::Status::OK();
 }
 
 void Scanner::AddPrefetchTask() {
   while (q_.size() < static_cast<std::size_t>(options_->batch_readahead) &&
-         prefetch_offset_ < reader_->metadata().length()) {
-    auto start = prefetch_offset_;
-    auto length = static_cast<int32_t>(
-        std::min(static_cast<int64_t>(options_->batch_size), reader_->metadata().length() - start));
+         current_chunk_ < reader_->metadata().num_chunks()) {
+    auto chunk_id = current_chunk_++;
     auto f = std::async(
-        [&](int32_t start, int32_t length) {
-          auto batch = reader_->ReadBatch(start, length, *schema_);
-          if (!batch.ok()) {
+        [&](int32_t chunk_id) {
+          auto result = project_->Execute(reader_, chunk_id);
+          if (!result.ok()) {
             fmt::print(
-                "Bad batch: start={}, length={}: {}\n", start, length, batch.status().message());
+                stderr, "Read bad chunk: chunk_id={}: {}\n", chunk_id, result.status().message());
           }
-          return std::make_tuple(batch, length);
+          return result;
         },
-        start,
-        length);
+        chunk_id);
     q_.push(std::move(f));
-    prefetch_offset_ += length;
   }
 }
 
@@ -83,14 +85,7 @@ void Scanner::AddPrefetchTask() {
   }
   auto future = std::move(q_.front());
   q_.pop();
-  auto [result, length] = future.get();
-  if (!result.ok()) {
-    current_offset_ += options_->batch_size;
-    return result.status();
-  }
-  auto batch = *result;
-  current_offset_ += (*result)->num_rows();
-  return batch;
+  return future.get();
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> Scanner::operator()() {

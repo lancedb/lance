@@ -47,11 +47,25 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const std::vector<std::string>& columns);
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      int32_t offset, int32_t length, const std::vector<std::string>& columns) const;
+  /// Read a RecordBatch at the offset.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadAt(const lance::format::Schema& schema,
+                                                                int32_t offset,
+                                                                int32_t length) const;
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      int32_t offset, int32_t length, const lance::format::Schema& schema) const;
+  /// Read a chunk.
+  ///
+  /// While ReadAt can read at any arbitrary offsets, ReadChunks always
+  /// starts at the chunk boundry.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema,
+      int32_t chunk_id,
+      std::optional<int32_t> length = std::nullopt) const;
+
+  /// Read a chunk with indices
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema,
+      int32_t chunk_id,
+      std::shared_ptr<::arrow::Int32Array> indices) const;
 
   /// Get file metadata.
   const lance::format::Metadata& metadata() const;
@@ -73,44 +87,54 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const lance::format::Schema& schema) const;
 
+  /// Array Read Parameters.
+  ///  - ReadAt offset + length.
+  ///  - Take elements by indices.
+  struct ArrayReadParams {
+    ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
+
+    ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
+
+    std::optional<int32_t> offset = std::nullopt;
+    std::optional<int32_t> length = std::nullopt;
+    std::optional<std::shared_ptr<::arrow::Int32Array>> indices = std::nullopt;
+  };
+
+  /// Read a chunk using ArrayReadParams.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+      const lance::format::Schema& schema, int32_t chunk_id, const ArrayReadParams& params) const;
+
   /// Get an ARRAY from column / file at chunk.
   ///
   /// \param field the field (column) specification
   /// \param chunk_id the index of the chunk in the file.
-  /// \param start start position
-  /// \param length the length of the array to fetch.
+  /// \param params Read parameters
   ///
   /// \return An array if success.
-  /// TODO: use std::optional for length
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetListArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetDictionaryArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      int32_t start = 0,
-      std::optional<int32_t> length = std::nullopt) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(
       int32_t idx, const lance::format::Schema& schema);
@@ -127,7 +151,8 @@ class FileReader {
   ///
   /// \param field_id the field / column Id
   /// \param chunk_id the chunk index in the file
-  /// \return the offset where the chunk starts. Returns Status::Invalid otherwise.
+  /// \return the offset where the chunk starts. Returns
+  /// Status::Invalid otherwise.
   ::arrow::Result<int64_t> GetChunkOffset(int64_t field_id, int64_t chunk_id) const;
 
  private:

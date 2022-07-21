@@ -32,12 +32,19 @@ namespace fs = std::filesystem;
 
 /// Convert a Parquet file to lance file.
 arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) {
-  auto uri = fs::absolute(in_uri);
+  auto uri = in_uri;
+  if (!uri.starts_with("s3")) {
+    uri = fs::absolute(uri);
+  }
+  auto path = uri;
+  if (path.starts_with("s3")) {
+    path = uri.substr(std::string("s3://").size());
+  }
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri).ValueOrDie();
   auto factory =
       arrow::dataset::FileSystemDatasetFactory::Make(
           fs,
-          {in_uri},
+          {path},
           std::shared_ptr<arrow::dataset::FileFormat>(new arrow::dataset::ParquetFileFormat()),
           arrow::dataset::FileSystemFactoryOptions())
           .ValueOrDie();

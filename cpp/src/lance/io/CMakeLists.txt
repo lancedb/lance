@@ -23,6 +23,8 @@ add_library(
         filter.h
         pb.cc
         pb.h
+        project.cc
+        project.h
         reader.cc
         reader.h
         scanner.cc
