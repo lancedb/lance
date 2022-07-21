@@ -28,6 +28,9 @@ std::shared_ptr<::arrow::Array> Limit::Execute(const std::shared_ptr<::arrow::Ar
   }
   auto array_length = array->length();
   auto desired_length = Execute(array_length);
+  if (desired_length == 0 && array_length > 0) {
+    return nullptr;
+  }
   return array->Slice(0, desired_length);
 }
 

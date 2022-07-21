@@ -15,13 +15,32 @@
 #include "lance/io/limit_offset.h"
 
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <numeric>
 #include <vector>
 
 #include "lance/arrow/stl.h"
+
+TEST_CASE("Test Limit with length") {
+  auto limit = lance::io::Limit(100);
+  CHECK(limit.Execute(10) == 10);
+  CHECK(limit.Execute(80) == 80);
+  CHECK(limit.Execute(20) == 10);
+  // Limit already reached.
+  CHECK(limit.Execute(30) == 0);
+}
+
+TEST_CASE("Test Limit over Array") {
+  auto limit = lance::io::Limit(10);
+  auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+
+  CHECK(limit.Execute(nullptr) == nullptr);
+  CHECK(limit.Execute(arr)->Equals(arr));
+  CHECK(limit.Execute(arr->Slice(2))->Equals(arr->Slice(2)));
+  CHECK(limit.Execute(arr)->Equals(arr->Slice(0, 2)));
+  CHECK(limit.Execute(arr) == nullptr);
+}
 
 TEST_CASE("Test offsets") {
   auto offset = lance::io::Offset(100);
@@ -38,7 +57,6 @@ TEST_CASE("Test apply offset over arrays") {
 
   std::vector<int32_t> nums(20);
   std::iota(std::begin(nums), std::end(nums), 0);
-  fmt::print("Numbers: {}\n", nums);
   auto arr = lance::arrow::ToArray(nums).ValueOrDie();
 
   CHECK(!offset.Execute(nullptr).operator bool());

@@ -36,6 +36,7 @@ class Limit {
   /// \return a positive value. Returns 0 if the limit of records is reached.
   int32_t Execute(int32_t length);
 
+  /// Debug String
   std::string ToString() const;
 
  private:
@@ -58,6 +59,7 @@ class Offset {
   /// \return a positive value.
   std::optional<int32_t> Execute(int32_t length);
 
+  /// Debug String
   std::string ToString() const;
 
  private:
