@@ -49,7 +49,7 @@ std::shared_ptr<::arrow::Array> Offset::Execute(const std::shared_ptr<::arrow::A
   }
   auto offset = Execute(array->length());
   if (!offset.has_value()) {
-    return nullptr;
+    return array->Slice(0, 0);
   }
   return array->Slice(offset.value());
 }
