@@ -42,13 +42,13 @@ class Filter {
   /// For example, with a record batch of {"bar": [0, 2, 32, 5, 32]}, and filter "bar = 32",
   /// this function returns:
   ///
-  /// < UInt64Array({2, 4}), {"bar": [32, 32]} >
+  /// { Int32Array({2, 4}), RecordBatch({"bar": [32, 32]}) }
   ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
+      std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
       Execute(std::shared_ptr<::arrow::RecordBatch>) const;
 
   ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::UInt64Array>, std::shared_ptr<::arrow::RecordBatch>>>
+      std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
   Execute(std::shared_ptr<FileReader> reader, int32_t chunk_idx) const;
 
   const std::shared_ptr<lance::format::Schema>& schema() const;

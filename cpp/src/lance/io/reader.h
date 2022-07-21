@@ -65,7 +65,7 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
       const lance::format::Schema& schema,
       int32_t chunk_id,
-      std::shared_ptr<::arrow::UInt64Array> indices) const;
+      std::shared_ptr<::arrow::Int32Array> indices) const;
 
   /// Get file metadata.
   const lance::format::Metadata& metadata() const;
@@ -87,22 +87,22 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const lance::format::Schema& schema) const;
 
-  /// Consolidate read by offset and read by indices parameters.
-  struct GetArrayParams {
-    GetArrayParams(int32_t offset);
+  /// Array Read Parameters.
+  ///  - ReadAt offset + length.
+  ///  - Take elements by indices.
+  struct ArrayReadParams {
+    ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
 
-    GetArrayParams(int32_t offset, std::optional<int32_t> length);
-
-    GetArrayParams(std::shared_ptr<::arrow::UInt64Array> indices);
+    ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
 
     std::optional<int32_t> offset = std::nullopt;
     std::optional<int32_t> length = std::nullopt;
-    std::optional<std::shared_ptr<::arrow::UInt64Array>> indices = std::nullopt;
+    std::optional<std::shared_ptr<::arrow::Int32Array>> indices = std::nullopt;
   };
 
-  /// Read a chunk using GetArrayParams.
+  /// Read a chunk using ArrayReadParams.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
-      const lance::format::Schema& schema, int32_t chunk_id, const GetArrayParams& params) const;
+      const lance::format::Schema& schema, int32_t chunk_id, const ArrayReadParams& params) const;
 
   /// Get an ARRAY from column / file at chunk.
   ///
@@ -114,27 +114,27 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      const GetArrayParams& params) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      const GetArrayParams& params) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      const GetArrayParams& params) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetListArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      const GetArrayParams& params) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetDictionaryArray(
       const std::shared_ptr<lance::format::Field>& field,
       int chunk_id,
-      const GetArrayParams& params) const;
+      const ArrayReadParams& params) const;
 
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(
       int32_t idx, const lance::format::Schema& schema);

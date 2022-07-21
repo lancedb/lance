@@ -87,7 +87,7 @@ class Decoder {
   /// \param indices. The sorted array of indices within the page.
   /// \return an array of value if success.
   virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
-      std::shared_ptr<::arrow::UInt64Array> indices) const = 0;
+      std::shared_ptr<::arrow::Int32Array> indices) const = 0;
 
  protected:
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;

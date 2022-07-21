@@ -263,18 +263,18 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
     const lance::format::Schema& schema, int32_t chunk_id, std::optional<int32_t> length) const {
-  return ReadChunk(schema, chunk_id, GetArrayParams(0, length));
+  return ReadChunk(schema, chunk_id, ArrayReadParams(0, length));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
     const lance::format::Schema& schema,
     int32_t chunk_id,
-    std::shared_ptr<::arrow::UInt64Array> indices) const {
-  return ReadChunk(schema, chunk_id, GetArrayParams(indices));
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  return ReadChunk(schema, chunk_id, ArrayReadParams(indices));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
-    const lance::format::Schema& schema, int32_t chunk_id, const GetArrayParams& params) const {
+    const lance::format::Schema& schema, int32_t chunk_id, const ArrayReadParams& params) const {
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   /// TODO: GH-43. Read field in parallel.
   for (auto& field : schema.fields()) {
@@ -296,7 +296,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    const GetArrayParams& params) const {
+    const ArrayReadParams& params) const {
   auto dtype = field->type();
   if (is_struct(dtype)) {
     return GetStructArray(field, chunk_id, params);
@@ -312,7 +312,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetStructArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    const GetArrayParams& params) const {
+    const ArrayReadParams& params) const {
   ::arrow::ArrayVector children;
   std::vector<std::string> field_names;
   for (auto child : field->fields()) {
@@ -327,7 +327,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetListArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    const GetArrayParams& params) const {
+    const ArrayReadParams& params) const {
   if (params.indices.has_value()) {
     // TODO: GH-39. We should improve the read behavior to use indices to save some I/Os.
     auto& indices = params.indices.value();
@@ -370,7 +370,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetDictionaryArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    const GetArrayParams& params) const {
+    const ArrayReadParams& params) const {
   assert(::arrow::is_dictionary(field->type()->id()));
   return GetPrimitiveArray(field, chunk_id, params);
 }
@@ -378,7 +378,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetPrimitiveArray(
     const std::shared_ptr<lance::format::Field>& field,
     int chunk_id,
-    const GetArrayParams& params) const {
+    const ArrayReadParams& params) const {
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto pos, GetChunkOffset(field_id, chunk_id));
   ARROW_ASSIGN_OR_RAISE(auto chunk_length, lookup_table_->GetPageLength(field_id, chunk_id));
@@ -393,12 +393,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return result;
 }
 
-FileReader::GetArrayParams::GetArrayParams(int32_t off) : offset(off) {}
-
-FileReader::GetArrayParams::GetArrayParams(int32_t off, std::optional<int32_t> len)
+FileReader::ArrayReadParams::ArrayReadParams(int32_t off, std::optional<int32_t> len)
     : offset(off), length(len) {}
 
-FileReader::GetArrayParams::GetArrayParams(std::shared_ptr<::arrow::UInt64Array> idx)
+FileReader::ArrayReadParams::ArrayReadParams(std::shared_ptr<::arrow::Int32Array> idx)
     : indices(idx) {}
 
 }  // namespace lance::io

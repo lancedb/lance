@@ -60,7 +60,7 @@ TEST_CASE("value = 32") {
 
   auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
-  CHECK(indices->Equals(lance::arrow::ToArray<uint64_t>({2, 4}).ValueOrDie()));
+  CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
   bar = lance::arrow::ToArray({32, 32}).ValueOrDie();
   struct_arr =
@@ -80,7 +80,7 @@ TEST_CASE("label = cat or label = dog") {
 
   auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
-  CHECK(indices->Equals(lance::arrow::ToArray<uint64_t>({1, 2, 4}).ValueOrDie()));
+  CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 
   labels = lance::arrow::ToArray({"dog", "cat", "cat"}).ValueOrDie();
   struct_arr =

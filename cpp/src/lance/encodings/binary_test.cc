@@ -97,7 +97,7 @@ TEST_CASE("Take") {
 
   VarBinaryDecoder<::arrow::StringType> decoder(infile, ::arrow::utf8());
   decoder.Reset(offset, 100);
-  auto indices = lance::arrow::ToArray<uint64_t>({5, 10, 20}).ValueOrDie();
+  auto indices = lance::arrow::ToArray({5, 10, 20}).ValueOrDie();
   auto actual = decoder.Take(indices).ValueOrDie();
   auto expected = lance::arrow::ToArray({"5", "10", "20"}).ValueOrDie();
   CHECK(expected->Equals(actual));
