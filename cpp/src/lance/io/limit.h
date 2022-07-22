@@ -20,56 +20,33 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 
 namespace lance::io {
 
-
-/// Execution Plan for Offset clause
-class Offset {
- public:
-  Offset() = delete;
-
-  explicit Offset(int32_t offset) noexcept;
-
-  /// Apply offset to the input array.
-  std::shared_ptr<::arrow::Array> Execute(const std::shared_ptr<::arrow::Array>& array);
-
-  /// Apply offset to the size of the length.
-  ///
-  /// \return a positive value.
-  std::optional<int32_t> Execute(int32_t length);
-
-  /// Debug String
-  std::string ToString() const;
-
- private:
-  int32_t offset_ = 0;
-  int32_t seen_ = 0;
-};
-
-/// Plan for Limit clause.
+/// Plan for Limit clause:
+///
+///    LIMIT value:int64 [OFFSET value:int64]
+///
 class Limit {
  public:
   Limit() = delete;
 
-  explicit Limit(int32_t limit) noexcept;
-
-  /// Apply limit to the input array.
-  std::shared_ptr<::arrow::Array> Execute(const std::shared_ptr<::arrow::Array>& array);
+  explicit Limit(int64_t limit, int64_t offset = 0) noexcept;
 
   /// Apply limit to the size of the length.
   ///
-  /// \return a positive value. Returns 0 if the limit of records is reached.
-  int32_t Execute(int32_t length);
+  /// \return a tuple of [offset, length]. Return [0, 0] to skip a chunk.
+  /// Returns std::nullopt to indicate the end of the iteration.
+  std::optional<std::tuple<int64_t, int64_t>> Apply(int64_t length);
 
   /// Debug String
   std::string ToString() const;
 
  private:
-  int32_t limit_;
-  int32_t seen_ = 0;
-
-  std::unique_ptr<Offset> offset_;
+  int64_t limit_;
+  int64_t offset_ = 0;
+  int64_t seen_ = 0;
 };
 
 }  // namespace lance::io

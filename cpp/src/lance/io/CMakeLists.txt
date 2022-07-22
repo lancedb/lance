@@ -21,8 +21,8 @@ add_library(
         endian.h
         filter.cc
         filter.h
-        limit_offset.cc
-        limit_offset.h
+        limit.cc
+        limit.h
         pb.cc
         pb.h
         project.cc
@@ -39,4 +39,4 @@ target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(io format)
 
 add_lance_test(filter_test)
-add_lance_test(limit_offset_test)
+add_lance_test(limit_test)

@@ -19,6 +19,7 @@
 #include <arrow/result.h>
 
 #include <memory>
+#include <optional>
 
 namespace lance::format {
 class Schema;
@@ -37,21 +38,33 @@ class Project {
   Project() = delete;
 
   /// Make a Project from the full dataset schema and scan options.
+  ///
+  /// \param schema dataset schema.
+  /// \param scan_options Arrow scan options.
+  /// \param limit limit number of records to return. Optional.
+  /// \param offset offset to fetch the record. Optional.
+  /// \return Project if success. Returns the error status otherwise.
+  ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
       std::shared_ptr<format::Schema> schema,
-      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
+      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+      std::optional<int32_t> limit = std::nullopt,
+      int32_t offset = 0);
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t chunk_idx);
 
   /// Returns True if the plan supports parallel scan.
+  ///
   bool CanParallelScan() const;
 
  private:
   Project(std::shared_ptr<format::Schema> dataset_schema,
           std::shared_ptr<format::Schema> projected_schema,
           std::shared_ptr<format::Schema> scan_schema,
-          std::unique_ptr<Filter> filter);
+          std::unique_ptr<Filter> filter,
+          std::optional<int32_t> limit = std::nullopt,
+          int32_t offset = 0);
 
   std::shared_ptr<format::Schema> dataset_schema_;
   std::shared_ptr<format::Schema> projected_schema_;
