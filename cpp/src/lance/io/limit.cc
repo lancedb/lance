@@ -32,7 +32,7 @@ std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
     return std::nullopt;
   }
   auto read_to = std::min(length, offset_ + limit_ - seen_);
-  auto offset = std::max(0LL, offset_ - seen_);
+  auto offset = std::max(static_cast<int64_t>(0), offset_ - seen_);
   seen_ += length;
   if (seen_ < offset_) {
     /// No data to read.
