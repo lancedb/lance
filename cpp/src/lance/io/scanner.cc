@@ -34,14 +34,20 @@
 namespace lance::io {
 
 Scanner::Scanner(std::shared_ptr<FileReader> reader,
-                 std::shared_ptr<arrow::dataset::ScanOptions> options) noexcept
+                 std::shared_ptr<arrow::dataset::ScanOptions> options,
+                 std::optional<int64_t> limit,
+                 int64_t offset) noexcept
     : reader_(reader),
       options_(options),
+      limit_(limit),
+      offset_(offset),
       max_queue_size_(static_cast<std::size_t>(options->batch_readahead)) {}
 
 Scanner::Scanner(const Scanner& other) noexcept
     : reader_(other.reader_),
       options_(other.options_),
+      limit_(other.limit_),
+      offset_(other.offset_),
       schema_(other.schema_),
       project_(other.project_),
       current_chunk_(other.current_chunk_),
@@ -50,6 +56,8 @@ Scanner::Scanner(const Scanner& other) noexcept
 Scanner::Scanner(Scanner&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
+      limit_(other.limit_),
+      offset_(other.offset_),
       schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
       current_chunk_(other.current_chunk_),
@@ -58,7 +66,7 @@ Scanner::Scanner(Scanner&& other) noexcept
 
 ::arrow::Status Scanner::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_));
+  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_, limit_, offset_));
   if (!project_->CanParallelScan()) {
     max_queue_size_ = 1;
   }
