@@ -42,6 +42,8 @@ std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
   return std::make_tuple(offset, read_to - offset);
 }
 
-std::string Limit::ToString() const { return fmt::format("Limit(n={})", limit_); }
+std::string Limit::ToString() const {
+  return fmt::format("Limit(n={}, offset={})", limit_, offset_);
+}
 
 }  // namespace lance::io

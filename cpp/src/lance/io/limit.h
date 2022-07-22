@@ -26,12 +26,13 @@ namespace lance::io {
 
 /// Plan for Limit clause:
 ///
-///    LIMIT value:int64 [OFFSET value:int64]
+///   LIMIT value:int64 [OFFSET value:int64]
 ///
 class Limit {
  public:
   Limit() = delete;
 
+  /// Construct a Limit Clause with limit, and optionally, offset.
   explicit Limit(int64_t limit, int64_t offset = 0) noexcept;
 
   /// Apply limit to the size of the length.
@@ -44,7 +45,7 @@ class Limit {
   std::string ToString() const;
 
  private:
-  int64_t limit_;
+  int64_t limit_ = 0;
   int64_t offset_ = 0;
   int64_t seen_ = 0;
 };

@@ -39,7 +39,9 @@ class Scanner {
  public:
   /// Constructor.
   Scanner(std::shared_ptr<FileReader> reader,
-          std::shared_ptr<::arrow::dataset::ScanOptions> options) noexcept;
+          std::shared_ptr<::arrow::dataset::ScanOptions> options,
+          std::optional<int64_t> limit = std::nullopt,
+          int64_t offset = 0) noexcept;
 
   /// Copy constructor.
   Scanner(const Scanner& other) noexcept;

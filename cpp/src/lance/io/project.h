@@ -56,6 +56,8 @@ class Project {
 
   /// Returns True if the plan supports parallel scan.
   ///
+  /// TODO: should we remove this LIMIT / OFFSET logic, and the decision about parallel scan
+  /// out of the format spec?
   bool CanParallelScan() const;
 
  private:
