@@ -70,6 +70,7 @@ class Scanner {
   std::shared_ptr<Project> project_;
 
   int current_chunk_ = 0;
+  std::size_t max_queue_size_ = 1;
   std::queue<std::future<::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>>> q_;
 
   void AddPrefetchTask();

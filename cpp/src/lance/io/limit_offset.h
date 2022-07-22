@@ -23,28 +23,6 @@
 
 namespace lance::io {
 
-/// Plan for Limit clause.
-class Limit {
- public:
-  Limit() = delete;
-
-  explicit Limit(int32_t limit) noexcept;
-
-  /// Apply limit to the input array.
-  std::shared_ptr<::arrow::Array> Execute(const std::shared_ptr<::arrow::Array>& array);
-
-  /// Apply limit to the size of the length.
-  ///
-  /// \return a positive value. Returns 0 if the limit of records is reached.
-  int32_t Execute(int32_t length);
-
-  /// Debug String
-  std::string ToString() const;
-
- private:
-  int32_t limit_;
-  int32_t seen_ = 0;
-};
 
 /// Execution Plan for Offset clause
 class Offset {
@@ -67,6 +45,31 @@ class Offset {
  private:
   int32_t offset_ = 0;
   int32_t seen_ = 0;
+};
+
+/// Plan for Limit clause.
+class Limit {
+ public:
+  Limit() = delete;
+
+  explicit Limit(int32_t limit) noexcept;
+
+  /// Apply limit to the input array.
+  std::shared_ptr<::arrow::Array> Execute(const std::shared_ptr<::arrow::Array>& array);
+
+  /// Apply limit to the size of the length.
+  ///
+  /// \return a positive value. Returns 0 if the limit of records is reached.
+  int32_t Execute(int32_t length);
+
+  /// Debug String
+  std::string ToString() const;
+
+ private:
+  int32_t limit_;
+  int32_t seen_ = 0;
+
+  std::unique_ptr<Offset> offset_;
 };
 
 }  // namespace lance::io
