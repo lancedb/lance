@@ -64,7 +64,10 @@ find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND CMAKE_MODULE_PATH /usr/lib/x86_64-linux-gnu/cmake/arrow)
+    list(APPEND CMAKE_MODULE_PATH
+            /usr/lib/x86_64-linux-gnu/cmake/arrow
+            /usr/lib64/cmake/arrow
+            )
 endif ()
 
 if (APPLE)
