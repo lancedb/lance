@@ -21,6 +21,7 @@
 
 #include "lance/arrow/utils.h"
 #include "lance/io/filter.h"
+#include "lance/io/limit.h"
 #include "lance/io/reader.h"
 
 namespace lance::io {
@@ -28,15 +29,20 @@ namespace lance::io {
 Project::Project(std::shared_ptr<format::Schema> dataset_schema,
                  std::shared_ptr<format::Schema> projected_schema,
                  std::shared_ptr<format::Schema> scan_schema,
-                 std::unique_ptr<Filter> filter)
+                 std::unique_ptr<Filter> filter,
+                 std::optional<int32_t> limit,
+                 int32_t offset)
     : dataset_schema_(dataset_schema),
       projected_schema_(projected_schema),
       scan_schema_(scan_schema),
-      filter_(std::move(filter)) {}
+      filter_(std::move(filter)),
+      limit_(limit.has_value() ? new Limit(limit.value(), offset) : nullptr) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     std::shared_ptr<format::Schema> schema,
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+    std::optional<int32_t> limit,
+    int32_t offset) {
   ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(*schema, scan_options->filter));
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
@@ -49,8 +55,10 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
     ARROW_ASSIGN_OR_RAISE(scan_schema, projected_schema->Exclude(filter->schema()));
   }
   return std::unique_ptr<Project>(
-      new Project(schema, projected_schema, scan_schema, std::move(filter)));
+      new Project(schema, projected_schema, scan_schema, std::move(filter), limit, offset));
 }
+
+bool Project::CanParallelScan() const { return limit_.operator bool(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
     std::shared_ptr<FileReader> reader, int32_t chunk_idx) {
@@ -60,6 +68,18 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
       return result.status();
     }
     auto [indices, values] = result.ValueUnsafe();
+    assert(indices->length() == values->num_rows());
+    if (limit_) {
+      auto offset_and_len = limit_->Apply(indices->length());
+      if (!offset_and_len.has_value()) {
+        /// Indicate the end of iteration.
+        return nullptr;
+      }
+      auto [offset, len] = offset_and_len.value();
+      indices =
+          std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
+      values = values->Slice(offset, len);
+    }
     ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*scan_schema_, chunk_idx, indices));
     assert(values->num_rows() == batch->num_rows());
     ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));

@@ -39,7 +39,9 @@ class Scanner {
  public:
   /// Constructor.
   Scanner(std::shared_ptr<FileReader> reader,
-          std::shared_ptr<::arrow::dataset::ScanOptions> options) noexcept;
+          std::shared_ptr<::arrow::dataset::ScanOptions> options,
+          std::optional<int64_t> limit = std::nullopt,
+          int64_t offset = 0) noexcept;
 
   /// Copy constructor.
   Scanner(const Scanner& other) noexcept;
@@ -65,11 +67,14 @@ class Scanner {
 
   std::shared_ptr<FileReader> reader_;
   std::shared_ptr<::arrow::dataset::ScanOptions> options_;
+  std::optional<int64_t> limit_ = std::nullopt;
+  int64_t offset_ = 0;
   std::shared_ptr<lance::format::Schema> schema_;
   /// Projection over the dataset.
   std::shared_ptr<Project> project_;
 
   int current_chunk_ = 0;
+  std::size_t max_queue_size_ = 1;
   std::queue<std::future<::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>>> q_;
 
   void AddPrefetchTask();
