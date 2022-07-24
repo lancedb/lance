@@ -31,7 +31,7 @@ class FileReader;
 class Filter;
 class Limit;
 
-/// Projection over dataset.
+/// \brief Projection over dataset.
 ///
 class Project {
  public:
@@ -54,9 +54,11 @@ class Project {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t chunk_idx);
 
-  /// Returns True if the plan supports parallel scan.
+  /// \brief Can the plan support parallel scan.
   ///
-  /// TODO: should we remove this LIMIT / OFFSET logic, and the decision about parallel scan
+  /// \note Once Projection has limit / offset clause, parallel reads are limited.
+  ///
+  /// \todo GH-43. should we remove this LIMIT / OFFSET logic, and the decision about parallel scan
   /// out of the format spec?
   bool CanParallelScan() const;
 
