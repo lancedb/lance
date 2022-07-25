@@ -13,6 +13,11 @@ Lance is a *cloud-native columnar data format* designed for unstructured machine
 * Cloud-native optimizations on low-cost cloud storage, i.e., AWS S3, Google GCS, or Azure Blob Storage.
 * Open access via first-class [Apache Arrow](https://arrow.apache.org/) integration and multi-language support.
 
+Non-goals:
+
+* A new SQL engine
+* A new ML framework
+
 ## How to Use Lance
 
 Thanks for its Apache Arrow-first APIs, `lance` can be used as a native `Arrow` extension.
