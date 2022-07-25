@@ -4,20 +4,18 @@
 
 Lance is a *cloud-native columnar data format* designed for unstructured machine learning datasets, featuring:
 
-* Fast columnar scan for ML dataset analysis, ML training and evaluation.
+* Fast columnar scan for ML dataset analysis, ML training, and evaluation.
 * Encodings that are capable of fast point queries for interactive data exploration.
 * Extensible design for index and predicates pushdown.
-* Self-describable, nested and strong-typed data with an extensible type system.
+* Self-describable, nested, and strong-typed data with an extensible type system. Support Image, Video, Audio and Sensor
+  Data. Support Annotations and Tensors.
 * Schema evolution and update (TODO).
-* Cloud-native optimizations on low-cost cloud storage, i.e., AWS S3, Google GCS or Azure Blob Storage.
-* First-class [Apache Arrow](https://arrow.apache.org/) integration and multi-languages support.
+* Cloud-native optimizations on low-cost cloud storage, i.e., AWS S3, Google GCS, or Azure Blob Storage.
+* Open access via first-class [Apache Arrow](https://arrow.apache.org/) integration and multi-language support.
 
 ## Why
 
-Why do you build Lance from scratch, instead of using [Parquet](https://parquet.apache.org/)
-, [ORC](https://orc.apache.org/) or [Tfrecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
-
-We envision that a typical Machine Learning cycle involves the following steps:
+Machine Learning development cycle involves the steps:
 
 ```mermaid
 graph LR
@@ -25,9 +23,23 @@ graph LR
     B --> C[Analytics];
     C --> D[Feature Engineer];
     D --> E[Training];
-    E -- Evaluation --> C;
+    E --> F[Evaluation];
+    F --> C;
+    E --> G[Deployment];
+    G --> H[Monitoring];
+    H --> A;
 ```
 
+People use different data representations to varying stages for performance or tooling available.
+The academia mainly uses XML / JSON for annotations and zipped images/sensors data for deep learning.
+While the industry uses data lake (Parquet-based techniques, i.e., Delta Lake, Iceberg) or data warehouse (AWS Redshift
+or Google BigQuery) to collect and analyze data, they have to convert the data into training-friendly formats, such
+as [Rikai](https://github.com/eto-ai/rikai)/ [Petastorm](https://github.com/uber/petastorm)
+or [Tfrecord](https://www.tensorflow.org/tutorials/load_data/tfrecord).
+Multiple single-purpose data transforms, as well as syncing copies between cloud storage to local training
+instances have become a common practice among ML practices.
+
+The comparison of different storage technology in each stage of ML development cycle.
 
 |                     | Lance | Parquet & ORC | JSON & XML | Tfrecord | Database | Warehouse |
 |---------------------|-------|---------------|------------|----------|----------|-----------|
