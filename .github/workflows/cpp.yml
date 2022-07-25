@@ -40,7 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Install dependencies
-        run: brew install apache-arrow protobuf
+        run: |
+          brew update
+          brew install apache-arrow protobuf
       - name: Cmake
         run: cmake -B build
       - name: Build
