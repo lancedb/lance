@@ -1,4 +1,6 @@
-# Lance: A Columnar Data Format
+# Lance: A Columnar Data Format for Deep Learning
+
+## Introduction
 
 
 ## Presentations and Talks
