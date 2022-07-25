@@ -50,3 +50,6 @@ python/lance/_lib.cpp
 *.parquet
 *.parq
 *.lance
+
+python/thirdparty/arrow/
+python/wheels

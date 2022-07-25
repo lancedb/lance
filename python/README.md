@@ -53,12 +53,12 @@ source ${HOME}/.venv/lance/bin/activate
 python setup.py develop
 ```
 
-Test the installation in python:
+Test the installation in python using duckdb (`pip install duckdb`):
 
 ```python
 import duckdb
-import pylance
-uri = "..../pet.lance"
-pets = pylance.dataset(uri)
+import lance
+uri = "s3://eto-public/datasets/oxford_pet/pet.lance"
+pets = lance.dataset(uri)
 duckdb.query('select label, count(1) from pets group by label').to_arrow_table()
 ```
