@@ -88,3 +88,8 @@ TEST_CASE("Exclude schema") {
   INFO("Expected: " << expected->ToString() << "\nActual: " << excluded->ToString());
   CHECK(excluded->Equals(expected));
 }
+
+TEST_CASE("Get Field Counts") {
+  auto schema = lance::format::Schema(arrow_schema);
+  CHECK(schema.GetFieldsCount() == 9);
+}

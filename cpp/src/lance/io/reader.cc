@@ -298,6 +298,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field,
     int32_t batch_id,
     const ArrayReadParams& params) const {
+  fmt::print("Read field: {} {}\n", field->name(), field->id());
   auto dtype = field->type();
   if (is_struct(dtype)) {
     return GetStructArray(field, batch_id, params);
@@ -358,7 +359,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
   if (!result.ok()) {
-    fmt::print("GetListArray: field={}, batch_id={}, start={}, length={}\nReason:{}\n",
+    fmt::print("GetListArray: field={}, batch_id_={}, start={}, length={}\nReason:{}\n",
                field->name(),
                batch_id,
                start,

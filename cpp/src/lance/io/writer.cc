@@ -77,7 +77,7 @@ FileWriter::~FileWriter() {}
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
   }
-  chunk_id_++;
+  batch_id_++;
   return ::arrow::Status::OK();
 }
 
@@ -102,7 +102,7 @@ FileWriter::~FileWriter() {}
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
-  lookup_table_.SetPageInfo(field_id, chunk_id_, pos, arr->length());
+  lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
 
@@ -139,7 +139,7 @@ FileWriter::~FileWriter() {}
   }
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
-  lookup_table_.SetPageInfo(field_id, chunk_id_, pos, arr->length());
+  lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
 

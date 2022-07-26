@@ -16,7 +16,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "lance/format/format.pb.h"
 #include "lance/format/page_table.h"
 
 using lance::format::PageTable;

@@ -66,7 +66,7 @@ class FileWriter final : public ::arrow::dataset::FileWriter {
   std::shared_ptr<lance::format::Schema> lance_schema_;
   std::unique_ptr<lance::format::Metadata> metadata_;
   format::PageTable lookup_table_;
-  int32_t chunk_id_ = 0;
+  int32_t batch_id_ = 0;
 };
 
 }  // namespace lance::io

@@ -499,7 +499,7 @@ std::shared_ptr<Field> Schema::GetField(const std::string& name) const {
 int32_t Schema::GetFieldsCount() const {
   int32_t cnt = fields_.size();
   for (auto& field : fields_) {
-    field->GetFieldsCount();
+    cnt += field->GetFieldsCount();
   }
   return cnt;
 }

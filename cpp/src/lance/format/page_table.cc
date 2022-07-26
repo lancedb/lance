@@ -15,6 +15,8 @@
 #include "lance/format/page_table.h"
 
 #include <arrow/builder.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <memory>
 #include <vector>
@@ -25,6 +27,11 @@ void PageTable::SetPageInfo(int32_t column_id,
                             int32_t batch_id,
                             int64_t position,
                             int64_t length) noexcept {
+  fmt::print("Setting page info: column_id={} batch_id={} position={} length={}\n",
+             column_id,
+             batch_id,
+             position,
+             length);
   page_info_map_[column_id][batch_id] = std::make_tuple(position, length);
 }
 
@@ -55,16 +62,16 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
   for (int32_t column_id = 0; column_id < num_columns; ++column_id) {
     for (int32_t batch_id = 0; batch_id < num_batches; ++batch_id) {
       auto page_info = GetPageInfo(column_id, batch_id);
-      if (page_info.has_value()) {
-        ARROW_RETURN_NOT_OK(builder.Append(std::get<0>(page_info.value())));
-        ARROW_RETURN_NOT_OK(builder.Append(std::get<1>(page_info.value())));
-      }
+      auto [position, length] = page_info.value_or(std::make_tuple(-1, -1));
+      ARROW_RETURN_NOT_OK(builder.Append(position));
+      ARROW_RETURN_NOT_OK(builder.Append(length));
     }
   }
   ARROW_ASSIGN_OR_RAISE(auto page_table, builder.Finish());
   ARROW_ASSIGN_OR_RAISE(auto pos, out->Tell());
   ARROW_RETURN_NOT_OK(
       out->Write(std::static_pointer_cast<::arrow::Int64Array>(page_table)->values()));
+  fmt::print("Write page table {} to pos={}\n", page_info_map_, pos);
   return pos;
 }
 
@@ -73,23 +80,26 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
     int64_t page_table_position,
     int32_t num_columns,
     int32_t num_batches) {
-  ARROW_ASSIGN_OR_RAISE(auto buf,
-                        in->ReadAt(page_table_position,
-                                   (num_columns * num_batches * 2 * sizeof(int64_t))));
+  fmt::print("Read PageTable at: pos={}, cols={} batches={}\n",
+             page_table_position,
+             num_columns,
+             num_batches);
+  ARROW_ASSIGN_OR_RAISE(
+      auto buf, in->ReadAt(page_table_position, (num_columns * num_batches * 2 * sizeof(int64_t))));
 
   auto arr = ::arrow::Int64Array(num_columns * num_batches * 2, buf);
 
   auto lt = std::make_shared<PageTable>();
-  for (int col = 0; col < num_columns; col++) {
-    for (int ch = 0; ch < num_batches; ch++) {
-      auto idx = col * num_batches + ch;
+  for (int32_t col = 0; col < num_columns; col++) {
+    for (int32_t batch = 0; batch < num_batches; batch++) {
+      auto idx = col * num_batches + batch;
       auto position = arr.Value(idx * 2);
       auto length = arr.Value(idx * 2 + 1);
-      lt->SetPageInfo(col, ch, position, length);
+      lt->SetPageInfo(col, batch, position, length);
     }
   }
+  fmt::print("Lookup map is: {}\n", lt->page_info_map_);
   return lt;
 }
-
 
 }  // namespace lance::format

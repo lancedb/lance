@@ -55,7 +55,7 @@ message Metadata {
   // Position of the manifest in the file. If it is zero, the manifest is stored externally.
   uint64 manifest_position = 1;
 
-  /** Logical offsets of each chunk group, i.e., number of the rows in each chunk. */
+  // Logical offsets of each chunk group, i.e., number of the rows in each chunk.
   repeated int32 batch_offsets = 2;
 
   // The file position to store page position table.
