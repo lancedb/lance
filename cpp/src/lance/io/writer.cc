@@ -101,7 +101,6 @@ FileWriter::~FileWriter() {}
                                                 const std::shared_ptr<::arrow::Array>& arr) {
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
-  lookup_table_.AddPageLength(field_id, chunk_id_, arr->length());
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
   lookup_table_.SetPageInfo(field_id, chunk_id_, pos, arr->length());
   return ::arrow::Status::OK();
@@ -150,8 +149,7 @@ FileWriter::~FileWriter() {}
   ARROW_RETURN_NOT_OK(visitor.VisitSchema(lance_schema_));
 
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
-  metadata_->SetChunkPosition(pos);
-  lookup_table_.WritePageLengthTo(&metadata_->pb());
+  metadata_->SetPageTablePosition(pos);
 
   std::string primary_key;
   if (options_->type_name() == lance::arrow::LanceFileFormat::Make()->type_name()) {
