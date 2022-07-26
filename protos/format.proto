@@ -36,51 +36,42 @@ Format:
 |        <metadata position>             |
 | MAJOR_VERSION | MINOR_VERSION | "NFFT" |
 +----------------------------------------+
+
  */
 
-//option optimize_for = LITE_RUNTIME;
+// Manifest is a global section shared between all the files.
+message Manifest {
+  // Primary key column of the dataset.
+  string primary_key = 1;
+  
+  // All fields in the dataset.
+  repeated Field fields = 2;
+}
 
-/**
- File-level Metadata, at the end of a file:.
+/*
+ File-level Metadata.
 */
 message Metadata {
-  // The start row id of this file. Row ID is a monotonic increasing number,
-  // used to identify a row globally.
-  uint64 start_row_id = 1;
-
   /**
    Position the manifest in the file.
    If it is zero, the manifest is stored externally.
   */
-  uint64 manifest_position = 2;
+  uint64 manifest_position = 1;
 
   /** Logical offsets of each chunk group, i.e., number of the rows in each chunk. */
-  repeated int32 chunk_offsets = 3;
+  repeated int32 chunk_offsets = 2;
 
-  /**
-    The position in the file, where the lookup up table of all columns is stored.
+  // The file position to store page offset table.
+  //
+  // The lookup table of each column is stored as an NxM int64_t array:
+  // chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
+  uint64 page_offsets_position = 3;
 
-    The lookup table of each column is stored as an NxM int64_t array:
-      - chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
-   */
-  uint64 chunk_position = 4;
-
-  /// The physical length of each chunk (page).
-  ///
-  /// Put page count here for now, not final decision?
-  /// This should be a M * N array.
-  /// Not sure whether we want store the
-  repeated int64 page_lengths = 5;
-}
-
-/*
- * Manifest is a global section shared between all the files.
- */
-message Manifest {
-  string primary_key = 1;
-
-  /* All fields in the dataset */
-  repeated Field fields = 2;
+  // The number of values in each page.
+  //
+  // Note that this number is not always the same with the chunk_length when
+  // the it represents a nested column.
+  uint64 page_lengths_position = 4;
 }
 
 /// Supported encodings.

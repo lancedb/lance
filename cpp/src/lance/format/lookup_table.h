@@ -32,6 +32,17 @@ class LookupTable {
  public:
   LookupTable() = default;
 
+  /// Read lookup table from the opened file.
+  ///
+  /// \param in The input file to read
+  /// \param offset
+  /// \param pb
+  /// \return
+  static ::arrow::Result<std::shared_ptr<LookupTable>> Read(
+      const std::shared_ptr<::arrow::io::RandomAccessFile>& in,
+      int64_t offset,
+      const pb::Metadata& pb);
+
   void AddOffset(int32_t column, int32_t chunk, int64_t offset);
 
   void AddPageLength(int32_t column, int32_t chunk, int64_t length);
@@ -40,21 +51,16 @@ class LookupTable {
   ///
   /// \param column_id the column / field ID.
   /// \param chunk_id the chunk id.
-  /// \return file offset if available.
+  /// \return file offset if available. Returns `std::nullopt` if the chunk does not have
+  ///         physical data, for example, for a parent field node.
   std::optional<int64_t> GetOffset(int32_t column_id, int32_t chunk_id) const;
 
   ::arrow::Result<int64_t> GetPageLength(int32_t column_id, int32_t chunk_id) const;
 
+  /// Write LookupTable to persistent storage.
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out);
 
   void WritePageLengthTo(pb::Metadata* out);
-
-  /// Read lookup table from the opened file.
-  ///
-  static ::arrow::Result<std::shared_ptr<LookupTable>> Read(
-      const std::shared_ptr<::arrow::io::RandomAccessFile>& in,
-      int64_t offset,
-      const pb::Metadata& pb);
 
  private:
   /// Map<column, Map<chunk, offset>>

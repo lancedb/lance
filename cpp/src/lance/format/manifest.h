@@ -42,7 +42,7 @@ class Manifest final {
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
 
-  ~Manifest();
+  ~Manifest() = default;
 
   /// Parse a Manifest from input file at the offset.
   static ::arrow::Result<std::shared_ptr<Manifest>> Parse(

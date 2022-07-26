@@ -22,10 +22,8 @@ Manifest::Manifest(const std::string& primary_key, std::shared_ptr<Schema> schem
   }
 }
 
-Manifest::Manifest(Manifest&& other)
+Manifest::Manifest(Manifest&& other) noexcept
     : primary_key_(other.primary_key_), schema_(std::move(other.schema_)) {}
-
-Manifest::~Manifest() {}
 
 ::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
     std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset) {
