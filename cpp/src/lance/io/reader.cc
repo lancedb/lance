@@ -30,9 +30,9 @@
 #include "lance/encodings/binary.h"
 #include "lance/encodings/plain.h"
 #include "lance/format/format.h"
-#include "lance/format/lookup_table.h"
 #include "lance/format/manifest.h"
 #include "lance/format/metadata.h"
+#include "lance/format/page_table.h"
 #include "lance/format/schema.h"
 #include "lance/io/endian.h"
 
@@ -90,7 +90,7 @@ Status FileReader::Open() {
 
   ARROW_ASSIGN_OR_RAISE(
       lookup_table_,
-      format::LookupTable::Read(file_, metadata_->chunk_position(), metadata_->pb()));
+      format::PageTable::Read(file_, metadata_->chunk_position(), metadata_->pb()));
   return Status::OK();
 }
 
@@ -220,7 +220,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   std::vector<std::shared_ptr<::arrow::ChunkedArray>> columns;
   for (auto& field : schema.fields()) {
     ::arrow::ArrayVector chunks;
-    for (int i = 0; i < metadata_->num_chunks(); i++) {
+    for (int i = 0; i < metadata_->num_batches(); i++) {
       ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, i, 0));
       chunks.emplace_back(arr);
     }
@@ -241,8 +241,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     // Make a local copy?
     auto ckid = chunk_id;
     auto ck_index = idx_in_chunk;
-    while (len > 0 && ckid < metadata_->num_chunks()) {
-      auto page_length = metadata_->GetChunkLength(chunk_id);
+    while (len > 0 && ckid < metadata_->num_batches()) {
+      auto page_length = metadata_->GetBatchLength(chunk_id);
       auto length_in_chunk = std::min(len, page_length - ck_index);
       ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, ckid, {ck_index, length_in_chunk}));
       len -= length_in_chunk;

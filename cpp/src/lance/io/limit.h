@@ -44,7 +44,7 @@ class Limit {
   /// Return `std::nullopt` to indicate the end of the iteration.
   ///
   /// \code{.cpp}
-  /// auto chunk_length = GetChunkLength(chunk_id);
+  /// auto chunk_length = GetBatchLength(chunk_id);
   /// auto limit = Limit(20, 30);
   /// auto offset_and_length = limit.Apply(chunk_length);
   /// if (!offset_and_length) {

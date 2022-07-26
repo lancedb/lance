@@ -20,32 +20,37 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <vector>
 
 namespace lance::format {
 
-namespace pb {
-class Metadata;
-}
-
-class LookupTable {
+/// PageTable lookup table for pages.
+class PageTable {
  public:
-  LookupTable() = default;
+  using PageInfo = std::tuple<int64_t, int64_t>;
 
-  /// Read lookup table from the opened file.
+  PageTable() = default;
+
+  /// Make the page table from an opened file.
   ///
   /// \param in The input file to read
-  /// \param offset
-  /// \param pb
-  /// \return
-  static ::arrow::Result<std::shared_ptr<LookupTable>> Read(
+  /// \param page_table_position The file position to the page table.
+  /// \param num_columns the total number of columns, including the nested columns.
+  /// \param num_batches the total number of batches in the file.
+  ///
+  /// \return a LookupTable if success.
+  static ::arrow::Result<std::shared_ptr<PageTable>> Make(
       const std::shared_ptr<::arrow::io::RandomAccessFile>& in,
-      int64_t offset,
-      const pb::Metadata& pb);
+      int64_t page_table_position,
+      int32_t num_columns,
+      int32_t num_batches);
 
-  void AddOffset(int32_t column, int32_t chunk, int64_t offset);
+  /// Set PageInfo.
+  void SetPageInfo(int32_t column_id, int32_t batch_id, int64_t position, int64_t length) noexcept;
 
-  void AddPageLength(int32_t column, int32_t chunk, int64_t length);
+  /// Get PageInfo
+  std::optional<PageInfo> GetPageInfo(int32_t column_id, int32_t batch_id) const noexcept;
 
   /// Get the file offset of a chunk of a array.
   ///
@@ -55,21 +60,19 @@ class LookupTable {
   ///         physical data, for example, for a parent field node.
   std::optional<int64_t> GetOffset(int32_t column_id, int32_t chunk_id) const;
 
-  ::arrow::Result<int64_t> GetPageLength(int32_t column_id, int32_t chunk_id) const;
 
-  /// Write LookupTable to persistent storage.
-  ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out);
-
-  void WritePageLengthTo(pb::Metadata* out);
+  /// Write PageTable to a file.
+  ///
+  /// \param out the output stream to write page table to.
+  /// \return file position if success.
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::io::OutputStream>& out);
 
  private:
   /// Map<column, Map<chunk, offset>>
-  std::map<int32_t, std::map<int32_t, int64_t>> offsets_;
+  std::map<int32_t, std::map<int32_t, PageInfo>> page_info_map_;
 
   /// Map<column, Map<chunk, length>>
   std::map<int32_t, std::map<int32_t, int64_t>> lengths_;
-
-  std::vector<int64_t> page_lengths_;
 };
 
 }  // namespace lance::format

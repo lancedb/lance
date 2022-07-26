@@ -44,7 +44,7 @@ message Manifest {
   // Primary key column of the dataset.
   string primary_key = 1;
   
-  // All fields in the dataset.
+  // All fields of the dataset, including the nested fields.
   repeated Field fields = 2;
 }
 
@@ -52,26 +52,17 @@ message Manifest {
  File-level Metadata.
 */
 message Metadata {
-  /**
-   Position the manifest in the file.
-   If it is zero, the manifest is stored externally.
-  */
+  // Position of the manifest in the file. If it is zero, the manifest is stored externally.
   uint64 manifest_position = 1;
 
   /** Logical offsets of each chunk group, i.e., number of the rows in each chunk. */
-  repeated int32 chunk_offsets = 2;
+  repeated int32 batch_offsets = 2;
 
-  // The file position to store page offset table.
+  // The file position to store page position table.
   //
   // The lookup table of each column is stored as an NxM int64_t array:
   // chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
-  uint64 page_offsets_position = 3;
-
-  // The number of values in each page.
-  //
-  // Note that this number is not always the same with the chunk_length when
-  // the it represents a nested column.
-  uint64 page_lengths_position = 4;
+  uint64 page_table_position = 3;
 }
 
 /// Supported encodings.

@@ -25,12 +25,12 @@ add_library(
         ${PROTO_HDRS}
         ${PROTO_SRCS}
         format.h
-        lookup_table.cc
-        lookup_table.h
         manifest.cc
         manifest.h
         metadata.cc
         metadata.h
+        page_table.cc
+        page_table.h
         schema.cc
         schema.h
         visitors.cc
@@ -38,6 +38,6 @@ add_library(
 )
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
-add_lance_test(lookup_table_test)
 add_lance_test(metadata_test)
+add_lance_test(page_table_test)
 add_lance_test(schema_test)

@@ -5,9 +5,9 @@
 TEST_CASE("Test locate chunk") {
 
   auto metadata = lance::format::Metadata();
-  metadata.AddChunkOffset(10);
-  metadata.AddChunkOffset(20);
-  metadata.AddChunkOffset(30);
+  metadata.AddBatchLength(10);
+  metadata.AddBatchLength(20);
+  metadata.AddBatchLength(30);
 
   {
     auto [chunk, idx] = metadata.LocateChunk(0).ValueOrDie();

@@ -23,7 +23,7 @@
 
 namespace lance::format {
 class Field;
-class LookupTable;
+class PageTable;
 class Manifest;
 class Metadata;
 class Schema;
@@ -160,7 +160,7 @@ class FileReader {
   ::arrow::MemoryPool* pool_;
   std::shared_ptr<lance::format::Metadata> metadata_;
   std::shared_ptr<lance::format::Manifest> manifest_;
-  std::shared_ptr<lance::format::LookupTable> lookup_table_;
+  std::shared_ptr<lance::format::PageTable> lookup_table_;
 
   std::shared_ptr<::arrow::Buffer> cached_last_page_;
 };

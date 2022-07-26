@@ -40,13 +40,14 @@ class Metadata final {
   static ::arrow::Result<std::shared_ptr<Metadata>> Make(
       const std::shared_ptr<::arrow::Buffer>& buffer);
 
-  /// Get the number of chunks in this. file.
-  int32_t num_chunks() const;
+  /// Get the number of batches in this file.
+  int32_t num_batches() const;
 
-  void AddChunkOffset(int32_t chunk_length);
+  /// Add the length of the batch.
+  void AddBatchLength(int32_t length);
 
   /// Get the logical length of a chunk.
-  int32_t GetChunkLength(int32_t chunk_id) const;
+  int32_t GetBatchLength(int32_t batch_id) const;
 
   /// Locate the chunk index where the idx belongs.
   ///
@@ -57,9 +58,11 @@ class Metadata final {
   /// Get the number of records in this file.
   int64_t length() const;
 
-  int64_t chunk_position() const { return pb_.chunk_position(); }
+  /// Get the file position to the page table.
+  int64_t page_table_position() const;
 
-  void SetChunkPosition(int64_t position);
+  /// Set the position of the page table.
+  void SetPageTablePosition(int64_t position);
 
   ::arrow::Result<std::shared_ptr<Manifest>> GetManifest(
       std::shared_ptr<::arrow::io::RandomAccessFile> in);

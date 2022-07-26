@@ -74,7 +74,7 @@ Scanner::Scanner(Scanner&& other) noexcept
 }
 
 void Scanner::AddPrefetchTask() {
-  while (q_.size() < max_queue_size_ && current_chunk_ < reader_->metadata().num_chunks()) {
+  while (q_.size() < max_queue_size_ && current_chunk_ < reader_->metadata().num_batches()) {
     auto chunk_id = current_chunk_++;
     auto f = std::async(
         [&](int32_t chunk_id) {

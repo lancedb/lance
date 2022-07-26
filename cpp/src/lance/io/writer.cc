@@ -72,7 +72,7 @@ FileWriter::FileWriter(std::shared_ptr<::arrow::Schema> schema,
 FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::Write(const std::shared_ptr<::arrow::RecordBatch>& batch) {
-  metadata_->AddChunkOffset(batch->num_rows());
+  metadata_->AddBatchLength(batch->num_rows());
 
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
@@ -103,7 +103,7 @@ FileWriter::~FileWriter() {}
   auto encoder = field->GetEncoder(destination_);
   lookup_table_.AddPageLength(field_id, chunk_id_, arr->length());
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
-  lookup_table_.AddOffset(field_id, chunk_id_, pos);
+  lookup_table_.SetPageInfo(field_id, chunk_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
 
@@ -139,9 +139,8 @@ FileWriter::~FileWriter() {}
     ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
   }
   auto field_id = field->id();
-  lookup_table_.AddPageLength(field_id, chunk_id_, arr->length());
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
-  lookup_table_.AddOffset(field_id, chunk_id_, pos);
+  lookup_table_.SetPageInfo(field_id, chunk_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
 
