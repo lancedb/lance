@@ -5,7 +5,6 @@
 #include <memory>
 
 #include "lance/arrow/type.h"
-#include "lance/format/format.h"
 #include "lance/format/schema.h"
 #include "lance/io/pb.h"
 
@@ -21,13 +20,10 @@ Manifest::Manifest(const std::string& primary_key, std::shared_ptr<Schema> schem
   for (auto field : schema_->ToProto()) {
     max_field_id = std::max(max_field_id, field.id());
   }
-  num_physical_columns_ = max_field_id + 1;
 }
 
 Manifest::Manifest(Manifest&& other)
-    : primary_key_(other.primary_key_),
-      schema_(std::move(other.schema_)),
-      num_physical_columns_(other.num_physical_columns_) {}
+    : primary_key_(other.primary_key_), schema_(std::move(other.schema_)) {}
 
 Manifest::~Manifest() {}
 
@@ -48,7 +44,7 @@ Manifest::~Manifest() {}
   return io::WriteProto(out, pb);
 }
 
-std::string Manifest::primary_key() const { return primary_key_; }
+const std::string& Manifest::primary_key() const { return primary_key_; }
 
 const Schema& Manifest::schema() const { return *schema_; }
 

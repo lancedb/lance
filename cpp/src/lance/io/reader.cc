@@ -82,7 +82,7 @@ Status FileReader::Open() {
   auto inbuf_offset = footer_read_len - (size - metadata_offset);
   assert(inbuf_offset >= 0);
   ARROW_ASSIGN_OR_RAISE(
-      metadata_, format::Metadata::Parse(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
+      metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
   ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
   // TODO: Let's assume that chunk position is prefetched in memory already.
