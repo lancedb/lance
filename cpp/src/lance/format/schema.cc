@@ -172,6 +172,14 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
   return set_dictionary(dict_arr);
 }
 
+int32_t Field::GetFieldsCount() const {
+  int32_t cnt = children_.size();
+  for (auto& field : children_) {
+    cnt += field->GetFieldsCount();
+  }
+  return cnt;
+}
+
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
@@ -486,6 +494,14 @@ std::shared_ptr<Field> Schema::GetField(const std::string& name) const {
     }
   }
   return nullptr;
+}
+
+int32_t Schema::GetFieldsCount() const {
+  int32_t cnt = fields_.size();
+  for (auto& field : fields_) {
+    field->GetFieldsCount();
+  }
+  return cnt;
 }
 
 std::vector<lance::format::pb::Field> Schema::ToProto() const {

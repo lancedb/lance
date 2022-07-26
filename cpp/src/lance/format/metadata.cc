@@ -41,6 +41,10 @@ Result<shared_ptr<Metadata>> Metadata::Make(const shared_ptr<::arrow::Buffer>& b
   return meta;
 }
 
+::arrow::Result<int64_t> Metadata::Write(const std::shared_ptr<::arrow::io::OutputStream>& out) {
+  return io::WriteProto(out, pb_);
+}
+
 int32_t Metadata::num_batches() const { return pb_.batch_offsets_size() - 1; }
 
 int64_t Metadata::length() const {
@@ -86,6 +90,8 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   }
   return Manifest::Parse(in, pb_.manifest_position());
 }
+
+void Metadata::SetManifestPosition(int64_t position) { pb_.set_manifest_position(position); }
 
 int64_t Metadata::page_table_position() const { return pb_.page_table_position(); }
 

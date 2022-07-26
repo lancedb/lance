@@ -158,9 +158,9 @@ FileWriter::~FileWriter() {}
   }
   format::Manifest manifest(primary_key, lance_schema_);
   ARROW_ASSIGN_OR_RAISE(pos, manifest.Write(destination_));
-  metadata_->pb().set_manifest_position(pos);
+  metadata_->SetManifestPosition(pos);
 
-  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, metadata_->pb()));
+  ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
   return internal::WriteFooter(destination_, pos);
 }
 

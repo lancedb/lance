@@ -25,27 +25,22 @@ TEST_CASE("Serialize Chunk length") {
   lance::format::PageTable lt;
 
   int num_columns = 3;
-  int num_chunks = 5;
+  int num_batches = 5;
   for (int col = 0; col < num_columns; col++) {
-    for (int chk = 0; chk < num_chunks; chk++) {
-      lt.AddOffset(col, chk, col * 10 + chk);
-      lt.AddPageLength(col, chk, col * 10 + chk);
+    for (int batch = 0; batch < num_batches; batch++) {
+      lt.SetPageInfo(col, batch, col * 10 + batch, col * 10 + batch);
     }
   }
-  lance::format::pb::Metadata metadata;
 
   auto out_buf = arrow::io::BufferOutputStream::Create().ValueOrDie();
   lt.Write(out_buf).ValueOrDie();
-  lt.WritePageLengthTo(&metadata);
 
   auto in_buf = std::make_shared<arrow::io::BufferReader>(out_buf->Finish().ValueOrDie());
-  auto actual = PageTable::Read(in_buf, 0, metadata).ValueOrDie();
+  auto actual = PageTable::Make(in_buf, 0, num_columns, num_batches).ValueOrDie();
 
   for (int col = 0; col < num_columns; col++) {
-    for (int chk = 0; chk < num_chunks; chk++) {
-      INFO("Getting offset col=" << col << " chk=" << chk);
-      CHECK(actual->GetOffset(col, chk) == col * 10 + chk);
-      CHECK(actual->GetPageLength(col, chk).ValueOrDie() == col * 10 + chk);
+    for (int batch = 0; batch < num_batches; batch++) {
+      CHECK(actual->GetPageInfo(col, batch) == std::make_tuple(col * 10 + batch, col * 10 + batch));
     }
   }
 }

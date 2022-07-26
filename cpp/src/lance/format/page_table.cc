@@ -15,13 +15,9 @@
 #include "lance/format/page_table.h"
 
 #include <arrow/builder.h>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <memory>
 #include <vector>
-
-#include "lance/format/format.pb.h"
 
 namespace lance::format {
 
@@ -77,12 +73,11 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
     int64_t page_table_position,
     int32_t num_columns,
     int32_t num_batches) {
-  int columns, chunks;
   ARROW_ASSIGN_OR_RAISE(auto buf,
                         in->ReadAt(page_table_position,
-                                   (columns * chunks * sizeof(int64_t) * 2)));
+                                   (num_columns * num_batches * 2 * sizeof(int64_t))));
 
-  auto arr = ::arrow::Int64Array(columns * chunks, buf);
+  auto arr = ::arrow::Int64Array(num_columns * num_batches * 2, buf);
 
   auto lt = std::make_shared<PageTable>();
   for (int col = 0; col < num_columns; col++) {

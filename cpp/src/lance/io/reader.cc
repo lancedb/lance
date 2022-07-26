@@ -43,8 +43,6 @@ using std::unique_ptr;
 using lance::arrow::is_list;
 using lance::arrow::is_struct;
 
-namespace pb = lance::format::pb;
-
 typedef ::arrow::Result<std::shared_ptr<::arrow::Scalar>> ScalarResult;
 
 namespace lance::io {
@@ -88,9 +86,11 @@ Status FileReader::Open() {
   // TODO: Let's assume that chunk position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
+  auto num_batches = metadata_->num_batches();
+  auto num_columns = manifest_->schema().GetFieldsCount();
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
-      format::PageTable::Make(file_, metadata_->page_table_position(), metadata_->pb()));
+      format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
   return Status::OK();
 }
 

@@ -40,6 +40,12 @@ class Metadata final {
   static ::arrow::Result<std::shared_ptr<Metadata>> Make(
       const std::shared_ptr<::arrow::Buffer>& buffer);
 
+  /// Write Metadata to an open output stream.
+  ///
+  /// \param out the output file
+  /// \return file position if success.
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::io::OutputStream>& out);
+
   /// Get the number of batches in this file.
   int32_t num_batches() const;
 
@@ -63,6 +69,8 @@ class Metadata final {
 
   /// Set the position of the page table.
   void SetPageTablePosition(int64_t position);
+
+  void SetManifestPosition(int64_t position);
 
   ::arrow::Result<std::shared_ptr<Manifest>> GetManifest(
       std::shared_ptr<::arrow::io::RandomAccessFile> in);
