@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -173,11 +174,10 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 }
 
 int32_t Field::GetFieldsCount() const {
-  int32_t cnt = children_.size();
-  for (auto& field : children_) {
-    cnt += field->GetFieldsCount();
-  }
-  return cnt;
+  return std::accumulate(
+      std::begin(children_), std::end(children_), children_.size(), [](int32_t acc, auto& f) {
+        return f->GetFieldsCount() + acc;
+      });
 }
 
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
@@ -497,11 +497,10 @@ std::shared_ptr<Field> Schema::GetField(const std::string& name) const {
 }
 
 int32_t Schema::GetFieldsCount() const {
-  int32_t cnt = fields_.size();
-  for (auto& field : fields_) {
-    cnt += field->GetFieldsCount();
-  }
-  return cnt;
+  return std::accumulate(
+      std::begin(fields_), std::end(fields_), fields_.size(), [](int32_t acc, auto& f) {
+        return f->GetFieldsCount() + acc;
+      });
 }
 
 std::vector<lance::format::pb::Field> Schema::ToProto() const {
