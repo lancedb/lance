@@ -49,17 +49,13 @@ class PageTable {
   /// Set PageInfo.
   void SetPageInfo(int32_t column_id, int32_t batch_id, int64_t position, int64_t length) noexcept;
 
-  /// Get PageInfo
-  std::optional<PageInfo> GetPageInfo(int32_t column_id, int32_t batch_id) const noexcept;
-
-  /// Get the file offset of a chunk of a array.
+  /// Get PageInfo (a tuple of `[position, length]`) of a page.
   ///
   /// \param column_id the column / field ID.
-  /// \param chunk_id the chunk id.
-  /// \return file offset if available. Returns `std::nullopt` if the chunk does not have
-  ///         physical data, for example, for a parent field node.
-  std::optional<int64_t> GetOffset(int32_t column_id, int32_t chunk_id) const;
-
+  /// \param batch_id the ID of the batch
+  /// \return a tuple of `[position, length]` if available. Can return `std::nullopt` if
+  //          the page is virtual (i.e., parent field)
+  std::optional<PageInfo> GetPageInfo(int32_t column_id, int32_t batch_id) const noexcept;
 
   /// Write PageTable to a file.
   ///
@@ -70,9 +66,6 @@ class PageTable {
  private:
   /// Map<column, Map<chunk, offset>>
   std::map<int32_t, std::map<int32_t, PageInfo>> page_info_map_;
-
-  /// Map<column, Map<chunk, length>>
-  std::map<int32_t, std::map<int32_t, int64_t>> lengths_;
 };
 
 }  // namespace lance::format
