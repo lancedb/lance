@@ -44,5 +44,7 @@ add_executable(point_query point_query.cc)
 target_link_libraries(
         point_query
         lance
+        lance_benchmark
         Catch2::Catch2
 )
+target_include_directories(point_query SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
