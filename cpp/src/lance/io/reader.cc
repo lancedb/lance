@@ -300,7 +300,6 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     const std::shared_ptr<lance::format::Field>& field,
     int32_t batch_id,
     const ArrayReadParams& params) const {
-  fmt::print("Read field: {} {}\n", field->name(), field->id());
   auto dtype = field->type();
   if (is_struct(dtype)) {
     return GetStructArray(field, batch_id, params);

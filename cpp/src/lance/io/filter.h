@@ -49,7 +49,7 @@ class Filter {
 
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-  Execute(std::shared_ptr<FileReader> reader, int32_t chunk_idx) const;
+  Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const;
 
   const std::shared_ptr<lance::format::Schema>& schema() const;
 

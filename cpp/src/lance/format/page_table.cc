@@ -15,8 +15,6 @@
 #include "lance/format/page_table.h"
 
 #include <arrow/builder.h>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <memory>
 #include <vector>
@@ -27,11 +25,6 @@ void PageTable::SetPageInfo(int32_t column_id,
                             int32_t batch_id,
                             int64_t position,
                             int64_t length) noexcept {
-  fmt::print("Setting page info: column_id={} batch_id={} position={} length={}\n",
-             column_id,
-             batch_id,
-             position,
-             length);
   page_info_map_[column_id][batch_id] = std::make_tuple(position, length);
 }
 
@@ -71,7 +64,6 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
   ARROW_ASSIGN_OR_RAISE(auto pos, out->Tell());
   ARROW_RETURN_NOT_OK(
       out->Write(std::static_pointer_cast<::arrow::Int64Array>(page_table)->values()));
-  fmt::print("Write page table {} to pos={}\n", page_info_map_, pos);
   return pos;
 }
 
@@ -80,10 +72,6 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
     int64_t page_table_position,
     int32_t num_columns,
     int32_t num_batches) {
-  fmt::print("Read PageTable at: pos={}, cols={} batches={}\n",
-             page_table_position,
-             num_columns,
-             num_batches);
   ARROW_ASSIGN_OR_RAISE(
       auto buf, in->ReadAt(page_table_position, (num_columns * num_batches * 2 * sizeof(int64_t))));
 
@@ -98,7 +86,6 @@ std::optional<PageTable::PageInfo> PageTable::GetPageInfo(int32_t column_id,
       lt->SetPageInfo(col, batch, position, length);
     }
   }
-  fmt::print("Lookup map is: {}\n", lt->page_info_map_);
   return lt;
 }
 
