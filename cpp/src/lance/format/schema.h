@@ -193,6 +193,9 @@ class Field final {
 
   bool RemoveChild(int32_t id);
 
+  /// Get the fields count recursively.
+  ///
+  /// It counts all the fields (node) from the schema tree, including the parent nodes.
   int32_t GetFieldsCount() const;
 
   // TODO: use enum to replace protobuf enum.

@@ -78,8 +78,9 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it);
   assert(bound_idx >= 0);
   bound_idx = std::max(0, bound_idx - 1);
-  int32_t idx_in_batch = row_index - pb_.batch_offsets(bound_idx);
-  return std::tuple(bound_idx, idx_in_batch);
+  // Offset within the batch.
+  int32_t offset = row_index - pb_.batch_offsets(bound_idx);
+  return std::tuple(bound_idx, offset);
 }
 
 ::arrow::Result<std::shared_ptr<Manifest>> Metadata::GetManifest(
