@@ -48,9 +48,7 @@ message Manifest {
   repeated Field fields = 2;
 }
 
-/*
- File-level Metadata.
-*/
+// Metadata of one Lane file.
 message Metadata {
   // Position of the manifest in the file. If it is zero, the manifest is stored externally.
   uint64 manifest_position = 1;
@@ -58,10 +56,16 @@ message Metadata {
   // Logical offsets of each chunk group, i.e., number of the rows in each chunk.
   repeated int32 batch_offsets = 2;
 
-  // The file position to store page position table.
+  // The file position that page table is stored.
   //
-  // The lookup table of each column is stored as an NxM int64_t array:
-  // chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
+  // A page table is a matrix of N x N x 2, where N = num_fields, and M = num_batches.
+  // Each cell in the table is a pair of <position:int64, length:int64> of the page.
+  // Both position and length are int64 values.
+  // The <position, length> of all the pages in the same column are then contiguously stored.
+  //
+  // For example, for the column 5 and batch 4, we have:
+  //   position = page_table[5][4][0];
+  //   length = page_table[5][4][1];
   uint64 page_table_position = 3;
 }
 
