@@ -83,7 +83,7 @@ Status FileReader::Open() {
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
   ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
-  // TODO: Let's assume that chunk position is prefetched in memory already.
+  // TODO: Let's assume that page position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
   auto num_batches = metadata_->num_batches();
@@ -174,15 +174,12 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
     int32_t idx, const format::Schema& schema) {
-  auto chunk_result = metadata_->LocateBatch(idx);
-  if (!chunk_result.ok()) {
-    return chunk_result.status();
-  }
-  auto [batch_id, idx_in_chunk] = *chunk_result;
+  ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(idx));
+  auto [batch_id, idx_in_batch] = batch;
   auto row = std::vector<::std::shared_ptr<::arrow::Scalar>>();
   std::vector<std::future<::arrow::Result<::std::shared_ptr<::arrow::Scalar>>>> futures;
   for (auto& field : schema.fields()) {
-    auto f = std::async(&FileReader::GetScalar, this, field, batch_id, idx_in_chunk);
+    auto f = std::async(&FileReader::GetScalar, this, field, batch_id, idx_in_batch);
     futures.emplace_back(std::move(f));
   }
   for (auto& f : futures) {
@@ -232,8 +229,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
     const lance::format::Schema& schema, int32_t offset, int32_t length) const {
-  ARROW_ASSIGN_OR_RAISE(auto chunk_and_idx, metadata_->LocateBatch(offset));
-  auto [batch_id, idx_in_chunk] = chunk_and_idx;
+  ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(offset));
+  auto [batch_id, idx_in_batch] = batch;
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   for (auto& field : schema.fields()) {
     auto len =
@@ -241,13 +238,13 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     ::arrow::ArrayVector chunks;
     // Make a local copy?
     auto ckid = batch_id;
-    auto ck_index = idx_in_chunk;
+    auto ck_index = idx_in_batch;
     while (len > 0 && ckid < metadata_->num_batches()) {
       auto page_length = metadata_->GetBatchLength(batch_id);
-      auto length_in_chunk = std::min(len, page_length - ck_index);
+      auto length_in_page = std::min(len, page_length - ck_index);
       ARROW_ASSIGN_OR_RAISE(auto arr,
-                            GetArray(field, ckid, ArrayReadParams(ck_index, length_in_chunk)));
-      len -= length_in_chunk;
+                            GetArray(field, ckid, ArrayReadParams(ck_index, length_in_page)));
+      len -= length_in_page;
       ckid++;
       ck_index = 0;
       chunks.emplace_back(arr);
@@ -265,17 +262,17 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema, int32_t batch_id, std::optional<int32_t> length) const {
-  return ReadChunk(schema, batch_id, ArrayReadParams(0, length));
+  return ReadBatch(schema, batch_id, ArrayReadParams(0, length));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema,
     int32_t batch_id,
     std::shared_ptr<::arrow::Int32Array> indices) const {
-  return ReadChunk(schema, batch_id, ArrayReadParams(indices));
+  return ReadBatch(schema, batch_id, ArrayReadParams(indices));
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema, int32_t batch_id, const ArrayReadParams& params) const {
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   /// TODO: GH-43. Read field in parallel.
@@ -293,7 +290,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     return offset.value();
   }
   return ::arrow::Status::Invalid(
-      fmt::format("Invalid access for chunk offset: field={} batch={}", field_id, batch_id));
+      fmt::format("Invalid access for page info: field={} batch={}", field_id, batch_id));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetArray(

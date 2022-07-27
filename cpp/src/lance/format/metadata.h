@@ -52,7 +52,7 @@ class Metadata final {
   /// Add the length of the batch.
   void AddBatchLength(int32_t length);
 
-  /// Get the logical length of a chunk.
+  /// Get the logical length of a batch.
   int32_t GetBatchLength(int32_t batch_id) const;
 
   /// Locate the batch where the row belongs.

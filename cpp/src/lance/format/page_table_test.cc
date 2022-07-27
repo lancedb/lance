@@ -12,15 +12,15 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include "lance/format/page_table.h"
+
 #include <arrow/io/api.h>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "lance/format/page_table.h"
-
 using lance::format::PageTable;
 
-TEST_CASE("Serialize Chunk length") {
+TEST_CASE("Serialize page length") {
   lance::format::PageTable lt;
 
   int num_columns = 3;

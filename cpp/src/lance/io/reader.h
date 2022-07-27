@@ -103,8 +103,13 @@ class FileReader {
     std::optional<std::shared_ptr<::arrow::Int32Array>> indices = std::nullopt;
   };
 
-  /// Read a chunk using ArrayReadParams.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+  /// Read a batch using ArrayReadParams.
+  ///
+  /// \param schema the schema to read.
+  /// \param batch_id the id of the batch to read
+  /// \param params read params.
+  /// \return a RecordBatch if success.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema, int32_t batch_id, const ArrayReadParams& params) const;
 
   /// Get an ARRAY from column / file from a given Batch.
@@ -150,7 +155,7 @@ class FileReader {
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetStructScalar(
       const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const;
 
-  /// Get the file offset of a chunk for a column.
+  /// Get the file position and page length for a page.
   ///
   /// \param field_id the field / column Id
   /// \param batch_id the index of a batch.
