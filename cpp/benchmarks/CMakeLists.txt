@@ -39,3 +39,10 @@ target_link_libraries(
         argparse
 )
 target_include_directories(convert SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
+
+add_executable(point_query point_query.cc)
+target_link_libraries(
+        point_query
+        lance
+        Catch2::Catch2
+)
