@@ -127,7 +127,7 @@ TEST_CASE("Write COCO Dataset") {
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
   CHECK(reader->primary_key() == "filename");
-  CHECK(reader->num_chunks() == 1);
+  CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
   auto result = reader->ReadTable();
@@ -167,7 +167,7 @@ TEST_CASE("Write dictionary type") {
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
   CHECK(reader->primary_key() == "label");
-  CHECK(reader->num_chunks() == 1);
+  CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
   auto actual_table = reader->ReadTable().ValueOrDie();

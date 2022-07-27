@@ -64,7 +64,7 @@ class PageTable {
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::io::OutputStream>& out);
 
  private:
-  /// Map<column, Map<chunk, offset>>
+  /// Map<column, Map<page, {position, length}>>
   std::map<int32_t, std::map<int32_t, PageInfo>> page_info_map_;
 };
 

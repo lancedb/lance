@@ -65,7 +65,7 @@ Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
 Filter::Execute(std::shared_ptr<FileReader> reader, int32_t chunk_idx) const {
-  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*schema_, chunk_idx));
+  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*schema_, chunk_idx));
   return Execute(batch);
 }
 

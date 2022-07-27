@@ -55,11 +55,11 @@ class Metadata final {
   /// Get the logical length of a chunk.
   int32_t GetBatchLength(int32_t batch_id) const;
 
-  /// Locate the chunk index where the idx belongs.
+  /// Locate the batch where the row belongs.
   ///
-  /// \param idx the absolute index of a row in the file.
-  /// \return a tuple of <chunk id, idx in the chunk>
-  ::arrow::Result<std::tuple<int32_t, int32_t>> LocateChunk(int32_t idx) const;
+  /// \param idx the row index, within the file.
+  /// \return a tuple of <batch id, idx in the batch>
+  ::arrow::Result<std::tuple<int32_t, int32_t>> LocateBatch(int32_t row_index) const;
 
   /// Get the number of records in this file.
   int64_t length() const;

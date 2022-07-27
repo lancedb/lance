@@ -80,13 +80,13 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
           std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
       values = values->Slice(offset, len);
     }
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*scan_schema_, chunk_idx, indices));
+    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*scan_schema_, chunk_idx, indices));
     assert(values->num_rows() == batch->num_rows());
     ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
     return merged;
   } else {
     // Read without filter.
-    return reader->ReadChunk(*scan_schema_, chunk_idx);
+    return reader->ReadBatch(*scan_schema_, chunk_idx);
   }
 }
 

@@ -66,19 +66,19 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   return pb_.batch_offsets(batch_id + 1) - pb_.batch_offsets(batch_id);
 }
 
-::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateChunk(int32_t idx) const {
+::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateBatch(int32_t row_index) const {
   int64_t len = length();
-  if (idx < 0 || idx >= len) {
-    return ::arrow::Status::IndexError(fmt::format("Chunk index out of range: {} of {}", idx, len));
+  if (row_index < 0 || row_index >= len) {
+    return ::arrow::Status::IndexError(fmt::format("Chunk index out of range: {} of {}", row_index, len));
   }
-  auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), idx);
+  auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), row_index);
   if (it == pb_.batch_offsets().end()) {
-    return ::arrow::Status::IndexError("Chunk index out of range {} of {}", idx, len);
+    return ::arrow::Status::IndexError("Chunk index out of range {} of {}", row_index, len);
   }
   int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it);
   assert(bound_idx >= 0);
   bound_idx = std::max(0, bound_idx - 1);
-  int32_t idx_in_chunk = idx - pb_.batch_offsets(bound_idx);
+  int32_t idx_in_chunk = row_index - pb_.batch_offsets(bound_idx);
   return std::tuple(bound_idx, idx_in_chunk);
 }
 

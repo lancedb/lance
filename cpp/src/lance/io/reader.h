@@ -35,9 +35,10 @@ namespace lance::io {
 /// FileReader implementation.
 class FileReader {
  public:
-  FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
-             ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
+  explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
+  /// Opens the FileReader.
   ::arrow::Status Open();
 
   /// Get the reference to the lance schema.
@@ -53,17 +54,18 @@ class FileReader {
                                                                 int32_t offset,
                                                                 int32_t length) const;
 
-  /// Read a chunk.
+  /// Read a Batch.
   ///
-  /// While ReadAt can read at any arbitrary offsets, ReadChunks always
-  /// starts at the chunk boundry.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+  /// While ReadAt can read at any arbitrary offset within a batch, ReadBatch always
+  /// starts at the batch boundary.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,
       int32_t batch_id,
       std::optional<int32_t> length = std::nullopt) const;
 
-  /// Read a chunk with indices
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+  /// Read a Batch with indices.
+  ///
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,
       int32_t batch_id,
       std::shared_ptr<::arrow::Int32Array> indices) const;
@@ -92,9 +94,9 @@ class FileReader {
   ///  - ReadAt offset + length.
   ///  - Take elements by indices.
   struct ArrayReadParams {
-    ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
+    explicit ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
 
-    ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
+    explicit ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
 
     std::optional<int32_t> offset = std::nullopt;
     std::optional<int32_t> length = std::nullopt;
@@ -105,7 +107,7 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
       const lance::format::Schema& schema, int32_t batch_id, const ArrayReadParams& params) const;
 
-  /// Get an ARRAY from column / file at chunk.
+  /// Get an ARRAY from column / file from a given Batch.
   ///
   /// \param field the field (column) specification
   /// \param batch_id the index of the batch in the file.

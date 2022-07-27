@@ -156,10 +156,11 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   decoder->Reset(pos, length);
   ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
-  ARROW_ASSIGN_OR_RAISE(auto values,
-                        GetArray(field->fields()[0],
-                                 batch_id,
-                                 {offsets->Value(0), offsets->Value(1) - offsets->Value(0)}));
+  ARROW_ASSIGN_OR_RAISE(
+      auto values,
+      GetArray(field->fields()[0],
+               batch_id,
+               ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
   ARROW_ASSIGN_OR_RAISE(offsets, ResetOffsets(offsets));
   auto rst = ::arrow::ListArray::FromArrays(field->type(), *offsets, *values);
   if (!rst.ok()) {
@@ -173,7 +174,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
     int32_t idx, const format::Schema& schema) {
-  auto chunk_result = metadata_->LocateChunk(idx);
+  auto chunk_result = metadata_->LocateBatch(idx);
   if (!chunk_result.ok()) {
     return chunk_result.status();
   }
@@ -221,7 +222,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   for (auto& field : schema.fields()) {
     ::arrow::ArrayVector chunks;
     for (int i = 0; i < metadata_->num_batches(); i++) {
-      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, i, 0));
+      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, i, ArrayReadParams(0)));
       chunks.emplace_back(arr);
     }
     columns.emplace_back(std::make_shared<::arrow::ChunkedArray>(chunks));
@@ -231,7 +232,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
     const lance::format::Schema& schema, int32_t offset, int32_t length) const {
-  ARROW_ASSIGN_OR_RAISE(auto chunk_and_idx, metadata_->LocateChunk(offset));
+  ARROW_ASSIGN_OR_RAISE(auto chunk_and_idx, metadata_->LocateBatch(offset));
   auto [batch_id, idx_in_chunk] = chunk_and_idx;
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   for (auto& field : schema.fields()) {
@@ -244,7 +245,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     while (len > 0 && ckid < metadata_->num_batches()) {
       auto page_length = metadata_->GetBatchLength(batch_id);
       auto length_in_chunk = std::min(len, page_length - ck_index);
-      ARROW_ASSIGN_OR_RAISE(auto arr, GetArray(field, ckid, {ck_index, length_in_chunk}));
+      ARROW_ASSIGN_OR_RAISE(auto arr,
+                            GetArray(field, ckid, ArrayReadParams(ck_index, length_in_chunk)));
       len -= length_in_chunk;
       ckid++;
       ck_index = 0;
@@ -261,12 +263,12 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema, int32_t batch_id, std::optional<int32_t> length) const {
   return ReadChunk(schema, batch_id, ArrayReadParams(0, length));
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadChunk(
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema,
     int32_t batch_id,
     std::shared_ptr<::arrow::Int32Array> indices) const {
@@ -339,7 +341,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     }
     auto start = static_cast<int32_t>(indices->Value(0));
     auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start);
-    ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr, GetListArray(field, batch_id, {start, length}));
+    ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr,
+                          GetListArray(field, batch_id, ArrayReadParams(start, length)));
     ARROW_ASSIGN_OR_RAISE(auto datum,
                           ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
     return datum.make_array();
@@ -352,8 +355,9 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
   int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
-  ARROW_ASSIGN_OR_RAISE(auto values,
-                        GetArray(field->fields()[0], batch_id, {start_pos, array_length}));
+  ARROW_ASSIGN_OR_RAISE(
+      auto values,
+      GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
 
   // Realigned offsets
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
