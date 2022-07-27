@@ -61,7 +61,7 @@ void BenchmarkPointQueryLance(const std::string& uri) {
   auto length = reader->length();
 
   fmt::print("Open Lance File: {}\n", uri);
-  fmt::print("Number of Pages: {}, Rows={}\n", reader->num_chunks(), length);
+  fmt::print("Number of Pages: {}, Rows={}\n", reader->num_batches(), length);
 
   std::random_device rd;
   std::mt19937 mt(rd());
