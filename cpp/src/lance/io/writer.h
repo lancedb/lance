@@ -22,8 +22,8 @@
 
 #include <memory>
 
-#include "lance/format/lookup_table.h"
 #include "lance/format/metadata.h"
+#include "lance/format/page_table.h"
 
 namespace lance::format {
 class Field;
@@ -65,8 +65,8 @@ class FileWriter final : public ::arrow::dataset::FileWriter {
 
   std::shared_ptr<lance::format::Schema> lance_schema_;
   std::unique_ptr<lance::format::Metadata> metadata_;
-  format::LookupTable lookup_table_;
-  int32_t chunk_id_ = 0;
+  format::PageTable lookup_table_;
+  int32_t batch_id_ = 0;
 };
 
 }  // namespace lance::io

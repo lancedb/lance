@@ -105,7 +105,7 @@ class PlainDecoderImpl : public Decoder {
     }
     if (start + length.value() > length_ || start > length_) {
       return ::arrow::Status::IndexError(
-          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, chunk_length={}\n",
+          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, page_length={}\n",
                       start,
                       length.value(),
                       length_));

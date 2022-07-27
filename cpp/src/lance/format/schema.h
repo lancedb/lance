@@ -75,6 +75,9 @@ class Schema final {
   /// Top level fields;
   const std::vector<std::shared_ptr<Field>> fields() const { return fields_; }
 
+  /// Count the number of all fields, including nested fields.
+  int32_t GetFieldsCount() const;
+
   /// Get the field by fully qualified field name.
   ///
   /// \param name the fully qualified name, i.e., "annotations.box.xmin".
@@ -189,6 +192,11 @@ class Field final {
   void SetId(int32_t parent_id, int32_t* current_id);
 
   bool RemoveChild(int32_t id);
+
+  /// Get the fields count recursively.
+  ///
+  /// It counts all the fields (node) from the schema tree, including the parent nodes.
+  int32_t GetFieldsCount() const;
 
   // TODO: use enum to replace protobuf enum.
   pb::Field::Type GetNodeType() const;

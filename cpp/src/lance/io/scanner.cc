@@ -50,7 +50,7 @@ Scanner::Scanner(const Scanner& other) noexcept
       offset_(other.offset_),
       schema_(other.schema_),
       project_(other.project_),
-      current_chunk_(other.current_chunk_),
+      current_batch_(other.current_batch_),
       max_queue_size_(other.max_queue_size_) {}
 
 Scanner::Scanner(Scanner&& other) noexcept
@@ -60,7 +60,7 @@ Scanner::Scanner(Scanner&& other) noexcept
       offset_(other.offset_),
       schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
-      current_chunk_(other.current_chunk_),
+      current_batch_(other.current_batch_),
       max_queue_size_(other.max_queue_size_),
       q_(std::move(other.q_)) {}
 
@@ -74,18 +74,18 @@ Scanner::Scanner(Scanner&& other) noexcept
 }
 
 void Scanner::AddPrefetchTask() {
-  while (q_.size() < max_queue_size_ && current_chunk_ < reader_->metadata().num_chunks()) {
-    auto chunk_id = current_chunk_++;
+  while (q_.size() < max_queue_size_ && current_batch_ < reader_->metadata().num_batches()) {
+    auto batch_id = current_batch_++;
     auto f = std::async(
-        [&](int32_t chunk_id) {
-          auto result = project_->Execute(reader_, chunk_id);
+        [&](int32_t batch) {
+          auto result = project_->Execute(reader_, batch);
           if (!result.ok()) {
             fmt::print(
-                stderr, "Read bad chunk: chunk_id={}: {}\n", chunk_id, result.status().message());
+                stderr, "Read bad batch: batch_id={}: {}\n", batch, result.status().message());
           }
           return result;
         },
-        chunk_id);
+        batch_id);
     q_.push(std::move(f));
   }
 }

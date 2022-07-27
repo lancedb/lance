@@ -61,9 +61,9 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
 bool Project::CanParallelScan() const { return limit_.operator bool(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
-    std::shared_ptr<FileReader> reader, int32_t chunk_idx) {
+    std::shared_ptr<FileReader> reader, int32_t batch_id) {
   if (filter_) {
-    auto result = filter_->Execute(reader, chunk_idx);
+    auto result = filter_->Execute(reader, batch_id);
     if (!result.ok()) {
       return result.status();
     }
@@ -80,13 +80,13 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
           std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
       values = values->Slice(offset, len);
     }
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadChunk(*scan_schema_, chunk_idx, indices));
+    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*scan_schema_, batch_id, indices));
     assert(values->num_rows() == batch->num_rows());
     ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
     return merged;
   } else {
     // Read without filter.
-    return reader->ReadChunk(*scan_schema_, chunk_idx);
+    return reader->ReadBatch(*scan_schema_, batch_id);
   }
 }
 

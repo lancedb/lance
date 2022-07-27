@@ -36,51 +36,37 @@ Format:
 |        <metadata position>             |
 | MAJOR_VERSION | MINOR_VERSION | "NFFT" |
 +----------------------------------------+
+
  */
 
-//option optimize_for = LITE_RUNTIME;
-
-/**
- File-level Metadata, at the end of a file:.
-*/
-message Metadata {
-  // The start row id of this file. Row ID is a monotonic increasing number,
-  // used to identify a row globally.
-  uint64 start_row_id = 1;
-
-  /**
-   Position the manifest in the file.
-   If it is zero, the manifest is stored externally.
-  */
-  uint64 manifest_position = 2;
-
-  /** Logical offsets of each chunk group, i.e., number of the rows in each chunk. */
-  repeated int32 chunk_offsets = 3;
-
-  /**
-    The position in the file, where the lookup up table of all columns is stored.
-
-    The lookup table of each column is stored as an NxM int64_t array:
-      - chunk[M][N] = chunk_position + num_chunk * M * 8 + N * 8
-   */
-  uint64 chunk_position = 4;
-
-  /// The physical length of each chunk (page).
-  ///
-  /// Put page count here for now, not final decision?
-  /// This should be a M * N array.
-  /// Not sure whether we want store the
-  repeated int64 page_lengths = 5;
+// Manifest is a global section shared between all the files.
+message Manifest {
+  // Primary key column of the dataset.
+  string primary_key = 1;
+  
+  // All fields of the dataset, including the nested fields.
+  repeated Field fields = 2;
 }
 
-/*
- * Manifest is a global section shared between all the files.
- */
-message Manifest {
-  string primary_key = 1;
+// Metadata of one Lane file.
+message Metadata {
+  // Position of the manifest in the file. If it is zero, the manifest is stored externally.
+  uint64 manifest_position = 1;
 
-  /* All fields in the dataset */
-  repeated Field fields = 2;
+  // Logical offsets of each chunk group, i.e., number of the rows in each chunk.
+  repeated int32 batch_offsets = 2;
+
+  // The file position that page table is stored.
+  //
+  // A page table is a matrix of N x N x 2, where N = num_fields, and M = num_batches.
+  // Each cell in the table is a pair of <position:int64, length:int64> of the page.
+  // Both position and length are int64 values.
+  // The <position, length> of all the pages in the same column are then contiguously stored.
+  //
+  // For example, for the column 5 and batch 4, we have:
+  //   position = page_table[5][4][0];
+  //   length = page_table[5][4][1];
+  uint64 page_table_position = 3;
 }
 
 /// Supported encodings.

@@ -106,7 +106,7 @@ template <ArrowType T>
   }
   if (start + *length > length_) {
     return ::arrow::Status::IndexError(
-        fmt::format("VarBinaryDecoder::ToArray: out of range: start={} length={} chunk_length={}\n",
+        fmt::format("VarBinaryDecoder::ToArray: out of range: start={} length={} page_length={}\n",
                     start,
                     *length,
                     length_));

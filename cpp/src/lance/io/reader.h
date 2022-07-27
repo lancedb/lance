@@ -20,12 +20,13 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <tuple>
 
 namespace lance::format {
 class Field;
-class LookupTable;
 class Manifest;
 class Metadata;
+class PageTable;
 class Schema;
 }  // namespace lance::format
 
@@ -34,9 +35,10 @@ namespace lance::io {
 /// FileReader implementation.
 class FileReader {
  public:
-  FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
-             ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
+  explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
+  /// Opens the FileReader.
   ::arrow::Status Open();
 
   /// Get the reference to the lance schema.
@@ -52,19 +54,20 @@ class FileReader {
                                                                 int32_t offset,
                                                                 int32_t length) const;
 
-  /// Read a chunk.
+  /// Read a Batch.
   ///
-  /// While ReadAt can read at any arbitrary offsets, ReadChunks always
-  /// starts at the chunk boundry.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+  /// While ReadAt can read at any arbitrary offset within a batch, ReadBatch always
+  /// starts at the batch boundary.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,
-      int32_t chunk_id,
+      int32_t batch_id,
       std::optional<int32_t> length = std::nullopt) const;
 
-  /// Read a chunk with indices
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
+  /// Read a Batch with indices.
+  ///
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,
-      int32_t chunk_id,
+      int32_t batch_id,
       std::shared_ptr<::arrow::Int32Array> indices) const;
 
   /// Get file metadata.
@@ -91,76 +94,81 @@ class FileReader {
   ///  - ReadAt offset + length.
   ///  - Take elements by indices.
   struct ArrayReadParams {
-    ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
+    explicit ArrayReadParams(int32_t offset, std::optional<int32_t> length = std::nullopt);
 
-    ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
+    explicit ArrayReadParams(std::shared_ptr<::arrow::Int32Array> indices);
 
     std::optional<int32_t> offset = std::nullopt;
     std::optional<int32_t> length = std::nullopt;
     std::optional<std::shared_ptr<::arrow::Int32Array>> indices = std::nullopt;
   };
 
-  /// Read a chunk using ArrayReadParams.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadChunk(
-      const lance::format::Schema& schema, int32_t chunk_id, const ArrayReadParams& params) const;
+  /// Read a batch using ArrayReadParams.
+  ///
+  /// \param schema the schema to read.
+  /// \param batch_id the id of the batch to read
+  /// \param params read params.
+  /// \return a RecordBatch if success.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
+      const lance::format::Schema& schema, int32_t batch_id, const ArrayReadParams& params) const;
 
-  /// Get an ARRAY from column / file at chunk.
+  /// Get an ARRAY from column / file from a given Batch.
   ///
   /// \param field the field (column) specification
-  /// \param chunk_id the index of the chunk in the file.
+  /// \param batch_id the index of the batch in the file.
   /// \param params Read parameters
   ///
   /// \return An array if success.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetArray(
       const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
+      int32_t batch_id,
       const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetPrimitiveArray(
       const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
+      int32_t batch_id,
       const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetStructArray(
       const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
+      int32_t batch_id,
       const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetListArray(
       const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
+      int32_t batch_id,
       const ArrayReadParams& params) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> GetDictionaryArray(
       const std::shared_ptr<lance::format::Field>& field,
-      int chunk_id,
+      int32_t batch_id,
       const ArrayReadParams& params) const;
 
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(
       int32_t idx, const lance::format::Schema& schema);
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetScalar(
-      const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const;
+      const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const;
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetPrimitiveScalar(
-      const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const;
+      const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const;
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetListScalar(
-      const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const;
+      const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const;
   ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> GetStructScalar(
-      const std::shared_ptr<lance::format::Field>& field, int32_t chunk_id, int32_t idx) const;
+      const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const;
 
-  /// Get the file offset of a chunk for a column.
+  /// Get the file position and page length for a page.
   ///
   /// \param field_id the field / column Id
-  /// \param chunk_id the chunk index in the file
-  /// \return the offset where the chunk starts. Returns
-  /// Status::Invalid otherwise.
-  ::arrow::Result<int64_t> GetChunkOffset(int64_t field_id, int64_t chunk_id) const;
+  /// \param batch_id the index of a batch.
+  /// \return a tuple of `[position, length]` for a page. Returns `Status::Invalid` otherwise.
+  ::arrow::Result<std::tuple<int64_t, int64_t>> GetPageInfo(int32_t field_id,
+                                                            int32_t batch_id) const;
 
  private:
   std::shared_ptr<::arrow::io::RandomAccessFile> file_;
   ::arrow::MemoryPool* pool_;
   std::shared_ptr<lance::format::Metadata> metadata_;
   std::shared_ptr<lance::format::Manifest> manifest_;
-  std::shared_ptr<lance::format::LookupTable> lookup_table_;
+  std::shared_ptr<lance::format::PageTable> page_table_;
 
   std::shared_ptr<::arrow::Buffer> cached_last_page_;
 };
