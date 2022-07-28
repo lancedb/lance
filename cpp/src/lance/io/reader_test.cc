@@ -60,14 +60,14 @@ TEST_CASE("Test List Array With Nulls") {
     fmt::print("Table: {}\n", (*table_result)->ToString());
     CHECK(table->Equals(*table_result.ValueOrDie()));
 
-//  for (int i = 0; i < reader->length(); i++) {
-//    auto row = reader->Get(i);
-//    INFO("Get row 0 " << row.status());
-//    CHECK(row.ok());
-//    fmt::print("Row {} is: {} \n", i, *row);
-//    for (auto& scalar : *row) {
-//      fmt::print("Scalar type; {}\n", scalar->type->ToString());
-//      fmt::print("Get: {}\n", scalar->ToString());
-//    }
-//  }
+    for (int i = 0; i < reader->length(); i++) {
+      auto row = reader->Get(i);
+      INFO("Get row 0 " << row.status());
+      CHECK(row.ok());
+      fmt::print("Row {} is: {} \n", i, *row);
+      for (auto& scalar : *row) {
+        fmt::print("Scalar type; {}\n", scalar->type->ToString());
+        fmt::print("Get: {}\n", scalar->ToString());
+      }
+    }
 }

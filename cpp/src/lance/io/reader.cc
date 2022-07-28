@@ -337,14 +337,12 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   auto start = params.offset.value();
 
   std::shared_ptr<::arrow::Array> offsets_arr;
-  if (params.length.has_value()) {
+  if (length.has_value()) {
     ARROW_ASSIGN_OR_RAISE(
         offsets_arr,
-        GetPrimitiveArray(
-            field, batch_id, ArrayReadParams(params.offset.value(), params.length.value() + 1)));
+        GetPrimitiveArray(field, batch_id, ArrayReadParams(start, length.value() + 1)));
   } else {
-    ARROW_ASSIGN_OR_RAISE(
-        offsets_arr, GetPrimitiveArray(field, batch_id, ArrayReadParams(params.offset.value())));
+    ARROW_ASSIGN_OR_RAISE(offsets_arr, GetPrimitiveArray(field, batch_id, ArrayReadParams(start)));
   }
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
@@ -352,19 +350,25 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
-
+  if (array_length == 0) {
+    return ::arrow::MakeEmptyArray(field->type());
+  }
   // Realigned offsets
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
-  auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
-  if (!result.ok()) {
-    fmt::print("GetListArray: field={}, batch_id_={}, start={}, length={}\nReason:{}\n",
-               field->name(),
-               batch_id,
-               start,
-               *length,
-               result.status().message());
+  fmt::print("Shiftted Offset: {} values={}\n", shifted_offsets->ToString(), values->ToString());
+
+  // Setup null bitmap
+  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(array_length, pool_));
+  for (int i = 0; i < array_length; i++) {
+    ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
+                                offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
-  return result;
+  fmt::print("Null bitmap is: {}\n", null_bitmap->ToHexString());
+  return std::make_shared<::arrow::ListArray>(field->type(),
+                                              offsets->length() - 1,
+                                              shifted_offsets->data()->buffers[1],
+                                              values,
+                                              null_bitmap);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetDictionaryArray(
