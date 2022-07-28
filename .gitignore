@@ -54,4 +54,6 @@ python/lance/_lib.cpp
 python/thirdparty/arrow/
 python/wheels
 
+# Rust
 Cargo.lock
+target
