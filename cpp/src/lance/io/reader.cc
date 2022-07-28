@@ -363,7 +363,6 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
                                 offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
-  fmt::print("Null bitmap is: {}\n", null_bitmap->ToHexString());
   return std::make_shared<::arrow::ListArray>(field->type(),
                                               offsets->length() - 1,
                                               shifted_offsets->data()->buffers[1],

@@ -51,23 +51,22 @@ TEST_CASE("Test List Array With Nulls") {
   auto reader_result = lance::arrow::FileReader::Make(infile);
   INFO("Open file: " << reader_result.status());
   auto reader = std::move(reader_result.ValueOrDie());
-    auto table_result = reader->ReadTable();
-    INFO("Table read result: " << table_result.status());
-    CHECK(table_result.ok());
+  auto table_result = reader->ReadTable();
+  INFO("Table read result: " << table_result.status());
+  CHECK(table_result.ok());
 
-    INFO("Expected table: " << table->ToString()
-                            << "\n Actual table: " << table_result.ValueOrDie()->ToString());
-    fmt::print("Table: {}\n", (*table_result)->ToString());
-    CHECK(table->Equals(*table_result.ValueOrDie()));
+  INFO("Expected table: " << table->ToString()
+                          << "\n Actual table: " << table_result.ValueOrDie()->ToString());
+  CHECK(table->Equals(*table_result.ValueOrDie()));
 
-    for (int i = 0; i < reader->length(); i++) {
-      auto row = reader->Get(i);
-      INFO("Get row 0 " << row.status());
-      CHECK(row.ok());
-      fmt::print("Row {} is: {} \n", i, *row);
-      for (auto& scalar : *row) {
-        fmt::print("Scalar type; {}\n", scalar->type->ToString());
-        fmt::print("Get: {}\n", scalar->ToString());
-      }
+  for (int i = 0; i < reader->length(); i++) {
+    auto row = reader->Get(i);
+    INFO("Get row 0 " << row.status());
+    CHECK(row.ok());
+    fmt::print("Row {} is: {} \n", i, *row);
+    for (auto& scalar : *row) {
+      fmt::print("Scalar type; {}\n", scalar->type->ToString());
+      fmt::print("Get: {}\n", scalar->ToString());
     }
+  }
 }
