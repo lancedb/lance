@@ -57,7 +57,7 @@ class Schema final {
   [[nodiscard]] ::arrow::Result<std::shared_ptr<Schema>> Project(
       const std::vector<std::string>& column_names) const;
 
-  /// Use arrow::schema to create a project of the current schema.
+  /// Use `arrow::Schema` to create a project over the current Lance schema.
   ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::Schema& arrow_schema) const;
 
   /// Exclude (subtract) the fields from the given schema.
@@ -161,7 +161,7 @@ class Field final {
   const std::shared_ptr<Field>& field(int i) const { return children_[i]; };
 
   /// Returns the direct child with the name. Returns nullptr if such field does not exist.
-  const std::shared_ptr<Field> Get(const std::string_view& name) const;
+  std::shared_ptr<Field> Get(const std::string_view& name) const;
 
   /// Check if two fields are equal.
   ///
@@ -177,8 +177,8 @@ class Field final {
  private:
   Field(const Field& field) = delete;
 
-  const std::shared_ptr<Field> Get(const std::vector<std::string>& field_path,
-                                   std::size_t start_idx = 0) const;
+  std::shared_ptr<Field> Get(const std::vector<std::string>& field_path,
+                             std::size_t start_idx = 0) const;
 
   /// Make a new copy of the field.
   std::shared_ptr<Field> Copy(bool include_children = false) const;

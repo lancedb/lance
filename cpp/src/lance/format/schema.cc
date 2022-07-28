@@ -103,10 +103,13 @@ std::shared_ptr<Field> Field::Get(int32_t id) {
   return std::shared_ptr<Field>();
 }
 
-const std::shared_ptr<Field> Field::Get(const std::vector<std::string>& field_path,
-                                        std::size_t start_idx) const {
+std::shared_ptr<Field> Field::Get(const std::vector<std::string>& field_path,
+                                  std::size_t start_idx) const {
   if (start_idx >= field_path.size()) {
     return nullptr;
+  }
+  if (lance::arrow::is_list(type())) {
+    return children_[0]->Get(field_path, start_idx);
   }
   auto child = Get(field_path[start_idx]);
   if (!child || start_idx == field_path.size() - 1) {
@@ -115,7 +118,7 @@ const std::shared_ptr<Field> Field::Get(const std::vector<std::string>& field_pa
   return child->Get(field_path, start_idx + 1);
 }
 
-const std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
+std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
   if (logical_type_ == "list.struct") {
     if (children_.empty()) {
       return nullptr;
@@ -317,6 +320,9 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
       assert(subfield);
       new_field->AddChild(subfield->Project(arrow_subfield));
     }
+  } else if (arrow::is_list(arrow_field->type())) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field->type());
+    new_field->AddChild(children_[0]->Project(list_type->value_field()));
   }
   return new_field;
 }
@@ -378,6 +384,16 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   if (comp_idx >= components.size() || !new_field || !field) {
     return ::arrow::Status::OK();
   }
+
+  /// If this is a list<struct> node, we push the copy field into the child / struct node.
+  if (field->logical_type() == "list.struct") {
+    assert(field->children_.size() == 1);
+    if (new_field->children_.empty()) {
+      new_field->children_.emplace_back(field->children_[0]->Copy(false));
+    }
+    return CopyField(new_field->children_[0], field->children_[0], components, comp_idx);
+  }
+
   const auto& name = components[comp_idx];
   auto new_child = new_field->Get(name);
   if (!new_child) {
