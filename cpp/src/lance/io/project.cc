@@ -48,6 +48,10 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
   if (projected_arrow_schema->num_fields() == 0) {
     projected_arrow_schema = scan_options->dataset_schema;
   }
+  fmt::print(stderr,
+             "XXX\nStart to project schema: \noriginal={}\nprojected={}\n---XXX\n",
+             schema->ToString(),
+             projected_arrow_schema->ToString());
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema->Project(*projected_arrow_schema));
   auto scan_schema = projected_schema;
   if (filter) {

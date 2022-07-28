@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Union
 from pathlib import Path
+from typing import Union, Optional
 
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -22,7 +22,7 @@ from lance.lib import LanceFileFormat, WriteTable
 __all__ = ["dataset", "write_table"]
 
 
-def dataset(uri: str) -> ds.Dataset:
+def dataset(uri: str, columns: Optional[str] = None, limit: Optional[int] = None, offset: int = 0) -> ds.Dataset:
     """
     Create an Arrow Dataset from the given lance uri.
 

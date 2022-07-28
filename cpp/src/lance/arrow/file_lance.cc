@@ -50,12 +50,17 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     const ::arrow::dataset::FileSource& source) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, source.Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::arrow::FileReader::Make(infile));
+  fmt::print(stderr, "Inspect schema: \n");
   return reader->GetSchema();
 }
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
+  fmt::print(stderr,
+             "Scan schema:\n  projection_schema={}\n\nproject_expr={}\n",
+             options->projected_schema->ToString(),
+             options->projection.ToString());
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
 
   auto reader = std::make_shared<lance::io::FileReader>(infile);
