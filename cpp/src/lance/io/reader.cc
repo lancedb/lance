@@ -353,10 +353,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   if (array_length == 0) {
     return ::arrow::MakeEmptyArray(field->type());
   }
-  // Realigned offsets
+  // Realigned offsets to be zero-started
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
-  fmt::print("Shiftted Offset: {} values={}\n", shifted_offsets->ToString(), values->ToString());
-
   // Setup null bitmap
   ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(array_length, pool_));
   for (int i = 0; i < array_length; i++) {

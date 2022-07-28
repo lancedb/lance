@@ -22,6 +22,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 #include "lance/arrow/writer.h"
 
@@ -59,14 +60,13 @@ TEST_CASE("Test List Array With Nulls") {
                           << "\n Actual table: " << table_result.ValueOrDie()->ToString());
   CHECK(table->Equals(*table_result.ValueOrDie()));
 
-  for (int i = 0; i < reader->length(); i++) {
-    auto row = reader->Get(i);
-    INFO("Get row 0 " << row.status());
-    CHECK(row.ok());
-    fmt::print("Row {} is: {} \n", i, *row);
-    for (auto& scalar : *row) {
-      fmt::print("Scalar type; {}\n", scalar->type->ToString());
-      fmt::print("Get: {}\n", scalar->ToString());
-    }
+  auto row = reader->Get(0).ValueOrDie();
+  auto scalar = row[0];
+  CHECK(scalar->Equals(::arrow::ListScalar(::lance::arrow::ToArray({1, 1, 1}).ValueOrDie())));
+
+  for (int i = 2; i < 5; i++) {
+    scalar = reader->Get(i).ValueOrDie()[0];
+    CHECK(scalar->Equals(::arrow::NullScalar()));
   }
+
 }
