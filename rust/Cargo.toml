@@ -1,0 +1,13 @@
+[package]
+name = "lance"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+homepage = "https://github.com/eto-ai/lance"
+repository = "https://github.com/eto-ai/lance"
+authors = ["Lance Developers <dev@eto.ai>"]
+readme = "../README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
