@@ -12,13 +12,19 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-pub mod encodings;
+//! Lance Encodings
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
+use std::io;
+
+use arrow::array::Array;
+use arrow::array::Int32Array;
+
+/// Encoder.
+pub trait Encoder {
+    fn write(&mut self, array: &dyn Array) -> Result<i64, io::Error>;
+}
+
+/// Decoder.
+pub trait Decoder {
+    fn take(&mut self, indices: &dyn Int32Array) -> Result<Array, io::Error>;
 }
