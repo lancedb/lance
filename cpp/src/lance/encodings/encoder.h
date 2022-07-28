@@ -56,14 +56,15 @@ class Encoder {
 class Decoder {
  public:
   inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                 int64_t position,
-                 int32_t length) noexcept
-      : infile_(infile), position_(position), length_(length){};
-
-  inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile) noexcept
-      : infile_(infile), position_(-1), length_(-1) {}
+                 std::shared_ptr<::arrow::DataType> type) noexcept
+      : infile_(infile), type_(type) {}
 
   virtual ~Decoder() = default;
+
+  /// Initialize the decoder.
+  virtual ::arrow::Status Init() {
+      return ::arrow::Status::OK();
+  };
 
   virtual void Reset(int64_t position, int32_t length) {
     position_ = position;
@@ -81,10 +82,18 @@ class Decoder {
   virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const = 0;
 
+  /// Take the values by the indices.
+  ///
+  /// \param indices. The sorted array of indices within the page.
+  /// \return an array of value if success.
+  virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const = 0;
+
  protected:
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;
-  int64_t position_;
-  int32_t length_;
+  std::shared_ptr<::arrow::DataType> type_;
+  int64_t position_ = -1;
+  int32_t length_ = -1;
 };
 
 }  // namespace lance::encodings

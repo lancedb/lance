@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "lance/arrow/stl.h"
 #include "lance/format/format.h"
 
 using arrow::BinaryBuilder;
@@ -35,13 +36,6 @@ using lance::encodings::VarBinaryEncoder;
 using std::string;
 using std::vector;
 
-auto BuildStringArray(const vector<string>& words) {
-  arrow::StringBuilder builder;
-  for (auto s : words) {
-    CHECK(builder.Append(s).ok());
-  }
-  return std::static_pointer_cast<arrow::StringArray>(builder.Finish().ValueOrDie());
-}
 
 auto WriteStrings(std::shared_ptr<arrow::io::BufferOutputStream> out,
                   std::shared_ptr<StringArray> arr) {
@@ -52,8 +46,8 @@ auto WriteStrings(std::shared_ptr<arrow::io::BufferOutputStream> out,
 TEST_CASE("Write binary arrow") {
   auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
 
-  auto arr1 = BuildStringArray({"First", "Second", "More"});
-  auto arr2 = BuildStringArray({"THIS", "IS", "SOMETHING", "ELSE"});
+  auto arr1 = lance::arrow::ToArray({"First", "Second", "More"}).ValueOrDie();
+  auto arr2 = lance::arrow::ToArray({"THIS", "IS", "SOMETHING", "ELSE"}).ValueOrDie();
 
   auto offset1 = WriteStrings(out, arr1);
   auto offset2 = WriteStrings(out, arr2);
@@ -62,7 +56,8 @@ TEST_CASE("Write binary arrow") {
   auto infile = make_shared<arrow::io::BufferReader>(buf);
 
   {
-    VarBinaryDecoder<::arrow::StringType> decoder(infile, offset1, 3);
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, arrow::utf8());
+    decoder.Reset(offset1, 3);
 
     auto actual_arr = decoder.ToArray().ValueOrDie();
     CHECK(arr1->Equals(actual_arr));
@@ -74,7 +69,8 @@ TEST_CASE("Write binary arrow") {
   }
 
   {
-    VarBinaryDecoder<::arrow::StringType> decoder(infile, offset2, 4);
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, arrow::utf8());
+    decoder.Reset(offset2, 4);
 
     auto actual_arr = decoder.ToArray().ValueOrDie();
     INFO("ACTUAL ARR 2 " << actual_arr->ToString());
@@ -85,4 +81,24 @@ TEST_CASE("Write binary arrow") {
       CHECK(expected->CastTo(arrow::utf8()).ValueOrDie()->Equals(arr2->GetScalar(i).ValueOrDie()));
     }
   }
+}
+
+TEST_CASE("Take") {
+  auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+
+  std::vector<std::string> words;
+  for (int i = 0; i < 100; i++) {
+    words.emplace_back(fmt::format("{}", i));
+  }
+  auto arr = lance::arrow::ToArray(words).ValueOrDie();
+  auto offset = WriteStrings(out, arr);
+  auto buf = out->Finish().ValueOrDie();
+  auto infile = make_shared<arrow::io::BufferReader>(buf);
+
+  VarBinaryDecoder<::arrow::StringType> decoder(infile, ::arrow::utf8());
+  decoder.Reset(offset, 100);
+  auto indices = lance::arrow::ToArray({5, 10, 20}).ValueOrDie();
+  auto actual = decoder.Take(indices).ValueOrDie();
+  auto expected = lance::arrow::ToArray({"5", "10", "20"}).ValueOrDie();
+  CHECK(expected->Equals(actual));
 }

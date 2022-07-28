@@ -1,0 +1,16 @@
+FROM quay.io/pypa/manylinux2014_x86_64
+
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+RUN yum update -y \
+    && yum install -y epel-release || yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1).noarch.rpm \
+    && yum install -y https://apache.jfrog.io/artifactory/arrow/centos/$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1)/apache-arrow-release-latest.rpm \
+    && yum install -y --enablerepo=epel arrow-devel \
+        arrow-dataset-devel parquet-devel wget \
+    && cd /tmp \
+    && wget -q https://github.com/protocolbuffers/protobuf/releases/download/v3.20.1/protobuf-cpp-3.20.1.tar.gz -O - | tar -xz \
+    && cd protobuf* \
+    && ./configure \
+    && make -j \
+    && make install \
+    && rm -rf /tmp/proto*

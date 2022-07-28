@@ -1,11 +1,11 @@
-#!/bin/sh
+#!/bin/bash
 
 set -ex
 
 APACHE_ARROW_VERSION=release-8.0.0
 
 # Build apache arrow
-function build_arrow {
+build_arrow() {
     git clone git@github.com:apache/arrow
     pushd arrow
     git checkout ${APACHE_ARROW_VERSION}

@@ -1,3 +1,17 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #include "lance/arrow/writer.h"
 
 #include <arrow/builder.h>
@@ -97,7 +111,6 @@ auto CocoDataset() {
   auto annotations = listBuilder.Finish().ValueOrDie();
   listBuilder.Reset();
 
-  auto sink = arrow::io::BufferOutputStream::Create();
   auto table = arrow::Table::Make(schema, {filenameArr, split, width, images, annotations});
   return table;
 }
@@ -114,10 +127,13 @@ TEST_CASE("Write COCO Dataset") {
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
   CHECK(reader->primary_key() == "filename");
-  CHECK(reader->num_chunks() == 1);
+  CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
-  auto table = reader->ReadTable().ValueOrDie();
+  auto result = reader->ReadTable();
+  INFO("ReadTable: " << result.status().message());
+  CHECK(result.ok());
+  auto table = result.ValueUnsafe();
   CHECK(coco->num_columns() == table->num_columns());
 
   INFO("expect " << coco->ToString() << "\nactual " << table->ToString());
@@ -127,4 +143,33 @@ TEST_CASE("Write COCO Dataset") {
   CHECK(row.ok());
   auto anno_scalar = std::static_pointer_cast<::arrow::ListScalar>((*row)[row->size() - 1]);
   CHECK(anno_scalar->value->length() == 2);
+}
+
+TEST_CASE("Write dictionary type") {
+  auto label_type = ::arrow::dictionary(arrow::int8(), arrow::utf8());
+
+  ::arrow::DictionaryBuilder<arrow::StringType> builder;
+  CHECK(builder.Append("cat").ok());
+  CHECK(builder.Append("dog").ok());
+  CHECK(builder.Append("cat").ok());
+  CHECK(builder.Append("person").ok());
+
+  auto arr = builder.Finish().ValueOrDie();
+  INFO("array is " << arr->ToString());
+
+  auto schema = arrow::schema({arrow::field("label", label_type)});
+  auto table = arrow::Table::Make(schema, {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink, "label").ok());
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  INFO(FileReader::Make(infile).status());
+  auto reader = FileReader::Make(infile).ValueOrDie();
+  CHECK(reader->primary_key() == "label");
+  CHECK(reader->num_batches() == 1);
+  CHECK(reader->length() == 4);
+
+  auto actual_table = reader->ReadTable().ValueOrDie();
+  CHECK(table->Equals(*actual_table));
 }

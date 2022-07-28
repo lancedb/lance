@@ -14,7 +14,7 @@
 namespace lance::io {
 
 template <typename T>
-concept ProtoMessage = std::is_base_of<google::protobuf::MessageLite, T>::value;
+concept ProtoMessage = std::is_base_of<google::protobuf::Message, T>::value;
 
 template <ProtoMessage P>
 ::arrow::Result<P> ParseProto(std::shared_ptr<::arrow::Buffer> buf) {
@@ -39,6 +39,6 @@ template <ProtoMessage P>
 }
 
 ::arrow::Result<int64_t> WriteProto(std::shared_ptr<::arrow::io::OutputStream> sink,
-                                    const google::protobuf::MessageLite& pb);
+                                    const google::protobuf::Message& pb);
 
 }  // namespace lance::io

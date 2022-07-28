@@ -25,11 +25,15 @@ if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
 endif ()
 
 # Configure CCache if available
-find_program (CCACHE_FOUND ccache)
+find_program(CCACHE_FOUND ccache)
 if (CCACHE_FOUND)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
-  set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ccache)
+    set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif (CCACHE_FOUND)
+
+if (CMAKE_BUILD_TYPE STREQUAL Debug)
+    SET(LANCE_BUILD_BENCHMARKS ON)
+endif ()
 
 add_compile_options(-Wall -Wextra -fPIC)
 
@@ -60,7 +64,10 @@ find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    list(APPEND CMAKE_MODULE_PATH /usr/lib/x86_64-linux-gnu/cmake/arrow)
+    list(APPEND CMAKE_MODULE_PATH
+            /usr/lib/x86_64-linux-gnu/cmake/arrow
+            /usr/lib64/cmake/arrow
+            )
 endif ()
 
 if (APPLE)
@@ -70,7 +77,6 @@ if (APPLE)
     list(APPEND CMAKE_MODULE_PATH
             /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
             /usr/local/opt/apache-arrow/lib/cmake/arrow)
-    message("FOUND OPENSSL is : ${OPENSSL_ROOT_DIR}]")
 endif (APPLE)
 
 find_package(Arrow REQUIRED)
@@ -108,11 +114,14 @@ set(lance_objects
         )
 
 add_subdirectory(src)
+if (LANCE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif ()
 
 add_library(lance SHARED ${lance_objects})
 target_link_libraries(lance PUBLIC
+        ${Protobuf_LIBRARIES}
         ${ARROW_SHARED_LIB}
         ${ARROW_DATASET_SHARED_LIB}
         fmt::fmt
-        ${Protobuf_LIBRARIES}
         )

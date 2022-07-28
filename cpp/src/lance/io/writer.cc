@@ -25,6 +25,7 @@
 #include "lance/format/manifest.h"
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
+#include "lance/format/visitors.h"
 #include "lance/io/pb.h"
 
 namespace lance::io {
@@ -71,12 +72,12 @@ FileWriter::FileWriter(std::shared_ptr<::arrow::Schema> schema,
 FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::Write(const std::shared_ptr<::arrow::RecordBatch>& batch) {
-  metadata_->AddChunkOffset(batch->num_rows());
+  metadata_->AddBatchLength(batch->num_rows());
 
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
   }
-  chunk_id_++;
+  batch_id_++;
   return ::arrow::Status::OK();
 }
 
@@ -89,17 +90,19 @@ FileWriter::~FileWriter() {}
     return WriteStructArray(field, arr);
   } else if (lance::arrow::is_list(arr->type())) {
     return WriteListArray(field, arr);
+  } else if (::arrow::is_dictionary(arr->type_id())) {
+    return WriteDictionaryArray(field, arr);
   }
-  assert(false);
+  return ::arrow::Status::Invalid(
+      fmt::format("WriteArray: unsupported data type: {}", arr->type()->ToString()));
 }
 
 ::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
                                                 const std::shared_ptr<::arrow::Array>& arr) {
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
-  lookup_table_.AddPageLength(field_id, chunk_id_, arr->length());
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
-  lookup_table_.AddOffset(field_id, chunk_id_, pos);
+  lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
 
@@ -126,10 +129,27 @@ FileWriter::~FileWriter() {}
   return WriteArray(child_field, list_arr->values());
 }
 
+::arrow::Status FileWriter::WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
+                                                 const std::shared_ptr<::arrow::Array>& arr) {
+  assert(field->logical_type().starts_with("dict:"));
+  auto encoder = field->GetEncoder(destination_);
+  auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  if (!field->dictionary()) {
+    ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
+  }
+  auto field_id = field->id();
+  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
+  lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
+  return ::arrow::Status::OK();
+}
+
 ::arrow::Status FileWriter::WriteFooter() {
+  // Write dictionary values first.
+  auto visitor = format::WriteDictionaryVisitor(destination_);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(lance_schema_));
+
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
-  metadata_->SetChunkPosition(pos);
-  lookup_table_.WritePageLengthTo(&metadata_->pb());
+  metadata_->SetPageTablePosition(pos);
 
   std::string primary_key;
   if (options_->type_name() == lance::arrow::LanceFileFormat::Make()->type_name()) {
@@ -138,9 +158,9 @@ FileWriter::~FileWriter() {}
   }
   format::Manifest manifest(primary_key, lance_schema_);
   ARROW_ASSIGN_OR_RAISE(pos, manifest.Write(destination_));
-  metadata_->pb().set_manifest_position(pos);
+  metadata_->SetManifestPosition(pos);
 
-  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, metadata_->pb()));
+  ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
   return internal::WriteFooter(destination_, pos);
 }
 

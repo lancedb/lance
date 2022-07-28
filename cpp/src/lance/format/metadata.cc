@@ -1,3 +1,17 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #include "lance/format/metadata.h"
 
 #include <arrow/buffer.h>
@@ -5,7 +19,6 @@
 #include <fmt/format.h>
 
 #include <memory>
-#include <numeric>
 #include <tuple>
 
 #include "lance/format/format.h"
@@ -18,7 +31,7 @@ using std::shared_ptr;
 
 namespace lance::format {
 
-Result<shared_ptr<Metadata>> Metadata::Parse(shared_ptr<::arrow::Buffer> buffer) {
+Result<shared_ptr<Metadata>> Metadata::Make(const shared_ptr<::arrow::Buffer>& buffer) {
   auto meta = std::make_unique<Metadata>();
   auto msg = io::ParseProto<pb::Metadata>(buffer);
   if (!msg.ok()) {
@@ -28,37 +41,46 @@ Result<shared_ptr<Metadata>> Metadata::Parse(shared_ptr<::arrow::Buffer> buffer)
   return meta;
 }
 
-int32_t Metadata::num_chunks() const { return pb_.chunk_offsets_size() - 1; }
+::arrow::Result<int64_t> Metadata::Write(const std::shared_ptr<::arrow::io::OutputStream>& out) {
+  return io::WriteProto(out, pb_);
+}
 
-int64_t Metadata::length() const { return pb_.chunk_offsets(pb_.chunk_offsets_size() - 1); }
+int32_t Metadata::num_batches() const { return pb_.batch_offsets_size() - 1; }
 
-void Metadata::AddChunkOffset(int32_t chunk_length) {
-  if (pb_.chunk_offsets_size() == 0) {
-    pb_.add_chunk_offsets(0);
+int64_t Metadata::length() const {
+  if (pb_.batch_offsets_size() == 0) {
+    return 0;
   }
-  auto last = pb_.chunk_offsets(pb_.chunk_offsets_size() - 1);
-  pb_.add_chunk_offsets(last + chunk_length);
+  return pb_.batch_offsets(pb_.batch_offsets_size() - 1);
 }
 
-int32_t Metadata::GetChunkLength(int32_t chunk_id) const {
-  assert(chunk_id <= pb_.chunk_offsets_size());
-  return pb_.chunk_offsets(chunk_id + 1) - pb_.chunk_offsets(chunk_id);
+void Metadata::AddBatchLength(int32_t batch_length) {
+  if (pb_.batch_offsets_size() == 0) {
+    pb_.add_batch_offsets(0);
+  }
+  pb_.add_batch_offsets(length() + batch_length);
 }
 
-::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateChunk(int32_t idx) const {
+int32_t Metadata::GetBatchLength(int32_t batch_id) const {
+  assert(batch_id <= pb_.batch_offsets_size());
+  return pb_.batch_offsets(batch_id + 1) - pb_.batch_offsets(batch_id);
+}
+
+::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateBatch(int32_t row_index) const {
   int64_t len = length();
-  if (idx < 0 || idx >= len) {
-    return ::arrow::Status::IndexError(fmt::format("Chunk index out of range: {} of {}", idx, len));
+  if (row_index < 0 || row_index >= len) {
+    return ::arrow::Status::IndexError(fmt::format("Row index out of range: {} of {}", row_index, len));
   }
-  auto it = std::upper_bound(pb_.chunk_offsets().begin(), pb_.chunk_offsets().end(), idx);
-  if (it == pb_.chunk_offsets().end()) {
-    return ::arrow::Status::IndexError("Chunk index out of range {} of {}", idx, len);
+  auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), row_index);
+  if (it == pb_.batch_offsets().end()) {
+    return ::arrow::Status::IndexError("Row index out of range {} of {}", row_index, len);
   }
-  int32_t bound_idx = std::distance(pb_.chunk_offsets().begin(), it);
+  int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it);
   assert(bound_idx >= 0);
   bound_idx = std::max(0, bound_idx - 1);
-  int32_t idx_in_chunk = idx - pb_.chunk_offsets(bound_idx);
-  return std::tuple(bound_idx, idx_in_chunk);
+  // Offset within the batch.
+  int32_t offset = row_index - pb_.batch_offsets(bound_idx);
+  return std::tuple(bound_idx, offset);
 }
 
 ::arrow::Result<std::shared_ptr<Manifest>> Metadata::GetManifest(
@@ -70,6 +92,10 @@ int32_t Metadata::GetChunkLength(int32_t chunk_id) const {
   return Manifest::Parse(in, pb_.manifest_position());
 }
 
-void Metadata::SetChunkPosition(int64_t position) { pb_.set_chunk_position(position); }
+void Metadata::SetManifestPosition(int64_t position) { pb_.set_manifest_position(position); }
+
+int64_t Metadata::page_table_position() const { return pb_.page_table_position(); }
+
+void Metadata::SetPageTablePosition(int64_t position) { pb_.set_page_table_position(position); }
 
 }  // namespace lance::format
