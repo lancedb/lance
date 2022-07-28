@@ -159,15 +159,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
       GetArray(field->fields()[0],
                batch_id,
                ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
-  auto scalar = std::make_shared<::arrow::ListScalar>(values);
-  fmt::print("At this moment: field={} scalar_type={} scalar={}\n",
-             field->name(),
-//             (*rst)->type()->ToString(),
-//             (*rst)->ToString(),
-             scalar->type->ToString(),
-             scalar->ToString());
-
-  return scalar;
+  return std::make_shared<::arrow::ListScalar>(values);
 }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
@@ -318,8 +310,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     children.emplace_back(arr);
     field_names.emplace_back(child->name());
   }
-  auto arr = ::arrow::StructArray::Make(children, field_names);
-  return arr;
+  return ::arrow::StructArray::Make(children, field_names);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetListArray(
@@ -345,7 +336,16 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   auto length = params.length;
   auto start = params.offset.value();
 
-  ARROW_ASSIGN_OR_RAISE(auto offsets_arr, GetPrimitiveArray(field, batch_id, params));
+  std::shared_ptr<::arrow::Array> offsets_arr;
+  if (params.length.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(
+        offsets_arr,
+        GetPrimitiveArray(
+            field, batch_id, ArrayReadParams(params.offset.value(), params.length.value() + 1)));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(
+        offsets_arr, GetPrimitiveArray(field, batch_id, ArrayReadParams(params.offset.value())));
+  }
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
   int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
@@ -353,7 +353,6 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
 
-  fmt::print("Get List Array: offsets = {} values={}\n", offsets->ToString(), values);
   // Realigned offsets
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
