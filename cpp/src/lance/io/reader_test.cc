@@ -68,5 +68,4 @@ TEST_CASE("Test List Array With Nulls") {
     scalar = reader->Get(i).ValueOrDie()[0];
     CHECK(scalar->Equals(::arrow::NullScalar()));
   }
-
 }
