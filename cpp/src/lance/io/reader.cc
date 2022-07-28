@@ -350,19 +350,16 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
-  if (array_length == 0) {
-    return ::arrow::MakeEmptyArray(field->type());
-  }
   // Realigned offsets to be zero-started
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   // Setup null bitmap
-  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(array_length, pool_));
-  for (int i = 0; i < array_length; i++) {
+  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
+  for (int i = 0; i < shifted_offsets->length() - 1; i++) {
     ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
                                 offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
   return std::make_shared<::arrow::ListArray>(field->type(),
-                                              offsets->length() - 1,
+                                              shifted_offsets->length() - 1,
                                               shifted_offsets->data()->buffers[1],
                                               values,
                                               null_bitmap);

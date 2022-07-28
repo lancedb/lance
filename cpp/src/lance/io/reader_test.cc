@@ -37,11 +37,6 @@ TEST_CASE("Test List Array With Nulls") {
   CHECK(list_builder.AppendNulls(3).ok());
 
   auto values = std::static_pointer_cast<::arrow::ListArray>(list_builder.Finish().ValueOrDie());
-  fmt::print("List is : {} offset={} null bitmaps={}\n",
-             values,
-             values->offsets(),
-             values->null_bitmap()->ToString());
-
   auto schema = ::arrow::schema({::arrow::field("values", ::arrow::list(::arrow::int32()))});
   auto table = ::arrow::Table::Make(schema, {values});
 
