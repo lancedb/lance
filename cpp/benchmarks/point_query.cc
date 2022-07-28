@@ -67,13 +67,12 @@ void BenchmarkPointQueryLance(const std::string& uri) {
   std::mt19937 mt(rd());
   std::uniform_int_distribution<int32_t> dist(0, length - 1);
 
-  auto read = [&]() {
+  BENCHMARK("Single Thread") {
     auto idx = dist(mt);
     auto row = reader->Get(idx);
+    INFO("Row status: " << idx << ": " << row.status());
     CHECK(row.ok());
   };
-
-  BENCHMARK("Single Thread") { return read(); };
 }
 
 TEST_CASE("Random Access Over One File") {

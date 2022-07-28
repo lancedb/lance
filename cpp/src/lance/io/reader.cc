@@ -138,13 +138,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Int32Array>> ResetOffsets(
     const std::shared_ptr<::arrow::Int32Array>& offsets) {
   int32_t start_pos = offsets->Value(0);
-  ::arrow::Int32Builder builder;
-  for (int i = 0; i < offsets->length(); i++) {
-    ARROW_RETURN_NOT_OK(builder.Append(offsets->Value(i) - start_pos));
-  }
-  ARROW_ASSIGN_OR_RAISE(auto arr, builder.Finish());
-
-  return std::static_pointer_cast<::arrow::Int32Array>(arr);
+  ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::Subtract(offsets, ::arrow::Datum(start_pos)));
+  return std::static_pointer_cast<::arrow::Int32Array>(datum.make_array());
 }
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetListScalar(
@@ -156,19 +151,14 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   decoder->Reset(pos, length);
   ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
+  if (offsets->Value(0) == offsets->Value(1)) {
+    return std::make_shared<::arrow::NullScalar>();
+  }
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0],
                batch_id,
                ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
-  ARROW_ASSIGN_OR_RAISE(offsets, ResetOffsets(offsets));
-  auto rst = ::arrow::ListArray::FromArrays(field->type(), *offsets, *values);
-  if (!rst.ok()) {
-    fmt::print(stderr, "GetListScalar error: {}\n", rst.status().message());
-    return rst.status();
-  }
-  ARROW_ASSIGN_OR_RAISE(auto list_arr,
-                        ::arrow::ListArray::FromArrays(field->type(), *offsets, *values));
   return std::make_shared<::arrow::ListScalar>(values);
 }
 
@@ -320,8 +310,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     children.emplace_back(arr);
     field_names.emplace_back(child->name());
   }
-  auto arr = ::arrow::StructArray::Make(children, field_names);
-  return arr;
+  return ::arrow::StructArray::Make(children, field_names);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetListArray(
@@ -347,26 +336,33 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   auto length = params.length;
   auto start = params.offset.value();
 
-  ARROW_ASSIGN_OR_RAISE(auto offsets_arr, GetPrimitiveArray(field, batch_id, params));
+  std::shared_ptr<::arrow::Array> offsets_arr;
+  if (length.has_value()) {
+    ARROW_ASSIGN_OR_RAISE(
+        offsets_arr,
+        GetPrimitiveArray(field, batch_id, ArrayReadParams(start, length.value() + 1)));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(offsets_arr, GetPrimitiveArray(field, batch_id, ArrayReadParams(start)));
+  }
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
   int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
-
-  // Realigned offsets
+  // Realigned offsets to be zero-started
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
-  auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
-  if (!result.ok()) {
-    fmt::print("GetListArray: field={}, batch_id_={}, start={}, length={}\nReason:{}\n",
-               field->name(),
-               batch_id,
-               start,
-               *length,
-               result.status().message());
+  // Setup null bitmap
+  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
+  for (int i = 0; i < shifted_offsets->length() - 1; i++) {
+    ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
+                                offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
-  return result;
+  return std::make_shared<::arrow::ListArray>(field->type(),
+                                              shifted_offsets->length() - 1,
+                                              shifted_offsets->data()->buffers[1],
+                                              values,
+                                              null_bitmap);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetDictionaryArray(
