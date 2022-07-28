@@ -138,13 +138,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 ::arrow::Result<std::shared_ptr<::arrow::Int32Array>> ResetOffsets(
     const std::shared_ptr<::arrow::Int32Array>& offsets) {
   int32_t start_pos = offsets->Value(0);
-  ::arrow::Int32Builder builder;
-  for (int i = 0; i < offsets->length(); i++) {
-    ARROW_RETURN_NOT_OK(builder.Append(offsets->Value(i) - start_pos));
-  }
-  ARROW_ASSIGN_OR_RAISE(auto arr, builder.Finish());
-
-  return std::static_pointer_cast<::arrow::Int32Array>(arr);
+  ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::Subtract(offsets, ::arrow::Datum(start_pos)));
+  return std::static_pointer_cast<::arrow::Int32Array>(datum.make_array());
 }
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetListScalar(
@@ -156,20 +151,23 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   decoder->Reset(pos, length);
   ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
+  if (offsets->Value(0) == offsets->Value(1)) {
+    return std::make_shared<::arrow::NullScalar>();
+  }
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0],
                batch_id,
                ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
-  ARROW_ASSIGN_OR_RAISE(offsets, ResetOffsets(offsets));
-  auto rst = ::arrow::ListArray::FromArrays(field->type(), *offsets, *values);
-  if (!rst.ok()) {
-    fmt::print(stderr, "GetListScalar error: {}\n", rst.status().message());
-    return rst.status();
-  }
-  ARROW_ASSIGN_OR_RAISE(auto list_arr,
-                        ::arrow::ListArray::FromArrays(field->type(), *offsets, *values));
-  return std::make_shared<::arrow::ListScalar>(values);
+  auto scalar = std::make_shared<::arrow::ListScalar>(values);
+  fmt::print("At this moment: field={} scalar_type={} scalar={}\n",
+             field->name(),
+//             (*rst)->type()->ToString(),
+//             (*rst)->ToString(),
+             scalar->type->ToString(),
+             scalar->ToString());
+
+  return scalar;
 }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
@@ -355,6 +353,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
 
+  fmt::print("Get List Array: offsets = {} values={}\n", offsets->ToString(), values);
   // Realigned offsets
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   auto result = ::arrow::ListArray::FromArrays(*shifted_offsets, *values, pool_);
