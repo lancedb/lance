@@ -1,12 +1,13 @@
 [package]
 name = "lance"
-version = "0.0.1"
+version = "0.0.1-alpha0"
 edition = "2021"
 license = "Apache-2.0"
 homepage = "https://github.com/eto-ai/lance"
 repository = "https://github.com/eto-ai/lance"
 authors = ["Lance Developers <dev@eto.ai>"]
 readme = "../README.md"
+description = "Rust Implementation of Lance Columnar Format"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
