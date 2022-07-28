@@ -9,14 +9,15 @@ const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
      ::arrow::field("split", ::arrow::utf8()),
      ::arrow::field("annotations",
-                    ::arrow::struct_({::arrow::field("label", ::arrow::utf8()),
-                                      ::arrow::field("box",
-                                                     ::arrow::struct_({
-                                                         ::arrow::field("xmin", ::arrow::float32()),
-                                                         ::arrow::field("ymin", ::arrow::float32()),
-                                                         ::arrow::field("xmax", ::arrow::float32()),
-                                                         ::arrow::field("ymax", ::arrow::float32()),
-                                                     }))}))});
+                    ::arrow::list(::arrow::struct_(
+                        {::arrow::field("label", ::arrow::utf8()),
+                         ::arrow::field("box",
+                                        ::arrow::struct_({
+                                            ::arrow::field("xmin", ::arrow::float32()),
+                                            ::arrow::field("ymin", ::arrow::float32()),
+                                            ::arrow::field("xmax", ::arrow::float32()),
+                                            ::arrow::field("ymax", ::arrow::float32()),
+                                        }))})))});
 
 TEST_CASE("Get field by name") {
   auto schema = lance::format::Schema(arrow_schema);
@@ -45,12 +46,27 @@ TEST_CASE("Schema equal") {
   CHECK(schema1 == schema2);
 }
 
+TEST_CASE("Project nested fields") {
+  auto original = lance::format::Schema(arrow_schema);
+  auto projection = original.Project({"annotations.box.xmin"}).ValueOrDie();
+
+  auto expected_schema = ::arrow::schema({::arrow::field(
+      "annotations",
+      ::arrow::list(::arrow::struct_({::arrow::field(
+          "box", ::arrow::struct_({::arrow::field("xmin", ::arrow::float32())}))})))});
+  auto expected = lance::format::Schema(expected_schema);
+  INFO("Expected: " << expected.ToString());
+  INFO("Actual: " << projection->ToString());
+  CHECK(projection->Equals(expected, false));
+}
+
 TEST_CASE("Get schema view") {
   auto original = lance::format::Schema(arrow_schema);
   auto view = original.Project({"split", "annotations.box.xmin"});
   INFO("Create view status: " << view.status());
   CHECK(view.ok());
   CHECK((*view)->GetField("split"));
+  INFO("Annotations xmin: " << (*view)->GetField("annotations.box.xmin"));
   CHECK((*view)->GetField("annotations.box.xmin"));
   CHECK(!(*view)->GetField("pk"));
   CHECK(!(*view)->GetField("annotations.label"));
@@ -63,8 +79,9 @@ TEST_CASE("Get projection via arrow schema") {
   auto schema = lance::format::Schema(arrow_schema);
   auto projected_schema = ::arrow::schema(
       {::arrow::field("pk", ::arrow::utf8()),
-       ::arrow::field("annotations",
-                      ::arrow::struct_({::arrow::field("label", ::arrow::utf8())}))});
+       ::arrow::field(
+           "annotations",
+           ::arrow::list(::arrow::struct_({::arrow::field("label", ::arrow::utf8())})))});
   auto projection = schema.Project(*projected_schema).ValueOrDie();
 
   auto expect_schema = lance::format::Schema(projected_schema);
@@ -81,8 +98,9 @@ TEST_CASE("Exclude schema") {
 
   auto excluded_arrow_schema = ::arrow::schema(
       {::arrow::field("pk", ::arrow::utf8()),
-       ::arrow::field("annotations",
-                      ::arrow::struct_({::arrow::field("label", ::arrow::utf8())}))});
+       ::arrow::field(
+           "annotations",
+           ::arrow::list(::arrow::struct_({::arrow::field("label", ::arrow::utf8())})))});
   auto expected = original.Project(*excluded_arrow_schema).ValueOrDie();
 
   INFO("Expected: " << expected->ToString() << "\nActual: " << excluded->ToString());
@@ -91,5 +109,5 @@ TEST_CASE("Exclude schema") {
 
 TEST_CASE("Get Field Counts") {
   auto schema = lance::format::Schema(arrow_schema);
-  CHECK(schema.GetFieldsCount() == 9);
+  CHECK(schema.GetFieldsCount() == 10);
 }
