@@ -50,7 +50,6 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     const ::arrow::dataset::FileSource& source) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, source.Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::arrow::FileReader::Make(infile));
-  fmt::print(stderr, "Inspect schema: \n");
   return reader->GetSchema();
 }
 

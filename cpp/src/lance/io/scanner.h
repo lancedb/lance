@@ -14,8 +14,10 @@
 
 #pragma once
 
+#include <arrow/record_batch.h>
 #include <arrow/type_fwd.h>
 
+#include <atomic>
 #include <future>
 #include <memory>
 #include <optional>
@@ -35,7 +37,7 @@ class FileReader;
 class Project;
 
 /// Lance Scanner
-class Scanner {
+class Scanner : ::arrow::RecordBatchReader {
  public:
   /// Constructor.
   Scanner(std::shared_ptr<FileReader> reader,
@@ -54,10 +56,9 @@ class Scanner {
   /// Open the Scanner. Must call it before start iterating.
   ::arrow::Status Open();
 
-  /// Returns the next record batch if any.
-  ///
-  /// \return A record batch. Returns `nullptr` if reaches the end.
-  ::arrow::Result<::std::shared_ptr<::arrow::RecordBatch>> Next();
+  std::shared_ptr<::arrow::Schema> schema() const override;
+
+  ::arrow::Status ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) override;
 
   /// Async read, to match LanceFileFormat::ScanBatchesAsync()
   ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> operator()();
@@ -73,7 +74,7 @@ class Scanner {
   /// Projection over the dataset.
   std::shared_ptr<Project> project_;
 
-  int current_batch_ = 0;
+  std::atomic_int32_t current_batch_ = 0;
   std::size_t max_queue_size_ = 1;
   std::queue<std::future<::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>>> q_;
 

@@ -16,6 +16,7 @@
 
 #include <arrow/dataset/scanner.h>
 #include <arrow/record_batch.h>
+#include <arrow/status.h>
 #include <arrow/util/future.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -50,7 +51,7 @@ Scanner::Scanner(const Scanner& other) noexcept
       offset_(other.offset_),
       schema_(other.schema_),
       project_(other.project_),
-      current_batch_(other.current_batch_),
+      current_batch_(int(other.current_batch_)),
       max_queue_size_(other.max_queue_size_) {}
 
 Scanner::Scanner(Scanner&& other) noexcept
@@ -60,7 +61,7 @@ Scanner::Scanner(Scanner&& other) noexcept
       offset_(other.offset_),
       schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
-      current_batch_(other.current_batch_),
+      current_batch_(int(other.current_batch_)),
       max_queue_size_(other.max_queue_size_),
       q_(std::move(other.q_)) {}
 
@@ -73,33 +74,32 @@ Scanner::Scanner(Scanner&& other) noexcept
   return ::arrow::Status::OK();
 }
 
-void Scanner::AddPrefetchTask() {
-  while (q_.size() < max_queue_size_ && current_batch_ < reader_->metadata().num_batches()) {
-    auto batch_id = current_batch_++;
-    auto f = std::async(
-        [&](int32_t batch) {
-          auto result = project_->Execute(reader_, batch);
-          if (!result.ok()) {
-            fmt::print(
-                stderr, "Read bad batch: batch_id={}: {}\n", batch, result.status().message());
-          }
-          return result;
-        },
-        batch_id);
-    q_.push(std::move(f));
-  }
-}
+std::shared_ptr<::arrow::Schema> Scanner::schema() const { return project_->schema()->ToArrow(); }
 
-::arrow::Result<::std::shared_ptr<::arrow::RecordBatch>> Scanner::Next() {
-  // Let's do something simple.
-  // Each time just read batch_size * prefecth_size, to amortize I/O.
-  AddPrefetchTask();
-  if (q_.empty()) {
-    return nullptr;
+// void Scanner::AddPrefetchTask() {
+//   while (q_.size() < max_queue_size_ && current_batch_ < reader_->metadata().num_batches()) {
+//     auto batch_id = current_batch_++;
+//     auto f = std::async(
+//         [&](int32_t batch) {
+//           auto result = project_->Execute(reader_, batch);
+//           if (!result.ok()) {
+//             fmt::print(
+//                 stderr, "Read bad batch: batch_id={}: {}\n", batch, result.status().message());
+//           }
+//           return result;
+//         },
+//         batch_id);
+//     q_.push(std::move(f));
+//   }
+// }
+
+::arrow::Status Scanner::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
+  int32_t batch_id = current_batch_++;
+  if (batch_id < reader_->metadata().num_batches()) {
+    ARROW_ASSIGN_OR_RAISE(auto batch_read, project_->Execute(reader_, batch_id));
+    *batch = std::move(batch_read);
   }
-  auto future = std::move(q_.front());
-  q_.pop();
-  return future.get();
+  return ::arrow::Status::OK();
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> Scanner::operator()() {
