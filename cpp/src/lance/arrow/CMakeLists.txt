@@ -19,6 +19,7 @@ add_library(
         arrow
         OBJECT
         file_lance.cc
+        file_lance_ext.h
         reader.cc
         scanner.cc
         stl.h

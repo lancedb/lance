@@ -43,6 +43,7 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
 
   auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
   ARROW_RETURN_NOT_OK(builder.Filter(filter_));
+
   ARROW_ASSIGN_OR_RAISE(auto scanner, builder.Finish());
 
   /// We do the schema projection manuallly here to support nested structs.
@@ -52,13 +53,16 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   /// We can access subfields via column name `objects.value`.
   if (columns_.has_value()) {
     auto schema = lance::format::Schema(scanner->options()->dataset_schema);
-    fmt::print("Lance schema: {}\n\n", schema.ToString());
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns_.value()));
-    fmt::print("Lance projected: columns={}\nschema=\n{}\n",
-               columns_.value(),
-               projected_schema->ToString());
     scanner->options()->projected_schema = projected_schema->ToArrow();
   }
+
+  if (limit_.has_value()) {
+    scanner->options()->batch_size = offset_ + limit_.value();
+    /// We need to limit the parallelism for Project to calculate LIMIT / Offset
+    scanner->options()->batch_readahead = 1;
+  }
+
   return scanner;
 }
 

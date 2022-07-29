@@ -55,14 +55,21 @@ TEST_CASE("Build Scanner with nested struct") {
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
   scanner_builder.Limit(10);
   scanner_builder.Project({"objects.val"});
+  scanner_builder.Filter(::arrow::compute::equal(::arrow::compute::field_ref({"objects", 0, "val"}),
+                                                 ::arrow::compute::literal(2)));
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
   auto scanner = result.ValueOrDie();
   fmt::print("Projected: {}\n", scanner->options()->projected_schema);
 
   auto expected_proj_schema = ::arrow::schema({::arrow::field(
-      "objects", ::arrow::list(::arrow::struct_({::arrow::field("val", ::arrow::int32())})))});
+      "objects", ::arrow::list(::arrow::struct_({::arrow::field("val", ::arrow::int64())})))});
   INFO("Expected schema: " << expected_proj_schema->ToString());
   INFO("Actual schema: " << scanner->options()->projected_schema->ToString());
   CHECK(expected_proj_schema->Equals(scanner->options()->projected_schema));
+
+  CHECK(scanner->options()->batch_size == 10);
+  CHECK(scanner->options()->batch_readahead == 1);
+
+  fmt::print("Scanner Options: {}\n", scanner->options()->filter.ToString());
 }
