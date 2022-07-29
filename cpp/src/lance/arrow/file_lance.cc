@@ -24,7 +24,7 @@
 #include "lance/io/filter.h"
 #include "lance/io/project.h"
 #include "lance/io/reader.h"
-#include "lance/io/scanner.h"
+#include "lance/io/record_batch_reader.h"
 #include "lance/io/writer.h"
 
 const char kLanceFormatTypeName[] = "lance";

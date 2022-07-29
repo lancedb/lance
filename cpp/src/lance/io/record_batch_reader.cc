@@ -12,8 +12,6 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/scanner.h"
-
 #include <arrow/dataset/scanner.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
@@ -31,6 +29,7 @@
 #include "lance/io/limit.h"
 #include "lance/io/project.h"
 #include "lance/io/reader.h"
+#include "lance/io/record_batch_reader.h"
 
 namespace lance::io {
 

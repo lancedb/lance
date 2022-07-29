@@ -29,8 +29,8 @@ add_library(
         project.h
         reader.cc
         reader.h
-        scanner.cc
-        scanner.h
+        record_batch_reader.cc
+        record_batch_reader.h
         writer.cc
         writer.h
 )
