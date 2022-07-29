@@ -268,7 +268,6 @@ std::shared_ptr<::arrow::DataType> Field::type() const {
     assert(children_.size() == 1);
     return ::arrow::list(children_[0]->type());
   } else if (logical_type_ == "list.struct") {
-    fmt::print("Logical type children: {} {} {}\n", name_, children_.size(), children_);
     assert(children_.size() == 1);
     return ::arrow::list(children_[0]->type());
   } else if (logical_type_ == "struct") {
