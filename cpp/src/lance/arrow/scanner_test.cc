@@ -15,17 +15,24 @@
 #include "lance/arrow/scanner.h"
 
 #include <arrow/builder.h>
+#include <arrow/dataset/dataset.h>
+#include <arrow/dataset/scanner.h>
+#include <arrow/table.h>
 #include <arrow/type.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <memory>
 
 #include "lance/arrow/type.h"
 
-auto nested_schema = ::arrow::schema({::arrow::field("objects",
+auto nested_schema = ::arrow::schema({::arrow::field("pk", ::arrow::int32()),
+                                      ::arrow::field("objects",
                                                      ::arrow::list(::arrow::struct_({
                                                          ::arrow::field("val", ::arrow::int64()),
+                                                         ::arrow::field("id", ::arrow::int32()),
+                                                         ::arrow::field("label", ::arrow::utf8()),
                                                      })))});
 
 TEST_CASE("Project nested columns") {
@@ -43,5 +50,19 @@ TEST_CASE("Project nested columns") {
 }
 
 TEST_CASE("Build Scanner with nested struct") {
-  //  auto scanner_builder = lance::arrow::ScannerBuilder();
+  auto table = ::arrow::Table::MakeEmpty(nested_schema).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
+  auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
+  scanner_builder.Limit(10);
+  scanner_builder.Project({"objects.val"});
+  auto result = scanner_builder.Finish();
+  CHECK(result.ok());
+  auto scanner = result.ValueOrDie();
+  fmt::print("Projected: {}\n", scanner->options()->projected_schema);
+
+  auto expected_proj_schema = ::arrow::schema({::arrow::field(
+      "objects", ::arrow::list(::arrow::struct_({::arrow::field("val", ::arrow::int32())})))});
+  INFO("Expected schema: " << expected_proj_schema->ToString());
+  INFO("Actual schema: " << scanner->options()->projected_schema->ToString());
+  CHECK(expected_proj_schema->Equals(scanner->options()->projected_schema));
 }

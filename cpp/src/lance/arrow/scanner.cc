@@ -16,6 +16,8 @@
 
 #include <arrow/dataset/dataset.h>
 #include <arrow/dataset/scanner.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/format/schema.h"
@@ -39,25 +41,25 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
     return ::arrow::Status::Invalid("Offset is negative");
   }
 
-  auto options = std::make_shared<::arrow::dataset::ScanOptions>();
-  options->dataset_schema = dataset_->schema();
-  options->filter = filter_;
+  auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
+  ARROW_RETURN_NOT_OK(builder.Filter(filter_));
+  ARROW_ASSIGN_OR_RAISE(auto scanner, builder.Finish());
 
+  /// We do the schema projection manuallly here to support nested structs.
+  /// Esp. for `list<struct>`, supports Spark-like access, for example,
+  ///
+  /// for schema: `objects: list<struct<id:int, value:float>>`,
+  /// We can access subfields via column name `objects.value`.
   if (columns_.has_value()) {
-    auto schema = lance::format::Schema(dataset_->schema());
+    auto schema = lance::format::Schema(scanner->options()->dataset_schema);
+    fmt::print("Lance schema: {}\n\n", schema.ToString());
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns_.value()));
-    options->projected_schema = projected_schema->ToArrow();
+    fmt::print("Lance projected: columns={}\nschema=\n{}\n",
+               columns_.value(),
+               projected_schema->ToString());
+    scanner->options()->projected_schema = projected_schema->ToArrow();
   }
-
-  // Limit / Offset pushdown
-  if (limit_.has_value()) {
-    options->batch_size = limit_.value() + offset_;
-    options->use_threads = false;
-    options->batch_readahead = 1;
-  }
-
-  auto builder = ::arrow::dataset::ScannerBuilder(dataset_, options);
-  return builder.Finish();
+  return scanner;
 }
 
 }  // namespace lance::arrow
