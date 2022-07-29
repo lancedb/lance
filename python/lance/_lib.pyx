@@ -6,12 +6,13 @@ from cython.operator cimport dereference as deref
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr
 from libcpp.string cimport string
+from libcpp.vector cimport vector
 from pathlib import Path
 from pyarrow import Table
-from pyarrow._dataset cimport FileFormat
+from pyarrow._dataset cimport FileFormat, Dataset
 from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow cimport CTable, COutputStream
-from pyarrow.includes.libarrow_dataset cimport CFileFormat
+from pyarrow.includes.libarrow_dataset cimport CFileFormat, CDataset
 from pyarrow.lib cimport pyarrow_unwrap_table, check_status, get_writer
 
 
@@ -47,6 +48,18 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
         pass
 
     cdef cppclass CFileWriteOptions "::lance::arrow::FileWriteOptions"
+
+
+cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
+    cdef cppclass CScannerBuilder "::lance::arrow::ScannerBuilder"(
+        shared_ptr[CDataset])
+
+
+def BuildScanner(dataset: Dataset):
+    cdef CScannerBuilder builder
+    with nogil:
+        builder = new CScannerBuilder(dataset.unwrap())
+    pass
 
 
 cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:

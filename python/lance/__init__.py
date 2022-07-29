@@ -22,7 +22,9 @@ from lance.lib import LanceFileFormat, WriteTable
 __all__ = ["dataset", "write_table"]
 
 
-def dataset(uri: str, columns: Optional[str] = None, limit: Optional[int] = None, offset: int = 0) -> ds.Dataset:
+def dataset(
+    uri: str,
+) -> ds.Dataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
@@ -33,6 +35,18 @@ def dataset(uri: str, columns: Optional[str] = None, limit: Optional[int] = None
     """
     fmt = LanceFileFormat()
     return ds.dataset(uri, format=fmt)
+
+
+def scanner(
+    data: Union[str, Path, ds.Dataset],
+    columns: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+):
+    if isinstance(data, (str, Path)):
+        data = dataset(str(data))
+    
+    pass
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str):

@@ -30,6 +30,7 @@ namespace lance::arrow {
 ///
 /// The main difference between ScannerBuilder and `::arrow::ScannerBuilder` is that
 /// the lance one allows fine-grained project/predicate/limit/offset push-downs.
+///
 class ScannerBuilder final {
  public:
   /// Construct ScannerBuilder with a Dataset URI
@@ -44,6 +45,7 @@ class ScannerBuilder final {
   /// \param columns Selected column names.
   void Project(const std::vector<std::string>& columns);
 
+  /// Apply Filter
   void Filter(const ::arrow::compute::Expression& filter);
 
   /// Set limit to the dataset
