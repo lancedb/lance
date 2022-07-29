@@ -14,4 +14,22 @@
 
 #pragma once
 
-namespace lance::arrow {}
+#include <arrow/dataset/file_base.h>
+
+#include <cstdint>
+#include <optional>
+
+namespace lance::arrow {
+
+class LanceFragmentScanOptions : public ::arrow::dataset::FragmentScanOptions {
+ public:
+  LanceFragmentScanOptions() = default;
+
+  std::string type_name() const override;
+
+  /// Support limit / offset pushdown
+  std::optional<int64_t> limit;
+  int64_t offset = 0;
+};
+
+}  // namespace lance::arrow

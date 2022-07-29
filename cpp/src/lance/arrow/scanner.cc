@@ -20,6 +20,7 @@
 #include <fmt/ranges.h>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/file_lance_ext.h"
 #include "lance/format/schema.h"
 
 namespace lance::arrow {
@@ -43,6 +44,11 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
 
   auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
   ARROW_RETURN_NOT_OK(builder.Filter(filter_));
+  
+  auto fragment_opts = std::make_shared<LanceFragmentScanOptions>();
+  fragment_opts->limit = limit_;
+  fragment_opts->offset = offset_;
+  ARROW_RETURN_NOT_OK(builder.FragmentScanOptions(fragment_opts));
 
   ARROW_ASSIGN_OR_RAISE(auto scanner, builder.Finish());
 

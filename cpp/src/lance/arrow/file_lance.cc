@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "lance/arrow/file_lance_ext.h"
 #include "lance/arrow/reader.h"
 #include "lance/format/schema.h"
 #include "lance/io/filter.h"
@@ -56,15 +57,22 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
-  fmt::print(stderr,
-             "Scan schema:\n  projection_schema={}\n\nproject_expr={}\n",
-             options->projected_schema->ToString(),
-             options->projection.ToString());
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
 
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
-  auto batch_reader = lance::io::RecordBatchReader(reader, options);
+
+  std::optional<int64_t> limit = std::nullopt;
+  int64_t offset = 0;
+  if (options->fragment_scan_options &&
+      options->fragment_scan_options->type_name() == kLanceFormatTypeName) {
+    auto lance_fragment_scan_options =
+        std::dynamic_pointer_cast<LanceFragmentScanOptions>(options->fragment_scan_options);
+    limit = lance_fragment_scan_options->limit;
+    offset = lance_fragment_scan_options->offset;
+  }
+
+  auto batch_reader = lance::io::RecordBatchReader(reader, options, limit, offset);
   ARROW_RETURN_NOT_OK(batch_reader.Open());
   auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
   return generator;
@@ -85,5 +93,7 @@ std::shared_ptr<::arrow::dataset::FileWriteOptions> LanceFileFormat::DefaultWrit
 
 FileWriteOptions::FileWriteOptions()
     : ::arrow::dataset::FileWriteOptions(std::make_shared<LanceFileFormat>()) {}
+
+std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTypeName; }
 
 }  // namespace lance::arrow
