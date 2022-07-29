@@ -64,9 +64,9 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
-  auto scanner = lance::io::Scanner(reader, options);
-  ARROW_RETURN_NOT_OK(scanner.Open());
-  auto generator = ::arrow::RecordBatchGenerator(std::move(scanner));
+  auto batch_reader = lance::io::RecordBatchReader(reader, options);
+  ARROW_RETURN_NOT_OK(batch_reader.Open());
+  auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
   return generator;
 }
 

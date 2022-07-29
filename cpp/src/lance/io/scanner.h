@@ -36,24 +36,24 @@ namespace lance::io {
 class FileReader;
 class Project;
 
-/// Lance Scanner
-class Scanner : ::arrow::RecordBatchReader {
+/// Lance RecordBatchReader
+class RecordBatchReader : ::arrow::RecordBatchReader {
  public:
   /// Constructor.
-  Scanner(std::shared_ptr<FileReader> reader,
-          std::shared_ptr<::arrow::dataset::ScanOptions> options,
-          std::optional<int64_t> limit = std::nullopt,
-          int64_t offset = 0) noexcept;
+  RecordBatchReader(std::shared_ptr<FileReader> reader,
+                    std::shared_ptr<::arrow::dataset::ScanOptions> options,
+                    std::optional<int64_t> limit = std::nullopt,
+                    int64_t offset = 0) noexcept;
 
   /// Copy constructor.
-  Scanner(const Scanner& other) noexcept;
+  RecordBatchReader(const RecordBatchReader& other) noexcept;
 
   /// Move constructor.
-  Scanner(Scanner&& other) noexcept;
+  RecordBatchReader(RecordBatchReader&& other) noexcept;
 
-  ~Scanner() = default;
+  ~RecordBatchReader() = default;
 
-  /// Open the Scanner. Must call it before start iterating.
+  /// Open the RecordBatchReader. Must call it before start iterating.
   ::arrow::Status Open();
 
   std::shared_ptr<::arrow::Schema> schema() const override;
@@ -64,7 +64,7 @@ class Scanner : ::arrow::RecordBatchReader {
   ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> operator()();
 
  private:
-  Scanner() = delete;
+  RecordBatchReader() = delete;
 
   std::shared_ptr<FileReader> reader_;
   std::shared_ptr<::arrow::dataset::ScanOptions> options_;
@@ -75,10 +75,6 @@ class Scanner : ::arrow::RecordBatchReader {
   std::shared_ptr<Project> project_;
 
   std::atomic_int32_t current_batch_ = 0;
-  std::size_t max_queue_size_ = 1;
-  std::queue<std::future<::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>>> q_;
-
-  void AddPrefetchTask();
 };
 
 }  // namespace lance::io
