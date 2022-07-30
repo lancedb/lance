@@ -31,6 +31,7 @@ namespace lance::arrow {
 /// The main difference between ScannerBuilder and `::arrow::ScannerBuilder` is that
 /// the lance one allows fine-grained project/predicate/limit/offset push-downs.
 ///
+/// We can deprecate this class once we've pushed these features to upstream projects.
 class ScannerBuilder final {
  public:
   /// Construct ScannerBuilder with a Dataset URI
