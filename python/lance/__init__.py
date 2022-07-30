@@ -17,9 +17,10 @@ from typing import Union, Optional
 
 import pyarrow as pa
 import pyarrow.dataset as ds
-from lance.lib import LanceFileFormat, WriteTable
+import pyarrow.compute as pc
+from lance.lib import LanceFileFormat, WriteTable, BuildScanner
 
-__all__ = ["dataset", "write_table"]
+__all__ = ["dataset", "write_table", "scanner"]
 
 
 def dataset(
@@ -40,13 +41,13 @@ def dataset(
 def scanner(
     data: Union[str, Path, ds.Dataset],
     columns: Optional[str] = None,
+    filter: Optional[pc.Expression] = None,
     limit: Optional[int] = None,
     offset: int = 0,
 ):
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
-    
-    pass
+    return BuildScanner(data, columns=columns, filter=filter, limit=limit, offset=offset)
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str):
