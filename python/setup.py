@@ -9,9 +9,9 @@ arrow_includes = pa.get_include()
 numpy_includes = np.get_include()
 
 # TODO allow for custom liblance directory
-lance_cpp = Path(__file__).resolve().parent.parent / 'cpp'
-lance_includes = str(lance_cpp / 'include')
-lance_libs = str(lance_cpp / 'build')
+lance_cpp = Path(__file__).resolve().parent.parent / "cpp"
+lance_includes = str(lance_cpp / "include")
+lance_libs = str(lance_cpp / "build")
 
 extensions = [Extension(
     "lance.lib",
@@ -21,7 +21,7 @@ extensions = [Extension(
     library_dirs=[lance_libs],
     language="c++",
     extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-    extra_link_args=["-Wl,-rpath", lance_libs]
+    extra_link_args=["-Wl,-rpath", lance_libs, "-larrow_python"]
 )]
 
 # The information here can also be placed in setup.cfg - better separation of
@@ -38,5 +38,5 @@ setup(
     install_requires=["pyarrow"],
     extras_require={"test": ["pytest>=6.0", "pandas", "duckdb"]},
     python_requires=">=3.8",
-    packages=find_packages()
+    packages=find_packages(),
 )

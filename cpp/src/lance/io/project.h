@@ -56,6 +56,9 @@ class Project {
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t batch_id);
 
+  /// Project schema
+  const std::shared_ptr<format::Schema>& schema() const;
+
   /// \brief Can the plan support parallel scan.
   ///
   /// \note Once Projection has limit / offset clause, parallel reads are limited.

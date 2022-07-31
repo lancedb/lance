@@ -1,6 +1,6 @@
 # distutils: language = c++
 
-from typing import Union
+from typing import Union, Optional
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
@@ -8,11 +8,14 @@ from libcpp.memory cimport shared_ptr
 from libcpp.string cimport string
 from pathlib import Path
 from pyarrow import Table
-from pyarrow._dataset cimport FileFormat
+from pyarrow._dataset cimport FileFormat, CScanner, CDataset, Dataset
+from pyarrow._dataset import Scanner
 from pyarrow.includes.common cimport *
+from pyarrow._compute cimport Expression, _bind
 from pyarrow.includes.libarrow cimport CTable, COutputStream
 from pyarrow.includes.libarrow_dataset cimport CFileFormat
-from pyarrow.lib cimport pyarrow_unwrap_table, check_status, get_writer
+from pyarrow.lib cimport *
+from pyarrow.lib import tobytes
 
 
 cdef extern from "<optional>" namespace "std" nogil:
@@ -55,6 +58,39 @@ cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
             shared_ptr[COutputStream] sink,
             const c_string& primary_key,
             optional[CFileWriteOptions] options)
+
+
+cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
+    cdef cppclass LScannerBuilder "::lance::arrow::ScannerBuilder":
+        LScannerBuilder(shared_ptr[CDataset]) except +
+        void Project(const vector[string]& columns)
+        void Filter(CExpression filter)
+        void Limit(int64_t limit, int64_t offset)
+        CResult[shared_ptr[CScanner]] Finish()
+
+def BuildScanner(
+        dataset: Dataset,
+        columns: Optional[list[str]] = None,
+        filter: Optional[Expression] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+):
+    cdef shared_ptr[CDataset] cdataset = dataset.unwrap()
+    cdef shared_ptr[LScannerBuilder] builder = shared_ptr[LScannerBuilder](
+        new LScannerBuilder(cdataset))
+
+    if columns:
+        builder.get().Project([tobytes(c) for c in columns])
+    if filter is not None:
+        builder.get().Filter(_bind(filter, dataset.schema()))
+    if limit is not None:
+        builder.get().Limit(limit, offset)
+
+    scanner = GetResultValue(builder.get().Finish())
+    creader = GetResultValue(scanner.get().ToRecordBatchReader())
+    reader = RecordBatchReader()
+    reader.reader = creader
+    return Scanner.from_batches(reader)
 
 
 cdef class LanceFileFormat(FileFormat):

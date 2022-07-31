@@ -58,6 +58,8 @@ Project::Project(std::shared_ptr<format::Schema> dataset_schema,
       new Project(schema, projected_schema, scan_schema, std::move(filter), limit, offset));
 }
 
+const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
+
 bool Project::CanParallelScan() const { return limit_.operator bool(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
@@ -86,7 +88,11 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
     return merged;
   } else {
     // Read without filter.
-    return reader->ReadBatch(*scan_schema_, batch_id);
+    if (limit_) {
+      return limit_->ReadBatch(reader, *scan_schema_);
+    } else {
+      return reader->ReadBatch(*scan_schema_, batch_id);
+    }
   }
 }
 

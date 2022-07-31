@@ -19,7 +19,9 @@ add_library(
         arrow
         OBJECT
         file_lance.cc
+        file_lance_ext.h
         reader.cc
+        scanner.cc
         stl.h
         type.cc
         type.h
@@ -31,6 +33,7 @@ target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(api_test)
 add_lance_test(arrow_dataset_test)
+add_lance_test(scanner_test)
 add_lance_test(type_test)
 add_lance_test(utils_test)
 add_lance_test(writer_test)
