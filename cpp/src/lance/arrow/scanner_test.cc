@@ -47,6 +47,12 @@ TEST_CASE("Project nested columns") {
   auto f = ref.FindOne(*schema).ValueOrDie();
   fmt::print("FindAll: {}\n", f.ToString());
   CHECK(!f.empty());
+
+  auto expr = ::arrow::compute::field_ref({"objects", 0, "val"});
+  fmt::print("Expr field: {} {}\n", expr.field_ref()->ToString(), expr.field_ref()->ToDotPath());
+  f = expr.field_ref()->FindOne(*schema).ValueOrDie();
+  fmt::print("FindAll: {}\n", f.ToString());
+  CHECK(!f.empty());
 }
 
 TEST_CASE("Build Scanner with nested struct") {

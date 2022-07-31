@@ -15,6 +15,7 @@ from pyarrow._compute cimport Expression, _bind
 from pyarrow.includes.libarrow cimport CTable, COutputStream
 from pyarrow.includes.libarrow_dataset cimport CFileFormat
 from pyarrow.lib cimport *
+from pyarrow.lib import tobytes
 
 
 cdef extern from "<optional>" namespace "std" nogil:
@@ -79,13 +80,12 @@ def BuildScanner(
         new LScannerBuilder(cdataset))
 
     if columns:
-        builder.get().Project(columns)
+        builder.get().Project([tobytes(c) for c in columns])
     if filter is not None:
         builder.get().Filter(_bind(filter, dataset.schema()))
     if limit is not None:
         builder.get().Limit(limit, offset)
 
-    cdef shared_ptr[CScanner] blabla
     scanner = GetResultValue(builder.get().Finish())
     creader = GetResultValue(scanner.get().ToRecordBatchReader())
     reader = RecordBatchReader()
