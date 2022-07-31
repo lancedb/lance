@@ -21,7 +21,7 @@ extensions = [Extension(
     library_dirs=[lance_libs],
     language="c++",
     extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-    extra_link_args=["-Wl,-rpath", lance_libs]
+    extra_link_args=["-Wl,-rpath", lance_libs, "-larrow_python"]
 )]
 
 # The information here can also be placed in setup.cfg - better separation of

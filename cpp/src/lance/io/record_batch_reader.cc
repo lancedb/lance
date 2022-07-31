@@ -12,6 +12,8 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include "lance/io/record_batch_reader.h"
+
 #include <arrow/dataset/scanner.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
@@ -29,7 +31,6 @@
 #include "lance/io/limit.h"
 #include "lance/io/project.h"
 #include "lance/io/reader.h"
-#include "lance/io/record_batch_reader.h"
 
 namespace lance::io {
 
@@ -71,7 +72,9 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   int32_t batch_id = current_batch_++;
   if (batch_id < reader_->metadata().num_batches()) {
     ARROW_ASSIGN_OR_RAISE(auto batch_read, project_->Execute(reader_, batch_id));
-    *batch = std::move(batch_read);
+    if (batch_read) {
+      *batch = std::move(batch_read);
+    }
   }
   return ::arrow::Status::OK();
 }

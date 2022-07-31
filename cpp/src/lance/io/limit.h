@@ -22,7 +22,13 @@
 #include <string>
 #include <tuple>
 
+namespace lance::format {
+class Schema;
+}  // namespace lance::format
+
 namespace lance::io {
+
+class FileReader;
 
 /// Plan for Limit clause:
 ///
@@ -54,6 +60,10 @@ class Limit {
   /// return infile->ReadAt(position, length);
   /// \endcode
   std::optional<std::tuple<int64_t, int64_t>> Apply(int64_t length);
+
+  /// ReadBatch
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
+      const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema);
 
   /// Debug String
   std::string ToString() const;

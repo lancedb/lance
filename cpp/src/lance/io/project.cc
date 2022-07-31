@@ -88,7 +88,11 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
     return merged;
   } else {
     // Read without filter.
-    return reader->ReadBatch(*scan_schema_, batch_id);
+    if (limit_) {
+      return limit_->ReadBatch(reader, *scan_schema_);
+    } else {
+      return reader->ReadBatch(*scan_schema_, batch_id);
+    }
   }
 }
 
