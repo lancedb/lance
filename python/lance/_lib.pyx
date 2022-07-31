@@ -14,7 +14,7 @@ from pyarrow.includes.common cimport *
 from pyarrow._compute cimport Expression, _bind
 from pyarrow.includes.libarrow cimport CTable, COutputStream
 from pyarrow.includes.libarrow_dataset cimport CFileFormat
-from pyarrow.lib cimport *
+from pyarrow.lib cimport GetResultValue, check_status, pyarrow_unwrap_table, get_writer, RecordBatchReader, CExpression
 from pyarrow.lib import tobytes
 
 
