@@ -2,6 +2,9 @@
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 
+![PyPi](https://img.shields.io/pypi/v/pylance)
+![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+
 Lance is a *cloud-native columnar data format* designed for unstructured machine learning datasets, featuring:
 
 * Fast columnar scan for ML dataset analysis, ML training, and evaluation.
