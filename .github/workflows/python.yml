@@ -26,7 +26,7 @@ jobs:
         cache-dependency-path: 'python/setup.py'
     - name: Build manylinux wheels
       run:
-        ./tools/build_wheels.sh
+        ./tools/build_wheel.sh
     - name: Pip install
       run: |
         python -m pip install wheels/pylance-0.0.1-cp310-cp310*.whl
