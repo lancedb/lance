@@ -13,4 +13,4 @@ docker run -v ${TOOLS_DIR}:/opt/lance/tools \
   -v ${LANCE_ROOT}:/code --rm \
   -w /code \
   pylance_manylinux \
-  /opt/lance/tools/build_manylinux_wheels.sh
+  /opt/lance/tools/build_manylinux_wheels.sh $1
