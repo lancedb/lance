@@ -7,10 +7,6 @@ RUN yum update -y \
     && yum install -y https://apache.jfrog.io/artifactory/arrow/centos/$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1)/apache-arrow-release-latest.rpm \
     && yum install -y --enablerepo=epel arrow-devel \
         arrow-dataset-devel arrow-python-devel parquet-devel wget \
-    && cd /tmp \
-    && wget -q https://github.com/protocolbuffers/protobuf/releases/download/v3.20.1/protobuf-cpp-3.20.1.tar.gz -O - | tar -xz \
-    && cd protobuf* \
-    && ./configure \
-    && make -j \
-    && make install \
-    && rm -rf /tmp/proto*
+        ftp://ftp.pbone.net/mirror/ftp.centos.org/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
+        ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
+        ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm
