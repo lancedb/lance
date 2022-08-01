@@ -29,14 +29,9 @@ jobs:
         cache-dependency-path: 'python/setup.py'
     - name: Build manylinux wheel
       run: ./tools/build_wheel.sh $(echo cp${{ matrix.python-version }} | sed "s/\.//")
-      working-directory: cpp
-      run: |
-        cmake -B build
-        make -C build -j
     - name: Pip install
       run: |
-        python -m pip install -q wheel numpy pyarrow cython pytest pandas duckdb
-        python setup.py develop
+        python -m pip install $(ls wheels/*.whl)[test]
     - name: Run python tests
       run: |
         pytest -x -v --durations=10
