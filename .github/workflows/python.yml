@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  build:
+  linux:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     strategy:
@@ -47,7 +47,7 @@ jobs:
     - name: Run python tests
       run: |
         pytest -x -v --durations=10
-  mac-build:
+  mac:
     runs-on: macos-12
     timeout-minutes: 10
     steps:
