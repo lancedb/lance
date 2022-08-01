@@ -39,7 +39,7 @@ jobs:
         make -C build -j
     - name: Pip install
       run: |
-        python -m pip install -q wheel numpy pyarrow cython pytest
+        python -m pip install -q wheel numpy pyarrow cython pytest pandas duckdb
         python setup.py develop
     - name: Run python tests
       run: |
