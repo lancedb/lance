@@ -54,14 +54,16 @@ jobs:
     - name: Build C++
       working-directory: cpp
       run: |
-        cmake -B build
-        make -C build -j
+        cmake -B build -DCMAKE_BUILD_TYPE=Release
+        make -C build -j 4
     - name: Build wheels
       uses: pypa/cibuildwheel@v2.8.1
+      working-directory: python
       env:
         CIBW_BUILD: cp310*
       with:
         package-dir: python
+        output-dir: python/wheelhouse
     - name: Install wheels
       run: |
         python -m pip install $(ls wheelhouse/pylance-*-cp310*.whl)[test]
