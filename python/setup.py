@@ -21,6 +21,7 @@ import numpy as np
 import pyarrow as pa
 from Cython.Build import cythonize
 
+pa.create_library_symlinks()
 arrow_includes = pa.get_include()
 arrow_library_dirs = pa.get_library_dirs()
 numpy_includes = np.get_include()
@@ -39,7 +40,7 @@ extensions = [
         library_dirs=[lance_libs] + arrow_library_dirs,
         language="c++",
         extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-        extra_link_args=["-Wl,-rpath", lance_libs, "-larrow_python"],
+        extra_link_args=["-Wl,-rpath", lance_libs, "-Wl,-rpath", arrow_library_dirs[0]],
     )
 ]
 
