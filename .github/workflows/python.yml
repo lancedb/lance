@@ -37,7 +37,10 @@ jobs:
         pytest -x -v --durations=10
   mac:
     runs-on: macos-12
-    timeout-minutes: 10
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: python
     steps:
     - uses: actions/checkout@v2
     - name: Set up Python
@@ -53,13 +56,13 @@ jobs:
       run: |
         cmake -B build
         make -C build -j
-    - name: Test Pip install
-      working-directory: python
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v2.8.1
+      env:
+        CIBW_BUILD: cp310*
+    - name: Install wheels
       run: |
-        python -m pip install -q wheel numpy pyarrow cython
-        python setup.py bdist_wheel
-        pip install $(ls dist/pylance-*.whl)[test]
+        python -m pip install $(ls wheelhouse/pylance-*-cp310*.whl)[test]
     - name: Run Tests
-      working-directory: python
       run: |
         pytest -x -v --durations=10
