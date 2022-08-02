@@ -29,4 +29,4 @@ before-build = [
 archs = ["native"]
 
 [tool.cibuildwheel.macos.environment]
-MACOSX_DEPLOYMENT_TARGET = "12"
+MACOSX_DEPLOYMENT_TARGET = "10.15"
