@@ -43,7 +43,7 @@ extensions = [
         "lance.lib",
         ["lance/_lib.pyx"],
         include_dirs=[lance_includes, arrow_includes, numpy_includes],
-        libraries=["lance"],
+        libraries=["lance"] + extra_libs,
         library_dirs=[lance_libs] + arrow_library_dirs,
         language="c++",
         extra_compile_args=["-Wall", "-std=c++20", "-O3"],
