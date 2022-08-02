@@ -21,6 +21,7 @@ test-skip = ["*universal2:arm64"]
 before-build = [
     "rm -rf {project}/build",
     "rm -rf {project}/../cpp/build",
+    "echo $(pwd)",
     "cd {project}/../cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j 4"
 ]
 
