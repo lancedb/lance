@@ -58,7 +58,6 @@ jobs:
         make -C build -j 4
     - name: Build wheels
       uses: pypa/cibuildwheel@v2.8.1
-      working-directory: python
       env:
         CIBW_BUILD: cp310*
       with:
