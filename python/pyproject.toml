@@ -20,9 +20,8 @@ test-skip = ["*universal2:arm64"]
 # Setuptools bug causes collision between pypy and cpython artifacts
 before-build = [
     "rm -rf {project}/build",
-    "rm -rf {project}/../cpp/build",
-    "echo $(pwd)",
-    "cd {project}/../cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j 4"
+    "rm -rf {project}/cpp/build",
+    "cd {project}/cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j 4"
 ]
 
 [tool.cibuildwheel.macos]
