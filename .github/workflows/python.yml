@@ -60,6 +60,8 @@ jobs:
       uses: pypa/cibuildwheel@v2.8.1
       env:
         CIBW_BUILD: cp310*
+      with:
+        package-dir: python
     - name: Install wheels
       run: |
         python -m pip install $(ls wheelhouse/pylance-*-cp310*.whl)[test]
