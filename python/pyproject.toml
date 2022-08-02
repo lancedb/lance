@@ -14,7 +14,7 @@ testpaths = ["lance/tests"]
 
 [tool.cibuildwheel]
 build = "cp38-* cp39-* cp310-*"
-test-command = "pytest {project}/lance/tests"
+test-command = "pytest {project}/python/lance/tests"
 test-extras = ["test"]
 test-skip = ["*universal2:arm64"]
 # Setuptools bug causes collision between pypy and cpython artifacts

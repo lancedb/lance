@@ -51,11 +51,6 @@ jobs:
       run: |
         brew update
         brew install apache-arrow protobuf
-    - name: Build C++
-      working-directory: cpp
-      run: |
-        cmake -B build -DCMAKE_BUILD_TYPE=Release
-        make -C build -j 4
     - name: Build wheels
       uses: pypa/cibuildwheel@v2.8.1
       env:
