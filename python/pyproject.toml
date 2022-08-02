@@ -1,9 +1,5 @@
 [build-system]
-requires = [
-    "setuptools>=42",
-    "wheel",
-    "ninja"
-]
+requires = ["setuptools>=42", "wheel", "ninja", "numpy", "cython", "pyarrow<9"]
 build-backend = "setuptools.build_meta"
 
 [tool.isort]
@@ -17,8 +13,20 @@ filterwarnings = ["error"]
 testpaths = ["lance/tests"]
 
 [tool.cibuildwheel]
-test-command = "pytest {project}/pylance/tests"
+build = "cp38-* cp39-* cp310-*"
+test-command = "pytest {project}/python/lance/tests"
 test-extras = ["test"]
 test-skip = ["*universal2:arm64"]
 # Setuptools bug causes collision between pypy and cpython artifacts
-before-build = "rm -rf {project}/build"
+before-build = [
+    "rm -rf {project}/build",
+    "rm -rf {project}/cpp/build",
+    "cd {project}/cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j 4"
+]
+
+[tool.cibuildwheel.macos]
+# We only support native build for now, because homebrew only installs native libarrow and protobuf.
+archs = ["native"]
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "10.15"

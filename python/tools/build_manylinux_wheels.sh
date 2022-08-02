@@ -1,8 +1,15 @@
 #!/bin/bash
+#
 
 set -ex
 
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib
+
+if [[ "$#" -ne 1 ]]; then
+  py_versions=(cp38 cp39 cp310)
+else
+  py_versions=($1)
+fi
 
 pushd /code/cpp
 rm -rf build
@@ -14,7 +21,7 @@ popd
 
 pushd /code/python
 rm -rf wheels dist build
-for py in cp38 cp39 cp310
+for py in "${py_versions[@]}"
 do
   /opt/python/${py}-${py}/bin/pip install numpy pyarrow cython
   /opt/python/${py}-${py}/bin/python setup.py bdist_wheel

@@ -82,7 +82,7 @@ def BuildScanner(
     if columns:
         builder.get().Project([tobytes(c) for c in columns])
     if filter is not None:
-        builder.get().Filter(_bind(filter, dataset.schema()))
+        builder.get().Filter(_bind(filter, dataset.schema))
     if limit is not None:
         builder.get().Limit(limit, offset)
 

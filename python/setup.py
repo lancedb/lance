@@ -16,14 +16,22 @@
 
 from pathlib import Path
 from setuptools import Extension, find_packages, setup
+import platform
 
 import numpy as np
 import pyarrow as pa
 from Cython.Build import cythonize
 
+extra_libs = []
+# TODO: ciwheelbuild can not find / dont need arrow_python.
+if platform.system() == "Linux":
+    extra_libs.append("arrow_python")
+
+pa.create_library_symlinks()
 arrow_includes = pa.get_include()
 arrow_library_dirs = pa.get_library_dirs()
 numpy_includes = np.get_include()
+
 
 # TODO allow for custom liblance directory
 lance_cpp = Path(__file__).resolve().parent.parent / "cpp"
@@ -35,11 +43,11 @@ extensions = [
         "lance.lib",
         ["lance/_lib.pyx"],
         include_dirs=[lance_includes, arrow_includes, numpy_includes],
-        libraries=["lance"],
+        libraries=["lance"] + extra_libs,
         library_dirs=[lance_libs] + arrow_library_dirs,
         language="c++",
         extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-        extra_link_args=["-Wl,-rpath", lance_libs, "-larrow_python"],
+        extra_link_args=["-Wl,-rpath", lance_libs, "-Wl,-rpath", arrow_library_dirs[0]],
     )
 ]
 
