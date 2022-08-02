@@ -60,7 +60,6 @@ jobs:
         output-dir: python/wheelhouse
     - name: Install wheels
       run: |
-        pip install -U pip
         python3 -m pip install $(ls wheelhouse/pylance-*-cp310*.whl)[test]
     - name: Run Tests
       run: |
