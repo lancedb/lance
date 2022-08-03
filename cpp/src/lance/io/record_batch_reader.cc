@@ -102,9 +102,8 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
     int32_t batch_id = current_batch_++;
     auto result = thread_pool_->Submit(
         [&](int32_t batch_id) {
-          /// TODO: how to handle error in thread pool?
-          auto result = this->ReadBatch(batch_id);
-          return result.ValueOrDie();
+          return ::arrow::Future<std::shared_ptr<arrow::RecordBatch>>::MakeFinished(
+              this->ReadBatch(batch_id));
         },
         batch_id);
     if (!result.ok()) {
