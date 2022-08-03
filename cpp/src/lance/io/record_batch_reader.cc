@@ -71,7 +71,6 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
 ::arrow::Status RecordBatchReader::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
   ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_, limit_, offset_));
-  fmt::print("Open with arrow threads: {}\n", ::arrow::GetCpuThreadPoolCapacity());
   return ::arrow::Status::OK();
 }
 
