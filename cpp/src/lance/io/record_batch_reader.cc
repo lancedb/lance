@@ -18,11 +18,11 @@
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
 #include <arrow/util/future.h>
+#include <arrow/util/thread_pool.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include <algorithm>
-#include <future>
 #include <tuple>
 
 #include "lance/format/metadata.h"
@@ -36,9 +36,16 @@ namespace lance::io {
 
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      std::shared_ptr<arrow::dataset::ScanOptions> options,
+                                     ::arrow::internal::ThreadPool* thread_pool,
                                      std::optional<int64_t> limit,
                                      int64_t offset) noexcept
-    : reader_(reader), options_(options), limit_(limit), offset_(offset) {}
+    : reader_(reader),
+      options_(options),
+      limit_(limit),
+      offset_(offset),
+      thread_pool_(thread_pool) {
+  assert(thread_pool_);
+}
 
 RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
     : reader_(other.reader_),
@@ -47,6 +54,7 @@ RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
       offset_(other.offset_),
       schema_(other.schema_),
       project_(other.project_),
+      thread_pool_(other.thread_pool_),
       current_batch_(int(other.current_batch_)) {}
 
 RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
@@ -56,6 +64,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       offset_(other.offset_),
       schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
+      thread_pool_(std::move(other.thread_pool_)),
       current_batch_(int(other.current_batch_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
@@ -80,9 +89,17 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  /// TODO: Make it truly async someday.
-  auto f = ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(this->Next());
-  return f;
+  int32_t batch_id = current_batch_++;
+  
+  auto result = thread_pool_->Submit([&]() {
+    auto batch = std::shared_ptr<::arrow::RecordBatch>(nullptr);
+    auto result = this->ReadNext(&batch);
+    return batch;
+  });
+  if (result.ok()) {
+    return result.ValueOrDie();
+  }
+  return result.status();
 }
 
 }  // namespace lance::io
