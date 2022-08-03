@@ -68,6 +68,8 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
  private:
   RecordBatchReader() = delete;
 
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(int32_t batch_id) const;
+
   std::shared_ptr<FileReader> reader_;
   std::shared_ptr<::arrow::dataset::ScanOptions> options_;
   std::optional<int64_t> limit_ = std::nullopt;

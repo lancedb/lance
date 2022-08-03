@@ -79,23 +79,30 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
   int32_t batch_id = current_batch_++;
-  if (batch_id < reader_->metadata().num_batches()) {
-    ARROW_ASSIGN_OR_RAISE(auto batch_read, project_->Execute(reader_, batch_id));
-    if (batch_read) {
-      *batch = std::move(batch_read);
-    }
+  ARROW_ASSIGN_OR_RAISE(auto batch_read, ReadBatch(batch_id));
+  if (batch_read) {
+    *batch = std::move(batch_read);
   }
   return ::arrow::Status::OK();
 }
 
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch(
+    int32_t batch_id) const {
+  if (batch_id < reader_->metadata().num_batches()) {
+    return project_->Execute(reader_, batch_id);
+  }
+  return nullptr;
+}
+
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
   int32_t batch_id = current_batch_++;
-  
-  auto result = thread_pool_->Submit([&]() {
-    auto batch = std::shared_ptr<::arrow::RecordBatch>(nullptr);
-    auto result = this->ReadNext(&batch);
-    return batch;
-  });
+  auto result = thread_pool_->Submit(
+      [&](int32_t batch_id) {
+        /// TODO: how to handle error in thread pool?
+        auto result = this->ReadBatch(batch_id);
+        return result.ValueOrDie();
+      },
+      batch_id);
   if (result.ok()) {
     return result.ValueOrDie();
   }
