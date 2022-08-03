@@ -65,11 +65,13 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
       thread_pool_(std::move(other.thread_pool_)),
-      current_batch_(int(other.current_batch_)) {}
+      current_batch_(int(other.current_batch_)),
+      readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
   schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
   ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_, limit_, offset_));
+  fmt::print("Open with arrow threads: {}\n", ::arrow::GetCpuThreadPoolCapacity());
   return ::arrow::Status::OK();
 }
 
@@ -95,18 +97,28 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  int32_t batch_id = current_batch_++;
-  auto result = thread_pool_->Submit(
-      [&](int32_t batch_id) {
-        /// TODO: how to handle error in thread pool?
-        auto result = this->ReadBatch(batch_id);
-        return result.ValueOrDie();
-      },
-      batch_id);
-  if (result.ok()) {
-    return result.ValueOrDie();
+  int total_batches = reader_->metadata().num_batches();
+  while (static_cast<int32_t>(readahead_queue_.size()) < options_->batch_readahead &&
+         current_batch_ < total_batches) {
+    int32_t batch_id = current_batch_++;
+    auto result = thread_pool_->Submit(
+        [&](int32_t batch_id) {
+          /// TODO: how to handle error in thread pool?
+          auto result = this->ReadBatch(batch_id);
+          return result.ValueOrDie();
+        },
+        batch_id);
+    if (!result.ok()) {
+      return result.status();
+    }
+    readahead_queue_.emplace(std::move(result.ValueOrDie()));
   }
-  return result.status();
+  if (readahead_queue_.empty()) {
+    return std::shared_ptr<::arrow::RecordBatch>(nullptr);
+  }
+  auto first = readahead_queue_.front();
+  readahead_queue_.pop();
+  return first;
 }
 
 }  // namespace lance::io

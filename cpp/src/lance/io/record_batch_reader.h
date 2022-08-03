@@ -80,6 +80,7 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
 
   ::arrow::internal::ThreadPool* thread_pool_;
   std::atomic_int32_t current_batch_ = 0;
+  std::queue<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> readahead_queue_;
 };
 
 }  // namespace lance::io
