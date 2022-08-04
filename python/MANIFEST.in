@@ -1,1 +1,4 @@
 include README.md
+global-include *.pyx
+global-include *.pxd
+global-exclude *.cpp
