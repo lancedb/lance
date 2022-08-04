@@ -23,7 +23,7 @@ pushd /code/python
 rm -rf wheels dist build
 for py in "${py_versions[@]}"
 do
-  /opt/python/${py}-${py}/bin/pip install numpy pyarrow cython
+  /opt/python/${py}-${py}/bin/pip install numpy "pyarrow<9" cython
   /opt/python/${py}-${py}/bin/python setup.py bdist_wheel
 done
 

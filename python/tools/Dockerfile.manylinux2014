@@ -2,11 +2,18 @@ FROM quay.io/pypa/manylinux2014_x86_64
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
+ENV ARROW_VERSION=8.0.0-1.el7.x86_64
+
 RUN yum update -y \
-    && yum install -y epel-release || yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1).noarch.rpm \
-    && yum install -y https://apache.jfrog.io/artifactory/arrow/centos/$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1)/apache-arrow-release-latest.rpm \
-    && yum install -y --enablerepo=epel arrow-devel \
-        arrow-dataset-devel arrow-python-devel parquet-devel wget \
-        ftp://ftp.pbone.net/mirror/ftp.centos.org/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
-        ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
-        ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm
+  && yum install -y epel-release || yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1).noarch.rpm \
+  && yum install -y https://apache.jfrog.io/artifactory/arrow/centos/7/x86_64/Packages/apache-arrow-release-8.0.0-1.el7.noarch.rpm \
+  && yum install -y --enablerepo=epel \
+  arrow-python-devel-${ARROW_VERSION} \
+  arrow-devel-${ARROW_VERSION} \
+  arrow-glib-devel-${ARROW_VERSION} \
+  arrow-dataset-devel-${ARROW_VERSION} \
+  parquet-devel-${ARROW_VERSION} \
+  wget \
+  ftp://ftp.pbone.net/mirror/ftp.centos.org/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
+  ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
+  ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm

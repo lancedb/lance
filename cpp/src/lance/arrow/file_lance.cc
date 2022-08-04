@@ -15,6 +15,7 @@
 #include "lance/arrow/file_lance.h"
 
 #include <arrow/dataset/file_base.h>
+#include <arrow/util/thread_pool.h>
 #include <fmt/format.h>
 
 #include <memory>
@@ -72,7 +73,8 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     offset = lance_fragment_scan_options->offset;
   }
 
-  auto batch_reader = lance::io::RecordBatchReader(reader, options, limit, offset);
+  auto batch_reader = lance::io::RecordBatchReader(
+      reader, options, ::arrow::internal::GetCpuThreadPool(), limit, offset);
   ARROW_RETURN_NOT_OK(batch_reader.Open());
   auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
   return generator;
