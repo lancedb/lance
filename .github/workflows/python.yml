@@ -61,6 +61,10 @@ jobs:
     - name: Install wheels
       run: |
         python3 -m pip install $(ls wheelhouse/pylance-*-cp310*.whl)[test]
+    - name: Test imports
+      run: |
+        python3 -c "import pyarrow; import lance"
+        python3 -c "import lance; import pyarrow"
     - name: Run Tests
       run: |
         pytest -x -v --durations=10
