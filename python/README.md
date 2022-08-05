@@ -1,6 +1,6 @@
-# Setup
+# Python bindings for Lance file format
 
-Lance is a columnar file format designed for managing large-scale computer vision datasets in cloud-native, production
+Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
 environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point 
 queries to training scans. 
 

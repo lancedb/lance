@@ -5,7 +5,23 @@
 ![PyPi](https://img.shields.io/pypi/v/pylance)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
-Lance is a *cloud-native columnar data format* designed for unstructured machine learning datasets, featuring:
+Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
+environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point 
+queries to training scans. 
+
+## Why use Lance
+
+You should use lance if you're a ML engineer looking to be 10x more productive when working with computer vision 
+datasets:
+
+1. Lance saves you from having to manage multiple systems and formats for metadata, 
+raw assets, labeling updates, and vector indices.
+2. Lance's custom column encoding means you don't need to choose between fast analytics and fast point queries.
+3. Lance has a first-class Apache Arrow integration so it's easy to create and query Lance datasets (e.g., you can
+directly query lance datasets using DuckDB with no extra work)
+4. Did we mention Lance is fast.
+
+## Major features
 
 * Fast columnar scan for ML dataset analysis, ML training, and evaluation.
 * Encodings that are capable of fast point queries for interactive data exploration.
@@ -16,7 +32,7 @@ Lance is a *cloud-native columnar data format* designed for unstructured machine
 * Cloud-native optimizations on low-cost cloud storage, i.e., AWS S3, Google GCS, or Azure Blob Storage.
 * Open access via first-class [Apache Arrow](https://arrow.apache.org/) integration and multi-language support.
 
-Non-goals:
+### Non-goals
 
 * A new SQL engine
 * A new ML framework
@@ -37,7 +53,7 @@ ds = lance.dataset("s3://eto-public/datasets/oxford_pet/pet.lance")
 duckdb.query('select label, count(1) from ds group by label').to_arrow_table()
 ```
 
-## Why
+## Why are you building yet another data format?!
 
 Machine Learning development cycle involves the steps:
 
