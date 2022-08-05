@@ -14,6 +14,6 @@ RUN yum update -y \
   arrow-dataset-devel-${ARROW_VERSION} \
   parquet-devel-${ARROW_VERSION} \
   wget \
-  ftp://ftp.pbone.net/mirror/ftp.centos.org/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
-  ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
-  ftp://ftp.pbone.net/mirror/vault.centos.org/7.8.2003/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm
+  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
+  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
+  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm

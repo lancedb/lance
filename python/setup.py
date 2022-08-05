@@ -55,7 +55,7 @@ extensions = [
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pylance",
-    version="0.0.1",
+    version="0.0.2",
     author="Lance Developers",
     author_email="contact@eto.ai",
     description="Python extension for lance",
