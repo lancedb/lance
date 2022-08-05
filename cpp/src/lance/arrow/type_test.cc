@@ -17,7 +17,9 @@
 #include <arrow/type.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using std::string;
@@ -37,4 +39,34 @@ TEST_CASE("Parse dictionary type") {
 
   actual = lance::arrow::FromLogicalType(logical_type).ValueOrDie();
   CHECK(dict_type->Equals(actual));
+}
+
+// Type reference: https://arrow.apache.org/docs/cpp/api/datatype.html
+TEST_CASE("Logical type coverage") {
+  const auto kArrayTypeMap =
+      std::vector<std::tuple<std::shared_ptr<::arrow::DataType>, std::string>>({
+          {::arrow::null(), "null"},
+          {::arrow::boolean(), "bool"},
+          {::arrow::int8(), "int8"},
+          {::arrow::uint8(), "uint8"},
+          {::arrow::int16(), "int16"},
+          {::arrow::uint16(), "uint16"},
+          {::arrow::int32(), "int32"},
+          {::arrow::uint32(), "uint32"},
+          {::arrow::int64(), "int64"},
+          {::arrow::uint64(), "uint64"},
+          {::arrow::float16(), "halffloat"},
+          {::arrow::float32(), "float"},
+          {::arrow::float64(), "double"},
+          {::arrow::utf8(), "string"},
+          {::arrow::binary(), "binary"},
+          {::arrow::large_utf8(), "large_string"},
+          {::arrow::large_binary(), "large_binary"},
+      });
+
+  for (auto& [arrow_type, type_str] : kArrayTypeMap) {
+    INFO("Data type: " << arrow_type->ToString() << " type string: " << type_str);
+    CHECK(lance::arrow::ToLogicalType(arrow_type).ValueOrDie() == type_str);
+    CHECK(lance::arrow::FromLogicalType(type_str).ValueOrDie()->Equals(arrow_type));
+  }
 }

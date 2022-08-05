@@ -43,36 +43,34 @@ namespace lance::arrow {
   }
 }
 
+const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiveTypeMap = {
+    {"null", ::arrow::null()},
+    {"bool", ::arrow::boolean()},
+    {"int8", ::arrow::int8()},
+    {"uint8", ::arrow::uint8()},
+    {"int16", ::arrow::int16()},
+    {"uint16", ::arrow::uint16()},
+    {"int32", ::arrow::int32()},
+    {"uint32", ::arrow::uint32()},
+    {"int64", ::arrow::int64()},
+    {"uint64", ::arrow::uint64()},
+    {"halffloat", ::arrow::float16()},
+    {"float", ::arrow::float32()},
+    {"double", ::arrow::float64()},
+    {"string", ::arrow::utf8()},
+    {"binary", ::arrow::binary()},
+    {"large_string", ::arrow::large_utf8()},
+    {"large_binary", ::arrow::large_binary()},
+};
+
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type) {
   // TODO: optimize this lookup table?
-  if (logical_type == "bool") {
-    return ::arrow::boolean();
-  } else if (logical_type == "int8") {
-    return ::arrow::int8();
-  } else if (logical_type == "uint8") {
-    return ::arrow::utf8();
-  } else if (logical_type == "int16") {
-    return ::arrow::int16();
-  } else if (logical_type == "uint16") {
-    return ::arrow::uint16();
-  } else if (logical_type == "int32") {
-    return ::arrow::int32();
-  } else if (logical_type == "uint32") {
-    return ::arrow::uint32();
-  } else if (logical_type == "int64") {
-    return ::arrow::int64();
-  } else if (logical_type == "uint64") {
-    return ::arrow::uint64();
-  } else if (logical_type == "float") {
-    return ::arrow::float32();
-  } else if (logical_type == "double") {
-    return ::arrow::float64();
-  } else if (logical_type == "string") {
-    return ::arrow::utf8();
-  } else if (logical_type == "binary") {
-    return ::arrow::binary();
-  } else if (logical_type.starts_with("dict")) {
+  const auto& it = kPrimitiveTypeMap.find(logical_type.to_string());
+  if (it != kPrimitiveTypeMap.end()) {
+    return it->second;
+  }
+  if (logical_type.starts_with("dict")) {
     auto components = ::arrow::internal::SplitString(logical_type, ':');
     if (components.size() != 4) {
       return ::arrow::Status::Invalid(
