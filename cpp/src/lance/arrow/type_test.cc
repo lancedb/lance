@@ -45,6 +45,7 @@ TEST_CASE("Parse dictionary type") {
 TEST_CASE("Logical type coverage") {
   const auto kArrayTypeMap =
       std::vector<std::tuple<std::shared_ptr<::arrow::DataType>, std::string>>({
+          // Primitive types
           {::arrow::null(), "null"},
           {::arrow::boolean(), "bool"},
           {::arrow::int8(), "int8"},
@@ -62,6 +63,14 @@ TEST_CASE("Logical type coverage") {
           {::arrow::binary(), "binary"},
           {::arrow::large_utf8(), "large_string"},
           {::arrow::large_binary(), "large_binary"},
+          {::arrow::fixed_size_binary(1234), "fixed_size_binary:1234"},
+          // Time
+          {::arrow::date32(), "date32:day"},
+          {::arrow::date64(), "date64:ms"},
+          {::arrow::timestamp(::arrow::TimestampType::Unit::SECOND), "timestamp:s"},
+          {::arrow::timestamp(::arrow::TimestampType::Unit::MILLI), "timestamp:ms"},
+          {::arrow::timestamp(::arrow::TimestampType::Unit::MICRO), "timestamp:us"},
+          {::arrow::timestamp(::arrow::TimestampType::Unit::NANO), "timestamp:ns"},
       });
 
   for (auto& [arrow_type, type_str] : kArrayTypeMap) {

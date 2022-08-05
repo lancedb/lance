@@ -26,12 +26,43 @@
 
 namespace lance::arrow {
 
+namespace {
+
+std::string ToString(::arrow::TimeUnit::type unit) {
+  using TimeUnit = ::arrow::TimeUnit;
+  switch (unit) {
+    case TimeUnit::SECOND:
+      return "s";
+    case TimeUnit::MILLI:
+      return "ms";
+    case TimeUnit::MICRO:
+      return "us";
+    case TimeUnit::NANO:
+      return "ns";
+    default:
+      assert(false);
+      return "";
+  }
+}
+
+}  // namespace
+
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype) {
   if (is_list(dtype)) {
     auto list_type = std::reinterpret_pointer_cast<::arrow::ListType>(dtype);
     return is_struct(list_type->value_type()) ? "list.struct" : "list";
   } else if (is_struct(dtype)) {
     return "struct";
+  } else if (::arrow::is_fixed_size_binary(dtype->id())) {
+    auto fixed_type = std::reinterpret_pointer_cast<::arrow::FixedSizeBinaryType>(dtype);
+    return fmt::format("fixed_size_binary:{}", fixed_type->byte_width());
+  } else if (dtype->id() == ::arrow::Date32Type::type_id) {
+    return "date32:day";
+  } else if (dtype->id() == ::arrow::Date64Type::type_id) {
+    return "date64:ms";
+  } else if (is_timestamp(dtype)) {
+    auto timestamp_type = std::dynamic_pointer_cast<::arrow::TimestampType>(dtype);
+    return fmt::format("timestamp:{}", ToString(timestamp_type->unit()));
   } else if (::arrow::is_dictionary(dtype->id())) {
     auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(dtype);
     return fmt::format("dict:{}:{}:{}",
@@ -61,15 +92,57 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
     {"binary", ::arrow::binary()},
     {"large_string", ::arrow::large_utf8()},
     {"large_binary", ::arrow::large_binary()},
+    {"date32:day", ::arrow::date32()},
+    {"date64:ms", ::arrow::date64()},
+};
+
+::arrow::Result<std::shared_ptr<::arrow::DataType>> FromTimestampLogicalType(
+    const ::arrow::util::string_view& logical_type) {
+  auto components = ::arrow::internal::SplitString(logical_type, ':');
+  if (components.size() != 2) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Invalid timestamp string: {}", logical_type.to_string()));
+  }
+  assert(components[0] == "timestamp");
+  auto& unit = components[1];
+  using Unit = ::arrow::TimestampType::Unit;
+  if (unit == "s") {
+    return ::arrow::timestamp(Unit::SECOND);
+  } else if (unit == "ms") {
+    return ::arrow::timestamp(Unit::MILLI);
+  } else if (unit == "us") {
+    return ::arrow::timestamp(Unit::MICRO);
+  } else if (unit == "ns") {
+    return ::arrow::timestamp(Unit::NANO);
+  };
+  return ::arrow::Status::Invalid("Unsupported timestamp logical type: {}", logical_type);
 };
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type) {
-  // TODO: optimize this lookup table?
   const auto& it = kPrimitiveTypeMap.find(logical_type.to_string());
   if (it != kPrimitiveTypeMap.end()) {
     return it->second;
   }
+
+  if (logical_type.starts_with("timestamp:")) {
+    return FromTimestampLogicalType(logical_type);
+  }
+
+  if (logical_type.starts_with("fixed_size_binary")) {
+    auto components = ::arrow::internal::SplitString(logical_type, ':');
+    if (components.size() != 2) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixed size binary string: {}", logical_type.to_string()));
+    }
+    auto size = std::stoi(components[1].to_string());
+    if (size == 0) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixe size binary string: {}", logical_type.to_string()));
+    }
+    return ::arrow::fixed_size_binary(size);
+  }
+
   if (logical_type.starts_with("dict")) {
     auto components = ::arrow::internal::SplitString(logical_type, ':');
     if (components.size() != 4) {
@@ -83,6 +156,10 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
   }
   return ::arrow::Status::NotImplemented(fmt::format(
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
+}
+
+bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
+  return dtype->id() == ::arrow::TimestampType::type_id;
 }
 
 }  // namespace lance::arrow
