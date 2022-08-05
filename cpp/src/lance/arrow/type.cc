@@ -60,6 +60,12 @@ std::string ToString(::arrow::TimeUnit::type unit) {
     return "date32:day";
   } else if (dtype->id() == ::arrow::Date64Type::type_id) {
     return "date64:ms";
+  } else if (dtype->id() == ::arrow::Time32Type::type_id) {
+    auto time32 = std::dynamic_pointer_cast<::arrow::Time32Type>(dtype);
+    return fmt::format("time32:{}", ToString(time32->unit()));
+  } else if (dtype->id() == ::arrow::Time64Type::type_id) {
+    auto time64 = std::dynamic_pointer_cast<::arrow::Time64Type>(dtype);
+    return fmt::format("time64:{}", ToString(time64->unit()));
   } else if (is_timestamp(dtype)) {
     auto timestamp_type = std::dynamic_pointer_cast<::arrow::TimestampType>(dtype);
     return fmt::format("timestamp:{}", ToString(timestamp_type->unit()));
@@ -96,26 +102,38 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
     {"date64:ms", ::arrow::date64()},
 };
 
-::arrow::Result<std::shared_ptr<::arrow::DataType>> FromTimestampLogicalType(
+::arrow::Result<::arrow::TimeUnit::type> TimeUnitFromLogicalType(
+    const ::arrow::util::string_view& unit) {
+  using Unit = ::arrow::TimeUnit;
+  if (unit == "s") {
+    return Unit::SECOND;
+  } else if (unit == "ms") {
+    return Unit::MILLI;
+  } else if (unit == "us") {
+    return Unit::MICRO;
+  } else if (unit == "ns") {
+    return Unit::NANO;
+  };
+  return ::arrow::Status::Invalid(fmt::format("Unsupported TimeUnit: {}", unit.to_string()));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::DataType>> TimeFromLogicalType(
     const ::arrow::util::string_view& logical_type) {
   auto components = ::arrow::internal::SplitString(logical_type, ':');
   if (components.size() != 2) {
     return ::arrow::Status::Invalid(
         fmt::format("Invalid timestamp string: {}", logical_type.to_string()));
   }
-  assert(components[0] == "timestamp");
-  auto& unit = components[1];
-  using Unit = ::arrow::TimestampType::Unit;
-  if (unit == "s") {
-    return ::arrow::timestamp(Unit::SECOND);
-  } else if (unit == "ms") {
-    return ::arrow::timestamp(Unit::MILLI);
-  } else if (unit == "us") {
-    return ::arrow::timestamp(Unit::MICRO);
-  } else if (unit == "ns") {
-    return ::arrow::timestamp(Unit::NANO);
-  };
-  return ::arrow::Status::Invalid("Unsupported timestamp logical type: {}", logical_type);
+  ARROW_ASSIGN_OR_RAISE(auto unit, TimeUnitFromLogicalType(components[1]));
+  if (components[0] == "timestamp") {
+    return ::arrow::timestamp(unit);
+  } else if (components[0] == "time32") {
+    return ::arrow::time32(unit);
+  } else if (components[0] == "time64") {
+    return ::arrow::time64(unit);
+  }
+  return ::arrow::Status::Invalid(
+      fmt::format("Invalid temporal logical type: {}", logical_type.to_string()));
 };
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
@@ -125,8 +143,8 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
     return it->second;
   }
 
-  if (logical_type.starts_with("timestamp:")) {
-    return FromTimestampLogicalType(logical_type);
+  if (logical_type.starts_with("time")) {
+    return TimeFromLogicalType(logical_type);
   }
 
   if (logical_type.starts_with("fixed_size_binary")) {

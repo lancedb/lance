@@ -71,6 +71,10 @@ TEST_CASE("Logical type coverage") {
           {::arrow::timestamp(::arrow::TimestampType::Unit::MILLI), "timestamp:ms"},
           {::arrow::timestamp(::arrow::TimestampType::Unit::MICRO), "timestamp:us"},
           {::arrow::timestamp(::arrow::TimestampType::Unit::NANO), "timestamp:ns"},
+          {::arrow::time32(::arrow::TimeUnit::SECOND), "time32:s"},
+          {::arrow::time32(::arrow::TimeUnit::MILLI), "time32:ms"},
+          {::arrow::time64(::arrow::TimeUnit::MICRO), "time64:us"},
+          {::arrow::time64(::arrow::TimeUnit::NANO), "time64:ns"},
       });
 
   for (auto& [arrow_type, type_str] : kArrayTypeMap) {
