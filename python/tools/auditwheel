@@ -6,8 +6,15 @@ import sys
 from auditwheel.main import main
 from auditwheel.policy import _POLICIES as POLICIES
 
-#for p in POLICIES:
-#    p['lib_whitelist'].extend(['libarrow.so.800', 'libarrow_dataset.so.800'])
+for p in POLICIES:
+    p["lib_whitelist"].extend(
+        [
+            "libarrow.so.800",
+            "libarrow_dataset.so.800",
+            "libarrow_python.so.800",
+            "libparquet.so.800",
+        ]
+    )
 
 if __name__ == "__main__":
     sys.exit(main())
