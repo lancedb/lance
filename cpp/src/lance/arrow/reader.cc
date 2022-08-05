@@ -50,9 +50,9 @@ FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
 
 FileReader::~FileReader() {}
 
-Result<std::shared_ptr<FileReader>> FileReader::Make(
-    std::shared_ptr<::arrow::io::RandomAccessFile> in, ::arrow::MemoryPool* pool) {
-  auto reader = std::shared_ptr<FileReader>(new FileReader(in, pool));
+Result<unique_ptr<FileReader>> FileReader::Make(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                                                ::arrow::MemoryPool* pool) {
+  auto reader = unique_ptr<FileReader>(new FileReader(in, pool));
   ARROW_RETURN_NOT_OK(reader->impl_->reader()->Open());
   return reader;
 }

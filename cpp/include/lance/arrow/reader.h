@@ -35,7 +35,7 @@ class FileReader final {
 
   /// Factory method.
   ///
-  static ::arrow::Result<std::shared_ptr<FileReader>> Make(
+  static ::arrow::Result<std::unique_ptr<FileReader>> Make(
       std::shared_ptr<::arrow::io::RandomAccessFile> in,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
