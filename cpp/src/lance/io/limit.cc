@@ -46,9 +46,10 @@ std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Limit::ReadBatch(
     const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema) {
-  if (seen_ >= limit_ + offset_) {
+  if (seen_ >= limit_) {
     return nullptr;
   }
+  fmt::print("ReadAt: offset={} limit_={} seen_={}\n", offset_, limit_, seen_);
   ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadAt(schema, offset_, limit_ - seen_));
   seen_ += batch->num_rows();
   return batch;

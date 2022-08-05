@@ -14,10 +14,18 @@
 
 #include "lance/io/limit.h"
 
+#include <arrow/io/api.h>
+#include <arrow/table.h>
+#include <arrow/type.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <memory>
 #include <numeric>
+
+#include "lance/arrow/stl.h"
+#include "lance/arrow/writer.h"
+#include "lance/io/reader.h"
 
 TEST_CASE("LIMIT 100") {
   auto limit = lance::io::Limit(100);
@@ -36,4 +44,27 @@ TEST_CASE("LIMIT 10 OFFSET 20") {
   INFO("Limit::Apply(20): offset=" << std::get<0>(val) << " len=" << std::get<1>(val));
   CHECK(val == std::make_tuple(5, 10));
   CHECK(limit.Apply(5) == std::nullopt);
+}
+
+TEST_CASE("Read limit multiple times") {
+  auto values = std::vector<int>(50);
+  std::iota(std::begin(values), std::end(values), 1);
+  auto array = lance::arrow::ToArray(values).ValueOrDie();
+
+  auto schema = ::arrow::schema({::arrow::field("values", ::arrow::int32())});
+  auto table = ::arrow::Table::Make(schema, {array});
+  auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink, "").ok());
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  auto reader = std::make_shared<lance::io::FileReader>(infile);
+  CHECK(reader->Open().ok());
+  auto limit = lance::io::Limit(5, 10);
+  auto batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
+  INFO("Actual: " << batch->column(0)->ToString());
+  CHECK(batch->column(0)->Equals(lance::arrow::ToArray({11, 12, 13, 14, 15}).ValueOrDie()));
+
+  // Already read all the data. Crashed on GH-74.
+  batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
+  CHECK(!batch);
 }
