@@ -51,19 +51,35 @@ extensions = [
     )
 ]
 
+
+this_directory = Path(__file__).parent
+long_description = (this_directory / "README.md").read_text()
+
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pylance",
-    version="0.0.2",
+    version="0.0.3",
     author="Lance Developers",
     author_email="contact@eto.ai",
     description="Python extension for lance",
-    long_description="",
+    license="Apache Software License",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     install_requires=["pyarrow>=8,<9"],
     extras_require={"test": ["pytest>=6.0", "pandas", "duckdb"]},
     python_requires=">=3.8",
     packages=find_packages(),
+    classifiers=[
+        "License :: OSI Approved :: Apache Software License",
+        "Development Status :: 3 - Alpha",
+        "Programming Language :: C++",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Operating System :: POSIX :: Linux",
+        "Intended Audience :: Developers",
+    ],
 )
