@@ -68,7 +68,7 @@ setup(
     long_description_content_type="text/markdown",
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
-    install_requires=["pyarrow>=8,<9"],
+    install_requires=["pyarrow>=9,<10"],
     extras_require={"test": ["pytest>=6.0", "pandas", "duckdb"]},
     python_requires=">=3.8",
     packages=find_packages(),
