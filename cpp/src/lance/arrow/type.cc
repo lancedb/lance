@@ -77,6 +77,7 @@ std::string ToString(::arrow::TimeUnit::type unit) {
                        dict_type->index_type()->ToString(),
                        dict_type->ordered());
   } else if (::lance::arrow::is_extension(dtype)) {
+    // TODO what if extension_name has a `:` in it?
     auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(dtype);
     return fmt::format("extension:{}",
                        ext_type->extension_name());
@@ -167,12 +168,21 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
   }
 
   if (logical_type.starts_with("extension")) {
+    // here logical_type is in the format extension:<extension_name>
+    // Note that an ExtensionType subclass instance with the extension_name
+    // must already be registered
     auto components = ::arrow::internal::SplitString(logical_type, ':');
     if (components.size() != 2) {
       return ::arrow::Status::Invalid(
           fmt::format("Invalid extension type string: {}", logical_type.to_string()));
     }
-    return ::arrow::GetExtensionType(components[1].to_string());
+    auto ext_type = ::arrow::GetExtensionType(components[1].to_string());
+    if (ext_type == nullptr) {
+      // The extension type was not registered
+      return ::arrow::Status::Invalid(
+          fmt::format("ExtensionType '{}' was not registered", logical_type.to_string()));
+    }
+    return ext_type;
   }
 
   if (logical_type.starts_with("dict")) {
