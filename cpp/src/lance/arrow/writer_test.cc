@@ -118,7 +118,7 @@ auto CocoDataset() {
 TEST_CASE("Write COCO Dataset") {
   auto coco = CocoDataset();
   auto sink = arrow::io::BufferOutputStream::Create();
-  auto status = lance::arrow::WriteTable(*coco, sink.ValueOrDie(), "filename");
+  auto status = lance::arrow::WriteTable(*coco, sink.ValueOrDie());
   INFO("Write file: " << status);
   CHECK(status.ok());
   auto buf = sink.ValueOrDie()->Finish().ValueOrDie();
@@ -126,7 +126,6 @@ TEST_CASE("Write COCO Dataset") {
   auto infile = make_shared<arrow::io::BufferReader>(buf);
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
-  CHECK(reader->primary_key() == "filename");
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
@@ -161,12 +160,11 @@ TEST_CASE("Write dictionary type") {
   auto table = arrow::Table::Make(schema, {arr});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink, "label").ok());
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
-  CHECK(reader->primary_key() == "label");
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 

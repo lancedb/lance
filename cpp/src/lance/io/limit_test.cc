@@ -54,7 +54,7 @@ TEST_CASE("Read limit multiple times") {
   auto schema = ::arrow::schema({::arrow::field("values", ::arrow::int32())});
   auto table = ::arrow::Table::Make(schema, {array});
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink, "").ok());
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<lance::io::FileReader>(infile);

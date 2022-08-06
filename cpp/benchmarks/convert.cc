@@ -54,7 +54,7 @@ arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) 
   auto table = scanner->ToTable().ValueOrDie();
 
   auto outfile = fs->OpenOutputStream(out).ValueOrDie();
-  return lance::arrow::WriteTable(*table, outfile, "id");
+  return lance::arrow::WriteTable(*table, outfile);
 }
 
 int main(int argc, char** argv) {

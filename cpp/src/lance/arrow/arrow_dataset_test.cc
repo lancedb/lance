@@ -40,7 +40,7 @@ TEST_CASE("FileSystemFactory Test") {
 
   {
     auto sink = fs->OpenOutputStream(path).ValueOrDie();
-    CHECK(lance::arrow::WriteTable(*table, sink, "key").ok());
+    CHECK(lance::arrow::WriteTable(*table, sink).ok());
   }
 
   auto factory =

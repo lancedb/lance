@@ -151,12 +151,10 @@ FileWriter::~FileWriter() {}
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
   metadata_->SetPageTablePosition(pos);
 
-  std::string primary_key;
   if (options_->type_name() == lance::arrow::LanceFileFormat::Make()->type_name()) {
     auto opts = std::dynamic_pointer_cast<lance::arrow::FileWriteOptions>(options_);
-    primary_key = opts->primary_key;
   }
-  format::Manifest manifest(primary_key, lance_schema_);
+  format::Manifest manifest(lance_schema_);
   ARROW_ASSIGN_OR_RAISE(pos, manifest.Write(destination_));
   metadata_->SetManifestPosition(pos);
 

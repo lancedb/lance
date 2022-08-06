@@ -23,13 +23,11 @@ namespace lance::arrow {
 
 ::arrow::Status WriteTable(const ::arrow::Table& table,
                            shared_ptr<::arrow::io::OutputStream> sink,
-                           const string& primary_key,
                            std::optional<FileWriteOptions> options) {
   auto opts = std::make_shared<lance::arrow::FileWriteOptions>();
   if (options.has_value()) {
     *opts = options.value();
   }
-  opts->primary_key = primary_key;
   lance::io::FileWriter writer(table.schema(), opts, sink, {});
 
   std::shared_ptr<::arrow::RecordBatch> batch;

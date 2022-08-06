@@ -41,7 +41,7 @@ TEST_CASE("Test List Array With Nulls") {
   auto table = ::arrow::Table::Make(schema, {values});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink, "").ok());
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader_result = lance::arrow::FileReader::Make(infile);
