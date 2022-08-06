@@ -59,10 +59,13 @@ inline bool is_struct(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::STRUCT;
 }
 
-/// Returns True if the data type si a map.
+/// Returns True if the data type is a map.
 inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
   return dtype->id() == ::arrow::Type::MAP;
 }
+
+/// Returns True if the data type is timestamp type.
+bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype);
 
 /// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);

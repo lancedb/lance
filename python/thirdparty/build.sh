@@ -2,7 +2,7 @@
 
 set -ex
 
-APACHE_ARROW_VERSION=apache-arrow-8.0.1
+APACHE_ARROW_VERSION=apache-arrow-9.0.0
 
 # Build apache arrow
 build_arrow() {

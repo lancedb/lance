@@ -26,12 +26,49 @@
 
 namespace lance::arrow {
 
+namespace {
+
+std::string ToString(::arrow::TimeUnit::type unit) {
+  using TimeUnit = ::arrow::TimeUnit;
+  switch (unit) {
+    case TimeUnit::SECOND:
+      return "s";
+    case TimeUnit::MILLI:
+      return "ms";
+    case TimeUnit::MICRO:
+      return "us";
+    case TimeUnit::NANO:
+      return "ns";
+    default:
+      assert(false);
+      return "";
+  }
+}
+
+}  // namespace
+
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype) {
   if (is_list(dtype)) {
     auto list_type = std::reinterpret_pointer_cast<::arrow::ListType>(dtype);
     return is_struct(list_type->value_type()) ? "list.struct" : "list";
   } else if (is_struct(dtype)) {
     return "struct";
+  } else if (::arrow::is_fixed_size_binary(dtype->id())) {
+    auto fixed_type = std::reinterpret_pointer_cast<::arrow::FixedSizeBinaryType>(dtype);
+    return fmt::format("fixed_size_binary:{}", fixed_type->byte_width());
+  } else if (dtype->id() == ::arrow::Date32Type::type_id) {
+    return "date32:day";
+  } else if (dtype->id() == ::arrow::Date64Type::type_id) {
+    return "date64:ms";
+  } else if (dtype->id() == ::arrow::Time32Type::type_id) {
+    auto time32 = std::dynamic_pointer_cast<::arrow::Time32Type>(dtype);
+    return fmt::format("time32:{}", ToString(time32->unit()));
+  } else if (dtype->id() == ::arrow::Time64Type::type_id) {
+    auto time64 = std::dynamic_pointer_cast<::arrow::Time64Type>(dtype);
+    return fmt::format("time64:{}", ToString(time64->unit()));
+  } else if (is_timestamp(dtype)) {
+    auto timestamp_type = std::dynamic_pointer_cast<::arrow::TimestampType>(dtype);
+    return fmt::format("timestamp:{}", ToString(timestamp_type->unit()));
   } else if (::arrow::is_dictionary(dtype->id())) {
     auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(dtype);
     return fmt::format("dict:{}:{}:{}",
@@ -43,36 +80,88 @@ namespace lance::arrow {
   }
 }
 
+const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiveTypeMap = {
+    {"null", ::arrow::null()},
+    {"bool", ::arrow::boolean()},
+    {"int8", ::arrow::int8()},
+    {"uint8", ::arrow::uint8()},
+    {"int16", ::arrow::int16()},
+    {"uint16", ::arrow::uint16()},
+    {"int32", ::arrow::int32()},
+    {"uint32", ::arrow::uint32()},
+    {"int64", ::arrow::int64()},
+    {"uint64", ::arrow::uint64()},
+    {"halffloat", ::arrow::float16()},
+    {"float", ::arrow::float32()},
+    {"double", ::arrow::float64()},
+    {"string", ::arrow::utf8()},
+    {"binary", ::arrow::binary()},
+    {"large_string", ::arrow::large_utf8()},
+    {"large_binary", ::arrow::large_binary()},
+    {"date32:day", ::arrow::date32()},
+    {"date64:ms", ::arrow::date64()},
+};
+
+::arrow::Result<::arrow::TimeUnit::type> TimeUnitFromLogicalType(
+    const ::arrow::util::string_view& unit) {
+  using Unit = ::arrow::TimeUnit;
+  if (unit == "s") {
+    return Unit::SECOND;
+  } else if (unit == "ms") {
+    return Unit::MILLI;
+  } else if (unit == "us") {
+    return Unit::MICRO;
+  } else if (unit == "ns") {
+    return Unit::NANO;
+  };
+  return ::arrow::Status::Invalid(fmt::format("Unsupported TimeUnit: {}", unit.to_string()));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::DataType>> TimeFromLogicalType(
+    const ::arrow::util::string_view& logical_type) {
+  auto components = ::arrow::internal::SplitString(logical_type, ':');
+  if (components.size() != 2) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Invalid timestamp string: {}", logical_type.to_string()));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto unit, TimeUnitFromLogicalType(components[1]));
+  if (components[0] == "timestamp") {
+    return ::arrow::timestamp(unit);
+  } else if (components[0] == "time32") {
+    return ::arrow::time32(unit);
+  } else if (components[0] == "time64") {
+    return ::arrow::time64(unit);
+  }
+  return ::arrow::Status::Invalid(
+      fmt::format("Invalid temporal logical type: {}", logical_type.to_string()));
+};
+
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type) {
-  // TODO: optimize this lookup table?
-  if (logical_type == "bool") {
-    return ::arrow::boolean();
-  } else if (logical_type == "int8") {
-    return ::arrow::int8();
-  } else if (logical_type == "uint8") {
-    return ::arrow::utf8();
-  } else if (logical_type == "int16") {
-    return ::arrow::int16();
-  } else if (logical_type == "uint16") {
-    return ::arrow::uint16();
-  } else if (logical_type == "int32") {
-    return ::arrow::int32();
-  } else if (logical_type == "uint32") {
-    return ::arrow::uint32();
-  } else if (logical_type == "int64") {
-    return ::arrow::int64();
-  } else if (logical_type == "uint64") {
-    return ::arrow::uint64();
-  } else if (logical_type == "float") {
-    return ::arrow::float32();
-  } else if (logical_type == "double") {
-    return ::arrow::float64();
-  } else if (logical_type == "string") {
-    return ::arrow::utf8();
-  } else if (logical_type == "binary") {
-    return ::arrow::binary();
-  } else if (logical_type.starts_with("dict")) {
+  const auto& it = kPrimitiveTypeMap.find(logical_type.to_string());
+  if (it != kPrimitiveTypeMap.end()) {
+    return it->second;
+  }
+
+  if (logical_type.starts_with("time")) {
+    return TimeFromLogicalType(logical_type);
+  }
+
+  if (logical_type.starts_with("fixed_size_binary")) {
+    auto components = ::arrow::internal::SplitString(logical_type, ':');
+    if (components.size() != 2) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixed size binary string: {}", logical_type.to_string()));
+    }
+    auto size = std::stoi(components[1].to_string());
+    if (size == 0) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixe size binary string: {}", logical_type.to_string()));
+    }
+    return ::arrow::fixed_size_binary(size);
+  }
+
+  if (logical_type.starts_with("dict")) {
     auto components = ::arrow::internal::SplitString(logical_type, ':');
     if (components.size() != 4) {
       return ::arrow::Status::Invalid(
@@ -85,6 +174,10 @@ namespace lance::arrow {
   }
   return ::arrow::Status::NotImplemented(fmt::format(
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
+}
+
+bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
+  return dtype->id() == ::arrow::TimestampType::type_id;
 }
 
 }  // namespace lance::arrow
