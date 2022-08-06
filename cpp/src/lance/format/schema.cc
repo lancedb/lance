@@ -44,23 +44,29 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
       encoding_(pb::NONE) {
-  if (::lance::arrow::is_struct(field->type())) {
-    auto struct_type = std::static_pointer_cast<::arrow::StructType>(field->type());
+  auto field_type = field->type();
+  if (::lance::arrow::is_extension(field_type)) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
+    field_type = ext_type->storage_type();
+  }
+
+  if (::lance::arrow::is_struct(field_type)) {
+    auto struct_type = std::static_pointer_cast<::arrow::StructType>(field_type);
     for (auto& arrow_field : struct_type->fields()) {
       children_.push_back(std::shared_ptr<Field>(new Field(arrow_field)));
     }
-  } else if (::lance::arrow::is_list(field->type())) {
-    auto list_type = std::static_pointer_cast<::arrow::ListType>(field->type());
+  } else if (::lance::arrow::is_list(field_type)) {
+    auto list_type = std::static_pointer_cast<::arrow::ListType>(field_type);
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
     encoding_ = pb::PLAIN;
   }
 
-  if (::arrow::is_binary_like(field->type()->id())) {
+  if (::arrow::is_binary_like(field_type->id())) {
     encoding_ = pb::VAR_BINARY;
-  } else if (::arrow::is_primitive(field->type()->id())) {
+  } else if (::arrow::is_primitive(field_type->id())) {
     encoding_ = pb::PLAIN;
-  } else if (::arrow::is_dictionary(field->type()->id())) {
+  } else if (::arrow::is_dictionary(field_type->id())) {
     encoding_ = pb::DICTIONARY;
   }
 }
@@ -273,7 +279,7 @@ std::shared_ptr<::arrow::DataType> Field::type() const {
   } else if (logical_type_ == "struct") {
     std::vector<std::shared_ptr<::arrow::Field>> sub_types;
     for (auto& child : children_) {
-      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), child->type()));
+      sub_types.emplace_back(child->ToArrow());
     }
     return ::arrow::struct_(sub_types);
   } else {

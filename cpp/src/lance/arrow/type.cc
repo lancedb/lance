@@ -24,6 +24,7 @@
 
 #include "lance/format/schema.h"
 
+
 namespace lance::arrow {
 
 namespace {
@@ -75,8 +76,12 @@ std::string ToString(::arrow::TimeUnit::type unit) {
                        dict_type->value_type()->ToString(),
                        dict_type->index_type()->ToString(),
                        dict_type->ordered());
+  } else if (::lance::arrow::is_extension(dtype)) {
+    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(dtype);
+    return fmt::format("extension:{}",
+                       ext_type->extension_name());
   } else {
-    return dtype->ToString();
+      return dtype->ToString();
   }
 }
 
@@ -161,16 +166,25 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
     return ::arrow::fixed_size_binary(size);
   }
 
+  if (logical_type.starts_with("extension")) {
+    auto components = ::arrow::internal::SplitString(logical_type, ':');
+    if (components.size() != 2) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid extension type string: {}", logical_type.to_string()));
+    }
+    return ::arrow::GetExtensionType(components[1].to_string());
+  }
+
   if (logical_type.starts_with("dict")) {
     auto components = ::arrow::internal::SplitString(logical_type, ':');
-    if (components.size() != 4) {
-      return ::arrow::Status::Invalid(
-          fmt::format("Invalid dictionary type string: {}", logical_type.to_string()));
-    }
-    ARROW_ASSIGN_OR_RAISE(auto value_type, FromLogicalType(components[1]));
-    ARROW_ASSIGN_OR_RAISE(auto index_value, FromLogicalType(components[2]));
-    auto ordered = components[3] == "true";
-    return ::arrow::dictionary(index_value, value_type, ordered);
+      if (components.size() != 4) {
+        return ::arrow::Status::Invalid(
+            fmt::format("Invalid dictionary type string: {}", logical_type.to_string()));
+      }
+      ARROW_ASSIGN_OR_RAISE(auto value_type, FromLogicalType(components[1]));
+      ARROW_ASSIGN_OR_RAISE(auto index_value, FromLogicalType(components[2]));
+      auto ordered = components[3] == "true";
+      return ::arrow::dictionary(index_value, value_type, ordered);
   }
   return ::arrow::Status::NotImplemented(fmt::format(
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));

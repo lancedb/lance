@@ -44,7 +44,7 @@ std::shared_ptr<::arrow::Schema> ToArrowVisitor::Finish() { return ::arrow::sche
 
 ::arrow::Result<::std::shared_ptr<::arrow::Field>> ToArrowVisitor::DoVisit(
     std::shared_ptr<Field> node) {
-  return std::make_shared<::arrow::Field>(node->name(), node->type());
+  return node->ToArrow();
 }
 
 WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::OutputStream> out)

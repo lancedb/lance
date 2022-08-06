@@ -41,8 +41,42 @@ TEST_CASE("Parse dictionary type") {
   CHECK(dict_type->Equals(actual));
 }
 
+
+class ImageType : public ::arrow::ExtensionType {
+ public:
+  ImageType() : ExtensionType(::arrow::struct_({
+                    ::arrow::field("data", ::arrow::large_binary()),
+                    ::arrow::field("uri", ::arrow::utf8()),
+                })) {}
+
+  std::string extension_name() const override { return "image"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override {
+    return other.extension_name() != extension_name();
+  }
+
+  std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
+      const override {
+    return std::make_shared<::arrow::ExtensionArray>(data);
+  }
+
+  ::arrow::Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override {
+    if (serialized != "ext-struct-type-unique-code") {
+      return ::arrow::Status::Invalid("Type identifier did not match");
+    }
+    return std::make_shared<ImageType>();
+  }
+  std::string Serialize() const override { return "image-ext"; }
+};
+
+
 // Type reference: https://arrow.apache.org/docs/cpp/api/datatype.html
 TEST_CASE("Logical type coverage") {
+  auto ext_type = std::make_shared<ImageType>();
+  ::arrow::RegisterExtensionType(ext_type);
+
   const auto kArrayTypeMap =
       std::vector<std::tuple<std::shared_ptr<::arrow::DataType>, std::string>>({
           // Primitive types
@@ -75,6 +109,7 @@ TEST_CASE("Logical type coverage") {
           {::arrow::time32(::arrow::TimeUnit::MILLI), "time32:ms"},
           {::arrow::time64(::arrow::TimeUnit::MICRO), "time64:us"},
           {::arrow::time64(::arrow::TimeUnit::NANO), "time64:ns"},
+          {ext_type, "extension:image"},
       });
 
   for (auto& [arrow_type, type_str] : kArrayTypeMap) {
