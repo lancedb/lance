@@ -26,18 +26,16 @@ class Schema;
 /// \brief Manifest.
 ///
 /// Organize the less-frequently updated metadata about the full dataset:
-///  * Primary key
 ///  * Schema
 ///
 class Manifest final {
  public:
   Manifest() = default;
 
-  /// Construct a Manifest with primary key and schema.
+  /// Construct a Manifest with the schema.
   ///
-  /// \param primary_key the primary key of the dataset.
   /// \param schema the dataset schema.
-  Manifest(const std::string& primary_key, std::shared_ptr<Schema> schema);
+  Manifest(std::shared_ptr<Schema> schema);
 
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
@@ -54,15 +52,10 @@ class Manifest final {
   /// \return The offset of the manifest.
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
 
-  /// Get the primary key of this dataset.
-  const std::string& primary_key() const;
-
   /// Get schema of the dataset.
   const Schema& schema() const;
 
  private:
-  /// Primary key of the datasets.
-  std::string primary_key_;
 
   /// Table schema.
   std::shared_ptr<Schema> schema_;

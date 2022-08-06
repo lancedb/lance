@@ -41,11 +41,8 @@ Format:
 
 // Manifest is a global section shared between all the files.
 message Manifest {
-  // Primary key column of the dataset.
-  string primary_key = 1;
-  
   // All fields of the dataset, including the nested fields.
-  repeated Field fields = 2;
+  repeated Field fields = 1;
 }
 
 // Metadata of one Lane file.

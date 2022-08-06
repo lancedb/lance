@@ -50,7 +50,7 @@ def scanner(
     return BuildScanner(data, columns=columns, filter=filter, limit=limit, offset=offset)
 
 
-def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str):
+def write_table(table: pa.Table, destination: Union[str, Path]):
     """Write an Arrow Table into the destination.
 
     Parameters
@@ -59,7 +59,5 @@ def write_table(table: pa.Table, destination: Union[str, Path], primary_key: str
         Apache Arrow Table
     destination : str or `Path`
         The destination to write dataset to.
-    primary_key : str
-        The column name of the primary key.
     """
-    WriteTable(table, destination, primary_key)
+    WriteTable(table, destination)

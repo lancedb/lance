@@ -57,8 +57,6 @@ Result<unique_ptr<FileReader>> FileReader::Make(std::shared_ptr<::arrow::io::Ran
   return reader;
 }
 
-string FileReader::primary_key() const { return impl_->reader()->manifest().primary_key(); }
-
 int64_t FileReader::num_batches() const { return impl_->reader()->metadata().num_batches(); }
 
 int64_t FileReader::length() const { return impl_->reader()->metadata().length(); }

@@ -30,7 +30,7 @@ def test_dictionary_type_query(tmp_path: Path):
 
     uri = tmp_path / "dict.lance"
     print(pa.Table.from_pandas(df, preserve_index=False).schema)
-    lance.write_table(pa.Table.from_pandas(df), tmp_path / "dict.lance", "class")
+    lance.write_table(pa.Table.from_pandas(df), tmp_path / "dict.lance")
     # print(df)
 
     ds = lance.dataset(uri)

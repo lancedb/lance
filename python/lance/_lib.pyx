@@ -56,7 +56,6 @@ cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
     CStatus CWriteTable "::lance::arrow::WriteTable"(
             const CTable& table,
             shared_ptr[COutputStream] sink,
-            const c_string& primary_key,
             optional[CFileWriteOptions] options)
 
 
@@ -108,13 +107,11 @@ cdef class LanceFileFormat(FileFormat):
         return LanceFileFormat, tuple()
 
 def WriteTable(table: Table,
-               sink: Union[str, Path],
-               primary_key: str):
+               sink: Union[str, Path]):
     arrow_table = pyarrow_unwrap_table(table)
     cdef shared_ptr[COutputStream] out
     get_writer(sink, &out)
-    cdef string pk = primary_key.encode("utf-8")
 
     cdef optional[CFileWriteOptions] options = nullopt
     with nogil:
-        check_status(CWriteTable(deref(arrow_table), out, pk, options))
+        check_status(CWriteTable(deref(arrow_table), out, options))

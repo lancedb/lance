@@ -27,13 +27,11 @@ namespace lance::arrow {
 ///
 /// \param table arrow table.
 /// \param sink the output stream to write it to.
-/// \param primary_key the primary key of the dataset.
 /// \param options File write options, optional.
 ///
 /// \return Status::OK() if succeed.
 ::arrow::Status WriteTable(const ::arrow::Table& table,
                            std::shared_ptr<::arrow::io::OutputStream> sink,
-                           const std::string& primary_key,
                            std::optional<FileWriteOptions> options = std::nullopt);
 
 }  // namespace nft::arrow
