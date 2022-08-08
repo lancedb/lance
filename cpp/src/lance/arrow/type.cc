@@ -77,12 +77,15 @@ std::string ToString(::arrow::TimeUnit::type unit) {
                        dict_type->index_type()->ToString(),
                        dict_type->ordered());
   } else if (::lance::arrow::is_extension(dtype)) {
-    // TODO what if extension_name has a `:` in it?
     auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(dtype);
+    // TODO how to deal with parametric types?
+    if (ext_type->extension_name().find(':') != std::string::npos) {
+      return ::arrow::Status::Invalid(fmt::format("Extension name {} cannot have a ':' in it", ext_type->extension_name()));
+    }
     return fmt::format("extension:{}",
                        ext_type->extension_name());
   } else {
-      return dtype->ToString();
+    return dtype->ToString();
   }
 }
 
