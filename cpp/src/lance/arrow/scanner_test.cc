@@ -26,6 +26,8 @@
 #include <memory>
 
 #include "lance/arrow/type.h"
+#include "lance/format/schema.h"
+
 
 auto nested_schema = ::arrow::schema({::arrow::field("pk", ::arrow::int32()),
                                       ::arrow::field("objects",
@@ -78,4 +80,104 @@ TEST_CASE("Build Scanner with nested struct") {
   CHECK(scanner->options()->batch_readahead == 1);
 
   fmt::print("Scanner Options: {}\n", scanner->options()->filter.ToString());
+}
+
+
+// A parametric type where the extension_name() is always the same
+class ParametricType : public ::arrow::ExtensionType {
+ public:
+  explicit ParametricType(int32_t parameter)
+      : ExtensionType(::arrow::int32()), parameter_(parameter) {}
+
+  int32_t parameter() const { return parameter_; }
+
+  std::string extension_name() const override { return "parametric-type"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override {
+    const auto& other_ext = static_cast<const ExtensionType&>(other);
+    if (other_ext.extension_name() != this->extension_name()) {
+      return false;
+    }
+    return this->parameter() == static_cast<const ParametricType&>(other).parameter();
+  }
+
+  std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
+      const override {
+    return std::make_shared<::arrow::ExtensionArray>(data);
+  }
+
+  ::arrow::Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override {
+    const int32_t parameter = *reinterpret_cast<const int32_t*>(serialized.data());
+    return std::make_shared<ParametricType>(parameter);
+  }
+
+  std::string Serialize() const override {
+    std::string result("    ");
+    memcpy(&result[0], &parameter_, sizeof(int32_t));
+    return result;
+  }
+
+ private:
+  int32_t parameter_;
+};
+
+
+std::shared_ptr<::arrow::Table> MakeTable() {
+  auto ext_type = std::make_shared<ParametricType>(1);
+  ::arrow::StringBuilder stringBuilder;
+  ::arrow::Int32Builder intBuilder;
+
+  CHECK(stringBuilder.AppendValues({"train", "train", "split", "train"}).ok());
+  auto c1 = stringBuilder.Finish().ValueOrDie();
+  stringBuilder.Reset();
+
+  CHECK(intBuilder.AppendValues({1, 2, 3, 4}).ok());
+  auto c2 = intBuilder.Finish().ValueOrDie();
+  intBuilder.Reset();
+
+  auto schema = ::arrow::schema({arrow::field("c1", ::arrow::utf8()),
+                                 arrow::field("c2", ext_type)});
+
+  std::vector<std::shared_ptr<::arrow::Array>> cols;
+  cols.push_back(c1);
+  cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, c2));
+  return ::arrow::Table::Make(std::move(schema), std::move(cols));
+}
+
+std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::Table> table) {
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
+  auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
+  scanner_builder.Limit(2);
+  scanner_builder.Project({"c2"});
+  // TODO how can extension types implement comparisons for filtering against storage type?
+  auto result = scanner_builder.Finish();
+  CHECK(result.ok());
+  auto scanner = result.ValueOrDie();
+  fmt::print("Projected: {}\n", scanner->options()->projected_schema);
+  return scanner;
+}
+
+
+TEST_CASE("Scanner with extension") {
+  auto table = MakeTable();
+  auto ext_type = std::make_shared<ParametricType>(1);
+  ::arrow::RegisterExtensionType(ext_type);
+  auto scanner = MakeScanner(table);
+
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
+  INFO("Dataset schema is " << dataset->schema()->ToString());
+
+  auto schema = ::lance::format::Schema(dataset->schema());
+  INFO("Lance schema is " << schema.ToString());
+
+  auto expected_proj_schema = ::arrow::schema({::arrow::field("c2", ext_type)});
+  INFO("Expected schema: " << expected_proj_schema->ToString());
+  INFO("Actual schema: " << scanner->options()->projected_schema->ToString());
+  CHECK(expected_proj_schema->Equals(scanner->options()->projected_schema));
+
+  auto actual_table = scanner->ToTable().ValueOrDie();
+  CHECK(actual_table->schema()->Equals(expected_proj_schema));
+  CHECK(actual_table->GetColumnByName("c2")->type()->Equals(ext_type));
 }

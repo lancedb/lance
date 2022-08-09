@@ -151,6 +151,10 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 }
 
 std::string Field::ToString() const {
+  if (is_extension_field()) {
+    return fmt::format("{}({}): {}, encoding={}, extension_name={}", name_, id_, type()->ToString(),
+                       encoding_, extension_name());
+  }
   return fmt::format("{}({}): {}, encoding={}", name_, id_, type()->ToString(), encoding_);
 }
 
@@ -319,6 +323,7 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
   new_field->parent_ = parent_;
   new_field->name_ = name_;
   new_field->logical_type_ = logical_type_;
+  new_field->extension_name_ = extension_name_;
   new_field->encoding_ = encoding_;
   new_field->dictionary_offset_ = dictionary_offset_;
   new_field->dictionary_page_length_ = dictionary_page_length_;
@@ -334,15 +339,20 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
 std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arrow_field) const {
   assert(name_ == arrow_field->name());
   auto new_field = Copy();
-  if (arrow::is_struct(arrow_field->type())) {
-    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field->type());
+  auto dtype = arrow_field->type();
+  if (dtype->id() == ::arrow::Type::EXTENSION) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
+    dtype = ext_type->storage_type();
+  }
+  if (arrow::is_struct(dtype)) {
+    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(dtype);
     for (auto arrow_subfield : struct_type->fields()) {
       auto subfield = Get(arrow_subfield->name());
       assert(subfield);
       new_field->AddChild(subfield->Project(arrow_subfield));
     }
-  } else if (arrow::is_list(arrow_field->type())) {
-    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field->type());
+  } else if (arrow::is_list(dtype)) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(dtype);
     new_field->AddChild(children_[0]->Project(list_type->value_field()));
   }
   return new_field;

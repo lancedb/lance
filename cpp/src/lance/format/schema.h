@@ -140,7 +140,7 @@ class Field final {
 
   std::string extension_name() const { return extension_name_; }
 
-  bool is_extension_field() { return !extension_name_.empty(); }
+  bool is_extension_field() const { return !extension_name_.empty(); }
 
   void set_encoding(lance::format::pb::Encoding encoding);
 
