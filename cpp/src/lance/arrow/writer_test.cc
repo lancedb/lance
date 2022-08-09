@@ -172,6 +172,7 @@ TEST_CASE("Write dictionary type") {
   CHECK(table->Equals(*actual_table));
 }
 
+<<<<<<< HEAD
 TEST_CASE("Large binary field") {
   auto field_type = ::arrow::large_binary();
   auto schema = ::arrow::schema({arrow::field("f1", field_type)});
@@ -203,3 +204,69 @@ TEST_CASE("Binary field") {
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 }
+=======
+
+class ImageType : public ::arrow::ExtensionType {
+ public:
+  ImageType() : ExtensionType(::arrow::struct_({
+                    ::arrow::field("uri", ::arrow::utf8()),
+                })) {}
+
+  std::string extension_name() const override { return "image"; }
+
+  bool ExtensionEquals(const ExtensionType& other) const override {
+    return other.extension_name() != extension_name();
+  }
+
+  std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
+      const override {
+    return std::make_shared<::arrow::ExtensionArray>(data);
+  }
+
+  ::arrow::Result<std::shared_ptr<DataType>> Deserialize(
+      std::shared_ptr<DataType> storage_type,
+      const std::string& serialized) const override {
+    if (serialized != "ext-struct-type-unique-code") {
+      return ::arrow::Status::Invalid("Type identifier did not match");
+    }
+    return std::make_shared<ImageType>();
+  }
+  std::string Serialize() const override { return "image-ext"; }
+};
+
+
+TEST_CASE("Write extension type") {
+  auto ext_type = std::make_shared<ImageType>();
+  ::arrow::RegisterExtensionType(ext_type);
+  auto uriBuilder = std::make_shared<StringBuilder>();    
+  auto imageBuilder = std::make_shared<StructBuilder>(
+      ext_type->storage_type(),
+      arrow::default_memory_pool(),
+      vector<shared_ptr<ArrayBuilder>>({uriBuilder}));
+  for (int i = 0; i < 4; i++) {
+    CHECK(imageBuilder->Append().ok());
+    CHECK(uriBuilder->Append(fmt::format("s3://{}", i)).ok());
+  }
+  auto arr = imageBuilder->Finish().ValueOrDie();  
+  INFO("array is " << arr->ToString());
+
+  auto schema = ::arrow::schema({arrow::field("image", ext_type)});
+  std::vector<std::shared_ptr<::arrow::Array>> cols;
+  cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, arr));
+  auto table = ::arrow::Table::Make(std::move(schema), std::move(cols));
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+
+  /*
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  INFO(FileReader::Make(infile).status());
+  auto reader = FileReader::Make(infile).ValueOrDie();
+  CHECK(reader->num_batches() == 1);
+  CHECK(reader->length() == 4);
+
+  auto actual_table = reader->ReadTable().ValueOrDie();
+  CHECK(table->Equals(*actual_table));
+   */
+}
+
