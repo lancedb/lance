@@ -73,4 +73,6 @@ bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype);
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type);
 
+std::string GetExtensionName(std::shared_ptr<::arrow::DataType> dtype);
+
 }  // namespace lance::arrow

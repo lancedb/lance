@@ -43,14 +43,24 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
+      extension_name_(arrow::GetExtensionName(field->type())),
       encoding_(pb::NONE) {
-  if (::lance::arrow::is_struct(field->type())) {
-    auto struct_type = std::static_pointer_cast<::arrow::StructType>(field->type());
+  if (is_extension_field()) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
+    init(ext_type->storage_type());
+  } else {
+    init(field->type());
+  }
+}
+
+void Field::init(std::shared_ptr<::arrow::DataType> dtype) {
+  if (::lance::arrow::is_struct(dtype)) {
+    auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
       children_.push_back(std::shared_ptr<Field>(new Field(arrow_field)));
     }
-  } else if (::lance::arrow::is_list(field->type())) {
-    auto list_type = std::static_pointer_cast<::arrow::ListType>(field->type());
+  } else if (::lance::arrow::is_list(dtype)) {
+    auto list_type = std::static_pointer_cast<::arrow::ListType>(dtype);
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
     encoding_ = pb::PLAIN;
@@ -71,6 +81,7 @@ Field::Field(const pb::Field& pb)
       parent_(pb.parent_id()),
       name_(pb.name()),
       logical_type_(pb.logical_type()),
+      extension_name_(pb.extension_name()),
       encoding_(pb.encoding()),
       dictionary_offset_(pb.dictionary_offset()),
       dictionary_page_length_(pb.dictionary_page_length()) {}

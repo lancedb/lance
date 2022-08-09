@@ -172,7 +172,7 @@ TEST_CASE("Write dictionary type") {
   CHECK(table->Equals(*actual_table));
 }
 
-<<<<<<< HEAD
+
 TEST_CASE("Large binary field") {
   auto field_type = ::arrow::large_binary();
   auto schema = ::arrow::schema({arrow::field("f1", field_type)});
@@ -204,7 +204,7 @@ TEST_CASE("Binary field") {
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 }
-=======
+
 
 class ImageType : public ::arrow::ExtensionType {
  public:
@@ -235,10 +235,9 @@ class ImageType : public ::arrow::ExtensionType {
 };
 
 
-TEST_CASE("Write extension type") {
+std::shared_ptr<::arrow::Table> MakeTable() {
   auto ext_type = std::make_shared<ImageType>();
-  ::arrow::RegisterExtensionType(ext_type);
-  auto uriBuilder = std::make_shared<StringBuilder>();    
+  auto uriBuilder = std::make_shared<StringBuilder>();
   auto imageBuilder = std::make_shared<StructBuilder>(
       ext_type->storage_type(),
       arrow::default_memory_pool(),
@@ -247,26 +246,33 @@ TEST_CASE("Write extension type") {
     CHECK(imageBuilder->Append().ok());
     CHECK(uriBuilder->Append(fmt::format("s3://{}", i)).ok());
   }
-  auto arr = imageBuilder->Finish().ValueOrDie();  
+  auto arr = imageBuilder->Finish().ValueOrDie();
   INFO("array is " << arr->ToString());
 
   auto schema = ::arrow::schema({arrow::field("image", ext_type)});
   std::vector<std::shared_ptr<::arrow::Array>> cols;
   cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, arr));
-  auto table = ::arrow::Table::Make(std::move(schema), std::move(cols));
+  return ::arrow::Table::Make(std::move(schema), std::move(cols));
+}
 
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
-
-  /*
+std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   INFO(FileReader::Make(infile).status());
   auto reader = FileReader::Make(infile).ValueOrDie();
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
-
-  auto actual_table = reader->ReadTable().ValueOrDie();
-  CHECK(table->Equals(*actual_table));
-   */
+  return reader->ReadTable().ValueOrDie();
 }
 
+TEST_CASE("Extension type round-trip unregistered") {
+  auto table = MakeTable();
+  auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
+      table->GetColumnByName("image")->chunk(0))->storage();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+
+  // We can read it back without the extension
+  auto actual_table = ReadTable(sink);
+  CHECK(arr->Equals(actual_table->GetColumnByName("image")->chunk(0)));
+}
