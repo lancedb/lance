@@ -264,7 +264,7 @@ std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutpu
   return reader->ReadTable().ValueOrDie();
 }
 
-TEST_CASE("Extension type round-trip unregistered") {
+TEST_CASE("Write extension but read storage if not registered") {
   auto table = MakeTable();
   auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
       table->GetColumnByName("image")->chunk(0))->storage();
@@ -276,3 +276,16 @@ TEST_CASE("Extension type round-trip unregistered") {
   auto actual_table = ReadTable(sink);
   CHECK(arr->Equals(actual_table->GetColumnByName("image")->chunk(0)));
 }
+
+
+TEST_CASE("Extension type round-trip") {
+  auto table = MakeTable();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+
+  // We can read it back without the extension
+  auto actual_table = ReadTable(sink);
+  CHECK(table->Equals(*actual_table));
+}
+
