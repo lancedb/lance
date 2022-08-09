@@ -215,7 +215,7 @@ class ImageType : public ::arrow::ExtensionType {
   std::string extension_name() const override { return "image"; }
 
   bool ExtensionEquals(const ExtensionType& other) const override {
-    return other.extension_name() != extension_name();
+    return other.extension_name() == extension_name();
   }
 
   std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
@@ -249,7 +249,7 @@ std::shared_ptr<::arrow::Table> MakeTable() {
   auto arr = imageBuilder->Finish().ValueOrDie();
   INFO("array is " << arr->ToString());
 
-  auto schema = ::arrow::schema({arrow::field("image", ext_type)});
+  auto schema = ::arrow::schema({arrow::field("image_ext", ext_type)});
   std::vector<std::shared_ptr<::arrow::Array>> cols;
   cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, arr));
   return ::arrow::Table::Make(std::move(schema), std::move(cols));
@@ -267,20 +267,21 @@ std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutpu
 TEST_CASE("Write extension but read storage if not registered") {
   auto table = MakeTable();
   auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
-      table->GetColumnByName("image")->chunk(0))->storage();
+      table->GetColumnByName("image_ext")->chunk(0))->storage();
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
   // We can read it back without the extension
   auto actual_table = ReadTable(sink);
-  CHECK(arr->Equals(actual_table->GetColumnByName("image")->chunk(0)));
+  CHECK(arr->Equals(actual_table->GetColumnByName("image_ext")->chunk(0)));
 }
 
 
 TEST_CASE("Extension type round-trip") {
+  auto ext_type = std::make_shared<ImageType>();
+  arrow::RegisterExtensionType(ext_type);
   auto table = MakeTable();
-
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 

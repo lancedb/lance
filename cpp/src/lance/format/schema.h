@@ -123,7 +123,7 @@ class Field final {
 
   std::shared_ptr<Field> Get(int32_t id);
 
-  std::shared_ptr<::arrow::Field> ToArrow() const;
+  std::shared_ptr<::arrow::Field> ToArrow();
 
   std::vector<lance::format::pb::Field> ToProto() const;
 

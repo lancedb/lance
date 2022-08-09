@@ -251,7 +251,15 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   }
 }
 
-std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }
+std::shared_ptr<::arrow::Field> Field::ToArrow() {
+  if (is_extension_field()) {
+    auto ext_type = ::arrow::GetExtensionType(extension_name());
+    if (ext_type != nullptr) {
+      return ::arrow::field(name(), ext_type);
+    }
+  }
+  return ::arrow::field(name(), type());
+}
 
 std::vector<lance::format::pb::Field> Field::ToProto() const {
   std::vector<lance::format::pb::Field> pb_fields;
@@ -261,6 +269,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_parent_id(parent_);
   field.set_id(id_);
   field.set_logical_type(logical_type_);
+  field.set_extension_name(extension_name_);
   field.set_encoding(encoding_);
   field.set_dictionary_offset(dictionary_offset_);
   field.set_dictionary_page_length(dictionary_page_length_);
