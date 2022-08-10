@@ -27,6 +27,8 @@
 
 #include "lance/arrow/reader.h"
 #include "lance/arrow/type.h"
+#include "lance/format/schema.h"
+#include "lance/arrow/testing.h"
 #include "lance/io/reader.h"
 
 using arrow::ArrayBuilder;
@@ -34,8 +36,10 @@ using arrow::Int32Builder;
 using arrow::ListBuilder;
 using arrow::StringBuilder;
 using arrow::StructBuilder;
+using arrow::LargeBinaryBuilder;
 using arrow::Table;
 using lance::arrow::FileReader;
+using lance::format::Schema;
 
 using std::make_shared;
 using std::map;
@@ -206,45 +210,18 @@ TEST_CASE("Binary field") {
 }
 
 
-class ImageType : public ::arrow::ExtensionType {
- public:
-  ImageType() : ExtensionType(::arrow::struct_({
-                    ::arrow::field("uri", ::arrow::utf8()),
-                })) {}
-
-  std::string extension_name() const override { return "image"; }
-
-  bool ExtensionEquals(const ExtensionType& other) const override {
-    return other.extension_name() == extension_name();
-  }
-
-  std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
-      const override {
-    return std::make_shared<::arrow::ExtensionArray>(data);
-  }
-
-  ::arrow::Result<std::shared_ptr<DataType>> Deserialize(
-      std::shared_ptr<DataType> storage_type,
-      const std::string& serialized) const override {
-    if (serialized != "ext-struct-type-unique-code") {
-      return ::arrow::Status::Invalid("Type identifier did not match");
-    }
-    return std::make_shared<ImageType>();
-  }
-  std::string Serialize() const override { return "image-ext"; }
-};
-
-
 std::shared_ptr<::arrow::Table> MakeTable() {
-  auto ext_type = std::make_shared<ImageType>();
-  auto uriBuilder = std::make_shared<StringBuilder>();
-  auto imageBuilder = std::make_shared<StructBuilder>(
+  auto ext_type = std::make_shared<::lance::testing::ImageType>();
+  auto uriBuilder = std::make_shared<::arrow::StringBuilder>();
+  auto dataBuilder = std::make_shared<::arrow::Int32Builder>();
+  auto imageBuilder = std::make_shared<::arrow::StructBuilder>(
       ext_type->storage_type(),
       arrow::default_memory_pool(),
-      vector<shared_ptr<ArrayBuilder>>({uriBuilder}));
+      std::vector<std::shared_ptr<::arrow::ArrayBuilder>>({uriBuilder, dataBuilder}));
   for (int i = 0; i < 4; i++) {
     CHECK(imageBuilder->Append().ok());
     CHECK(uriBuilder->Append(fmt::format("s3://{}", i)).ok());
+    CHECK(dataBuilder->Append(i).ok());
   }
   auto arr = imageBuilder->Finish().ValueOrDie();
   INFO("array is " << arr->ToString());
@@ -257,8 +234,8 @@ std::shared_ptr<::arrow::Table> MakeTable() {
 
 std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  INFO(FileReader::Make(infile).status());
-  auto reader = FileReader::Make(infile).ValueOrDie();
+  INFO(::lance::arrow::FileReader::Make(infile).status());
+  auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
   return reader->ReadTable().ValueOrDie();
@@ -275,11 +252,17 @@ TEST_CASE("Write extension but read storage if not registered") {
   // We can read it back without the extension
   auto actual_table = ReadTable(sink);
   CHECK(arr->Equals(actual_table->GetColumnByName("image_ext")->chunk(0)));
+  auto lance_schema = Schema(actual_table->schema());
+  auto image_field = lance_schema.GetField("image_ext");
+  CHECK(image_field->logical_type() == "struct");
+  CHECK(image_field->extension_name() == "");
+  CHECK(!(image_field->is_extension_type()));
+  CHECK(lance_schema.GetFieldsCount() == 3);
 }
 
 
 TEST_CASE("Extension type round-trip") {
-  auto ext_type = std::make_shared<ImageType>();
+  auto ext_type = std::make_shared<::lance::testing::ImageType>();
   arrow::RegisterExtensionType(ext_type);
   auto table = MakeTable();
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();

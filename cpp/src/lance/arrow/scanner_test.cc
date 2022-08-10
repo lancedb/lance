@@ -26,6 +26,7 @@
 #include <memory>
 
 #include "lance/arrow/type.h"
+#include "lance/arrow/testing.h"
 #include "lance/format/schema.h"
 
 
@@ -83,49 +84,8 @@ TEST_CASE("Build Scanner with nested struct") {
 }
 
 
-// A parametric type where the extension_name() is always the same
-class ParametricType : public ::arrow::ExtensionType {
- public:
-  explicit ParametricType(int32_t parameter)
-      : ExtensionType(::arrow::int32()), parameter_(parameter) {}
-
-  int32_t parameter() const { return parameter_; }
-
-  std::string extension_name() const override { return "parametric-type"; }
-
-  bool ExtensionEquals(const ExtensionType& other) const override {
-    const auto& other_ext = static_cast<const ExtensionType&>(other);
-    if (other_ext.extension_name() != this->extension_name()) {
-      return false;
-    }
-    return this->parameter() == static_cast<const ParametricType&>(other).parameter();
-  }
-
-  std::shared_ptr<::arrow::Array> MakeArray(std::shared_ptr<::arrow::ArrayData> data)
-      const override {
-    return std::make_shared<::arrow::ExtensionArray>(data);
-  }
-
-  ::arrow::Result<std::shared_ptr<DataType>> Deserialize(
-      std::shared_ptr<DataType> storage_type,
-      const std::string& serialized) const override {
-    const int32_t parameter = *reinterpret_cast<const int32_t*>(serialized.data());
-    return std::make_shared<ParametricType>(parameter);
-  }
-
-  std::string Serialize() const override {
-    std::string result("    ");
-    memcpy(&result[0], &parameter_, sizeof(int32_t));
-    return result;
-  }
-
- private:
-  int32_t parameter_;
-};
-
-
 std::shared_ptr<::arrow::Table> MakeTable() {
-  auto ext_type = std::make_shared<ParametricType>(1);
+  auto ext_type = std::make_shared<::lance::testing::ParametricType>(1);
   ::arrow::StringBuilder stringBuilder;
   ::arrow::Int32Builder intBuilder;
 
@@ -162,7 +122,7 @@ std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::
 
 TEST_CASE("Scanner with extension") {
   auto table = MakeTable();
-  auto ext_type = std::make_shared<ParametricType>(1);
+  auto ext_type = std::make_shared<::lance::testing::ParametricType>(1);
   ::arrow::RegisterExtensionType(ext_type);
   auto scanner = MakeScanner(table);
 
