@@ -181,16 +181,13 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
 }
 
-bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
-  return dtype->id() == ::arrow::TimestampType::type_id;
-}
 
-std::string GetExtensionName(std::shared_ptr<::arrow::DataType> dtype) {
+std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype) {
   if (dtype->id() == ::arrow::Type::EXTENSION) {
     auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
     return ext_type->extension_name();
   }
-  return "";
+  return std::nullopt;
 }
 
 }  // namespace lance::arrow

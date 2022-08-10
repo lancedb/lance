@@ -83,8 +83,8 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::WriteArray(const std::shared_ptr<format::Field>& field,
                                        const std::shared_ptr<::arrow::Array>& arr) {
-  if (arr->type_id() == ::arrow::Type::EXTENSION) {
-    assert(field->is_extension_field());
+  if (::lance::arrow::is_extension(arr->type())) {
+    assert(field->is_extension_type());
     auto ext_array = std::static_pointer_cast<::arrow::ExtensionArray>(arr);
     return WriteArray(field, ext_array->storage());
   }

@@ -43,9 +43,9 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
-      extension_name_(arrow::GetExtensionName(field->type())),
+      extension_name_(arrow::GetExtensionName(field->type()).value_or("")),
       encoding_(pb::NONE) {
-  if (is_extension_field()) {
+  if (is_extension_type()) {
     auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
     init(ext_type->storage_type());
   } else {
@@ -151,7 +151,7 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 }
 
 std::string Field::ToString() const {
-  if (is_extension_field()) {
+  if (is_extension_type()) {
     return fmt::format("{}({}): {}, encoding={}, extension_name={}", name_, id_, type()->ToString(),
                        encoding_, extension_name());
   }
@@ -255,8 +255,8 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   }
 }
 
-std::shared_ptr<::arrow::Field> Field::ToArrow() {
-  if (is_extension_field()) {
+std::shared_ptr<::arrow::Field> Field::ToArrow() const {
+  if (is_extension_type()) {
     auto ext_type = ::arrow::GetExtensionType(extension_name());
     if (ext_type != nullptr) {
       return ::arrow::field(name(), ext_type);
@@ -340,7 +340,7 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   assert(name_ == arrow_field->name());
   auto new_field = Copy();
   auto dtype = arrow_field->type();
-  if (dtype->id() == ::arrow::Type::EXTENSION) {
+  if (::lance::arrow::is_extension(dtype)) {
     auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
     dtype = ext_type->storage_type();
   }

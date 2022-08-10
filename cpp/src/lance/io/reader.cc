@@ -299,7 +299,7 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     storage_arr = GetPrimitiveArray(field, batch_id, params);
   }
 
-  if (field->is_extension_field()) {
+  if (field->is_extension_type()) {
     std::shared_ptr<::arrow::ExtensionType> ext_type = ::arrow::GetExtensionType(
         field->extension_name());
     if (ext_type != nullptr && storage_arr.ok()) {
