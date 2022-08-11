@@ -69,7 +69,7 @@ setup(
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     install_requires=["pyarrow>=9,<10"],
-    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb"]},
+    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"]},
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[

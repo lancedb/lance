@@ -19,8 +19,11 @@ import pandas as pd
 import time
 
 import pyarrow.fs
+import pyarrow.dataset as ds
 
-__all__ = ["download_uris", "timeit"]
+import lance
+
+__all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
 
 def get_bytes(uri):
@@ -46,3 +49,61 @@ def timeit(func):
         return result
 
     return timeit_wrapper
+
+
+def get_dataset(uri: str) -> ds.Dataset:
+    """
+    Return a pyarrow Dataset stored at the given uri
+    """
+    if uri.endswith('.lance'):
+        return lance.dataset(uri)
+    return ds.dataset(uri)
+
+
+def get_uri(base_uri: str, dataset_name: str, fmt: str,
+            flavor: str = None) -> str:
+    """
+    Return the uri to the dataset with the given specifications
+
+    Parameters
+    ----------
+    base_uri: str
+        Base uri to the root of the benchmark dataset catalog
+    dataset_name: str
+        Catalog name of the dataset (e.g., coco, oxford_pet)
+    fmt: str
+        'lance', 'parquet', or 'raw'
+    flavor: str, optional
+        We may store different flavors for parquet and lance,
+        e.g., with image links but not bytes
+    """
+    return f"{base_uri}/{dataset_name}{('_' + flavor) if flavor else ''}.{fmt}"
+
+
+class BenchmarkSuite:
+
+    def __init__(self):
+        self._benchmarks = {}
+
+    def benchmark(self, name):
+        def decorator(func):
+            b = Benchmark(name, timeit(func))
+            self._benchmarks[name] = b
+            return timeit(func)
+        return decorator
+
+    def get_benchmark(self, name):
+        return self._benchmarks[name]
+
+    def list_benchmarks(self):
+        return self._benchmarks.values()
+
+
+class Benchmark:
+
+    def __init__(self, name, func):
+        self.name = name
+        self.func = func
+
+    def run(self, *args, **kwargs):
+        return self.func(*args, **kwargs)

@@ -1,14 +1,47 @@
 #!/usr/bin/env python3
+from typing import Union
 
-import argparse
+import click
 import json
 import os
 
+import duckdb
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.fs
+import pyarrow.compute as pc
 
-from bench_utils import download_uris, timeit
+import lance
+from bench_utils import download_uris, get_uri, get_dataset, BenchmarkSuite, timeit
+
+
+coco_benchmarks = BenchmarkSuite()
+
+
+@coco_benchmarks.benchmark("label_distribution")
+def label_distribution(base_uri: str, fmt: str, flavor: str = None):
+    if fmt == 'raw':
+        return _label_distribution_raw(base_uri)
+    elif fmt == 'lance':
+        uri = get_uri(base_uri, "coco", fmt, flavor)
+        dataset = get_dataset(uri)
+        return _label_distribution_lance(dataset)
+    elif fmt == 'parquet':
+        uri = get_uri(base_uri, "coco", fmt, flavor)
+        dataset = get_dataset(uri)
+        return _label_distribution_duckdb(dataset)
+    raise NotImplementedError()
+
+@coco_benchmarks.benchmark("filter_data")
+def filter_data(base_uri: str, fmt: str, flavor: str = None):
+    if fmt == 'raw':
+        return _filter_data_raw(base_uri)
+    elif fmt == 'lance':
+        return _filter_data_lance(base_uri)
+    elif fmt == 'parquet':
+        return _filter_data_parquet(base_uri)
+    raise NotImplementedError()
 
 
 def get_metadata(base_uri: str, split: str = "val"):
@@ -33,7 +66,6 @@ def get_metadata(base_uri: str, split: str = "val"):
         .groupby("image_id")
         .agg(list)
     )
-    # print(anno_df, anno_df.columns)
     images_df = pd.DataFrame(annotation_json["images"])
     images_df["split"] = split
     images_df["image_uri"] = images_df["file_name"].apply(
@@ -43,7 +75,7 @@ def get_metadata(base_uri: str, split: str = "val"):
 
 
 @timeit
-def get_label_distribution(base_uri: str):
+def _label_distribution_raw(base_uri: str):
     """Minic
     SELECT label, count(1) FROM coco_dataset GROUP BY 1
     """
@@ -55,26 +87,85 @@ def get_label_distribution(base_uri: str):
 
 
 @timeit
-def get_filtered_data(url: str, klass="cat", offset=20, limit=50):
+def _filter_data_raw(url: str, klass="cat", offset=20, limit=50):
     """SELECT image, annotations FROM coco WHERE annotations.label = 'cat' LIMIT 50 OFFSET 20"""
-    # %time rs = bench.get_pets_filtered_data(url, "pug", 20, 50)
     df = get_metadata(url)
-    print(df["annotations"])
     filtered = df[["image_uri", "annotations"]].loc[df["annotations"].apply(
         lambda annos: any([a["name"] == "cat" for a in annos])
     )]
     limited = filtered[offset:offset + limit]
-    limited["image"] = download_uris(limited.image_uri)
+    limited.assign(image=download_uris(limited.image_uri))
     return limited
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Benchmarks on COCO dataset")
-    parser.add_argument("uri", help="base uri for coco dataset")
-    args = parser.parse_args()
+@timeit
+def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
+    uri = get_uri(base_uri, "coco", "lance", None)
+    index_scanner = lance.scanner(uri, columns=['id', 'annotations.label'])
+    query = (f"SELECT distinct id FROM ("
+             f"  SELECT id, UNNEST(annotations) as ann FROM index_scanner"
+             f") WHERE ann.label == '{klass}'")
+    filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
+    scanner = lance.scanner(uri, ['image', 'annotations.label'],
+                            limit=50, offset=20)
+    return scanner.to_table().to_pandas()
 
-    get_label_distribution(args.uri)
-    get_filtered_data(args.uri)
+
+@timeit
+def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50):
+    uri = get_uri(base_uri, "coco", "parquet", None)
+    dataset = ds.dataset(uri)
+    query = (f"SELECT distinct id FROM ("
+             f"  SELECT id, UNNEST(annotations) as ann FROM dataset"
+             f") WHERE ann.label == '{klass}'")
+    filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
+    df: pd.DataFrame = duckdb.query("SELECT image, annotations FROM dataset LIMIT 50 OFFSET 20").to_df()
+    df["label"] = df.annotations.apply(lambda x: [elm["label"] for elm in x])
+    return df.drop(columns='annotations')
+
+
+def _label_distribution_lance(dataset: ds.Dataset):
+    scanner = lance.scanner(dataset, columns=['annotations.label'])
+    return _label_distribution_duckdb(scanner)
+
+
+@timeit
+def _label_distribution_duckdb(arrow_obj: Union[ds.Dataset | ds.Scanner]):
+    query = """\
+      SELECT ann.label, COUNT(1) FROM (
+        SELECT UNNEST(annotations) as ann FROM arrow_obj
+      ) GROUP BY 1
+    """
+    return duckdb.query(query).to_df()
+
+
+KNOWN_FORMATS = ["lance", "parquet", "raw"]
+
+
+@click.command
+@click.option('-u', '--base-uri', required=True, type=str,
+              help="Base uri to the benchmark dataset catalog")
+@click.option('-f', '--format', 'fmt',
+              help="'lance', 'parquet', or 'raw'. Omit for all")
+@click.option('--flavor', type=str,
+              help="external if parquet/lance had external images version")
+@click.option('-b', '--benchmark', type=str,
+              help="which benchmark to run. Omit for all")
+def main(base_uri, fmt, flavor, benchmark):
+    if fmt:
+        fmt = fmt.strip().lower()
+        assert fmt in KNOWN_FORMATS
+    base_uri = f'{base_uri}/datasets/coco'
+
+    if benchmark is not None:
+        coco_benchmarks.get_benchmark(benchmark).run(base_uri, fmt, flavor)
+    else:
+        for b in coco_benchmarks.list_benchmarks():
+            if fmt:
+                b.run(base_uri, fmt, flavor)
+            else:
+                for f in KNOWN_FORMATS:
+                    b.run(base_uri, f, flavor)
 
 
 if __name__ == "__main__":
