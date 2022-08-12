@@ -171,3 +171,35 @@ TEST_CASE("Write dictionary type") {
   auto actual_table = reader->ReadTable().ValueOrDie();
   CHECK(table->Equals(*actual_table));
 }
+
+TEST_CASE("Large binary field") {
+  auto field_type = ::arrow::large_binary();
+  auto schema = ::arrow::schema({arrow::field("f1", field_type)});
+
+  auto builder = ::arrow::LargeBinaryBuilder();
+  for (int i = 0; i < 4; i++) {
+    CHECK(builder.Append(fmt::format("{}", i)).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+  auto table = ::arrow::Table::Make(std::move(schema), {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  auto result = lance::arrow::WriteTable(*table, sink);
+  INFO("Write table: " << result.message());
+  CHECK(result.ok());
+}
+
+TEST_CASE("Binary field") {
+  auto field_type = ::arrow::binary();
+  auto schema = ::arrow::schema({arrow::field("f1", field_type)});
+
+  auto builder = ::arrow::BinaryBuilder();
+  for (int i = 0; i < 4; i++) {
+    CHECK(builder.Append(fmt::format("{}", i)).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+  auto table = ::arrow::Table::Make(std::move(schema), {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+}
