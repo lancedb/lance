@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import pathlib
 from typing import Union
 
 import click
@@ -13,13 +14,13 @@ import pyarrow.fs
 import pyarrow.compute as pc
 
 import lance
-from bench_utils import download_uris, get_uri, get_dataset, BenchmarkSuite, timeit
+from bench_utils import download_uris, get_uri, get_dataset, BenchmarkSuite
 
 
 coco_benchmarks = BenchmarkSuite()
 
 
-@coco_benchmarks.benchmark("label_distribution")
+@coco_benchmarks.benchmark("label_distribution", key=['fmt', 'flavor'])
 def label_distribution(base_uri: str, fmt: str, flavor: str = None):
     if fmt == 'raw':
         return _label_distribution_raw(base_uri)
@@ -33,7 +34,8 @@ def label_distribution(base_uri: str, fmt: str, flavor: str = None):
         return _label_distribution_duckdb(dataset)
     raise NotImplementedError()
 
-@coco_benchmarks.benchmark("filter_data")
+
+@coco_benchmarks.benchmark("filter_data", key=['fmt', 'flavor'])
 def filter_data(base_uri: str, fmt: str, flavor: str = None):
     if fmt == 'raw':
         return _filter_data_raw(base_uri)
@@ -74,7 +76,6 @@ def get_metadata(base_uri: str, split: str = "val"):
     return images_df.merge(anno_df, left_on="id", right_on="image_id")
 
 
-@timeit
 def _label_distribution_raw(base_uri: str):
     """Minic
     SELECT label, count(1) FROM coco_dataset GROUP BY 1
@@ -86,7 +87,6 @@ def _label_distribution_raw(base_uri: str):
     return exploded_series.value_counts()
 
 
-@timeit
 def _filter_data_raw(url: str, klass="cat", offset=20, limit=50):
     """SELECT image, annotations FROM coco WHERE annotations.label = 'cat' LIMIT 50 OFFSET 20"""
     df = get_metadata(url)
@@ -98,7 +98,6 @@ def _filter_data_raw(url: str, klass="cat", offset=20, limit=50):
     return limited
 
 
-@timeit
 def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
     uri = get_uri(base_uri, "coco", "lance", None)
     index_scanner = lance.scanner(uri, columns=['id', 'annotations.label'])
@@ -111,7 +110,6 @@ def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
     return scanner.to_table().to_pandas()
 
 
-@timeit
 def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50):
     uri = get_uri(base_uri, "coco", "parquet", None)
     dataset = ds.dataset(uri)
@@ -119,9 +117,7 @@ def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50):
              f"  SELECT id, UNNEST(annotations) as ann FROM dataset"
              f") WHERE ann.label == '{klass}'")
     filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
-    df: pd.DataFrame = duckdb.query("SELECT image, annotations FROM dataset LIMIT 50 OFFSET 20").to_df()
-    df["label"] = df.annotations.apply(lambda x: [elm["label"] for elm in x])
-    return df.drop(columns='annotations')
+    return duckdb.query("SELECT image, annotations FROM dataset LIMIT 50 OFFSET 20").to_arrow_table()
 
 
 def _label_distribution_lance(dataset: ds.Dataset):
@@ -129,7 +125,6 @@ def _label_distribution_lance(dataset: ds.Dataset):
     return _label_distribution_duckdb(scanner)
 
 
-@timeit
 def _label_distribution_duckdb(arrow_obj: Union[ds.Dataset | ds.Scanner]):
     query = """\
       SELECT ann.label, COUNT(1) FROM (
@@ -151,21 +146,30 @@ KNOWN_FORMATS = ["lance", "parquet", "raw"]
               help="external if parquet/lance had external images version")
 @click.option('-b', '--benchmark', type=str,
               help="which benchmark to run. Omit for all")
-def main(base_uri, fmt, flavor, benchmark):
+@click.option('-r', '--repeats', type=int,
+              help="number of times to run each benchmark")
+@click.option('-o', '--output', type=str,
+              help="save timing results to directory")
+def main(base_uri, fmt, flavor, benchmark, repeats, output):
     if fmt:
         fmt = fmt.strip().lower()
         assert fmt in KNOWN_FORMATS
+    else:
+        fmt = KNOWN_FORMATS
     base_uri = f'{base_uri}/datasets/coco'
 
+    def run_benchmark(bmark):
+        for f in fmt:
+            bmark.repeat(repeats or 1).run(base_uri=base_uri, fmt=f, flavor=flavor)
+        if output:
+            path = pathlib.Path(output) / f"{bmark.name}.csv"
+            bmark.to_df().to_csv(path, index=False, )
+
     if benchmark is not None:
-        coco_benchmarks.get_benchmark(benchmark).run(base_uri, fmt, flavor)
+        b = coco_benchmarks.get_benchmark(benchmark)
+        run_benchmark(b)
     else:
-        for b in coco_benchmarks.list_benchmarks():
-            if fmt:
-                b.run(base_uri, fmt, flavor)
-            else:
-                for f in KNOWN_FORMATS:
-                    b.run(base_uri, f, flavor)
+        [run_benchmark(b) for b in coco_benchmarks.list_benchmarks()]
 
 
 if __name__ == "__main__":

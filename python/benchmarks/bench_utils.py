@@ -84,12 +84,13 @@ class BenchmarkSuite:
 
     def __init__(self):
         self._benchmarks = {}
+        self._results = {}
 
-    def benchmark(self, name):
+    def benchmark(self, name, key=None):
         def decorator(func):
-            b = Benchmark(name, timeit(func))
+            b = Benchmark(name, func, key=key)
             self._benchmarks[name] = b
-            return timeit(func)
+            return func
         return decorator
 
     def get_benchmark(self, name):
@@ -101,9 +102,40 @@ class BenchmarkSuite:
 
 class Benchmark:
 
-    def __init__(self, name, func):
+    def __init__(self, name, func, key=None, num_runs=1):
         self.name = name
         self.func = func
+        self.key = key
+        self.num_runs = num_runs
+        self._components = {}
+
+    def repeat(self, num_runs: int):
+        return Benchmark(self.name, self.func, key=self.key, num_runs=num_runs)
 
     def run(self, *args, **kwargs):
-        return self.func(*args, **kwargs)
+        self._components = {}
+        output = None
+        func = self.timeit("total")(self.func)
+        for i in range(self.num_runs):
+            output = func(*args, **kwargs)
+        return output
+
+    def to_df(self):
+        return pd.DataFrame(self._components)
+
+    def timeit(self, name):
+        def benchmark_decorator(func):
+            @wraps(func)
+            def timeit_wrapper(*args, **kwargs):
+                start_time = time.perf_counter()
+                result = func(*args, **kwargs)
+                end_time = time.perf_counter()
+                total_time = end_time - start_time
+                # first item in the args, ie `args[0]` is `self`
+                print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
+                key = tuple([name] + [kwargs.get(k) for k in self.key])
+                self._components.setdefault(key, []).append(total_time)
+                return result
+            return timeit_wrapper
+        return benchmark_decorator
+
