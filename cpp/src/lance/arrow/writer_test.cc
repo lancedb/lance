@@ -184,7 +184,9 @@ TEST_CASE("Large binary field") {
   auto table = ::arrow::Table::Make(std::move(schema), {arr});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+  auto result = lance::arrow::WriteTable(*table, sink);
+  INFO("Write table: " << result.message());
+  CHECK(result.ok());
 }
 
 TEST_CASE("Binary field") {

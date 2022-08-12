@@ -84,7 +84,8 @@ FileWriter::~FileWriter() {}
 ::arrow::Status FileWriter::WriteArray(const std::shared_ptr<format::Field>& field,
                                        const std::shared_ptr<::arrow::Array>& arr) {
   assert(field->type()->id() == arr->type_id());
-  if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id())) {
+  if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
+      ::arrow::is_large_binary_like(arr->type_id())) {
     return WritePrimitiveArray(field, arr);
   } else if (lance::arrow::is_struct(arr->type())) {
     return WriteStructArray(field, arr);
