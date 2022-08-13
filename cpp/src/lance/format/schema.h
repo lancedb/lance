@@ -136,9 +136,9 @@ class Field final {
 
   std::string name() const;
 
-  std::string logical_type() const { return logical_type_; };
+  const std::string& logical_type() { return logical_type_; };
 
-  std::string extension_name() const { return extension_name_; }
+  const std::string& extension_name() { return extension_name_; }
 
   bool is_extension_type() const { return !extension_name_.empty(); }
 
@@ -205,7 +205,7 @@ class Field final {
   // TODO: use enum to replace protobuf enum.
   pb::Field::Type GetNodeType() const;
 
-  void init(std::shared_ptr<::arrow::DataType> dtype);
+  void Init(std::shared_ptr<::arrow::DataType> dtype);
 
   int32_t id_ = -1;
   int32_t parent_ = -1;

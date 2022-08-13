@@ -47,13 +47,13 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       encoding_(pb::NONE) {
   if (is_extension_type()) {
     auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
-    init(ext_type->storage_type());
+    Init(ext_type->storage_type());
   } else {
-    init(field->type());
+    Init(field->type());
   }
 }
 
-void Field::init(std::shared_ptr<::arrow::DataType> dtype) {
+void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
   if (::lance::arrow::is_struct(dtype)) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
@@ -66,7 +66,7 @@ void Field::init(std::shared_ptr<::arrow::DataType> dtype) {
     encoding_ = pb::PLAIN;
   }
 
-  auto type_id = field->type()->id();
+  auto type_id = dtype->id();
   if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = pb::VAR_BINARY;
   } else if (::arrow::is_primitive(type_id)) {
@@ -153,7 +153,7 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 std::string Field::ToString() const {
   if (is_extension_type()) {
     return fmt::format("{}({}): {}, encoding={}, extension_name={}", name_, id_, type()->ToString(),
-                       encoding_, extension_name());
+                       encoding_, extension_name_);
   }
   return fmt::format("{}({}): {}, encoding={}", name_, id_, type()->ToString(), encoding_);
 }
@@ -257,7 +257,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 
 std::shared_ptr<::arrow::Field> Field::ToArrow() const {
   if (is_extension_type()) {
-    auto ext_type = ::arrow::GetExtensionType(extension_name());
+    auto ext_type = ::arrow::GetExtensionType(extension_name_);
     if (ext_type != nullptr) {
       return ::arrow::field(name(), ext_type);
     }
