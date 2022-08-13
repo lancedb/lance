@@ -107,13 +107,12 @@ class Benchmark:
         self.func = func
         self.key = key
         self.num_runs = num_runs
-        self._components = {}
+        self._timings = {}
 
     def repeat(self, num_runs: int):
         return Benchmark(self.name, self.func, key=self.key, num_runs=num_runs)
 
     def run(self, *args, **kwargs):
-        self._components = {}
         output = None
         func = self.timeit("total")(self.func)
         for i in range(self.num_runs):
@@ -121,7 +120,7 @@ class Benchmark:
         return output
 
     def to_df(self):
-        return pd.DataFrame(self._components)
+        return pd.DataFrame(self._timings)
 
     def timeit(self, name):
         def benchmark_decorator(func):
@@ -134,7 +133,7 @@ class Benchmark:
                 # first item in the args, ie `args[0]` is `self`
                 print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
                 key = tuple([name] + [kwargs.get(k) for k in self.key])
-                self._components.setdefault(key, []).append(total_time)
+                self._timings.setdefault(key, []).append(total_time)
                 return result
             return timeit_wrapper
         return benchmark_decorator

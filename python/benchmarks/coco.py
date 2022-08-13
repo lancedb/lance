@@ -14,6 +14,7 @@ import pyarrow.fs
 import pyarrow.compute as pc
 
 import lance
+from parse_coco import CocoConverter
 from bench_utils import download_uris, get_uri, get_dataset, BenchmarkSuite
 
 
@@ -40,95 +41,62 @@ def filter_data(base_uri: str, fmt: str, flavor: str = None):
     if fmt == 'raw':
         return _filter_data_raw(base_uri)
     elif fmt == 'lance':
-        return _filter_data_lance(base_uri)
+        return _filter_data_lance(base_uri, flavor=flavor)
     elif fmt == 'parquet':
-        return _filter_data_parquet(base_uri)
+        return _filter_data_parquet(base_uri, flavor=flavor)
     raise NotImplementedError()
-
-
-def get_metadata(base_uri: str, split: str = "val"):
-    annotation_uri = os.path.join(base_uri, f"annotations/instances_{split}2017.json")
-    fs, path = pa.fs.FileSystem.from_uri(annotation_uri)
-    with fs.open_input_file(path) as fobj:
-        annotation_json = json.load(fobj)
-    df = pd.DataFrame(annotation_json["annotations"])
-    category_df = pd.DataFrame(annotation_json["categories"])
-    annotations_df = df.merge(category_df, left_on="category_id", right_on="id").rename(
-        {"id": "category_id"}
-    )
-    anno_df = (
-        pd.DataFrame(
-            {
-                "image_id": df.image_id,
-                "annotations": annotations_df.drop(
-                    columns=["image_id"], axis=1
-                ).to_dict(orient="records"),
-            }
-        )
-        .groupby("image_id")
-        .agg(list)
-    )
-    images_df = pd.DataFrame(annotation_json["images"])
-    images_df["split"] = split
-    images_df["image_uri"] = images_df["file_name"].apply(
-        lambda fname: os.path.join(base_uri, f"{split}2017", fname)
-    )
-    return images_df.merge(anno_df, left_on="id", right_on="image_id")
-
 
 def _label_distribution_raw(base_uri: str):
     """Minic
     SELECT label, count(1) FROM coco_dataset GROUP BY 1
     """
-    metadata = get_metadata(base_uri)
-    exploded_series = (
-        metadata["annotations"].explode("annotations").apply(lambda r: r["name"])
-    )
-    return exploded_series.value_counts()
+    c = CocoConverter(base_uri)
+    df = c.read_instances()
+    return pd.json_normalize(df.annotations.explode()).name.value_counts()
 
 
-def _filter_data_raw(url: str, klass="cat", offset=20, limit=50):
+def _filter_data_raw(base_uri: str, klass="cat", offset=20, limit=50):
     """SELECT image, annotations FROM coco WHERE annotations.label = 'cat' LIMIT 50 OFFSET 20"""
-    df = get_metadata(url)
-    filtered = df[["image_uri", "annotations"]].loc[df["annotations"].apply(
-        lambda annos: any([a["name"] == "cat" for a in annos])
-    )]
+    c = CocoConverter(base_uri)
+    df = c.read_instances()
+    mask = df.annotations.apply(lambda ann: any([a["name"] == klass for a in ann]))
+    filtered = df.loc[mask, ["image_uri", "annotations"]]
     limited = filtered[offset:offset + limit]
     limited.assign(image=download_uris(limited.image_uri))
     return limited
 
 
-def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
-    uri = get_uri(base_uri, "coco", "lance", None)
-    index_scanner = lance.scanner(uri, columns=['id', 'annotations.label'])
-    query = (f"SELECT distinct id FROM ("
-             f"  SELECT id, UNNEST(annotations) as ann FROM index_scanner"
-             f") WHERE ann.label == '{klass}'")
-    filtered_ids = duckdb.query(query).arrow().column("id").combine_chunks()
-    scanner = lance.scanner(uri, ['id', 'image', 'annotations.label'],
-                            #filter=pc.field("id").isin(filtered_ids),
+def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50, flavor=None):
+    uri = get_uri(base_uri, "coco", "lance", flavor)
+    index_scanner = lance.scanner(uri, columns=['image_id', 'annotations.name'])
+    query = (f"SELECT distinct image_id FROM ("
+             f"  SELECT image_id, UNNEST(annotations) as ann FROM index_scanner"
+             f") WHERE ann.name == '{klass}'")
+    filtered_ids = duckdb.query(query).arrow().column("image_id").combine_chunks()
+    scanner = lance.scanner(uri, ['image_id', 'image', 'annotations.name'],
+                            #filter=pc.field("image_id").isin(filtered_ids),
                             limit=50, offset=20)
     return scanner.to_table().to_pandas()
 
 
-def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50):
-    uri = get_uri(base_uri, "coco", "parquet", None)
+def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50, flavor=None):
+    uri = get_uri(base_uri, "coco", "parquet", flavor)
     dataset = ds.dataset(uri)
-    query = (f"SELECT distinct id FROM ("
-             f"  SELECT id, UNNEST(annotations) as ann FROM dataset"
-             f") WHERE ann.label == '{klass}'")
-    filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
+    query = (f"SELECT distinct image_id FROM ("
+             f"  SELECT image_id, UNNEST(annotations) as ann FROM dataset"
+             f") WHERE ann.name == '{klass}'")
+    filtered_ids = duckdb.query(query).arrow().column("image_id").to_numpy().tolist()
     return duckdb.query("SELECT image, annotations FROM dataset LIMIT 50 OFFSET 20").to_arrow_table()
 
 
 def _label_distribution_lance(dataset: ds.Dataset):
-    scanner = lance.scanner(dataset, columns=['annotations.label'])
+    scanner = lance.scanner(dataset, columns=['annotations.name'])
     return _label_distribution_duckdb(scanner)
 
 
 def _label_distribution_duckdb(arrow_obj: Union[ds.Dataset | ds.Scanner]):
     query = """\
-      SELECT ann.label, COUNT(1) FROM (
+      SELECT ann.name, COUNT(1) FROM (
         SELECT UNNEST(annotations) as ann FROM arrow_obj
       ) GROUP BY 1
     """
@@ -161,11 +129,12 @@ def main(base_uri, fmt, flavor, benchmark, repeats, output):
     base_uri = f'{base_uri}/datasets/coco'
 
     def run_benchmark(bmark):
+        b = bmark.repeat(repeats or 1)
         for f in fmt:
-            bmark.repeat(repeats or 1).run(base_uri=base_uri, fmt=f, flavor=flavor)
+            b.run(base_uri=base_uri, fmt=f, flavor=flavor)
         if output:
             path = pathlib.Path(output) / f"{bmark.name}.csv"
-            bmark.to_df().to_csv(path, index=False, )
+            b.to_df().to_csv(path, index=False)
 
     if benchmark is not None:
         b = coco_benchmarks.get_benchmark(benchmark)
