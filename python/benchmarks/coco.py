@@ -106,6 +106,7 @@ def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
              f") WHERE ann.label == '{klass}'")
     filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
     scanner = lance.scanner(uri, ['image', 'annotations.label'],
+                            filter=pc.field("annotations", "label") == klass,
                             limit=50, offset=20)
     return scanner.to_table().to_pandas()
 
@@ -154,6 +155,7 @@ def main(base_uri, fmt, flavor, benchmark, repeats, output):
     if fmt:
         fmt = fmt.strip().lower()
         assert fmt in KNOWN_FORMATS
+        fmt = [fmt]
     else:
         fmt = KNOWN_FORMATS
     base_uri = f'{base_uri}/datasets/coco'
