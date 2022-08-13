@@ -46,6 +46,7 @@ def filter_data(base_uri: str, fmt: str, flavor: str = None):
         return _filter_data_parquet(base_uri, flavor=flavor)
     raise NotImplementedError()
 
+
 def _label_distribution_raw(base_uri: str):
     """Minic
     SELECT label, count(1) FROM coco_dataset GROUP BY 1

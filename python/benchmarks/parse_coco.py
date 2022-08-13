@@ -10,6 +10,7 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 
 import lance
+from bench_utils import download_uris
 
 
 class CocoConverter:
@@ -66,9 +67,23 @@ class CocoConverter:
             output_path = os.path.join(self.dataset_root, f'coco_links.{fmt}')
         table = pa.Table.from_pandas(df, get_schema())
         if fmt == 'parquet':
-            return pq.write_table(table, output_path)
+            pq.write_table(table, output_path)
         elif fmt == 'lance':
-            return lance.write_table(table, output_path)
+            lance.write_table(table, output_path)
+        return table
+
+    def make_embedded_dataset(self, table: pa.Table, fmt='lance', output_path=None):
+        if output_path is None:
+            output_path = os.path.join(self.dataset_root, f'coco.{fmt}')
+        uris = table["image_uri"].to_numpy()
+        images = download_uris(pd.Series(uris))
+        arr = pa.BinaryArray.from_pandas(images)
+        embedded = table.append_column(pa.field("image", pa.binary()), arr)
+        if fmt == 'parquet':
+            pq.write_table(embedded, output_path)
+        elif fmt == 'lance':
+            lance.write_table(embedded, output_path)
+        return embedded
 
 
 def _ann_schema():
