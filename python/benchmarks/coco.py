@@ -104,9 +104,9 @@ def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50):
     query = (f"SELECT distinct id FROM ("
              f"  SELECT id, UNNEST(annotations) as ann FROM index_scanner"
              f") WHERE ann.label == '{klass}'")
-    filtered_ids = duckdb.query(query).arrow().column("id").to_numpy().tolist()
-    scanner = lance.scanner(uri, ['image', 'annotations.label'],
-                            filter=pc.field("annotations", "label") == klass,
+    filtered_ids = duckdb.query(query).arrow().column("id").combine_chunks()
+    scanner = lance.scanner(uri, ['id', 'image', 'annotations.label'],
+                            #filter=pc.field("id").isin(filtered_ids),
                             limit=50, offset=20)
     return scanner.to_table().to_pandas()
 
