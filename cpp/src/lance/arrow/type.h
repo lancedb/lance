@@ -21,6 +21,7 @@
 
 #include <concepts>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -65,12 +66,20 @@ inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
 }
 
 /// Returns True if the data type is timestamp type.
-bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype);
+inline bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
+  return dtype->id() == ::arrow::TimestampType::type_id;
+}
+
+inline bool is_extension(std::shared_ptr<::arrow::DataType> dtype) {
+  return dtype->id() == ::arrow::Type::EXTENSION;
+}
 
 /// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
     ::arrow::util::string_view logical_type);
+
+std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype);
 
 }  // namespace lance::arrow

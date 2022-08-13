@@ -27,6 +27,8 @@
 
 #include "lance/arrow/reader.h"
 #include "lance/arrow/type.h"
+#include "lance/format/schema.h"
+#include "lance/arrow/testing.h"
 #include "lance/io/reader.h"
 
 using arrow::ArrayBuilder;
@@ -34,8 +36,10 @@ using arrow::Int32Builder;
 using arrow::ListBuilder;
 using arrow::StringBuilder;
 using arrow::StructBuilder;
+using arrow::LargeBinaryBuilder;
 using arrow::Table;
 using lance::arrow::FileReader;
+using lance::format::Schema;
 
 using std::make_shared;
 using std::map;
@@ -172,6 +176,7 @@ TEST_CASE("Write dictionary type") {
   CHECK(table->Equals(*actual_table));
 }
 
+
 TEST_CASE("Large binary field") {
   auto field_type = ::arrow::large_binary();
   auto schema = ::arrow::schema({arrow::field("f1", field_type)});
@@ -203,3 +208,68 @@ TEST_CASE("Binary field") {
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 }
+
+
+std::shared_ptr<::arrow::Table> MakeTable() {
+  auto ext_type = std::make_shared<::lance::testing::ImageType>();
+  auto uriBuilder = std::make_shared<::arrow::StringBuilder>();
+  auto dataBuilder = std::make_shared<::arrow::Int32Builder>();
+  auto imageBuilder = std::make_shared<::arrow::StructBuilder>(
+      ext_type->storage_type(),
+      arrow::default_memory_pool(),
+      std::vector<std::shared_ptr<::arrow::ArrayBuilder>>({uriBuilder, dataBuilder}));
+  for (int i = 0; i < 4; i++) {
+    CHECK(imageBuilder->Append().ok());
+    CHECK(uriBuilder->Append(fmt::format("s3://{}", i)).ok());
+    CHECK(dataBuilder->Append(i).ok());
+  }
+  auto arr = imageBuilder->Finish().ValueOrDie();
+  INFO("array is " << arr->ToString());
+
+  auto schema = ::arrow::schema({arrow::field("image_ext", ext_type)});
+  std::vector<std::shared_ptr<::arrow::Array>> cols;
+  cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, arr));
+  return ::arrow::Table::Make(std::move(schema), std::move(cols));
+}
+
+std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  INFO(::lance::arrow::FileReader::Make(infile).status());
+  auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
+  CHECK(reader->num_batches() == 1);
+  CHECK(reader->length() == 4);
+  return reader->ReadTable().ValueOrDie();
+}
+
+TEST_CASE("Write extension but read storage if not registered") {
+  auto table = MakeTable();
+  auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
+      table->GetColumnByName("image_ext")->chunk(0))->storage();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+
+  // We can read it back without the extension
+  auto actual_table = ReadTable(sink);
+  CHECK(arr->Equals(actual_table->GetColumnByName("image_ext")->chunk(0)));
+  auto lance_schema = Schema(actual_table->schema());
+  auto image_field = lance_schema.GetField("image_ext");
+  CHECK(image_field->logical_type() == "struct");
+  CHECK(image_field->extension_name() == "");
+  CHECK(!(image_field->is_extension_type()));
+  CHECK(lance_schema.GetFieldsCount() == 3);
+}
+
+
+TEST_CASE("Extension type round-trip") {
+  auto ext_type = std::make_shared<::lance::testing::ImageType>();
+  arrow::RegisterExtensionType(ext_type);
+  auto table = MakeTable();
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+
+  // We can read it back without the extension
+  auto actual_table = ReadTable(sink);
+  CHECK(table->Equals(*actual_table));
+}
+

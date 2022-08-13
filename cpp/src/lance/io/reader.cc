@@ -288,15 +288,25 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     int32_t batch_id,
     const ArrayReadParams& params) const {
   auto dtype = field->type();
+  Result<std::shared_ptr<::arrow::Array>> storage_arr;
   if (is_struct(dtype)) {
-    return GetStructArray(field, batch_id, params);
+    storage_arr = GetStructArray(field, batch_id, params);
   } else if (is_list(dtype)) {
-    return GetListArray(field, batch_id, params);
+    storage_arr = GetListArray(field, batch_id, params);
   } else if (::arrow::is_dictionary(dtype->id())) {
-    return GetDictionaryArray(field, batch_id, params);
+    storage_arr = GetDictionaryArray(field, batch_id, params);
   } else {
-    return GetPrimitiveArray(field, batch_id, params);
+    storage_arr = GetPrimitiveArray(field, batch_id, params);
   }
+
+  if (field->is_extension_type()) {
+    std::shared_ptr<::arrow::ExtensionType> ext_type = ::arrow::GetExtensionType(
+        field->extension_name());
+    if (ext_type != nullptr && storage_arr.ok()) {
+    return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
+    }
+  }
+  return storage_arr;
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FileReader::GetStructArray(

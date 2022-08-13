@@ -1,4 +1,5 @@
 #include "lance/format/schema.h"
+#include "lance/arrow/testing.h"
 
 #include <arrow/type.h>
 #include <fmt/format.h>
@@ -18,6 +19,13 @@ const auto arrow_schema = ::arrow::schema(
                                             ::arrow::field("xmax", ::arrow::float32()),
                                             ::arrow::field("ymax", ::arrow::float32()),
                                         }))})))});
+
+
+std::shared_ptr<::arrow::DataType> image_type = std::make_shared<::lance::testing::ImageType>();
+const auto ext_schema = ::arrow::schema(
+    {::arrow::field("pk", ::arrow::utf8()),
+     ::arrow::field("image", image_type)});
+
 
 TEST_CASE("Get field by name") {
   auto schema = lance::format::Schema(arrow_schema);
@@ -111,3 +119,22 @@ TEST_CASE("Get Field Counts") {
   auto schema = lance::format::Schema(arrow_schema);
   CHECK(schema.GetFieldsCount() == 10);
 }
+
+TEST_CASE("Get Field Counts extension") {
+  auto schema = lance::format::Schema(ext_schema);
+  CHECK(schema.GetFieldsCount() == 4);
+}
+
+TEST_CASE("Project nested extension type") {
+  auto original = lance::format::Schema(ext_schema);
+  auto projection = original.Project({"image.uri"}).ValueOrDie();
+
+  auto expected_schema = ::arrow::schema({::arrow::field(
+      "image",
+      ::arrow::struct_({::arrow::field("uri", ::arrow::utf8())}))});
+  auto expected = lance::format::Schema(expected_schema);
+  INFO("Expected: " << expected.ToString());
+  INFO("Actual: " << projection->ToString());
+  CHECK(projection->Equals(expected, false));
+}
+

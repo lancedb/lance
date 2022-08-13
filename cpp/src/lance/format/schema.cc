@@ -43,20 +43,30 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
+      extension_name_(arrow::GetExtensionName(field->type()).value_or("")),
       encoding_(pb::NONE) {
-  if (::lance::arrow::is_struct(field->type())) {
-    auto struct_type = std::static_pointer_cast<::arrow::StructType>(field->type());
+  if (is_extension_type()) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
+    Init(ext_type->storage_type());
+  } else {
+    Init(field->type());
+  }
+}
+
+void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
+  if (::lance::arrow::is_struct(dtype)) {
+    auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
       children_.push_back(std::shared_ptr<Field>(new Field(arrow_field)));
     }
-  } else if (::lance::arrow::is_list(field->type())) {
-    auto list_type = std::static_pointer_cast<::arrow::ListType>(field->type());
+  } else if (::lance::arrow::is_list(dtype)) {
+    auto list_type = std::static_pointer_cast<::arrow::ListType>(dtype);
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
     encoding_ = pb::PLAIN;
   }
 
-  auto type_id = field->type()->id();
+  auto type_id = dtype->id();
   if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = pb::VAR_BINARY;
   } else if (::arrow::is_primitive(type_id)) {
@@ -71,6 +81,7 @@ Field::Field(const pb::Field& pb)
       parent_(pb.parent_id()),
       name_(pb.name()),
       logical_type_(pb.logical_type()),
+      extension_name_(pb.extension_name()),
       encoding_(pb.encoding()),
       dictionary_offset_(pb.dictionary_offset()),
       dictionary_page_length_(pb.dictionary_page_length()) {}
@@ -140,6 +151,10 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 }
 
 std::string Field::ToString() const {
+  if (is_extension_type()) {
+    return fmt::format("{}({}): {}, encoding={}, extension_name={}", name_, id_, type()->ToString(),
+                       encoding_, extension_name_);
+  }
   return fmt::format("{}({}): {}, encoding={}", name_, id_, type()->ToString(), encoding_);
 }
 
@@ -240,7 +255,15 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   }
 }
 
-std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }
+std::shared_ptr<::arrow::Field> Field::ToArrow() const {
+  if (is_extension_type()) {
+    auto ext_type = ::arrow::GetExtensionType(extension_name_);
+    if (ext_type != nullptr) {
+      return ::arrow::field(name(), ext_type);
+    }
+  }
+  return ::arrow::field(name(), type());
+}
 
 std::vector<lance::format::pb::Field> Field::ToProto() const {
   std::vector<lance::format::pb::Field> pb_fields;
@@ -250,6 +273,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_parent_id(parent_);
   field.set_id(id_);
   field.set_logical_type(logical_type_);
+  field.set_extension_name(extension_name_);
   field.set_encoding(encoding_);
   field.set_dictionary_offset(dictionary_offset_);
   field.set_dictionary_page_length(dictionary_page_length_);
@@ -299,6 +323,7 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
   new_field->parent_ = parent_;
   new_field->name_ = name_;
   new_field->logical_type_ = logical_type_;
+  new_field->extension_name_ = extension_name_;
   new_field->encoding_ = encoding_;
   new_field->dictionary_offset_ = dictionary_offset_;
   new_field->dictionary_page_length_ = dictionary_page_length_;
@@ -314,15 +339,20 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
 std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arrow_field) const {
   assert(name_ == arrow_field->name());
   auto new_field = Copy();
-  if (arrow::is_struct(arrow_field->type())) {
-    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field->type());
+  auto dtype = arrow_field->type();
+  if (::lance::arrow::is_extension(dtype)) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
+    dtype = ext_type->storage_type();
+  }
+  if (arrow::is_struct(dtype)) {
+    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(dtype);
     for (auto arrow_subfield : struct_type->fields()) {
       auto subfield = Get(arrow_subfield->name());
       assert(subfield);
       new_field->AddChild(subfield->Project(arrow_subfield));
     }
-  } else if (arrow::is_list(arrow_field->type())) {
-    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field->type());
+  } else if (arrow::is_list(dtype)) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(dtype);
     new_field->AddChild(children_[0]->Project(list_type->value_field()));
   }
   return new_field;

@@ -28,7 +28,7 @@ add_library(
         utils.cc
         utils.h
         writer.cc
-)
+        testing.h)
 target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(api_test)

@@ -105,4 +105,7 @@ message Field {
   /// The logic type presents the value type of the column, i.e., string value.
   int64 dictionary_offset = 8;
   int64 dictionary_page_length = 9;
+
+  // optional extension type name
+  string extension_name = 10;
 }

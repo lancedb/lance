@@ -136,7 +136,11 @@ class Field final {
 
   std::string name() const;
 
-  std::string logical_type() const { return logical_type_; };
+  const std::string& logical_type() { return logical_type_; };
+
+  const std::string& extension_name() { return extension_name_; }
+
+  bool is_extension_type() const { return !extension_name_.empty(); }
 
   void set_encoding(lance::format::pb::Encoding encoding);
 
@@ -201,10 +205,13 @@ class Field final {
   // TODO: use enum to replace protobuf enum.
   pb::Field::Type GetNodeType() const;
 
+  void Init(std::shared_ptr<::arrow::DataType> dtype);
+
   int32_t id_ = -1;
   int32_t parent_ = -1;
   std::string name_;
   std::string logical_type_;
+  std::string extension_name_;
   lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
 
   // Dictionary type

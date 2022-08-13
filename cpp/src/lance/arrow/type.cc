@@ -48,6 +48,11 @@ std::string ToString(::arrow::TimeUnit::type unit) {
 }  // namespace
 
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype) {
+  if (dtype->id() == ::arrow::Type::EXTENSION) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
+    return ToLogicalType(ext_type->storage_type());
+  }
+
   if (is_list(dtype)) {
     auto list_type = std::reinterpret_pointer_cast<::arrow::ListType>(dtype);
     return is_struct(list_type->value_type()) ? "list.struct" : "list";
@@ -176,8 +181,13 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
 }
 
-bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
-  return dtype->id() == ::arrow::TimestampType::type_id;
+
+std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype) {
+  if (dtype->id() == ::arrow::Type::EXTENSION) {
+    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(dtype);
+    return ext_type->extension_name();
+  }
+  return std::nullopt;
 }
 
 }  // namespace lance::arrow
