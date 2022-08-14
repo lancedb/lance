@@ -41,8 +41,7 @@ class FileReader {
   /// Opens the FileReader.
   ::arrow::Status Open();
 
-  /// Get the reference to the lance schema.
-  const lance::format::Schema& schema() const;
+  const std::shared_ptr<format::Schema>& schema() const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable();
 

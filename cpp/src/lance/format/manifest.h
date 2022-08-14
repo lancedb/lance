@@ -53,7 +53,7 @@ class Manifest final {
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
 
   /// Get schema of the dataset.
-  const Schema& schema() const;
+  const std::shared_ptr<Schema>& schema() const;
 
  private:
 

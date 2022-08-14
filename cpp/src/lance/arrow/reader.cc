@@ -62,7 +62,7 @@ int64_t FileReader::num_batches() const { return impl_->reader()->metadata().num
 int64_t FileReader::length() const { return impl_->reader()->metadata().length(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> FileReader::GetSchema() {
-  return impl_->reader()->schema().ToArrow();
+  return impl_->reader()->schema()->ToArrow();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable() {

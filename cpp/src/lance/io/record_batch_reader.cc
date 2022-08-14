@@ -69,7 +69,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
+  schema_ = reader_->schema();
   ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
