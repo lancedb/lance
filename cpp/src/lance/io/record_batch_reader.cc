@@ -52,7 +52,6 @@ RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
       options_(other.options_),
       limit_(other.limit_),
       offset_(other.offset_),
-      schema_(other.schema_),
       project_(other.project_),
       thread_pool_(other.thread_pool_),
       current_batch_(int(other.current_batch_)) {}
@@ -62,15 +61,13 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       options_(std::move(other.options_)),
       limit_(other.limit_),
       offset_(other.offset_),
-      schema_(std::move(other.schema_)),
       project_(std::move(other.project_)),
       thread_pool_(std::move(other.thread_pool_)),
       current_batch_(int(other.current_batch_)),
       readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  schema_ = std::make_shared<lance::format::Schema>(reader_->schema());
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(schema_, options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_->schema(), options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
 

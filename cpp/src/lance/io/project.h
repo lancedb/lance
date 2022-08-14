@@ -46,7 +46,7 @@ class Project {
   /// \return Project if success. Returns the error status otherwise.
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
-      std::shared_ptr<format::Schema> schema,
+      const format::Schema& schema,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
       std::optional<int32_t> limit = std::nullopt,
       int32_t offset = 0);
@@ -68,14 +68,12 @@ class Project {
   bool CanParallelScan() const;
 
  private:
-  Project(std::shared_ptr<format::Schema> dataset_schema,
-          std::shared_ptr<format::Schema> projected_schema,
+  Project(std::shared_ptr<format::Schema> projected_schema,
           std::shared_ptr<format::Schema> scan_schema,
           std::unique_ptr<Filter> filter,
           std::optional<int32_t> limit = std::nullopt,
           int32_t offset = 0);
 
-  std::shared_ptr<format::Schema> dataset_schema_;
   std::shared_ptr<format::Schema> projected_schema_;
   /// scan_schema_ equals to projected_schema_ - filters_.schema()
   /// It includes the columns that are not read from the filters yet.

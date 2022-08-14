@@ -74,7 +74,6 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   std::shared_ptr<::arrow::dataset::ScanOptions> options_;
   std::optional<int64_t> limit_ = std::nullopt;
   int64_t offset_ = 0;
-  std::shared_ptr<lance::format::Schema> schema_;
   /// Projection over the dataset.
   std::shared_ptr<Project> project_;
 

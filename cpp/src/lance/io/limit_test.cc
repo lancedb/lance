@@ -25,6 +25,7 @@
 
 #include "lance/arrow/stl.h"
 #include "lance/arrow/writer.h"
+#include "lance/format/schema.h"
 #include "lance/io/reader.h"
 
 TEST_CASE("LIMIT 100") {
