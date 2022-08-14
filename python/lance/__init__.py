@@ -19,6 +19,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from lance.lib import LanceFileFormat, WriteTable, BuildScanner
+from lance.types import register_extension_types
+register_extension_types()
 
 __all__ = ["dataset", "write_table", "scanner"]
 

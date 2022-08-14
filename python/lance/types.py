@@ -26,6 +26,9 @@ __all__ = ["ImageType", "Point2dType", "Box2dType"]
 
 
 # Arrow extension type
+from pyarrow import ArrowKeyError
+
+
 class LanceType(pa.ExtensionType, ABC):
     pass
 
@@ -105,7 +108,13 @@ class Box2dType(LanceType):
         return Box2dType()
 
 
-pa.register_extension_type(ImageType(ImageType.URI_TYPE))
-pa.register_extension_type(ImageType(ImageType.BINARY_TYPE))
-pa.register_extension_type(Point2dType())
-pa.register_extension_type(Box2dType())
+def register_extension_types():
+    try:
+        pa.register_extension_type(ImageType(ImageType.URI_TYPE))
+        pa.register_extension_type(ImageType(ImageType.BINARY_TYPE))
+        pa.register_extension_type(Point2dType())
+        pa.register_extension_type(Box2dType())
+    except ArrowKeyError:
+        # already registered
+        pass
+    
