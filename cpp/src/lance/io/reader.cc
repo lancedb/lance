@@ -87,14 +87,14 @@ Status FileReader::Open() {
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
   auto num_batches = metadata_->num_batches();
-  auto num_columns = schema()->GetFieldsCount();
+  auto num_columns = manifest_->schema().GetFieldsCount();
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
   return Status::OK();
 }
 
-const std::shared_ptr<format::Schema>& FileReader::schema() const { return manifest_->schema(); }
+const lance::format::Schema& FileReader::schema() const { return manifest_->schema(); }
 
 const lance::format::Manifest& FileReader::manifest() const { return *manifest_; }
 
@@ -182,22 +182,24 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
     int32_t idx, const std::vector<std::string>& columns) {
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema()->Project(columns));
+  auto schema = manifest_->schema();
+  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
   return Get(idx, *projection);
 }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(int32_t idx) {
-  return Get(idx, *manifest_->schema());
+  return Get(idx, manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable() {
   std::vector<std::shared_ptr<::arrow::ChunkedArray>> columns;
-  return ReadTable(*manifest_->schema());
+  return ReadTable(manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
     const std::vector<std::string>& columns) {
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema()->Project(columns));
+  auto schema = manifest_->schema();
+  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
   return ReadTable(*projection);
 }
 
@@ -298,10 +300,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   }
 
   if (field->is_extension_type()) {
-    std::shared_ptr<::arrow::ExtensionType> ext_type =
-        ::arrow::GetExtensionType(field->extension_name());
+    std::shared_ptr<::arrow::ExtensionType> ext_type = ::arrow::GetExtensionType(
+        field->extension_name());
     if (ext_type != nullptr && storage_arr.ok()) {
-      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
+    return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
     }
   }
   return storage_arr;
@@ -361,11 +363,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   // Realigned offsets to be zero-started
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   // Setup null bitmap
-  ARROW_ASSIGN_OR_RAISE(auto null_bitmap,
-                        ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
+  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
   for (int i = 0; i < shifted_offsets->length() - 1; i++) {
-    ::arrow::bit_util::SetBitTo(
-        null_bitmap->mutable_data(), i, offsets->Value(i + 1) - offsets->Value(i) > 0);
+    ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
+                                offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
   return std::make_shared<::arrow::ListArray>(field->type(),
                                               shifted_offsets->length() - 1,

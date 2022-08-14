@@ -61,11 +61,11 @@ TEST_CASE("Read limit multiple times") {
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   CHECK(reader->Open().ok());
   auto limit = lance::io::Limit(5, 10);
-  auto batch = limit.ReadBatch(reader, *reader->schema()).ValueOrDie();
+  auto batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
   INFO("Actual: " << batch->column(0)->ToString());
   CHECK(batch->column(0)->Equals(lance::arrow::ToArray({11, 12, 13, 14, 15}).ValueOrDie()));
 
   // Already read all the data. Crashed on GH-74.
-  batch = limit.ReadBatch(reader, *reader->schema()).ValueOrDie();
+  batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
   CHECK(!batch);
 }
