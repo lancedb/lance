@@ -110,26 +110,27 @@ FileWriter::~FileWriter() {}
   auto encoder = field->GetEncoder(destination_);
   auto type = field->type();
 
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> physical_arr;
+  // Physical array.
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> storage_arr;
   switch (type->id()) {
     case ::arrow::TimestampType::type_id:
     case ::arrow::Date64Type::type_id:
     case ::arrow::Time64Type::type_id:
-      physical_arr = arr->View(::arrow::int64());
+      storage_arr = arr->View(::arrow::int64());
       break;
     case ::arrow::Date32Type::type_id:
     case ::arrow::Time32Type::type_id:
-      physical_arr = arr->View(::arrow::int32());
+      storage_arr = arr->View(::arrow::int32());
       break;
     default:
-      physical_arr = arr;
+      storage_arr = arr;
       break;
   }
-  if (!physical_arr.ok()) {
-    return physical_arr.status();
+  if (!storage_arr.ok()) {
+    return storage_arr.status();
   }
 
-  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(physical_arr.ValueOrDie()));
+  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(storage_arr.ValueOrDie()));
   lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }
