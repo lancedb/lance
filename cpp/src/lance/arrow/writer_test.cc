@@ -218,25 +218,30 @@ TEST_CASE("Binary field") {
 }
 
 TEST_CASE("Write timestamp") {
-  auto type = ::arrow::timestamp(::arrow::TimeUnit::NANO);
+  for (auto& type : {
+           ::arrow::timestamp(::arrow::TimeUnit::NANO),
+           ::arrow::timestamp(::arrow::TimeUnit::SECOND),
+           ::arrow::time64(::arrow::TimeUnit::NANO),
+           ::arrow::time32(::arrow::TimeUnit::SECOND),
+       }) {
+    auto schema = ::arrow::schema({arrow::field("ts", type)});
+    auto builder = ::arrow::TimestampBuilder(type, ::arrow::default_memory_pool());
+    for (int i = 0; i < 4; i++) {
+      CHECK(builder.Append(i * 1000).ok());
+    }
+    auto arr = builder.Finish().ValueOrDie();
+    auto table = ::arrow::Table::Make(std::move(schema), {arr});
 
-  auto schema = ::arrow::schema({arrow::field("ts", type)});
-  auto builder = ::arrow::TimestampBuilder(type, ::arrow::default_memory_pool());
-  for (int i = 0; i < 4; i++) {
-    CHECK(builder.Append(i * 1000).ok());
+    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto result = lance::arrow::WriteTable(*table, sink);
+    INFO("Write " << type->ToString() << ": " << result.message());
+    CHECK(result.ok());
+
+    auto actual_table = ReadTable(sink);
+    INFO("Actual table: " << actual_table->ToString());
+    INFO("Expected table: " << table->ToString());
+    CHECK(table->Equals(*actual_table));
   }
-  auto arr = builder.Finish().ValueOrDie();
-  auto table = ::arrow::Table::Make(std::move(schema), {arr});
-
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  auto result = lance::arrow::WriteTable(*table, sink);
-  INFO("Write " << type->ToString() << ": " << result.message());
-  CHECK(result.ok());
-
-  auto actual_table = ReadTable(sink);
-  INFO("Actual table: " << actual_table->ToString());
-  INFO("Expected table: " << table->ToString());
-  CHECK(table->Equals(*actual_table));
 }
 
 std::shared_ptr<::arrow::Table> MakeTable() {

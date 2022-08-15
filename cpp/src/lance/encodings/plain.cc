@@ -77,10 +77,6 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
       ARROW_RETURN_NOT_OK(
           out_->Write(std::reinterpret_pointer_cast<::arrow::DoubleArray>(arr)->values()));
       break;
-    case ::arrow::Type::TIMESTAMP:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::Int64Array>(arr)->values()));
-      break;
     default:
       return Status::Invalid(
           fmt::format("PlainEncoder:: does not support data type {}", data_type->ToString()));
@@ -193,8 +189,7 @@ PlainDecoder::~PlainDecoder() {}
       impl_.reset(new PlainDecoderImpl<::arrow::DoubleType>(infile_, type_));
       break;
     default:
-      return ::arrow::Status::Invalid(
-          fmt::format("PlainDecoder::Init(): unsupported type: {}", type_->ToString()));
+      return ::arrow::Status::Invalid(fmt::format("Unsupported type: {}", type_->ToString()));
   }
   return ::arrow::Status::OK();
 }

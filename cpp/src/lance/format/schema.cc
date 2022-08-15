@@ -152,8 +152,12 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 
 std::string Field::ToString() const {
   if (is_extension_type()) {
-    return fmt::format("{}({}): {}, encoding={}, extension_name={}", name_, id_, type()->ToString(),
-                       encoding_, extension_name_);
+    return fmt::format("{}({}): {}, encoding={}, extension_name={}",
+                       name_,
+                       id_,
+                       type()->ToString(),
+                       encoding_,
+                       extension_name_);
   }
   return fmt::format("{}({}): {}, encoding={}", name_, id_, type()->ToString(), encoding_);
 }
@@ -212,6 +216,8 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
       fmt::print(stderr, "Encoding {} is not supported\n", encoding_);
       assert(false);
   }
+  // Make compiler happy.
+  return nullptr;
 }
 
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
@@ -223,6 +229,12 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else if (data_type->id() == ::arrow::TimestampType::type_id) {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int64());
+    } else if (data_type->id() == ::arrow::Time32Type::type_id) {
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(
+          infile, std::make_shared<::arrow::Time32Type::PhysicalType>());
+    } else if (data_type->id() == ::arrow::Time64Type::type_id) {
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(
+          infile, std::make_shared<::arrow::Time64Type::PhysicalType>());
     } else {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
     }
