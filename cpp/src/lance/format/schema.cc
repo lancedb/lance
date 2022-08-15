@@ -217,9 +217,12 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   std::shared_ptr<lance::encodings::Decoder> decoder;
+  auto data_type = type();
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
+    } else if (data_type->id() == ::arrow::TimestampType::type_id) {
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int64());
     } else {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
     }

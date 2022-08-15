@@ -297,6 +297,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     storage_arr = GetDictionaryArray(field, batch_id, params);
   } else {
     storage_arr = GetPrimitiveArray(field, batch_id, params);
+    if (!storage_arr.ok()) {
+      return storage_arr.status();
+    }
+    storage_arr = storage_arr.ValueOrDie()->View(dtype);
   }
 
   if (field->is_extension_type()) {
