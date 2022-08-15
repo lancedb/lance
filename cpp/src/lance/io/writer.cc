@@ -108,7 +108,29 @@ FileWriter::~FileWriter() {}
                                                 const std::shared_ptr<::arrow::Array>& arr) {
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
-  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
+  auto type = field->type();
+
+  // Physical array.
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> storage_arr;
+  switch (type->id()) {
+    case ::arrow::TimestampType::type_id:
+    case ::arrow::Date64Type::type_id:
+    case ::arrow::Time64Type::type_id:
+      storage_arr = arr->View(::arrow::int64());
+      break;
+    case ::arrow::Date32Type::type_id:
+    case ::arrow::Time32Type::type_id:
+      storage_arr = arr->View(::arrow::int32());
+      break;
+    default:
+      storage_arr = arr;
+      break;
+  }
+  if (!storage_arr.ok()) {
+    return storage_arr.status();
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(storage_arr.ValueOrDie()));
   lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
   return ::arrow::Status::OK();
 }

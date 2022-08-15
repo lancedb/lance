@@ -296,7 +296,8 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   } else if (::arrow::is_dictionary(dtype->id())) {
     storage_arr = GetDictionaryArray(field, batch_id, params);
   } else {
-    storage_arr = GetPrimitiveArray(field, batch_id, params);
+    ARROW_ASSIGN_OR_RAISE(auto primitive_arr, GetPrimitiveArray(field, batch_id, params));
+    storage_arr = primitive_arr->View(dtype);
   }
 
   if (!storage_arr.ok()) {

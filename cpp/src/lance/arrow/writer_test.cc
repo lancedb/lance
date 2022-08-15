@@ -26,17 +26,17 @@
 #include <vector>
 
 #include "lance/arrow/reader.h"
+#include "lance/arrow/testing.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
-#include "lance/arrow/testing.h"
 #include "lance/io/reader.h"
 
 using arrow::ArrayBuilder;
 using arrow::Int32Builder;
+using arrow::LargeBinaryBuilder;
 using arrow::ListBuilder;
 using arrow::StringBuilder;
 using arrow::StructBuilder;
-using arrow::LargeBinaryBuilder;
 using arrow::Table;
 using lance::arrow::FileReader;
 using lance::format::Schema;
@@ -119,6 +119,15 @@ auto CocoDataset() {
   return table;
 }
 
+std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  INFO(::lance::arrow::FileReader::Make(infile).status());
+  auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
+  CHECK(reader->num_batches() == 1);
+  CHECK(reader->length() == 4);
+  return reader->ReadTable().ValueOrDie();
+}
+
 TEST_CASE("Write COCO Dataset") {
   auto coco = CocoDataset();
   auto sink = arrow::io::BufferOutputStream::Create();
@@ -176,7 +185,6 @@ TEST_CASE("Write dictionary type") {
   CHECK(table->Equals(*actual_table));
 }
 
-
 TEST_CASE("Large binary field") {
   auto field_type = ::arrow::large_binary();
   auto schema = ::arrow::schema({arrow::field("f1", field_type)});
@@ -209,6 +217,34 @@ TEST_CASE("Binary field") {
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 }
 
+TEST_CASE("Write timestamp") {
+  for (auto& type : {
+           ::arrow::date32(),
+           ::arrow::date64(),
+           ::arrow::time32(::arrow::TimeUnit::SECOND),
+           ::arrow::time64(::arrow::TimeUnit::NANO),
+           ::arrow::timestamp(::arrow::TimeUnit::NANO),
+           ::arrow::timestamp(::arrow::TimeUnit::SECOND),
+       }) {
+    auto schema = ::arrow::schema({arrow::field("ts", type)});
+    auto builder = ::arrow::TimestampBuilder(type, ::arrow::default_memory_pool());
+    for (int i = 0; i < 4; i++) {
+      CHECK(builder.Append(i * 1000).ok());
+    }
+    auto arr = builder.Finish().ValueOrDie();
+    auto table = ::arrow::Table::Make(std::move(schema), {arr});
+
+    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto result = lance::arrow::WriteTable(*table, sink);
+    INFO("Write " << type->ToString() << ": " << result.message());
+    CHECK(result.ok());
+
+    auto actual_table = ReadTable(sink);
+    INFO("Actual table: " << actual_table->ToString());
+    INFO("Expected table: " << table->ToString());
+    CHECK(table->Equals(*actual_table));
+  }
+}
 
 std::shared_ptr<::arrow::Table> MakeTable() {
   auto ext_type = std::make_shared<::lance::testing::ImageType>();
@@ -232,19 +268,11 @@ std::shared_ptr<::arrow::Table> MakeTable() {
   return ::arrow::Table::Make(std::move(schema), std::move(cols));
 }
 
-std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
-  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  INFO(::lance::arrow::FileReader::Make(infile).status());
-  auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
-  CHECK(reader->num_batches() == 1);
-  CHECK(reader->length() == 4);
-  return reader->ReadTable().ValueOrDie();
-}
-
 TEST_CASE("Write extension but read storage if not registered") {
   auto table = MakeTable();
   auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
-      table->GetColumnByName("image_ext")->chunk(0))->storage();
+                 table->GetColumnByName("image_ext")->chunk(0))
+                 ->storage();
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
@@ -259,7 +287,6 @@ TEST_CASE("Write extension but read storage if not registered") {
   CHECK(!(image_field->is_extension_type()));
   CHECK(lance_schema.GetFieldsCount() == 3);
 }
-
 
 TEST_CASE("Extension type round-trip") {
   auto ext_type = std::make_shared<::lance::testing::ImageType>();
