@@ -62,4 +62,4 @@ def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int 
     batch_size : int, optional
         Set the batch size to write to disk.
     """
-    WriteTable(table, destination)
+    WriteTable(table, destination, batch_size=batch_size)

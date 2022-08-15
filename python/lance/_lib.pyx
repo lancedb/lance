@@ -93,7 +93,6 @@ def BuildScanner(
     reader.reader = creader
     return Scanner.from_batches(reader)
 
-
 cdef class LanceFileFormat(FileFormat):
     def __init__(self):
         self.init(shared_ptr[CFileFormat](new CLanceFileFormat()))
