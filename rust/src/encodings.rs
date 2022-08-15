@@ -17,14 +17,14 @@
 use std::io;
 
 use arrow::array::Array;
-use arrow::array::Int32Array;
 
 /// Encoder.
 pub trait Encoder {
+    /// Write an Arrow array to the file, returns the position in the file.
     fn write(&mut self, array: &dyn Array) -> Result<i64, io::Error>;
 }
 
 /// Decoder.
 pub trait Decoder {
-    fn take(&mut self, indices: &dyn Int32Array) -> Result<Array, io::Error>;
+    fn take(&mut self, indices: &dyn Array) -> Result<&dyn Array, io::Error>;
 }
