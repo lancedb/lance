@@ -19,8 +19,6 @@
 #include <arrow/type_fwd.h>
 #include <lance/arrow/file_lance.h>
 
-#include <optional>
-
 namespace lance::arrow {
 
 /// Write an Arrow Table into the destination.
