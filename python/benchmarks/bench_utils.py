@@ -12,18 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
+import pathlib
+from abc import ABC, abstractmethod
 from functools import wraps
 import multiprocessing as mp
+
+import click
 import pandas as pd
 import time
 
+import pyarrow as pa
 import pyarrow.fs
 import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 
 import lance
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
+
+KNOWN_FORMATS = ["lance", "parquet", "raw"]
 
 
 def get_bytes(uri):
@@ -82,7 +90,8 @@ def get_uri(base_uri: str, dataset_name: str, fmt: str,
 
 class BenchmarkSuite:
 
-    def __init__(self):
+    def __init__(self, name: str):
+        self.name = name
         self._benchmarks = {}
         self._results = {}
 
@@ -91,6 +100,7 @@ class BenchmarkSuite:
             b = Benchmark(name, func, key=key)
             self._benchmarks[name] = b
             return func
+
         return decorator
 
     def get_benchmark(self, name):
@@ -98,6 +108,45 @@ class BenchmarkSuite:
 
     def list_benchmarks(self):
         return self._benchmarks.values()
+
+    def create_main(self):
+        @click.command
+        @click.option('-u', '--base-uri', required=True, type=str,
+                      help="Base uri to the benchmark dataset catalog")
+        @click.option('-f', '--format', 'fmt',
+                      help="'lance', 'parquet', or 'raw'. Omit for all")
+        @click.option('--flavor', type=str,
+                      help="external if parquet/lance had external images version")
+        @click.option('-b', '--benchmark', type=str,
+                      help="which benchmark to run. Omit for all")
+        @click.option('-r', '--repeats', type=int,
+                      help="number of times to run each benchmark")
+        @click.option('-o', '--output', type=str,
+                      help="save timing results to directory")
+        def main(base_uri, fmt, flavor, benchmark, repeats, output):
+            if fmt:
+                fmt = fmt.strip().lower()
+                assert fmt in KNOWN_FORMATS
+                fmt = [fmt]
+            else:
+                fmt = KNOWN_FORMATS
+            base_uri = f'{base_uri}/datasets/{self.name}'
+
+            def run_benchmark(bmark):
+                b = bmark.repeat(repeats or 1)
+                for f in fmt:
+                    b.run(base_uri=base_uri, fmt=f, flavor=flavor)
+                if output:
+                    path = pathlib.Path(output) / f"{bmark.name}.csv"
+                    b.to_df().to_csv(path, index=False)
+
+            if benchmark is not None:
+                b = self.get_benchmark(benchmark)
+                run_benchmark(b)
+            else:
+                [run_benchmark(b) for b in self.list_benchmarks()]
+
+        return main
 
 
 class Benchmark:
@@ -135,6 +184,52 @@ class Benchmark:
                 key = tuple([name] + [kwargs.get(k) for k in self.key])
                 self._timings.setdefault(key, []).append(total_time)
                 return result
+
             return timeit_wrapper
+
         return benchmark_decorator
 
+
+class DatasetConverter(ABC):
+
+    def __init__(self, name, uri_root):
+        self.name = name
+        self.uri_root = uri_root
+
+    @abstractmethod
+    def read_metadata(self) -> pd.DataFrame:
+        pass
+
+    def default_dataset_path(self, fmt, flavor=None):
+        suffix = f"_{flavor}" if flavor else ""
+        return os.path.join(self.uri_root,
+                            f'{self.name}{suffix}.{fmt}')
+
+    def save_df(self, df, fmt='lance', output_path=None):
+        output_path = output_path or self.default_dataset_path(fmt, "links")
+        table = pa.Table.from_pandas(df, self.get_schema())
+        if fmt == 'parquet':
+            pq.write_table(table, output_path)
+        elif fmt == 'lance':
+            lance.write_table(table, output_path)
+        return table
+
+    @abstractmethod
+    def image_uris(self, table):
+        pass
+
+    def make_embedded_dataset(self, table: pa.Table, fmt='lance', output_path=None):
+        output_path = output_path or self.default_dataset_path(fmt)
+        uris = self.image_uris(table)
+        images = download_uris(pd.Series(uris))
+        arr = pa.BinaryArray.from_pandas(images)
+        embedded = table.append_column(pa.field("image", pa.binary()), arr)
+        if fmt == 'parquet':
+            pq.write_table(embedded, output_path)
+        elif fmt == 'lance':
+            lance.write_table(embedded, output_path)
+        return embedded
+
+    @abstractmethod
+    def get_schema(self):
+        pass
