@@ -123,8 +123,6 @@ std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutpu
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   INFO(::lance::arrow::FileReader::Make(infile).status());
   auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
-  CHECK(reader->num_batches() == 1);
-  CHECK(reader->length() == 4);
   return reader->ReadTable().ValueOrDie();
 }
 
@@ -244,6 +242,35 @@ TEST_CASE("Write timestamp") {
     INFO("Expected table: " << table->ToString());
     CHECK(table->Equals(*actual_table));
   }
+}
+
+TEST_CASE("Write with batch size") {
+  auto options = lance::arrow::FileWriteOptions();
+  options.batch_size = 5;  // use an odd number;
+  auto int_builder = ::arrow::Int32Builder();
+  for (int i = 0; i < 100; i++) {
+    CHECK(int_builder.Append(i).ok());
+  }
+  auto arr = int_builder.Finish().ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("v", ::arrow::int32())}), {arr});
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  auto result = lance::arrow::WriteTable(*table, sink, options);
+  CHECK(result.ok());
+
+  auto actual_table = ReadTable(sink);
+  auto reader = ::arrow::TableBatchReader(actual_table);
+  std::shared_ptr<::arrow::RecordBatch> batch;
+  int batch_count = 0;
+  while (true) {
+    CHECK(reader.ReadNext(&batch).ok());
+    if (!batch) {
+      break;
+    }
+    batch_count++;
+    CHECK(batch->num_rows() == 5);
+  }
+  CHECK(batch_count == 20);
 }
 
 std::shared_ptr<::arrow::Table> MakeTable() {

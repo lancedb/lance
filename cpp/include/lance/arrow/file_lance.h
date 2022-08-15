@@ -57,9 +57,9 @@ class FileWriteOptions : public ::arrow::dataset::FileWriteOptions {
 
   ~FileWriteOptions() override = default;
 
-  std::string primary_key;
+  ::arrow::Status Validate() const;
 
-  int32_t chunk_size = 1024;
+  int32_t batch_size = 1024;
 };
 
 }  // namespace lance::arrow
