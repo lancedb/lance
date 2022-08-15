@@ -227,14 +227,13 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
-    } else if (data_type->id() == ::arrow::TimestampType::type_id) {
+    } else if (data_type->id() == ::arrow::TimestampType::type_id ||
+               data_type->id() == ::arrow::Time64Type::type_id ||
+               data_type->id() == ::arrow::Date64Type::type_id) {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int64());
-    } else if (data_type->id() == ::arrow::Time32Type::type_id) {
-      decoder = std::make_shared<lance::encodings::PlainDecoder>(
-          infile, std::make_shared<::arrow::Time32Type::PhysicalType>());
-    } else if (data_type->id() == ::arrow::Time64Type::type_id) {
-      decoder = std::make_shared<lance::encodings::PlainDecoder>(
-          infile, std::make_shared<::arrow::Time64Type::PhysicalType>());
+    } else if (data_type->id() == ::arrow::Time32Type::type_id ||
+               data_type->id() == ::arrow::Date32Type::type_id) {
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
     }

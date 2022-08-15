@@ -219,10 +219,12 @@ TEST_CASE("Binary field") {
 
 TEST_CASE("Write timestamp") {
   for (auto& type : {
+           ::arrow::date32(),
+           ::arrow::date64(),
+           ::arrow::time32(::arrow::TimeUnit::SECOND),
+           ::arrow::time64(::arrow::TimeUnit::NANO),
            ::arrow::timestamp(::arrow::TimeUnit::NANO),
            ::arrow::timestamp(::arrow::TimeUnit::SECOND),
-           ::arrow::time64(::arrow::TimeUnit::NANO),
-           ::arrow::time32(::arrow::TimeUnit::SECOND),
        }) {
     auto schema = ::arrow::schema({arrow::field("ts", type)});
     auto builder = ::arrow::TimestampBuilder(type, ::arrow::default_memory_pool());
