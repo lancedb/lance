@@ -299,11 +299,15 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
     storage_arr = GetPrimitiveArray(field, batch_id, params);
   }
 
+  if (!storage_arr.ok()) {
+    return storage_arr;
+  }
+
   if (field->is_extension_type()) {
-    std::shared_ptr<::arrow::ExtensionType> ext_type = ::arrow::GetExtensionType(
-        field->extension_name());
+    std::shared_ptr<::arrow::ExtensionType> ext_type =
+        ::arrow::GetExtensionType(field->extension_name());
     if (ext_type != nullptr && storage_arr.ok()) {
-    return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
+      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
     }
   }
   return storage_arr;
@@ -335,11 +339,15 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
           "FileReader::GetListArray: indices is empty: field={}({})", field->name(), field->id()));
     }
     auto start = static_cast<int32_t>(indices->Value(0));
-    auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start);
+    auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start + 1);
+
     ARROW_ASSIGN_OR_RAISE(auto unfiltered_arr,
                           GetListArray(field, batch_id, ArrayReadParams(start, length)));
-    ARROW_ASSIGN_OR_RAISE(auto datum,
-                          ::arrow::compute::CallFunction("take", {unfiltered_arr, indices}));
+    ARROW_ASSIGN_OR_RAISE(auto offsets_datum,
+                          ::arrow::compute::Subtract(indices, ::arrow::Datum(indices->Value(0))));
+    ARROW_ASSIGN_OR_RAISE(
+        auto datum,
+        ::arrow::compute::CallFunction("take", {unfiltered_arr, offsets_datum.make_array()}));
     return datum.make_array();
   }
 
@@ -363,10 +371,11 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   // Realigned offsets to be zero-started
   ARROW_ASSIGN_OR_RAISE(auto shifted_offsets, ResetOffsets(offsets));
   // Setup null bitmap
-  ARROW_ASSIGN_OR_RAISE(auto null_bitmap, ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
+  ARROW_ASSIGN_OR_RAISE(auto null_bitmap,
+                        ::arrow::AllocateBitmap(shifted_offsets->length() - 1, pool_));
   for (int i = 0; i < shifted_offsets->length() - 1; i++) {
-    ::arrow::bit_util::SetBitTo(null_bitmap->mutable_data(), i,
-                                offsets->Value(i + 1) - offsets->Value(i) > 0);
+    ::arrow::bit_util::SetBitTo(
+        null_bitmap->mutable_data(), i, offsets->Value(i + 1) - offsets->Value(i) > 0);
   }
   return std::make_shared<::arrow::ListArray>(field->type(),
                                               shifted_offsets->length() - 1,
@@ -394,11 +403,10 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
   decoder->Reset(position, length);
   decltype(decoder->ToArray()) result;
   if (params.indices) {
-    result = decoder->Take(params.indices.value());
+    return decoder->Take(params.indices.value());
   } else {
-    result = decoder->ToArray(params.offset.value(), params.length);
+    return decoder->ToArray(params.offset.value(), params.length);
   }
-  return result;
 }
 
 FileReader::ArrayReadParams::ArrayReadParams(int32_t off, std::optional<int32_t> len)
