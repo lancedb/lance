@@ -47,7 +47,9 @@ def scanner(
 ):
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
-    return BuildScanner(data, columns=columns, filter=filter, limit=limit, offset=offset)
+    return BuildScanner(
+        data, columns=columns, filter=filter, limit=limit, offset=offset
+    )
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
