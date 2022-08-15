@@ -35,11 +35,12 @@ if (CCACHE_FOUND)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif (CCACHE_FOUND)
 
+add_compile_options(-Wall -Wextra -fPIC)
+
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     SET(LANCE_BUILD_BENCHMARKS ON)
+    add_compile_options(-Werror)
 endif ()
-
-add_compile_options(-Wall -Wextra -fPIC)
 
 # TODO: Fix on linux
 Include(FetchContent)

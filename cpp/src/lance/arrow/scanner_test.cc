@@ -123,7 +123,7 @@ std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::
 TEST_CASE("Scanner with extension") {
   auto table = MakeTable();
   auto ext_type = std::make_shared<::lance::testing::ParametricType>(1);
-  ::arrow::RegisterExtensionType(ext_type);
+  CHECK(::arrow::RegisterExtensionType(ext_type).ok());
   auto scanner = MakeScanner(table);
 
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);

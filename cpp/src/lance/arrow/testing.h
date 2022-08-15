@@ -11,12 +11,12 @@
 //  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
-#include <arrow/type.h>
+
 #include <arrow/extension_type.h>
+#include <arrow/type.h>
 #include <fmt/format.h>
 
 #include <string>
-
 
 namespace lance {
 namespace testing {
@@ -41,12 +41,14 @@ class ImageType : public ::arrow::ExtensionType {
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::DataType>> Deserialize(
-      std::shared_ptr<::arrow::DataType> storage_type, const std::string& serialized) const override {
+      [[maybe_unused]] std::shared_ptr<::arrow::DataType> storage_type,
+      const std::string& serialized) const override {
     if (serialized != "ext-struct-type-unique-code") {
       return ::arrow::Status::Invalid("Type identifier did not match");
     }
     return std::make_shared<ImageType>();
   }
+
   std::string Serialize() const override { return "image-ext"; }
 };
 
@@ -74,7 +76,8 @@ class ParametricType : public ::arrow::ExtensionType {
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::DataType>> Deserialize(
-      std::shared_ptr<::arrow::DataType> storage_type, const std::string& serialized) const override {
+      [[maybe_unused]] std::shared_ptr<::arrow::DataType> storage_type,
+      const std::string& serialized) const override {
     const int32_t parameter = *reinterpret_cast<const int32_t*>(serialized.data());
     return std::make_shared<ParametricType>(parameter);
   }
@@ -89,5 +92,5 @@ class ParametricType : public ::arrow::ExtensionType {
   int32_t parameter_;
 };
 
-}
-}
+}  // namespace testing
+}  // namespace lance
