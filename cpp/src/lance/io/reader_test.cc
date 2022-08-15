@@ -25,6 +25,7 @@
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 #include "lance/arrow/writer.h"
+#include "lance/io/reader.h"
 
 TEST_CASE("Test List Array With Nulls") {
   auto int_builder = std::make_shared<::arrow::Int32Builder>();
@@ -62,5 +63,40 @@ TEST_CASE("Test List Array With Nulls") {
   for (int i = 2; i < 5; i++) {
     scalar = reader->Get(i).ValueOrDie()[0];
     CHECK(scalar->Equals(::arrow::NullScalar()));
+  }
+}
+
+TEST_CASE("Get List Array With Indices") {
+  auto value_builder = std::make_shared<::arrow::Int32Builder>();
+  auto list_builder = ::arrow::ListBuilder(::arrow::default_memory_pool(), value_builder);
+  for (int i = 0; i < 10; i++) {
+    CHECK(list_builder.Append().ok());
+    CHECK(value_builder->AppendValues({1 * i, 2 * i, 3 * i}).ok());
+  }
+
+  auto arr = std::static_pointer_cast<::arrow::ListArray>(list_builder.Finish().ValueOrDie());
+  auto schema = ::arrow::schema({::arrow::field("values", ::arrow::list(::arrow::int32()))});
+  auto table = ::arrow::Table::Make(schema, {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  auto reader = lance::io::FileReader(infile);
+  CHECK(reader.Open().ok());
+
+  for (auto& indices : std::vector<std::vector<int>>({{0, 1, 3}, {2, 3, 4}, {0, 5, 9}})) {
+    list_builder.Reset();
+    value_builder->Reset();
+    for (int idx : indices) {
+      CHECK(list_builder.Append().ok());
+      CHECK(value_builder->AppendValues({idx * 1, idx * 2, idx * 3}).ok());
+    }
+    auto expected_arr =
+        std::static_pointer_cast<::arrow::ListArray>(list_builder.Finish().ValueOrDie());
+    auto expected_table = ::arrow::Table::Make(schema, {expected_arr});
+
+    auto batch = reader.ReadBatch(reader.schema(), 0, lance::arrow::ToArray(indices).ValueOrDie())
+                     .ValueOrDie();
+    CHECK(batch->Equals(*expected_table->CombineChunksToBatch().ValueOrDie()));
   }
 }
