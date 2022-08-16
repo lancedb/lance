@@ -75,7 +75,8 @@ class OxfordPetConverter(DatasetConverter):
             no_index = pd.Index(names.values).difference(df.filename)
             self._data_quality_issues["missing_index"] = no_index
 
-        with_xmls['segmented'] = with_xmls.segmented.astype(bool)
+        # TODO lance doesn't support writing booleans yet
+        with_xmls['segmented'] = with_xmls.segmented.astype(pd.Int8Dtype())
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -132,16 +133,16 @@ class OxfordPetConverter(DatasetConverter):
         object_schema = pa.list_(pa.struct([
             pa.field("name", pa.string()),
             pa.field("pose", pa.string()),
-            pa.field("truncated", pa.bool_()),
-            pa.field("occluded", pa.bool_()),
+            pa.field("truncated", pa.uint8()),
+            pa.field("occluded", pa.uint8()),
             pa.field("bndbox", bbox),
-            pa.field("difficult", pa.bool_())
+            pa.field("difficult", pa.uint8())
         ]))
         names = ["filename", "class", "species", "breed", "split",
                  "folder", "source", "size", "segmented", "object"]
         types = [pa.string(), pa.string(), pa.string(), pa.int16(),
                  pa.string(), pa.string(), source_schema, size_schema,
-                 pa.bool_(), object_schema]
+                 pa.uint8(), object_schema]
         return pa.schema([pa.field(name, dtype)
                           for name, dtype in zip(names, types)])
 
@@ -158,9 +159,9 @@ def _get_xml(uri):
             sz['height'] = int(sz['height'])
             sz['depth'] = int(sz['depth'])
             for obj in dd['object']:
-                obj['truncated'] = bool(obj['truncated'])
-                obj['occluded'] = bool(obj['occluded'])
-                obj['difficult'] = bool(obj['difficult'])
+                obj['truncated'] = int(obj['truncated'])
+                obj['occluded'] = int(obj['occluded'])
+                obj['difficult'] = int(obj['difficult'])
                 obj['bndbox'] = {
                     'xmin': int(obj['bndbox']['xmin']),
                     'xmax': int(obj['bndbox']['xmax']),

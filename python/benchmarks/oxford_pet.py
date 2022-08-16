@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 import lance
@@ -44,6 +45,17 @@ def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
         return scanner.to_table().to_pandas()
 
 
+@oxford_pet_benchmarks.benchmark("area_histogram", key=['fmt', 'flavor'])
+def compute_histogram(base_uri: str, fmt: str, flavor: Optional[str]):
+    if fmt == "raw":
+        return area_histogram_raw(base_uri)
+    suffix = '' if not flavor else f'_{flavor}'
+    uri = os.path.join(base_uri, f'oxford_pet{suffix}.{fmt}')
+    ds = _get_dataset(uri, fmt)
+    query = "SELECT histogram(size.width * size.height) FROM ds"
+    return duckdb.query(query).to_df()
+
+
 def _get_dataset(uri, fmt):
     if fmt == "parquet":
         return pa.dataset.dataset(uri)
@@ -66,6 +78,14 @@ def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
     uris = [os.path.join(base_uri, f"images/{x}.jpg")
             for x in limited.filename.values]
     return limited.assign(images=download_uris(pd.Series(uris)))
+
+
+def area_histogram_raw(base_uri):
+    c = OxfordPetConverter(base_uri)
+    df = c.read_metadata()
+    sz = pd.json_normalize(df['size'])
+    query = "SELECT histogram(width * height) FROM sz"
+    return duckdb.query(query).to_df()
 
 
 if __name__ == "__main__":
