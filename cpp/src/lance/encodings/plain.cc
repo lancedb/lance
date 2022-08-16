@@ -46,6 +46,16 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
   return out->Write(std::dynamic_pointer_cast<::arrow::BooleanArray>(written_arr)->values());
 }
 
+template <ArrowType T>
+::arrow::Status WriteArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
+                           const std::shared_ptr<::arrow::Array>& arr) {
+  auto width = ::arrow::bit_width(arr->type_id()) / 8;
+  assert(width > 0);
+  return out->Write(
+      std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(arr)->raw_values(),
+      arr->length() * width);
+}
+
 ::arrow::Result<int64_t> PlainEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
   auto data_type = arr->type();
 
@@ -57,43 +67,34 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
           WriteBooleanArray(out_, std::dynamic_pointer_cast<::arrow::BooleanArray>(arr)));
       break;
     case ::arrow::Type::INT8:
-      ARROW_RETURN_NOT_OK(out_->Write(std::static_pointer_cast<::arrow::Int8Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::Int8Type>(out_, arr));
       break;
     case ::arrow::Type::UINT8:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::UInt8Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::UInt8Type>(out_, arr));
       break;
     case ::arrow::Type::INT16:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::Int16Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::Int16Type>(out_, arr));
       break;
     case ::arrow::Type::UINT16:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::UInt16Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::UInt16Type>(out_, arr));
       break;
     case ::arrow::Type::INT32:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::reinterpret_pointer_cast<::arrow::Int32Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::Int32Type>(out_, arr));
       break;
     case ::arrow::Type::UINT32:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::UInt32Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::UInt32Type>(out_, arr));
       break;
     case ::arrow::Type::INT64:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::reinterpret_pointer_cast<::arrow::Int64Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::Int64Type>(out_, arr));
       break;
     case ::arrow::Type::UINT64:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::UInt64Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::UInt64Type>(out_, arr));
       break;
     case ::arrow::Type::FLOAT:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::reinterpret_pointer_cast<::arrow::FloatArray>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::FloatType>(out_, arr));
       break;
     case ::arrow::Type::DOUBLE:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::reinterpret_pointer_cast<::arrow::DoubleArray>(arr)->values()));
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::DoubleType>(out_, arr));
       break;
     default:
       return Status::Invalid(
