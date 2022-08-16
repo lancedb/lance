@@ -44,7 +44,7 @@ def scanner(
     filter: Optional[pc.Expression] = None,
     limit: Optional[int] = None,
     offset: int = 0,
-):
+) -> ds.Scanner:
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
     return BuildScanner(

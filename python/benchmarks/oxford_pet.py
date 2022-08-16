@@ -1,48 +1,93 @@
-import multiprocessing as mp
-import os
+#!/usr/bin/env python3
 
+import os
+from typing import Optional
+
+import duckdb
 import numpy as np
 import pandas as pd
-import pyarrow.fs as fs
+
+import lance
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset
+from bench_utils import BenchmarkSuite, download_uris
+from parse_pet import OxfordPetConverter
+
+oxford_pet_benchmarks = BenchmarkSuite("oxford_pet")
 
 
-def read_pets_metadata(url):
-    list_txt = os.path.join(url, "annotations/list.txt")
-    df = pd.read_csv(list_txt, delimiter=" ", comment="#", header=None)
-    df.columns = ["filename", "class", "species", "breed"]
-
-    species_dtype = pd.CategoricalDtype(["Unknown", "Cat", "Dog"])
-    df.species = pd.Categorical.from_codes(df.species, dtype=species_dtype)
-
-    breeds = df.filename.str.rsplit("_", 1).str[0].unique()
-    assert len(breeds) == 37
-
-    breeds = np.concatenate([["Unknown"], breeds])
-    class_dtype = pd.CategoricalDtype(breeds)
-    df["class"] = pd.Categorical.from_codes(df["class"], dtype=class_dtype)
-
-    return df
+@oxford_pet_benchmarks.benchmark("label_distribution", key=['fmt', 'flavor'])
+def label_distribution(base_uri: str, fmt: str, flavor: Optional[str]):
+    if fmt == "raw":
+        return get_pets_class_distribution(base_uri)
+    suffix = '' if not flavor else f'_{flavor}'
+    ds = _get_dataset(os.path.join(base_uri, f'oxford_pet{suffix}.{fmt}'), fmt)
+    query = "SELECT class, count(1) FROM ds GROUP BY 1"
+    return duckdb.query(query).to_df()
 
 
-def get_pets_class_distribution(url):
-    # %time df = bench.get_pets_class_distribution(url)
-    df = read_pets_metadata(url)
+@oxford_pet_benchmarks.benchmark("filter_data", key=['fmt', 'flavor'])
+def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
+    if fmt == "raw":
+        return get_pets_filtered_data(base_uri)
+    suffix = '' if not flavor else f'_{flavor}'
+    uri = os.path.join(base_uri, f'oxford_pet{suffix}.{fmt}')
+    if fmt == "parquet":
+        ds = _get_dataset(uri, fmt)
+        query = ("SELECT image, class FROM ds WHERE class='pug' "
+                 "LIMIT 50 OFFSET 20")
+        return duckdb.query(query).to_df()
+    elif fmt == "lance":
+        scanner = lance.scanner(uri, columns=["image", "class"],
+                                filter=pc.field("class") == "pug",
+                                limit=50, offset=20)
+        return scanner.to_table().to_pandas()
+
+
+@oxford_pet_benchmarks.benchmark("area_histogram", key=['fmt', 'flavor'])
+def compute_histogram(base_uri: str, fmt: str, flavor: Optional[str]):
+    if fmt == "raw":
+        return area_histogram_raw(base_uri)
+    suffix = '' if not flavor else f'_{flavor}'
+    uri = os.path.join(base_uri, f'oxford_pet{suffix}.{fmt}')
+    ds = _get_dataset(uri, fmt)
+    query = "SELECT histogram(size.width * size.height) FROM ds"
+    return duckdb.query(query).to_df()
+
+
+def _get_dataset(uri, fmt):
+    if fmt == "parquet":
+        return pa.dataset.dataset(uri)
+    elif fmt == "lance":
+        return lance.dataset(uri)
+    raise NotImplementedError()
+
+
+def get_pets_class_distribution(base_uri):
+    c = OxfordPetConverter(base_uri)
+    df = c.read_metadata()
     return df.groupby("class")["class"].count()
 
 
-def get_pets_filtered_data(url, klass="pug", offset=20, limit=50):
-    # %time rs = bench.get_pets_filtered_data(url, "pug", 20, 50)
-    df = read_pets_metadata(url)
+def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
+    c = OxfordPetConverter(base_uri)
+    df = c.read_metadata()
     filtered = df.loc[df["class"] == klass, ["class", "filename"]]
-    limited = filtered[offset : offset + limit]
-    pool = mp.Pool(mp.cpu_count() - 1)
-    all_bytes = pool.map(get_bytes, limited.filename.values)
-    limited["image"] = all_bytes
-    return limited
+    limited: pd.DataFrame = filtered[offset: offset + limit]
+    uris = [os.path.join(base_uri, f"images/{x}.jpg")
+            for x in limited.filename.values]
+    return limited.assign(images=download_uris(pd.Series(uris)))
 
 
-def get_bytes(name):
-    s3, key = fs.FileSystem.from_uri(
-        f"s3://eto-public/datasets/oxford_pet/images/{name}.jpg"
-    )
-    return s3.open_input_file(key).read()
+def area_histogram_raw(base_uri):
+    c = OxfordPetConverter(base_uri)
+    df = c.read_metadata()
+    sz = pd.json_normalize(df['size'])
+    query = "SELECT histogram(width * height) FROM sz"
+    return duckdb.query(query).to_df()
+
+
+if __name__ == "__main__":
+    main = oxford_pet_benchmarks.create_main()
+    main()
