@@ -66,13 +66,12 @@ def get_dataset(uri: str) -> ds.Dataset:
     """
     Return a pyarrow Dataset stored at the given uri
     """
-    if uri.endswith('.lance'):
+    if uri.endswith(".lance"):
         return lance.dataset(uri)
     return ds.dataset(uri)
 
 
-def get_uri(base_uri: str, dataset_name: str, fmt: str,
-            flavor: str = None) -> str:
+def get_uri(base_uri: str, dataset_name: str, fmt: str, flavor: str = None) -> str:
     """
     Return the uri to the dataset with the given specifications
 
@@ -92,7 +91,6 @@ def get_uri(base_uri: str, dataset_name: str, fmt: str,
 
 
 class BenchmarkSuite:
-
     def __init__(self, name: str):
         self.name = name
         self._benchmarks = {}
@@ -114,18 +112,30 @@ class BenchmarkSuite:
 
     def create_main(self):
         @click.command
-        @click.option('-u', '--base-uri', required=True, type=str,
-                      help="Base uri to the benchmark dataset catalog")
-        @click.option('-f', '--format', 'fmt',
-                      help="'lance', 'parquet', or 'raw'. Omit for all")
-        @click.option('--flavor', type=str,
-                      help="external if parquet/lance had external images version")
-        @click.option('-b', '--benchmark', type=str,
-                      help="which benchmark to run. Omit for all")
-        @click.option('-r', '--repeats', type=int,
-                      help="number of times to run each benchmark")
-        @click.option('-o', '--output', type=str,
-                      help="save timing results to directory")
+        @click.option(
+            "-u",
+            "--base-uri",
+            required=True,
+            type=str,
+            help="Base uri to the benchmark dataset catalog",
+        )
+        @click.option(
+            "-f", "--format", "fmt", help="'lance', 'parquet', or 'raw'. Omit for all"
+        )
+        @click.option(
+            "--flavor",
+            type=str,
+            help="external if parquet/lance had external images version",
+        )
+        @click.option(
+            "-b", "--benchmark", type=str, help="which benchmark to run. Omit for all"
+        )
+        @click.option(
+            "-r", "--repeats", type=int, help="number of times to run each benchmark"
+        )
+        @click.option(
+            "-o", "--output", type=str, help="save timing results to directory"
+        )
         def main(base_uri, fmt, flavor, benchmark, repeats, output):
             if fmt:
                 fmt = fmt.strip().lower()
@@ -133,7 +143,7 @@ class BenchmarkSuite:
                 fmt = [fmt]
             else:
                 fmt = KNOWN_FORMATS
-            base_uri = f'{base_uri}/datasets/{self.name}'
+            base_uri = f"{base_uri}/datasets/{self.name}"
 
             def run_benchmark(bmark):
                 b = bmark.repeat(repeats or 1)
@@ -153,7 +163,6 @@ class BenchmarkSuite:
 
 
 class Benchmark:
-
     def __init__(self, name, func, key=None, num_runs=1):
         self.name = name
         self.func = func
@@ -183,7 +192,9 @@ class Benchmark:
                 end_time = time.perf_counter()
                 total_time = end_time - start_time
                 # first item in the args, ie `args[0]` is `self`
-                print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
+                print(
+                    f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds"
+                )
                 key = tuple([name] + [kwargs.get(k) for k in self.key])
                 self._timings.setdefault(key, []).append(total_time)
                 return result
@@ -194,7 +205,6 @@ class Benchmark:
 
 
 class DatasetConverter(ABC):
-
     def __init__(self, name, uri_root):
         self.name = name
         self.uri_root = uri_root
@@ -205,15 +215,14 @@ class DatasetConverter(ABC):
 
     def default_dataset_path(self, fmt, flavor=None):
         suffix = f"_{flavor}" if flavor else ""
-        return os.path.join(self.uri_root,
-                            f'{self.name}{suffix}.{fmt}')
+        return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
-    def save_df(self, df, fmt='lance', output_path=None):
+    def save_df(self, df, fmt="lance", output_path=None):
         output_path = output_path or self.default_dataset_path(fmt, "links")
         table = pa.Table.from_pandas(df, self.get_schema())
-        if fmt == 'parquet':
+        if fmt == "parquet":
             pq.write_table(table, output_path)
-        elif fmt == 'lance':
+        elif fmt == "lance":
             lance.write_table(table, output_path)
         return table
 
@@ -221,16 +230,18 @@ class DatasetConverter(ABC):
     def image_uris(self, table):
         pass
 
-    def make_embedded_dataset(self, table: pa.Table, fmt='lance', output_path=None):
+    def make_embedded_dataset(
+        self, table: pa.Table, fmt="lance", output_path=None, **kwargs
+    ):
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         arr = pa.BinaryArray.from_pandas(images)
         embedded = table.append_column(pa.field("image", pa.binary()), arr)
-        if fmt == 'parquet':
-            pq.write_table(embedded, output_path)
-        elif fmt == 'lance':
-            lance.write_table(embedded, output_path)
+        if fmt == "parquet":
+            pq.write_table(embedded, output_path, **kwargs)
+        elif fmt == "lance":
+            lance.write_table(embedded, output_path, **kwargs)
         return embedded
 
     @abstractmethod
