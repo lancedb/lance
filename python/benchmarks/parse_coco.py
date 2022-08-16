@@ -32,6 +32,7 @@ class CocoConverter(DatasetConverter):
         category_df = (pd.DataFrame(instances_json["categories"])
                        .rename({'id': 'category_id'}, axis=1))
         annotations_df = df.merge(category_df, on="category_id")
+        annotations_df['iscrowd'] = annotations_df.iscrowd.astype(bool)
         anno_df = (
             pd.DataFrame(
                 {
@@ -86,7 +87,7 @@ class CocoConverter(DatasetConverter):
         ])
         names = ['segmentation', 'area', 'iscrowd', 'bbox', 'category_id', 'id',
                  'supercategory', 'name']
-        types = [segmentation_type, pa.float64(), pa.int8(),
+        types = [segmentation_type, pa.float64(), pa.bool_(),
                  pa.list_(pa.float32()), pa.int16(), pa.int64(),
                  pa.utf8(), pa.utf8()]
         schema = pa.list_(pa.struct([pa.field(name, dtype)

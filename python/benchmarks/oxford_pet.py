@@ -62,11 +62,10 @@ def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
     c = OxfordPetConverter(base_uri)
     df = c.read_metadata()
     filtered = df.loc[df["class"] == klass, ["class", "filename"]]
-    limited = filtered[offset: offset + limit]
+    limited: pd.DataFrame = filtered[offset: offset + limit]
     uris = [os.path.join(base_uri, f"images/{x}.jpg")
             for x in limited.filename.values]
-    limited.assign(images=download_uris(pd.Series(uris)))
-    return limited
+    return limited.assign(images=download_uris(pd.Series(uris)))
 
 
 if __name__ == "__main__":

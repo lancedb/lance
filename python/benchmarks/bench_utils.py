@@ -17,6 +17,7 @@ import pathlib
 from abc import ABC, abstractmethod
 from functools import wraps
 import multiprocessing as mp
+from typing import Iterable
 
 import click
 import pandas as pd
@@ -34,14 +35,16 @@ __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"
 KNOWN_FORMATS = ["lance", "parquet", "raw"]
 
 
-def get_bytes(uri):
+def read_file(uri) -> bytes:
     fs, key = pyarrow.fs.FileSystem.from_uri(uri)
     return fs.open_input_file(key).read()
 
 
-def download_uris(uris: pd.Series) -> pd.Series:
+def download_uris(uris: Iterable[str], func=read_file) -> Iterable[bytes]:
+    if isinstance(uris, pd.Series):
+        uris = uris.values
     pool = mp.Pool(mp.cpu_count() - 1)
-    data = pool.map(get_bytes, uris.values)
+    data = pool.map(func, uris)
     return data
 
 
