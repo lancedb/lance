@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Union, Optional
 
 import pyarrow as pa
-import pyarrow.dataset as ds
 import pyarrow.compute as pc
+import pyarrow.dataset as ds
 from lance.lib import LanceFileFormat, WriteTable, BuildScanner
 
 __all__ = ["dataset", "write_table", "scanner"]
@@ -47,10 +47,12 @@ def scanner(
 ):
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
-    return BuildScanner(data, columns=columns, filter=filter, limit=limit, offset=offset)
+    return BuildScanner(
+        data, columns=columns, filter=filter, limit=limit, offset=offset
+    )
 
 
-def write_table(table: pa.Table, destination: Union[str, Path]):
+def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
     """Write an Arrow Table into the destination.
 
     Parameters
@@ -59,5 +61,7 @@ def write_table(table: pa.Table, destination: Union[str, Path]):
         Apache Arrow Table
     destination : str or `Path`
         The destination to write dataset to.
+    batch_size : int, optional
+        Set the batch size to write to disk.
     """
-    WriteTable(table, destination)
+    WriteTable(table, destination, batch_size=batch_size)

@@ -96,6 +96,13 @@ std::shared_ptr<::arrow::dataset::FileWriteOptions> LanceFileFormat::DefaultWrit
 FileWriteOptions::FileWriteOptions()
     : ::arrow::dataset::FileWriteOptions(std::make_shared<LanceFileFormat>()) {}
 
+::arrow::Status FileWriteOptions::Validate() const {
+  if (batch_size <= 1) {
+    return ::arrow::Status::Invalid("Batch size must be greater than 1");
+  }
+  return ::arrow::Status::OK();
+}
+
 std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTypeName; }
 
 }  // namespace lance::arrow

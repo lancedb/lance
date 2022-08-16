@@ -19,8 +19,6 @@
 #include <arrow/type_fwd.h>
 #include <lance/arrow/file_lance.h>
 
-#include <optional>
-
 namespace lance::arrow {
 
 /// Write an Arrow Table into the destination.
@@ -32,6 +30,6 @@ namespace lance::arrow {
 /// \return Status::OK() if succeed.
 ::arrow::Status WriteTable(const ::arrow::Table& table,
                            std::shared_ptr<::arrow::io::OutputStream> sink,
-                           std::optional<FileWriteOptions> options = std::nullopt);
+                           FileWriteOptions options = FileWriteOptions());
 
-}  // namespace nft::arrow
+}  // namespace lance::arrow
