@@ -20,6 +20,8 @@
 #include <arrow/type.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <string>
+#include <vector>
 
 #include "lance/arrow/scanner.h"
 #include "lance/arrow/stl.h"
@@ -32,13 +34,12 @@
 TEST_CASE("Project schema") {
   auto schema =
       ::arrow::schema({arrow::field("k", arrow::int16()), arrow::field("v", arrow::int32())});
-  auto arr = arrow::StructArray::Make(
-                 {
-                     lance::arrow::ToArray<int16_t>({1, 2, 3, 4}).ValueOrDie(),
-                     lance::arrow::ToArray<int32_t>({10, 20, 30, 40}).ValueOrDie(),
-                 },
-                 {"k", "v"})
-                 .ValueOrDie();
+  auto arr = arrow::StructArray::Make(::arrow::ArrayVector({
+                                   lance::arrow::ToArray<int16_t>({1, 2, 3, 4}).ValueOrDie(),
+                                   lance::arrow::ToArray<int32_t>({10, 20, 30, 40}).ValueOrDie(),
+                               }),
+                               std::vector<std::string>({"k", "v"}))
+          .ValueOrDie();
   auto tbl =
       arrow::Table::FromRecordBatches({arrow::RecordBatch::FromStructArray(arr).ValueOrDie()})
           .ValueOrDie();
