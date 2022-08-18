@@ -23,8 +23,8 @@
 
 namespace lance::testing {
 
-/// Make FileReader from an Arrow Table.
-::arrow::Result<std::shared_ptr<io::FileReader>> MakeReader(
+/// Make lance::io::FileReader from an Arrow Table.
+::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
     const std::shared_ptr<::arrow::Table>& table);
 
 }  // namespace lance::testing
