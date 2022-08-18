@@ -40,4 +40,5 @@ add_dependencies(io format)
 
 add_lance_test(filter_test)
 add_lance_test(limit_test)
+add_lance_test(project_test)
 add_lance_test(reader_test)

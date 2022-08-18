@@ -80,10 +80,16 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
           std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
       values = values->Slice(offset, len);
     }
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*scan_schema_, batch_id, indices));
-    assert(values->num_rows() == batch->num_rows());
-    ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
-    return merged;
+    if (scan_schema_->fields().empty()) {
+      // No extra columns other than the filtered columns need to be read, for example,
+      // SELECT id FROM t WHERE id > 10
+      return values;
+    } else {
+      ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*scan_schema_, batch_id, indices));
+      assert(values->num_rows() == batch->num_rows());
+      ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
+      return merged;
+    }
   } else {
     // Read without filter.
     if (limit_) {

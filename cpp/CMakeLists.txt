@@ -97,6 +97,7 @@ function(add_lance_test test_name)
         target_link_libraries(${test_name}
                 Catch2::Catch2WithMain
                 lance
+                $<TARGET_OBJECTS:lance_testing>
                 )
         target_include_directories(${test_name} SYSTEM PRIVATE ${ARROW_INCLUDE_DIR})
         target_include_directories(${test_name} SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR})
@@ -107,7 +108,7 @@ endfunction()
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     include(CTest)
     include(Catch)
-    set(test_libs Catch2::Catch2WithMain)
+    set(test_libs Catch2::Catch2WithMain $<TARGET_OBJECTS:lance_testing>)
     enable_testing()
 endif ()
 
