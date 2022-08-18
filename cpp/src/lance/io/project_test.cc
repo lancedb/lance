@@ -55,4 +55,5 @@ TEST_CASE("Project schema") {
 
   auto reader = lance::testing::MakeReader(tbl).ValueOrDie();
   auto batch = project->Execute(reader, 0).ValueOrDie();
+  CHECK(batch->GetColumnByName("v")->Equals(lance::arrow::ToArray({20}).ValueOrDie()));
 }
