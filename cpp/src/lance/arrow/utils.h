@@ -33,4 +33,6 @@ namespace lance::arrow {
     const std::shared_ptr<::arrow::StructArray>& rhs,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
+std::string ColumnNameFromFieldRef(const ::arrow::FieldRef& ref);
+
 }  // namespace lance::arrow

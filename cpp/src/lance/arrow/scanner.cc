@@ -21,6 +21,7 @@
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/schema.h"
 
 namespace lance::arrow {
@@ -41,7 +42,6 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   if (offset_ < 0) {
     return ::arrow::Status::Invalid("Offset is negative");
   }
-
   auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
   ARROW_RETURN_NOT_OK(builder.Filter(filter_));
 
@@ -61,8 +61,21 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   /// TODO: contribute this change to Apache Arrow.
   if (columns_.has_value()) {
     auto schema = lance::format::Schema(scanner->options()->dataset_schema);
-    ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns_.value()));
+    auto columns = columns_.value();
+
+    if (::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
+      for (auto& filtered_column :
+           ::arrow::compute::FieldsInExpression(scanner->options()->filter)) {
+        auto filtered_col_name = ColumnNameFromFieldRef(filtered_column);
+        if (std::find(std::begin(columns), std::end(columns), filtered_col_name) == columns.end()) {
+          columns.emplace_back(filtered_col_name);
+        }
+      }
+    }
+    ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
     scanner->options()->dataset_schema = projected_schema->ToArrow();
+    ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
+                          scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
 
     /// Only keep the top level column names to build the output schema.
     std::vector<std::string> top_names;
