@@ -43,7 +43,6 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   }
 
   auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
-  ARROW_RETURN_NOT_OK(builder.Filter(filter_));
 
   auto fragment_opts = std::make_shared<LanceFragmentScanOptions>();
   fragment_opts->limit = limit_;
@@ -83,6 +82,8 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
     scanner->options()->projected_schema = project_desc.schema;
     scanner->options()->projection = project_desc.expression;
   }
+  ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
+                        scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
 
   if (limit_.has_value()) {
     scanner->options()->batch_size = offset_ + limit_.value();
