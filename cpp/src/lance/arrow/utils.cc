@@ -103,4 +103,24 @@ namespace lance::arrow {
   return ::arrow::StructArray::Make(arrays, names);
 }
 
+std::string ColumnNameFromFieldRef(const ::arrow::FieldRef& ref) {
+  if (ref.IsName()) {
+    return *ref.name();
+  }
+  assert(ref.IsNested());
+  std::string name;
+  for (auto& child : *ref.nested_refs()) {
+    if (child.IsFieldPath()) {
+      continue;
+    }
+    if (child.IsName()) {
+      if (!name.empty()) {
+        name += ".";
+      }
+      name += *child.name();
+    }
+  }
+  return name;
+}
+
 }  // namespace lance::arrow
