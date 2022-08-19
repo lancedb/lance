@@ -83,7 +83,7 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
     scanner->options()->projection = project_desc.expression;
   }
   ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
-                        scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
+                        filter_.Bind(*scanner->options()->dataset_schema));
 
   if (limit_.has_value()) {
     scanner->options()->batch_size = offset_ + limit_.value();
