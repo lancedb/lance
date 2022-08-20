@@ -12,7 +12,9 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
+
+use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::schema::Schema;
 
@@ -48,7 +50,10 @@ impl<R: Read + Seek> FileReader<R> {
         let mut buf = [0; 16];
         let nbytes = self.file.read(&mut buf)?;
         if nbytes < 16 {
-            return Err(Error::new(ErrorKind::InvalidData, "Not a lance file: size < 16 bytes"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Not a lance file: size < 16 bytes",
+            ));
         }
         let s = match std::str::from_utf8(&buf[12..16]) {
             Ok(s) => s,
@@ -59,8 +64,7 @@ impl<R: Read + Seek> FileReader<R> {
         }
         // TODO: check version
 
-        let offset_bytes = buf[0..8];
-        Ok(0)
+        Cursor::new(&buf[0..8]).read_i64::<LittleEndian>()
     }
 
     pub fn schema(&self) -> &Schema {
