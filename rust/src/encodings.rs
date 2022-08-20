@@ -14,9 +14,27 @@
 
 //! Lance Encodings
 
+use std::fmt;
 use std::io;
 
 use arrow::array::Array;
+
+#[derive(Debug)]
+pub enum Encoding {
+    Plain,
+    VarBinary,
+    Dictionary,
+}
+
+impl fmt::Display for Encoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain => write!(f, "{}", "plain"),
+            Self::VarBinary => write!(f, "{}", "var_binary"),
+            Self::Dictionary => write!(f, "{}", "dictionary"),
+        }
+    }
+}
 
 /// Encoder.
 pub trait Encoder {

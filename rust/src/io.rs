@@ -51,54 +51,40 @@ impl<P: prost::Message + Default> ProtoReader<P> for ProtoParser {
     }
 }
 
+fn read_footer<R: Read + Seek>(file: &mut R) -> Result<i64> {
+    file.seek(SeekFrom::End(-16))?;
+    let mut buf = [0; 16];
+    let nbytes = file.read(&mut buf)?;
+    if nbytes < 16 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Not a lance file: size < 16 bytes",
+        ));
+    }
+    let s = match std::str::from_utf8(&buf[12..16]) {
+        Ok(s) => s,
+        Err(_) => return Err(Error::new(ErrorKind::InvalidData, "Not a lance file")),
+    };
+    if !s.eq(MAGIC_NUMBER) {
+        return Err(Error::new(ErrorKind::InvalidData, "Not a lance file"));
+    }
+    // TODO: check version
+
+    Cursor::new(&buf[0..8]).read_i64::<LittleEndian>()
+}
+
 impl<R: Read + Seek> FileReader<R> {
     pub fn new(file: R) -> Result<Self> {
-        let mut reader = FileReader {
-            file,
-            schema: Schema {},
-        };
-        let metadata_pos = reader.read_footer()?;
+        let mut f = file;
+        let metadata_pos = read_footer(&mut f)?;
         let metadata: crate::format::pb::Metadata =
-            ProtoParser::read(&mut reader.file, metadata_pos)?;
-        println!(
-            "Batch offset: {:?} pages= {:?} {}",
-            metadata.batch_offsets, metadata.page_table_position, metadata.manifest_position
-        );
+            ProtoParser::read(&mut f, metadata_pos)?;
         let manifest: crate::format::pb::Manifest =
-            ProtoParser::read(&mut reader.file, metadata.manifest_position as i64)?;
-        println!("Schema / fields: {:?}", manifest.fields);
-
-        match reader.open() {
-            Ok(_) => Ok(reader),
-            Err(e) => Err(e),
-        }
-    }
-
-    // Open the file reader
-    fn open(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn read_footer(&mut self) -> Result<i64> {
-        self.file.seek(SeekFrom::End(-16))?;
-        let mut buf = [0; 16];
-        let nbytes = self.file.read(&mut buf)?;
-        if nbytes < 16 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "Not a lance file: size < 16 bytes",
-            ));
-        }
-        let s = match std::str::from_utf8(&buf[12..16]) {
-            Ok(s) => s,
-            Err(_) => return Err(Error::new(ErrorKind::InvalidData, "Not a lance file")),
-        };
-        if !s.eq(MAGIC_NUMBER) {
-            return Err(Error::new(ErrorKind::InvalidData, "Not a lance file"));
-        }
-        // TODO: check version
-
-        Cursor::new(&buf[0..8]).read_i64::<LittleEndian>()
+            ProtoParser::read(&mut f, metadata.manifest_position as i64)?;
+        Ok(FileReader{
+            file: f,
+            schema: Schema::new(&manifest.fields),
+        })
     }
 
     pub fn schema(&self) -> &Schema {
