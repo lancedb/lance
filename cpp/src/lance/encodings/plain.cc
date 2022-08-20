@@ -104,8 +104,6 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
 
 namespace {
 
-
-
 template <ArrowType T>
 class PlainDecoderImpl : public Decoder {
  public:
