@@ -84,9 +84,9 @@ message Field {
 
   // Fully qualified name.
   string name = 2;
-  /// Field Id.
+  // Field Id.
   int32 id = 3;
-  /// Parent Field ID. If not set, this is a top-level column.
+  // Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
 
   // Logical types, support parameterized Arrow Type.
@@ -96,10 +96,10 @@ message Field {
 
   Encoding encoding = 7;
 
-  /// The file offset for storing the dictionary value.
-  /// It is only valid if encoding is DICTIONARY.
-  ///
-  /// The logic type presents the value type of the column, i.e., string value.
+  // The file offset for storing the dictionary value.
+  // It is only valid if encoding is DICTIONARY.
+  //
+  // The logic type presents the value type of the column, i.e., string value.
   int64 dictionary_offset = 8;
   int64 dictionary_page_length = 9;
 
