@@ -9,12 +9,14 @@ authors = ["Lance Developers <dev@eto.ai>"]
 readme = "../README.md"
 description = "Rust Implementation of Lance Columnar Format"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "lance"
 
 [dependencies]
-arrow = { version = "19.0" }
-clap = "3"
-prost = "0.10"
+arrow = { version = "20.0" }
+clap = { version = "3", features = ["derive"] }
+prost = "0.11.0"
+byteorder = "1.4"
 
 [build-dependencies]
-prost-build = { version = "0.10" }
+prost-build = { version = "0.11" }

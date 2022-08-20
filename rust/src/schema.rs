@@ -12,16 +12,31 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-pub mod encodings;
-pub mod io;
-pub mod schema;
+use crate::format::pb;
+use std::fmt;
 
-pub mod format {
-    /// Protobuf definitions
-    pub mod pb {
-        include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
+#[derive(Debug)]
+pub struct Field {
+    pub id: i32,
+    pub parent_id: i32,
+    pub name: String,
+}
+
+impl Field {
+    pub fn from_proto(pb: pb::Field) -> Field {
+        Field {
+            id: pb.id,
+            parent_id: pb.parent_id,
+            name: pb.name.clone(),
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {}
+#[derive(Debug)]
+pub struct Schema {}
+
+impl fmt::Display for Schema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Schema()")
+    }
+}

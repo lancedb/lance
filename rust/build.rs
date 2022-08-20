@@ -12,16 +12,9 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-pub mod encodings;
-pub mod io;
-pub mod schema;
+use std::io::Result;
 
-pub mod format {
-    /// Protobuf definitions
-    pub mod pb {
-        include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
-    }
+fn main() -> Result<()> {
+    prost_build::compile_protos(&["../protos/format.proto"], &["../protos/"])?;
+    Ok(())
 }
-
-#[cfg(test)]
-mod tests {}
