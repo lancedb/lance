@@ -42,6 +42,7 @@ fn main() {
         Commands::Inspect { path } => {
             let f = File::open(path).unwrap();
             let reader = FileReader::new(f).unwrap();
+            println!("Number of RecordBatch: {}", reader.num_chunks());
             println!("Schema: {}\n", reader.schema())
         }
     }

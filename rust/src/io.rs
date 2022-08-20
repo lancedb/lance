@@ -17,6 +17,7 @@ use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::schema::Schema;
+use crate::format::pb;
 
 static MAGIC_NUMBER: &str = "LANC";
 
@@ -24,6 +25,8 @@ static MAGIC_NUMBER: &str = "LANC";
 pub struct FileReader<R: Read + Seek> {
     file: R,
     schema: Schema,
+    // TODO: impl a Metadata
+    metadata: pb::Metadata,
 }
 
 trait ProtoReader<P: prost::Message + Default> {
@@ -84,10 +87,15 @@ impl<R: Read + Seek> FileReader<R> {
         Ok(FileReader{
             file: f,
             schema: Schema::new(&manifest.fields),
+            metadata,
         })
     }
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    pub fn num_chunks(&self) -> i32 {
+        self.metadata.batch_offsets.len() as i32 - 1
     }
 }
