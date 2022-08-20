@@ -85,7 +85,7 @@ impl<R: Read + Seek> FileReader<R> {
             ProtoParser::read(&mut f, metadata.manifest_position as i64)?;
         Ok(FileReader {
             file: f,
-            schema: Schema::new(&manifest.fields),
+            schema: Schema::from_proto(&manifest.fields),
             metadata,
         })
     }

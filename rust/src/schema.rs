@@ -12,33 +12,44 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+//! Lance Dataset Schema
+
 use crate::format::pb;
 use std::fmt;
 
 use crate::encodings::Encoding;
 
+/// Lance Field.
+///
+/// Metadata of a column.
 #[derive(Debug)]
 pub struct Field {
     pub id: i32,
     pub parent_id: i32,
     pub name: String,
+    logical_type: String,
+    extension_name: String,
     pub encoding: Option<Encoding>,
+    node_type: i32,
 
     children: Vec<Field>,
 }
 
 impl Field {
-    pub fn new(pb: &pb::Field) -> Field {
+    pub fn from_proto(pb: &pb::Field) -> Field {
         Field {
             id: pb.id,
             parent_id: pb.parent_id,
             name: pb.name.to_string(),
+            logical_type: pb.logical_type.to_string(),
+            extension_name: pb.extension_name.to_string(),
             encoding: match pb.encoding {
                 1 => Some(Encoding::Plain),
                 2 => Some(Encoding::VarBinary),
                 3 => Some(Encoding::Dictionary),
                 _ => None,
             },
+            node_type: pb.r#type,
 
             children: vec![],
         }
@@ -66,9 +77,11 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "Field({}, id={}, encoding={})",
+            "Field({}, id={}, type={}, ext_type={}, encoding={})",
             self.name,
             self.id,
+            self.logical_type,
+            self.extension_name,
             match &self.encoding {
                 Some(enc) => format!("{}", enc),
                 None => String::from("N/A"),
@@ -88,10 +101,11 @@ pub struct Schema {
 }
 
 impl Schema {
-    pub fn new(fields: &Vec<crate::format::pb::Field>) -> Schema {
+    /// Create a new schema from protobuf.
+    pub fn from_proto(fields: &Vec<crate::format::pb::Field>) -> Schema {
         let mut schema = Schema { fields: vec![] };
         fields.iter().for_each(|f| {
-            let lance_field = Field::new(f);
+            let lance_field = Field::from_proto(f);
             if lance_field.parent_id < 0 {
                 schema.fields.push(lance_field);
             } else {
