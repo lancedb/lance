@@ -57,6 +57,9 @@ impl<R: Read + Seek> FileReader<R> {
         if !s.eq(MAGIC_NUMBER) {
             return Err(Error::new(ErrorKind::InvalidData, "Not a lance file"));
         }
+        // TODO: check version
+
+        let offset_bytes = buf[0..8];
         Ok(0)
     }
 
