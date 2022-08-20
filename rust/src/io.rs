@@ -16,8 +16,8 @@ use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use crate::schema::Schema;
 use crate::format::pb;
+use crate::schema::Schema;
 
 static MAGIC_NUMBER: &str = "LANC";
 
@@ -80,11 +80,10 @@ impl<R: Read + Seek> FileReader<R> {
     pub fn new(file: R) -> Result<Self> {
         let mut f = file;
         let metadata_pos = read_footer(&mut f)?;
-        let metadata: crate::format::pb::Metadata =
-            ProtoParser::read(&mut f, metadata_pos)?;
+        let metadata: crate::format::pb::Metadata = ProtoParser::read(&mut f, metadata_pos)?;
         let manifest: crate::format::pb::Manifest =
             ProtoParser::read(&mut f, metadata.manifest_position as i64)?;
-        Ok(FileReader{
+        Ok(FileReader {
             file: f,
             schema: Schema::new(&manifest.fields),
             metadata,
