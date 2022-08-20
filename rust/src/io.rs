@@ -26,6 +26,31 @@ pub struct FileReader<R: Read + Seek> {
     schema: Schema,
 }
 
+trait ProtoReader<P: prost::Message + Default> {
+    fn read<R: Read + Seek>(file: &mut R, pos: i64) -> Result<P>;
+}
+
+struct ProtoParser;
+
+impl<P: prost::Message + Default> ProtoReader<P> for ProtoParser {
+    fn read<R: Read + Seek>(file: &mut R, pos: i64) -> Result<P> {
+        let mut size_buf = [0; 4];
+        file.seek(SeekFrom::Start(pos as u64))?;
+        file.read(&mut size_buf)?;
+        let pb_size = Cursor::new(size_buf).read_i32::<LittleEndian>()?;
+        let mut buf = Vec::with_capacity(pb_size as usize);
+        buf.resize(pb_size as usize, 0);
+        file.read(&mut buf)?;
+        match P::decode(&buf[..]) {
+            Ok(m) => Ok(m),
+            Err(e) => Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid metadata: ".to_owned() + &e.to_string(),
+            )),
+        }
+    }
+}
+
 impl<R: Read + Seek> FileReader<R> {
     pub fn new(file: R) -> Result<Self> {
         let mut reader = FileReader {
@@ -33,6 +58,15 @@ impl<R: Read + Seek> FileReader<R> {
             schema: Schema {},
         };
         let metadata_pos = reader.read_footer()?;
+        let metadata: crate::format::pb::Metadata =
+            ProtoParser::read(&mut reader.file, metadata_pos)?;
+        println!(
+            "Batch offset: {:?} pages= {:?} {}",
+            metadata.batch_offsets, metadata.page_table_position, metadata.manifest_position
+        );
+        let manifest: crate::format::pb::Manifest =
+            ProtoParser::read(&mut reader.file, metadata.manifest_position as i64)?;
+        println!("Schema / fields: {:?}", manifest.fields);
 
         match reader.open() {
             Ok(_) => Ok(reader),
