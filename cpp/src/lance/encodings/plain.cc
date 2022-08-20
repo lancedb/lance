@@ -60,9 +60,8 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
       ARROW_RETURN_NOT_OK(out_->Write(std::static_pointer_cast<::arrow::Int8Array>(arr)->values()));
       break;
     case ::arrow::Type::UINT8:
-      ARROW_RETURN_NOT_OK(out_->Write(
-          std::static_pointer_cast<::arrow::UInt8Array>(arr)->raw_values() + arr->offset(),
-          arr->length()));
+      ARROW_RETURN_NOT_OK(
+          out_->Write(std::static_pointer_cast<::arrow::UInt8Array>(arr)->values()));
       break;
     case ::arrow::Type::INT16:
       ARROW_RETURN_NOT_OK(
