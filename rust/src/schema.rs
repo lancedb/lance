@@ -15,6 +15,7 @@
 //! Lance Dataset Schema
 
 use crate::format::pb;
+use arrow::datatypes::DataType;
 use std::fmt;
 
 use crate::encodings::Encoding;
@@ -36,6 +37,7 @@ pub struct Field {
 }
 
 impl Field {
+    /// Build Field from protobuf.
     pub fn from_proto(pb: &pb::Field) -> Field {
         Field {
             id: pb.id,
@@ -52,6 +54,27 @@ impl Field {
             node_type: pb.r#type,
 
             children: vec![],
+        }
+    }
+
+    /// Return Arrow Data Type.
+    pub fn datatype(&self) -> DataType {
+        match self.logical_type.as_str() {
+            "bool" => DataType::Boolean,
+            "uint8" => DataType::UInt8,
+            "int8" => DataType::Int8,
+            "uint16" => DataType::UInt16,
+            "int16" => DataType::Int16,
+            "uint32" => DataType::UInt32,
+            "int32" => DataType::Int32,
+            "uint64" => DataType::UInt64,
+            "int64" => DataType::Int64,
+            "halffloat" => DataType::Float16,
+            "float" => DataType::Float32,
+            "double" => DataType::Float64,
+            "binary" => DataType::Binary,
+            "string" => DataType::Utf8,
+            _ => panic!(),
         }
     }
 
