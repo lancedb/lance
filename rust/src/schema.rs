@@ -27,7 +27,7 @@ impl Field {
         Field {
             id: pb.id,
             parent_id: pb.parent_id,
-            name: pb.name.clone(),
+            name: pb.name,
         }
     }
 }

@@ -16,7 +16,7 @@ use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use crate::schema::Schema;
 
-static MAGIC_NUMBER: [u8;4] = ['L', 'A', 'N', 'C'];
+static MAGIC_NUMBER: &str = "LANC";
 
 /// Lance File Reader.
 pub struct FileReader<R: Read + Seek> {
@@ -50,11 +50,11 @@ impl<R: Read + Seek> FileReader<R> {
         if nbytes < 16 {
             return Err(Error::new(ErrorKind::InvalidData, "Not a lance file: size < 16 bytes"));
         }
-        if (match std::str::from_utf8(&buf[12..16]) {
+        let s = match std::str::from_utf8(&buf[12..16]) {
             Ok(s) => s,
             Err(_) => return Err(Error::new(ErrorKind::InvalidData, "Not a lance file")),
-        }).eq(MAGIC_NUMBER) {
-            print!("blabla");
+        };
+        if !s.eq(MAGIC_NUMBER) {
             return Err(Error::new(ErrorKind::InvalidData, "Not a lance file"));
         }
         Ok(0)
