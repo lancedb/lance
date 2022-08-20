@@ -14,11 +14,12 @@
 
 //! Lance Dataset Schema
 
-use crate::format::pb;
-use arrow::datatypes::DataType;
 use std::fmt;
 
+use arrow::datatypes::DataType;
+
 use crate::encodings::Encoding;
+use crate::format::pb;
 
 /// Lance Field.
 ///
@@ -58,7 +59,7 @@ impl Field {
     }
 
     /// Return Arrow Data Type.
-    pub fn datatype(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         match self.logical_type.as_str() {
             "bool" => DataType::Boolean,
             "uint8" => DataType::UInt8,

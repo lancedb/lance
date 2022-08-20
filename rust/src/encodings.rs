@@ -16,6 +16,7 @@
 
 use std::fmt;
 use std::io;
+use std::io::Result;
 
 use arrow::array::Array;
 
@@ -39,10 +40,10 @@ impl fmt::Display for Encoding {
 /// Encoder.
 pub trait Encoder {
     /// Write an Arrow array to the file, returns the position in the file.
-    fn write(&mut self, array: &dyn Array) -> Result<i64, io::Error>;
+    fn write(&mut self, array: &dyn Array) -> Result<i64>;
 }
 
 /// Decoder.
 pub trait Decoder {
-    fn take(&mut self, indices: &dyn Array) -> Result<&dyn Array, io::Error>;
+    fn take(&mut self, indices: &dyn Array) -> Result<&dyn Array>;
 }
