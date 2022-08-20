@@ -32,18 +32,37 @@ namespace lance::encodings {
 
 PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Encoder(out) {}
 
+::arrow::Status WriteBooleanArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
+                                  const std::shared_ptr<::arrow::BooleanArray>& arr) {
+  // TODO: Boolean array is not necessarily aligned with the byte boundary:
+  //  See ::arrow::BooleanArray::Value(int64)
+  // Is there a faster way to write / shift the boolean array?
+  ::arrow::BooleanBuilder builder;
+  ARROW_RETURN_NOT_OK(builder.Reserve(arr->length()));
+  for (int i = 0; i < arr->length(); i++) {
+    ARROW_RETURN_NOT_OK(builder.Append(arr->Value(i)));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto written_arr, builder.Finish());
+  return out->Write(std::dynamic_pointer_cast<::arrow::BooleanArray>(written_arr)->values());
+}
+
 ::arrow::Result<int64_t> PlainEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
   auto data_type = arr->type();
 
   ARROW_ASSIGN_OR_RAISE(auto value_offset, out_->Tell());
   // TODO: support more types.
   switch (data_type->id()) {
+    case ::arrow::Type::BOOL:
+      ARROW_RETURN_NOT_OK(
+          WriteBooleanArray(out_, std::dynamic_pointer_cast<::arrow::BooleanArray>(arr)));
+      break;
     case ::arrow::Type::INT8:
       ARROW_RETURN_NOT_OK(out_->Write(std::static_pointer_cast<::arrow::Int8Array>(arr)->values()));
       break;
     case ::arrow::Type::UINT8:
-      ARROW_RETURN_NOT_OK(
-          out_->Write(std::static_pointer_cast<::arrow::UInt8Array>(arr)->values()));
+      ARROW_RETURN_NOT_OK(out_->Write(
+          std::static_pointer_cast<::arrow::UInt8Array>(arr)->raw_values() + arr->offset(),
+          arr->length()));
       break;
     case ::arrow::Type::INT16:
       ARROW_RETURN_NOT_OK(
@@ -85,6 +104,55 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
 }
 
 namespace {
+
+class BooleanPlainDecoderImpl : public Decoder {
+ public:
+  using Decoder::Decoder;
+
+  /// Get one single scalar value from the column.
+  ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override {
+    int64_t offset = idx / 8;
+    uint8_t byte;
+    ARROW_RETURN_NOT_OK(infile_->ReadAt(position_ + offset, 1, &byte));
+    return std::make_shared<::arrow::BooleanScalar>(
+        ::arrow::bit_util::GetBitFromByte(byte, idx % 8));
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
+      int32_t start, std::optional<int32_t> length) const override {
+    if (!length.has_value()) {
+      length = length_ - start;
+    }
+    if (start + length.value() > length_ || start > length_) {
+      return ::arrow::Status::IndexError(
+          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, page_length={}\n",
+                      start,
+                      length.value(),
+                      length_));
+    }
+    int64_t byte_length = length.value() / 8 + 1;
+    ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
+    return std::make_shared<::arrow::BooleanArray>(length.value(), buf);
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override {
+    int32_t start = indices->Value(0);
+    int32_t length = indices->Value(indices->length() - 1) - start + 1;
+    if (indices->length() == 0 || start < 0 || start + length > length_) {
+      return ::arrow::Status::Invalid("PlainDecoder::Take: Indices array is not valid");
+    }
+    ARROW_ASSIGN_OR_RAISE(auto raw_value_arr, ToArray(start, length));
+    auto values = std::static_pointer_cast<::arrow::BooleanArray>(raw_value_arr);
+    ::arrow::BooleanBuilder builder;
+    ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
+    for (int64_t i = 0; i < indices->length(); i++) {
+      auto index = indices->Value(i);
+      ARROW_RETURN_NOT_OK(builder.Append(values->Value(index - start)));
+    }
+    return builder.Finish();
+  }
+};
 
 template <ArrowType T>
 class PlainDecoderImpl : public Decoder {
@@ -156,7 +224,7 @@ PlainDecoder::~PlainDecoder() {}
 ::arrow::Status PlainDecoder::Init() {
   switch (type_->id()) {
     case ::arrow::Type::BOOL:
-      impl_.reset(new PlainDecoderImpl<::arrow::BooleanType>(infile_, type_));
+      impl_.reset(new BooleanPlainDecoderImpl(infile_, type_));
       break;
     case ::arrow::Type::INT8:
       impl_.reset(new PlainDecoderImpl<::arrow::Int8Type>(infile_, type_));

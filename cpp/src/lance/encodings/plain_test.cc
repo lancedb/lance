@@ -23,6 +23,7 @@
 #include "lance/arrow/stl.h"
 
 using arrow::Int32Builder;
+using lance::arrow::ToArray;
 
 TEST_CASE("Test Write Int32 array") {
   auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5, 6, 7, 8}).ValueOrDie();
@@ -65,4 +66,35 @@ TEST_CASE("Test take plain values") {
   auto actual = decoder.Take(indices).ValueOrDie();
   INFO("Indices " << indices->ToString() << " Actual " << actual->ToString());
   CHECK(actual->Equals(indices));
+}
+
+TEST_CASE("Write boolean array") {
+  arrow::BooleanBuilder builder;
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append(i % 3 == 0).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  lance::encodings::PlainEncoder encoder(sink);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  lance::encodings::PlainDecoder decoder(infile, arr->type());
+  CHECK(decoder.Init().ok());
+  decoder.Reset(offset, arr->length());
+
+  auto actual = decoder.ToArray().ValueOrDie();
+  CHECK(arr->Equals(actual));
+
+  for (int i = 0; i < arr->length(); i++) {
+    INFO("Expected: " << arr->GetScalar(i).ValueOrDie()->ToString()
+                      << " Got: " << decoder.GetScalar(i).ValueOrDie()->ToString());
+    CHECK(arr->GetScalar(i).ValueOrDie()->Equals(decoder.GetScalar(i).ValueOrDie()));
+  }
+
+  auto indices = ToArray({0, 3, 6}).ValueOrDie();
+  CHECK(lance::arrow::ToArray({true, true, true})
+            .ValueOrDie()
+            ->Equals(decoder.Take(indices).ValueOrDie()));
 }

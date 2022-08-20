@@ -32,6 +32,7 @@
 #include "lance/io/reader.h"
 
 using arrow::ArrayBuilder;
+using arrow::BooleanBuilder;
 using arrow::Int32Builder;
 using arrow::LargeBinaryBuilder;
 using arrow::ListBuilder;
@@ -58,11 +59,13 @@ auto CocoDataset() {
   auto schema = arrow::schema({arrow::field("filename", arrow::utf8()),
                                arrow::field("split", arrow::utf8()),
                                arrow::field("width", arrow::int32()),
+                               arrow::field("valid", arrow::boolean()),
                                arrow::field("image", image_type),
                                arrow::field("annotations", arrow::list(annotationType))});
 
   StringBuilder stringBuilder;
   Int32Builder intBuilder;
+  BooleanBuilder booleanBuilder;
 
   CHECK(stringBuilder.AppendValues({"1.jpg", "2.jpg", "3.jpg", "4.jpg"}).ok());
   auto filenameArr = stringBuilder.Finish().ValueOrDie();
@@ -75,6 +78,10 @@ auto CocoDataset() {
   CHECK(intBuilder.AppendValues({1, 2, 3, 4}).ok());
   auto width = intBuilder.Finish().ValueOrDie();
   intBuilder.Reset();
+
+  CHECK(booleanBuilder.AppendValues(std::vector<bool>({true, true, false, true})).ok());
+  auto valid = booleanBuilder.Finish().ValueOrDie();
+  booleanBuilder.Reset();
 
   auto uriBuilder = std::make_shared<StringBuilder>();
   auto imageBuilder = std::make_shared<StructBuilder>(
@@ -115,7 +122,7 @@ auto CocoDataset() {
   auto annotations = listBuilder.Finish().ValueOrDie();
   listBuilder.Reset();
 
-  auto table = arrow::Table::Make(schema, {filenameArr, split, width, images, annotations});
+  auto table = arrow::Table::Make(schema, {filenameArr, split, width, valid, images, annotations});
   return table;
 }
 
