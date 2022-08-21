@@ -38,6 +38,27 @@ pub struct Field {
 }
 
 impl Field {
+    pub fn new(field: &arrow::datatypes::Field) -> Field {
+        Field {
+            id: -1,
+            parent_id: -1,
+            name: field.name().clone(),
+            logical_type: field.data_type().to_string(),
+            extension_name: String::new(),
+            encoding: match field.data_type() {
+                t if DataType::is_numeric(t) => Some(Encoding::Plain),
+                DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
+                    Some(Encoding::VarBinary)
+                }
+                DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
+                _ => None,
+            },
+            node_type: 0,
+            children: vec![],
+        }
+        // TODO Add subfields.
+    }
+
     /// Build Field from protobuf.
     pub fn from_proto(pb: &pb::Field) -> Field {
         Field {
@@ -125,6 +146,16 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// Create a Schema from arrow schema.
+    pub fn new(schema: &arrow::datatypes::Schema) -> Schema {
+        Schema {
+            fields: schema
+                .fields()
+                .iter()
+                .map(|field| Field::new(field))
+                .collect(),
+        }
+    }
     /// Create a new schema from protobuf.
     pub fn from_proto(fields: &Vec<crate::format::pb::Field>) -> Schema {
         let mut schema = Schema { fields: vec![] };
