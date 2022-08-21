@@ -17,7 +17,7 @@
 use std::fmt;
 use std::io::Result;
 
-use arrow::array::{Array, PrimitiveArray};
+use arrow::array::{Array, ArrayRef, Int32Array};
 use arrow::datatypes::ArrowPrimitiveType;
 
 pub mod plain;
@@ -49,9 +49,9 @@ pub trait Encoder {
 pub trait Decoder<T: ArrowPrimitiveType> {
     type ArrowType;
 
-    fn decode(&mut self, offset: i32, length: Option<i32>) -> Result<PrimitiveArray<T>>;
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<ArrayRef>;
 
-    fn take(&mut self, indices: &dyn Array) -> Result<PrimitiveArray<T>>;
+    fn take(&mut self, indices: &Int32Array) -> Result<ArrayRef>;
 
     fn value(&self, i: usize) -> Result<T::Native>;
 }
