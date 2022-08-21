@@ -12,8 +12,11 @@ description = "Rust Implementation of Lance Columnar Format"
 [[bin]]
 name = "lance"
 
+[lib]
+crate-type=["staticlib", "cdylib", "lib"]
+
 [dependencies]
-arrow = { version = "20.0" }
+arrow = { version = "20.0", default-features = false }
 clap = { version = "3", features = ["derive"] }
 prost = "0.11.0"
 byteorder = "1.4"
