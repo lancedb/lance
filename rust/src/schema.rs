@@ -152,12 +152,12 @@ impl Schema {
             fields: schema
                 .fields()
                 .iter()
-                .map(|field| Field::new(field))
+                .map(Field::new)
                 .collect(),
         }
     }
     /// Create a new schema from protobuf.
-    pub fn from_proto(fields: &Vec<crate::format::pb::Field>) -> Schema {
+    pub fn from_proto(fields: &[crate::format::pb::Field]) -> Schema {
         let mut schema = Schema { fields: vec![] };
         fields.iter().for_each(|f| {
             let lance_field = Field::from_proto(f);

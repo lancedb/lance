@@ -32,9 +32,9 @@ pub enum Encoding {
 impl fmt::Display for Encoding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Plain => write!(f, "{}", "plain"),
-            Self::VarBinary => write!(f, "{}", "var_binary"),
-            Self::Dictionary => write!(f, "{}", "dictionary"),
+            Self::Plain => write!(f, "plain"),
+            Self::VarBinary => write!(f, "var_binary"),
+            Self::Dictionary => write!(f, "dictionary"),
         }
     }
 }

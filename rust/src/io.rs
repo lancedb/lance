@@ -39,11 +39,11 @@ impl<P: prost::Message + Default> ProtoReader<P> for ProtoParser {
     fn read<R: Read + Seek>(file: &mut R, pos: i64) -> Result<P> {
         let mut size_buf = [0; 4];
         file.seek(SeekFrom::Start(pos as u64))?;
-        file.read(&mut size_buf)?;
+        file.read_exact(&mut size_buf)?;
         let pb_size = Cursor::new(size_buf).read_i32::<LittleEndian>()?;
         let mut buf = Vec::with_capacity(pb_size as usize);
         buf.resize(pb_size as usize, 0);
-        file.read(&mut buf)?;
+        file.read_exact(&mut buf)?;
         match P::decode(&buf[..]) {
             Ok(m) => Ok(m),
             Err(e) => Err(Error::new(

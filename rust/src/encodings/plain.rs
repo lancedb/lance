@@ -31,9 +31,9 @@ pub struct PlainDecoder<'a, R: Read + Seek> {
 impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
     pub fn new(file: &'a mut R, position: u64, page_length: i64) -> Self {
         PlainDecoder {
-            file: file,
-            position: position,
-            page_length: page_length,
+            file,
+            position,
+            page_length,
         }
     }
 }
@@ -45,14 +45,14 @@ impl<'a, R: Read + Seek, T: ArrowPrimitiveType> Decoder<T> for PlainDecoder<'a, 
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         let mut mutable_buf = MutableBuffer::new(read_len * T::get_byte_width());
-        (*self.file).read(mutable_buf.as_slice_mut())?;
+        (*self.file).read_exact(mutable_buf.as_slice_mut())?;
         let builder = ArrayDataBuilder::new(T::DATA_TYPE).buffers(vec![mutable_buf.into()]);
         let data = match builder.build() {
             Ok(d) => d,
             Err(e) => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
-                    format!("Invalid builder: {}", e.to_string()),
+                    format!("Invalid builder: {}", e),
                 ))
             }
         };
