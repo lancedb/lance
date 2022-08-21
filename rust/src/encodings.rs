@@ -17,7 +17,10 @@
 use std::fmt;
 use std::io::Result;
 
-use arrow::array::Array;
+use arrow::array::{Array, PrimitiveArray};
+use arrow::datatypes::ArrowPrimitiveType;
+
+pub mod plain;
 
 #[derive(Debug)]
 pub enum Encoding {
@@ -43,6 +46,12 @@ pub trait Encoder {
 }
 
 /// Decoder.
-pub trait Decoder {
-    fn take(&mut self, indices: &dyn Array) -> Result<&dyn Array>;
+pub trait Decoder<T: ArrowPrimitiveType> {
+    type ArrowType;
+
+    fn decode(&mut self, offset: i32, length: Option<i32>) -> Result<PrimitiveArray<T>>;
+
+    fn take(&mut self, indices: &dyn Array) -> Result<PrimitiveArray<T>>;
+
+    fn value(&self, i: usize) -> Result<T::Native>;
 }
