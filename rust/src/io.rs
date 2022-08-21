@@ -41,8 +41,7 @@ impl<P: prost::Message + Default> ProtoReader<P> for ProtoParser {
         file.seek(SeekFrom::Start(pos as u64))?;
         file.read_exact(&mut size_buf)?;
         let pb_size = Cursor::new(size_buf).read_i32::<LittleEndian>()?;
-        let mut buf = Vec::with_capacity(pb_size as usize);
-        buf.resize(pb_size as usize, 0);
+        let mut buf = vec![0; pb_size as usize];
         file.read_exact(&mut buf)?;
         match P::decode(&buf[..]) {
             Ok(m) => Ok(m),
