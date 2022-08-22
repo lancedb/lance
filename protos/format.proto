@@ -1,8 +1,5 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
+ * The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
@@ -98,8 +95,8 @@ message Metadata {
   // The <position, length> of all the pages in the same column are then contiguously stored.
   //
   // For example, for the column 5 and batch 4, we have:
-  //   position = page_table[5][4][0];
-  //   length = page_table[5][4][1];
+  //   position = page_table\[5\]\[4\]\[0\];
+  //   length = page_table\[5\]\[4\]\[1\];
   uint64 page_table_position = 3;
 }
 
@@ -136,9 +133,9 @@ message Field {
 
   // Fully qualified name.
   string name = 2;
-  /// Field Id.
+  // Field Id.
   int32 id = 3;
-  /// Parent Field ID. If not set, this is a top-level column.
+  // Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
 
   // Logical types, support parameterized Arrow Type.
