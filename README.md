@@ -1,4 +1,4 @@
-# Lance: A Columnar Data Format for Deep Learning Dataset
+# Lance: A Columnar Data Format for Computer Vision
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 
@@ -6,45 +6,45 @@
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
-environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point 
-queries to training scans. 
+environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
+queries to training scans.
 
-## Why use Lance
+Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
 
-You should use lance if you're a ML engineer looking to be 10x more productive when working with computer vision 
-datasets:
+## What problems does Lance solve?
 
-1. Lance saves you from having to manage multiple systems and formats for metadata, 
-raw assets, labeling updates, and vector indices.
-2. Lance's custom column encoding means you don't need to choose between fast analytics and fast point queries.
-3. Lance has a first-class Apache Arrow integration so it's easy to create and query Lance datasets (e.g., you can
-directly query lance datasets using DuckDB with no extra work)
-4. Did we mention Lance is fast.
+Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML engineering community.
 
-## Major features
+### Working with vision data for ML is different from working with tabular data:
+- Training, analytics, and labeling uses different tools requiring different formats
+- Data annotations are almost always deeply nested
+- Images / videos are large blobs that are difficult to query by existing engines
 
-* Fast columnar scan for ML dataset analysis, ML training, and evaluation.
-* Encodings that are capable of fast point queries for interactive data exploration.
-* Extensible design for index and predicates pushdown.
-* Self-describable, nested, and strong-typed data with an extensible type system. Support Image, Video, Audio and Sensor
-  Data. Support Annotations and Tensors.
-* Schema evolution and update (TODO).
-* Cloud-native optimizations on low-cost cloud storage, i.e., AWS S3, Google GCS, or Azure Blob Storage.
-* Open access via first-class [Apache Arrow](https://arrow.apache.org/) integration and multi-language support.
+### This results in some major pain-points:
+- Too much time spent on low level data munging
+- Multiple copies creates data quality issues, even for well-known datasets
+- Reproducibility and data versioning is extremely difficult to achieve
 
-### Non-goals
+### Lance to the rescue
+To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
+- Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
+- Rich ML data types and integrations to eliminate manual data conversions
+- Support for vector and search indices, versioning, and schema evolution
 
-* A new SQL engine
-* A new ML framework
+## Quick Start
 
-## How to Use Lance
+We've provided Linux and MacOS wheels for Lance in PyPI. You can install Lance python bindings via:
+
+```
+pip install pylance
+```
 
 Thanks for its Apache Arrow-first APIs, `lance` can be used as a native `Arrow` extension.
 For example, it enables users to directly use `DuckDB` to analyze lance dataset
 via [DuckDB's Arrow integration](https://duckdb.org/docs/guides/python/sql_on_arrow).
 
 ```python
-# pip install pylance duckdb 
+# pip install pylance duckdb
 import lance
 import duckdb
 
@@ -52,6 +52,26 @@ import duckdb
 ds = lance.dataset("s3://eto-public/datasets/oxford_pet/pet.lance")
 duckdb.query('select label, count(1) from ds group by label').to_arrow_table()
 ```
+
+## What makes Lance different
+
+Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://docs.google.com/document/d/1kknVcqRK65YqGkKASuQ40apr2A2DyK0Qtx5nhCPCdqQ/edit).
+
+**Encodings**: to achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
+
+**Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
+
+**Versioning / updates** (ROADMAP): a Manifest can be used to record snapshots. Updates are supported via write-ahead logs.
+
+**Secondary Indices** (ROADMAP):
+  - Vector index for similarity search over embedding space
+  - Inverted index for fuzzy search over many label / annotation fields
+
+## Benchmarks
+
+We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/xmls. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
+
+![](docs/lance_perf.png)
 
 ## Why are you building yet another data format?!
 
