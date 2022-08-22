@@ -37,7 +37,7 @@ ToArray(const std::vector<T>& vec, ::arrow::MemoryPool* pool = ::arrow::default_
   using ArrayType = typename ::arrow::TypeTraits<ArrowType>::ArrayType;
   typename ::arrow::TypeTraits<ArrowType>::BuilderType builder(pool);
   ARROW_RETURN_NOT_OK(builder.Reserve(vec.size()));
-  for (auto& v : vec) {
+  for (const auto& v : vec) {
     ARROW_RETURN_NOT_OK(builder.Append(v));
   }
   auto result = builder.Finish();

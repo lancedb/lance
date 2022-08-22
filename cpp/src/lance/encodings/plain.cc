@@ -32,12 +32,30 @@ namespace lance::encodings {
 
 PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Encoder(out) {}
 
+::arrow::Status WriteBooleanArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
+                                  const std::shared_ptr<::arrow::BooleanArray>& arr) {
+  // TODO: Boolean array is not necessarily aligned with the byte boundary:
+  //  See ::arrow::BooleanArray::Value(int64)
+  // Is there a faster way to write / shift the boolean array?
+  ::arrow::BooleanBuilder builder;
+  ARROW_RETURN_NOT_OK(builder.Reserve(arr->length()));
+  for (int i = 0; i < arr->length(); i++) {
+    ARROW_RETURN_NOT_OK(builder.Append(arr->Value(i)));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto written_arr, builder.Finish());
+  return out->Write(std::dynamic_pointer_cast<::arrow::BooleanArray>(written_arr)->values());
+}
+
 ::arrow::Result<int64_t> PlainEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
   auto data_type = arr->type();
 
   ARROW_ASSIGN_OR_RAISE(auto value_offset, out_->Tell());
   // TODO: support more types.
   switch (data_type->id()) {
+    case ::arrow::Type::BOOL:
+      ARROW_RETURN_NOT_OK(
+          WriteBooleanArray(out_, std::dynamic_pointer_cast<::arrow::BooleanArray>(arr)));
+      break;
     case ::arrow::Type::INT8:
       ARROW_RETURN_NOT_OK(out_->Write(std::static_pointer_cast<::arrow::Int8Array>(arr)->values()));
       break;
@@ -145,6 +163,37 @@ class PlainDecoderImpl : public Decoder {
   using BuilderType = typename ::arrow::TypeTraits<T>::BuilderType;
 };
 
+class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
+ public:
+  using PlainDecoderImpl::PlainDecoderImpl;
+
+  /// Get one single scalar value from the column.
+  ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override {
+    int64_t offset = idx / 8;
+    uint8_t byte;
+    ARROW_RETURN_NOT_OK(infile_->ReadAt(position_ + offset, 1, &byte));
+    return std::make_shared<::arrow::BooleanScalar>(
+        ::arrow::bit_util::GetBitFromByte(byte, idx % 8));
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
+      int32_t start, std::optional<int32_t> length) const override {
+    if (!length.has_value()) {
+      length = length_ - start;
+    }
+    if (start + length.value() > length_ || start > length_) {
+      return ::arrow::Status::IndexError(
+          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, page_length={}\n",
+                      start,
+                      length.value(),
+                      length_));
+    }
+    int64_t byte_length = ::arrow::bit_util::BytesForBits(length.value());
+    ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
+    return std::make_shared<::arrow::BooleanArray>(length.value(), buf);
+  }
+};
+
 }  // namespace
 
 PlainDecoder::PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
@@ -156,7 +205,7 @@ PlainDecoder::~PlainDecoder() {}
 ::arrow::Status PlainDecoder::Init() {
   switch (type_->id()) {
     case ::arrow::Type::BOOL:
-      impl_.reset(new PlainDecoderImpl<::arrow::BooleanType>(infile_, type_));
+      impl_.reset(new BooleanPlainDecoderImpl(infile_, type_));
       break;
     case ::arrow::Type::INT8:
       impl_.reset(new PlainDecoderImpl<::arrow::Int8Type>(infile_, type_));

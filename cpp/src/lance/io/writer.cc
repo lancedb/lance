@@ -106,6 +106,10 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
                                                 const std::shared_ptr<::arrow::Array>& arr) {
+  if (arr->length() == 0) {
+    return ::arrow::Status::OK();
+  }
+
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
   auto type = field->type();
