@@ -55,7 +55,7 @@ duckdb.query('select label, count(1) from ds group by label').to_arrow_table()
 
 ## What makes Lance different
 
-Here we will highlight a few aspects of Lance’s design. For more details, see the full Lance design document.
+Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://docs.google.com/document/d/1kknVcqRK65YqGkKASuQ40apr2A2DyK0Qtx5nhCPCdqQ/edit).
 
 **Encodings**: to achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
 
