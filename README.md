@@ -6,7 +6,7 @@
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
-environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point 
+environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
 queries to training scans.
 
 Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
@@ -14,7 +14,7 @@ Lance core is written in C++ and comes with python bindings to start. With first
 ## What problems does Lance solve?
 
 Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML engineering community.
- 
+
 ### Working with vision data for ML is different from working with tabular data:
 - Training, analytics, and labeling uses different tools requiring different formats
 - Data annotations are almost always deeply nested
@@ -44,7 +44,7 @@ For example, it enables users to directly use `DuckDB` to analyze lance dataset
 via [DuckDB's Arrow integration](https://duckdb.org/docs/guides/python/sql_on_arrow).
 
 ```python
-# pip install pylance duckdb 
+# pip install pylance duckdb
 import lance
 import duckdb
 
@@ -70,6 +70,8 @@ Here we will highlight a few aspects of Lance’s design. For more details, see 
 ## Benchmarks
 
 We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/xmls. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
+
+![](docs/lance_perf.png)
 
 ## Why are you building yet another data format?!
 
