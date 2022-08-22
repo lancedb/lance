@@ -9,7 +9,7 @@ Lance is a cloud-native columnar data format designed for managing large-scale c
 environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point 
 queries to training scans.
 
-Lance core is written in C++ and comes with python bindings to start. With first class integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
+Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
 
 ## What problems does Lance solve?
 
@@ -67,6 +67,9 @@ Here we will highlight a few aspects of Lance’s design. For more details, see 
   - Vector index for similarity search over embedding space
   - Inverted index for fuzzy search over many label / annotation fields
 
+## Benchmarks
+
+We create a Lance dataset using the Oxford Pet dataset to do some preliminary performance testing of Lance as compared to Parquet and raw image/xmls. For analytics queries, Lance is 50-100x better than reading the raw metadata. For batched random access, Lance is 100x better than both parquet and raw files.
 
 ## Why are you building yet another data format?!
 
