@@ -35,7 +35,8 @@ VarBinaryEncoder::VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> ou
 Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array> data) {
   ARROW_ASSIGN_OR_RAISE(auto start_offset, out_->Tell());
   auto arr = std::static_pointer_cast<::arrow::BinaryArray>(data);
-  ARROW_RETURN_NOT_OK(out_->Write(arr->value_data()));
+  auto bytes = arr->value_offset(arr->length()) - arr->value_offset(0);
+  ARROW_RETURN_NOT_OK(out_->Write(arr->raw_data(), bytes));
 
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
   offsetBuilder_.Reset();

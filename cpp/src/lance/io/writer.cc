@@ -73,6 +73,7 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::Write(const std::shared_ptr<::arrow::RecordBatch>& batch) {
   metadata_->AddBatchLength(batch->num_rows());
+  fmt::print("Write batch: len={}\n", batch->num_rows());
 
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
@@ -109,6 +110,9 @@ FileWriter::~FileWriter() {}
   if (arr->length() == 0) {
     return ::arrow::Status::OK();
   }
+  assert(!::arrow::is_nested(field->type()->id()));
+  fmt::print(
+      "FileWriter::WritePrimitiveArray: field={} len={}\n", field->ToString(), arr->length());
 
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
@@ -157,6 +161,7 @@ FileWriter::~FileWriter() {}
   assert(field->fields().size() == 1);
   auto list_arr = std::static_pointer_cast<::arrow::ListArray>(arr);
   auto offset_arr = list_arr->offsets();
+  fmt::print("Write list array offsets: {}, len={}\n", field->name(), list_arr->length());
   ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, list_arr->offsets()));
   auto child_field = field->field(0);
   return WriteArray(child_field, list_arr->values());
@@ -170,6 +175,11 @@ FileWriter::~FileWriter() {}
   if (!field->dictionary()) {
     ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
   }
+  fmt::print("Writing dict: name={} type={} length={} dict(len)={}\n",
+             field->name(),
+             field->type()->ToString(),
+             arr->length(),
+             dict_arr->length());
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
   lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
