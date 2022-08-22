@@ -188,7 +188,7 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
                       length.value(),
                       length_));
     }
-    int64_t byte_length = length.value() / 8 + 1;
+    int64_t byte_length = ::arrow::bit_util::BytesForBits(length.value());
     ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
     return std::make_shared<::arrow::BooleanArray>(length.value(), buf);
   }
