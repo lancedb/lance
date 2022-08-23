@@ -73,8 +73,6 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::Write(const std::shared_ptr<::arrow::RecordBatch>& batch) {
   metadata_->AddBatchLength(batch->num_rows());
-  fmt::print("Write batch: len={}\n", batch->num_rows());
-
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
   }
@@ -110,10 +108,6 @@ FileWriter::~FileWriter() {}
   if (arr->length() == 0) {
     return ::arrow::Status::OK();
   }
-  assert(!::arrow::is_nested(field->type()->id()));
-  fmt::print(
-      "FileWriter::WritePrimitiveArray: field={} len={}\n", field->ToString(), arr->length());
-
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
   auto type = field->type();
@@ -160,26 +154,25 @@ FileWriter::~FileWriter() {}
   assert(field->logical_type() == "list" || field->logical_type() == "list.struct");
   assert(field->fields().size() == 1);
   auto list_arr = std::static_pointer_cast<::arrow::ListArray>(arr);
-  auto offset_arr = list_arr->offsets();
-  fmt::print("Write list array offsets: {}, len={}\n", field->name(), list_arr->length());
-  ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, list_arr->offsets()));
   auto child_field = field->field(0);
-  return WriteArray(child_field, list_arr->values());
+
+  ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, list_arr->offsets()));
+
+  auto start_offset = list_arr->value_offset(0);
+  auto last_offset = list_arr->value_offset(arr->length());
+  auto child_length = last_offset - start_offset;
+  return WriteArray(child_field,
+                    list_arr->values()->Slice(start_offset, child_length));
 }
 
 ::arrow::Status FileWriter::WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
                                                  const std::shared_ptr<::arrow::Array>& arr) {
   assert(field->logical_type().starts_with("dict:"));
   auto encoder = field->GetEncoder(destination_);
-  auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
   if (!field->dictionary()) {
     ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
   }
-  fmt::print("Writing dict: name={} type={} length={} dict(len)={}\n",
-             field->name(),
-             field->type()->ToString(),
-             arr->length(),
-             dict_arr->length());
   auto field_id = field->id();
   ARROW_ASSIGN_OR_RAISE(auto pos, encoder->Write(arr));
   lookup_table_.SetPageInfo(field_id, batch_id_, pos, arr->length());
