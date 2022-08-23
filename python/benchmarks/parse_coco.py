@@ -149,13 +149,14 @@ def _convert_segmentation(s):
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
 )
 @click.option("-f", "--fmt", type=str, help="Output format (parquet or lance)")
+@click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
 @click.option(
     "-o",
     "--output-path",
     type=str,
     help="Output path. Default is {base_uri}/coco_links.{fmt}",
 )
-def main(base_uri, version, fmt, output_path):
+def main(base_uri, version, fmt, embedded, output_path):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
     known_formats = ["lance", "parquet"]
@@ -165,7 +166,10 @@ def main(base_uri, version, fmt, output_path):
     else:
         fmt = known_formats
     for f in fmt:
-        return converter.save_df(df, f, output_path)
+        if embedded:
+            converter.make_embedded_dataset(df, f, output_path)
+        else:
+            return converter.save_df(df, f, output_path)
 
 
 if __name__ == "__main__":
