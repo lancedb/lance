@@ -18,6 +18,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -218,6 +219,8 @@ class Field final {
   int64_t dictionary_offset_ = -1;
   int64_t dictionary_page_length_ = 0;
   std::shared_ptr<::arrow::Array> dictionary_;
+
+  std::mutex lock_;
 
   friend class FieldVisitor;
   friend class ToArrowVisitor;

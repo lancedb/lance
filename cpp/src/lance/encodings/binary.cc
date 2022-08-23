@@ -35,17 +35,18 @@ VarBinaryEncoder::VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> ou
 Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array> data) {
   ARROW_ASSIGN_OR_RAISE(auto start_offset, out_->Tell());
   auto arr = std::static_pointer_cast<::arrow::BinaryArray>(data);
-  ARROW_RETURN_NOT_OK(out_->Write(arr->value_data()));
+  auto bytes = arr->value_offset(arr->length()) - arr->value_offset(0);
+  ARROW_RETURN_NOT_OK(out_->Write(arr->raw_data(), bytes));
 
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
-  offsetBuilder_.Reset();
+  offsets_builder_.Reset();
   assert(arr->length() > 0);
-  for (int64_t i = 0; i < arr->length(); ++i) {
-    ARROW_RETURN_NOT_OK(offsetBuilder_.Append(start_offset + arr->value_offset(i)));
+  for (int64_t i = 0; i <= arr->length(); ++i) {
+    ARROW_RETURN_NOT_OK(offsets_builder_.Append(start_offset + arr->value_offset(i)));
   }
-  ARROW_RETURN_NOT_OK(offsetBuilder_.Append(offsets_position));
-  ARROW_RETURN_NOT_OK(offsetBuilder_.Finish(&offsetsArr));
-  ARROW_RETURN_NOT_OK(out_->Write(offsetsArr->values()));
+  ARROW_RETURN_NOT_OK(offsets_builder_.Finish(&offsets_));
+
+  ARROW_RETURN_NOT_OK(out_->Write(offsets_->values()));
   return offsets_position;
 }
 

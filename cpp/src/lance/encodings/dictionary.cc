@@ -33,7 +33,7 @@ DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> 
 
 ::arrow::Result<int64_t> DictionaryEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
   assert(::arrow::is_dictionary(arr->type_id()));
-  auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
   return plain_encoder_->Write(dict_arr->indices());
 }
 

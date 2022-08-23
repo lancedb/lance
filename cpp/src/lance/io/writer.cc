@@ -15,6 +15,7 @@
 #include "lance/io/writer.h"
 
 #include <arrow/array.h>
+#include <arrow/compute/exec.h>
 #include <arrow/dataset/file_base.h>
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
@@ -73,7 +74,6 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::Write(const std::shared_ptr<::arrow::RecordBatch>& batch) {
   metadata_->AddBatchLength(batch->num_rows());
-
   for (const auto& field : lance_schema_->fields()) {
     ARROW_RETURN_NOT_OK(WriteArray(field, batch->GetColumnByName(field->name())));
   }
@@ -106,10 +106,6 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
                                                 const std::shared_ptr<::arrow::Array>& arr) {
-  if (arr->length() == 0) {
-    return ::arrow::Status::OK();
-  }
-
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
   auto type = field->type();
@@ -156,17 +152,25 @@ FileWriter::~FileWriter() {}
   assert(field->logical_type() == "list" || field->logical_type() == "list.struct");
   assert(field->fields().size() == 1);
   auto list_arr = std::static_pointer_cast<::arrow::ListArray>(arr);
-  auto offset_arr = list_arr->offsets();
-  ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, list_arr->offsets()));
   auto child_field = field->field(0);
-  return WriteArray(child_field, list_arr->values());
+
+  ARROW_ASSIGN_OR_RAISE(
+      auto offsets_datum,
+      ::arrow::compute::CallFunction(
+          "subtract", {list_arr->offsets(), list_arr->offsets()->GetScalar(0).ValueOrDie()}));
+  ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, offsets_datum.make_array()));
+
+  auto start_offset = list_arr->value_offset(0);
+  auto last_offset = list_arr->value_offset(arr->length());
+  auto child_length = last_offset - start_offset;
+  return WriteArray(child_field, list_arr->values()->Slice(start_offset, child_length));
 }
 
 ::arrow::Status FileWriter::WriteDictionaryArray(const std::shared_ptr<format::Field>& field,
                                                  const std::shared_ptr<::arrow::Array>& arr) {
   assert(field->logical_type().starts_with("dict:"));
   auto encoder = field->GetEncoder(destination_);
-  auto dict_arr = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
   if (!field->dictionary()) {
     ARROW_RETURN_NOT_OK(field->set_dictionary(dict_arr->dictionary()));
   }
