@@ -1,16 +1,13 @@
 #!/usr/bin/env python
 """Parse coco dataset"""
-import click
 import json
 import os
 
+import click
 import pandas as pd
 import pyarrow as pa
-import pyarrow.fs
-import pyarrow.parquet as pq
 
-import lance
-from bench_utils import download_uris, DatasetConverter
+from bench_utils import DatasetConverter
 
 
 class CocoConverter(DatasetConverter):
@@ -91,7 +88,7 @@ class CocoConverter(DatasetConverter):
             pa.utf8(),
             pa.utf8(),
             pa.int64(),
-            pa.utf8(),
+            pa.dictionary(pa.uint8(), pa.utf8()),
             pa.utf8(),
             self._ann_schema(),
         ]
@@ -126,12 +123,12 @@ class CocoConverter(DatasetConverter):
         types = [
             segmentation_type,
             pa.float64(),
-            pa.int8(),
+            pa.bool(),
             pa.list_(pa.float32()),
             pa.int16(),
             pa.int64(),
-            pa.utf8(),
-            pa.utf8(),
+            pa.dictionary(pa.uint8(), pa.utf8()),
+            pa.dictionary(pa.uint8(), pa.utf8()),
         ]
         schema = pa.list_(
             pa.struct([pa.field(name, dtype) for name, dtype in zip(names, types)])
