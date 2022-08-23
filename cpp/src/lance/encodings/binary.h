@@ -58,8 +58,8 @@ class VarBinaryEncoder : public Encoder {
   std::string ToString() const override { return "Encoder(type=VarBinary)"; }
 
  private:
-  ::arrow::TypeTraits<OffsetType>::BuilderType offsetBuilder_;
-  std::shared_ptr<::arrow::TypeTraits<OffsetType>::ArrayType> offsetsArr;
+  ::arrow::TypeTraits<OffsetType>::BuilderType offsets_builder_;
+  std::shared_ptr<::arrow::TypeTraits<OffsetType>::ArrayType> offsets_;
 };
 
 /// Decode for Var-length binary encoding.
