@@ -41,11 +41,12 @@ Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array> da
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
   offsetBuilder_.Reset();
   assert(arr->length() > 0);
-  for (int64_t i = 0; i < arr->length(); ++i) {
+  for (int64_t i = 0; i <= arr->length(); ++i) {
     ARROW_RETURN_NOT_OK(offsetBuilder_.Append(start_offset + arr->value_offset(i)));
   }
-  ARROW_RETURN_NOT_OK(offsetBuilder_.Append(offsets_position));
   ARROW_RETURN_NOT_OK(offsetBuilder_.Finish(&offsetsArr));
+  assert(offsetsArr->length() == arr->length() + 1);
+  assert(offsetsArr->values()->size() == arr->value_offset(arr->length()) - arr->value_offset(0));
   ARROW_RETURN_NOT_OK(out_->Write(offsetsArr->values()));
   return offsets_position;
 }

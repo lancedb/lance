@@ -248,8 +248,13 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
     auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
     if (!dictionary()) {
-      /// Fetch dictionary on demand?
-      ARROW_RETURN_NOT_OK(LoadDictionary(infile));
+      {
+        std::scoped_lock lock(lock_);
+        if (!dictionary()) {
+          /// Fetch dictionary on demand?
+          ARROW_RETURN_NOT_OK(LoadDictionary(infile));
+        }
+      }
     }
     decoder =
         std::make_shared<lance::encodings::DictionaryDecoder>(infile, dict_type, dictionary());
