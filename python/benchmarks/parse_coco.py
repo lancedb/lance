@@ -26,6 +26,7 @@ class CocoConverter(DatasetConverter):
     def _instances_to_df(self, split, instances_json):
         df = pd.DataFrame(instances_json["annotations"])
         df["segmentation"] = df.segmentation.apply(_convert_segmentation)
+        df["iscrowd"] = df.iscrowd.astype("bool")
         category_df = pd.DataFrame(instances_json["categories"]).rename(
             {"id": "category_id"}, axis=1
         )
@@ -123,7 +124,7 @@ class CocoConverter(DatasetConverter):
         types = [
             segmentation_type,
             pa.float64(),
-            pa.bool(),
+            pa.bool_(),
             pa.list_(pa.float32()),
             pa.int16(),
             pa.int64(),

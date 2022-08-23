@@ -219,7 +219,7 @@ class DatasetConverter(ABC):
 
     def save_df(self, df, fmt="lance", output_path=None):
         output_path = output_path or self.default_dataset_path(fmt, "links")
-        table = pa.Table.from_pandas(df, self.get_schema())
+        table = pa.Table.from_pandas(df, self.get_schema()).unify_dictionaries()
         if fmt == "parquet":
             pq.write_table(table, output_path)
         elif fmt == "lance":
