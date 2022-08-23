@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 #  Copyright (c) 2022. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +17,7 @@ import multiprocessing as mp
 import os
 import pathlib
 from typing import Iterable
+import click
 
 import numpy as np
 import pandas as pd
@@ -171,3 +173,24 @@ def _get_xml(uri):
             return dd
     except Exception:
         return {}
+
+
+@click.command
+@click.option("-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root")
+@click.option("-f", "--fmt", type=click.Choice(["parquet", "lance"]), help="Output format (parquet or lance)")
+@click.option("-o", "--output", type=str, default="oxford_pet.lance", help="Output path")
+def main(base_uri, fmt, output):
+    known_formats = ["lance", "parquet"]
+    if fmt is not None:
+        assert fmt in known_formats
+        fmt = [fmt]
+    else:
+        fmt = known_formats
+    converter = OxfordPetConverter(base_uri)
+    df = converter.read_metadata()
+    for f in fmt:
+        converter.make_embedded_dataset(df, f, output_path=output)
+
+
+if __name__ == "__main__":
+    main()
