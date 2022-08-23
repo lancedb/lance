@@ -16,6 +16,7 @@
 import multiprocessing as mp
 import os
 import pathlib
+import sys
 from typing import Iterable
 import click
 
@@ -133,18 +134,27 @@ class OxfordPetConverter(DatasetConverter):
             pa.field("ymax", pa.int32()),
         ])
         object_schema = pa.list_(pa.struct([
-            pa.field("name", pa.string()),
-            pa.field("pose", pa.string()),
-            pa.field("truncated", pa.uint8()),
-            pa.field("occluded", pa.uint8()),
+            pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
+            pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
+            pa.field("truncated", pa.bool_()),
+            pa.field("occluded", pa.bool_()),
             pa.field("bndbox", bbox),
             pa.field("difficult", pa.uint8())
         ]))
         names = ["filename", "class", "species", "breed", "split",
                  "folder", "source", "size", "segmented", "object"]
-        types = [pa.string(), pa.string(), pa.string(), pa.int16(),
-                 pa.string(), pa.string(), source_schema, size_schema,
-                 pa.uint8(), object_schema]
+        types = [
+            pa.string(),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.int16(),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.string(),
+            source_schema,
+            size_schema,
+            pa.uint8(),
+            object_schema
+        ]
         return pa.schema([pa.field(name, dtype)
                           for name, dtype in zip(names, types)])
 
@@ -161,8 +171,8 @@ def _get_xml(uri):
             sz['height'] = int(sz['height'])
             sz['depth'] = int(sz['depth'])
             for obj in dd['object']:
-                obj['truncated'] = int(obj['truncated'])
-                obj['occluded'] = int(obj['occluded'])
+                obj['truncated'] = bool(int(obj['truncated']))
+                obj['occluded'] = bool(int(obj['occluded']))
                 obj['difficult'] = int(obj['difficult'])
                 obj['bndbox'] = {
                     'xmin': int(obj['bndbox']['xmin']),
