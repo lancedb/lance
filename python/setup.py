@@ -59,7 +59,7 @@ long_description = (this_directory / "README.md").read_text()
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pylance",
-    version="0.0.3",
+    version="0.0.4",
     author="Lance Developers",
     author_email="contact@eto.ai",
     description="Python extension for lance",
