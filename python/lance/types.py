@@ -33,11 +33,6 @@ class LanceType(pa.ExtensionType, ABC):
     pass
 
 
-# Pandas extension type
-class LanceDtype(pd.api.extensions.ExtensionDtype, ABC):
-    pass
-
-
 class ImageType(LanceType):
 
     URI_TYPE = "uri"
@@ -52,13 +47,14 @@ class ImageType(LanceType):
             storage_type = pa.binary()
         else:
             raise NotImplementedError(
-                "Lance ImageType must be either 'uri' or 'binary'")
+                "Lance ImageType must be either 'uri' or 'binary'"
+            )
         return storage_type
 
     def __init__(self, image_type=URI_TYPE):
         self._image_type = image_type
         storage_type = ImageType.get_storage_type(image_type)
-        super(ImageType, self).__init__(storage_type, f'lance.image[{image_type}]')
+        super(ImageType, self).__init__(storage_type, f"image[{image_type}]")
 
     @property
     def image_type(self):
@@ -72,20 +68,17 @@ class ImageType(LanceType):
         serialized = serialized.decode()
         assert serialized.startswith("image_type=")
         image_type = serialized.split("=")[1]
-        assert image_type == cls.URI_TYPE or image_type == cls.BINARY_TYPE
+        assert image_type in (cls.URI_TYPE, cls.BINARY_TYPE)
         return ImageType(image_type)
 
 
 # TODO turn these into fixed sized list arrays once GH#101 is done
 class Point2dType(LanceType):
-
     def __init__(self):
-        super(Point2dType, self).__init__(
-            pa.list_(pa.float64()),
-            'lance.point2d')
+        super(Point2dType, self).__init__(pa.list_(pa.float64()), "point2d")
 
     def __arrow_ext_serialize__(self):
-        return b''
+        return b""
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
@@ -94,14 +87,11 @@ class Point2dType(LanceType):
 
 # TODO turn these into fixed sized list arrays once GH#101 is done
 class Box2dType(LanceType):
-
     def __init__(self):
-        super(Box2dType, self).__init__(
-            pa.list_(pa.float64()),
-            'lance.box2d')
+        super(Box2dType, self).__init__(pa.list_(pa.float64()), "box2d")
 
     def __arrow_ext_serialize__(self):
-        return b''
+        return b""
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
@@ -117,4 +107,3 @@ def register_extension_types():
     except ArrowKeyError:
         # already registered
         pass
-    
