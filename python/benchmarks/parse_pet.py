@@ -139,7 +139,7 @@ class OxfordPetConverter(DatasetConverter):
             pa.field("truncated", pa.bool_()),
             pa.field("occluded", pa.bool_()),
             pa.field("bndbox", bbox),
-            pa.field("difficult", pa.uint8())
+            pa.field("difficult", pa.bool_())
         ]))
         names = ["filename", "class", "species", "breed", "split",
                  "folder", "source", "size", "segmented", "object"]
@@ -173,7 +173,7 @@ def _get_xml(uri):
             for obj in dd['object']:
                 obj['truncated'] = bool(int(obj['truncated']))
                 obj['occluded'] = bool(int(obj['occluded']))
-                obj['difficult'] = int(obj['difficult'])
+                obj['difficult'] = bool(int(obj['difficult']))
                 obj['bndbox'] = {
                     'xmin': int(obj['bndbox']['xmin']),
                     'xmax': int(obj['bndbox']['xmax']),
@@ -188,8 +188,9 @@ def _get_xml(uri):
 @click.command
 @click.option("-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root")
 @click.option("-f", "--fmt", type=click.Choice(["parquet", "lance"]), help="Output format (parquet or lance)")
+@click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
 @click.option("-o", "--output", type=str, default="oxford_pet.lance", help="Output path")
-def main(base_uri, fmt, output):
+def main(base_uri, fmt, embedded, output):
     known_formats = ["lance", "parquet"]
     if fmt is not None:
         assert fmt in known_formats
@@ -199,7 +200,10 @@ def main(base_uri, fmt, output):
     converter = OxfordPetConverter(base_uri)
     df = converter.read_metadata()
     for f in fmt:
-        converter.make_embedded_dataset(df, f, output_path=output)
+        if embedded:
+            converter.make_embedded_dataset(df, f, output_path=output)
+        else:
+            converter.save_df(df, f, output_path=output)
 
 
 if __name__ == "__main__":
