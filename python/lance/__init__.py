@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import platform
 from pathlib import Path
-from typing import Union, Optional
+from typing import Optional, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
-from lance.lib import LanceFileFormat, WriteTable, BuildScanner
+
+from lance.lib import BuildScanner, LanceFileFormat, WriteTable
+from lance.types import register_extension_types
+
+if platform.system() == "Linux":
+    # TODO enable on MacOS
+    register_extension_types()
 
 __all__ = ["dataset", "write_table", "scanner"]
 

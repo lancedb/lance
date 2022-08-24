@@ -1,20 +1,33 @@
 # distutils: language = c++
 
-from typing import Union, Optional
+from typing import Optional, Union
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr
 from libcpp.string cimport string
+
 from pathlib import Path
+
 from pyarrow import Table
-from pyarrow._dataset cimport FileFormat, CScanner, CDataset, Dataset
+
+from pyarrow._dataset cimport CDataset, CScanner, Dataset, FileFormat
+
 from pyarrow._dataset import Scanner
-from pyarrow.includes.common cimport *
+
 from pyarrow._compute cimport Expression, _bind
-from pyarrow.includes.libarrow cimport CTable, COutputStream
+from pyarrow.includes.common cimport *
+from pyarrow.includes.libarrow cimport COutputStream, CTable
 from pyarrow.includes.libarrow_dataset cimport CFileFormat
-from pyarrow.lib cimport GetResultValue, check_status, pyarrow_unwrap_table, get_writer, RecordBatchReader, CExpression
+from pyarrow.lib cimport (
+    CExpression,
+    GetResultValue,
+    RecordBatchReader,
+    check_status,
+    get_writer,
+    pyarrow_unwrap_table,
+)
+
 from pyarrow.lib import tobytes
 
 
