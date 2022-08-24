@@ -17,11 +17,14 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
-from lance import write_table, dataset
+
+from lance import dataset, write_table
 
 
 def test_simple_round_trips(tmp_path: Path):
-    table = pa.Table.from_pandas(pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]}))
+    table = pa.Table.from_pandas(
+        pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]})
+    )
     write_table(table, tmp_path / "test.lance")
 
     assert (tmp_path / "test.lance").exists()
@@ -29,7 +32,7 @@ def test_simple_round_trips(tmp_path: Path):
     ds = dataset(str(tmp_path / "test.lance"))
     actual = ds.to_table()
 
-    assert (table == actual)
+    assert table == actual
 
 
 def test_write_categorical_values(tmp_path: Path):
@@ -41,4 +44,4 @@ def test_write_categorical_values(tmp_path: Path):
     assert (tmp_path / "test.lance").exists()
 
     actual = dataset(str(tmp_path / "test.lance")).to_table()
-    assert (table == actual)
+    assert table == actual

@@ -18,13 +18,16 @@
 from pathlib import Path
 
 import duckdb
-import lance
 import pandas as pd
 import pyarrow as pa
 
+import lance
+
 
 def test_dictionary_type_query(tmp_path: Path):
-    df = pd.DataFrame({"class": ["foo", "bar", "foo", "zoo"], "grade": ["A", "B", "B", "A"]})
+    df = pd.DataFrame(
+        {"class": ["foo", "bar", "foo", "zoo"], "grade": ["A", "B", "B", "A"]}
+    )
     # df["class"] = df["class"].astype("category")
     # df["grade"] = df["grade"].astype("category")
 
