@@ -17,7 +17,7 @@ import pathlib
 from abc import ABC, abstractmethod
 from functools import wraps
 import multiprocessing as mp
-from typing import Iterable
+from typing import Iterable, Union
 
 import click
 import pandas as pd
@@ -219,7 +219,7 @@ class DatasetConverter(ABC):
 
     def save_df(self, df, fmt="lance", output_path=None):
         output_path = output_path or self.default_dataset_path(fmt, "links")
-        table = pa.Table.from_pandas(df, self.get_schema())
+        table = pa.Table.from_pandas(df, self.get_schema()).unify_dictionaries()
         if fmt == "parquet":
             pq.write_table(table, output_path)
         elif fmt == "lance":
@@ -231,8 +231,11 @@ class DatasetConverter(ABC):
         pass
 
     def make_embedded_dataset(
-        self, table: pa.Table, fmt="lance", output_path=None, **kwargs
+        self, table: Union[pa.Table | pd.DataFrame], fmt="lance", output_path=None, **kwargs
     ):
+        if isinstance(table, pd.DataFrame):
+            table = pa.Table.from_pandas(table, self.get_schema())
+        table = table.unify_dictionaries()
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))

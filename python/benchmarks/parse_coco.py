@@ -1,16 +1,13 @@
 #!/usr/bin/env python
 """Parse coco dataset"""
-import click
 import json
 import os
 
+import click
 import pandas as pd
 import pyarrow as pa
-import pyarrow.fs
-import pyarrow.parquet as pq
 
-import lance
-from bench_utils import download_uris, DatasetConverter
+from bench_utils import DatasetConverter
 
 
 class CocoConverter(DatasetConverter):
@@ -29,6 +26,7 @@ class CocoConverter(DatasetConverter):
     def _instances_to_df(self, split, instances_json):
         df = pd.DataFrame(instances_json["annotations"])
         df["segmentation"] = df.segmentation.apply(_convert_segmentation)
+        df["iscrowd"] = df.iscrowd.astype("bool")
         category_df = pd.DataFrame(instances_json["categories"]).rename(
             {"id": "category_id"}, axis=1
         )
@@ -91,7 +89,7 @@ class CocoConverter(DatasetConverter):
             pa.utf8(),
             pa.utf8(),
             pa.int64(),
-            pa.utf8(),
+            pa.dictionary(pa.uint8(), pa.utf8()),
             pa.utf8(),
             self._ann_schema(),
         ]
@@ -126,12 +124,12 @@ class CocoConverter(DatasetConverter):
         types = [
             segmentation_type,
             pa.float64(),
-            pa.int8(),
+            pa.bool_(),
             pa.list_(pa.float32()),
             pa.int16(),
             pa.int64(),
-            pa.utf8(),
-            pa.utf8(),
+            pa.dictionary(pa.uint8(), pa.utf8()),
+            pa.dictionary(pa.uint8(), pa.utf8()),
         ]
         schema = pa.list_(
             pa.struct([pa.field(name, dtype) for name, dtype in zip(names, types)])
@@ -151,13 +149,14 @@ def _convert_segmentation(s):
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
 )
 @click.option("-f", "--fmt", type=str, help="Output format (parquet or lance)")
+@click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
 @click.option(
     "-o",
     "--output-path",
     type=str,
     help="Output path. Default is {base_uri}/coco_links.{fmt}",
 )
-def main(base_uri, version, fmt, output_path):
+def main(base_uri, version, fmt, embedded, output_path):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
     known_formats = ["lance", "parquet"]
@@ -167,7 +166,10 @@ def main(base_uri, version, fmt, output_path):
     else:
         fmt = known_formats
     for f in fmt:
-        return converter.save_df(df, f, output_path)
+        if embedded:
+            converter.make_embedded_dataset(df, f, output_path)
+        else:
+            return converter.save_df(df, f, output_path)
 
 
 if __name__ == "__main__":

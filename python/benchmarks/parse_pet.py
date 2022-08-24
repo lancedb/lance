@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 #  Copyright (c) 2022. Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +16,9 @@
 import multiprocessing as mp
 import os
 import pathlib
+import sys
 from typing import Iterable
+import click
 
 import numpy as np
 import pandas as pd
@@ -131,18 +134,27 @@ class OxfordPetConverter(DatasetConverter):
             pa.field("ymax", pa.int32()),
         ])
         object_schema = pa.list_(pa.struct([
-            pa.field("name", pa.string()),
-            pa.field("pose", pa.string()),
-            pa.field("truncated", pa.uint8()),
-            pa.field("occluded", pa.uint8()),
+            pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
+            pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
+            pa.field("truncated", pa.bool_()),
+            pa.field("occluded", pa.bool_()),
             pa.field("bndbox", bbox),
-            pa.field("difficult", pa.uint8())
+            pa.field("difficult", pa.bool_())
         ]))
         names = ["filename", "class", "species", "breed", "split",
                  "folder", "source", "size", "segmented", "object"]
-        types = [pa.string(), pa.string(), pa.string(), pa.int16(),
-                 pa.string(), pa.string(), source_schema, size_schema,
-                 pa.uint8(), object_schema]
+        types = [
+            pa.string(),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.int16(),
+            pa.dictionary(pa.uint8(), pa.string()),
+            pa.string(),
+            source_schema,
+            size_schema,
+            pa.uint8(),
+            object_schema
+        ]
         return pa.schema([pa.field(name, dtype)
                           for name, dtype in zip(names, types)])
 
@@ -159,9 +171,9 @@ def _get_xml(uri):
             sz['height'] = int(sz['height'])
             sz['depth'] = int(sz['depth'])
             for obj in dd['object']:
-                obj['truncated'] = int(obj['truncated'])
-                obj['occluded'] = int(obj['occluded'])
-                obj['difficult'] = int(obj['difficult'])
+                obj['truncated'] = bool(int(obj['truncated']))
+                obj['occluded'] = bool(int(obj['occluded']))
+                obj['difficult'] = bool(int(obj['difficult']))
                 obj['bndbox'] = {
                     'xmin': int(obj['bndbox']['xmin']),
                     'xmax': int(obj['bndbox']['xmax']),
@@ -171,3 +183,28 @@ def _get_xml(uri):
             return dd
     except Exception:
         return {}
+
+
+@click.command
+@click.option("-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root")
+@click.option("-f", "--fmt", type=click.Choice(["parquet", "lance"]), help="Output format (parquet or lance)")
+@click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
+@click.option("-o", "--output", type=str, default="oxford_pet.lance", help="Output path")
+def main(base_uri, fmt, embedded, output):
+    known_formats = ["lance", "parquet"]
+    if fmt is not None:
+        assert fmt in known_formats
+        fmt = [fmt]
+    else:
+        fmt = known_formats
+    converter = OxfordPetConverter(base_uri)
+    df = converter.read_metadata()
+    for f in fmt:
+        if embedded:
+            converter.make_embedded_dataset(df, f, output_path=output)
+        else:
+            converter.save_df(df, f, output_path=output)
+
+
+if __name__ == "__main__":
+    main()
