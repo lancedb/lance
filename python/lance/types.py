@@ -23,7 +23,7 @@ import pandas as pd
 import pyarrow as pa
 
 
-__all__ = ["ImageUriType", "ImageBinaryType", "Point2dType", "Box2dType"]
+__all__ = ["ImageType", "ImageUriType", "ImageBinaryType", "Point2dType", "Box2dType"]
 
 
 # Arrow extension type
@@ -46,6 +46,15 @@ class ImageType(LanceType):
 
     def __arrow_ext_serialize__(self):
         return b""
+
+    @classmethod
+    def from_storage(cls, storage_type):
+        if storage_type == pa.utf8():
+            return ImageUriType()
+        elif storage_type in (pa.binary(), pa.large_binary()):
+            return ImageBinaryType()
+        else:
+            raise NotImplementedError(f"Unrecognized image storage type {storage_type}")
 
 
 class ImageUriType(ImageType):

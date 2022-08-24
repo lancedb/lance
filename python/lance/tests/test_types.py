@@ -11,9 +11,9 @@ from lance.types import *
     platform.system() == "Darwin", reason="Extension types only work on Linux right now"
 )
 def test_image(tmp_path):
-    image_type = ImageUriType()
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
+    image_type = ImageType.from_storage(storage.type)
     _test_extension_rt(tmp_path, image_type, storage)
 
 
@@ -21,9 +21,9 @@ def test_image(tmp_path):
     platform.system() == "Darwin", reason="Extension types only work on Linux right now"
 )
 def test_image_binary(tmp_path):
-    image_type = ImageBinaryType()
     data = [b"<imagebytes>" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
+    image_type = ImageType.from_storage(storage.type)
     _test_extension_rt(tmp_path, image_type, storage)
 
 
