@@ -5,8 +5,15 @@ from lance.types import *
 
 
 def test_image(tmp_path):
-    image_type = ImageType('uri')
-    data = [f's3://bucket/{x}.jpg' for x in ['a', 'b', 'c']]
+    image_type = ImageUriType()
+    data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
+    storage = pa.StringArray.from_pandas(data)
+    _test_extension_rt(tmp_path, image_type, storage)
+
+
+def test_image_binary(tmp_path):
+    image_type = ImageBinaryType()
+    data = [b"<imagebytes>" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
     _test_extension_rt(tmp_path, image_type, storage)
 
@@ -27,8 +34,8 @@ def test_box2d(tmp_path):
 
 def _test_extension_rt(tmp_path, ext_type, storage_arr):
     arr = pa.ExtensionArray.from_storage(ext_type, storage_arr)
-    table = pa.Table.from_arrays([arr], names=['ext'])
-    lance.write_table(table, str(tmp_path/'test.lance'))
-    table = lance.dataset(str(tmp_path/'test.lance')).to_table()
-    assert table['ext'].type == ext_type
-    assert table['ext'].to_pylist() == storage_arr.to_pylist()
+    table = pa.Table.from_arrays([arr], names=["ext"])
+    lance.write_table(table, str(tmp_path / "test.lance"))
+    table = lance.dataset(str(tmp_path / "test.lance")).to_table()
+    assert table["ext"].type == ext_type
+    assert table["ext"].to_pylist() == storage_arr.to_pylist()

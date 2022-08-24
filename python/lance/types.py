@@ -15,14 +15,14 @@
 """
 Arrow extension types for Lance
 """
-from abc import ABC
+from abc import ABC, abstractproperty
 
 import pandas as pd
 
 import pyarrow as pa
 
 
-__all__ = ["ImageType", "Point2dType", "Box2dType"]
+__all__ = ["ImageUriType", "ImageBinaryType", "Point2dType", "Box2dType"]
 
 
 # Arrow extension type
@@ -34,42 +34,38 @@ class LanceType(pa.ExtensionType, ABC):
 
 
 class ImageType(LanceType):
-
-    URI_TYPE = "uri"
-    BINARY_TYPE = "binary"
-    # TODO support Tensor type?
-
-    @classmethod
-    def get_storage_type(cls, image_type):
-        if image_type == ImageType.URI_TYPE:
-            storage_type = pa.utf8()
-        elif image_type == ImageType.BINARY_TYPE:
-            storage_type = pa.binary()
-        else:
-            raise NotImplementedError(
-                "Lance ImageType must be either 'uri' or 'binary'"
-            )
-        return storage_type
-
-    def __init__(self, image_type=URI_TYPE):
-        self._image_type = image_type
-        storage_type = ImageType.get_storage_type(image_type)
-        super(ImageType, self).__init__(storage_type, f"image[{image_type}]")
-
-    @property
-    def image_type(self):
-        return self._image_type
+    @abstractproperty
+    def storage_type(self):
+        pass
 
     def __arrow_ext_serialize__(self):
-        return f"image_type={self.image_type}".encode()
+        return b""
+
+
+class ImageUriType(ImageType):
+    @property
+    def storage_type(self):
+        return pa.utf8()
+
+    def __init__(self):
+        super(ImageUriType, self).__init__(self.storage_type, "image[uri]")
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
-        serialized = serialized.decode()
-        assert serialized.startswith("image_type=")
-        image_type = serialized.split("=")[1]
-        assert image_type in (cls.URI_TYPE, cls.BINARY_TYPE)
-        return ImageType(image_type)
+        return ImageUriType()
+
+
+class ImageBinaryType(ImageType):
+    @property
+    def storage_type(self):
+        return pa.binary()
+
+    def __init__(self):
+        super(ImageBinaryType, self).__init__(self.storage_type, "image[binary]")
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return ImageBinaryType()
 
 
 # TODO turn these into fixed sized list arrays once GH#101 is done
@@ -100,8 +96,8 @@ class Box2dType(LanceType):
 
 def register_extension_types():
     try:
-        pa.register_extension_type(ImageType(ImageType.URI_TYPE))
-        pa.register_extension_type(ImageType(ImageType.BINARY_TYPE))
+        pa.register_extension_type(ImageUriType())
+        pa.register_extension_type(ImageBinaryType())
         pa.register_extension_type(Point2dType())
         pa.register_extension_type(Box2dType())
     except ArrowKeyError:
