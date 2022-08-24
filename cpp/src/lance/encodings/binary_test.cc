@@ -102,3 +102,31 @@ TEST_CASE("Take") {
   auto expected = lance::arrow::ToArray({"5", "10", "20"}).ValueOrDie();
   CHECK(expected->Equals(actual));
 }
+
+TEST_CASE("Write slices of binary array") {
+  auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+
+  std::vector<std::string> words;
+  for (int i = 0; i < 100; i++) {
+    words.emplace_back(fmt::format("number-{}", i));
+  }
+  auto arr = lance::arrow::ToArray(words).ValueOrDie();
+  std::vector<int64_t> offsets;
+  for (int i = 0; i < 100; i += 10) {
+    auto slice = std::dynamic_pointer_cast<::StringArray>(arr->Slice(i, 10));
+    offsets.emplace_back(WriteStrings(out, slice));
+  }
+
+  auto buf = out->Finish().ValueOrDie();
+  auto infile = make_shared<arrow::io::BufferReader>(buf);
+
+  std::vector<std::shared_ptr<::arrow::Array>> chunks;
+  for (auto& offset : offsets) {
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, ::arrow::utf8());
+    decoder.Reset(offset, 10);
+    chunks.emplace_back(decoder.ToArray().ValueOrDie());
+  }
+  auto chunked_arr = ::arrow::ChunkedArray(chunks);
+  INFO("Chunk: " << chunked_arr.ToString() << " Expected: {}" << arr->ToString());
+  CHECK(chunked_arr.Equals(::arrow::ChunkedArray(arr)));
+};

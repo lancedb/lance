@@ -32,7 +32,7 @@ class DictionaryEncoder : public Encoder {
 
   virtual ~DictionaryEncoder() = default;
 
-  ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) override;
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   /// Write value array.
   ///

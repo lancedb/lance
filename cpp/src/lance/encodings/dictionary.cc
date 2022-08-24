@@ -31,7 +31,7 @@ namespace lance::encodings {
 DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out)
     : Encoder(out), plain_encoder_(std::make_unique<PlainEncoder>(out)) {}
 
-::arrow::Result<int64_t> DictionaryEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
+::arrow::Result<int64_t> DictionaryEncoder::Write(const std::shared_ptr<::arrow::Array>& arr) {
   assert(::arrow::is_dictionary(arr->type_id()));
   auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
   return plain_encoder_->Write(dict_arr->indices());
