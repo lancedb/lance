@@ -35,14 +35,16 @@ VarBinaryEncoder::VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> ou
 Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& data) {
   ARROW_ASSIGN_OR_RAISE(auto start_offset, out_->Tell());
   auto arr = std::static_pointer_cast<::arrow::BinaryArray>(data);
-  auto bytes = arr->value_offset(arr->length()) - arr->value_offset(0);
-  ARROW_RETURN_NOT_OK(out_->Write(arr->raw_data(), bytes));
+  typename ::arrow::BinaryArray::offset_type len;
+  auto pos = arr->GetValue(0, &len);
+  auto first_offset = arr->value_offset(0);
+  auto bytes = arr->value_offset(arr->length()) - first_offset;
+  ARROW_RETURN_NOT_OK(out_->Write(pos, bytes));
 
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
   offsets_builder_.Reset();
   assert(arr->length() > 0);
   /// Reset the slice's first offset to zero.
-  auto first_offset = arr->value_offset(0);
   for (int64_t i = 0; i <= arr->length(); ++i) {
     ARROW_RETURN_NOT_OK(
         offsets_builder_.Append(start_offset + arr->value_offset(i) - first_offset));

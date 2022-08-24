@@ -119,4 +119,14 @@ TEST_CASE("Write slices of binary array") {
 
   auto buf = out->Finish().ValueOrDie();
   auto infile = make_shared<arrow::io::BufferReader>(buf);
+
+  std::vector<std::shared_ptr<::arrow::Array>> chunks;
+  for (auto& offset : offsets) {
+    VarBinaryDecoder<::arrow::StringType> decoder(infile, ::arrow::utf8());
+    decoder.Reset(offset, 10);
+    chunks.emplace_back(decoder.ToArray().ValueOrDie());
+  }
+  auto chunked_arr = ::arrow::ChunkedArray(chunks);
+  INFO("Chunk: " << chunked_arr.ToString() << " Expected: {}" << arr->ToString());
+  CHECK(chunked_arr.Equals(::arrow::ChunkedArray(arr)));
 };
