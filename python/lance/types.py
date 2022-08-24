@@ -110,6 +110,8 @@ class Box2dType(LanceType):
 
 
 def register_extension_types():
+    if platform.system() != "Linux":
+        pass
     try:
         pa.register_extension_type(ImageUriType())
         pa.register_extension_type(ImageBinaryType())
