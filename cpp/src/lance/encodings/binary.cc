@@ -32,7 +32,7 @@ namespace lance::encodings {
 VarBinaryEncoder::VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out) noexcept
     : Encoder(out) {}
 
-Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array> data) {
+Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& data) {
   ARROW_ASSIGN_OR_RAISE(auto start_offset, out_->Tell());
   auto arr = std::static_pointer_cast<::arrow::BinaryArray>(data);
   auto bytes = arr->value_offset(arr->length()) - arr->value_offset(0);
@@ -41,12 +41,18 @@ Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array> da
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
   offsets_builder_.Reset();
   assert(arr->length() > 0);
+  /// Reset the slice's first offset to zero.
+  auto first_offset = arr->value_offset(0);
   for (int64_t i = 0; i <= arr->length(); ++i) {
-    ARROW_RETURN_NOT_OK(offsets_builder_.Append(start_offset + arr->value_offset(i)));
+    ARROW_RETURN_NOT_OK(
+        offsets_builder_.Append(start_offset + arr->value_offset(i) - first_offset));
   }
   ARROW_RETURN_NOT_OK(offsets_builder_.Finish(&offsets_));
+  assert(offsets_->Value(0) == start_offset);
 
-  ARROW_RETURN_NOT_OK(out_->Write(offsets_->values()));
+  ARROW_RETURN_NOT_OK(
+      out_->Write(offsets_->raw_values(),
+                  (arr->length() + 1) * sizeof(typename ::arrow::TypeTraits<OffsetType>::CType)));
   return offsets_position;
 }
 

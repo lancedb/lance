@@ -41,7 +41,7 @@ class Encoder {
   ///
   /// \param arr an array to write with the encoding.
   /// \return offset of metadata
-  virtual ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) = 0;
+  virtual ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) = 0;
 
   /// Debug String
   virtual std::string ToString() const = 0;

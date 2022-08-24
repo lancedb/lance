@@ -56,7 +56,7 @@ template <ArrowType T>
       arr->length() * width);
 }
 
-::arrow::Result<int64_t> PlainEncoder::Write(std::shared_ptr<::arrow::Array> arr) {
+::arrow::Result<int64_t> PlainEncoder::Write(const std::shared_ptr<::arrow::Array>& arr) {
   auto data_type = arr->type();
 
   ARROW_ASSIGN_OR_RAISE(auto value_offset, out_->Tell());

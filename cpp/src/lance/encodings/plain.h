@@ -34,7 +34,7 @@ class PlainEncoder : public Encoder {
 
   virtual ~PlainEncoder() = default;
 
-  ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::Array> arr) override;
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   std::string ToString() const override { return "Encoder(type=Plain)"; }
 };

@@ -52,7 +52,7 @@ class VarBinaryEncoder : public Encoder {
   virtual ~VarBinaryEncoder() = default;
 
   /// Write an Array, and returns the offsets to the index block.
-  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array> arr) override;
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   /// Debug string.
   std::string ToString() const override { return "Encoder(type=VarBinary)"; }

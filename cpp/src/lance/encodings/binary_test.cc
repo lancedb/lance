@@ -102,3 +102,21 @@ TEST_CASE("Take") {
   auto expected = lance::arrow::ToArray({"5", "10", "20"}).ValueOrDie();
   CHECK(expected->Equals(actual));
 }
+
+TEST_CASE("Write slices of binary array") {
+  auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+
+  std::vector<std::string> words;
+  for (int i = 0; i < 100; i++) {
+    words.emplace_back(fmt::format("number-{}", i));
+  }
+  auto arr = lance::arrow::ToArray(words).ValueOrDie();
+  std::vector<int64_t> offsets;
+  for (int i = 0; i < 100; i += 10) {
+    auto slice = std::dynamic_pointer_cast<::StringArray>(arr->Slice(i, 10));
+    offsets.emplace_back(WriteStrings(out, slice));
+  }
+
+  auto buf = out->Finish().ValueOrDie();
+  auto infile = make_shared<arrow::io::BufferReader>(buf);
+};
