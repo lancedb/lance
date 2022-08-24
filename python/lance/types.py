@@ -16,6 +16,7 @@
 Arrow extension types for Lance
 """
 from abc import ABC, abstractproperty
+import platform
 
 import pandas as pd
 
@@ -30,7 +31,12 @@ from pyarrow import ArrowKeyError
 
 
 class LanceType(pa.ExtensionType, ABC):
-    pass
+    def __init__(self, storage_type, extension_name):
+        if platform.system() != "Linux":
+            raise NotImplementedError(
+                "Extension types are enabled for linux only for now"
+            )
+        super(LanceType, self).__init__(storage_type, extension_name)
 
 
 class ImageType(LanceType):

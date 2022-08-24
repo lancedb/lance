@@ -1,9 +1,15 @@
+import platform
+import pytest
+
 import lance
 import pyarrow as pa
 
 from lance.types import *
 
 
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="Extension types only work on Linux right now"
+)
 def test_image(tmp_path):
     image_type = ImageUriType()
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
@@ -11,6 +17,9 @@ def test_image(tmp_path):
     _test_extension_rt(tmp_path, image_type, storage)
 
 
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="Extension types only work on Linux right now"
+)
 def test_image_binary(tmp_path):
     image_type = ImageBinaryType()
     data = [b"<imagebytes>" for x in ["a", "b", "c"]]
@@ -18,6 +27,9 @@ def test_image_binary(tmp_path):
     _test_extension_rt(tmp_path, image_type, storage)
 
 
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="Extension types only work on Linux right now"
+)
 def test_point(tmp_path):
     point_type = Point2dType()
     data = [(float(x), float(x)) for x in range(100)]
@@ -25,6 +37,9 @@ def test_point(tmp_path):
     _test_extension_rt(tmp_path, point_type, storage)
 
 
+@pytest.mark.skipif(
+    platform.system() == "Darwin", reason="Extension types only work on Linux right now"
+)
 def test_box2d(tmp_path):
     box_type = Box2dType()
     data = [(float(x), float(x), float(x), float(x)) for x in range(100)]
