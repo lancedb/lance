@@ -6,16 +6,28 @@ from typing import Optional
 import duckdb
 import numpy as np
 import pandas as pd
-
-import lance
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset
 from bench_utils import BenchmarkSuite, download_uris
 from parse_pet import OxfordPetConverter
 
+import lance
+
 oxford_pet_benchmarks = BenchmarkSuite("oxford_pet")
 
+
+@oxford_pet_benchmarks.benchmark("total_count", key=['fmt', 'flavor'])
+def total_count(base_uri: str, fmt: str, flavor: Optional[str]):
+    if fmt == "raw":
+        return get_pets_class_distribution(base_uri)
+    suffix = '' if not flavor else f'_{flavor}'
+    ds = _get_dataset(os.path.join(base_uri, f'oxford_pet{suffix}.{fmt}'), fmt)
+    if fmt == "parquet":
+        query = "SELECT count(1) FROM ds"
+        return duckdb.query(query).to_df()
+    elif fmt == "lance":
+        return ds.count_rows()
 
 @oxford_pet_benchmarks.benchmark("label_distribution", key=['fmt', 'flavor'])
 def label_distribution(base_uri: str, fmt: str, flavor: Optional[str]):

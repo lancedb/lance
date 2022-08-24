@@ -134,8 +134,8 @@ class OxfordPetConverter(DatasetConverter):
             pa.field("ymax", pa.int32()),
         ])
         object_schema = pa.list_(pa.struct([
-            pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
-            pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
+            pa.field("name", pa.dictionary(pa.int8(), pa.string())),
+            pa.field("pose", pa.dictionary(pa.int8(), pa.string())),
             pa.field("truncated", pa.bool_()),
             pa.field("occluded", pa.bool_()),
             pa.field("bndbox", bbox),
@@ -145,10 +145,10 @@ class OxfordPetConverter(DatasetConverter):
                  "folder", "source", "size", "segmented", "object"]
         types = [
             pa.string(),
-            pa.dictionary(pa.uint8(), pa.string()),
-            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
             pa.int16(),
-            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
             pa.string(),
             source_schema,
             size_schema,
