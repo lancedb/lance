@@ -63,8 +63,7 @@ def test_write_dataset(tmp_path: Path):
         table,
         tmp_path,
         partitioning=["split"],
-        format=LanceFileFormat(),
-        file_options=LanceFileFormat().make_write_options(),
+        format=LanceFileFormat()
     )
 
     part_dirs = [d.name for d in tmp_path.iterdir()]
