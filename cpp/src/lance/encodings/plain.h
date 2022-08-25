@@ -39,6 +39,8 @@ class PlainEncoder : public Encoder {
   std::string ToString() const override { return "Encoder(type=Plain)"; }
 };
 
+/// Plain encoding decoder.
+///
 class PlainDecoder : public Decoder {
  public:
   PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,

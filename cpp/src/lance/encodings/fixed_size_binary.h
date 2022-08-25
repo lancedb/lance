@@ -17,6 +17,8 @@
 #include <arrow/array.h>
 #include <arrow/io/api.h>
 
+#include <memory>
+
 #include "lance/encodings/encoder.h"
 
 namespace lance::encodings {
@@ -31,10 +33,32 @@ class FixedSizeBinaryEncoder : public Encoder {
   /// Write an fixed-size array, and returns the offsets to the index block.
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
-  std::string ToString() const override;
+  [[nodiscard]] std::string ToString() const override;
+};
+
+/// Fixed size binary decoder.
+class FixedSizedBinaryDecoder : public Decoder {
+ public:
+  using Decoder::Decoder;
+
+  virtual ~FixedSizedBinaryDecoder() = default;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
+      int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override;
+
+  [[nodiscard]] std::string ToString() const;
 
  private:
-  std::unique_ptr<Encoder> impl_;
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToFixedSizeBinaryArray(int32_t start,
+                                                                          int32_t length) const;
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToFixedSizeListArray(int32_t start,
+                                                                        int32_t length) const;
 };
 
 }  // namespace lance::encodings

@@ -49,7 +49,7 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
 template <ArrowType T>
 ::arrow::Status WriteArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
                            const std::shared_ptr<::arrow::Array>& arr) {
-  auto width = ::arrow::bit_width(arr->type_id()) / 8;
+  auto width = arr->type()->byte_width();
   assert(width > 0);
   return out->Write(
       std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(arr)->raw_values(),
