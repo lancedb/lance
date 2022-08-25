@@ -80,10 +80,6 @@ inline bool is_fixed_size_list(const std::shared_ptr<::arrow::DataType>& dtype) 
     const std::shared_ptr<::arrow::DataType>& dtype,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
-::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
-    ::arrow::Type::type type_id,
-    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
-
 /// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 

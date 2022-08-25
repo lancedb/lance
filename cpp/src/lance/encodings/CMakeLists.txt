@@ -19,10 +19,10 @@ add_library(
         binary.h
         dictionary.cc
         dictionary.h
+        encoder.cc
         encoder.h
         plain.cc
         plain.h
-        encoder.cc
 )
 
 target_include_directories(encodings SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
