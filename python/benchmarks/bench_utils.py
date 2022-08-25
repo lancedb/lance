@@ -223,7 +223,11 @@ class DatasetConverter(ABC):
         if fmt == "parquet":
             pq.write_table(table, output_path)
         elif fmt == "lance":
-            lance.write_table(table, output_path)
+            pa.dataset.write_dataset(
+                table,
+                output_path,
+                format=lance.LanceFileFormat(),
+            )
         return table
 
     @abstractmethod
@@ -231,7 +235,11 @@ class DatasetConverter(ABC):
         pass
 
     def make_embedded_dataset(
-        self, table: Union[pa.Table | pd.DataFrame], fmt="lance", output_path=None, **kwargs
+        self,
+        table: Union[pa.Table | pd.DataFrame],
+        fmt="lance",
+        output_path=None,
+        **kwargs,
     ):
         if isinstance(table, pd.DataFrame):
             table = pa.Table.from_pandas(table, self.get_schema())
@@ -244,7 +252,9 @@ class DatasetConverter(ABC):
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":
-            lance.write_table(embedded, output_path, **kwargs)
+            pa.dataset.write_dataset(
+                embedded, output_path, format=lance.LanceFileFormat(), **kwargs
+            )
         return embedded
 
     @abstractmethod

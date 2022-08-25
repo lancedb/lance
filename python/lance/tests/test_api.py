@@ -16,9 +16,10 @@
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
 
-from lance import dataset, write_table
+import pyarrow as pa
+import pyarrow.dataset as ds
+from lance import write_table, dataset, LanceFileFormat
 
 
 def test_simple_round_trips(tmp_path: Path):
@@ -45,3 +46,30 @@ def test_write_categorical_values(tmp_path: Path):
 
     actual = dataset(str(tmp_path / "test.lance")).to_table()
     assert table == actual
+
+
+
+def test_write_dataset(tmp_path: Path):
+    table = pa.Table.from_pandas(
+        pd.DataFrame(
+            {
+                "label": [123, 456, 789],
+                "values": [22, 33, 2.24],
+                "split": ["a", "b", "a"],
+            }
+        )
+    )
+    ds.write_dataset(
+        table,
+        tmp_path,
+        partitioning=["split"],
+        format=LanceFileFormat()
+    )
+
+    part_dirs = [d.name for d in tmp_path.iterdir()]
+    assert set(part_dirs) == set(["a", "b"])
+    part_a = list((tmp_path / "a").glob("*.lance"))[0]
+    actual = dataset(part_a).to_table()
+    assert actual == pa.Table.from_pandas(
+        pd.DataFrame({"label": [123, 789], "values": [22, 2.24]})
+    )
