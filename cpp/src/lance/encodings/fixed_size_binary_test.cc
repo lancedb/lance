@@ -15,6 +15,7 @@
 #include "lance/encodings/fixed_size_binary.h"
 
 #include <arrow/builder.h>
+#include <arrow/type.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,6 +26,22 @@ TEST_CASE("Write fixed size binary") {
   CHECK(builder.Append("12345689").ok());
   auto arr = builder.Finish().ValueOrDie();
 
+  auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+
+  auto encoder = ::lance::encodings::FixedSizeBinaryEncoder(out);
+  CHECK(encoder.Write(arr).ok());
+}
+
+TEST_CASE("Write fixed size list") {
+  auto dtype = ::arrow::fixed_size_list(::arrow::int32(), 4);
+  auto int_builder = std::make_shared<::arrow::Int32Builder>();
+  auto builder = ::arrow::FixedSizeListBuilder(::arrow::default_memory_pool(), int_builder, dtype);
+  CHECK(builder.Append().ok());
+  CHECK(int_builder->AppendValues({1, 2, 3, 4}).ok());
+  CHECK(builder.Append().ok());
+  CHECK(int_builder->AppendValues({5, 6, 7, 8}).ok());
+  auto arr = builder.Finish().ValueOrDie();
+
   fmt::print("Arr {}\n", arr->ToString());
 
   auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
@@ -32,5 +49,3 @@ TEST_CASE("Write fixed size binary") {
   auto encoder = ::lance::encodings::FixedSizeBinaryEncoder(out);
   CHECK(encoder.Write(arr).ok());
 }
-
-TEST_CASE("Write fixed size list") {}
