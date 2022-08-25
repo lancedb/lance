@@ -182,6 +182,15 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
 }
 
+::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetFixedSizeListArrayBuilder(
+    const std::shared_ptr<::arrow::DataType>& dtype, ::arrow::MemoryPool* pool) {
+  assert(dtype->id() == ::arrow::Type::FIXED_SIZE_LIST);
+  auto list_type = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(dtype);
+  ARROW_ASSIGN_OR_RAISE(auto value_builder,
+                        ::lance::arrow::GetArrayBuilder(list_type->value_type(), pool));
+  return std::make_shared<::arrow::FixedSizeListBuilder>(pool, value_builder, list_type);
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
     const std::shared_ptr<::arrow::DataType>& dtype, ::arrow::MemoryPool* pool) {
   switch (dtype->id()) {
@@ -217,6 +226,8 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
       return std::make_shared<::arrow::LargeStringBuilder>(pool);
     case ::arrow::Type::FIXED_SIZE_BINARY:
       return std::make_shared<::arrow::FixedSizeBinaryBuilder>(dtype, pool);
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      return GetFixedSizeListArrayBuilder(dtype, pool);
     default:
       return ::arrow::Status::Invalid(
           fmt::format("Unsupported GetArrayBuilder type: {}", dtype->ToString()));

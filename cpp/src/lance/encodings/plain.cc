@@ -288,7 +288,7 @@ PlainDecoder::~PlainDecoder() {}
     default:
       return ::arrow::Status::Invalid(fmt::format("Unsupported type: {}", type_->ToString()));
   }
-  return ::arrow::Status::OK();
+  return impl_->Init();
 }
 
 void PlainDecoder::Reset(int64_t position, int32_t length) {

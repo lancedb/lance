@@ -20,14 +20,12 @@ add_library(
         dictionary.cc
         dictionary.h
         encoder.h
-        fixed_size_binary.cc
-        fixed_size_binary.h
         plain.cc
         plain.h
-        encoder.cc)
+        encoder.cc
+)
 
 target_include_directories(encodings SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(binary_test)
-add_lance_test(fixed_size_binary_test)
 add_lance_test(plain_test)

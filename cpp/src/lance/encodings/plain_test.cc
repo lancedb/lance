@@ -98,3 +98,54 @@ TEST_CASE("Write boolean array") {
             .ValueOrDie()
             ->Equals(decoder.Take(indices).ValueOrDie()));
 }
+
+void TestWriteFixedSizeArray(const std::shared_ptr<::arrow::Array>& arr) {
+  auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
+
+  auto encoder = ::lance::encodings::PlainEncoder(out);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  auto infile = make_shared<arrow::io::BufferReader>(out->Finish().ValueOrDie());
+  auto decoder = lance::encodings::PlainDecoder(infile, arr->type());
+  CHECK(decoder.Init().ok());
+  decoder.Reset(offset, arr->length());
+
+  auto actual = decoder.ToArray(0).ValueOrDie();
+  INFO("Expected: " << arr->ToString() << "\nActual: " << actual->ToString());
+  CHECK(arr->Equals(actual));
+
+  auto indices = lance::arrow::ToArray({1, 3, 5}).ValueOrDie();
+  auto values = decoder.Take(indices).ValueOrDie();
+  for (int i = 0; i < indices->length(); i++) {
+    CHECK(
+        values->GetScalar(i).ValueOrDie()->Equals(arr->GetScalar(indices->Value(i)).ValueOrDie()));
+  }
+}
+
+TEST_CASE("Write fixed size binary") {
+  auto dtype = ::arrow::fixed_size_binary(10);
+  auto builder = ::arrow::FixedSizeBinaryBuilder(dtype);
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append(fmt::format("number-{}", i)).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  TestWriteFixedSizeArray(arr);
+}
+
+TEST_CASE("Write fixed size list") {
+  auto list_size = 4;
+  auto dtype = ::arrow::fixed_size_list(::arrow::int32(), list_size);
+  auto int_builder = std::make_shared<::arrow::Int32Builder>();
+  auto builder = ::arrow::FixedSizeListBuilder(::arrow::default_memory_pool(), int_builder, dtype);
+
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append().ok());
+    for (int j = 0; j < list_size; j++) {
+      CHECK(int_builder->Append(i * list_size + j).ok());
+    }
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  TestWriteFixedSizeArray(arr);
+}
