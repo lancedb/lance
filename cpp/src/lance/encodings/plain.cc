@@ -123,8 +123,6 @@ class PlainDecoderImpl : public Decoder {
  public:
   using Decoder::Decoder;
 
-  virtual constexpr int byte_width() const { return type_->byte_width(); }
-
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
     if (!length.has_value()) {
@@ -138,7 +136,7 @@ class PlainDecoderImpl : public Decoder {
                       length.value(),
                       length_));
     }
-    auto nbyes = byte_width();
+    auto nbyes = type_->byte_width();
     ARROW_ASSIGN_OR_RAISE(auto buf,
                           infile_->ReadAt(position_ + start * nbyes, length.value() * nbyes));
     return std::make_shared<ArrayType>(type_, length.value(), buf);
