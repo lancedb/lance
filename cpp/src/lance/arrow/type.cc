@@ -14,6 +14,7 @@
 
 #include "lance/arrow/type.h"
 
+#include <arrow/builder.h>
 #include <arrow/result.h>
 #include <arrow/type.h>
 #include <arrow/type_traits.h>
@@ -181,6 +182,41 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
       "FromLogicalType: logical_type \"{}\" is not supported yet", logical_type.to_string()));
 }
 
+::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
+    ::arrow::Type::type type_id) {
+  switch (type_id) {
+    case ::arrow::Type::UINT8:
+      return std::make_shared<::arrow::UInt8Builder>();
+    case ::arrow::Type::INT8:
+      return std::make_shared<::arrow::Int8Builder>();
+    case ::arrow::Type::UINT16:
+      return std::make_shared<::arrow::UInt16Builder>();
+    case ::arrow::Type::INT16:
+      return std::make_shared<::arrow::Int16Builder>();
+    case ::arrow::Type::UINT32:
+      return std::make_shared<::arrow::UInt32Builder>();
+    case ::arrow::Type::INT32:
+      return std::make_shared<::arrow::Int32Builder>();
+    case ::arrow::Type::UINT64:
+      return std::make_shared<::arrow::UInt64Builder>();
+    case ::arrow::Type::INT64:
+      return std::make_shared<::arrow::Int64Builder>();
+    case ::arrow::Type::HALF_FLOAT:
+      return std::make_shared<::arrow::HalfFloatBuilder>();
+    case ::arrow::Type::FLOAT:
+      return std::make_shared<::arrow::FloatBuilder>();
+    case ::arrow::Type::DOUBLE:
+      return std::make_shared<::arrow::DoubleBuilder>();
+    default:
+      return ::arrow::Status::Invalid(
+          fmt::format("Unsupported GetArrayBuilder type: type_id={}", type_id));
+  }
+}
+
+::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
+    const std::shared_ptr<::arrow::DataType>& dtype) {
+  return GetArrayBuilder(dtype->id());
+}
 
 std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype) {
   if (dtype->id() == ::arrow::Type::EXTENSION) {

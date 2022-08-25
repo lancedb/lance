@@ -58,15 +58,14 @@ class Encoder {
 class Decoder {
  public:
   inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                 std::shared_ptr<::arrow::DataType> type) noexcept
-      : infile_(infile), type_(type) {}
+                 std::shared_ptr<::arrow::DataType> type,
+                 ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept
+      : infile_(infile), type_(type), pool_(pool) {}
 
   virtual ~Decoder() = default;
 
   /// Initialize the decoder.
-  virtual ::arrow::Status Init() {
-      return ::arrow::Status::OK();
-  };
+  virtual ::arrow::Status Init() { return ::arrow::Status::OK(); };
 
   virtual void Reset(int64_t position, int32_t length) {
     position_ = position;
@@ -96,6 +95,8 @@ class Decoder {
   std::shared_ptr<::arrow::DataType> type_;
   int64_t position_ = -1;
   int32_t length_ = -1;
+
+  ::arrow::MemoryPool* pool_;
 };
 
 }  // namespace lance::encodings

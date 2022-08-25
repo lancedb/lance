@@ -14,6 +14,8 @@
 
 #include "lance/encodings/fixed_size_binary.h"
 
+#include <arrow/builder.h>
+
 #include "lance/arrow/type.h"
 #include "lance/encodings/encoder.h"
 #include "lance/encodings/plain.h"
@@ -91,11 +93,24 @@ std::string FixedSizeBinaryEncoder::ToString() const { return "FixedSizeBinaryEn
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FixedSizedBinaryDecoder::Take(
     std::shared_ptr<::arrow::Int32Array> indices) const {
+  std::shared_ptr<::arrow::ArrayBuilder> builder;
+  if (lance::arrow::is_fixed_size_list(type_)) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(type_);
+    ARROW_ASSIGN_OR_RAISE(auto value_builder,
+                          ::lance::arrow::GetArrayBuilder(list_type->value_type()));
+    builder = std::make_shared<::arrow::FixedSizeListBuilder>(pool_, value_builder, type_);
+  } else if (::arrow::is_fixed_size_binary(type_->id())) {
+    builder = std::make_shared<::arrow::FixedSizeBinaryBuilder>(type_);
+  } else {
+    return ::arrow::Status::Invalid("FixedSizeBuilderDecoder::Take: Invalid data type: ", type_);
+  }
+
   // TODO: Use thread pool
   for (int i = 0; i < indices->length(); i++) {
     ARROW_ASSIGN_OR_RAISE(auto scalar, GetScalar(indices->Value(i)));
+    ARROW_RETURN_NOT_OK(builder->AppendScalar(*scalar));
   }
-  return ::arrow::Status::OK();
+  return builder->Finish();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Scalar>> FixedSizedBinaryDecoder::GetScalar(
