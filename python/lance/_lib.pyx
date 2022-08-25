@@ -4,15 +4,13 @@ from typing import Optional, Union
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
-from libcpp.memory cimport shared_ptr
+from libcpp.memory cimport shared_ptr, const_pointer_cast
 from libcpp.string cimport string
 
 from pathlib import Path
 
 from pyarrow import Table
-
-from pyarrow._dataset cimport CDataset, CScanner, Dataset, FileFormat
-
+from pyarrow._dataset cimport FileFormat, FileWriteOptions, CFileWriteOptions, CScanner, CDataset, Dataset
 from pyarrow._dataset import Scanner
 
 from pyarrow._compute cimport Expression, _bind
@@ -62,8 +60,8 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
         CFileFormat):
         pass
 
-    cdef cppclass CFileWriteOptions "::lance::arrow::FileWriteOptions":
-        CFileWriteOptions() except +
+    cdef cppclass CLanceFileWriteOptions "::lance::arrow::FileWriteOptions":
+        CLanceFileWriteOptions() except +
         int batch_size
 
 
@@ -71,7 +69,7 @@ cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
     CStatus CWriteTable "::lance::arrow::WriteTable"(
             const CTable& table,
             shared_ptr[COutputStream] sink,
-            CFileWriteOptions options)
+            CLanceFileWriteOptions options)
 
 
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
@@ -106,6 +104,17 @@ def BuildScanner(
     reader.reader = creader
     return Scanner.from_batches(reader)
 
+cdef class LanceFileWriteOptions(FileWriteOptions):
+    @staticmethod
+    cdef wrap(const shared_ptr[CFileWriteOptions]& sp):
+        cdef LanceFileWriteOptions self = LanceFileWriteOptions.__new__(LanceFileWriteOptions)
+        self.init(sp)
+        return self
+
+    @property
+    def format(self):
+        return LanceFileFormat()
+
 cdef class LanceFileFormat(FileFormat):
     def __init__(self):
         self.init(shared_ptr[CFileFormat](new CLanceFileFormat()))
@@ -120,6 +129,9 @@ cdef class LanceFileFormat(FileFormat):
     def __reduce__(self):
         return LanceFileFormat, tuple()
 
+    def make_write_options(self):
+        return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
+
 def WriteTable(table: Table,
                sink: Union[str, Path],
                batch_size: int):
@@ -127,7 +139,7 @@ def WriteTable(table: Table,
     cdef shared_ptr[COutputStream] out
     get_writer(sink, &out)
 
-    cdef CFileWriteOptions options = CFileWriteOptions()
+    cdef CLanceFileWriteOptions options = CLanceFileWriteOptions()
     options.batch_size = batch_size
     with nogil:
         check_status(CWriteTable(deref(arrow_table), out, options))
