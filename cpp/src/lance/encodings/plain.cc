@@ -146,6 +146,13 @@ class PlainDecoderImpl : public Decoder {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
       std::shared_ptr<::arrow::Int32Array> indices) const override {
+    // Simple heuristic to:
+    // Use batch scan for primitive data
+    // Use parallel reads for large(r) blob
+    if (!::arrow::is_primitive(type_->id())) {
+      return Decoder::Take(indices);
+    }
+
     int32_t start = indices->Value(0);
     int32_t length = indices->Value(indices->length() - 1) - start + 1;
     if (indices->length() == 0 || start < 0 || start + length > length_) {
