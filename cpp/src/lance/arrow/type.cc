@@ -183,39 +183,44 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
-    ::arrow::Type::type type_id) {
-  switch (type_id) {
+    const std::shared_ptr<::arrow::DataType>& dtype, ::arrow::MemoryPool* pool) {
+  switch (dtype->id()) {
     case ::arrow::Type::UINT8:
-      return std::make_shared<::arrow::UInt8Builder>();
+      return std::make_shared<::arrow::UInt8Builder>(pool);
     case ::arrow::Type::INT8:
-      return std::make_shared<::arrow::Int8Builder>();
+      return std::make_shared<::arrow::Int8Builder>(pool);
     case ::arrow::Type::UINT16:
-      return std::make_shared<::arrow::UInt16Builder>();
+      return std::make_shared<::arrow::UInt16Builder>(pool);
     case ::arrow::Type::INT16:
-      return std::make_shared<::arrow::Int16Builder>();
+      return std::make_shared<::arrow::Int16Builder>(pool);
     case ::arrow::Type::UINT32:
-      return std::make_shared<::arrow::UInt32Builder>();
+      return std::make_shared<::arrow::UInt32Builder>(pool);
     case ::arrow::Type::INT32:
-      return std::make_shared<::arrow::Int32Builder>();
+      return std::make_shared<::arrow::Int32Builder>(pool);
     case ::arrow::Type::UINT64:
-      return std::make_shared<::arrow::UInt64Builder>();
+      return std::make_shared<::arrow::UInt64Builder>(pool);
     case ::arrow::Type::INT64:
-      return std::make_shared<::arrow::Int64Builder>();
+      return std::make_shared<::arrow::Int64Builder>(pool);
     case ::arrow::Type::HALF_FLOAT:
-      return std::make_shared<::arrow::HalfFloatBuilder>();
+      return std::make_shared<::arrow::HalfFloatBuilder>(pool);
     case ::arrow::Type::FLOAT:
-      return std::make_shared<::arrow::FloatBuilder>();
+      return std::make_shared<::arrow::FloatBuilder>(pool);
     case ::arrow::Type::DOUBLE:
-      return std::make_shared<::arrow::DoubleBuilder>();
+      return std::make_shared<::arrow::DoubleBuilder>(pool);
+    case ::arrow::Type::BINARY:
+      return std::make_shared<::arrow::BinaryBuilder>(pool);
+    case ::arrow::Type::STRING:
+      return std::make_shared<::arrow::StringBuilder>(pool);
+    case ::arrow::Type::LARGE_BINARY:
+      return std::make_shared<::arrow::LargeBinaryBuilder>(pool);
+    case ::arrow::Type::LARGE_STRING:
+      return std::make_shared<::arrow::LargeStringBuilder>(pool);
+    case ::arrow::Type::FIXED_SIZE_BINARY:
+      return std::make_shared<::arrow::FixedSizeBinaryBuilder>(dtype, pool);
     default:
       return ::arrow::Status::Invalid(
-          fmt::format("Unsupported GetArrayBuilder type: type_id={}", type_id));
+          fmt::format("Unsupported GetArrayBuilder type: {}", dtype->ToString()));
   }
-}
-
-::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
-    const std::shared_ptr<::arrow::DataType>& dtype) {
-  return GetArrayBuilder(dtype->id());
 }
 
 std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype) {

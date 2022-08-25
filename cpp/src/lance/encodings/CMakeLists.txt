@@ -24,7 +24,7 @@ add_library(
         fixed_size_binary.h
         plain.cc
         plain.h
-)
+        encoder.cc)
 
 target_include_directories(encodings SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 

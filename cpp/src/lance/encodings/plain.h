@@ -52,8 +52,7 @@ class PlainEncoder : public Encoder {
 ///
 class PlainDecoder : public Decoder {
  public:
-  PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-               std::shared_ptr<::arrow::DataType> type);
+  using Decoder::Decoder;
 
   ~PlainDecoder() override;
 
@@ -62,9 +61,8 @@ class PlainDecoder : public Decoder {
 
   void Reset(int64_t position, int32_t length) override;
 
-  /// Get one single scalar from the page.
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
-
+  
   /// Read the buffer as array.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;

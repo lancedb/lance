@@ -35,7 +35,7 @@
 namespace lance::io {
 
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
-                                     std::shared_ptr<arrow::dataset::ScanOptions> options,
+                                     std::shared_ptr<::arrow::dataset::ScanOptions> options,
                                      ::arrow::internal::ThreadPool* thread_pool,
                                      std::optional<int64_t> limit,
                                      int64_t offset) noexcept
@@ -99,7 +99,7 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
     int32_t batch_id = current_batch_++;
     auto result = thread_pool_->Submit(
         [&](int32_t batch_id) {
-          return ::arrow::Future<std::shared_ptr<arrow::RecordBatch>>::MakeFinished(
+          return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
               this->ReadBatch(batch_id));
         },
         batch_id);

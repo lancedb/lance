@@ -22,14 +22,6 @@
 
 namespace lance::encodings {
 
-::arrow::Result<std::shared_ptr<::arrow::Array>> FixedSizedBinaryDecoder::ToFixedSizeBinaryArray(
-    int32_t start, int32_t length) const {
-  auto byte_width = type_->byte_width();
-  ARROW_ASSIGN_OR_RAISE(auto buf,
-                        infile_->ReadAt(position_ + start * byte_width, length * byte_width));
-  return std::make_shared<::arrow::FixedSizeBinaryArray>(type_, length, buf);
-}
-
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FixedSizedBinaryDecoder::ToFixedSizeListArray(
     int32_t start, int32_t length) const {
   auto fixed_list_type = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(type_);
@@ -59,8 +51,6 @@ namespace lance::encodings {
   }
   if (lance::arrow::is_fixed_size_list(type_)) {
     return ToFixedSizeListArray(start, length.value());
-  } else if (::arrow::is_fixed_size_binary(type_->id())) {
-    return ToFixedSizeBinaryArray(start, length.value());
   }
   return ::arrow::Status::Invalid("Invalid data type: {}\n", type_->ToString());
 }
@@ -86,12 +76,6 @@ namespace lance::encodings {
   }
   return builder->Finish();
 }
-
-::arrow::Result<std::shared_ptr<::arrow::Scalar>> FixedSizedBinaryDecoder::GetScalar(
-    int64_t idx) const {
-  ARROW_ASSIGN_OR_RAISE(auto arr, ToArray(idx, 1));
-  return arr->GetScalar(0);
-};
 
 std::string FixedSizedBinaryDecoder::ToString() const { return "FixedSizeBinaryDecoder"; }
 
