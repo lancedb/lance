@@ -23,19 +23,6 @@
 
 namespace lance::encodings {
 
-/// Fixed length binary encoder
-class FixedSizeBinaryEncoder : public Encoder {
- public:
-  FixedSizeBinaryEncoder(const std::shared_ptr<::arrow::io::OutputStream>& out) noexcept;
-
-  ~FixedSizeBinaryEncoder() override;
-
-  /// Write an fixed-size array, and returns the offsets to the index block.
-  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
-
-  [[nodiscard]] std::string ToString() const override;
-};
-
 /// Fixed size binary decoder.
 class FixedSizedBinaryDecoder : public Decoder {
  public:

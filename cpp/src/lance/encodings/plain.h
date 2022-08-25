@@ -28,6 +28,11 @@ namespace lance::encodings {
 /// Plain Encoder.
 ///
 /// Encoding fixed sized values in an plain array.
+///
+/// Supported data types:
+///  - Primitive values
+///  - Fixed sized binary
+///  - Fixed sized list
 class PlainEncoder : public Encoder {
  public:
   explicit PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out);
@@ -37,6 +42,10 @@ class PlainEncoder : public Encoder {
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   std::string ToString() const override { return "Encoder(type=Plain)"; }
+
+ private:
+  ::arrow::Result<int64_t> WriteFixedSizeListArray(
+      const std::shared_ptr<::arrow::FixedSizeListArray>& arr);
 };
 
 /// Plain encoding decoder.

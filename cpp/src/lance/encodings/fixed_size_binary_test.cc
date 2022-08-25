@@ -21,11 +21,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/arrow/stl.h"
+#include "lance/encodings/plain.h"
 
 void TestWriteFixedSizeArray(const std::shared_ptr<::arrow::Array>& arr) {
   auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
 
-  auto encoder = ::lance::encodings::FixedSizeBinaryEncoder(out);
+  auto encoder = ::lance::encodings::PlainEncoder(out);
   auto offset = encoder.Write(arr).ValueOrDie();
 
   auto infile = make_shared<arrow::io::BufferReader>(out->Finish().ValueOrDie());

@@ -22,37 +22,11 @@
 
 namespace lance::encodings {
 
-FixedSizeBinaryEncoder::FixedSizeBinaryEncoder(
-    const std::shared_ptr<::arrow::io::OutputStream>& out) noexcept
-    : Encoder(out) {}
-
-FixedSizeBinaryEncoder::~FixedSizeBinaryEncoder() {}
-
-::arrow::Result<int64_t> FixedSizeBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& arr) {
-  assert(::arrow::is_fixed_size_binary(arr->type_id()) ||
-         lance::arrow::is_fixed_size_list(arr->type()));
-
-  ARROW_ASSIGN_OR_RAISE(auto values_position, out_->Tell());
-  if (::arrow::is_fixed_size_binary(arr->type_id())) {
-    auto a = std::static_pointer_cast<::arrow::FixedSizeBinaryArray>(arr);
-    ARROW_RETURN_NOT_OK(out_->Write(a->raw_values(), a->length() * a->byte_width()));
-  } else if (lance::arrow::is_fixed_size_list(arr->type())) {
-    auto list_arr = std::dynamic_pointer_cast<::arrow::FixedSizeListArray>(arr);
-    assert(::arrow::is_primitive(list_arr->values()->type_id()));
-
-    auto plain_encoder = PlainEncoder(out_);
-    return plain_encoder.Write(list_arr->values());
-  }
-
-  return values_position;
-}
-
-std::string FixedSizeBinaryEncoder::ToString() const { return "FixedSizeBinaryEncoder"; }
-
 ::arrow::Result<std::shared_ptr<::arrow::Array>> FixedSizedBinaryDecoder::ToFixedSizeBinaryArray(
     int32_t start, int32_t length) const {
-  auto bytes = type_->byte_width();
-  ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start * bytes, length * bytes));
+  auto byte_width = type_->byte_width();
+  ARROW_ASSIGN_OR_RAISE(auto buf,
+                        infile_->ReadAt(position_ + start * byte_width, length * byte_width));
   return std::make_shared<::arrow::FixedSizeBinaryArray>(type_, length, buf);
 }
 
@@ -100,7 +74,7 @@ std::string FixedSizeBinaryEncoder::ToString() const { return "FixedSizeBinaryEn
                           ::lance::arrow::GetArrayBuilder(list_type->value_type()));
     builder = std::make_shared<::arrow::FixedSizeListBuilder>(pool_, value_builder, type_);
   } else if (::arrow::is_fixed_size_binary(type_->id())) {
-    builder = std::make_shared<::arrow::FixedSizeBinaryBuilder>(type_);
+    builder = std::make_shared<::arrow::FixedSizeBinaryBuilder>(type_, pool_);
   } else {
     return ::arrow::Status::Invalid("FixedSizeBuilderDecoder::Take: Invalid data type: ", type_);
   }

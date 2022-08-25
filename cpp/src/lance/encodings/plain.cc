@@ -46,6 +46,12 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
   return out->Write(std::dynamic_pointer_cast<::arrow::BooleanArray>(written_arr)->values());
 }
 
+::arrow::Result<int64_t> PlainEncoder::WriteFixedSizeListArray(
+    const std::shared_ptr<::arrow::FixedSizeListArray>& arr) {
+  assert(::arrow::is_primitive(arr->values()->type_id()));
+  return Write(arr->values());
+}
+
 template <ArrowType T>
 ::arrow::Status WriteArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
                            const std::shared_ptr<::arrow::Array>& arr) {
@@ -95,6 +101,13 @@ template <ArrowType T>
       break;
     case ::arrow::Type::DOUBLE:
       ARROW_RETURN_NOT_OK(WriteArray<::arrow::DoubleType>(out_, arr));
+      break;
+    case ::arrow::Type::FIXED_SIZE_BINARY:
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::FixedSizeBinaryType>(out_, arr));
+      break;
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      ARROW_RETURN_NOT_OK(
+          WriteFixedSizeListArray(std::dynamic_pointer_cast<::arrow::FixedSizeListArray>(arr)));
       break;
     default:
       return Status::Invalid(
