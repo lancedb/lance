@@ -37,6 +37,8 @@ class Encoder {
  public:
   Encoder(std::shared_ptr<::arrow::io::OutputStream> out) : out_(out) {}
 
+  virtual ~Encoder() = default;
+
   /// Write an Arrow Array and returns the start offset of the column metadata.
   ///
   /// \param arr an array to write with the encoding.

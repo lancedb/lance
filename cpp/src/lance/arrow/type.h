@@ -61,17 +61,21 @@ inline bool is_struct(const std::shared_ptr<::arrow::DataType>& dtype) {
 }
 
 /// Returns True if the data type is a map.
-inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_map(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::MAP;
 }
 
 /// Returns True if the data type is timestamp type.
-inline bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_timestamp(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::TimestampType::type_id;
 }
 
-inline bool is_extension(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_extension(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::EXTENSION;
+}
+
+inline bool is_fixed_size_list(const std::shared_ptr<::arrow::DataType>& dtype) {
+  return dtype->id() == ::arrow::Type::FIXED_SIZE_LIST;
 }
 
 /// Convert arrow DataType to a string representation.

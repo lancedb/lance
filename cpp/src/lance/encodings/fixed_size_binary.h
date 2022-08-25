@@ -12,18 +12,29 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/encodings/fixed_len_binary.h"
+#pragma once
+
+#include <arrow/array.h>
+#include <arrow/io/api.h>
+
+#include "lance/encodings/encoder.h"
 
 namespace lance::encodings {
 
-FixedLenBinaryEncoder::FixedLenBinaryEncoder(const std::shared_ptr<::arrow::io::OutputStream>& out,
-                                             uint32_t width) noexcept
-    : Encoder(out), width_(width) {}
+/// Fixed length binary encoder
+class FixedSizeBinaryEncoder : public Encoder {
+ public:
+  FixedSizeBinaryEncoder(const std::shared_ptr<::arrow::io::OutputStream>& out) noexcept;
 
-::arrow::Result<int64_t> FixedLenBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& arr) {
-  ARROW_ASSIGN_OR_RAISE(auto values_position, out_->Tell());
-  auto a = std::static_pointer_cast<::arrow::BinaryArray>(arr);
-  return 0;
-}
+  ~FixedSizeBinaryEncoder() override;
+
+  /// Write an fixed-size array, and returns the offsets to the index block.
+  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
+
+  std::string ToString() const override;
+
+ private:
+  std::unique_ptr<Encoder> impl_;
+};
 
 }  // namespace lance::encodings
