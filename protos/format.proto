@@ -72,6 +72,7 @@ enum Encoding {
   PLAIN = 1;
   VAR_BINARY = 2;
   DICTIONARY = 3;
+  FIXED_SIZE_BINARY = 4;
 }
 
 /**
