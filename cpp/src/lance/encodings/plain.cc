@@ -136,9 +136,9 @@ class PlainDecoderImpl : public Decoder {
                       length.value(),
                       length_));
     }
-    auto nbyes = type_->byte_width();
-    ARROW_ASSIGN_OR_RAISE(auto buf,
-                          infile_->ReadAt(position_ + start * nbyes, length.value() * nbyes));
+    auto byte_length = type_->byte_width();
+    ARROW_ASSIGN_OR_RAISE(
+        auto buf, infile_->ReadAt(position_ + start * byte_length, length.value() * byte_length));
     return std::make_shared<ArrayType>(type_, length.value(), buf);
   }
 

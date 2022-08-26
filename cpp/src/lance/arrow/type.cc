@@ -193,39 +193,35 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
 
 ::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
     const std::shared_ptr<::arrow::DataType>& dtype, ::arrow::MemoryPool* pool) {
+#define MAKE_BUILDER(type_id)                                                                      \
+  case type_id:                                                                                    \
+    return std::make_shared<                                                                       \
+        typename ::arrow::TypeTraits<typename ::arrow::TypeIdTraits<type_id>::Type>::BuilderType>( \
+        dtype, pool)
+
   switch (dtype->id()) {
-    case ::arrow::Type::UINT8:
-      return std::make_shared<::arrow::UInt8Builder>(pool);
-    case ::arrow::Type::INT8:
-      return std::make_shared<::arrow::Int8Builder>(pool);
-    case ::arrow::Type::UINT16:
-      return std::make_shared<::arrow::UInt16Builder>(pool);
-    case ::arrow::Type::INT16:
-      return std::make_shared<::arrow::Int16Builder>(pool);
-    case ::arrow::Type::UINT32:
-      return std::make_shared<::arrow::UInt32Builder>(pool);
-    case ::arrow::Type::INT32:
-      return std::make_shared<::arrow::Int32Builder>(pool);
-    case ::arrow::Type::UINT64:
-      return std::make_shared<::arrow::UInt64Builder>(pool);
-    case ::arrow::Type::INT64:
-      return std::make_shared<::arrow::Int64Builder>(pool);
-    case ::arrow::Type::HALF_FLOAT:
-      return std::make_shared<::arrow::HalfFloatBuilder>(pool);
-    case ::arrow::Type::FLOAT:
-      return std::make_shared<::arrow::FloatBuilder>(pool);
-    case ::arrow::Type::DOUBLE:
-      return std::make_shared<::arrow::DoubleBuilder>(pool);
-    case ::arrow::Type::BINARY:
-      return std::make_shared<::arrow::BinaryBuilder>(pool);
-    case ::arrow::Type::STRING:
-      return std::make_shared<::arrow::StringBuilder>(pool);
-    case ::arrow::Type::LARGE_BINARY:
-      return std::make_shared<::arrow::LargeBinaryBuilder>(pool);
-    case ::arrow::Type::LARGE_STRING:
-      return std::make_shared<::arrow::LargeStringBuilder>(pool);
-    case ::arrow::Type::FIXED_SIZE_BINARY:
-      return std::make_shared<::arrow::FixedSizeBinaryBuilder>(dtype, pool);
+    MAKE_BUILDER(::arrow::Type::BOOL);
+    MAKE_BUILDER(::arrow::Type::UINT8);
+    MAKE_BUILDER(::arrow::Type::INT8);
+    MAKE_BUILDER(::arrow::Type::UINT16);
+    MAKE_BUILDER(::arrow::Type::INT16);
+    MAKE_BUILDER(::arrow::Type::UINT32);
+    MAKE_BUILDER(::arrow::Type::INT32);
+    MAKE_BUILDER(::arrow::Type::UINT64);
+    MAKE_BUILDER(::arrow::Type::INT64);
+    MAKE_BUILDER(::arrow::Type::HALF_FLOAT);
+    MAKE_BUILDER(::arrow::Type::FLOAT);
+    MAKE_BUILDER(::arrow::Type::DOUBLE);
+    MAKE_BUILDER(::arrow::Type::DATE32);
+    MAKE_BUILDER(::arrow::Type::DATE64);
+    MAKE_BUILDER(::arrow::Type::TIME32);
+    MAKE_BUILDER(::arrow::Type::TIME64);
+    MAKE_BUILDER(::arrow::Type::TIMESTAMP);
+    MAKE_BUILDER(::arrow::Type::BINARY);
+    MAKE_BUILDER(::arrow::Type::STRING);
+    MAKE_BUILDER(::arrow::Type::LARGE_BINARY);
+    MAKE_BUILDER(::arrow::Type::LARGE_STRING);
+    MAKE_BUILDER(::arrow::Type::FIXED_SIZE_BINARY);
     case ::arrow::Type::FIXED_SIZE_LIST:
       return GetFixedSizeListArrayBuilder(dtype, pool);
     default:
