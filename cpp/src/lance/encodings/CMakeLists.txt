@@ -19,6 +19,7 @@ add_library(
         binary.h
         dictionary.cc
         dictionary.h
+        encoder.cc
         encoder.h
         plain.cc
         plain.h

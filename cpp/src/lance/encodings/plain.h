@@ -28,6 +28,11 @@ namespace lance::encodings {
 /// Plain Encoder.
 ///
 /// Encoding fixed sized values in an plain array.
+///
+/// Supported data types:
+///  - Primitive values
+///  - Fixed sized binary
+///  - Fixed sized list
 class PlainEncoder : public Encoder {
  public:
   explicit PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out);
@@ -37,12 +42,17 @@ class PlainEncoder : public Encoder {
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   std::string ToString() const override { return "Encoder(type=Plain)"; }
+
+ private:
+  ::arrow::Result<int64_t> WriteFixedSizeListArray(
+      const std::shared_ptr<::arrow::FixedSizeListArray>& arr);
 };
 
+/// Plain encoding decoder.
+///
 class PlainDecoder : public Decoder {
  public:
-  PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-               std::shared_ptr<::arrow::DataType> type);
+  using Decoder::Decoder;
 
   ~PlainDecoder() override;
 
@@ -51,9 +61,8 @@ class PlainDecoder : public Decoder {
 
   void Reset(int64_t position, int32_t length) override;
 
-  /// Get one single scalar from the page.
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
-
+  
   /// Read the buffer as array.
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override;

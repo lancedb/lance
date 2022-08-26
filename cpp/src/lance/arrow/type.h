@@ -25,7 +25,6 @@
 #include <string>
 #include <vector>
 
-
 template <typename T>
 concept HasToString = requires(T t) {
                         { t.ToString() } -> std::same_as<std::string>;
@@ -42,8 +41,7 @@ struct fmt::formatter<T> : fmt::formatter<std::string_view> {
 template <HasToString T>
 struct fmt::formatter<std::shared_ptr<T>> : fmt::formatter<std::string_view> {
   template <typename FormatContext>
-  auto format(const std::shared_ptr<T>& v, FormatContext& ctx)
-      -> decltype(ctx.out()) {
+  auto format(const std::shared_ptr<T>& v, FormatContext& ctx) -> decltype(ctx.out()) {
     return fmt::format_to(ctx.out(), "{}", v->ToString());
   }
 };
@@ -61,18 +59,26 @@ inline bool is_struct(const std::shared_ptr<::arrow::DataType>& dtype) {
 }
 
 /// Returns True if the data type is a map.
-inline bool is_map(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_map(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::MAP;
 }
 
 /// Returns True if the data type is timestamp type.
-inline bool is_timestamp(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_timestamp(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::TimestampType::type_id;
 }
 
-inline bool is_extension(std::shared_ptr<::arrow::DataType> dtype) {
+inline bool is_extension(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::EXTENSION;
 }
+
+inline bool is_fixed_size_list(const std::shared_ptr<::arrow::DataType>& dtype) {
+  return dtype->id() == ::arrow::Type::FIXED_SIZE_LIST;
+}
+
+::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
+    const std::shared_ptr<::arrow::DataType>& dtype,
+    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
 /// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);

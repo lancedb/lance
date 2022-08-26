@@ -46,10 +46,16 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
   return out->Write(std::dynamic_pointer_cast<::arrow::BooleanArray>(written_arr)->values());
 }
 
+::arrow::Result<int64_t> PlainEncoder::WriteFixedSizeListArray(
+    const std::shared_ptr<::arrow::FixedSizeListArray>& arr) {
+  assert(::arrow::is_primitive(arr->values()->type_id()));
+  return Write(arr->values());
+}
+
 template <ArrowType T>
 ::arrow::Status WriteArray(const std::shared_ptr<::arrow::io::OutputStream>& out,
                            const std::shared_ptr<::arrow::Array>& arr) {
-  auto width = ::arrow::bit_width(arr->type_id()) / 8;
+  auto width = arr->type()->byte_width();
   assert(width > 0);
   return out->Write(
       std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(arr)->raw_values(),
@@ -96,6 +102,13 @@ template <ArrowType T>
     case ::arrow::Type::DOUBLE:
       ARROW_RETURN_NOT_OK(WriteArray<::arrow::DoubleType>(out_, arr));
       break;
+    case ::arrow::Type::FIXED_SIZE_BINARY:
+      ARROW_RETURN_NOT_OK(WriteArray<::arrow::FixedSizeBinaryType>(out_, arr));
+      break;
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      ARROW_RETURN_NOT_OK(
+          WriteFixedSizeListArray(std::dynamic_pointer_cast<::arrow::FixedSizeListArray>(arr)));
+      break;
     default:
       return Status::Invalid(
           fmt::format("PlainEncoder:: does not support data type {}", data_type->ToString()));
@@ -110,13 +123,6 @@ class PlainDecoderImpl : public Decoder {
  public:
   using Decoder::Decoder;
 
-  /// Get one single scalar value from the column.
-  ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override {
-    CType value;
-    ARROW_RETURN_NOT_OK(infile_->ReadAt(position_ + idx * sizeof(value), sizeof(value), &value));
-    return std::make_shared<typename ::arrow::TypeTraits<T>::ScalarType>(value);
-  }
-
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
     if (!length.has_value()) {
@@ -124,19 +130,27 @@ class PlainDecoderImpl : public Decoder {
     }
     if (start + length.value() > length_ || start > length_) {
       return ::arrow::Status::IndexError(
-          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, page_length={}\n",
+          fmt::format("{}::ToArray: out of range: start={}, length={}, page_length={}\n",
+                      ToString(),
                       start,
                       length.value(),
                       length_));
     }
-    auto bytes = std::max(1, ::arrow::bit_width(type_->id()) / 8);
-    ARROW_ASSIGN_OR_RAISE(auto buf,
-                          infile_->ReadAt(position_ + start * bytes, length.value() * bytes));
-    return std::make_shared<ArrayType>(length.value(), buf);
+    auto byte_length = type_->byte_width();
+    ARROW_ASSIGN_OR_RAISE(
+        auto buf, infile_->ReadAt(position_ + start * byte_length, length.value() * byte_length));
+    return std::make_shared<ArrayType>(type_, length.value(), buf);
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
       std::shared_ptr<::arrow::Int32Array> indices) const override {
+    // Simple heuristic to:
+    // Use batch scan for primitive data
+    // Use parallel reads for large(r) blob
+    if (!::arrow::is_primitive(type_->id())) {
+      return Decoder::Take(indices);
+    }
+
     int32_t start = indices->Value(0);
     int32_t length = indices->Value(indices->length() - 1) - start + 1;
     if (indices->length() == 0 || start < 0 || start + length > length_) {
@@ -147,8 +161,8 @@ class PlainDecoderImpl : public Decoder {
     // We can optimize this later if the indices are sparse and making small I/Os can bring
     // benefits.
     ARROW_ASSIGN_OR_RAISE(auto raw_value_arr, ToArray(start, length));
-    auto values = std::static_pointer_cast<ArrayType>(raw_value_arr);
-    BuilderType builder;
+    auto values = std::dynamic_pointer_cast<ArrayType>(raw_value_arr);
+    BuilderType builder(type_, pool_);
     ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
     for (int64_t i = 0; i < indices->length(); i++) {
       auto index = indices->Value(i);
@@ -157,9 +171,11 @@ class PlainDecoderImpl : public Decoder {
     return builder.Finish();
   }
 
+  [[nodiscard]] std::string ToString() const {
+    return fmt::format("PlainEncoder({})", type_->ToString());
+  }
+
  private:
-  using CType = typename ::arrow::TypeTraits<T>::CType;
-  using ScalarType = typename ::arrow::TypeTraits<T>::ScalarType;
   using ArrayType = typename ::arrow::TypeTraits<T>::ArrayType;
   using BuilderType = typename ::arrow::TypeTraits<T>::BuilderType;
 };
@@ -195,11 +211,40 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
   }
 };
 
-}  // namespace
+class FixedSizeListPlainDecoderImpl : public Decoder {
+ public:
+  FixedSizeListPlainDecoderImpl(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
+                                std::shared_ptr<::arrow::FixedSizeListType> type,
+                                ::arrow::MemoryPool* pool = ::arrow::default_memory_pool())
+      : Decoder(infile, type, pool),
+        plain_decoder_(infile, type->value_type(), pool),
+        list_type_(type) {}
 
-PlainDecoder::PlainDecoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                           std::shared_ptr<::arrow::DataType> type)
-    : Decoder(infile, type) {}
+  ::arrow::Status Init() override { return plain_decoder_.Init(); }
+
+  void Reset(int64_t position, int32_t length) override {
+    Decoder::Reset(position, length);
+    plain_decoder_.Reset(position, length * list_type_->list_size());
+  }
+
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
+      int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override {
+    if (!length.has_value()) {
+      length = length_ - start;
+    }
+
+    auto list_size = list_type_->list_size();
+    ARROW_ASSIGN_OR_RAISE(auto values,
+                          plain_decoder_.ToArray(start * list_size, length.value() * list_size));
+    return std::make_shared<::arrow::FixedSizeListArray>(type_, length.value(), values);
+  }
+
+ private:
+  PlainDecoder plain_decoder_;
+  std::shared_ptr<::arrow::FixedSizeListType> list_type_;
+};
+
+}  // namespace
 
 PlainDecoder::~PlainDecoder() {}
 
@@ -238,10 +283,17 @@ PlainDecoder::~PlainDecoder() {}
     case ::arrow::Type::DOUBLE:
       impl_.reset(new PlainDecoderImpl<::arrow::DoubleType>(infile_, type_));
       break;
+    case ::arrow::Type::FIXED_SIZE_BINARY:
+      impl_.reset(new PlainDecoderImpl<::arrow::FixedSizeBinaryType>(infile_, type_));
+      break;
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      impl_.reset(new FixedSizeListPlainDecoderImpl(
+          infile_, std::dynamic_pointer_cast<::arrow::FixedSizeListType>(type_)));
+      break;
     default:
       return ::arrow::Status::Invalid(fmt::format("Unsupported type: {}", type_->ToString()));
   }
-  return ::arrow::Status::OK();
+  return impl_->Init();
 }
 
 void PlainDecoder::Reset(int64_t position, int32_t length) {

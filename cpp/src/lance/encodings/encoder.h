@@ -16,10 +16,13 @@
 
 #include <arrow/result.h>
 #include <arrow/status.h>
+#include <arrow/type_fwd.h>
 
 #include <concepts>
 #include <memory>
 #include <optional>
+
+#include "lance/arrow/type.h"
 
 namespace arrow::io {
 class RandomAccessFile;
@@ -36,6 +39,8 @@ concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
 class Encoder {
  public:
   Encoder(std::shared_ptr<::arrow::io::OutputStream> out) : out_(out) {}
+
+  virtual ~Encoder() = default;
 
   /// Write an Arrow Array and returns the start offset of the column metadata.
   ///
@@ -55,24 +60,19 @@ class Encoder {
 ///
 class Decoder {
  public:
-  inline Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
-                 std::shared_ptr<::arrow::DataType> type) noexcept
-      : infile_(infile), type_(type) {}
+  Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
+          std::shared_ptr<::arrow::DataType> type,
+          ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
   virtual ~Decoder() = default;
 
   /// Initialize the decoder.
-  virtual ::arrow::Status Init() {
-      return ::arrow::Status::OK();
-  };
+  virtual ::arrow::Status Init();
 
-  virtual void Reset(int64_t position, int32_t length) {
-    position_ = position;
-    length_ = length;
-  }
+  virtual void Reset(int64_t position, int32_t length);
 
   /// Get a Value without scanning the full row group.
-  virtual ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const = 0;
+  virtual ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const;
 
   /// Read the array.
   ///
@@ -86,14 +86,20 @@ class Decoder {
   ///
   /// \param indices. The sorted array of indices within the page.
   /// \return an array of value if success.
+  ///
+  /// The naive implementation is taking each element in parallel.
+  /// It is up to the concrete Decoder to override this method to offer higher performance
+  /// implementation.
   virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
-      std::shared_ptr<::arrow::Int32Array> indices) const = 0;
+      std::shared_ptr<::arrow::Int32Array> indices) const;
 
  protected:
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;
   std::shared_ptr<::arrow::DataType> type_;
   int64_t position_ = -1;
   int32_t length_ = -1;
+
+  ::arrow::MemoryPool* pool_;
 };
 
 }  // namespace lance::encodings
