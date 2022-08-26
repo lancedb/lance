@@ -69,7 +69,8 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
   auto type_id = dtype->id();
   if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = pb::VAR_BINARY;
-  } else if (::arrow::is_primitive(type_id)) {
+  } else if (::arrow::is_primitive(type_id) || ::arrow::is_fixed_size_binary(type_id) ||
+             lance::arrow::is_fixed_size_list(dtype)) {
     encoding_ = pb::PLAIN;
   } else if (::arrow::is_dictionary(type_id)) {
     encoding_ = pb::DICTIONARY;

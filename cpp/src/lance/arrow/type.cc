@@ -62,6 +62,11 @@ std::string ToString(::arrow::TimeUnit::type unit) {
   } else if (::arrow::is_fixed_size_binary(dtype->id())) {
     auto fixed_type = std::reinterpret_pointer_cast<::arrow::FixedSizeBinaryType>(dtype);
     return fmt::format("fixed_size_binary:{}", fixed_type->byte_width());
+  } else if (is_fixed_size_list(dtype)) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(dtype);
+    assert(::arrow::is_primitive(list_type->value_type()->id()));
+    ARROW_ASSIGN_OR_RAISE(auto value_type, ToLogicalType(list_type->value_type()));
+    return fmt::format("fixed_size_list:{}:{}", value_type, list_type->list_size());
   } else if (dtype->id() == ::arrow::Date32Type::type_id) {
     return "date32:day";
   } else if (dtype->id() == ::arrow::Date64Type::type_id) {
@@ -165,6 +170,21 @@ const static std::map<std::string, std::shared_ptr<::arrow::DataType>> kPrimitiv
           fmt::format("Invalid fixe size binary string: {}", logical_type.to_string()));
     }
     return ::arrow::fixed_size_binary(size);
+  }
+
+  if (logical_type.starts_with("fixed_size_list:")) {
+    auto components = ::arrow::internal::SplitString(logical_type, ':');
+    if (components.size() != 3) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixed size list string: {}", logical_type.to_string()));
+    }
+    ARROW_ASSIGN_OR_RAISE(auto value_type, FromLogicalType(components[1]));
+    auto size = std::stoi(components[2].to_string());
+    if (size == 0) {
+      return ::arrow::Status::Invalid(
+          fmt::format("Invalid fixe size binary string: {}", logical_type.to_string()));
+    }
+    return ::arrow::fixed_size_list(value_type, size);
   }
 
   if (logical_type.starts_with("dict")) {

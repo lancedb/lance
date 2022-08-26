@@ -1,10 +1,11 @@
 #include "lance/format/schema.h"
-#include "lance/arrow/testing.h"
 
 #include <arrow/type.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include "lance/arrow/testing.h"
 
 const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
@@ -20,12 +21,9 @@ const auto arrow_schema = ::arrow::schema(
                                             ::arrow::field("ymax", ::arrow::float32()),
                                         }))})))});
 
-
 std::shared_ptr<::arrow::DataType> image_type = std::make_shared<::lance::testing::ImageType>();
-const auto ext_schema = ::arrow::schema(
-    {::arrow::field("pk", ::arrow::utf8()),
-     ::arrow::field("image", image_type)});
-
+const auto ext_schema =
+    ::arrow::schema({::arrow::field("pk", ::arrow::utf8()), ::arrow::field("image", image_type)});
 
 TEST_CASE("Get field by name") {
   auto schema = lance::format::Schema(arrow_schema);
@@ -129,12 +127,25 @@ TEST_CASE("Project nested extension type") {
   auto original = lance::format::Schema(ext_schema);
   auto projection = original.Project({"image.uri"}).ValueOrDie();
 
-  auto expected_schema = ::arrow::schema({::arrow::field(
-      "image",
-      ::arrow::struct_({::arrow::field("uri", ::arrow::utf8())}))});
+  auto expected_schema = ::arrow::schema(
+      {::arrow::field("image", ::arrow::struct_({::arrow::field("uri", ::arrow::utf8())}))});
   auto expected = lance::format::Schema(expected_schema);
   INFO("Expected: " << expected.ToString());
   INFO("Actual: " << projection->ToString());
   CHECK(projection->Equals(expected, false));
 }
 
+TEST_CASE("Fixed size list") {
+  auto arrow_field =
+      ::arrow::field("fixed_size_list", ::arrow::fixed_size_list(::arrow::int32(), 4));
+  auto field = ::lance::format::Field(arrow_field);
+  CHECK(field.encoding() == ::lance::format::pb::PLAIN);
+  CHECK(field.logical_type() == "fixed_size_list:int32:4");
+}
+
+TEST_CASE("Fixed size binary") {
+  auto arrow_field = ::arrow::field("fs_binary", ::arrow::fixed_size_binary(100));
+  auto field = ::lance::format::Field(arrow_field);
+  CHECK(field.encoding() == ::lance::format::pb::PLAIN);
+  CHECK(field.logical_type() == "fixed_size_binary:100");
+}
