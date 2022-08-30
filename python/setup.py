@@ -32,7 +32,6 @@ arrow_includes = pa.get_include()
 arrow_library_dirs = pa.get_library_dirs()
 numpy_includes = np.get_include()
 
-
 # TODO allow for custom liblance directory
 lance_cpp = Path(__file__).resolve().parent.parent / "cpp"
 lance_includes = str(lance_cpp / "include")
@@ -51,7 +50,6 @@ extensions = [
     )
 ]
 
-
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
@@ -69,7 +67,8 @@ setup(
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     install_requires=["pyarrow>=9,<10"],
-    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"]},
+    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"],
+                    "pytorch": ["pytorch"]},
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[
