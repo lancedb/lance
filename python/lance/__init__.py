@@ -49,13 +49,20 @@ def scanner(
     data: Union[str, Path, ds.Dataset],
     columns: Optional[str] = None,
     filter: Optional[pc.Expression] = None,
+    batch_size: Optional[int] = None,
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> ds.Scanner:
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
+    print(batch_size)
     return BuildScanner(
-        data, columns=columns, filter=filter, limit=limit, offset=offset
+        data,
+        columns=columns,
+        filter=filter,
+        batch_size=batch_size,
+        limit=limit,
+        offset=offset,
     )
 
 

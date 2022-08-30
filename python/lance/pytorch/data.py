@@ -21,9 +21,7 @@ import pyarrow.dataset
 try:
     from torch.utils.data import IterableDataset
 except ImportError:
-    raise ImportError(
-        "Please install pytorch via pip install lance[pytorch]"
-    )
+    raise ImportError("Please install pytorch via pip install lance[pytorch]")
 
 from lance import dataset
 
@@ -38,14 +36,15 @@ class LanceDataset(IterableDataset):
     """
 
     def __init__(
-            self,
-            uri: Union[str, Path],
-            columns: Optional[list[str]] = None,
-            batch_size: int = 64,
+        self,
+        uri: Union[str, Path],
+        columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
     ):
         self.uri = uri
         self.columns = columns if columns else []
         self.batch_size = batch_size
+        print(f"Init lance dataset: batch size={batch_size}")
         self.scanner: pa.dataset.Scanner = dataset(self.uri).scanner(
             columns=columns, batch_size=batch_size
         )

@@ -39,6 +39,4 @@ def test_data_loader(tmp_path: Path):
     dataset = LanceDataset(tmp_path / "lance", batch_size=4)
     print(dataset)
     id_batch, value_batch = next(iter(dataset))
-    assert(id_batch.shape == (1, 4))
-
-
+    assert id_batch.shape == (1, 4)

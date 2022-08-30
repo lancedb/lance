@@ -48,7 +48,6 @@ def test_write_categorical_values(tmp_path: Path):
     assert table == actual
 
 
-
 def test_write_dataset(tmp_path: Path):
     table = pa.Table.from_pandas(
         pd.DataFrame(
@@ -59,12 +58,7 @@ def test_write_dataset(tmp_path: Path):
             }
         )
     )
-    ds.write_dataset(
-        table,
-        tmp_path,
-        partitioning=["split"],
-        format=LanceFileFormat()
-    )
+    ds.write_dataset(table, tmp_path, partitioning=["split"], format=LanceFileFormat())
 
     part_dirs = [d.name for d in tmp_path.iterdir()]
     assert set(part_dirs) == set(["a", "b"])
