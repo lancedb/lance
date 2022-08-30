@@ -203,3 +203,23 @@ TEST_CASE("Test ScanBatchesAsync with batch size") {
   }
   CHECK(num_batches == kTotalValues / kBatchSize);
 }
+
+TEST_CASE("Test ScanBatchesAsync with batch size") {
+  const int kTotalValues = 100;
+  const int kBatchSize = 4;
+  auto scanner = MakeScannerForBatchScan(kTotalValues, kBatchSize).ValueOrDie();
+
+  auto generator = scanner->ScanBatchesAsync().ValueOrDie();
+  int num_batches = 0;
+  while (true) {
+    auto fut = generator();
+    CHECK(fut.Wait(1));
+    auto batch = fut.result().ValueOrDie();
+    if (!batch.record_batch) {
+      break;
+    }
+    num_batches++;
+    CHECK(batch.record_batch->num_rows() == kBatchSize);
+  }
+  CHECK(num_batches == kTotalValues / kBatchSize);
+}
