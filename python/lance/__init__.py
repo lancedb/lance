@@ -19,7 +19,6 @@ from typing import Optional, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
-
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable
 from lance.types import register_extension_types
 
@@ -49,13 +48,19 @@ def scanner(
     data: Union[str, Path, ds.Dataset],
     columns: Optional[str] = None,
     filter: Optional[pc.Expression] = None,
+    batch_size: Optional[int] = None,
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> ds.Scanner:
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
     return BuildScanner(
-        data, columns=columns, filter=filter, limit=limit, offset=offset
+        data,
+        columns=columns,
+        filter=filter,
+        batch_size=batch_size,
+        limit=limit,
+        offset=offset,
     )
 
 

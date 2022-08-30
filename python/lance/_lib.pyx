@@ -77,6 +77,7 @@ cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
         LScannerBuilder(shared_ptr[CDataset]) except +
         void Project(const vector[string]& columns)
         void Filter(CExpression filter)
+        void BatchSize(int64_t batch_size)
         void Limit(int64_t limit, int64_t offset)
         CResult[shared_ptr[CScanner]] Finish()
 
@@ -84,6 +85,7 @@ def BuildScanner(
         dataset: Dataset,
         columns: Optional[list[str]] = None,
         filter: Optional[Expression] = None,
+        batch_size: Optional[int] = None,
         limit: Optional[int] = None,
         offset: int = 0,
 ):
@@ -95,6 +97,8 @@ def BuildScanner(
         builder.get().Project([tobytes(c) for c in columns])
     if filter is not None:
         builder.get().Filter(_bind(filter, dataset.schema))
+    if batch_size is not None:
+       builder.get().BatchSize(batch_size)
     if limit is not None:
         builder.get().Limit(limit, offset)
 
