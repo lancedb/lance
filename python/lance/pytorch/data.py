@@ -23,7 +23,7 @@ try:
 except ImportError:
     raise ImportError("Please install pytorch via pip install lance[pytorch]")
 
-from lance import dataset
+from lance import dataset, scanner
 
 __all__ = ["LanceDataset"]
 
@@ -45,8 +45,8 @@ class LanceDataset(IterableDataset):
         self.columns = columns if columns else []
         self.batch_size = batch_size
         print(f"Init lance dataset: batch size={batch_size}")
-        self.scanner: pa.dataset.Scanner = dataset(self.uri).scanner(
-            columns=columns, batch_size=batch_size
+        self.scanner: pa.dataset.Scanner = scanner(
+            dataset(self.uri), columns=columns, batch_size=batch_size
         )
 
     def __repr__(self):
