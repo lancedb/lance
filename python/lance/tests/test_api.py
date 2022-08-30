@@ -16,10 +16,11 @@
 from pathlib import Path
 
 import pandas as pd
-
 import pyarrow as pa
 import pyarrow.dataset as ds
-from lance import write_table, dataset, LanceFileFormat
+import pytest
+
+from lance import LanceFileFormat, dataset, scanner, write_table
 
 
 def test_simple_round_trips(tmp_path: Path):
@@ -48,7 +49,6 @@ def test_write_categorical_values(tmp_path: Path):
     assert table == actual
 
 
-
 def test_write_dataset(tmp_path: Path):
     table = pa.Table.from_pandas(
         pd.DataFrame(
@@ -59,12 +59,7 @@ def test_write_dataset(tmp_path: Path):
             }
         )
     )
-    ds.write_dataset(
-        table,
-        tmp_path,
-        partitioning=["split"],
-        format=LanceFileFormat()
-    )
+    ds.write_dataset(table, tmp_path, partitioning=["split"], format=LanceFileFormat())
 
     part_dirs = [d.name for d in tmp_path.iterdir()]
     assert set(part_dirs) == set(["a", "b"])
@@ -73,3 +68,14 @@ def test_write_dataset(tmp_path: Path):
     assert actual == pa.Table.from_pandas(
         pd.DataFrame({"label": [123, 789], "values": [22, 2.24]})
     )
+
+
+def test_scan_with_batch_size(tmp_path: Path):
+    df = pd.DataFrame({"values": range(100)})
+    write_table(pa.Table.from_pandas(df), tmp_path / "batch_size.lance")
+
+    s = scanner(dataset(tmp_path / "batch_size.lance"))
+    for batch in s.to_reader():  # type: pa.RecordBatch
+        assert batch.num_rows == 4
+    else:
+        pytest.fail("No batch read")

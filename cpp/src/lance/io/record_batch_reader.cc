@@ -94,6 +94,8 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
   int total_batches = reader_->metadata().num_batches();
+  fmt::print("Operator(): batch_size={} total_batches={}\n", options_->batch_size, total_batches);
+
   while (static_cast<int32_t>(readahead_queue_.size()) < options_->batch_readahead &&
          current_batch_ < total_batches) {
     int32_t batch_id = current_batch_++;
