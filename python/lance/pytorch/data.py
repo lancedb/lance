@@ -56,9 +56,9 @@ class LanceDataset(IterableDataset):
         """Yield dataset"""
         import torch
 
-        for batch in self.scanner.scan_batches():
+        for batch in self.scanner.to_reader():
             # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
             yield [
                 torch.from_numpy(arr.to_numpy(zero_copy_only=False, writable=True))
-                for arr in batch.record_batch.columns
+                for arr in batch.columns
             ]
