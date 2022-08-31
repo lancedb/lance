@@ -63,8 +63,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       offset_(other.offset_),
       project_(std::move(other.project_)),
       thread_pool_(std::move(other.thread_pool_)),
-      current_batch_(int(other.current_batch_)),
-      readahead_queue_(std::move(other.readahead_queue_)) {}
+      current_batch_(int(other.current_batch_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
   ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_->schema(), options_, limit_, offset_));
@@ -97,27 +96,23 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   int total_batches = reader_->metadata().num_batches();
   fmt::print("Operator(): batch_size={} total_batches={}\n", options_->batch_size, total_batches);
   auto batch_size = options_->batch_size;
+  int32_t batch_id = current_batch_++;
+  auto page_length = reader_->metadata().GetBatchLength(batch_id);
+  ::arrow::Result<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> submit_result;
 
-  while (static_cast<int32_t>(readahead_queue_.size()) < options_->batch_readahead &&
-         current_batch_ < total_batches) {
-    int32_t batch_id = current_batch_++;
-    auto result = thread_pool_->Submit(
-        [&](int32_t batch_id) {
-          return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
-              this->ReadBatch(batch_id));
-        },
-        batch_id);
-    if (!result.ok()) {
-      return result.status();
-    }
-    readahead_queue_.emplace(std::move(result.ValueOrDie()));
+  /// This is brute-forcefully to choose between read batch directly.
+  if (page_length < batch_size) {
+    /// Read up to the batch end.
+    submit_result =
+        thread_pool_->Submit([&](int32_t batch_id) { return this->ReadBatch(batch_id); }, batch_id);
+  } else {
+    submit_result =
+        thread_pool_->Submit([&](int32_t batch_id) { return this->ReadBatch(batch_id); }, batch_id);
   }
-  if (readahead_queue_.empty()) {
-    return std::shared_ptr<::arrow::RecordBatch>(nullptr);
+  if (!submit_result.ok()) {
+    return decltype(RecordBatchReader::operator()())::MakeFinished(submit_result.status());
   }
-  auto first = readahead_queue_.front();
-  readahead_queue_.pop();
-  return first;
+  return submit_result.ValueOrDie();
 }
 
 }  // namespace lance::io

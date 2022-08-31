@@ -54,6 +54,21 @@ class FileReader {
                                                                 int32_t offset,
                                                                 int32_t length) const;
 
+  /// Read a RecordBatch from offset within one batch.
+  ///
+  /// \param schema projected schema to read.
+  /// \param batch_id the id of the batch.
+  /// \param offset the offset of rows within the batch to read.
+  /// \param length the number of rows to retrieve.
+  /// \return RecordBatch if success.
+  ///
+  /// Note that it does not read pass the page boundary.
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
+      const lance::format::Schema& schema,
+      int32_t batch_id,
+      int32_t offset,
+      std::optional<int32_t> length = std::nullopt) const;
+
   /// Read a Batch.
   ///
   /// While ReadAt can read at any arbitrary offset within a batch, ReadBatch always

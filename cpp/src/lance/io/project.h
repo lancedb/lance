@@ -55,7 +55,6 @@ class Project {
   ///
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t batch_id);
-
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
 
@@ -74,6 +73,9 @@ class Project {
           std::optional<int32_t> limit = std::nullopt,
           int32_t offset = 0);
 
+  /// File reader
+  std::shared_ptr<FileReader> reader_;
+
   std::shared_ptr<format::Schema> projected_schema_;
   /// scan_schema_ equals to projected_schema_ - filters_.schema()
   /// It includes the columns that are not read from the filters yet.
@@ -81,6 +83,8 @@ class Project {
   std::unique_ptr<Filter> filter_;
 
   std::unique_ptr<Limit> limit_;
+
+  std::shared_ptr<::arrow::dataset::ScanOptions> options_;
 };
 
 }  // namespace lance::io
