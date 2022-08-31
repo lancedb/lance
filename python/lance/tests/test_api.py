@@ -19,7 +19,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pytest
-
 from lance import LanceFileFormat, dataset, scanner, write_table
 
 
@@ -70,12 +69,24 @@ def test_write_dataset(tmp_path: Path):
     )
 
 
-def test_scan_with_batch_size(tmp_path: Path):
+def test_scan_to_reader_with_batch_size(tmp_path: Path):
     df = pd.DataFrame({"values": range(100)})
     write_table(pa.Table.from_pandas(df), tmp_path / "batch_size.lance")
 
     s = scanner(dataset(tmp_path / "batch_size.lance"))
-    for batch in s.to_reader():  # type: pa.RecordBatch
+    ds = dataset(tmp_path / "batch_size.lance")
+    for batch in ds.to_batches():  # type: pa.RecordBatch
+        assert batch.num_rows == 4
+    else:
+        pytest.fail("No batch read")
+
+
+def test_scan_to_batches_with_batch_size(tmp_path: Path):
+    df = pd.DataFrame({"values": range(100)})
+    write_table(pa.Table.from_pandas(df), tmp_path / "batch_size.lance")
+
+    s = scanner(dataset(tmp_path / "batch_size.lance"))
+    for batch in s.to_batches():  # type: pa.RecordBatch
         assert batch.num_rows == 4
     else:
         pytest.fail("No batch read")

@@ -76,6 +76,7 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 }
 
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
+  fmt::print("This is calling ReadNext: \n");
   int32_t batch_id = current_batch_++;
   ARROW_ASSIGN_OR_RAISE(auto batch_read, ReadBatch(batch_id));
   if (batch_read) {
@@ -95,6 +96,7 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
   int total_batches = reader_->metadata().num_batches();
   fmt::print("Operator(): batch_size={} total_batches={}\n", options_->batch_size, total_batches);
+  auto batch_size = options_->batch_size;
 
   while (static_cast<int32_t>(readahead_queue_.size()) < options_->batch_readahead &&
          current_batch_ < total_batches) {
