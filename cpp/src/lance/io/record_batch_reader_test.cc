@@ -44,6 +44,7 @@ TEST_CASE("Test Read with batch size") {
   auto scanner = builder.Finish().ValueOrDie();
 
   auto record_batch_reader = RecordBatchReader(file_reader, scanner->options());
+  CHECK(record_batch_reader.Open().ok());
   while (true) {
     auto fut = record_batch_reader();
     CHECK(fut.Wait(5));

@@ -130,7 +130,7 @@ std::optional<RecordBatchReader::Task> RecordBatchReader::NextTask() {
 
   auto result = thread_pool_->Submit([&]() {
     auto task = NextTask();
-    if (task) {
+    if (task.has_value()) {
       return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
           this->ReadBatch(task->batch_id, task->offset, task->length));
     } else {
