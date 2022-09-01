@@ -65,7 +65,7 @@ Filter::Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const {
   return Execute(batch);
 }
 
-// const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
+const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
 
 std::string Filter::ToString() const { return filter_.ToString(); }
 

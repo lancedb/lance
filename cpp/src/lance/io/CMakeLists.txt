@@ -21,12 +21,9 @@ add_library(
         io
         OBJECT
         endian.h
-        limit.cc
-        limit.h
+
         pb.cc
         pb.h
-        project.cc
-        project.h
         reader.cc
         reader.h
         record_batch_reader.cc
@@ -38,6 +35,4 @@ target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 # Depend on lance::format to generate protobuf
 add_dependencies(io format lance_io_exec)
 
-add_lance_test(limit_test)
-add_lance_test(project_test)
 add_lance_test(reader_test)

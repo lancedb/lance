@@ -12,14 +12,15 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "filter.h"
+#include "lance/io/exec/filter.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/exec/expression.h>
 #include <arrow/record_batch.h>
+#include <fmt/format.h>
 
-#include "catch2/catch_test_macros.hpp"
-#include "fmt/format.h"
+#include <catch2/catch_test_macros.hpp>
+
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
@@ -28,6 +29,7 @@ using ::arrow::compute::equal;
 using ::arrow::compute::field_ref;
 using ::arrow::compute::literal;
 using ::arrow::compute::or_;
+using lance::io::exec::Filter;
 
 const auto kSchema =
     lance::format::Schema(::arrow::schema({::arrow::field("pk", ::arrow::int32()),
@@ -35,17 +37,16 @@ const auto kSchema =
                                            ::arrow::field("label", ::arrow::utf8())}));
 
 TEST_CASE("Test without filter") {
-  auto empty_filter =
-      lance::io::Filter::Make(kSchema, ::arrow::compute::literal(true)).ValueOrDie();
+  auto empty_filter = Filter::Make(kSchema, ::arrow::compute::literal(true)).ValueOrDie();
   CHECK(empty_filter == nullptr);
 }
 
 TEST_CASE("Test with one condition") {
-  auto filter = lance::io::Filter::Make(kSchema, equal(field_ref("value"), literal("32")));
+  auto filter = Filter::Make(kSchema, equal(field_ref("value"), literal("32")));
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 
-  filter = lance::io::Filter::Make(kSchema, equal(literal("32"), field_ref("value")));
+  filter = Filter::Make(kSchema, equal(literal("32"), field_ref("value")));
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 }
@@ -57,7 +58,7 @@ TEST_CASE("value = 32") {
       ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
-  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = Filter::Make(kSchema, expr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
@@ -77,7 +78,7 @@ TEST_CASE("label = cat or label = dog") {
       ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
-  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = Filter::Make(kSchema, expr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 

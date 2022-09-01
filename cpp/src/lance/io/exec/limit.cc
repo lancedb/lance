@@ -12,16 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/limit.h"
+#include "limit.h"
 
 #include <arrow/record_batch.h>
-#include <fmt/format.h>
 
 #include <algorithm>
 
+#include "fmt/format.h"
 #include "lance/io/reader.h"
 
-namespace lance::io {
+namespace lance::io::exec {
 
 Limit::Limit(int64_t limit, int64_t offset) noexcept : limit_(limit), offset_(offset) {
   assert(offset >= 0);

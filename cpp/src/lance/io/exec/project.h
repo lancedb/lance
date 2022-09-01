@@ -26,8 +26,11 @@ class Schema;
 }
 
 namespace lance::io {
-
 class FileReader;
+}
+
+namespace lance::io::exec {
+
 class Filter;
 class Limit;
 
@@ -75,4 +78,4 @@ class Project {
   std::unique_ptr<Limit> limit_;
 };
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

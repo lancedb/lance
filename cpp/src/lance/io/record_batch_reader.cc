@@ -28,8 +28,8 @@
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
 #include "lance/io/exec/filter.h"
-#include "lance/io/limit.h"
-#include "lance/io/project.h"
+#include "lance/io/exec/limit.h"
+#include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
 
 namespace lance::io {
@@ -67,7 +67,8 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_->schema(), options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_,
+                        exec::Project::Make(reader_->schema(), options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
 

@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/limit.h"
+#include "lance/io/exec/limit.h"
 
 #include <arrow/io/api.h>
 #include <arrow/table.h>
@@ -28,8 +28,10 @@
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
 
+using lance::io::exec::Limit;
+
 TEST_CASE("LIMIT 100") {
-  auto limit = lance::io::Limit(100);
+  auto limit = Limit(100);
   CHECK(limit.Apply(10).value() == std::make_tuple(0, 10));
   CHECK(limit.Apply(80).value() == std::make_tuple(0, 80));
   CHECK(limit.Apply(20).value() == std::make_tuple(0, 10));
@@ -38,7 +40,7 @@ TEST_CASE("LIMIT 100") {
 }
 
 TEST_CASE("LIMIT 10 OFFSET 20") {
-  auto limit = lance::io::Limit(10, 20);
+  auto limit = Limit(10, 20);
   CHECK(limit.Apply(10).value() == std::make_tuple(0, 0));
   CHECK(limit.Apply(5).value() == std::make_tuple(0, 0));
   auto val = limit.Apply(20).value();
@@ -60,7 +62,7 @@ TEST_CASE("Read limit multiple times") {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   CHECK(reader->Open().ok());
-  auto limit = lance::io::Limit(5, 10);
+  auto limit = Limit(5, 10);
   auto batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
   INFO("Actual: " << batch->column(0)->ToString());
   CHECK(batch->column(0)->Equals(lance::arrow::ToArray({11, 12, 13, 14, 15}).ValueOrDie()));

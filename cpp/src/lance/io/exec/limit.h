@@ -27,8 +27,10 @@ class Schema;
 }  // namespace lance::format
 
 namespace lance::io {
-
 class FileReader;
+}
+
+namespace lance::io::exec {
 
 /// Plan for Limit clause:
 ///
@@ -74,4 +76,4 @@ class Limit {
   int64_t seen_ = 0;
 };
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

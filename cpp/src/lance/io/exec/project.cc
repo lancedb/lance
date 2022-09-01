@@ -12,19 +12,20 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/project.h"
+#include "project.h"
 
 #include <arrow/api.h>
 #include <arrow/result.h>
-#include <fmt/format.h>
-#include <fmt/ranges.h>
 
+#include "fmt/format.h"
+#include "fmt/ranges.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
-#include "lance/io/limit.h"
+#include "lance/io/exec/limit.h"
 #include "lance/io/reader.h"
+#include "limit.h"
 
-namespace lance::io {
+namespace lance::io::exec {
 
 Project::Project(std::shared_ptr<format::Schema> projected_schema,
                  std::shared_ptr<format::Schema> scan_schema,
@@ -98,4 +99,4 @@ const std::shared_ptr<format::Schema>& Project::schema() const { return projecte
   }
 }
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

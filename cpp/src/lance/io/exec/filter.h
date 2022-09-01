@@ -53,7 +53,7 @@ class Filter : public ExecNode {
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
   Execute(std::shared_ptr<lance::io::FileReader> reader, int32_t batch_id) const;
 
-  //  const std::shared_ptr<lance::format::Schema>& schema() const;
+  const std::shared_ptr<lance::format::Schema>& schema() const;
 
   std::string ToString() const override;
 
