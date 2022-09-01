@@ -41,32 +41,40 @@ RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      int64_t offset) noexcept
     : reader_(reader),
       options_(options),
+      num_batches_(reader->metadata().num_batches()),
       limit_(limit),
       offset_(offset),
       thread_pool_(thread_pool) {
   assert(thread_pool_);
+  current_batch_length_ = reader->metadata().GetBatchLength(0);
 }
 
 RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
     : reader_(other.reader_),
       options_(other.options_),
+      num_batches_(other.num_batches_),
       limit_(other.limit_),
       offset_(other.offset_),
       project_(other.project_),
       thread_pool_(other.thread_pool_),
-      current_batch_(int(other.current_batch_)) {}
+      current_batch_(int(other.current_batch_)),
+      current_batch_length_(other.current_batch_length_),
+      current_offset_(other.current_offset_) {}
 
 RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
+      num_batches_(other.num_batches_),
       limit_(other.limit_),
       offset_(other.offset_),
       project_(std::move(other.project_)),
       thread_pool_(std::move(other.thread_pool_)),
-      current_batch_(int(other.current_batch_)) {}
+      current_batch_(int(other.current_batch_)),
+      current_batch_length_(other.current_batch_length_),
+      current_offset_(other.current_offset_) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_->schema(), options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_, options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
 
@@ -74,20 +82,43 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   return project_->schema()->ToArrow();
 }
 
+std::optional<RecordBatchReader::Task> RecordBatchReader::NextTask() {
+  std::lock_guard guard(lock_);
+  if (current_batch_ >= num_batches_) {
+    return std::nullopt;
+  }
+
+  auto task = Task();
+  task.batch_id = current_batch_;
+  task.length = options_->batch_size;
+  task.offset = current_offset_;
+
+  current_offset_ += task.length;
+  if (current_offset_ >= current_batch_length_) {
+    current_batch_++;
+    current_offset_ = 0;
+    if (current_batch_ < num_batches_) {
+      current_batch_length_ = reader_->metadata().GetBatchLength(current_batch_);
+    }
+  }
+  return task;
+}
+
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
-  fmt::print("This is calling ReadNext: \n");
-  int32_t batch_id = current_batch_++;
-  ARROW_ASSIGN_OR_RAISE(auto batch_read, ReadBatch(batch_id));
-  if (batch_read) {
-    *batch = std::move(batch_read);
+  auto task = NextTask();
+  if (task) {
+    ARROW_ASSIGN_OR_RAISE(auto batch_read, ReadBatch(task->batch_id, task->offset, task->length));
+    if (batch_read) {
+      *batch = std::move(batch_read);
+    }
   }
   return ::arrow::Status::OK();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch(
-    int32_t batch_id) const {
+    int32_t batch_id, int32_t offset, std::optional<int32_t> length) const {
   if (batch_id < reader_->metadata().num_batches()) {
-    return project_->Execute(reader_, batch_id);
+    return project_->Execute(reader_, batch_id, offset, length);
   }
   return nullptr;
 }
@@ -95,24 +126,21 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
   int total_batches = reader_->metadata().num_batches();
   fmt::print("Operator(): batch_size={} total_batches={}\n", options_->batch_size, total_batches);
-  auto batch_size = options_->batch_size;
-  int32_t batch_id = current_batch_++;
-  auto page_length = reader_->metadata().GetBatchLength(batch_id);
   ::arrow::Result<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> submit_result;
 
-  /// This is brute-forcefully to choose between read batch directly.
-  if (page_length < batch_size) {
-    /// Read up to the batch end.
-    submit_result =
-        thread_pool_->Submit([&](int32_t batch_id) { return this->ReadBatch(batch_id); }, batch_id);
-  } else {
-    submit_result =
-        thread_pool_->Submit([&](int32_t batch_id) { return this->ReadBatch(batch_id); }, batch_id);
+  auto result = thread_pool_->Submit([&]() {
+    auto task = NextTask();
+    if (task) {
+      return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
+          this->ReadBatch(task->batch_id, task->offset, task->length));
+    } else {
+      return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(nullptr);
+    }
+  });
+  if (result.ok()) {
+    return result.ValueOrDie();
   }
-  if (!submit_result.ok()) {
-    return decltype(RecordBatchReader::operator()())::MakeFinished(submit_result.status());
-  }
-  return submit_result.ValueOrDie();
+  return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(result.status());
 }
 
 }  // namespace lance::io

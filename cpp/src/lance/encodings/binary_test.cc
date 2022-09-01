@@ -130,3 +130,5 @@ TEST_CASE("Write slices of binary array") {
   INFO("Chunk: " << chunked_arr.ToString() << " Expected: {}" << arr->ToString());
   CHECK(chunked_arr.Equals(::arrow::ChunkedArray(arr)));
 };
+
+TEST_CASE("Read over batch boundary") {}

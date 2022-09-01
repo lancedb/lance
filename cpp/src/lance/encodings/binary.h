@@ -98,16 +98,17 @@ template <ArrowType T>
 template <ArrowType T>
 ::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::ToArray(
     int32_t start, std::optional<int32_t> length) const {
-  if (!length.has_value()) {
-    length = length_ - start;
-  }
-  if (start + *length > length_) {
-    return ::arrow::Status::IndexError(
+  if (start >= length_) {
+    return ::arrow::Status::Invalid(
         fmt::format("VarBinaryDecoder::ToArray: out of range: start={} length={} page_length={}\n",
                     start,
                     *length,
                     length_));
   }
+  if (!length.has_value()) {
+    length = length_ - start;
+  }
+  length = std::min(length_ - start, length.value());
 
   auto offsets_buf =
       infile_->ReadAt(position_ + start * sizeof(OffsetCType), (*length + 1) * sizeof(OffsetCType));

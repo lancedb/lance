@@ -35,18 +35,6 @@ class Filter {
   static ::arrow::Result<std::unique_ptr<Filter>> Make(const lance::format::Schema& schema,
                                                        const ::arrow::compute::Expression& filter);
 
-  /// Execute the filter on an arrow RecordBatch.
-  ///
-  /// \return a tuple of [indices, filtered_array].
-  ///
-  /// For example, with a record batch of {"bar": [0, 2, 32, 5, 32]}, and filter "bar = 32",
-  /// this function returns:
-  ///
-  /// { Int32Array({2, 4}), RecordBatch({"bar": [32, 32]}) }
-  ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-      Execute(std::shared_ptr<::arrow::RecordBatch>) const;
-
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
   Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const;
@@ -57,6 +45,18 @@ class Filter {
 
  private:
   Filter(std::shared_ptr<lance::format::Schema> schema, const ::arrow::compute::Expression& filter);
+
+  /// Execute the filter on an arrow RecordBatch.
+  ///
+  /// \return a tuple of [indices, filtered_array].
+  ///
+  /// For example, with a record batch of {"bar": [0, 2, 32, 5, 32]}, and filter "bar = 32",
+  /// this function returns:
+  ///
+  /// { Int32Array({2, 4}), RecordBatch({"bar": [32, 32]}) }
+  ::arrow::Result<
+      std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
+  Execute(const std::shared_ptr<::arrow::RecordBatch>& batch) const;
 
   std::shared_ptr<lance::format::Schema> schema_;
   ::arrow::compute::Expression filter_;

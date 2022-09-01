@@ -69,17 +69,31 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
  private:
   RecordBatchReader() = delete;
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(int32_t batch_id) const;
+  /// A Task description to read
+  struct Task {
+    int32_t batch_id;
+    int32_t offset;
+    int32_t length;
+  };
 
-  std::shared_ptr<FileReader> reader_;
-  std::shared_ptr<::arrow::dataset::ScanOptions> options_;
+  std::optional<Task> NextTask();
+
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
+      int32_t batch_id, int32_t offset = 0, std::optional<int32_t> length = std::nullopt) const;
+
+  const std::shared_ptr<FileReader> reader_;
+  const std::shared_ptr<::arrow::dataset::ScanOptions> options_;
+  const int32_t num_batches_;
   std::optional<int64_t> limit_ = std::nullopt;
   int64_t offset_ = 0;
   /// Projection over the dataset.
   std::shared_ptr<Project> project_;
 
   ::arrow::internal::ThreadPool* thread_pool_;
-  std::atomic_int32_t current_batch_ = 0;
+  std::mutex lock_;
+  int32_t current_batch_ = 0;
+  int64_t current_batch_length_ = 0;
+  int32_t current_offset_ = 0;
 };
 
 }  // namespace lance::io

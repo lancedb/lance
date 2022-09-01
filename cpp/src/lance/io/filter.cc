@@ -45,7 +45,7 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
+Filter::Execute(const std::shared_ptr<::arrow::RecordBatch>& batch) const {
   ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
   ARROW_ASSIGN_OR_RAISE(auto mask,
                         ::arrow::compute::ExecuteScalarExpression(

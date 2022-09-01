@@ -39,22 +39,26 @@ class Project {
 
   /// Make a Project from the full dataset schema and scan options.
   ///
-  /// \param schema dataset schema.
+  /// \param reader lane=ce file reader.
   /// \param scan_options Arrow scan options.
   /// \param limit limit number of records to return. Optional.
   /// \param offset offset to fetch the record. Optional.
   /// \return Project if success. Returns the error status otherwise.
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
-      const format::Schema& schema,
+      const std::shared_ptr<FileReader>& reader,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
       std::optional<int32_t> limit = std::nullopt,
       int32_t offset = 0);
 
   /// \brief Apply Projection over a batch.
   ///
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
-                                                                 int32_t batch_id);
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(
+      const std::shared_ptr<FileReader>& reader,
+      int32_t batch_id,
+      int32_t offset = 0,
+      std::optional<int32_t> length = std::nullopt);
+
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
 
@@ -67,14 +71,20 @@ class Project {
   bool CanParallelScan() const;
 
  private:
-  Project(std::shared_ptr<format::Schema> projected_schema,
+  Project(const std::shared_ptr<FileReader>& reader,
+          const std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+          std::shared_ptr<format::Schema> projected_schema,
           std::shared_ptr<format::Schema> scan_schema,
           std::unique_ptr<Filter> filter,
           std::optional<int32_t> limit = std::nullopt,
           int32_t offset = 0);
 
+  /// Scan options batch size.
+  int64_t batch_size() const;
+
   /// File reader
   std::shared_ptr<FileReader> reader_;
+  std::shared_ptr<::arrow::dataset::ScanOptions> scan_options_;
 
   std::shared_ptr<format::Schema> projected_schema_;
   /// scan_schema_ equals to projected_schema_ - filters_.schema()

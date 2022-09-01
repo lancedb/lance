@@ -17,6 +17,7 @@
 #include <arrow/array.h>
 #include <arrow/compute/exec/expression.h>
 #include <arrow/record_batch.h>
+#include <arrow/table.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -24,6 +25,7 @@
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
+#include "lance/testing/io.h"
 
 using ::arrow::compute::equal;
 using ::arrow::compute::field_ref;
@@ -57,9 +59,11 @@ TEST_CASE("value = 32") {
   auto struct_arr =
       ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
+  auto table = ::arrow::Table::FromRecordBatches({batch}).ValueOrDie();
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
   auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
-  auto [indices, output] = filter->Execute(batch).ValueOrDie();
+  auto [indices, output] = filter->Execute(reader, 0).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
   bar = lance::arrow::ToArray({32, 32}).ValueOrDie();
@@ -77,9 +81,11 @@ TEST_CASE("label = cat or label = dog") {
   auto struct_arr =
       ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
+  auto table = ::arrow::Table::FromRecordBatches({batch}).ValueOrDie();
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
   auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
-  auto [indices, output] = filter->Execute(batch).ValueOrDie();
+  auto [indices, output] = filter->Execute(reader, 0).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 
   labels = lance::arrow::ToArray({"dog", "cat", "cat"}).ValueOrDie();

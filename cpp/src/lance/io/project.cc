@@ -26,21 +26,26 @@
 
 namespace lance::io {
 
-Project::Project(std::shared_ptr<format::Schema> projected_schema,
+Project::Project(const std::shared_ptr<FileReader>& reader,
+                 const std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+                 std::shared_ptr<format::Schema> projected_schema,
                  std::shared_ptr<format::Schema> scan_schema,
                  std::unique_ptr<Filter> filter,
                  std::optional<int32_t> limit,
                  int32_t offset)
-    : projected_schema_(projected_schema),
+    : reader_(reader),
+      scan_options_(scan_options),
+      projected_schema_(projected_schema),
       scan_schema_(scan_schema),
       filter_(std::move(filter)),
       limit_(limit.has_value() ? new Limit(limit.value(), offset) : nullptr) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
-    const format::Schema& schema,
+    const std::shared_ptr<FileReader>& reader,
     std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
     std::optional<int32_t> limit,
     int32_t offset) {
+  auto& schema = reader->schema();
   ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter));
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
@@ -52,16 +57,21 @@ Project::Project(std::shared_ptr<format::Schema> projected_schema,
     // Remove the columns in filter from the project schema, to avoid duplicated scan
     ARROW_ASSIGN_OR_RAISE(scan_schema, projected_schema->Exclude(filter->schema()));
   }
-  return std::unique_ptr<Project>(
-      new Project(projected_schema, scan_schema, std::move(filter), limit, offset));
+  return std::unique_ptr<Project>(new Project(
+      reader, scan_options, projected_schema, scan_schema, std::move(filter), limit, offset));
 }
 
 const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
 
+int64_t Project::batch_size() const { return scan_options_->batch_size; }
+
 bool Project::CanParallelScan() const { return limit_.operator bool(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
-    std::shared_ptr<FileReader> reader, int32_t batch_id) {
+    const std::shared_ptr<FileReader>& reader,
+    int32_t batch_id,
+    int32_t offset,
+    std::optional<int32_t> length) {
   if (filter_) {
     auto result = filter_->Execute(reader, batch_id);
     if (!result.ok()) {
@@ -75,10 +85,10 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
         /// Indicate the end of iteration.
         return nullptr;
       }
-      auto [offset, len] = offset_and_len.value();
-      indices =
-          std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
-      values = values->Slice(offset, len);
+      auto [offset_in_batch, len] = offset_and_len.value();
+      indices = std::static_pointer_cast<decltype(indices)::element_type>(
+          indices->Slice(offset_in_batch, len));
+      values = values->Slice(offset_in_batch, len);
     }
     if (scan_schema_->fields().empty()) {
       // No extra columns other than the filtered columns need to be read, for example,
@@ -95,7 +105,7 @@ bool Project::CanParallelScan() const { return limit_.operator bool(); }
     if (limit_) {
       return limit_->ReadBatch(reader, *scan_schema_);
     } else {
-      return reader->ReadBatch(*scan_schema_, batch_id);
+      return reader->ReadBatch(*scan_schema_, batch_id, offset, length);
     }
   }
 }
