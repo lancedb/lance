@@ -61,10 +61,12 @@ TEST_CASE("Build Scanner with nested struct") {
   auto table = ::arrow::Table::MakeEmpty(nested_schema).ValueOrDie();
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
-  scanner_builder.Limit(10);
-  scanner_builder.Project({"objects.val"});
-  scanner_builder.Filter(::arrow::compute::equal(::arrow::compute::field_ref({"objects", 0, "val"}),
-                                                 ::arrow::compute::literal(2)));
+  CHECK(scanner_builder.Limit(10).ok());
+  CHECK(scanner_builder.Project({"objects.val"}).ok());
+  CHECK(scanner_builder
+            .Filter(::arrow::compute::equal(::arrow::compute::field_ref({"objects", 0, "val"}),
+                                            ::arrow::compute::literal(2)))
+            .ok());
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
   auto scanner = result.ValueOrDie();
@@ -107,8 +109,8 @@ std::shared_ptr<::arrow::Table> MakeTable() {
 std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::Table> table) {
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
-  scanner_builder.Limit(2);
-  scanner_builder.Project({"c2"});
+  CHECK(scanner_builder.Limit(2).ok());
+  CHECK(scanner_builder.Project({"c2"}).ok());
   // TODO how can extension types implement comparisons for filtering against storage type?
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
@@ -149,7 +151,7 @@ TEST_CASE("Scanner with extension") {
 
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
-  scanner_builder.BatchSize(batch_size);
+  CHECK(scanner_builder.BatchSize(batch_size).ok());
   return scanner_builder.Finish();
 }
 
