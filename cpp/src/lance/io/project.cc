@@ -20,7 +20,7 @@
 #include <fmt/ranges.h>
 
 #include "lance/arrow/utils.h"
-#include "lance/io/filter.h"
+#include "lance/io/exec/filter.h"
 #include "lance/io/limit.h"
 #include "lance/io/reader.h"
 
@@ -57,8 +57,6 @@ Project::Project(std::shared_ptr<format::Schema> projected_schema,
 }
 
 const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
-
-bool Project::CanParallelScan() const { return limit_.operator bool(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
     std::shared_ptr<FileReader> reader, int32_t batch_id) {

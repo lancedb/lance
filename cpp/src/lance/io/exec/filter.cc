@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/filter.h"
+#include "filter.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/api.h>
@@ -22,7 +22,7 @@
 #include "lance/arrow/type.h"
 #include "lance/io/reader.h"
 
-namespace lance::io {
+namespace lance::io::exec {
 
 Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
                const ::arrow::compute::Expression& filter)
@@ -36,6 +36,8 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
   }
   return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Filter::Next() { return child_->Next(); }
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
@@ -63,7 +65,7 @@ Filter::Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const {
   return Execute(batch);
 }
 
-const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
+// const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
 
 std::string Filter::ToString() const { return filter_.ToString(); }
 

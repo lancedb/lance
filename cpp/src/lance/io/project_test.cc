@@ -26,7 +26,7 @@
 #include "lance/arrow/scanner.h"
 #include "lance/arrow/stl.h"
 #include "lance/format/schema.h"
-#include "lance/io/filter.h"
+#include "lance/io/exec/filter.h"
 #include "lance/io/limit.h"
 #include "lance/io/reader.h"
 #include "lance/testing/io.h"

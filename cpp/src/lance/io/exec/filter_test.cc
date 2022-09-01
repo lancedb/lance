@@ -12,15 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/io/filter.h"
+#include "filter.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/exec/expression.h>
 #include <arrow/record_batch.h>
-#include <fmt/format.h>
 
-#include <catch2/catch_test_macros.hpp>
-
+#include "catch2/catch_test_macros.hpp"
+#include "fmt/format.h"
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"

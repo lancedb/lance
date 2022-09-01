@@ -21,13 +21,13 @@
 #include <tuple>
 
 #include "lance/format/schema.h"
+#include "lance/io/exec/base.h"
+#include "lance/io/reader.h"
 
-namespace lance::io {
-
-class FileReader;
+namespace lance::io::exec {
 
 /// Filter.
-class Filter {
+class Filter : public ExecNode {
  public:
   Filter() = delete;
 
@@ -47,19 +47,23 @@ class Filter {
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
       Execute(std::shared_ptr<::arrow::RecordBatch>) const;
 
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next() override;
+
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-  Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const;
+  Execute(std::shared_ptr<lance::io::FileReader> reader, int32_t batch_id) const;
 
-  const std::shared_ptr<lance::format::Schema>& schema() const;
+  //  const std::shared_ptr<lance::format::Schema>& schema() const;
 
-  std::string ToString() const;
+  std::string ToString() const override;
 
  private:
   Filter(std::shared_ptr<lance::format::Schema> schema, const ::arrow::compute::Expression& filter);
 
   std::shared_ptr<lance::format::Schema> schema_;
   ::arrow::compute::Expression filter_;
+
+  std::unique_ptr<ExecNode> child_;
 };
 
 }  // namespace lance::io

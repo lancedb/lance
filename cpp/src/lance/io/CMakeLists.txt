@@ -15,12 +15,12 @@
 
 # Internal I/O
 
+add_subdirectory(exec)
+
 add_library(
         io
         OBJECT
         endian.h
-        filter.cc
-        filter.h
         limit.cc
         limit.h
         pb.cc
@@ -36,9 +36,8 @@ add_library(
 )
 target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 # Depend on lance::format to generate protobuf
-add_dependencies(io format)
+add_dependencies(io format lance_io_exec)
 
-add_lance_test(filter_test)
 add_lance_test(limit_test)
 add_lance_test(project_test)
 add_lance_test(reader_test)

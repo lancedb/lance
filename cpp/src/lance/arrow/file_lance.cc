@@ -23,7 +23,7 @@
 #include "lance/arrow/file_lance_ext.h"
 #include "lance/arrow/reader.h"
 #include "lance/format/schema.h"
-#include "lance/io/filter.h"
+#include "lance/io/exec/filter.h"
 #include "lance/io/project.h"
 #include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
