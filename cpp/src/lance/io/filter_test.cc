@@ -62,7 +62,7 @@ TEST_CASE("value = 32") {
   auto table = ::arrow::Table::FromRecordBatches({batch}).ValueOrDie();
   auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
-  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = lance::io::Filter::Make(reader->schema(), expr).ValueOrDie();
   auto [indices, output] = filter->Execute(reader, 0).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
@@ -84,7 +84,7 @@ TEST_CASE("label = cat or label = dog") {
   auto table = ::arrow::Table::FromRecordBatches({batch}).ValueOrDie();
   auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
-  auto filter = lance::io::Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = lance::io::Filter::Make(reader->schema(), expr).ValueOrDie();
   auto [indices, output] = filter->Execute(reader, 0).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 
