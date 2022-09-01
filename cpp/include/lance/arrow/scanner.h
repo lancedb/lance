@@ -15,6 +15,7 @@
 #pragma once
 
 #include <arrow/compute/exec/expression.h>
+#include <arrow/dataset/scanner.h>
 #include <arrow/dataset/type_fwd.h>
 #include <arrow/result.h>
 
@@ -44,22 +45,22 @@ class ScannerBuilder final {
   /// Project over selected columns.
   ///
   /// \param columns Selected column names.
-  void Project(const std::vector<std::string>& columns);
+  ::arrow::Status Project(const std::vector<std::string>& columns);
+
+  /// Set batch size to scan.
+  ::arrow::Status BatchSize(int64_t batch_size);
 
   /// Apply Filter
-  void Filter(const ::arrow::compute::Expression& filter);
+  ::arrow::Status Filter(const ::arrow::compute::Expression& filter);
 
-  /// Set limit to the dataset
-  void Limit(int64_t limit, int64_t offset = 0);
+  /// Set limit and offset to scan.
+  ::arrow::Status Limit(int64_t limit, int64_t offset = 0);
 
-  ::arrow::Result<std::shared_ptr<::arrow::dataset::Scanner>> Finish() const;
+  ::arrow::Result<std::shared_ptr<::arrow::dataset::Scanner>> Finish();
 
  private:
-  std::shared_ptr<::arrow::dataset::Dataset> dataset_;
+  ::arrow::dataset::ScannerBuilder builder_;
   std::optional<std::vector<std::string>> columns_ = std::nullopt;
-  ::arrow::compute::Expression filter_ = ::arrow::compute::literal(true);
-  std::optional<int64_t> limit_ = std::nullopt;
-  int64_t offset_ = 0;
 };
 
 }  // namespace lance::arrow

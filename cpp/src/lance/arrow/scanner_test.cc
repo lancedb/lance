@@ -20,15 +20,14 @@
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
 
-#include "lance/arrow/type.h"
+#include "lance/arrow/stl.h"
 #include "lance/arrow/testing.h"
+#include "lance/arrow/type.h"
 #include "lance/format/schema.h"
-
 
 auto nested_schema = ::arrow::schema({::arrow::field("pk", ::arrow::int32()),
                                       ::arrow::field("objects",
@@ -62,10 +61,12 @@ TEST_CASE("Build Scanner with nested struct") {
   auto table = ::arrow::Table::MakeEmpty(nested_schema).ValueOrDie();
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
-  scanner_builder.Limit(10);
-  scanner_builder.Project({"objects.val"});
-  scanner_builder.Filter(::arrow::compute::equal(::arrow::compute::field_ref({"objects", 0, "val"}),
-                                                 ::arrow::compute::literal(2)));
+  CHECK(scanner_builder.Limit(10).ok());
+  CHECK(scanner_builder.Project({"objects.val"}).ok());
+  CHECK(scanner_builder
+            .Filter(::arrow::compute::equal(::arrow::compute::field_ref({"objects", 0, "val"}),
+                                            ::arrow::compute::literal(2)))
+            .ok());
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
   auto scanner = result.ValueOrDie();
@@ -83,7 +84,6 @@ TEST_CASE("Build Scanner with nested struct") {
   fmt::print("Scanner Options: {}\n", scanner->options()->filter.ToString());
 }
 
-
 std::shared_ptr<::arrow::Table> MakeTable() {
   auto ext_type = std::make_shared<::lance::testing::ParametricType>(1);
   ::arrow::StringBuilder stringBuilder;
@@ -97,8 +97,8 @@ std::shared_ptr<::arrow::Table> MakeTable() {
   auto c2 = intBuilder.Finish().ValueOrDie();
   intBuilder.Reset();
 
-  auto schema = ::arrow::schema({arrow::field("c1", ::arrow::utf8()),
-                                 arrow::field("c2", ext_type)});
+  auto schema =
+      ::arrow::schema({arrow::field("c1", ::arrow::utf8()), arrow::field("c2", ext_type)});
 
   std::vector<std::shared_ptr<::arrow::Array>> cols;
   cols.push_back(c1);
@@ -109,8 +109,8 @@ std::shared_ptr<::arrow::Table> MakeTable() {
 std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::Table> table) {
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
-  scanner_builder.Limit(2);
-  scanner_builder.Project({"c2"});
+  CHECK(scanner_builder.Limit(2).ok());
+  CHECK(scanner_builder.Project({"c2"}).ok());
   // TODO how can extension types implement comparisons for filtering against storage type?
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
@@ -118,7 +118,6 @@ std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::
   fmt::print("Projected: {}\n", scanner->options()->projected_schema);
   return scanner;
 }
-
 
 TEST_CASE("Scanner with extension") {
   auto table = MakeTable();
@@ -140,4 +139,67 @@ TEST_CASE("Scanner with extension") {
   auto actual_table = scanner->ToTable().ValueOrDie();
   CHECK(actual_table->schema()->Equals(expected_proj_schema));
   CHECK(actual_table->GetColumnByName("c2")->type()->Equals(ext_type));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::dataset::Scanner>> MakeScannerForBatchScan(
+    int64_t num_values, int64_t batch_size) {
+  std::vector<int32_t> values(num_values);
+  std::iota(values.begin(), values.end(), 0);
+  auto arr = lance::arrow::ToArray(values).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("value", ::arrow::int32())}), {arr});
+
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
+  auto scanner_builder = lance::arrow::ScannerBuilder(dataset);
+  CHECK(scanner_builder.BatchSize(batch_size).ok());
+  return scanner_builder.Finish();
+}
+
+TEST_CASE("Test Scanner::ToRecordBatchReader with batch size") {
+  const int kTotalValues = 100;
+  const int kBatchSize = 4;
+  auto scanner = MakeScannerForBatchScan(kTotalValues, kBatchSize).ValueOrDie();
+  auto record_batch_reader = scanner->ToRecordBatchReader().ValueOrDie();
+  int num_batches = 0;
+  while (auto batch = record_batch_reader->Next().ValueOrDie()) {
+    CHECK(batch->num_rows() == kBatchSize);
+    num_batches++;
+  }
+  CHECK(num_batches == kTotalValues / kBatchSize);
+}
+
+TEST_CASE("Test Scanner::ScanBatch with batch size") {
+  const int kTotalValues = 100;
+  const int kBatchSize = 4;
+  auto scanner = MakeScannerForBatchScan(kTotalValues, kBatchSize).ValueOrDie();
+  auto batches = scanner->ScanBatches().ValueOrDie();
+  int num_batches = 0;
+  while (true) {
+    auto batch = batches.Next().ValueOrDie();
+    if (!batch.record_batch) {
+      break;
+    }
+    CHECK(batch.record_batch->num_rows() == kBatchSize);
+    num_batches++;
+  }
+  CHECK(num_batches == kTotalValues / kBatchSize);
+}
+
+TEST_CASE("Test ScanBatchesAsync with batch size") {
+  const int kTotalValues = 100;
+  const int kBatchSize = 4;
+  auto scanner = MakeScannerForBatchScan(kTotalValues, kBatchSize).ValueOrDie();
+  auto generator = scanner->ScanBatchesAsync().ValueOrDie();
+  int num_batches = 0;
+  while (true) {
+    auto fut = generator();
+    CHECK(fut.Wait(1));
+    auto batch = fut.result().ValueOrDie();
+    if (!batch.record_batch) {
+      break;
+    }
+    num_batches++;
+    CHECK(batch.record_batch->num_rows() == kBatchSize);
+  }
+  CHECK(num_batches == kTotalValues / kBatchSize);
 }

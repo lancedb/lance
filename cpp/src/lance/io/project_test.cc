@@ -46,9 +46,11 @@ TEST_CASE("Project schema") {
   auto dataset = std::make_shared<arrow::dataset::InMemoryDataset>(tbl);
 
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
-  scan_builder.Project({"v"});
-  scan_builder.Filter(
-      arrow::compute::equal(arrow::compute::field_ref("v"), arrow::compute::literal(20)));
+  CHECK(scan_builder.Project({"v"}).ok());
+  CHECK(scan_builder
+            .Filter(
+                arrow::compute::equal(arrow::compute::field_ref("v"), arrow::compute::literal(20)))
+            .ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
 
   auto lance_schema = lance::format::Schema(schema);

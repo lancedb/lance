@@ -27,30 +27,34 @@
 namespace lance::arrow {
 
 ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> dataset)
-    : dataset_(dataset) {}
+    : builder_(dataset) {}
 
-void ScannerBuilder::Project(const std::vector<std::string>& columns) { columns_ = columns; }
-
-void ScannerBuilder::Filter(const ::arrow::compute::Expression& filter) { filter_ = filter; }
-
-void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
-  limit_ = limit;
-  offset_ = offset;
+::arrow::Status ScannerBuilder::Project(const std::vector<std::string>& columns) {
+  columns_ = columns;
+  return ::arrow::Status::OK();
 }
 
-::arrow::Result<std::shared_ptr<::arrow::dataset::Scanner>> ScannerBuilder::Finish() const {
-  if (offset_ < 0) {
-    return ::arrow::Status::Invalid("Offset is negative");
+::arrow::Status ScannerBuilder::Filter(const ::arrow::compute::Expression& filter) {
+  return builder_.Filter(filter);
+}
+
+::arrow::Status ScannerBuilder::BatchSize(int64_t batch_size) {
+  return builder_.BatchSize(batch_size);
+}
+
+::arrow::Status ScannerBuilder::Limit(int64_t limit, int64_t offset) {
+  if (limit <= 0 || offset < 0) {
+    return ::arrow::Status::Invalid("Limit / offset is invalid: limit=", limit, " offset=", offset);
   }
-  auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
-  ARROW_RETURN_NOT_OK(builder.Filter(filter_));
-
   auto fragment_opts = std::make_shared<LanceFragmentScanOptions>();
-  fragment_opts->limit = limit_;
-  fragment_opts->offset = offset_;
-  ARROW_RETURN_NOT_OK(builder.FragmentScanOptions(fragment_opts));
+  fragment_opts->limit = limit;
+  fragment_opts->offset = offset;
 
-  ARROW_ASSIGN_OR_RAISE(auto scanner, builder.Finish());
+  return builder_.FragmentScanOptions(fragment_opts);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::dataset::Scanner>> ScannerBuilder::Finish() {
+  ARROW_ASSIGN_OR_RAISE(auto scanner, builder_.Finish());
 
   /// We do the schema projection manually here to support nested structs.
   /// Esp. for `list<struct>`, supports Spark-like access, for example,
@@ -97,10 +101,14 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
     scanner->options()->projection = project_desc.expression;
   }
 
-  if (limit_.has_value()) {
-    scanner->options()->batch_size = offset_ + limit_.value();
-    /// We need to limit the parallelism for Project to calculate LIMIT / Offset
-    scanner->options()->batch_readahead = 1;
+  if (scanner->options()->fragment_scan_options) {
+    auto fso = std::dynamic_pointer_cast<LanceFragmentScanOptions>(
+        scanner->options()->fragment_scan_options);
+    if (fso->limit) {
+      scanner->options()->batch_size = fso->limit.value();
+      /// We need to limit the parallelism for Project to calculate LIMIT / Offset
+      scanner->options()->batch_readahead = 1;
+    }
   }
 
   return scanner;
