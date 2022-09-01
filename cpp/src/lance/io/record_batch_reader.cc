@@ -75,18 +75,17 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       current_batch_length_(other.current_batch_length_),
       current_offset_(other.current_offset_) {}
 
-
 std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   return project_->schema()->ToArrow();
 }
 
-std::optional<RecordBatchReader::Task> RecordBatchReader::NextTask() {
+std::optional<RecordBatchReader::ReadBatchTask> RecordBatchReader::NextTask() {
   std::lock_guard guard(lock_);
   if (current_batch_ >= num_batches_) {
     return std::nullopt;
   }
 
-  auto task = Task();
+  auto task = ReadBatchTask();
   task.batch_id = current_batch_;
   task.length = options_->batch_size;
   task.offset = current_offset_;
@@ -122,21 +121,17 @@ std::optional<RecordBatchReader::Task> RecordBatchReader::NextTask() {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  ::arrow::Result<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> submit_result;
-
-  auto result = thread_pool_->Submit([&]() {
-    auto task = NextTask();
-    if (task.has_value()) {
-      return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
-          this->ReadBatch(task->batch_id, task->offset, task->length));
-    } else {
-      return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(nullptr);
-    }
-  });
-  if (result.ok()) {
-    return result.ValueOrDie();
-  }
-  return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(result.status());
+  ARROW_ASSIGN_OR_RAISE(
+      auto fut,
+      thread_pool_->Submit([&]() -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {
+        auto task = NextTask();
+        if (task) {
+          return this->ReadBatch(task->batch_id, task->offset, task->length);
+        } else {
+          return nullptr;
+        }
+      }));
+  return fut;
 }
 
 }  // namespace lance::io

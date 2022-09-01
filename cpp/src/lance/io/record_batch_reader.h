@@ -72,13 +72,15 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
       ::arrow::internal::ThreadPool* thread_pool = ::arrow::internal::GetCpuThreadPool()) noexcept;
 
   /// A Task description to read a batch from file reader.
-  struct Task {
+  struct ReadBatchTask {
+    /// The batch id to read.
     int32_t batch_id;
     int32_t offset;
     int32_t length;
   };
 
-  std::optional<Task> NextTask();
+  /// Returns the next read batch task. Returns std::nullopt if eof
+  std::optional<ReadBatchTask> NextTask();
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       int32_t batch_id, int32_t offset = 0, std::optional<int32_t> length = std::nullopt) const;
@@ -91,8 +93,11 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
 
   ::arrow::internal::ThreadPool* thread_pool_;
   std::mutex lock_;
+  /// The current batch id.
   int32_t current_batch_ = 0;
+  /// The page length of the current batch.
   int64_t current_batch_length_ = 0;
+  /// The offset to read from the current batch.
   int32_t current_offset_ = 0;
 };
 
