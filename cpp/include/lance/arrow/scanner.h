@@ -46,6 +46,9 @@ class ScannerBuilder final {
   /// \param columns Selected column names.
   void Project(const std::vector<std::string>& columns);
 
+  /// Set batch size to scan.
+  void BatchSize(int64_t batch_size);
+
   /// Apply Filter
   void Filter(const ::arrow::compute::Expression& filter);
 
@@ -58,6 +61,7 @@ class ScannerBuilder final {
   std::shared_ptr<::arrow::dataset::Dataset> dataset_;
   std::optional<std::vector<std::string>> columns_ = std::nullopt;
   ::arrow::compute::Expression filter_ = ::arrow::compute::literal(true);
+  std::optional<int64_t> batch_size_ = std::nullopt;
   std::optional<int64_t> limit_ = std::nullopt;
   int64_t offset_ = 0;
 };

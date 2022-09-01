@@ -33,6 +33,8 @@ void ScannerBuilder::Project(const std::vector<std::string>& columns) { columns_
 
 void ScannerBuilder::Filter(const ::arrow::compute::Expression& filter) { filter_ = filter; }
 
+void ScannerBuilder::BatchSize(int64_t batch_size) { batch_size_ = batch_size; }
+
 void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   limit_ = limit;
   offset_ = offset;
@@ -44,6 +46,10 @@ void ScannerBuilder::Limit(int64_t limit, int64_t offset) {
   }
   auto builder = ::arrow::dataset::ScannerBuilder(dataset_);
   ARROW_RETURN_NOT_OK(builder.Filter(filter_));
+
+  if (batch_size_) {
+    ARROW_RETURN_NOT_OK(builder.BatchSize(batch_size_.value()));
+  }
 
   auto fragment_opts = std::make_shared<LanceFragmentScanOptions>();
   fragment_opts->limit = limit_;
