@@ -58,14 +58,6 @@ class Project {
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
 
-  /// \brief Can the plan support parallel scan.
-  ///
-  /// \note Once Projection has limit / offset clause, parallel reads are limited.
-  ///
-  /// \todo GH-43. should we remove this LIMIT / OFFSET logic, and the decision about parallel scan
-  /// out of the format spec?
-  bool CanParallelScan() const;
-
  private:
   Project(const std::shared_ptr<FileReader>& reader,
           const std::shared_ptr<::arrow::dataset::ScanOptions>& scan_options,

@@ -71,8 +71,6 @@ const std::shared_ptr<format::Schema>& Project::schema() const { return projecte
 
 int64_t Project::batch_size() const { return scan_options_->batch_size; }
 
-bool Project::CanParallelScan() const { return limit_.operator bool(); }
-
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
     const std::shared_ptr<FileReader>& reader,
     int32_t batch_id,
