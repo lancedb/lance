@@ -41,15 +41,11 @@ class Project {
   ///
   /// \param reader lane=ce file reader.
   /// \param scan_options Arrow scan options.
-  /// \param limit limit number of records to return. Optional.
-  /// \param offset offset to fetch the record. Optional.
   /// \return Project if success. Returns the error status otherwise.
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
       const std::shared_ptr<FileReader>& reader,
-      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
-      std::optional<int32_t> limit = std::nullopt,
-      int32_t offset = 0);
+      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
 
   /// \brief Apply Projection over a batch.
   ///
@@ -72,12 +68,10 @@ class Project {
 
  private:
   Project(const std::shared_ptr<FileReader>& reader,
-          const std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+          const std::shared_ptr<::arrow::dataset::ScanOptions>& scan_options,
           std::shared_ptr<format::Schema> projected_schema,
           std::shared_ptr<format::Schema> scan_schema,
-          std::unique_ptr<Filter> filter,
-          std::optional<int32_t> limit = std::nullopt,
-          int32_t offset = 0);
+          std::unique_ptr<Filter> filter);
 
   /// Scan options batch size.
   int64_t batch_size() const;

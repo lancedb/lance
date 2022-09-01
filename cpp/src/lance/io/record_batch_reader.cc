@@ -34,16 +34,22 @@
 
 namespace lance::io {
 
+::arrow::Result<RecordBatchReader> RecordBatchReader::Make(
+    const std::shared_ptr<FileReader>& reader,
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
+    ::arrow::internal::ThreadPool* thread_pool) {
+  RecordBatchReader batch_reader(reader, options, thread_pool);
+  ARROW_ASSIGN_OR_RAISE(batch_reader.project_, Project::Make(reader, options));
+
+  return std::move(batch_reader);
+}
+
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                                     std::optional<int64_t> limit,
-                                     int64_t offset,
                                      ::arrow::internal::ThreadPool* thread_pool) noexcept
     : reader_(reader),
       options_(options),
       num_batches_(reader->metadata().num_batches()),
-      limit_(limit),
-      offset_(offset),
       thread_pool_(thread_pool) {
   assert(thread_pool_);
   current_batch_length_ = reader->metadata().GetBatchLength(0);
@@ -53,11 +59,9 @@ RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
     : reader_(other.reader_),
       options_(other.options_),
       num_batches_(other.num_batches_),
-      limit_(other.limit_),
-      offset_(other.offset_),
       project_(other.project_),
       thread_pool_(other.thread_pool_),
-      current_batch_(int(other.current_batch_)),
+      current_batch_(other.current_batch_),
       current_batch_length_(other.current_batch_length_),
       current_offset_(other.current_offset_) {}
 
@@ -65,18 +69,12 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
       num_batches_(other.num_batches_),
-      limit_(other.limit_),
-      offset_(other.offset_),
       project_(std::move(other.project_)),
       thread_pool_(std::move(other.thread_pool_)),
-      current_batch_(int(other.current_batch_)),
+      current_batch_(other.current_batch_),
       current_batch_length_(other.current_batch_length_),
       current_offset_(other.current_offset_) {}
 
-::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_, options_, limit_, offset_));
-  return ::arrow::Status::OK();
-}
 
 std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   return project_->schema()->ToArrow();
@@ -124,8 +122,6 @@ std::optional<RecordBatchReader::Task> RecordBatchReader::NextTask() {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  int total_batches = reader_->metadata().num_batches();
-  fmt::print("Operator(): batch_size={} total_batches={}\n", options_->batch_size, total_batches);
   ::arrow::Result<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> submit_result;
 
   auto result = thread_pool_->Submit([&]() {

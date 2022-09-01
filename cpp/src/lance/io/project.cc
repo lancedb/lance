@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include "lance/arrow/file_lance_ext.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/filter.h"
 #include "lance/io/limit.h"
@@ -27,24 +28,29 @@
 namespace lance::io {
 
 Project::Project(const std::shared_ptr<FileReader>& reader,
-                 const std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
+                 const std::shared_ptr<::arrow::dataset::ScanOptions>& scan_options,
                  std::shared_ptr<format::Schema> projected_schema,
                  std::shared_ptr<format::Schema> scan_schema,
-                 std::unique_ptr<Filter> filter,
-                 std::optional<int32_t> limit,
-                 int32_t offset)
+                 std::unique_ptr<Filter> filter)
     : reader_(reader),
       scan_options_(scan_options),
       projected_schema_(projected_schema),
       scan_schema_(scan_schema),
-      filter_(std::move(filter)),
-      limit_(limit.has_value() ? new Limit(limit.value(), offset) : nullptr) {}
+      filter_(std::move(filter)) {
+  if (scan_options->fragment_scan_options &&
+      scan_options->fragment_scan_options->type_name() ==
+          lance::arrow::LanceFragmentScanOptions().type_name()) {
+    auto fso = std::dynamic_pointer_cast<lance::arrow::LanceFragmentScanOptions>(
+        scan_options->fragment_scan_options);
+    if (fso->limit) {
+      limit_ = std::make_unique<Limit>(fso->limit.value(), fso->offset);
+    }
+  }
+}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     const std::shared_ptr<FileReader>& reader,
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
-    std::optional<int32_t> limit,
-    int32_t offset) {
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
   auto& schema = reader->schema();
   ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter));
   auto projected_arrow_schema = scan_options->projected_schema;
@@ -57,8 +63,8 @@ Project::Project(const std::shared_ptr<FileReader>& reader,
     // Remove the columns in filter from the project schema, to avoid duplicated scan
     ARROW_ASSIGN_OR_RAISE(scan_schema, projected_schema->Exclude(filter->schema()));
   }
-  return std::unique_ptr<Project>(new Project(
-      reader, scan_options, projected_schema, scan_schema, std::move(filter), limit, offset));
+  return std::unique_ptr<Project>(
+      new Project(reader, scan_options, projected_schema, scan_schema, std::move(filter)));
 }
 
 const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }

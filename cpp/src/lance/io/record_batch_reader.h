@@ -40,13 +40,11 @@ class Project;
 /// Lance RecordBatchReader
 class RecordBatchReader : ::arrow::RecordBatchReader {
  public:
-  /// Constructor.
-  RecordBatchReader(
-      std::shared_ptr<FileReader> reader,
-      std::shared_ptr<::arrow::dataset::ScanOptions> options,
-      std::optional<int64_t> limit = std::nullopt,
-      int64_t offset = 0,
-      ::arrow::internal::ThreadPool* thread_pool_ = ::arrow::internal::GetCpuThreadPool()) noexcept;
+  /// Factory method
+  static ::arrow::Result<RecordBatchReader> Make(
+      const std::shared_ptr<FileReader>& reader,
+      const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
+      ::arrow::internal::ThreadPool* thread_pool = ::arrow::internal::GetCpuThreadPool());
 
   /// Copy constructor.
   RecordBatchReader(const RecordBatchReader& other) noexcept;
@@ -55,9 +53,6 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   RecordBatchReader(RecordBatchReader&& other) noexcept;
 
   ~RecordBatchReader() = default;
-
-  /// Open the RecordBatchReader. Must call it before start iterating.
-  ::arrow::Status Open();
 
   std::shared_ptr<::arrow::Schema> schema() const override;
 
@@ -69,6 +64,12 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
 
  private:
   RecordBatchReader() = delete;
+
+  /// Constructor.
+  RecordBatchReader(
+      std::shared_ptr<FileReader> reader,
+      std::shared_ptr<::arrow::dataset::ScanOptions> options,
+      ::arrow::internal::ThreadPool* thread_pool = ::arrow::internal::GetCpuThreadPool()) noexcept;
 
   /// A Task description to read a batch from file reader.
   struct Task {
@@ -85,9 +86,6 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   const std::shared_ptr<FileReader> reader_;
   const std::shared_ptr<::arrow::dataset::ScanOptions> options_;
   const int32_t num_batches_;
-  // Limit and Offset push down.
-  std::optional<int64_t> limit_ = std::nullopt;
-  int64_t offset_ = 0;
   /// Projection over the dataset.
   std::shared_ptr<Project> project_;
 

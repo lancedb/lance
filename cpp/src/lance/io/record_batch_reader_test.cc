@@ -40,11 +40,10 @@ TEST_CASE("Test Read with batch size") {
   auto dataset = std::make_shared<arrow::dataset::InMemoryDataset>(t);
 
   auto builder = lance::arrow::ScannerBuilder(dataset);
-  builder.BatchSize(kBatchSize);
+  CHECK(builder.BatchSize(kBatchSize).ok());
   auto scanner = builder.Finish().ValueOrDie();
 
-  auto record_batch_reader = RecordBatchReader(file_reader, scanner->options());
-  CHECK(record_batch_reader.Open().ok());
+  auto record_batch_reader = RecordBatchReader::Make(file_reader, scanner->options()).ValueOrDie();
   while (true) {
     auto fut = record_batch_reader();
     CHECK(fut.Wait(5));

@@ -63,18 +63,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
 
-  std::optional<int64_t> limit = std::nullopt;
-  int64_t offset = 0;
-  if (options->fragment_scan_options &&
-      options->fragment_scan_options->type_name() == kLanceFormatTypeName) {
-    auto lance_fragment_scan_options =
-        std::dynamic_pointer_cast<LanceFragmentScanOptions>(options->fragment_scan_options);
-    limit = lance_fragment_scan_options->limit;
-    offset = lance_fragment_scan_options->offset;
-  }
-
-  auto batch_reader = lance::io::RecordBatchReader(reader, options, limit, offset);
-  ARROW_RETURN_NOT_OK(batch_reader.Open());
+  ARROW_ASSIGN_OR_RAISE(auto batch_reader, lance::io::RecordBatchReader::Make(reader, options));
   auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
   return generator;
 }
