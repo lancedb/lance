@@ -36,9 +36,9 @@ namespace lance::io {
 
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                                     ::arrow::internal::ThreadPool* thread_pool,
                                      std::optional<int64_t> limit,
-                                     int64_t offset) noexcept
+                                     int64_t offset,
+                                     ::arrow::internal::ThreadPool* thread_pool) noexcept
     : reader_(reader),
       options_(options),
       num_batches_(reader->metadata().num_batches()),
