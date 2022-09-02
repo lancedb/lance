@@ -23,10 +23,10 @@
 
 namespace lance::io::exec {
 
-::arrow::Result<std::unique_ptr<Limit>> Limit::Make(int64_t limit,
-                                                    int64_t offset,
-                                                    std::unique_ptr<ExecNode> child) noexcept {
-  return std::unique_ptr<Limit>(new Limit(limit, offset, std::move(child)));
+::arrow::Result<std::unique_ptr<ExecNode>> Limit::Make(int64_t limit,
+                                                       int64_t offset,
+                                                       std::unique_ptr<ExecNode> child) noexcept {
+  return std::unique_ptr<ExecNode>(new Limit(limit, offset, std::move(child)));
 }
 
 Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept

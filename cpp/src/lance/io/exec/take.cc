@@ -45,6 +45,7 @@ Take::Take(std::shared_ptr<FileReader> reader,
   auto values = std::reinterpret_pointer_cast<::arrow::StructArray>(vals);
   if (!schema_) {
     return ScanBatch{::arrow::RecordBatch::FromStructArray(vals).ValueOrDie(), filtered.batch_id};
+  } else {
   }
   return child_->Next();
 }

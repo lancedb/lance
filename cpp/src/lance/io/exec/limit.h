@@ -43,9 +43,9 @@ class Limit : public ExecNode {
   Limit() = delete;
 
   /// Factory method.
-  static ::arrow::Result<std::unique_ptr<Limit>> Make(int64_t limit,
-                                                      int64_t offset,
-                                                      std::unique_ptr<ExecNode> child) noexcept;
+  static ::arrow::Result<std::unique_ptr<ExecNode>> Make(int64_t limit,
+                                                         int64_t offset,
+                                                         std::unique_ptr<ExecNode> child) noexcept;
 
   /// Construct a Limit Clause with limit, and optionally, with offset.
   explicit Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept;

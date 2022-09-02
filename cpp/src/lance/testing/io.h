@@ -38,7 +38,9 @@ class DummyNode : lance::io::exec::ExecNode {
 
   DummyNode(DummyNode&&) = default;
 
-  static std::unique_ptr<DummyNode> Make() { return std::make_unique<DummyNode>(); }
+  static std::unique_ptr<io::exec::ExecNode> Make() {
+    return std::unique_ptr<io::exec::ExecNode>(new DummyNode());
+  }
 
   ::arrow::Result<io::exec::ScanBatch> Next() override {
     return ::arrow::Status::NotImplemented("DummyNode::Next not implemented");

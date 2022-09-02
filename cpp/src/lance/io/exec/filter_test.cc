@@ -37,16 +37,16 @@ const auto kSchema =
                                            ::arrow::field("label", ::arrow::utf8())}));
 
 TEST_CASE("Test without filter") {
-  auto empty_filter = Filter::Make(kSchema, ::arrow::compute::literal(true), nullptr).ValueOrDie();
+  auto empty_filter = Filter::Make(::arrow::compute::literal(true), nullptr).ValueOrDie();
   CHECK(empty_filter == nullptr);
 }
 
 TEST_CASE("Test with one condition") {
-  auto filter = Filter::Make(kSchema, equal(field_ref("value"), literal("32")), nullptr);
+  auto filter = Filter::Make(equal(field_ref("value"), literal("32")), nullptr);
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 
-  filter = Filter::Make(kSchema, equal(literal("32"), field_ref("value")), nullptr);
+  filter = Filter::Make(equal(literal("32"), field_ref("value")), nullptr);
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 }
@@ -58,7 +58,7 @@ TEST_CASE("value = 32") {
       ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
-  auto filter = Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = Filter::Make(expr, nullptr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
@@ -78,7 +78,7 @@ TEST_CASE("label = cat or label = dog") {
       ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
-  auto filter = Filter::Make(kSchema, expr).ValueOrDie();
+  auto filter = Filter::Make(expr, nullptr).ValueOrDie();
   auto [indices, output] = filter->Execute(batch).ValueOrDie();
   CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 

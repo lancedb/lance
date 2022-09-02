@@ -33,12 +33,12 @@ using lance::io::exec::Limit;
 using lance::testing::DummyNode;
 
 TEST_CASE("LIMIT 100") {
-  auto limit = Limit::Make(100, 0, std::move(DummyNode::Make())).ValueOrDie();
-  CHECK(limit->Apply(10).value() == std::make_tuple(0, 10));
-  CHECK(limit->Apply(80).value() == std::make_tuple(0, 80));
-  CHECK(limit->Apply(20).value() == std::make_tuple(0, 10));
+  auto limit = Limit(100, 0, DummyNode::Make());
+  CHECK(limit.Apply(10).value() == std::make_tuple(0, 10));
+  CHECK(limit.Apply(80).value() == std::make_tuple(0, 80));
+  CHECK(limit.Apply(20).value() == std::make_tuple(0, 10));
   // Limit already reached.
-  CHECK(limit->Apply(30) == std::nullopt);
+  CHECK(limit.Apply(30) == std::nullopt);
 }
 
 TEST_CASE("LIMIT 10 OFFSET 20") {
@@ -64,7 +64,7 @@ TEST_CASE("Read limit multiple times") {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   CHECK(reader->Open().ok());
-  auto limit = Limit(5, 10);
+  auto limit = Limit(5, 10, nullptr);
   auto batch = limit.ReadBatch(reader, reader->schema()).ValueOrDie();
   INFO("Actual: " << batch->column(0)->ToString());
   CHECK(batch->column(0)->Equals(lance::arrow::ToArray({11, 12, 13, 14, 15}).ValueOrDie()));
