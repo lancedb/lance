@@ -23,7 +23,14 @@
 
 namespace lance::io::exec {
 
-Limit::Limit(int64_t limit, int64_t offset) noexcept : limit_(limit), offset_(offset) {
+::arrow::Result<std::unique_ptr<Limit>> Limit::Make(int64_t limit,
+                                                    int64_t offset,
+                                                    std::unique_ptr<ExecNode> child) noexcept {
+  return std::unique_ptr<Limit>(new Limit(limit, offset, std::move(child)));
+}
+
+Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept
+    : limit_(limit), offset_(offset), child_(std::move(child)) {
   assert(offset >= 0);
   assert(limit >= 0);
 }
@@ -44,6 +51,19 @@ std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
   return std::make_tuple(offset, read_to - offset);
 }
 
+::arrow::Result<ScanBatch> Limit::Next() {
+  if (seen_ >= limit_) {
+    return ScanBatch{};
+  }
+  ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
+  if (batch.eof()) {
+    return batch;
+  }
+  auto num_records = limit_ - seen_;
+  seen_ += batch.batch->num_rows();
+  return ScanBatch{batch.batch->Slice(0, num_records), batch.batch_id};
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Limit::ReadBatch(
     const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema) {
   if (seen_ >= limit_) {
@@ -58,4 +78,4 @@ std::string Limit::ToString() const {
   return fmt::format("Limit(n={}, offset={})", limit_, offset_);
 }
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

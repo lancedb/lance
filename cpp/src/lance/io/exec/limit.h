@@ -22,6 +22,8 @@
 #include <string>
 #include <tuple>
 
+#include "lance/io/exec/base.h"
+
 namespace lance::format {
 class Schema;
 }  // namespace lance::format
@@ -36,12 +38,16 @@ namespace lance::io::exec {
 ///
 ///   LIMIT value:int64 [OFFSET value:int64]
 ///
-class Limit {
+class Limit : public ExecNode {
  public:
   Limit() = delete;
 
+  static ::arrow::Result<std::unique_ptr<Limit>> Make(int64_t limit,
+                                                      int64_t offset,
+                                                      std::unique_ptr<ExecNode> child) noexcept;
+
   /// Construct a Limit Clause with limit, and optionally, with offset.
-  explicit Limit(int64_t limit, int64_t offset = 0) noexcept;
+  explicit Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept;
 
   /// Apply limit when reading a Batch.
   ///
@@ -63,17 +69,21 @@ class Limit {
   /// \endcode
   std::optional<std::tuple<int64_t, int64_t>> Apply(int64_t length);
 
+  ::arrow::Result<ScanBatch> Next() override;
+
   /// ReadBatch
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema);
 
   /// Debug String
-  std::string ToString() const;
+  std::string ToString() const override;
 
  private:
   int64_t limit_ = 0;
   int64_t offset_ = 0;
   int64_t seen_ = 0;
+
+  std::unique_ptr<ExecNode> child_;
 };
 
 }  // namespace lance::io::exec

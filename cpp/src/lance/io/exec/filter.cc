@@ -23,26 +23,33 @@
 
 namespace lance::io::exec {
 
-Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
-               const ::arrow::compute::Expression& filter,
-               std::unique_ptr<ExecNode> child)
-    : schema_(schema), filter_(filter), child_(std::move(child)) {}
+Filter::Filter(const ::arrow::compute::Expression& filter,
+               std::unique_ptr<ExecNode> scan,
+               std::unique_ptr<ExecNode> take)
+    : filter_(filter), scan_(std::move(scan)), take_(std::move(take)) {}
 
 ::arrow::Result<std::unique_ptr<Filter>> Filter::Make(const lance::format::Schema& schema,
                                                       const ::arrow::compute::Expression& filter,
-                                                      std::unique_ptr<ExecNode> child) {
+                                                      std::unique_ptr<ExecNode> scan,
+                                                      std::unique_ptr<ExecNode> take) {
   ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(filter));
   if (!filter_schema) {
     return nullptr;
   }
-  return std::unique_ptr<Filter>(new Filter(filter_schema, filter, std::move(child)));
+  return std::unique_ptr<Filter>(new Filter(filter, std::move(scan), std::move(take)));
 }
 
 bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   return ::arrow::compute::ExpressionHasFieldRefs(filter);
 }
 
-::arrow::Result<ScanBatch> Filter::Next() { return child_->Next(); }
+::arrow::Result<ScanBatch> Filter::Next() {
+  ARROW_ASSIGN_OR_RAISE(auto batch, scan_->Next());
+  if (batch.eof()) {
+    return ScanBatch{};
+  }
+  return scan_->Next();
+}
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
@@ -65,9 +72,9 @@ Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-Filter::Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const {
-  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*schema_, batch_id));
-  return Execute(batch);
+Filter::Execute([[maybe_unused]] std::shared_ptr<lance::io::FileReader> reader,
+                [[maybe_unused]] int32_t batch_id) const {
+  return ::arrow::Status::NotImplemented("will delete soon");
 }
 
 std::string Filter::ToString() const { return filter_.ToString(); }

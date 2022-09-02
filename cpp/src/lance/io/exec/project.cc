@@ -27,45 +27,45 @@
 
 namespace lance::io::exec {
 
-Project::Project(std::shared_ptr<format::Schema> projected_schema,
-                 std::shared_ptr<format::Schema> scan_schema,
-                 std::unique_ptr<Filter> filter,
-                 std::optional<int32_t> limit,
-                 int32_t offset)
-    : projected_schema_(projected_schema),
-      scan_schema_(scan_schema),
-      filter_(std::move(filter)),
-      limit_(limit.has_value() ? new Limit(limit.value(), offset) : nullptr) {}
+Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     std::shared_ptr<FileReader> reader,
-    const format::Schema& schema,
     std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
     std::optional<int32_t> limit,
     int32_t offset) {
+  auto& schema = reader->schema();
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
     projected_arrow_schema = scan_options->dataset_schema;
   }
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
 
+  std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
-    auto scan_schema = projected_schema;
+    ARROW_ASSIGN_OR_RAISE(auto scan_schema, schema.Project(scan_options->filter));
     auto take_schema = projected_schema->Exclude(scan_schema->ToArrow());
+    ARROW_ASSIGN_OR_RAISE(auto scan_node,
+                          Scan::Make(reader, scan_schema, scan_options->batch_size));
+    ARROW_ASSIGN_OR_RAISE(
+        auto filter_node,
+        Filter::Make(*scan_schema, scan_options->filter, std::move(scan_node), nullptr));
+    child = std::move(filter_node);
+    if (limit.has_value()) {
+      ARROW_ASSIGN_OR_RAISE(auto limit_node, Limit::Make(limit.value(), offset, std::move(child)));
+      child = std::move(limit_node);
+    }
   } else {
-    auto scan = Scan::Make(reader, projected_schema, scan_options->batch_size);
+    ARROW_ASSIGN_OR_RAISE(auto scan,
+                          Scan::Make(reader, projected_schema, scan_options->batch_size));
+    child = std::move(scan);
   }
-  ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter, nullptr));
-  auto scan_schema = projected_schema;
-  if (filter) {
-    // Remove the columns in filter from the project schema, to avoid duplicated scan
-    ARROW_ASSIGN_OR_RAISE(scan_schema, projected_schema->Exclude(filter->schema()));
-  }
-  return std::unique_ptr<Project>(
-      new Project(projected_schema, scan_schema, std::move(filter), limit, offset));
+  return std::unique_ptr<Project>(new Project(std::move(child)));
 }
 
 const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
+
+std::string Project::ToString() const { return "Project"; }
 
 ::arrow::Result<ScanBatch> Project::Next() {
   assert(child_);

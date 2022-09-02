@@ -30,6 +30,8 @@ namespace lance::io::exec {
 struct ScanBatch {
   std::shared_ptr<::arrow::RecordBatch> batch;
   int32_t batch_id;
+
+  bool eof() const { return !batch; }
 };
 
 /// I/O execute base node.

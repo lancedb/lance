@@ -47,8 +47,6 @@ class Project : ExecNode {
   /// \param reader file reader.
   /// \param schema dataset schema.
   /// \param scan_options Arrow scan options.
-  /// \param limit limit number of records to return. Optional.
-  /// \param offset offset to fetch the record. Optional.
   /// \return Project if success. Returns the error status otherwise.
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
@@ -67,12 +65,10 @@ class Project : ExecNode {
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
 
+  std::string ToString() const override;
+
  private:
-  Project(std::shared_ptr<format::Schema> projected_schema,
-          std::shared_ptr<format::Schema> scan_schema,
-          std::unique_ptr<Filter> filter,
-          std::optional<int32_t> limit = std::nullopt,
-          int32_t offset = 0);
+  Project(std::unique_ptr<ExecNode> child);
 
   std::shared_ptr<format::Schema> projected_schema_;
   /// scan_schema_ equals to projected_schema_ - filters_.schema()

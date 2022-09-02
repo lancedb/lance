@@ -67,8 +67,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_,
-                        exec::Project::Make(reader_->schema(), options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
 
