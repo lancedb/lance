@@ -21,6 +21,8 @@
 #include <memory>
 #include <optional>
 
+#include "lance/io/exec/base.h"
+
 namespace lance::format {
 class Schema;
 }
@@ -42,6 +44,7 @@ class Project {
 
   /// Make a Project from the full dataset schema and scan options.
   ///
+  /// \param reader file reader.
   /// \param schema dataset schema.
   /// \param scan_options Arrow scan options.
   /// \param limit limit number of records to return. Optional.
@@ -49,6 +52,7 @@ class Project {
   /// \return Project if success. Returns the error status otherwise.
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
+      std::shared_ptr<FileReader> reader,
       const format::Schema& schema,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
       std::optional<int32_t> limit = std::nullopt,
@@ -76,6 +80,7 @@ class Project {
   std::unique_ptr<Filter> filter_;
 
   std::unique_ptr<Limit> limit_;
+  std::unique_ptr<ExecNode> child_;
 };
 
 }  // namespace lance::io::exec

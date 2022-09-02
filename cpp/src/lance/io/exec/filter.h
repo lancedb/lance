@@ -33,7 +33,11 @@ class Filter : public ExecNode {
 
   /// Build a filter from arrow's filter expression and dataset schema.
   static ::arrow::Result<std::unique_ptr<Filter>> Make(const lance::format::Schema& schema,
-                                                       const ::arrow::compute::Expression& filter);
+                                                       const ::arrow::compute::Expression& filter,
+                                                       std::unique_ptr<ExecNode> child);
+
+  /// Returns true if the filter expression has filter over actual columns.
+  static bool HasFilter(const ::arrow::compute::Expression& filter);
 
   /// Execute the filter on an arrow RecordBatch.
   ///
@@ -53,12 +57,12 @@ class Filter : public ExecNode {
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
   Execute(std::shared_ptr<lance::io::FileReader> reader, int32_t batch_id) const;
 
-  const std::shared_ptr<lance::format::Schema>& schema() const;
-
   std::string ToString() const override;
 
  private:
-  Filter(std::shared_ptr<lance::format::Schema> schema, const ::arrow::compute::Expression& filter);
+  Filter(std::shared_ptr<lance::format::Schema> schema,
+         const ::arrow::compute::Expression& filter,
+         std::unique_ptr<ExecNode> child);
 
   std::shared_ptr<lance::format::Schema> schema_;
   ::arrow::compute::Expression filter_;

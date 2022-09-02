@@ -33,7 +33,7 @@ class FieldVisitor {
 
   virtual ::arrow::Status Visit(std::shared_ptr<Field> field) = 0;
 
-  ::arrow::Status VisitSchema(std::shared_ptr<Schema> schema);
+  ::arrow::Status VisitSchema(const Schema& schema);
 };
 
 /// A Visitor to convert Field / Schema to an arrow::Schema

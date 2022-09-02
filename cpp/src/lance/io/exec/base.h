@@ -21,6 +21,10 @@
 #include <string>
 #include <vector>
 
+namespace lance::format {
+class Schema;
+}
+
 namespace lance::io::exec {
 
 struct ScanBatch {
@@ -41,7 +45,7 @@ class ExecNode {
   /// Returns the next batch of rows, returns nullptr if EOF.
   virtual ::arrow::Result<ScanBatch> Next() = 0;
 
-  virtual std::string ToString() const = 0;
+  [[nodiscard]] virtual std::string ToString() const = 0;
 };
 
 }  // namespace lance::io::exec

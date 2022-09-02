@@ -38,16 +38,22 @@ Project::Project(std::shared_ptr<format::Schema> projected_schema,
       limit_(limit.has_value() ? new Limit(limit.value(), offset) : nullptr) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
+    std::shared_ptr<FileReader> reader,
     const format::Schema& schema,
     std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
     std::optional<int32_t> limit,
     int32_t offset) {
-  ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter));
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
     projected_arrow_schema = scan_options->dataset_schema;
   }
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
+
+  if (Filter::HasFilter(scan_options->filter)) {
+    auto scan_schema =
+  } else {
+  }
+  ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter, nullptr));
   auto scan_schema = projected_schema;
   if (filter) {
     // Remove the columns in filter from the project schema, to avoid duplicated scan

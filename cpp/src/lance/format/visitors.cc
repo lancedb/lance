@@ -25,8 +25,8 @@
 
 namespace lance::format {
 
-::arrow::Status FieldVisitor::VisitSchema(std::shared_ptr<Schema> schema) {
-  for (auto& field : schema->fields()) {
+::arrow::Status FieldVisitor::VisitSchema(const Schema& schema) {
+  for (auto& field : schema.fields()) {
     ARROW_RETURN_NOT_OK(Visit(field));
   }
   return ::arrow::Status::OK();

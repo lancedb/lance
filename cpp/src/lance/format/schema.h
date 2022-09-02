@@ -72,7 +72,7 @@ class Schema final {
   ///
   /// \param other the schema to be excluded. It must to be a strict subset of this schema.
   /// \return The newly created schema, excluding any column in "other".
-  ::arrow::Result<std::shared_ptr<Schema>> Exclude(std::shared_ptr<Schema> other) const;
+  ::arrow::Result<std::shared_ptr<Schema>> Exclude(const Schema& other) const;
 
   /// Add a new parent field.
   void AddField(std::shared_ptr<Field> f);

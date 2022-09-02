@@ -19,22 +19,27 @@
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
 
-#include "lance/arrow/type.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
 
 Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
-               const ::arrow::compute::Expression& filter)
-    : schema_(schema), filter_(filter) {}
+               const ::arrow::compute::Expression& filter,
+               std::unique_ptr<ExecNode> child)
+    : schema_(schema), filter_(filter), child_(std::move(child)) {}
 
 ::arrow::Result<std::unique_ptr<Filter>> Filter::Make(const lance::format::Schema& schema,
-                                                      const ::arrow::compute::Expression& filter) {
+                                                      const ::arrow::compute::Expression& filter,
+                                                      std::unique_ptr<ExecNode> child) {
   ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(filter));
   if (!filter_schema) {
     return nullptr;
   }
-  return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
+  return std::unique_ptr<Filter>(new Filter(filter_schema, filter, std::move(child)));
+}
+
+bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
+  return ::arrow::compute::ExpressionHasFieldRefs(filter);
 }
 
 ::arrow::Result<ScanBatch> Filter::Next() { return child_->Next(); }
@@ -65,8 +70,6 @@ Filter::Execute(std::shared_ptr<FileReader> reader, int32_t batch_id) const {
   return Execute(batch);
 }
 
-const std::shared_ptr<lance::format::Schema>& Filter::schema() const { return schema_; }
-
 std::string Filter::ToString() const { return filter_.ToString(); }
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

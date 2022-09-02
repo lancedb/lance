@@ -512,7 +512,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   return Project(columns);
 }
 
-::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(std::shared_ptr<Schema> other) const {
+::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(const Schema& other) const {
   /// An visitor to remove fields in place.
   class SchemaExcludeVisitor : public FieldVisitor {
    public:

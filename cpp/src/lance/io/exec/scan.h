@@ -48,6 +48,8 @@ class Scan : public ExecNode {
   /// Returns the next available batch in the file. Or returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
+  const lance::format::Schema& schema();
+
   std::string ToString() const override;
 
  private:
@@ -61,9 +63,8 @@ class Scan : public ExecNode {
        int64_t batch_size);
 
   const std::shared_ptr<FileReader> reader_;
-  /// The projected schema to scan.
   const std::shared_ptr<lance::format::Schema> schema_;
-  int64_t batch_size_;
+  const int64_t batch_size_;
 
   /// Keep track of the progress.
   std::mutex lock_;

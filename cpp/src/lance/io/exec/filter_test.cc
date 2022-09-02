@@ -37,16 +37,16 @@ const auto kSchema =
                                            ::arrow::field("label", ::arrow::utf8())}));
 
 TEST_CASE("Test without filter") {
-  auto empty_filter = Filter::Make(kSchema, ::arrow::compute::literal(true)).ValueOrDie();
+  auto empty_filter = Filter::Make(kSchema, ::arrow::compute::literal(true), nullptr).ValueOrDie();
   CHECK(empty_filter == nullptr);
 }
 
 TEST_CASE("Test with one condition") {
-  auto filter = Filter::Make(kSchema, equal(field_ref("value"), literal("32")));
+  auto filter = Filter::Make(kSchema, equal(field_ref("value"), literal("32")), nullptr);
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 
-  filter = Filter::Make(kSchema, equal(literal("32"), field_ref("value")));
+  filter = Filter::Make(kSchema, equal(literal("32"), field_ref("value")), nullptr);
   INFO("filter " << filter.status().message());
   CHECK(filter.ok());
 }

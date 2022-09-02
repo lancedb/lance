@@ -55,7 +55,7 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
     }
   }
   if (batch_id >= reader_->metadata().num_batches()) {
-    // EOF
+    // Reach EOF
     return ScanBatch();
   }
 
