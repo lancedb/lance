@@ -125,8 +125,8 @@ class PlainDecoderImpl : public Decoder {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
-    auto read_length = std::min(length.value_or(length_), length_ - start);
-    if (read_length <= 0) {
+    auto len = std::min(length.value_or(length_), length_ - start);
+    if (len <= 0) {
       return ::arrow::Status::IndexError(
           fmt::format("{}::ToArray: out of range: start={}, length={}, page_length={}\n",
                       ToString(),
@@ -135,9 +135,9 @@ class PlainDecoderImpl : public Decoder {
                       length_));
     }
     auto byte_length = type_->byte_width();
-    ARROW_ASSIGN_OR_RAISE(
-        auto buf, infile_->ReadAt(position_ + start * byte_length, read_length * byte_length));
-    return std::make_shared<ArrayType>(type_, read_length, buf);
+    ARROW_ASSIGN_OR_RAISE(auto buf,
+                          infile_->ReadAt(position_ + start * byte_length, len * byte_length));
+    return std::make_shared<ArrayType>(type_, len, buf);
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(

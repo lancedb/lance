@@ -43,14 +43,31 @@ TEST_CASE("Test Scan::Next") {
   CHECK(tab->column(0)->num_chunks() == 2);
   auto reader = MakeReader(tab).ValueOrDie();
 
-  auto scan = Scan::Make(reader, std::make_shared<Schema>(reader->schema()), 8).ValueOrDie();
+  const int32_t kBatchSize = 8;
+  auto scan =
+      Scan::Make(reader, std::make_shared<Schema>(reader->schema()), kBatchSize).ValueOrDie();
   auto batch = scan->Next().ValueOrDie();
   CHECK(batch.batch_id == 0);
-  CHECK(batch.batch->num_rows() == 8);
+  CHECK(batch.batch->num_rows() == kBatchSize);
   batch = scan->Next().ValueOrDie();
   CHECK(batch.batch_id == 0);
-  CHECK(batch.batch->num_rows() == 8);
+  CHECK(batch.batch->num_rows() == kBatchSize);
   batch = scan->Next().ValueOrDie();
   CHECK(batch.batch_id == 0);
-  CHECK(batch.batch->num_rows() == 4);
+  CHECK(batch.batch->num_rows() == 20 - 2 * kBatchSize);
+
+  // Second batch
+  batch = scan->Next().ValueOrDie();
+  CHECK(batch.batch_id == 1);
+  CHECK(batch.batch->num_rows() == kBatchSize);
+  batch = scan->Next().ValueOrDie();
+  CHECK(batch.batch_id == 1);
+  CHECK(batch.batch->num_rows() == kBatchSize);
+  batch = scan->Next().ValueOrDie();
+  CHECK(batch.batch_id == 1);
+  CHECK(batch.batch->num_rows() == 20 - 2 * kBatchSize);
+
+  // We should stop now
+  batch = scan->Next().ValueOrDie();
+  CHECK(!batch.batch);
 }

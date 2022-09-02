@@ -54,6 +54,10 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
       }
     }
   }
+  if (batch_id >= reader_->metadata().num_batches()) {
+    // EOF
+    return ScanBatch();
+  }
 
   ARROW_ASSIGN_OR_RAISE(auto batch, reader_->ReadBatch(*schema_, batch_id, offset, batch_size_));
   return ScanBatch{
