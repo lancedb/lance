@@ -49,18 +49,16 @@ class FileReader {
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
       const std::vector<std::string>& columns);
 
-  /// Read a RecordBatch at the offset.
+  /// Read a RecordBatch at the file offset.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadAt(const lance::format::Schema& schema,
                                                                 int32_t offset,
                                                                 int32_t length) const;
 
-  /// Read a Batch.
-  ///
-  /// While ReadAt can read at any arbitrary offset within a batch, ReadBatch always
-  /// starts at the batch boundary.
+  /// Read a Batch
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,
       int32_t batch_id,
+      int32_t offset = 0,
       std::optional<int32_t> length = std::nullopt) const;
 
   /// Read a Batch with indices.
