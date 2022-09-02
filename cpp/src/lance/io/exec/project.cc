@@ -12,18 +12,18 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "project.h"
+#include "lance/io/exec/project.h"
 
 #include <arrow/api.h>
 #include <arrow/result.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
-#include "fmt/format.h"
-#include "fmt/ranges.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
+#include "lance/io/exec/scan.h"
 #include "lance/io/reader.h"
-#include "limit.h"
 
 namespace lance::io::exec {
 
@@ -50,8 +50,10 @@ Project::Project(std::shared_ptr<format::Schema> projected_schema,
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
 
   if (Filter::HasFilter(scan_options->filter)) {
-    auto scan_schema =
+    auto scan_schema = projected_schema;
+    auto take_schema = projected_schema->Exclude(scan_schema->ToArrow());
   } else {
+    auto scan = Scan::Make(reader, projected_schema, scan_options->batch_size);
   }
   ARROW_ASSIGN_OR_RAISE(auto filter, Filter::Make(schema, scan_options->filter, nullptr));
   auto scan_schema = projected_schema;
@@ -64,6 +66,11 @@ Project::Project(std::shared_ptr<format::Schema> projected_schema,
 }
 
 const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
+
+::arrow::Result<ScanBatch> Project::Next() {
+  assert(child_);
+  return child_->Next();
+}
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
     std::shared_ptr<FileReader> reader, int32_t batch_id) {

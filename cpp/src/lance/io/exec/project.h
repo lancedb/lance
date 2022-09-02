@@ -38,7 +38,7 @@ class Limit;
 
 /// \brief Projection over dataset.
 ///
-class Project {
+class Project : ExecNode {
  public:
   Project() = delete;
 
@@ -53,7 +53,6 @@ class Project {
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
       std::shared_ptr<FileReader> reader,
-      const format::Schema& schema,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
       std::optional<int32_t> limit = std::nullopt,
       int32_t offset = 0);
@@ -62,6 +61,8 @@ class Project {
   ///
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
                                                                  int32_t batch_id);
+
+  ::arrow::Result<ScanBatch> Next() override;
 
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
