@@ -23,6 +23,7 @@
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/scan.h"
+#include "lance/io/exec/take.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
@@ -44,21 +45,19 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
     ARROW_ASSIGN_OR_RAISE(auto scan_schema, schema.Project(scan_options->filter));
-    auto take_schema = projected_schema->Exclude(scan_schema->ToArrow());
     ARROW_ASSIGN_OR_RAISE(auto scan_node,
                           Scan::Make(reader, scan_schema, scan_options->batch_size));
-    ARROW_ASSIGN_OR_RAISE(
-        auto filter_node,
-        Filter::Make(*scan_schema, scan_options->filter, std::move(scan_node), nullptr));
-    child = std::move(filter_node);
+    ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(scan_node)));
     if (limit.has_value()) {
-      ARROW_ASSIGN_OR_RAISE(auto limit_node, Limit::Make(limit.value(), offset, std::move(child)));
-      child = std::move(limit_node);
+      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
     }
+    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(scan_schema->ToArrow()));
+    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
-    ARROW_ASSIGN_OR_RAISE(auto scan,
-                          Scan::Make(reader, projected_schema, scan_options->batch_size));
-    child = std::move(scan);
+    ARROW_ASSIGN_OR_RAISE(child, Scan::Make(reader, projected_schema, scan_options->batch_size));
+    if (limit.has_value()) {
+      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
+    }
   }
   return std::unique_ptr<Project>(new Project(std::move(child)));
 }

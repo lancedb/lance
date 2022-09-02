@@ -18,7 +18,9 @@
 #include <arrow/table.h>
 
 #include <memory>
+#include <string>
 
+#include "lance/io/exec/base.h"
 #include "lance/io/reader.h"
 
 namespace lance::testing {
@@ -26,5 +28,23 @@ namespace lance::testing {
 /// Make lance::io::FileReader from an Arrow Table.
 ::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
     const std::shared_ptr<::arrow::Table>& table);
+
+/// A Dummy ExecNode.
+///
+/// Used as place holder to replace ExecNode.child.
+class DummyNode : lance::io::exec::ExecNode {
+ public:
+  DummyNode() = default;
+
+  DummyNode(DummyNode&&) = default;
+
+  static std::unique_ptr<DummyNode> Make() { return std::make_unique<DummyNode>(); }
+
+  ::arrow::Result<io::exec::ScanBatch> Next() override {
+    return ::arrow::Status::NotImplemented("DummyNode::Next not implemented");
+  }
+
+  std::string ToString() const override { return "Dummy"; }
+};
 
 }  // namespace lance::testing

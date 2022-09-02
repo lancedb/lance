@@ -23,20 +23,12 @@
 
 namespace lance::io::exec {
 
-Filter::Filter(const ::arrow::compute::Expression& filter,
-               std::unique_ptr<ExecNode> scan,
-               std::unique_ptr<ExecNode> take)
-    : filter_(filter), scan_(std::move(scan)), take_(std::move(take)) {}
+Filter::Filter(const ::arrow::compute::Expression& filter, std::unique_ptr<ExecNode> child)
+    : filter_(filter), child_(std::move(child)) {}
 
-::arrow::Result<std::unique_ptr<Filter>> Filter::Make(const lance::format::Schema& schema,
-                                                      const ::arrow::compute::Expression& filter,
-                                                      std::unique_ptr<ExecNode> scan,
-                                                      std::unique_ptr<ExecNode> take) {
-  ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(filter));
-  if (!filter_schema) {
-    return nullptr;
-  }
-  return std::unique_ptr<Filter>(new Filter(filter, std::move(scan), std::move(take)));
+::arrow::Result<std::unique_ptr<Filter>> Filter::Make(const ::arrow::compute::Expression& filter,
+                                                      std::unique_ptr<ExecNode> scan) {
+  return std::unique_ptr<Filter>(new Filter(filter, std::move(scan)));
 }
 
 bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
@@ -44,11 +36,11 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
 }
 
 ::arrow::Result<ScanBatch> Filter::Next() {
-  ARROW_ASSIGN_OR_RAISE(auto batch, scan_->Next());
+  ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   if (batch.eof()) {
     return ScanBatch{};
   }
-  return scan_->Next();
+  return child_->Next();
 }
 
 ::arrow::Result<

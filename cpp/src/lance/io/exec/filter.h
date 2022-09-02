@@ -32,10 +32,8 @@ class Filter : public ExecNode {
   Filter() = delete;
 
   /// Build a filter from arrow's filter expression and dataset schema.
-  static ::arrow::Result<std::unique_ptr<Filter>> Make(const lance::format::Schema& schema,
-                                                       const ::arrow::compute::Expression& filter,
-                                                       std::unique_ptr<ExecNode> scan,
-                                                       std::unique_ptr<ExecNode> take);
+  static ::arrow::Result<std::unique_ptr<Filter>> Make(const ::arrow::compute::Expression& filter,
+                                                       std::unique_ptr<ExecNode> child);
 
   /// Returns true if the filter expression has filter over actual columns.
   static bool HasFilter(const ::arrow::compute::Expression& filter);
@@ -61,14 +59,10 @@ class Filter : public ExecNode {
   std::string ToString() const override;
 
  private:
-  Filter(const ::arrow::compute::Expression& filter,
-         std::unique_ptr<ExecNode> scan,
-         std::unique_ptr<ExecNode> take);
+  Filter(const ::arrow::compute::Expression& filter, std::unique_ptr<ExecNode> child);
 
   ::arrow::compute::Expression filter_;
-
-  std::unique_ptr<ExecNode> scan_;
-  std::unique_ptr<ExecNode> take_;
+  std::unique_ptr<ExecNode> child_;
 };
 
-}  // namespace lance::io
+}  // namespace lance::io::exec

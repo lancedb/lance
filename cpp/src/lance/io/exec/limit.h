@@ -42,6 +42,7 @@ class Limit : public ExecNode {
  public:
   Limit() = delete;
 
+  /// Factory method.
   static ::arrow::Result<std::unique_ptr<Limit>> Make(int64_t limit,
                                                       int64_t offset,
                                                       std::unique_ptr<ExecNode> child) noexcept;
@@ -69,6 +70,7 @@ class Limit : public ExecNode {
   /// \endcode
   std::optional<std::tuple<int64_t, int64_t>> Apply(int64_t length);
 
+  /// Apply the limits and returns the next batch.
   ::arrow::Result<ScanBatch> Next() override;
 
   /// ReadBatch

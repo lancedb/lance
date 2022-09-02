@@ -27,20 +27,22 @@
 #include "lance/arrow/writer.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
+#include "lance/testing/io.h"
 
 using lance::io::exec::Limit;
+using lance::testing::DummyNode;
 
 TEST_CASE("LIMIT 100") {
-  auto limit = Limit(100);
-  CHECK(limit.Apply(10).value() == std::make_tuple(0, 10));
-  CHECK(limit.Apply(80).value() == std::make_tuple(0, 80));
-  CHECK(limit.Apply(20).value() == std::make_tuple(0, 10));
+  auto limit = Limit::Make(100, 0, std::move(DummyNode::Make())).ValueOrDie();
+  CHECK(limit->Apply(10).value() == std::make_tuple(0, 10));
+  CHECK(limit->Apply(80).value() == std::make_tuple(0, 80));
+  CHECK(limit->Apply(20).value() == std::make_tuple(0, 10));
   // Limit already reached.
-  CHECK(limit.Apply(30) == std::nullopt);
+  CHECK(limit->Apply(30) == std::nullopt);
 }
 
 TEST_CASE("LIMIT 10 OFFSET 20") {
-  auto limit = Limit(10, 20);
+  auto limit = Limit(10, 20, nullptr);
   CHECK(limit.Apply(10).value() == std::make_tuple(0, 0));
   CHECK(limit.Apply(5).value() == std::make_tuple(0, 0));
   auto val = limit.Apply(20).value();

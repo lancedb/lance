@@ -100,7 +100,7 @@ TEST_CASE("Exclude schema") {
   auto original = lance::format::Schema(arrow_schema);
   auto projected = original.Project({"split", "annotations.box"}).ValueOrDie();
   INFO("Projected schema: " << projected->ToString());
-  auto excluded = original.Exclude(projected).ValueOrDie();
+  auto excluded = original.Exclude(*projected).ValueOrDie();
 
   auto excluded_arrow_schema = ::arrow::schema(
       {::arrow::field("pk", ::arrow::utf8()),
