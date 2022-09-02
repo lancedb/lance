@@ -19,8 +19,14 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace lance::io::exec {
+
+struct ScanBatch {
+  std::shared_ptr<::arrow::RecordBatch> batch;
+  int32_t batch_id;
+};
 
 /// I/O execute base node.
 ///
@@ -33,7 +39,7 @@ class ExecNode {
   virtual ~ExecNode() = default;
 
   /// Returns the next batch of rows, returns nullptr if EOF.
-  virtual ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next() = 0;
+  virtual ::arrow::Result<ScanBatch> Next() = 0;
 
   virtual std::string ToString() const = 0;
 };

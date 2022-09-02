@@ -47,7 +47,7 @@ class Filter : public ExecNode {
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
       Execute(std::shared_ptr<::arrow::RecordBatch>) const;
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next() override;
+  ::arrow::Result<ScanBatch> Next() override;
 
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>

@@ -37,7 +37,7 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
   return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Filter::Next() { return child_->Next(); }
+::arrow::Result<ScanBatch> Filter::Next() { return child_->Next(); }
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>

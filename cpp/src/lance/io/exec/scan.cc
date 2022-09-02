@@ -16,17 +16,52 @@
 
 #include <memory>
 
+#include "lance/format/metadata.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
+
+::arrow::Result<std::unique_ptr<Scan>> Scan::Make(std::shared_ptr<FileReader> reader,
+                                                  std::shared_ptr<lance::format::Schema> schema,
+                                                  int64_t batch_size) {
+  auto scan = std::unique_ptr<Scan>(new Scan(reader, schema, batch_size));
+  if (reader->metadata().num_batches() == 0) {
+    return ::arrow::Status::IOError("Can not open Scan on empty file");
+  }
+  scan->current_batch_page_length_ = reader->metadata().GetBatchLength(0);
+  return scan;
+}
 
 Scan::Scan(std::shared_ptr<FileReader> reader,
            std::shared_ptr<lance::format::Schema> schema,
            int64_t batch_size)
     : reader_(std::move(reader)), schema_(std::move(schema)), batch_size_(batch_size) {}
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Scan::Next() {
-  return reader_->ReadBatch(*schema_, current_batch_id_, current_offset_, batch_size_);
+::arrow::Result<ScanBatch> Scan::Next() {
+  int32_t offset;
+  int32_t batch_id;
+
+  {
+    std::lock_guard guard(lock_);
+    batch_id = current_batch_id_;
+    offset = current_offset_;
+    current_offset_ += batch_size_;
+    if (current_offset_ > current_batch_page_length_) {
+      current_batch_id_++;
+      current_offset_ = 0;
+      if (current_batch_id_ < reader_->metadata().num_batches()) {
+        current_batch_page_length_ = reader_->metadata().GetBatchLength(current_batch_id_);
+      }
+    }
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto batch, reader_->ReadBatch(*schema_, batch_id, offset, batch_size_));
+  return ScanBatch{
+      batch,
+      batch_id,
+  };
 }
+
+std::string Scan::ToString() const { return "Scan"; }
 
 }  // namespace lance::io::exec

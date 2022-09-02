@@ -36,6 +36,21 @@ namespace lance::io::exec {
 /// Leaf scan node.
 class Scan : public ExecNode {
  public:
+  /// Factory method.
+  static ::arrow::Result<std::unique_ptr<Scan>> Make(std::shared_ptr<FileReader> reader,
+                                                     std::shared_ptr<lance::format::Schema> schema,
+                                                     int64_t batch_size);
+
+  Scan() = delete;
+
+  virtual ~Scan() = default;
+
+  /// Returns the next available batch in the file. Or returns nullptr if EOF.
+  ::arrow::Result<ScanBatch> Next() override;
+
+  std::string ToString() const override;
+
+ private:
   /// Constructor
   ///
   /// \param reader An opened file reader.
@@ -45,12 +60,6 @@ class Scan : public ExecNode {
        std::shared_ptr<lance::format::Schema> schema,
        int64_t batch_size);
 
-  virtual ~Scan() = default;
-
-  /// Returns the next available batch. Or returns nullptr if EOF.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next() override;
-
- private:
   const std::shared_ptr<FileReader> reader_;
   /// The projected schema to scan.
   const std::shared_ptr<lance::format::Schema> schema_;
@@ -61,6 +70,8 @@ class Scan : public ExecNode {
   int32_t current_batch_id_ = 0;
   /// Offset in the batch.
   int32_t current_offset_ = 0;
+  ///
+  int32_t current_batch_page_length_ = 0;
 };
 
 }  // namespace lance::io::exec
