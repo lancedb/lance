@@ -499,6 +499,19 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   return projection;
 }
 
+::arrow::Result<std::shared_ptr<Schema>> Schema::Project(
+    const ::arrow::compute::Expression& expr) const {
+  if (!::arrow::compute::ExpressionHasFieldRefs(expr)) {
+    /// All scalar?
+    return nullptr;
+  }
+  std::vector<std::string> columns;
+  for (auto& ref : ::arrow::compute::FieldsInExpression(expr)) {
+    columns.emplace_back(std::string(*ref.name()));
+  }
+  return Project(columns);
+}
+
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(std::shared_ptr<Schema> other) const {
   /// An visitor to remove fields in place.
   class SchemaExcludeVisitor : public FieldVisitor {
