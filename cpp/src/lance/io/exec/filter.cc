@@ -47,8 +47,10 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   auto [indices, values] = indices_and_values;
   assert(indices->length() == values->num_rows());
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
-  ARROW_ASSIGN_OR_RAISE(auto struct_arr,
-                        ::arrow::StructArray::Make({indices, values_arr}, {"indices", "values"}));
+  ARROW_ASSIGN_OR_RAISE(
+      auto struct_arr,
+      ::arrow::StructArray::Make({indices, values_arr},
+                                 std::vector<std::string>({"indices", "values"})));
   ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(struct_arr));
   return ScanBatch{result_batch, batch.batch_id};
 }
