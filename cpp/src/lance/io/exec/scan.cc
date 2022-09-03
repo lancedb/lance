@@ -14,6 +14,8 @@
 
 #include "lance/io/exec/scan.h"
 
+#include <fmt/format.h>
+
 #include <memory>
 
 #include "lance/format/metadata.h"
@@ -54,6 +56,7 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
       }
     }
   }
+  fmt::print("Batch id: {} total batches={}\n", batch_id, reader_->metadata().num_batches());
   if (batch_id >= reader_->metadata().num_batches()) {
     // Reach EOF
     return ScanBatch();

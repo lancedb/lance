@@ -40,7 +40,18 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   if (batch.eof()) {
     return ScanBatch{};
   }
-  return child_->Next();
+  if (batch.batch->num_rows() == 0) {
+    return batch;
+  }
+  ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Execute(batch.batch));
+  auto [indices, values] = indices_and_values;
+  assert(indices->length() == values->num_rows());
+  ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
+  ARROW_ASSIGN_OR_RAISE(auto struct_arr,
+                        ::arrow::StructArray::Make({indices, values_arr}, {"indices", "values"}));
+  ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(struct_arr));
+  fmt::print("Filter returns : {}\n", result_batch->schema()->ToString());
+  return ScanBatch{result_batch, batch.batch_id};
 }
 
 ::arrow::Result<

@@ -14,6 +14,8 @@
 
 #include "lance/io/exec/take.h"
 
+#include "lance/arrow/utils.h"
+
 namespace lance::io::exec {
 
 Take::Take(std::shared_ptr<FileReader> reader,
@@ -39,15 +41,27 @@ Take::Take(std::shared_ptr<FileReader> reader,
   }
   auto indices = filtered.batch->GetColumnByName("indices");
   auto vals = filtered.batch->GetColumnByName("values");
-  if (!indices || !vals || vals->type_id() != ::arrow::Type::STRUCT) {
-    return ::arrow::Status::Invalid("Invalid data from filter");
+  if (!indices || indices->type_id() != ::arrow::Type::INT32 || !vals ||
+      vals->type_id() != ::arrow::Type::STRUCT) {
+    return ::arrow::Status::Invalid("Invalid data from filter node: batch=",
+                                    filtered.batch->ToString());
   }
   auto values = std::reinterpret_pointer_cast<::arrow::StructArray>(vals);
-  if (!schema_) {
+  if (!schema_ || schema_->fields().empty()) {
     return ScanBatch{::arrow::RecordBatch::FromStructArray(vals).ValueOrDie(), filtered.batch_id};
   } else {
+    auto& batch_id = filtered.batch_id;
+    auto int32_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices);
+    ARROW_ASSIGN_OR_RAISE(auto filtered_record_batch, ::arrow::RecordBatch::FromStructArray(vals));
+    ARROW_ASSIGN_OR_RAISE(auto batch, reader_->ReadBatch(*schema_, batch_id, int32_indices));
+    assert(filtered_record_batch->num_rows() == batch->num_rows());
+    fmt::print("Merge scan results: filtered={} extra={}\n",
+               filtered_record_batch->ToString(),
+               batch->schema()->ToString());
+    ARROW_ASSIGN_OR_RAISE(auto merged,
+                          lance::arrow::MergeRecordBatches(filtered_record_batch, batch));
+    return ScanBatch{merged, filtered.batch_id};
   }
-  return child_->Next();
 }
 
 std::string Take::ToString() const { return "Take"; }

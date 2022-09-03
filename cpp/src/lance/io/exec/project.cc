@@ -44,6 +44,9 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
 
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
+    /// Build a chain of:
+    ///
+    /// Take -> (optionally) Limit -> Filter -> Scan
     ARROW_ASSIGN_OR_RAISE(auto scan_schema, schema.Project(scan_options->filter));
     ARROW_ASSIGN_OR_RAISE(auto scan_node,
                           Scan::Make(reader, scan_schema, scan_options->batch_size));
@@ -51,9 +54,10 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
     if (limit.has_value()) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
     }
-    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(scan_schema->ToArrow()));
+    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*scan_schema));
     ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
+    /// (*optionally) Limit -> Scan
     ARROW_ASSIGN_OR_RAISE(child, Scan::Make(reader, projected_schema, scan_options->batch_size));
     if (limit.has_value()) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));

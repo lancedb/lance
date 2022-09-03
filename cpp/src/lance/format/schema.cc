@@ -519,8 +519,8 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
     SchemaExcludeVisitor(std::shared_ptr<Schema> excluded) : excluded_(excluded) {}
 
     ::arrow::Status Visit(std::shared_ptr<Field> field) override {
-      for (auto& field : field->fields()) {
-        ARROW_RETURN_NOT_OK(Visit(field));
+      for (auto& f : field->fields()) {
+        ARROW_RETURN_NOT_OK(Visit(f));
       }
       auto excluded_field = excluded_->GetField(field->id());
       if (!excluded_field) {

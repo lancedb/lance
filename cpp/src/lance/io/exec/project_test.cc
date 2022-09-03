@@ -56,11 +56,14 @@ TEST_CASE("Project schema") {
             .ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
 
-  auto lance_schema = lance::format::Schema(schema);
   auto reader = lance::testing::MakeReader(tbl).ValueOrDie();
   auto project = lance::io::exec::Project::Make(reader, scanner->options()).ValueOrDie();
 
-  auto batch = project->Execute(reader, 0).ValueOrDie();
-  INFO("Array v = " << batch->GetColumnByName("v")->ToString());
-  CHECK(batch->GetColumnByName("v")->Equals(lance::arrow::ToArray({20}).ValueOrDie()));
+  auto result = project->Next();
+  fmt::print("Result status: {}\n", result.status().ToString());
+  auto& batch = result.ValueOrDie();
+  fmt::print("Batcch is: {}\n", fmt::ptr(batch.batch));
+
+  INFO("Array v = " << batch.batch->GetColumnByName("v")->ToString());
+  CHECK(batch.batch->GetColumnByName("v")->Equals(lance::arrow::ToArray({20}).ValueOrDie()));
 }
