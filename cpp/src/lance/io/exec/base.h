@@ -21,10 +21,6 @@
 #include <string>
 #include <vector>
 
-namespace lance::format {
-class Schema;
-}
-
 namespace lance::io::exec {
 
 struct ScanBatch {
