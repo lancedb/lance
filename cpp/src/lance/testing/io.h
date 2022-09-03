@@ -50,6 +50,8 @@ class TableScan : lance::io::exec::ExecNode {
 
   ::arrow::Result<io::exec::ScanBatch> Next() override;
 
+  constexpr Type type() const override { return kTableScan; }
+
   std::string ToString() const override { return "Dummy"; }
 
  private:

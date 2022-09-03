@@ -40,9 +40,20 @@ struct ScanBatch {
 /// https://arrow.apache.org/docs/cpp/streaming_execution.html
 class ExecNode {
  public:
+  enum Type {
+    kScan = 0,
+    kProject = 1,
+    kFilter = 2,
+    kLimit = 3,
+    kTake = 4,
+    kTableScan = 256,
+  };
+
   ExecNode() = default;
 
   virtual ~ExecNode() = default;
+
+  virtual constexpr Type type() const = 0;
 
   /// Returns the next batch of rows, returns nullptr if EOF.
   virtual ::arrow::Result<ScanBatch> Next() = 0;

@@ -24,17 +24,13 @@
 
 #include "lance/io/exec/base.h"
 
-namespace lance::format {
-class Schema;
-}  // namespace lance::format
-
 namespace lance::io {
 class FileReader;
 }
 
 namespace lance::io::exec {
 
-/// Plan for Limit clause:
+/// Node for the Limit clause:
 ///
 ///   LIMIT value:int64 [OFFSET value:int64]
 ///
@@ -50,28 +46,10 @@ class Limit : public ExecNode {
   /// Construct a Limit Clause with limit, and optionally, with offset.
   explicit Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept;
 
-  /// Apply limit when reading a Batch.
-  ///
-  /// \param length the length of a Batch to be read.
-  /// \return a tuple of `[position, length]` that should be physically loaded
-  /// into memory. Return `[0, 0]` to skip this batch.
-  /// Return `std::nullopt` to indicate the end of the iteration.
-  ///
-  /// \code{.cpp}
-  /// auto length = GetPageLength(page_id);
-  /// auto limit = Limit(20, 30);
-  /// auto position_and_length = limit.Apply(length);
-  /// if (!offset_and_length) {
-  ///    // stop
-  ///    return;
-  /// }
-  /// auto [position, length] = position_and_length.value();
-  /// return infile->ReadAt(position, length);
-  /// \endcode
-  std::optional<std::tuple<int64_t, int64_t>> Apply(int64_t length);
-
   /// Apply the limits and returns the next batch.
   ::arrow::Result<ScanBatch> Next() override;
+
+  constexpr Type type() const override { return kLimit; }
 
   /// Debug String
   std::string ToString() const override;

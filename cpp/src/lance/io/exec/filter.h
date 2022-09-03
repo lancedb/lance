@@ -40,6 +40,8 @@ class Filter : public ExecNode {
 
   ::arrow::Result<ScanBatch> Next() override;
 
+  constexpr Type type() const override { return Type::kFilter; }
+
   std::string ToString() const override;
 
  private:

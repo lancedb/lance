@@ -69,6 +69,13 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
   };
 }
 
+::arrow::Status Scan::Seek(int32_t offset) {
+  ARROW_ASSIGN_OR_RAISE(auto batch_and_offset, reader_->metadata().LocateBatch(offset));
+  current_batch_id_ = std::get<0>(batch_and_offset);
+  current_offset_ = std::get<1>(batch_and_offset);
+  return ::arrow::Status::OK();
+}
+
 std::string Scan::ToString() const { return "Scan"; }
 
 }  // namespace lance::io::exec

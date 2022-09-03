@@ -12,13 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "limit.h"
+#include "lance/io/exec/limit.h"
 
 #include <arrow/record_batch.h>
+#include <fmt/format.h>
 
 #include <algorithm>
 
-#include "fmt/format.h"
+#include "lance/io/exec/scan.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
@@ -26,7 +27,13 @@ namespace lance::io::exec {
 ::arrow::Result<std::unique_ptr<ExecNode>> Limit::Make(int64_t limit,
                                                        int64_t offset,
                                                        std::unique_ptr<ExecNode> child) noexcept {
-  return std::unique_ptr<ExecNode>(new Limit(limit, offset, std::move(child)));
+  auto limit_node = std::make_unique<Limit>(limit, offset, std::move(child));
+  if (limit_node->child_->type() == kScan) {
+    auto scan = dynamic_cast<Scan*>(limit_node->child_.get());
+    ARROW_RETURN_NOT_OK(scan->Seek(offset));
+    limit_node->seen_ = offset;
+  }
+  return std::unique_ptr<ExecNode>(limit_node.release());
 }
 
 Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept
@@ -35,33 +42,27 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
   assert(limit >= 0);
 }
 
-std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
-  if (seen_ >= limit_ + offset_) {
-    /// Already read all the data.
-    return std::nullopt;
-  }
-  auto read_to = std::min(length, offset_ + limit_ - seen_);
-  auto offset = std::max(static_cast<int64_t>(0), offset_ - seen_);
-  seen_ += length;
-  if (seen_ < offset_) {
-    /// No data to read.
-    return std::make_tuple(0, 0);
-  }
-  assert(read_to >= offset);
-  return std::make_tuple(offset, read_to - offset);
-}
-
 ::arrow::Result<ScanBatch> Limit::Next() {
-  if (seen_ >= limit_) {
+  if (seen_ >= offset_ + limit_) {
     return ScanBatch{};
   }
   ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   if (batch.eof()) {
     return batch;
   }
-  auto num_records = limit_ - seen_;
-  seen_ += batch.batch->num_rows();
-  return ScanBatch{batch.batch->Slice(0, num_records), batch.batch_id};
+  // Find intersection of two range (offset, offset + limit) and (seen + batch_size).
+  auto num_rows = batch.batch->num_rows();
+  auto left = std::max(offset_, seen_);
+  auto right = std::min(seen_ + num_rows, offset_ + limit_);
+  std::shared_ptr<::arrow::RecordBatch> record_batch;
+  if (left < right) {
+    record_batch = batch.batch->Slice(left - seen_, right - left);
+  } else {
+    /// No interaction, skip the whole batch.
+    ARROW_ASSIGN_OR_RAISE(record_batch, ::arrow::RecordBatch::MakeEmpty(batch.batch->schema()));
+  }
+  seen_ += num_rows;
+  return ScanBatch{record_batch, batch.batch_id};
 }
 
 std::string Limit::ToString() const {

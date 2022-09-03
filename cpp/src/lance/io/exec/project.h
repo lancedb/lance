@@ -60,6 +60,8 @@ class Project : ExecNode {
   /// Project schema
   const std::shared_ptr<format::Schema>& schema() const;
 
+  constexpr Type type() const override { return kProject; }
+
   std::string ToString() const override;
 
  private:

@@ -58,6 +58,8 @@ class Take : public ExecNode {
   /// \return ScanBatch if succeed.
   ::arrow::Result<ScanBatch> Next() override;
 
+  constexpr Type type() const override { return kTake; }
+
   std::string ToString() const override;
 
  private:

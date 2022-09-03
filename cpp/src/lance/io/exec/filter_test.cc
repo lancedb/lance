@@ -22,8 +22,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/arrow/stl.h"
-#include "lance/arrow/type.h"
-#include "lance/format/schema.h"
 #include "lance/testing/io.h"
 
 using ::arrow::compute::equal;

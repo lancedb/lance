@@ -45,12 +45,20 @@ class Scan : public ExecNode {
 
   virtual ~Scan() = default;
 
+  constexpr Type type() const override { return Type::kScan; }
   /// Returns the next available batch in the file. Or returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
   const lance::format::Schema& schema();
 
   std::string ToString() const override;
+
+  /// Seek to a particular row.
+  ///
+  /// It is used by LIMIT to advance the starting offset, allows to skip IOs.
+  ///
+  /// \param offset the number of rows to seek forward.
+  ::arrow::Status Seek(int32_t offset);
 
  private:
   /// Constructor
