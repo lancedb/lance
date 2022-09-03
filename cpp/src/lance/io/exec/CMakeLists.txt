@@ -14,6 +14,7 @@ add_library(
         take.h
 )
 target_include_directories(lance_io_exec SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
+add_dependencies(lance_io_exec format)
 
 add_lance_test(filter_test)
 add_lance_test(project_test)
