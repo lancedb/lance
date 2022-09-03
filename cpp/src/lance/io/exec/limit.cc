@@ -64,16 +64,6 @@ std::optional<std::tuple<int64_t, int64_t>> Limit::Apply(int64_t length) {
   return ScanBatch{batch.batch->Slice(0, num_records), batch.batch_id};
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Limit::ReadBatch(
-    const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema) {
-  if (seen_ >= limit_) {
-    return nullptr;
-  }
-  ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadAt(schema, offset_, limit_ - seen_));
-  seen_ += batch->num_rows();
-  return batch;
-}
-
 std::string Limit::ToString() const {
   return fmt::format("Limit(n={}, offset={})", limit_, offset_);
 }

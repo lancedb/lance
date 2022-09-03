@@ -43,25 +43,24 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   if (batch.batch->num_rows() == 0) {
     return batch;
   }
-  ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Execute(batch.batch));
+  ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Apply(*batch.batch));
   auto [indices, values] = indices_and_values;
   assert(indices->length() == values->num_rows());
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
   ARROW_ASSIGN_OR_RAISE(auto struct_arr,
                         ::arrow::StructArray::Make({indices, values_arr}, {"indices", "values"}));
   ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(struct_arr));
-  fmt::print("Filter returns : {}\n", result_batch->schema()->ToString());
   return ScanBatch{result_batch, batch.batch_id};
 }
 
 ::arrow::Result<
     std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
-  ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch->schema())));
+Filter::Apply(const ::arrow::RecordBatch& batch) const {
+  ARROW_ASSIGN_OR_RAISE(auto filter_expr, filter_.Bind(*(batch.schema())));
   ARROW_ASSIGN_OR_RAISE(auto mask,
                         ::arrow::compute::ExecuteScalarExpression(
-                            filter_expr, *(batch->schema()), ::arrow::Datum(batch)));
-  ARROW_ASSIGN_OR_RAISE(auto data, batch->ToStructArray());
+                            filter_expr, *(batch.schema()), ::arrow::Datum(batch)));
+  ARROW_ASSIGN_OR_RAISE(auto data, batch.ToStructArray());
   ARROW_ASSIGN_OR_RAISE(auto indices_datum,
                         ::arrow::compute::CallFunction("indices_nonzero", {mask}));
   ARROW_ASSIGN_OR_RAISE(indices_datum, ::arrow::compute::Cast(indices_datum, ::arrow::int32()));
@@ -71,13 +70,6 @@ Filter::Execute(std::shared_ptr<::arrow::RecordBatch> batch) const {
   auto values_arr = values.make_array();
   ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(values_arr));
   return std::make_tuple(indices, result_batch);
-}
-
-::arrow::Result<
-    std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-Filter::Execute([[maybe_unused]] std::shared_ptr<lance::io::FileReader> reader,
-                [[maybe_unused]] int32_t batch_id) const {
-  return ::arrow::Status::NotImplemented("will delete soon");
 }
 
 std::string Filter::ToString() const { return filter_.ToString(); }

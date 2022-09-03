@@ -38,6 +38,13 @@ class Filter : public ExecNode {
   /// Returns true if the filter expression has filter over actual columns.
   static bool HasFilter(const ::arrow::compute::Expression& filter);
 
+  ::arrow::Result<ScanBatch> Next() override;
+
+  std::string ToString() const override;
+
+ private:
+  Filter(const ::arrow::compute::Expression& filter, std::unique_ptr<ExecNode> child);
+
   /// Execute the filter on an arrow RecordBatch.
   ///
   /// \return a tuple of [indices, filtered_array].
@@ -48,18 +55,7 @@ class Filter : public ExecNode {
   /// { Int32Array({2, 4}), RecordBatch({"bar": [32, 32]}) }
   ::arrow::Result<
       std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-      Execute(std::shared_ptr<::arrow::RecordBatch>) const;
-
-  ::arrow::Result<ScanBatch> Next() override;
-
-  ::arrow::Result<
-      std::tuple<std::shared_ptr<::arrow::Int32Array>, std::shared_ptr<::arrow::RecordBatch>>>
-  Execute(std::shared_ptr<lance::io::FileReader> reader, int32_t batch_id) const;
-
-  std::string ToString() const override;
-
- private:
-  Filter(const ::arrow::compute::Expression& filter, std::unique_ptr<ExecNode> child);
+  Apply(const ::arrow::RecordBatch& batch) const;
 
   ::arrow::compute::Expression filter_;
   std::unique_ptr<ExecNode> child_;

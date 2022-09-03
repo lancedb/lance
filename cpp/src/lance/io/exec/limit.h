@@ -73,10 +73,6 @@ class Limit : public ExecNode {
   /// Apply the limits and returns the next batch.
   ::arrow::Result<ScanBatch> Next() override;
 
-  /// ReadBatch
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
-      const std::shared_ptr<FileReader>& reader, const lance::format::Schema& schema);
-
   /// Debug String
   std::string ToString() const override;
 

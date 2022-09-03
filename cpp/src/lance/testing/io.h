@@ -29,24 +29,31 @@ namespace lance::testing {
 ::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
     const std::shared_ptr<::arrow::Table>& table);
 
-/// A Dummy ExecNode.
+/// A ExecNode that scans a Table in memory.
 ///
-/// Used as place holder to replace ExecNode.child.
-class DummyNode : lance::io::exec::ExecNode {
+/// This node can be used in test without creating files.
+class TableScan : lance::io::exec::ExecNode {
  public:
-  DummyNode() = default;
+  TableScan() = default;
 
-  DummyNode(DummyNode&&) = default;
+  TableScan(const ::arrow::Table& table, int64_t batch_size);
 
-  static std::unique_ptr<io::exec::ExecNode> Make() {
-    return std::unique_ptr<io::exec::ExecNode>(new DummyNode());
+  TableScan(TableScan&&) = default;
+
+  static std::unique_ptr<io::exec::ExecNode> Make(const ::arrow::Table& table,
+                                                  int64_t batch_size = 1024) {
+    return std::unique_ptr<io::exec::ExecNode>(new TableScan(table, batch_size));
   }
 
-  ::arrow::Result<io::exec::ScanBatch> Next() override {
-    return ::arrow::Status::NotImplemented("DummyNode::Next not implemented");
-  }
+  /// Make an empty table scanner.
+  static std::unique_ptr<io::exec::ExecNode> MakeEmpty();
+
+  ::arrow::Result<io::exec::ScanBatch> Next() override;
 
   std::string ToString() const override { return "Dummy"; }
+
+ private:
+  std::unique_ptr<::arrow::TableBatchReader> reader_;
 };
 
 }  // namespace lance::testing
