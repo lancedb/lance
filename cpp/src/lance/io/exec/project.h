@@ -55,11 +55,6 @@ class Project : ExecNode {
       std::optional<int32_t> limit = std::nullopt,
       int32_t offset = 0);
 
-  /// \brief Apply Projection over a batch.
-  ///
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Execute(std::shared_ptr<FileReader> reader,
-                                                                 int32_t batch_id);
-
   ::arrow::Result<ScanBatch> Next() override;
 
   /// Project schema

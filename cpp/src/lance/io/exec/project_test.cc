@@ -60,9 +60,7 @@ TEST_CASE("Project schema") {
   auto project = lance::io::exec::Project::Make(reader, scanner->options()).ValueOrDie();
 
   auto result = project->Next();
-  fmt::print("Result status: {}\n", result.status().ToString());
   auto& batch = result.ValueOrDie();
-  fmt::print("Batcch is: {}\n", fmt::ptr(batch.batch));
 
   INFO("Array v = " << batch.batch->GetColumnByName("v")->ToString());
   CHECK(batch.batch->GetColumnByName("v")->Equals(lance::arrow::ToArray({20}).ValueOrDie()));

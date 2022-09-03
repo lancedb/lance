@@ -75,44 +75,4 @@ std::string Project::ToString() const { return "Project"; }
   return child_->Next();
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Project::Execute(
-    std::shared_ptr<FileReader> reader, int32_t batch_id) {
-  if (filter_) {
-    auto result = filter_->Execute(reader, batch_id);
-    if (!result.ok()) {
-      return result.status();
-    }
-    auto [indices, values] = result.ValueUnsafe();
-    assert(indices->length() == values->num_rows());
-    if (limit_) {
-      auto offset_and_len = limit_->Apply(indices->length());
-      if (!offset_and_len.has_value()) {
-        /// Indicate the end of iteration.
-        return nullptr;
-      }
-      auto [offset, len] = offset_and_len.value();
-      indices =
-          std::static_pointer_cast<decltype(indices)::element_type>(indices->Slice(offset, len));
-      values = values->Slice(offset, len);
-    }
-    if (scan_schema_->fields().empty()) {
-      // No extra columns other than the filtered columns need to be read, for example,
-      // SELECT id FROM t WHERE id > 10
-      return values;
-    } else {
-      ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*scan_schema_, batch_id, indices));
-      assert(values->num_rows() == batch->num_rows());
-      ARROW_ASSIGN_OR_RAISE(auto merged, lance::arrow::MergeRecordBatches(values, batch));
-      return merged;
-    }
-  } else {
-    // Read without filter.
-    if (limit_) {
-      return limit_->ReadBatch(reader, *scan_schema_);
-    } else {
-      return reader->ReadBatch(*scan_schema_, batch_id);
-    }
-  }
-}
-
 }  // namespace lance::io::exec
