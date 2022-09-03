@@ -31,16 +31,6 @@ using ::arrow::compute::literal;
 using ::arrow::compute::or_;
 using lance::io::exec::Filter;
 
-const auto kSchema =
-    lance::format::Schema(::arrow::schema({::arrow::field("pk", ::arrow::int32()),
-                                           ::arrow::field("value", ::arrow::int32()),
-                                           ::arrow::field("label", ::arrow::utf8())}));
-
-TEST_CASE("Test without filter") {
-  auto empty_filter = Filter::Make(::arrow::compute::literal(true), nullptr).ValueOrDie();
-  CHECK(empty_filter == nullptr);
-}
-
 TEST_CASE("Test with one condition") {
   auto filter = Filter::Make(equal(field_ref("value"), literal("32")), nullptr);
   INFO("filter " << filter.status().message());

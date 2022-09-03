@@ -69,9 +69,6 @@ class Project : ExecNode {
   /// scan_schema_ equals to projected_schema_ - filters_.schema()
   /// It includes the columns that are not read from the filters yet.
   std::shared_ptr<format::Schema> scan_schema_;
-  std::unique_ptr<Filter> filter_;
-
-  std::unique_ptr<Limit> limit_;
   std::unique_ptr<ExecNode> child_;
 };
 
