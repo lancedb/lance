@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <arrow/compute/api.h>
 #include <arrow/type.h>
 
 #include <map>
@@ -60,6 +61,12 @@ class Schema final {
 
   /// Use `arrow::Schema` to create a project over the current Lance schema.
   ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::Schema& arrow_schema) const;
+
+  /// Use `arrow::compute::Expression` to create a projected schema.
+  ///
+  /// \param expr the expression to compute projection.
+  /// \return the projected schema. Or nullptr if the expression does not contain any field.
+  ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::compute::Expression& expr) const;
 
   /// Exclude (subtract) the fields from the given schema.
   ///

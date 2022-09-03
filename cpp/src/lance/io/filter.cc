@@ -30,16 +30,10 @@ Filter::Filter(std::shared_ptr<lance::format::Schema> schema,
 
 ::arrow::Result<std::unique_ptr<Filter>> Filter::Make(const lance::format::Schema& schema,
                                                       const ::arrow::compute::Expression& filter) {
-  if (!::arrow::compute::ExpressionHasFieldRefs(filter)) {
-    /// All scalar?
+  ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(filter));
+  if (!filter_schema) {
     return nullptr;
   }
-  auto field_refs = ::arrow::compute::FieldsInExpression(filter);
-  std::vector<std::string> columns;
-  for (auto& ref : field_refs) {
-    columns.emplace_back(std::string(*ref.name()));
-  }
-  ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(columns));
   return std::unique_ptr<Filter>(new Filter(filter_schema, filter));
 }
 
