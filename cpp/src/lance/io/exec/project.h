@@ -23,9 +23,6 @@
 
 #include "lance/io/exec/base.h"
 
-namespace lance::format {
-class Schema;
-}
 
 namespace lance::io {
 class FileReader;

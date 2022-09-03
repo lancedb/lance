@@ -24,10 +24,6 @@
 
 #include "lance/io/exec/base.h"
 
-namespace lance::io {
-class FileReader;
-}
-
 namespace lance::io::exec {
 
 /// Node for the Limit clause:
