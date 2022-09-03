@@ -72,7 +72,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
 }
 
 std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
-  return project_->schema()->ToArrow();
+  return options_->projected_schema;
 }
 
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {

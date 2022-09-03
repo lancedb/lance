@@ -17,7 +17,6 @@
 #include <arrow/api.h>
 #include <arrow/result.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
@@ -65,8 +64,6 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
   }
   return std::unique_ptr<Project>(new Project(std::move(child)));
 }
-
-const std::shared_ptr<format::Schema>& Project::schema() const { return projected_schema_; }
 
 std::string Project::ToString() const { return "Project"; }
 

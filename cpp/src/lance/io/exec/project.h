@@ -33,9 +33,6 @@ class FileReader;
 
 namespace lance::io::exec {
 
-class Filter;
-class Limit;
-
 /// \brief Projection over dataset.
 ///
 class Project : ExecNode {
@@ -57,9 +54,6 @@ class Project : ExecNode {
 
   ::arrow::Result<ScanBatch> Next() override;
 
-  /// Project schema
-  const std::shared_ptr<format::Schema>& schema() const;
-
   constexpr Type type() const override { return kProject; }
 
   std::string ToString() const override;
@@ -67,10 +61,6 @@ class Project : ExecNode {
  private:
   Project(std::unique_ptr<ExecNode> child);
 
-  std::shared_ptr<format::Schema> projected_schema_;
-  /// scan_schema_ equals to projected_schema_ - filters_.schema()
-  /// It includes the columns that are not read from the filters yet.
-  std::shared_ptr<format::Schema> scan_schema_;
   std::unique_ptr<ExecNode> child_;
 };
 
