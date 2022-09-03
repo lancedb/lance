@@ -103,7 +103,7 @@ template <ArrowType T>
     return ::arrow::Status::IndexError(
         fmt::format("VarBinaryDecoder::ToArray: out of range: start={} length={} page_length={}\n",
                     start,
-                    length.value_or(length_),
+                    length.value_or(-1),
                     length_));
   }
 

@@ -46,8 +46,8 @@ TEST_CASE("Test Write Int32 array") {
   }
 }
 
-TEST_CASE("Read not full batch") {
-  auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5, 6, 7, 8}).ValueOrDie();
+TEST_CASE("Do not read full batch") {
+  auto arr = lance::arrow::ToArray({10, 20, 30, 40, 50, 60, 70, 80}).ValueOrDie();
   CHECK(arr->length() == 8);
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
@@ -60,8 +60,9 @@ TEST_CASE("Read not full batch") {
   CHECK(decoder.Init().ok());
   decoder.Reset(offset, arr->length());
 
+  // Decode arr[6:8]
   auto values = decoder.ToArray(6, 8).ValueOrDie();
-  CHECK(values->Equals(lance::arrow::ToArray({7, 8}).ValueOrDie()));
+  CHECK(values->Equals(lance::arrow::ToArray({70, 80}).ValueOrDie()));
 }
 
 TEST_CASE("Test take plain values") {

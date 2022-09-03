@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "filter.h"
+#include "lance/io/exec/filter.h"
 
 #include <arrow/array.h>
 #include <arrow/compute/api.h>
@@ -45,7 +45,6 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   }
   ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Apply(*batch.batch));
   auto [indices, values] = indices_and_values;
-  assert(indices->length() == values->num_rows());
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
   ARROW_ASSIGN_OR_RAISE(
       auto struct_arr,
@@ -71,6 +70,7 @@ Filter::Apply(const ::arrow::RecordBatch& batch) const {
   auto indices = std::static_pointer_cast<::arrow::Int32Array>(indices_datum.make_array());
   auto values_arr = values.make_array();
   ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(values_arr));
+  assert(indices->length() == result_batch->num_rows());
   return std::make_tuple(indices, result_batch);
 }
 
