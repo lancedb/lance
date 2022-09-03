@@ -37,30 +37,19 @@ Take::Take(std::shared_ptr<FileReader> reader,
 ::arrow::Result<ScanBatch> Take::Next() {
   ARROW_ASSIGN_OR_RAISE(auto filtered, child_->Next());
   if (filtered.eof()) {
-    return ScanBatch{};
+    return ScanBatch::Null();
   }
-  auto indices = filtered.batch->GetColumnByName("indices");
-  auto vals = filtered.batch->GetColumnByName("values");
-  if (!indices || indices->type_id() != ::arrow::Type::INT32 || !vals ||
-      vals->type_id() != ::arrow::Type::STRUCT) {
-    return ::arrow::Status::Invalid("Invalid data from filter node: batch=",
-                                    filtered.batch->ToString());
-  }
-  auto values = std::reinterpret_pointer_cast<::arrow::StructArray>(vals);
+  assert(filtered.indices);
+  const auto batch_id = filtered.batch_id;
   if (!schema_ || schema_->fields().empty()) {
-    return ScanBatch{::arrow::RecordBatch::FromStructArray(vals).ValueOrDie(), filtered.batch_id};
+    return ScanBatch(filtered.batch, batch_id);
   } else {
-    auto& batch_id = filtered.batch_id;
-    auto int32_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices);
-    ARROW_ASSIGN_OR_RAISE(auto filtered_record_batch, ::arrow::RecordBatch::FromStructArray(vals));
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader_->ReadBatch(*schema_, batch_id, int32_indices));
-    assert(filtered_record_batch->num_rows() == batch->num_rows());
-    fmt::print("Merge scan results: filtered={} extra={}\n",
-               filtered_record_batch->ToString(),
-               batch->schema()->ToString());
-    ARROW_ASSIGN_OR_RAISE(auto merged,
-                          lance::arrow::MergeRecordBatches(filtered_record_batch, batch));
-    return ScanBatch{merged, filtered.batch_id};
+    ARROW_ASSIGN_OR_RAISE(auto rest_columns,
+                          reader_->ReadBatch(*schema_, batch_id, filtered.indices));
+    assert(filtered.batch->num_rows() == rest_columns->num_rows());
+    ARROW_ASSIGN_OR_RAISE(auto merged_batch,
+                          lance::arrow::MergeRecordBatches(filtered.batch, rest_columns));
+    return ScanBatch(merged_batch, filtered.batch_id);
   }
 }
 

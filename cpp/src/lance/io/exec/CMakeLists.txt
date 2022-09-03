@@ -12,7 +12,7 @@ add_library(
         scan.h
         take.cc
         take.h
-)
+        base.cc)
 target_include_directories(lance_io_exec SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(lance_io_exec format)
 

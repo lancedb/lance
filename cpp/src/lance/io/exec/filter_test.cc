@@ -46,20 +46,18 @@ TEST_CASE("value = 32") {
   auto bar = lance::arrow::ToArray({1, 2, 32, 0, 32}).ValueOrDie();
   auto struct_arr =
       ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
-  auto table =
-      ::arrow::Table::Make(::arrow::schema({::arrow::field("value", ::arrow::int32())}), {bar});
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32())});
+  auto table = ::arrow::Table::Make(schema, {bar});
   auto batch = ::arrow::RecordBatch::FromStructArray(struct_arr).ValueOrDie();
 
   auto filter = Filter::Make(expr, TableScan::Make(*table)).ValueOrDie();
   auto filtered_batch = filter->Next().ValueOrDie();
-  auto indices = filtered_batch.batch->GetColumnByName("indices");
   auto output = filtered_batch.batch->GetColumnByName("values");
-  CHECK(indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
+  CHECK(filtered_batch.indices->Equals(lance::arrow::ToArray({2, 4}).ValueOrDie()));
 
   bar = lance::arrow::ToArray({32, 32}).ValueOrDie();
-  struct_arr =
-      ::arrow::StructArray::Make({bar}, {::arrow::field("value", ::arrow::int32())}).ValueOrDie();
-  CHECK(output->Equals(struct_arr));
+  auto expected = ::arrow::RecordBatch::Make(schema, 2, {bar});
+  CHECK(filtered_batch.batch->Equals(*expected));
 }
 
 TEST_CASE("label = cat or label = dog") {
@@ -67,17 +65,14 @@ TEST_CASE("label = cat or label = dog") {
       or_(equal(field_ref("label"), literal("cat")), equal(field_ref("label"), literal("dog")));
   auto labels =
       lance::arrow::ToArray({"person", "dog", "cat", "car", "cat", "food", "hotdog"}).ValueOrDie();
-  auto table =
-      ::arrow::Table::Make(::arrow::schema({::arrow::field("label", ::arrow::utf8())}), {labels});
+  auto schema = ::arrow::schema({::arrow::field("label", ::arrow::utf8())});
+  auto table = ::arrow::Table::Make(schema, {labels});
 
   auto filter = Filter::Make(expr, TableScan::Make(*table)).ValueOrDie();
   auto filtered_batch = filter->Next().ValueOrDie();
-  auto indices = filtered_batch.batch->GetColumnByName("indices");
-  auto output = filtered_batch.batch->GetColumnByName("values");
-  CHECK(indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
+  CHECK(filtered_batch.indices->Equals(lance::arrow::ToArray({1, 2, 4}).ValueOrDie()));
 
   labels = lance::arrow::ToArray({"dog", "cat", "cat"}).ValueOrDie();
-  auto struct_arr =
-      ::arrow::StructArray::Make({labels}, {::arrow::field("label", ::arrow::utf8())}).ValueOrDie();
-  CHECK(output->Equals(struct_arr));
+  auto expected = ::arrow::RecordBatch::Make(schema, 3, {labels});
+  CHECK(filtered_batch.batch->Equals(*expected));
 }

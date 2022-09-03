@@ -59,7 +59,7 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
   fmt::print("Batch id: {} total batches={}\n", batch_id, reader_->metadata().num_batches());
   if (batch_id >= reader_->metadata().num_batches()) {
     // Reach EOF
-    return ScanBatch();
+    return ScanBatch::Null();
   }
 
   ARROW_ASSIGN_OR_RAISE(auto batch, reader_->ReadBatch(*schema_, batch_id, offset, batch_size_));

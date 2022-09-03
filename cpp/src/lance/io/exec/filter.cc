@@ -38,7 +38,7 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
 ::arrow::Result<ScanBatch> Filter::Next() {
   ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   if (batch.eof()) {
-    return ScanBatch{};
+    return ScanBatch::Null();
   }
   if (batch.batch->num_rows() == 0) {
     return batch;
@@ -46,12 +46,7 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Apply(*batch.batch));
   auto [indices, values] = indices_and_values;
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
-  ARROW_ASSIGN_OR_RAISE(
-      auto struct_arr,
-      ::arrow::StructArray::Make({indices, values_arr},
-                                 std::vector<std::string>({"indices", "values"})));
-  ARROW_ASSIGN_OR_RAISE(auto result_batch, ::arrow::RecordBatch::FromStructArray(struct_arr));
-  return ScanBatch{result_batch, batch.batch_id};
+  return ScanBatch::Filtered(values, batch.batch_id, indices);
 }
 
 ::arrow::Result<
