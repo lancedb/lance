@@ -46,9 +46,7 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   /// Constructor.
   RecordBatchReader(std::shared_ptr<FileReader> reader,
                     std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                    ::arrow::internal::ThreadPool* thread_pool_,
-                    std::optional<int64_t> limit = std::nullopt,
-                    int64_t offset = 0) noexcept;
+                    ::arrow::internal::ThreadPool* thread_pool_) noexcept;
 
   /// Copy constructor.
   RecordBatchReader(const RecordBatchReader& other) noexcept;
@@ -71,18 +69,13 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
  private:
   RecordBatchReader() = delete;
 
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(int32_t batch_id) const;
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch() const;
 
   std::shared_ptr<FileReader> reader_;
   std::shared_ptr<::arrow::dataset::ScanOptions> options_;
-  std::optional<int64_t> limit_ = std::nullopt;
-  int64_t offset_ = 0;
   /// Projection over the dataset.
   std::shared_ptr<exec::Project> project_;
-
   ::arrow::internal::ThreadPool* thread_pool_;
-  std::atomic_int32_t current_batch_ = 0;
-  std::queue<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> readahead_queue_;
 };
 
 }  // namespace lance::io

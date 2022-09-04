@@ -18,6 +18,7 @@
 #include <arrow/result.h>
 #include <fmt/format.h>
 
+#include "lance/arrow/file_lance_ext.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
@@ -31,9 +32,7 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     std::shared_ptr<FileReader> reader,
-    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
-    std::optional<int32_t> limit,
-    int32_t offset) {
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
   auto& schema = reader->schema();
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
@@ -41,6 +40,15 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
   }
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
 
+  std::optional<int64_t> limit;
+  int64_t offset;
+  if (scan_options->fragment_scan_options &&
+      lance::arrow::IsLanceFragmentScanOptions(*scan_options->fragment_scan_options)) {
+    auto fso = std::dynamic_pointer_cast<lance::arrow::LanceFragmentScanOptions>(
+        scan_options->fragment_scan_options);
+    limit = fso->limit;
+    offset = fso->offset;
+  }
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
     /// Build a chain of:

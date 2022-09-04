@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include <arrow/compute/exec/expression.h>
+#include <arrow/compute/api.h>
 #include <arrow/result.h>
 
 #include <memory>
