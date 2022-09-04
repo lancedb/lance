@@ -46,14 +46,14 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
     /// Build a chain of:
     ///
     /// Take -> (optionally) Limit -> Filter -> Scan
-    ARROW_ASSIGN_OR_RAISE(auto scan_schema, schema.Project(scan_options->filter));
-    ARROW_ASSIGN_OR_RAISE(auto scan_node,
-                          Scan::Make(reader, scan_schema, scan_options->batch_size));
-    ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(scan_node)));
+    ARROW_ASSIGN_OR_RAISE(auto filter_scan_schema, schema.Project(scan_options->filter));
+    ARROW_ASSIGN_OR_RAISE(auto filter_scan_node,
+                          Scan::Make(reader, filter_scan_schema, scan_options->batch_size));
+    ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(filter_scan_node)));
     if (limit.has_value()) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
     }
-    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*scan_schema));
+    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
     ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
     /// (*optionally) Limit -> Scan
