@@ -32,4 +32,7 @@ class LanceFragmentScanOptions : public ::arrow::dataset::FragmentScanOptions {
   int64_t offset = 0;
 };
 
+/// Check if the fragment scan option is LanceFragmentScanOptions.
+bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso);
+
 }  // namespace lance::arrow

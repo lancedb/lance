@@ -95,4 +95,8 @@ FileWriteOptions::FileWriteOptions()
 
 std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTypeName; }
 
+bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso) {
+  return fso.type_name() == kLanceFormatTypeName;
+}
+
 }  // namespace lance::arrow

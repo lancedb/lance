@@ -43,7 +43,7 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
   std::optional<int64_t> limit;
   int64_t offset;
   if (scan_options->fragment_scan_options &&
-      scan_options->fragment_scan_options->type_name() == "lance") {
+      lance::arrow::IsLanceFragmentScanOptions(*scan_options->fragment_scan_options)) {
     auto fso = std::dynamic_pointer_cast<lance::arrow::LanceFragmentScanOptions>(
         scan_options->fragment_scan_options);
     limit = fso->limit;
