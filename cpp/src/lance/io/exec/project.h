@@ -45,9 +45,7 @@ class Project : ExecNode {
   ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
       std::shared_ptr<FileReader> reader,
-      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options,
-      std::optional<int32_t> limit = std::nullopt,
-      int32_t offset = 0);
+      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
 
   ::arrow::Result<ScanBatch> Next() override;
 
