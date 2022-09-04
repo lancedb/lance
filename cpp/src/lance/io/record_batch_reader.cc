@@ -27,9 +27,9 @@
 
 #include "lance/format/metadata.h"
 #include "lance/format/schema.h"
-#include "lance/io/filter.h"
-#include "lance/io/limit.h"
-#include "lance/io/project.h"
+#include "lance/io/exec/filter.h"
+#include "lance/io/exec/limit.h"
+#include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
 
 namespace lance::io {
@@ -67,29 +67,24 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
       readahead_queue_(std::move(other.readahead_queue_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, Project::Make(reader_->schema(), options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_, limit_, offset_));
   return ::arrow::Status::OK();
 }
 
 std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
-  return project_->schema()->ToArrow();
+  return options_->projected_schema;
 }
 
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
-  int32_t batch_id = current_batch_++;
-  ARROW_ASSIGN_OR_RAISE(auto batch_read, ReadBatch(batch_id));
-  if (batch_read) {
-    *batch = std::move(batch_read);
-  }
+  ARROW_ASSIGN_OR_RAISE(auto scan_batch, project_->Next());
+  *batch = std::move(scan_batch.batch);
   return ::arrow::Status::OK();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch(
-    int32_t batch_id) const {
-  if (batch_id < reader_->metadata().num_batches()) {
-    return project_->Execute(reader_, batch_id);
-  }
-  return nullptr;
+    [[maybe_unused]] int32_t batch_id) const {
+  ARROW_ASSIGN_OR_RAISE(auto batch, project_->Next());
+  return batch.batch;
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {

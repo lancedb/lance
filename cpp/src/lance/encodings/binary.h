@@ -98,28 +98,26 @@ template <ArrowType T>
 template <ArrowType T>
 ::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::ToArray(
     int32_t start, std::optional<int32_t> length) const {
-  if (!length.has_value()) {
-    length = length_ - start;
-  }
-  if (start + *length > length_) {
+  auto len = std::min(length.value_or(length_), length_ - start);
+  if (len < 0) {
     return ::arrow::Status::IndexError(
         fmt::format("VarBinaryDecoder::ToArray: out of range: start={} length={} page_length={}\n",
                     start,
-                    *length,
+                    length.value_or(-1),
                     length_));
   }
 
   auto offsets_buf =
-      infile_->ReadAt(position_ + start * sizeof(OffsetCType), (*length + 1) * sizeof(OffsetCType));
+      infile_->ReadAt(position_ + start * sizeof(OffsetCType), (len + 1) * sizeof(OffsetCType));
   if (!offsets_buf.ok()) {
     return ::arrow::Status::IOError(
         fmt::format("VarBinaryDecoder::ToArray: failed to read offset: start={}, length={}: {}",
                     start,
-                    *length,
+                    len,
                     offsets_buf.status().message()));
   }
-  auto positions = std::make_shared<typename ::arrow::TypeTraits<OffsetType>::ArrayType>(
-      *length + 1, *offsets_buf);
+  auto positions =
+      std::make_shared<typename ::arrow::TypeTraits<OffsetType>::ArrayType>(len + 1, *offsets_buf);
   auto start_offset = positions->Value(0);
 
   ::arrow::Int32Builder builder;
@@ -133,7 +131,7 @@ template <ArrowType T>
   auto value_offsets = std::static_pointer_cast<::arrow::Int32Array>(*value_offsets_buf);
   auto read_length = positions->Value(positions->length() - 1) - start_offset;
   ARROW_ASSIGN_OR_RAISE(auto data_buf, infile_->ReadAt(start_offset, read_length));
-  return std::make_shared<ArrayType>(*length, value_offsets->values(), data_buf);
+  return std::make_shared<ArrayType>(len, value_offsets->values(), data_buf);
 }
 
 }  // namespace lance::encodings

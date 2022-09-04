@@ -251,8 +251,11 @@ const lance::format::Metadata& FileReader::metadata() const { return *metadata_;
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
-    const lance::format::Schema& schema, int32_t batch_id, std::optional<int32_t> length) const {
-  return ReadBatch(schema, batch_id, ArrayReadParams(0, length));
+    const lance::format::Schema& schema,
+    int32_t batch_id,
+    int32_t offset,
+    std::optional<int32_t> length) const {
+  return ReadBatch(schema, batch_id, ArrayReadParams(offset, length));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(

@@ -32,4 +32,26 @@ namespace lance::testing {
   return reader;
 }
 
+TableScan::TableScan(const ::arrow::Table& table, int64_t batch_size)
+    : reader_(new ::arrow::TableBatchReader(table)) {
+  reader_->set_chunksize(batch_size);
+};
+
+std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
+  return std::unique_ptr<io::exec::ExecNode>(new TableScan());
+}
+
+::arrow::Result<io::exec::ScanBatch> TableScan::Next() {
+  if (!reader_) {
+    return io::exec::ScanBatch{};
+  }
+  
+  std::shared_ptr<::arrow::RecordBatch> batch;
+  ARROW_RETURN_NOT_OK(reader_->ReadNext(&batch));
+  return io::exec::ScanBatch{
+      batch,
+      0,
+  };
+}
+
 }  // namespace lance::testing

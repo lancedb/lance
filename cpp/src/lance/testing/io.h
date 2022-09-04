@@ -18,7 +18,9 @@
 #include <arrow/table.h>
 
 #include <memory>
+#include <string>
 
+#include "lance/io/exec/base.h"
 #include "lance/io/reader.h"
 
 namespace lance::testing {
@@ -26,5 +28,34 @@ namespace lance::testing {
 /// Make lance::io::FileReader from an Arrow Table.
 ::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
     const std::shared_ptr<::arrow::Table>& table);
+
+/// A ExecNode that scans a Table in memory.
+///
+/// This node can be used in test without creating files.
+class TableScan : lance::io::exec::ExecNode {
+ public:
+  TableScan() = default;
+
+  TableScan(const ::arrow::Table& table, int64_t batch_size);
+
+  TableScan(TableScan&&) = default;
+
+  static std::unique_ptr<io::exec::ExecNode> Make(const ::arrow::Table& table,
+                                                  int64_t batch_size = 1024) {
+    return std::unique_ptr<io::exec::ExecNode>(new TableScan(table, batch_size));
+  }
+
+  /// Make an empty table scanner.
+  static std::unique_ptr<io::exec::ExecNode> MakeEmpty();
+
+  ::arrow::Result<io::exec::ScanBatch> Next() override;
+
+  constexpr Type type() const override { return kTableScan; }
+
+  std::string ToString() const override { return "Dummy"; }
+
+ private:
+  std::unique_ptr<::arrow::TableBatchReader> reader_;
+};
 
 }  // namespace lance::testing

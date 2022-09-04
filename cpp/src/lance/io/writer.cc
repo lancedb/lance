@@ -183,7 +183,7 @@ FileWriter::~FileWriter() {}
 ::arrow::Status FileWriter::WriteFooter() {
   // Write dictionary values first.
   auto visitor = format::WriteDictionaryVisitor(destination_);
-  ARROW_RETURN_NOT_OK(visitor.VisitSchema(lance_schema_));
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*lance_schema_));
 
   ARROW_ASSIGN_OR_RAISE(auto pos, lookup_table_.Write(destination_));
   metadata_->SetPageTablePosition(pos);

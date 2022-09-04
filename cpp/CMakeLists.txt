@@ -117,6 +117,7 @@ set(lance_objects
         $<TARGET_OBJECTS:encodings>
         $<TARGET_OBJECTS:format>
         $<TARGET_OBJECTS:io>
+        $<TARGET_OBJECTS:lance_io_exec>
         )
 
 add_subdirectory(src)

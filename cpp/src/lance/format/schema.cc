@@ -512,15 +512,15 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   return Project(columns);
 }
 
-::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(std::shared_ptr<Schema> other) const {
+::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(const Schema& other) const {
   /// An visitor to remove fields in place.
   class SchemaExcludeVisitor : public FieldVisitor {
    public:
     SchemaExcludeVisitor(std::shared_ptr<Schema> excluded) : excluded_(excluded) {}
 
     ::arrow::Status Visit(std::shared_ptr<Field> field) override {
-      for (auto& field : field->fields()) {
-        ARROW_RETURN_NOT_OK(Visit(field));
+      for (auto& f : field->fields()) {
+        ARROW_RETURN_NOT_OK(Visit(f));
       }
       auto excluded_field = excluded_->GetField(field->id());
       if (!excluded_field) {

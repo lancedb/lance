@@ -46,6 +46,25 @@ TEST_CASE("Test Write Int32 array") {
   }
 }
 
+TEST_CASE("Do not read full batch") {
+  auto arr = lance::arrow::ToArray({10, 20, 30, 40, 50, 60, 70, 80}).ValueOrDie();
+  CHECK(arr->length() == 8);
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  lance::encodings::PlainEncoder encoder(sink);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  // Read it back
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  lance::encodings::PlainDecoder decoder(infile, arrow::int32());
+  CHECK(decoder.Init().ok());
+  decoder.Reset(offset, arr->length());
+
+  // Decode arr[6:8]
+  auto values = decoder.ToArray(6, 8).ValueOrDie();
+  CHECK(values->Equals(lance::arrow::ToArray({70, 80}).ValueOrDie()));
+}
+
 TEST_CASE("Test take plain values") {
   arrow::Int32Builder builder;
   for (int i = 0; i < 100; i++) {

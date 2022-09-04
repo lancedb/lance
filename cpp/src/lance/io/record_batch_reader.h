@@ -35,7 +35,10 @@ class Schema;
 namespace lance::io {
 
 class FileReader;
+
+namespace exec {
 class Project;
+}
 
 /// Lance RecordBatchReader
 class RecordBatchReader : ::arrow::RecordBatchReader {
@@ -75,7 +78,7 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   std::optional<int64_t> limit_ = std::nullopt;
   int64_t offset_ = 0;
   /// Projection over the dataset.
-  std::shared_ptr<Project> project_;
+  std::shared_ptr<exec::Project> project_;
 
   ::arrow::internal::ThreadPool* thread_pool_;
   std::atomic_int32_t current_batch_ = 0;
