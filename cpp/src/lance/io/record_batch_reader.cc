@@ -36,38 +36,25 @@ namespace lance::io {
 
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                                     ::arrow::internal::ThreadPool* thread_pool,
-                                     std::optional<int64_t> limit,
-                                     int64_t offset) noexcept
-    : reader_(reader),
-      options_(options),
-      limit_(limit),
-      offset_(offset),
-      thread_pool_(thread_pool) {
+                                     ::arrow::internal::ThreadPool* thread_pool) noexcept
+    : reader_(reader), options_(options), thread_pool_(thread_pool) {
   assert(thread_pool_);
 }
 
 RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
     : reader_(other.reader_),
       options_(other.options_),
-      limit_(other.limit_),
-      offset_(other.offset_),
       project_(other.project_),
-      thread_pool_(other.thread_pool_),
-      current_batch_(int(other.current_batch_)) {}
+      thread_pool_(other.thread_pool_) {}
 
 RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
-      limit_(other.limit_),
-      offset_(other.offset_),
       project_(std::move(other.project_)),
-      thread_pool_(std::move(other.thread_pool_)),
-      current_batch_(int(other.current_batch_)),
-      readahead_queue_(std::move(other.readahead_queue_)) {}
+      thread_pool_(std::move(other.thread_pool_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_, limit_, offset_));
+  ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_));
   return ::arrow::Status::OK();
 }
 
@@ -81,34 +68,19 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
   return ::arrow::Status::OK();
 }
 
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch(
-    [[maybe_unused]] int32_t batch_id) const {
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch() const {
   ARROW_ASSIGN_OR_RAISE(auto batch, project_->Next());
   return batch.batch;
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  int total_batches = reader_->metadata().num_batches();
-  while (static_cast<int32_t>(readahead_queue_.size()) < options_->batch_readahead &&
-         current_batch_ < total_batches) {
-    int32_t batch_id = current_batch_++;
-    auto result = thread_pool_->Submit(
-        [&](int32_t batch_id) {
-          return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(
-              this->ReadBatch(batch_id));
-        },
-        batch_id);
-    if (!result.ok()) {
-      return result.status();
-    }
-    readahead_queue_.emplace(std::move(result.ValueOrDie()));
+  auto result = thread_pool_->Submit([&]() {
+    return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(this->ReadBatch());
+  });
+  if (!result.ok()) {
+    return result.status();
   }
-  if (readahead_queue_.empty()) {
-    return std::shared_ptr<::arrow::RecordBatch>(nullptr);
-  }
-  auto first = readahead_queue_.front();
-  readahead_queue_.pop();
-  return first;
+  return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>(result.ValueOrDie());
 }
 
 }  // namespace lance::io
