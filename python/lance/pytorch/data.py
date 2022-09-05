@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Union, Optional
+from typing import List, Optional, Union
 
 import pyarrow as pa
 import pyarrow.dataset
@@ -38,7 +38,7 @@ class LanceDataset(IterableDataset):
     def __init__(
         self,
         uri: Union[str, Path],
-        columns: Optional[list[str]] = None,
+        columns: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
     ):
         self.uri = uri

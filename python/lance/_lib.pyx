@@ -4,13 +4,22 @@ from typing import Optional, Union
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
-from libcpp.memory cimport shared_ptr, const_pointer_cast
+from libcpp.memory cimport const_pointer_cast, shared_ptr
 from libcpp.string cimport string
 
 from pathlib import Path
 
 from pyarrow import Table
-from pyarrow._dataset cimport FileFormat, FileWriteOptions, CFileWriteOptions, CScanner, CDataset, Dataset
+
+from pyarrow._dataset cimport (
+    CDataset,
+    CFileWriteOptions,
+    CScanner,
+    Dataset,
+    FileFormat,
+    FileWriteOptions,
+)
+
 from pyarrow._dataset import Scanner
 
 from pyarrow._compute cimport Expression, _bind

@@ -16,10 +16,10 @@
 from pathlib import Path
 
 import pandas as pd
-
 import pyarrow as pa
 import pyarrow.dataset as ds
-from lance import write_table, dataset, LanceFileFormat
+
+from lance import LanceFileFormat, dataset, write_table
 
 
 def test_simple_round_trips(tmp_path: Path):
