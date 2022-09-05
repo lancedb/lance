@@ -19,8 +19,6 @@ pytest.importorskip("torch")
 import torch
 import pyarrow as pa
 from pathlib import Path
-import pandas as pd
-from torch.utils.data import DataLoader
 
 from lance.pytorch.data import LanceDataset
 
@@ -30,13 +28,9 @@ def test_data_loader(tmp_path: Path):
     ids = pa.array(range(10))
     values = pa.array(range(10, 20))
     tab = pa.Table.from_arrays([ids, values], names=["id", "value"])
-    print(tab)
-    print(tab.take([0]))
-    print(ids)
 
     lance.write_table(tab, tmp_path / "lance")
 
     dataset = LanceDataset(tmp_path / "lance", batch_size=4)
-    print(dataset)
     id_batch, value_batch = next(iter(dataset))
-    assert id_batch.shape == 4
+    assert id_batch.shape == torch.Size([4])

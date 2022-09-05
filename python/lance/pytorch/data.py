@@ -44,7 +44,6 @@ class LanceDataset(IterableDataset):
         self.uri = uri
         self.columns = columns if columns else []
         self.batch_size = batch_size
-        print(f"Init lance dataset: batch size={batch_size}")
         self.scanner: pa.dataset.Scanner = scanner(
             dataset(self.uri), columns=columns, batch_size=batch_size
         )

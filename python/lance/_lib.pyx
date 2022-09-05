@@ -75,10 +75,10 @@ cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
     cdef cppclass LScannerBuilder "::lance::arrow::ScannerBuilder":
         LScannerBuilder(shared_ptr[CDataset]) except +
-        void Project(const vector[string]& columns)
-        void Filter(CExpression filter)
+        CStatus Project(const vector[string]& columns)
+        CStatus Filter(CExpression filter)
         CStatus BatchSize(int64_t batch_size)
-        void Limit(int64_t limit, int64_t offset)
+        CStatus Limit(int64_t limit, int64_t offset)
         CResult[shared_ptr[CScanner]] Finish()
 
 def BuildScanner(
