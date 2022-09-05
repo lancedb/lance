@@ -71,3 +71,35 @@ TEST_CASE("Test Scan::Next") {
   batch = scan->Next().ValueOrDie();
   CHECK(!batch.batch);
 }
+
+TEST_CASE("Scan move to the next batch") {
+  const auto kNumBatches = 3;
+  const auto kPageLength = 20;
+  ::arrow::ArrayVector arrs;
+  for (int i = 0; i < kNumBatches; i++) {
+    std::vector<int32_t> ints(kPageLength);
+    std::iota(ints.begin(), ints.end(), i * kPageLength);
+    arrs.emplace_back(lance::arrow::ToArray(ints).ValueOrDie());
+  }
+  auto schema = ::arrow::schema({
+      ::arrow::field("ints", ::arrow::int32()),
+  });
+  auto chunked_arrs = ::arrow::ChunkedArray::Make(arrs).ValueOrDie();
+  auto tab = ::arrow::Table::Make(schema, {chunked_arrs});
+  auto reader = MakeReader(tab).ValueOrDie();
+
+  // A batch size that is aligned with the page boundary.
+  const int32_t kBatchSize = 4;
+  auto scan =
+      Scan::Make(reader, std::make_shared<Schema>(reader->schema()), kBatchSize).ValueOrDie();
+  auto num_batches = 0;
+  while (true) {
+    auto batch = scan->Next().ValueOrDie();
+    if (!batch.batch) {
+      break;
+    }
+    num_batches++;
+    CHECK(batch.batch->num_rows() == kBatchSize);
+  }
+  CHECK(num_batches == kPageLength / kBatchSize * kNumBatches);
+}
