@@ -78,7 +78,6 @@ def scanner(
     """
     if isinstance(data, (str, Path)):
         data = dataset(str(data))
-    print(batch_size)
     return BuildScanner(
         data,
         columns=columns,
