@@ -6,18 +6,23 @@
 
 from pydoc import cli
 import click
-from torch import optim
 import pytorch_lightning as pl
+import torch
+import torchvision
+from torch import optim
 
 import lance
+import lance.pytorch.data
 
 
 class EfficientNet(pl.LightningModule):
     def __init__(self) -> None:
         super().__init__()
+        self.model = torchvision.models.efficientnet_b1()
 
     def training_step(self, batch, batch_idx):
         print(batch, batch_idx)
+        x, y = batch
         pass
 
     def configure_optimizers(self):
@@ -29,6 +34,8 @@ class EfficientNet(pl.LightningModule):
 @click.option("-b", "--batch_size", default=64, help="batch size", show_default=True)
 @click.argument("dataset")
 def train(dataset: str, batch_size: int):
+    dataset = lance.pytorch.data.LanceDataset(dataset, columns=["class"], batch_size=batch_size)
+    train_loader = torch.utils.data.DataLoader(dataset, num_workers=0, batch_size=None)
     model = EfficientNet()
     trainer = pl.Trainer(limit_train_batches=100, max_epochs=1)
     trainer.fit(model=model, train_dataloaders=train_loader)

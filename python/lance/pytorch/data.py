@@ -57,7 +57,8 @@ class LanceDataset(IterableDataset):
         for batch in self.scanner.to_reader():
             # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
             # Investigate how to directly perform zero-copy into Torch Tensor.
+            print(batch)
             yield [
-                torch.from_numpy(arr.to_numpy(zero_copy_only=False, writable=True))
+                arr.to_numpy(zero_copy_only=False, writable=True)
                 for arr in batch.columns
             ]
