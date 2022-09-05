@@ -19,6 +19,7 @@ import pyarrow as pa
 import pyarrow.dataset
 
 try:
+    import torch
     from torch.utils.data import IterableDataset
 except ImportError:
     raise ImportError("Please install pytorch via pip install lance[pytorch]")
@@ -53,10 +54,9 @@ class LanceDataset(IterableDataset):
 
     def __iter__(self):
         """Yield dataset"""
-        import torch
-
         for batch in self.scanner.to_reader():
             # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
+            # Investigate how to directly perform zero-copy into Torch Tensor.
             yield [
                 torch.from_numpy(arr.to_numpy(zero_copy_only=False, writable=True))
                 for arr in batch.columns
