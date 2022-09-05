@@ -37,48 +37,44 @@ class BDD100kConverter(DatasetConverter):
         return table["image_uri"].to_numpy()
 
     def get_schema(self):
+        attributes = pa.struct(
+            [
+                ("weather", pa.dictionary(pa.uint8(), pa.utf8())),
+                ("scene", pa.dictionary(pa.uint8(), pa.utf8())),
+                ("timeofday", pa.dictionary(pa.uint8(), pa.utf8())),
+            ]
+        )
+        labels = pa.list_(
+            pa.struct(
+                [
+                    ("category", pa.dictionary(pa.int8(), pa.utf8())),
+                    (
+                        "attributes",
+                        pa.struct(
+                            [
+                                ("occluded", pa.bool_()),
+                                ("truncated", pa.bool_()),
+                                (
+                                    "trafficLightColor",
+                                    pa.dictionary(pa.uint8(), pa.utf8()),
+                                ),
+                            ]
+                        ),
+                    ),
+                    ("manualShape", pa.bool_()),
+                    ("manualAttributes", pa.bool_()),
+                    ("box", pa.list_(pa.float32())),
+                ]
+            )
+        )
         schema = pa.schema(
             [
                 ("name", pa.utf8()),
                 ("image_uri", pa.utf8()),
                 ("timestamp", pa.int32()),
                 ("split", pa.dictionary(pa.uint8(), pa.utf8())),
-                (
-                    "attributes",
-                    pa.struct(
-                        [
-                            ("weather", pa.dictionary(pa.uint8(), pa.utf8())),
-                            ("scene", pa.dictionary(pa.uint8(), pa.utf8())),
-                            ("timeofday", pa.dictionary(pa.uint8(), pa.utf8())),
-                        ]
-                    ),
-                ),
-                (
-                    "labels",
-                    pa.list_(
-                        pa.struct(
-                            [
-                                ("category", pa.dictionary(pa.int8(), pa.utf8())),
-                                (
-                                    "attributes",
-                                    pa.struct(
-                                        [
-                                            ("occluded", pa.bool_()),
-                                            ("truncated", pa.bool_()),
-                                            (
-                                                "trafficLightColor",
-                                                pa.dictionary(pa.uint8(), pa.utf8()),
-                                            ),
-                                        ]
-                                    ),
-                                ),
-                                ("manualShape", pa.bool_()),
-                                ("manualAttributes", pa.bool_()),
-                                ("box", pa.list_(pa.float32())),
-                            ]
-                        )
-                    ),
-                ),
+                ("attributes", attributes),
+                ("labels", labels),
             ]
         )
         return schema
