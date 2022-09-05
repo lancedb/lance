@@ -68,7 +68,7 @@ setup(
     zip_safe=False,
     install_requires=["pyarrow>=9,<10"],
     extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"],
-                    "pytorch": ["pytorch"]},
+                    "pytorch": ["torch"]},
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[
