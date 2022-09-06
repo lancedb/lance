@@ -14,12 +14,11 @@
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from pathlib import Path
 
 import pyarrow as pa
-import torch
 
 import lance
 from lance.pytorch.data import LanceDataset

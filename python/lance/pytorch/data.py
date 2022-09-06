@@ -21,8 +21,8 @@ import pyarrow.dataset
 try:
     import torch
     from torch.utils.data import IterableDataset
-except ImportError:
-    raise ImportError("Please install pytorch via pip install lance[pytorch]")
+except ImportError as e:
+    raise ImportError("Please install pytorch", e)
 
 from lance import dataset, scanner
 

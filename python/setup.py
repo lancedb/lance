@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-from setuptools import Extension, find_packages, setup
 import platform
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 from Cython.Build import cythonize
+from setuptools import Extension, find_packages, setup
 
 extra_libs = []
 # TODO: ciwheelbuild can not find / dont need arrow_python.
@@ -67,8 +67,7 @@ setup(
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     install_requires=["pyarrow>=9,<10"],
-    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"],
-                    "pytorch": ["torch"]},
+    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"]},
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[
