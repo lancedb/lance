@@ -35,7 +35,7 @@ if (CCACHE_FOUND)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ccache)
 endif (CCACHE_FOUND)
 
-add_compile_options(-Wall -Wextra -fPIC)
+add_compile_options(-Wall -Wextra -fPIC -g)
 
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     SET(LANCE_BUILD_BENCHMARKS ON)
