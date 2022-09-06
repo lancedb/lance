@@ -48,7 +48,7 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
     batch_id = current_batch_id_;
     offset = current_offset_;
     current_offset_ += batch_size_;
-    if (current_offset_ > current_batch_page_length_) {
+    if (current_offset_ >= current_batch_page_length_) {
       current_batch_id_++;
       current_offset_ = 0;
       if (current_batch_id_ < reader_->metadata().num_batches()) {
@@ -56,7 +56,6 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
       }
     }
   }
-  fmt::print("Batch id: {} total batches={}\n", batch_id, reader_->metadata().num_batches());
   if (batch_id >= reader_->metadata().num_batches()) {
     // Reach EOF
     return ScanBatch::Null();
