@@ -30,7 +30,7 @@ def raw_collate_fn(batch):
     for img, label in batch:
         images.append(img)
         labels.append(label)
-    return torch.stack(images), torch.tensor(labels, dtype=torch.int64)
+    return torch.stack(images), torch.tensor(labels)
 
 
 class RawOxfordPetDataset(torch.utils.data.Dataset):
@@ -68,7 +68,7 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
                 comps = line.split()
                 if comps:
                     self.images.append(comps[0])
-                    self.labels.append(int(comps[1]))
+                    self.labels.append(torch.tensor(int(comps[1]), dtype=torch.long))
 
     def __len__(self):
         return len(self.images)
