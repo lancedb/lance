@@ -204,15 +204,15 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
       int32_t start, std::optional<int32_t> length) const override {
     auto len = GetReadLength(start, length);
     if (len < 0) {
-      return ::arrow::Status::IndexError(
-          fmt::format("PlainDecoder(bool)::ToArray: out of range: start={}, length={}, page_length={}\n",
-                      start,
-                      length.value(),
-                      length_));
+      return ::arrow::Status::IndexError(fmt::format(
+          "PlainDecoder(bool)::ToArray: out of range: start={}, length={}, page_length={}\n",
+          start,
+          length.value_or(-1),
+          length_));
     }
-    int64_t byte_length = ::arrow::bit_util::BytesForBits(length.value());
+    int64_t byte_length = ::arrow::bit_util::BytesForBits(len);
     ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
-    return std::make_shared<::arrow::BooleanArray>(length.value(), buf);
+    return std::make_shared<::arrow::BooleanArray>(len, buf);
   }
 };
 
