@@ -58,14 +58,14 @@ class LanceDataset(IterableDataset):
         self.uri = uri
         self.columns = columns if columns else []
         self.batch_size = batch_size
-        self.scanner: pa.dataset.Scanner = scanner(
-            dataset(self.uri), columns=columns, batch_size=batch_size
-        )
 
     def __repr__(self):
         return f"LanceDataset(uri={self.uri})"
 
     def __iter__(self):
         """Yield dataset"""
-        for batch in self.scanner.to_reader():
+        scan: pa.dataset.Scanner = scanner(
+            dataset(self.uri), columns=self.columns, batch_size=self.batch_size
+        )
+        for batch in scan.to_reader():
             yield [to_numpy(arr) for arr in batch.columns]

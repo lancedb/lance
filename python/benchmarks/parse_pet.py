@@ -231,9 +231,9 @@ def main(base_uri, fmt, embedded, output):
     df = converter.read_metadata()
     for f in fmt:
         if embedded:
-            converter.make_embedded_dataset(df, f, output_path=output)
+            converter.make_embedded_dataset(df, f, output_path=output, partitioning=["split"])
         else:
-            converter.save_df(df, f, output_path=output)
+            converter.save_df(df, f, output_path=output, partitioning=["split"])
 
 
 if __name__ == "__main__":

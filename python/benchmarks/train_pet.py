@@ -87,7 +87,7 @@ def collate_fn(batch):
     # TODO: Labels should be converted via torch.LanceDataset
     labels = torch.randint(0, 31, size=(len(batch[1]),))
     # TODO: Image conversion should in torch.LanceDataset
-    images = [transform(Image.open(io.BytesIO(data))) for data in batch[0]]
+    images = [transform(Image.open(io.BytesIO(data)).convert('RGB')) for data in batch[0]]
     return torch.stack(images), labels
 
 

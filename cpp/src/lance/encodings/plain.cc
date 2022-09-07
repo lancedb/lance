@@ -125,7 +125,7 @@ class PlainDecoderImpl : public Decoder {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
-    auto len = std::min(length.value_or(length_), length_ - start);
+    auto len = GetReadLength(start, length);
     if (len <= 0) {
       return ::arrow::Status::IndexError(
           fmt::format("{}::ToArray: out of range: start={}, length={}, page_length={}\n",
@@ -173,6 +173,15 @@ class PlainDecoderImpl : public Decoder {
     return fmt::format("PlainEncoder({})", type_->ToString());
   }
 
+ protected:
+  /// @brief Get the actual length to read in the page.
+  /// @param start the start offset
+  /// @param length proposed length to read
+  /// @return the actual length to read
+  int32_t GetReadLength(int32_t start, std::optional<int32_t> length) const {
+    return std::min(length.value_or(length_), length_ - start);
+  }
+
  private:
   using ArrayType = typename ::arrow::TypeTraits<T>::ArrayType;
   using BuilderType = typename ::arrow::TypeTraits<T>::BuilderType;
@@ -193,12 +202,10 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
-    if (!length.has_value()) {
-      length = length_ - start;
-    }
-    if (start + length.value() > length_ || start > length_) {
+    auto len = GetReadLength(start, length);
+    if (len < 0) {
       return ::arrow::Status::IndexError(
-          fmt::format("PlainDecoder::ToArray: out of range: start={}, length={}, page_length={}\n",
+          fmt::format("PlainDecoder(bool)::ToArray: out of range: start={}, length={}, page_length={}\n",
                       start,
                       length.value(),
                       length_));
