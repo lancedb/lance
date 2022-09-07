@@ -13,11 +13,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import multiprocessing as mp
 import os
 import pathlib
-import sys
-from typing import Iterable
 
 import click
 import numpy as np
@@ -25,7 +22,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.fs
 import xmltodict
-from bench_utils import DatasetConverter, download_uris, read_file
+
+from bench_utils import DatasetConverter, download_uris
+
 
 # Oxford PET has dataset quality issues:
 #
@@ -77,8 +76,8 @@ class OxfordPetConverter(DatasetConverter):
             no_index = pd.Index(names.values).difference(df.filename)
             self._data_quality_issues["missing_index"] = no_index
 
-        # TODO lance doesn't support writing booleans yet
-        with_xmls["segmented"] = with_xmls.segmented.astype(pd.Int8Dtype())
+        with_xmls['segmented'] = with_xmls.segmented.apply(
+            lambda x: pd.NA if pd.isnull(x) else bool(x)).astype(pd.BooleanDtype())
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -175,8 +174,8 @@ class OxfordPetConverter(DatasetConverter):
             pa.string(),
             source_schema,
             size_schema,
-            pa.uint8(),
-            object_schema,
+            pa.bool_(),
+            object_schema
         ]
         return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
 
@@ -232,9 +231,9 @@ def main(base_uri, fmt, embedded, output):
     df = converter.read_metadata()
     for f in fmt:
         if embedded:
-            converter.make_embedded_dataset(df, f, output_path=output)
+            converter.make_embedded_dataset(df, f, output_path=output, partitioning=["split"])
         else:
-            converter.save_df(df, f, output_path=output)
+            converter.save_df(df, f, output_path=output, partitioning=["split"])
 
 
 if __name__ == "__main__":
