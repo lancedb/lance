@@ -16,7 +16,8 @@
 Arrow extension types for Lance
 """
 import platform
-from abc import ABC, abstractproperty
+from abc import ABC, abstractproperty, abstractmethod
+from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -51,6 +52,9 @@ class ImageType(LanceType):
 
     def __arrow_ext_serialize__(self):
         return b""
+
+    def __arrow_ext_scalar_class__(self):
+        return ImageScalar
 
     @classmethod
     def from_storage(cls, storage_type):
@@ -94,6 +98,41 @@ class ImageBinaryType(ImageType):
         return ImageBinaryType()
 
 
+class Image:
+
+    def __init__(self, data: [bytes, str]):
+        if isinstance(data, bytes):
+            self._bytes: Optional[bytes] = data
+            self._uri: Optional[str] = None
+        elif isinstance(data, str):
+            self._bytes: Optional[bytes] = None
+            self._uri: Optional[str] = data
+
+    @property
+    def uri(self) -> str:
+        return self.uri
+
+    @property
+    def bytes(self) -> bytes:
+        return self.bytes
+
+    def to_pil(self):
+        import io
+        from PIL import Image
+        if self.bytes is not None:
+            return Image.open(io.BytesIO(self.bytes))
+        elif self.uri is not None:
+            with open_uri(self.uri) as fp:
+                return Image.open(fp)
+
+
+class ImageScalar(pa.ExtensionScalar, ABC):
+
+    @abstractmethod
+    def as_py(self) -> Image:
+        return Image(self.value.as_py())
+
+
 # TODO turn these into fixed sized list arrays once GH#101 is done
 class Point2dType(LanceType):
     """
@@ -125,7 +164,7 @@ class Box2dType(LanceType):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, openstorage_type, serialized):
         return Box2dType()
 
 

@@ -21,12 +21,13 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable
 from lance.types import register_extension_types
+from lance.version import __version__
 
 if platform.system() == "Linux":
     # TODO enable on MacOS
     register_extension_types()
 
-__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat"]
+__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
 
 
 def dataset(
