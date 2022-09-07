@@ -18,16 +18,14 @@ import os
 import pathlib
 import sys
 from typing import Iterable
-import click
 
+import click
 import numpy as np
 import pandas as pd
-import xmltodict
-
 import pyarrow as pa
 import pyarrow.fs
+import xmltodict
 from bench_utils import DatasetConverter, download_uris, read_file
-
 
 # Oxford PET has dataset quality issues:
 #
@@ -43,7 +41,6 @@ from bench_utils import DatasetConverter, download_uris, read_file
 
 
 class OxfordPetConverter(DatasetConverter):
-
     def __init__(self, uri_root):
         super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
         self._data_quality_issues = {}
@@ -60,18 +57,20 @@ class OxfordPetConverter(DatasetConverter):
         split = pd.concat([train, val, test])
         split.name = "split"
         split = split.reset_index()
-        with_split = df.merge(split, how='left', on="filename")
-        xml_files = (os.path.join(self.uri_root, "annotations", "xmls/")
-                     + with_split.filename + ".xml")
+        with_split = df.merge(split, how="left", on="filename")
+        xml_files = (
+            os.path.join(self.uri_root, "annotations", "xmls/")
+            + with_split.filename
+            + ".xml"
+        )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
-        with_xmls = pd.concat([with_split, ann_df.drop(columns=['filename'])],
-                              axis=1)
+        with_xmls = pd.concat([with_split, ann_df.drop(columns=["filename"])], axis=1)
 
         if check_quality:
-            trainval = df[df.split.isin(['train', 'val'])]
-            self._data_quality_issues["missing_xml"] = (
-                trainval[trainval.folder.isna()].filename.values.tolist()
-            )
+            trainval = df[df.split.isin(["train", "val"])]
+            self._data_quality_issues["missing_xml"] = trainval[
+                trainval.folder.isna()
+            ].filename.values.tolist()
 
             p = pathlib.Path(self.uri_root) / "annotations" / "xmls"
             names = pd.Series([p.name[:-4] for p in p.iterdir()])
@@ -79,70 +78,94 @@ class OxfordPetConverter(DatasetConverter):
             self._data_quality_issues["missing_index"] = no_index
 
         # TODO lance doesn't support writing booleans yet
-        with_xmls['segmented'] = with_xmls.segmented.astype(pd.Int8Dtype())
+        with_xmls["segmented"] = with_xmls.segmented.astype(pd.Int8Dtype())
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
-        list_txt = os.path.join(self.uri_root,
-                                f"annotations/{name}.txt")
+        list_txt = os.path.join(self.uri_root, f"annotations/{name}.txt")
         df = pd.read_csv(list_txt, delimiter=" ", comment="#", header=None)
         df.columns = ["filename", "class", "species", "breed"]
         return df
 
     @staticmethod
     def _find_split_index(trainval_df):
-        classnames = trainval_df.filename.str.rsplit('_', 1).str[0].str.lower()
+        classnames = trainval_df.filename.str.rsplit("_", 1).str[0].str.lower()
         return np.argmax(classnames < classnames.shift(1))
 
     @staticmethod
     def _to_category(metadata_df: pd.DataFrame):
         species_dtype = pd.CategoricalDtype(["Unknown", "Cat", "Dog"])
-        metadata_df['species'] = pd.Categorical.from_codes(metadata_df.species, dtype=species_dtype)
+        metadata_df["species"] = pd.Categorical.from_codes(
+            metadata_df.species, dtype=species_dtype
+        )
 
         breeds = metadata_df.filename.str.rsplit("_", 1).str[0].unique()
         assert len(breeds) == 37
 
         breeds = np.concatenate([["Unknown"], breeds])
         class_dtype = pd.CategoricalDtype(breeds)
-        metadata_df["class"] = pd.Categorical.from_codes(metadata_df["class"], dtype=class_dtype)
+        metadata_df["class"] = pd.Categorical.from_codes(
+            metadata_df["class"], dtype=class_dtype
+        )
         return metadata_df
 
     def default_dataset_path(self, fmt, flavor=None):
         suffix = f"_{flavor}" if flavor else ""
-        return os.path.join(self.uri_root,
-                            f'{self.name}{suffix}.{fmt}')
+        return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
     def image_uris(self, table):
-        return [os.path.join(self.uri_root, f"images/{x}.jpg")
-                for x in table["filename"].to_numpy()]
+        return [
+            os.path.join(self.uri_root, f"images/{x}.jpg")
+            for x in table["filename"].to_numpy()
+        ]
 
     def get_schema(self):
-        source_schema = pa.struct([
-            pa.field("database", pa.string()),
-            pa.field("annotation", pa.string()),
-            pa.field("image", pa.string())
-        ])
-        size_schema = pa.struct([
-            pa.field("width", pa.int32()),
-            pa.field("height", pa.int32()),
-            pa.field("depth", pa.uint8())
-        ])
-        bbox = pa.struct([
-            pa.field("xmin", pa.int32()),
-            pa.field("ymin", pa.int32()),
-            pa.field("xmax", pa.int32()),
-            pa.field("ymax", pa.int32()),
-        ])
-        object_schema = pa.list_(pa.struct([
-            pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
-            pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
-            pa.field("truncated", pa.bool_()),
-            pa.field("occluded", pa.bool_()),
-            pa.field("bndbox", bbox),
-            pa.field("difficult", pa.bool_())
-        ]))
-        names = ["filename", "class", "species", "breed", "split",
-                 "folder", "source", "size", "segmented", "object"]
+        source_schema = pa.struct(
+            [
+                pa.field("database", pa.string()),
+                pa.field("annotation", pa.string()),
+                pa.field("image", pa.string()),
+            ]
+        )
+        size_schema = pa.struct(
+            [
+                pa.field("width", pa.int32()),
+                pa.field("height", pa.int32()),
+                pa.field("depth", pa.uint8()),
+            ]
+        )
+        bbox = pa.struct(
+            [
+                pa.field("xmin", pa.int32()),
+                pa.field("ymin", pa.int32()),
+                pa.field("xmax", pa.int32()),
+                pa.field("ymax", pa.int32()),
+            ]
+        )
+        object_schema = pa.list_(
+            pa.struct(
+                [
+                    pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
+                    pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
+                    pa.field("truncated", pa.bool_()),
+                    pa.field("occluded", pa.bool_()),
+                    pa.field("bndbox", bbox),
+                    pa.field("difficult", pa.bool_()),
+                ]
+            )
+        )
+        names = [
+            "filename",
+            "class",
+            "species",
+            "breed",
+            "split",
+            "folder",
+            "source",
+            "size",
+            "segmented",
+            "object",
+        ]
         types = [
             pa.string(),
             pa.dictionary(pa.uint8(), pa.string()),
@@ -153,32 +176,31 @@ class OxfordPetConverter(DatasetConverter):
             source_schema,
             size_schema,
             pa.uint8(),
-            object_schema
+            object_schema,
         ]
-        return pa.schema([pa.field(name, dtype)
-                          for name, dtype in zip(names, types)])
+        return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
 
 
 def _get_xml(uri):
     fs, key = pa.fs.FileSystem.from_uri(uri)
     try:
         with fs.open_input_file(key) as fh:
-            dd = xmltodict.parse(fh.read())['annotation']
-            if not isinstance(dd['object'], list):
-                dd['object'] = [dd['object']]
-            sz = dd['size']
-            sz['width'] = int(sz['width'])
-            sz['height'] = int(sz['height'])
-            sz['depth'] = int(sz['depth'])
-            for obj in dd['object']:
-                obj['truncated'] = bool(int(obj['truncated']))
-                obj['occluded'] = bool(int(obj['occluded']))
-                obj['difficult'] = bool(int(obj['difficult']))
-                obj['bndbox'] = {
-                    'xmin': int(obj['bndbox']['xmin']),
-                    'xmax': int(obj['bndbox']['xmax']),
-                    'ymin': int(obj['bndbox']['ymin']),
-                    'ymax': int(obj['bndbox']['ymax']),
+            dd = xmltodict.parse(fh.read())["annotation"]
+            if not isinstance(dd["object"], list):
+                dd["object"] = [dd["object"]]
+            sz = dd["size"]
+            sz["width"] = int(sz["width"])
+            sz["height"] = int(sz["height"])
+            sz["depth"] = int(sz["depth"])
+            for obj in dd["object"]:
+                obj["truncated"] = bool(int(obj["truncated"]))
+                obj["occluded"] = bool(int(obj["occluded"]))
+                obj["difficult"] = bool(int(obj["difficult"]))
+                obj["bndbox"] = {
+                    "xmin": int(obj["bndbox"]["xmin"]),
+                    "xmax": int(obj["bndbox"]["xmax"]),
+                    "ymin": int(obj["bndbox"]["ymin"]),
+                    "ymax": int(obj["bndbox"]["ymax"]),
                 }
             return dd
     except Exception:
@@ -186,10 +208,19 @@ def _get_xml(uri):
 
 
 @click.command
-@click.option("-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root")
-@click.option("-f", "--fmt", type=click.Choice(["parquet", "lance"]), help="Output format (parquet or lance)")
+@click.option(
+    "-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root"
+)
+@click.option(
+    "-f",
+    "--fmt",
+    type=click.Choice(["parquet", "lance"]),
+    help="Output format (parquet or lance)",
+)
 @click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
-@click.option("-o", "--output", type=str, default="oxford_pet.lance", help="Output path")
+@click.option(
+    "-o", "--output", type=str, default="oxford_pet.lance", help="Output path"
+)
 def main(base_uri, fmt, embedded, output):
     known_formats = ["lance", "parquet"]
     if fmt is not None:

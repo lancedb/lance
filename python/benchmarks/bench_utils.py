@@ -12,20 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import multiprocessing as mp
 import os
 import pathlib
+import time
 from abc import ABC, abstractmethod
 from functools import wraps
-import multiprocessing as mp
 from typing import Iterable, Union
 
 import click
 import pandas as pd
-import time
-
 import pyarrow as pa
-import pyarrow.fs
 import pyarrow.dataset as ds
+import pyarrow.fs
 import pyarrow.parquet as pq
 
 import lance

@@ -6,7 +6,6 @@ import os
 import click
 import pandas as pd
 import pyarrow as pa
-
 from bench_utils import DatasetConverter
 
 

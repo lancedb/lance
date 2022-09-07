@@ -14,6 +14,7 @@
 
 import platform
 
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -50,6 +51,16 @@ def test_box2d(tmp_path):
     data = [(float(x), float(x), float(x), float(x)) for x in range(100)]
     storage = pa.array(data, pa.list_(pa.float64()))
     _test_extension_rt(tmp_path, box_type, storage)
+
+
+def test_label(tmp_path):
+    label_type = LabelType()
+    values = ["cat", "dog", "horse", "chicken", "donkey", "pig"]
+    indices = np.random.randint(0, len(values), 100)
+    storage = pa.DictionaryArray.from_arrays(
+        pa.array(indices, type=pa.int8()), pa.array(values, type=pa.string())
+    )
+    _test_extension_rt(tmp_path, label_type, storage)
 
 
 def _test_extension_rt(tmp_path, ext_type, storage_arr):

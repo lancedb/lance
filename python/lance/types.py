@@ -22,7 +22,14 @@ import pandas as pd
 import pyarrow as pa
 from pyarrow import ArrowKeyError
 
-__all__ = ["ImageType", "ImageUriType", "ImageBinaryType", "Point2dType", "Box2dType"]
+__all__ = [
+    "ImageType",
+    "ImageUriType",
+    "ImageBinaryType",
+    "Point2dType",
+    "Box2dType",
+    "LabelType",
+]
 
 
 class LanceType(pa.ExtensionType, ABC):
@@ -122,6 +129,24 @@ class Box2dType(LanceType):
         return Box2dType()
 
 
+class LabelType(LanceType):
+    """
+    A label used for classification. This is backed by a dictionary type
+    to make it easier for translating between human-readable strings and
+    integer classes used in the models
+    """
+
+    def __init__(self):
+        super(LabelType, self).__init__(pa.dictionary(pa.int8(), pa.string()), "label")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, type_self, storage_type, serialized):
+        return LabelType()
+
+
 def register_extension_types():
     if platform.system() != "Linux":
         raise NotImplementedError("Extension types are only supported on Linux for now")
@@ -130,6 +155,7 @@ def register_extension_types():
         pa.register_extension_type(ImageBinaryType())
         pa.register_extension_type(Point2dType())
         pa.register_extension_type(Box2dType())
+        pa.register_extension_type(LabelType())
     except ArrowKeyError:
         # already registered
         pass

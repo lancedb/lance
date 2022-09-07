@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Union
 
 import click
-import lance
 import pandas as pd
 import pyarrow as pa
 import pyarrow.fs
-
 from bench_utils import DatasetConverter
+
+import lance
 
 
 class BDD100kConverter(DatasetConverter):
@@ -23,12 +23,18 @@ class BDD100kConverter(DatasetConverter):
         for split in ["train", "val"]:
             annotation = pd.read_json(
                 os.path.join(
-                    self.uri_root, "bdd100k", "labels", f"bdd100k_labels_images_{split}.json"
+                    self.uri_root,
+                    "bdd100k",
+                    "labels",
+                    f"bdd100k_labels_images_{split}.json",
                 )
             )
             annotation["split"] = split
             annotation["image_uri"] = annotation["name"].map(
-                lambda name: os.path.join(self.uri_root, "bdd100k", "images", "100k", split, name))
+                lambda name: os.path.join(
+                    self.uri_root, "bdd100k", "images", "100k", split, name
+                )
+            )
             frames.append(annotation)
 
         return pd.concat(frames)
@@ -82,7 +88,12 @@ class BDD100kConverter(DatasetConverter):
 
 @click.command
 @click.option("-u", "--base-uri", type=str, required=True, help="Coco dataset root")
-@click.option("-f", "--fmt", type=click.Choice(["lance", "parquet"]), help="Output format (parquet or lance)")
+@click.option(
+    "-f",
+    "--fmt",
+    type=click.Choice(["lance", "parquet"]),
+    help="Output format (parquet or lance)",
+)
 @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
 @click.option(
     "-o",
@@ -103,7 +114,9 @@ def main(base_uri, fmt, embedded, output_path):
     partitioning = ["split"]
     for f in fmt:
         if embedded:
-            converter.make_embedded_dataset(df, f, output_path, partitioning=partitioning)
+            converter.make_embedded_dataset(
+                df, f, output_path, partitioning=partitioning
+            )
         else:
             return converter.save_df(df, f, output_path, partitioning=partitioning)
 

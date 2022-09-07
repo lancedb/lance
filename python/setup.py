@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-from setuptools import Extension, find_packages, setup
 import platform
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 from Cython.Build import cythonize
+from setuptools import Extension, find_packages, setup
 
 extra_libs = []
 # TODO: ciwheelbuild can not find / dont need arrow_python.
