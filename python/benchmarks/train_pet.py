@@ -30,7 +30,7 @@ def raw_collate_fn(batch):
     for img, label in batch:
         images.append(img)
         labels.append(label)
-    return torch.stack(images), torch.Tensor(labels)
+    return torch.stack(images), torch.tensor(labels, dtype=torch.int64)
 
 
 class RawOxfordPetDataset(torch.utils.data.Dataset):
@@ -77,7 +77,7 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
         image_uri = os.path.join(self.root, "images", f"{self.images[idx]}.jpg")
         fs, path = pyarrow.fs.FileSystem.from_uri(image_uri)
         with fs.open_input_stream(path) as fobj:
-            img = Image.open(io.BytesIO(fobj.readall()))
+            img = Image.open(io.BytesIO(fobj.readall())).convert('RGB')
             if self.transform:
                 img = self.transform(img)
             return img, self.labels[idx]
@@ -87,7 +87,6 @@ def collate_fn(batch):
     # TODO: Labels should be converted via torch.LanceDataset
     labels = torch.randint(0, 31, size=(len(batch[1]),))
     # TODO: Image conversion should in torch.LanceDataset
-    preprocessing = EfficientNet_B0_Weights.DEFAULT.transforms()
     images = [transform(Image.open(io.BytesIO(data))) for data in batch[0]]
     return torch.stack(images), labels
 
