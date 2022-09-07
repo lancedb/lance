@@ -32,7 +32,6 @@ arrow_includes = pa.get_include()
 arrow_library_dirs = pa.get_library_dirs()
 numpy_includes = np.get_include()
 
-
 # TODO allow for custom liblance directory
 lance_cpp = Path(__file__).resolve().parent.parent / "cpp"
 lance_includes = str(lance_cpp / "include")
@@ -50,7 +49,6 @@ extensions = [
         extra_link_args=["-Wl,-rpath", lance_libs, "-Wl,-rpath", arrow_library_dirs[0]],
     )
 ]
-
 
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()

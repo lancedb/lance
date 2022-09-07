@@ -84,15 +84,17 @@ cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
     cdef cppclass LScannerBuilder "::lance::arrow::ScannerBuilder":
         LScannerBuilder(shared_ptr[CDataset]) except +
-        void Project(const vector[string]& columns)
-        void Filter(CExpression filter)
-        void Limit(int64_t limit, int64_t offset)
+        CStatus Project(const vector[string]& columns)
+        CStatus Filter(CExpression filter)
+        CStatus BatchSize(int64_t batch_size)
+        CStatus Limit(int64_t limit, int64_t offset)
         CResult[shared_ptr[CScanner]] Finish()
 
 def BuildScanner(
         dataset: Dataset,
         columns: Optional[list[str]] = None,
         filter: Optional[Expression] = None,
+        batch_size: Optional[int] = None,
         limit: Optional[int] = None,
         offset: int = 0,
 ):
@@ -104,9 +106,10 @@ def BuildScanner(
         builder.get().Project([tobytes(c) for c in columns])
     if filter is not None:
         builder.get().Filter(_bind(filter, dataset.schema))
+    if batch_size is not None:
+        builder.get().BatchSize(batch_size)
     if limit is not None:
         builder.get().Limit(limit, offset)
-
     scanner = GetResultValue(builder.get().Finish())
     creader = GetResultValue(scanner.get().ToRecordBatchReader())
     reader = RecordBatchReader()
