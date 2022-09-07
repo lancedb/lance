@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import numpy as np
 
 try:
@@ -53,10 +54,12 @@ class LanceDataset(IterableDataset):
         self,
         uri: Union[str, Path],
         columns: Optional[List[str]] = None,
+        filter: Optional[pc.Expression] = None,
         batch_size: Optional[int] = None,
     ):
         self.uri = uri
         self.columns = columns if columns else []
+        self.filter = filter
         self.batch_size = batch_size
 
     def __repr__(self):
@@ -65,7 +68,10 @@ class LanceDataset(IterableDataset):
     def __iter__(self):
         """Yield dataset"""
         scan: pa.dataset.Scanner = scanner(
-            dataset(self.uri), columns=self.columns, batch_size=self.batch_size
+            dataset(self.uri),
+            columns=self.columns,
+            batch_size=self.batch_size,
+            filter=self.filter,
         )
         for batch in scan.to_reader():
             yield [to_numpy(arr) for arr in batch.columns]

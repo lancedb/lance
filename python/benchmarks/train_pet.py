@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 import click
 import pyarrow.fs
+import pyarrow.compute as pc
 import pytorch_lightning as pl
 import torch
 import torchvision
@@ -156,6 +157,7 @@ def train(
             dataset,
             columns=["image", "class"],
             batch_size=batch_size,
+            #filter=(pc.field("split") == "train")
         )
         train_loader = torch.utils.data.DataLoader(
             dataset,
