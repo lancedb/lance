@@ -5,6 +5,7 @@
 """
 
 import io
+import os
 from typing import Optional
 
 import click
@@ -64,11 +65,18 @@ class Classification(pl.LightningModule):
 
 
 @click.command()
-@click.option("-b", "--batch_size", default=4, help="batch size", show_default=True)
+@click.option("-b", "--batch_size", default=64, help="batch size", show_default=True)
 @click.option("-e", "--epochs", default=10, help="set max ephochs", show_default=True)
+@click.option(
+    "-w",
+    "--num_workers",
+    default=os.cpu_count(),
+    help="set pytorch DataLoader number of workers",
+    show_default=True,
+)
 @click.option("--benchmark", type=click.Choice(["io", "train"]), default="train")
 @click.argument("dataset")
-def train(dataset: str, batch_size: int, epochs: int, benchmark: str):
+def train(dataset: str, batch_size: int, epochs: int, benchmark: str, num_workers: int):
     print(f"Running benchmark: {benchmark}")
     dataset = lance.pytorch.data.LanceDataset(
         dataset,
@@ -77,7 +85,7 @@ def train(dataset: str, batch_size: int, epochs: int, benchmark: str):
     )
     train_loader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=8,
+        num_workers=num_workers,
         batch_size=None,
         collate_fn=collate_fn,
     )
