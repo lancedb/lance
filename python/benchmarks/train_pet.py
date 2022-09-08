@@ -6,12 +6,12 @@
 
 import io
 import os
-from typing import Callable, Optional
 import time
+from typing import Callable, Optional
 
 import click
-import pyarrow.fs
 import pyarrow.compute as pc
+import pyarrow.fs
 import pytorch_lightning as pl
 import torch
 import torchvision
