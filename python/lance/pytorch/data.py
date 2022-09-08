@@ -15,9 +15,10 @@
 from pathlib import Path
 from typing import List, Optional, Union
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import numpy as np
+import pyarrow.dataset
 
 try:
     import torch
@@ -25,7 +26,8 @@ try:
 except ImportError as e:
     raise ImportError("Please install pytorch", e)
 
-from lance import dataset, scanner
+import lance
+from lance import dataset
 
 __all__ = ["LanceDataset"]
 
@@ -51,27 +53,44 @@ class LanceDataset(IterableDataset):
     """
 
     def __init__(
-        self,
-        uri: Union[str, Path],
-        columns: Optional[List[str]] = None,
-        filter: Optional[pc.Expression] = None,
-        batch_size: Optional[int] = None,
+            self,
+            root: Union[str, Path],
+            columns: Optional[List[str]] = None,
+            filter: Optional[pc.Expression] = None,
+            batch_size: Optional[int] = None,
     ):
-        self.uri = uri
+        self.root = root
         self.columns = columns if columns else []
         self.filter = filter
         self.batch_size = batch_size
+        self._dataset: pa.dataset.FileSystemDataset = None
+        self._files: Optional[List[str]] = None
 
     def __repr__(self):
-        return f"LanceDataset(uri={self.uri})"
+        return f"LanceDataset(root={self.root})"
+
+    def _setup_dataset(self):
+        """Lazy loading dataset in different process."""
+        if self._files is not None:
+            return self._files
+
+        self._files = dataset(self.root).files
+        worker_info = torch.utils.data.get_worker_info()
+        # Split the work using at the files level for now.
+        if worker_info:
+            rank = worker_info.id
+            num_workers = worker_info.num_workers
+            self._files = [
+                self._files[i] for i in range(rank, len(self._files), num_workers)
+            ]
 
     def __iter__(self):
         """Yield dataset"""
-        scan: pa.dataset.Scanner = scanner(
-            dataset(self.uri),
-            columns=self.columns,
-            batch_size=self.batch_size,
-            filter=self.filter,
-        )
-        for batch in scan.to_reader():
-            yield [to_numpy(arr) for arr in batch.columns]
+        self._setup_dataset()
+        for file_uri in self._files:
+            ds = dataset(file_uri)
+            scan = lance.scanner(
+                ds, columns=self.columns, batch_size=self.batch_size, filter=self.filter
+            )
+            for batch in scan.to_reader():
+                yield [to_numpy(arr) for arr in batch.columns]
