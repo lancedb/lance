@@ -23,7 +23,7 @@ from pyarrow import fs
 
 from lance.io import copy, open_uri
 
-from .base import LanceType
+from lance.types.base import LanceType
 
 
 class ImageType(LanceType):
@@ -168,6 +168,9 @@ class EmbeddedImage(Image):
     def __eq__(self, other):
         return isinstance(other, EmbeddedImage) and other.bytes == self.bytes
 
+    def __repr__(self):
+        return "Image(<embedded>)"
+
 
 class ImageRef(Image):
     """
@@ -192,11 +195,13 @@ class ImageRef(Image):
             return Image(img.read())
 
     def save(self, uri):
-        copy(self.uri, uri)
-        return ImageRef(uri)
+        return ImageRef(copy(self.uri, uri))
 
     def __eq__(self, other):
         return isinstance(other, ImageRef) and other.uri == self.uri
+
+    def __repr__(self):
+        return f"Image({self.uri})"
 
 
 class ImageScalar(pa.ExtensionScalar):

@@ -15,7 +15,7 @@ import numpy as np
 
 import pyarrow as pa
 
-from .base import LanceType
+from lance.types.base import LanceType
 
 
 class Box2dType(LanceType):

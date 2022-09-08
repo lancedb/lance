@@ -19,10 +19,6 @@ import pyarrow as pa
 
 class LanceType(pa.ExtensionType, ABC):
     def __init__(self, storage_type, extension_name):
-        if platform.system() != "Linux":
-            raise NotImplementedError(
-                "Extension types are enabled for linux only for now"
-            )
         super(LanceType, self).__init__(storage_type, extension_name)
 
 

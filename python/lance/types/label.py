@@ -13,7 +13,7 @@
 #  limitations under the License.
 import pyarrow as pa
 
-from .base import LanceType
+from lance.types.base import LanceType
 
 
 class LabelType(LanceType):

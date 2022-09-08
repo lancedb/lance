@@ -17,10 +17,10 @@ import platform
 import pyarrow as pa
 from pyarrow import ArrowKeyError
 
-from .base import Point2dType
-from .box import Box2dType
-from .label import LabelType
-from .image import ImageBinaryType, ImageType, ImageUriType
+from lance.types.base import Point2dType
+from lance.types.box import Box2dType
+from lance.types.label import LabelType
+from lance.types.image import ImageBinaryType, ImageType, ImageUriType
 
 
 def register_extension_types():
