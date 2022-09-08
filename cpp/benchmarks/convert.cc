@@ -24,6 +24,7 @@
 
 #include "lance/arrow/reader.h"
 #include "lance/arrow/writer.h"
+#include "bench_utils.h"
 
 using std::map;
 using std::string;
@@ -33,27 +34,12 @@ namespace fs = std::filesystem;
 /// Convert a Parquet file to lance file.
 arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) {
   auto uri = in_uri;
-  if (!uri.starts_with("s3")) {
-    uri = fs::absolute(uri);
-  }
-  auto path = uri;
-  if (path.starts_with("s3")) {
-    path = uri.substr(std::string("s3://").size());
-  }
-  auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri).ValueOrDie();
-  auto factory =
-      arrow::dataset::FileSystemDatasetFactory::Make(
-          fs,
-          {path},
-          std::shared_ptr<arrow::dataset::FileFormat>(new arrow::dataset::ParquetFileFormat()),
-          arrow::dataset::FileSystemFactoryOptions())
-          .ValueOrDie();
-  auto dataset = factory->Finish().ValueOrDie();
+  auto dataset = OpenDataset(in_uri, "parquet");
   auto scan_builder = dataset->NewScan().ValueOrDie();
   auto scanner = scan_builder->Finish().ValueOrDie();
   auto table = scanner->ToTable().ValueOrDie();
 
-  auto outfile = fs->OpenOutputStream(out).ValueOrDie();
+  auto outfile = dataset->filesystem()->OpenOutputStream(out).ValueOrDie();
   return lance::arrow::WriteTable(*table, outfile);
 }
 
