@@ -76,8 +76,8 @@ class LanceDataset(IterableDataset):
 
         self._files = dataset(self.root).files
         worker_info = torch.utils.data.get_worker_info()
-        # Split the work using at the files level for now.
         if worker_info:
+            # Split the work using at the files level for now.
             rank = worker_info.id
             num_workers = worker_info.num_workers
             self._files = [
