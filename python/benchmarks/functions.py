@@ -59,8 +59,8 @@ def iou_vectorized(num_boxes: int):
     ymin_inter = np.maximum(ymin_arr, ymin_arr[:, np.newaxis])
     xmax_inter = np.minimum(xmax_arr, xmax_arr[:, np.newaxis])
     ymax_inter = np.minimum(ymax_arr, ymax_arr[:, np.newaxis])
-    intersection = (np.max(xmax_inter - xmin_inter + 1, 0) *
-                    np.max(ymax_inter - ymin_inter + 1, 0))
+    intersection = (np.maximum(xmax_inter - xmin_inter + 1, 0) *
+                    np.maximum(ymax_inter - ymin_inter + 1, 0))
     union = area + area[:, np.newaxis] - intersection
     return intersection / union
 

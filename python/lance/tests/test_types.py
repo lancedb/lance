@@ -20,6 +20,7 @@ import pytest
 
 import lance
 from lance.types import Box2dType, ImageType, LabelType, Point2dType
+from lance.types.box import Box2dArray
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -53,7 +54,41 @@ def test_box2d(tmp_path):
     storage = pa.StructArray.from_arrays(
         [xmin, ymin, xmax, ymax], names=["xmin", "ymin", "xmax", "ymax"]
     )
-    _test_extension_rt(tmp_path, box_type, storage)
+    ext_arr = _test_extension_rt(tmp_path, box_type, storage)
+    assert isinstance(ext_arr, Box2dArray)
+    assert np.all(ext_arr.xmin == xmin)
+    assert np.all(ext_arr.xmax == xmax)
+    assert np.all(ext_arr.ymin == ymin)
+    assert np.all(ext_arr.ymax == ymax)
+    actual_areas = ext_arr.area()
+    expected_areas = (xmax - xmin + 1) * (ymax - ymin + 1)
+    assert np.all(actual_areas == expected_areas)
+    actual_iou = ext_arr[:20].iou(ext_arr[90:])
+    expected_iou = _naive_iou(ext_arr[:20], ext_arr[90:])
+    assert np.all(actual_iou == expected_iou)
+
+
+def _naive_iou(box_a, box_b):
+    ious = np.zeros((len(box_a), len(box_b)))
+    for i in range(len(box_a)):
+        for j in range(len(box_b)):
+            xmin = max(box_a.xmin[i], box_b.xmin[j])
+            ymin = max(box_a.ymin[i], box_b.ymin[j])
+            xmax = min(box_a.xmax[i], box_b.xmax[j])
+            ymax = min(box_a.ymax[i], box_b.ymax[j])
+            # compute the area of intersection rectangle
+            inter = max(0, xmax - xmin + 1) * max(0, ymax - ymin + 1)
+            # compute the area of both the prediction and ground-truth
+            # rectangles
+            area_i = ((box_a.xmax[i] - box_a.xmin[i] + 1) *
+                      (box_a.ymax[i] - box_a.ymin[i] + 1))
+            area_j = ((box_b.xmax[j] - box_b.xmin[j] + 1) *
+                      (box_b.ymax[j] - box_b.ymin[j] + 1))
+            # compute the intersection over union by taking the intersection
+            # area and dividing it by the sum of prediction + ground-truth
+            # areas - the interesection area
+            ious[i, j] = inter / float(area_i + area_j - inter)
+    return ious
 
 
 def test_label(tmp_path):

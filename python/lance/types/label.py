@@ -11,35 +11,24 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import platform
-from abc import ABC
-
 import pyarrow as pa
 
-
-class LanceType(pa.ExtensionType, ABC):
-    def __init__(self, storage_type, extension_name):
-        if platform.system() != "Linux":
-            raise NotImplementedError(
-                "Extension types are enabled for linux only for now"
-            )
-        super(LanceType, self).__init__(storage_type, extension_name)
+from .base import LanceType
 
 
-class Point2dType(LanceType):
+class LabelType(LanceType):
     """
-    A Point in 2D space. Represented as 2 floating point numbers
+    A label used for classification. This is backed by a dictionary type
+    to make it easier for translating between human-readable strings and
+    integer classes used in the models
     """
 
     def __init__(self):
-        super(Point2dType, self).__init__(
-            pa.struct([pa.field("x", pa.float64()), pa.field("y", pa.float64())]),
-            "point2d",
-        )
+        super(LabelType, self).__init__(pa.dictionary(pa.int8(), pa.string()), "label")
 
     def __arrow_ext_serialize__(self):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, storage_type, serialized):
-        return Point2dType()
+    def __arrow_ext_deserialize__(cls, type_self, storage_type, serialized):
+        return LabelType()

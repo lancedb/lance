@@ -17,7 +17,9 @@ import platform
 import pyarrow as pa
 from pyarrow import ArrowKeyError
 
-from .annotations import Box2dType, LabelType, Point2dType
+from .base import Point2dType
+from .box import Box2dType
+from .label import LabelType
 from .image import ImageBinaryType, ImageType, ImageUriType
 
 
