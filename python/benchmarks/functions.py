@@ -13,6 +13,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import numpy as np
+import pyarrow as pa
+from lance.types.box import Box2dArray, Box2dType
 
 
 def iou(is_vectorized: bool, num_boxes: int = 100):
@@ -28,7 +30,7 @@ def iou_naive(num_boxes: int):
     ymax_arr = (np.random.randn(num_boxes) + 10) * 10
     ious = np.zeros((num_boxes, num_boxes))
     for i in range(num_boxes):
-        for j in range(i, num_boxes):
+        for j in range(num_boxes):
             xmin = max(xmin_arr[i], xmin_arr[j])
             ymin = max(ymin_arr[i], ymin_arr[j])
             xmax = min(xmax_arr[i], xmax_arr[j])
@@ -40,12 +42,11 @@ def iou_naive(num_boxes: int):
             area_i = ((xmax_arr[i] - xmin_arr[i] + 1) *
                       (ymax_arr[i] - ymin_arr[i] + 1))
             area_j = ((xmax_arr[j] - xmin_arr[j] + 1) *
-                      (ymax_arr[j] - ymax_arr[j] + 1))
+                      (ymax_arr[j] - ymin_arr[j] + 1))
             # compute the intersection over union by taking the intersection
             # area and dividing it by the sum of prediction + ground-truth
             # areas - the interesection area
             ious[i, j] = inter / float(area_i + area_j - inter)
-            ious[j, i] = inter / float(area_i + area_j - inter)
     return ious
 
 
@@ -54,15 +55,12 @@ def iou_vectorized(num_boxes: int):
     ymin_arr = np.random.randn(num_boxes) + 1
     xmax_arr = (np.random.randn(num_boxes) + 10) * 10
     ymax_arr = (np.random.randn(num_boxes) + 10) * 10
-    area = (xmax_arr - xmin_arr + 1) * (ymax_arr - ymin_arr + 1)
-    xmin_inter = np.maximum(xmin_arr, xmin_arr[:, np.newaxis])
-    ymin_inter = np.maximum(ymin_arr, ymin_arr[:, np.newaxis])
-    xmax_inter = np.minimum(xmax_arr, xmax_arr[:, np.newaxis])
-    ymax_inter = np.minimum(ymax_arr, ymax_arr[:, np.newaxis])
-    intersection = (np.maximum(xmax_inter - xmin_inter + 1, 0) *
-                    np.maximum(ymax_inter - ymin_inter + 1, 0))
-    union = area + area[:, np.newaxis] - intersection
-    return intersection / union
+    storage = pa.StructArray.from_arrays(
+        [xmin_arr, ymin_arr, xmax_arr, ymax_arr],
+        names=["xmin", "ymin", "xmax", "ymax"]
+    )
+    box_arr = Box2dArray.from_storage(Box2dType(), storage)
+    return box_arr.iou(box_arr)
 
 
 if __name__ == "__main__":
