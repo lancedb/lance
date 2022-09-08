@@ -26,7 +26,7 @@ from lance.io import copy, open_uri
 from lance.types.base import LanceType
 
 
-class ImageType(LanceType):
+class ImageType(LanceType, ABC):
     """
     Base type for Image's. Images can be either stored as a Uri pointer or
     bytes directly. Use ImageType.from_storage(storage_arr.type) to get an
@@ -36,9 +36,6 @@ class ImageType(LanceType):
 
     def __arrow_ext_serialize__(self):
         return b""
-
-    def __arrow_ext_scalar_class__(self):
-        return ImageScalar
 
     @classmethod
     def from_storage(cls, storage_type):
@@ -65,6 +62,9 @@ class ImageUriType(ImageType):
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return ImageUriType()
 
+    def __arrow_ext_scalar_class__(self):
+        return ImageUriScalar
+
 
 class ImageBinaryType(ImageType):
     """
@@ -81,6 +81,9 @@ class ImageBinaryType(ImageType):
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return ImageBinaryType()
 
+    def __arrow_ext_scalar_class__(self):
+        return ImageBinaryScalar
+
 
 class Image(ABC):
     """
@@ -91,9 +94,9 @@ class Image(ABC):
 
     def __new__(cls, data: Union[bytes, str]):
         if isinstance(data, bytes):
-            img = object.__new__(EmbeddedImage)
+            img = object.__new__(ImageBinary)
         elif isinstance(data, str):
-            img = object.__new__(ImageRef)
+            img = object.__new__(ImageUri)
         else:
             raise TypeError(
                 f"{cls.__name__} can only handle bytes or str " f"but got {type(data)}"
@@ -138,9 +141,9 @@ class Image(ABC):
         pass
 
 
-class EmbeddedImage(Image):
+class ImageBinary(Image):
     """
-    In-memory Image
+    An In-memory Image
     """
 
     def __init__(self, data: bytes):
@@ -163,18 +166,18 @@ class EmbeddedImage(Image):
         filesystem, path = fs.FileSystem.from_uri(uri)
         with filesystem.open_output_stream(path) as fobj:
             fobj.write(self.bytes)
-        return ImageRef(uri)
+        return ImageUri(uri)
 
     def __eq__(self, other):
-        return isinstance(other, EmbeddedImage) and other.bytes == self.bytes
+        return isinstance(other, ImageBinary) and other.bytes == self.bytes
 
     def __repr__(self):
         return "Image(<embedded>)"
 
 
-class ImageRef(Image):
+class ImageUri(Image):
     """
-    Image reference
+    An externalized image represented by its uri
     """
 
     def __init__(self, uri: str):
@@ -195,17 +198,24 @@ class ImageRef(Image):
             return Image(img.read())
 
     def save(self, uri):
-        return ImageRef(copy(self.uri, uri))
+        return ImageUri(copy(self.uri, uri))
 
     def __eq__(self, other):
-        return isinstance(other, ImageRef) and other.uri == self.uri
+        return isinstance(other, ImageUri) and other.uri == self.uri
 
     def __repr__(self):
         return f"Image({self.uri})"
 
 
-class ImageScalar(pa.ExtensionScalar):
+class ImageBinaryScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
 
     def as_py(self) -> Image:
-        return Image(self.value.as_py())
+        return ImageBinary(self.value.as_py())
+
+
+class ImageUriScalar(pa.ExtensionScalar):
+    """Used by ExtensionArray.to_pylist()"""
+
+    def as_py(self) -> Image:
+        return ImageUri(self.value.as_py())
