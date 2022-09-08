@@ -19,9 +19,10 @@ from typing import List, Optional, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
+
+from lance.version import __version__
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable
 from lance.types import register_extension_types
-from lance.version import __version__
 
 if platform.system() == "Linux":
     # TODO enable on MacOS

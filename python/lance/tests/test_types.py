@@ -19,7 +19,7 @@ import pyarrow as pa
 import pytest
 
 import lance
-from lance.types import *
+from lance.types import ImageType, Point2dType, Box2dType, LabelType
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -41,15 +41,18 @@ def test_image_binary(tmp_path):
 
 def test_point(tmp_path):
     point_type = Point2dType()
-    data = [(float(x), float(x)) for x in range(100)]
-    storage = pa.array(data, pa.list_(pa.float64()))
+    x, y = np.random.random(100), np.random.random(100)
+    storage = pa.StructArray.from_arrays([x, y], names=["x", "y"])
     _test_extension_rt(tmp_path, point_type, storage)
 
 
 def test_box2d(tmp_path):
     box_type = Box2dType()
-    data = [(float(x), float(x), float(x), float(x)) for x in range(100)]
-    storage = pa.array(data, pa.list_(pa.float64()))
+    xmin, ymin = np.random.random(100), np.random.random(100)
+    xmax, ymax = np.random.random(100), np.random.random(100)
+    storage = pa.StructArray.from_arrays(
+        [xmin, ymin, xmax, ymax],
+        names=["xmin", "ymin", "xmax", "ymax"])
     _test_extension_rt(tmp_path, box_type, storage)
 
 
@@ -69,4 +72,5 @@ def _test_extension_rt(tmp_path, ext_type, storage_arr):
     lance.write_table(table, str(tmp_path / "test.lance"))
     table = lance.dataset(str(tmp_path / "test.lance")).to_table()
     assert table["ext"].type == ext_type
-    assert table["ext"].to_pylist() == storage_arr.to_pylist()
+    assert table["ext"].to_pylist() == arr.to_pylist()
+    return arr

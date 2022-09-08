@@ -12,9 +12,11 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """IO utilities"""
+import os
+import shutil
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, IO
+from typing import Optional, IO, BinaryIO
 from urllib.parse import urlparse
 
 from pyarrow import fs
@@ -22,6 +24,7 @@ import requests
 from requests.auth import AuthBase
 
 import lance
+from lance.logging import logger
 
 USER_AGENT = f"User-Agent: Lance/{lance.__version__} (contact@eto.ai)"
 
@@ -71,3 +74,41 @@ def open_uri(
     else:
         filesystem, path = fs.FileSystem.from_uri(uri)
         return filesystem.open_input_file(path)
+
+
+def copy(source: [str, Path], dest: [str, Path]) -> str:
+    """Copy a file from source to destination, and return the URI of
+    the copied file.
+
+    Parameters
+    ----------
+    source : str
+        The source URI to copy from
+    dest : str
+        The destination uri or the destination directory. If ``dest`` is
+        a URI ends with a "/", it represents a directory.
+
+    Return
+    ------
+    str
+        Return the URI of destination.
+    """
+    parsed_source = urlparse(source)
+    if dest and dest.endswith("/"):
+        dest = os.path.join(dest, os.path.basename(parsed_source.path))
+    parsed_dest = urlparse(dest)
+    logger.debug("Copying %s to %s", source, dest)
+
+    if parsed_dest.scheme == parsed_source.scheme:
+        # Direct copy with the same file system
+        filesystem, source_path = fs.FileSystem.from_uri(str(source))
+        _, dest_path = fs.FileSystem.from_uri(str(dest))
+        filesystem.copy(source_path, dest_path)
+        return dest
+
+    source_fs, source_path = fs.FileSystem.from_uri(str(source))
+    dest_fs, dest_path = fs.FileSystem.from_uri(str(dest))
+    with (source_fs.open_input_file(source_path) as in_stream,
+          dest_fs.open_output_stream(dest_path) as out_stream):
+        shutil.copyfileobj(in_stream, out_stream)
+    return dest
