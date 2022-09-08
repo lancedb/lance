@@ -53,11 +53,11 @@ class LanceDataset(IterableDataset):
     """
 
     def __init__(
-            self,
-            root: Union[str, Path],
-            columns: Optional[List[str]] = None,
-            filter: Optional[pc.Expression] = None,
-            batch_size: Optional[int] = None,
+        self,
+        root: Union[str, Path],
+        columns: Optional[List[str]] = None,
+        filter: Optional[pc.Expression] = None,
+        batch_size: Optional[int] = None,
     ):
         self.root = root
         self.columns = columns if columns else []
