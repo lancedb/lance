@@ -18,6 +18,7 @@ from typing import List, Optional, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.fs
 import pyarrow.dataset
 
 try:
@@ -64,6 +65,7 @@ class LanceDataset(IterableDataset):
         self.filter = filter
         self.batch_size = batch_size
         self._dataset: pa.dataset.FileSystemDataset = None
+        self._fs: Optional[pyarrow.fs.FileSystem] = None
         self._files: Optional[List[str]] = None
 
     def __repr__(self):
@@ -74,6 +76,7 @@ class LanceDataset(IterableDataset):
         if self._files is not None:
             return self._files
 
+        self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
         self._files = dataset(self.root).files
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
@@ -88,7 +91,9 @@ class LanceDataset(IterableDataset):
         """Yield dataset"""
         self._setup_dataset()
         for file_uri in self._files:
-            ds = dataset(file_uri)
+            ds = pyarrow.dataset.dataset(
+                file_uri, filesystem=self._fs, format=lance.LanceFileFormat()
+            )
             scan = lance.scanner(
                 ds, columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )

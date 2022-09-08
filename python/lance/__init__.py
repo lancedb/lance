@@ -26,7 +26,7 @@ if platform.system() == "Linux":
     # TODO enable on MacOS
     register_extension_types()
 
-__all__ = ["dataset", "write_table", "scanner"]
+__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat"]
 
 
 def dataset(
