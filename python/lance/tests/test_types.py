@@ -19,7 +19,7 @@ import pyarrow as pa
 import pytest
 
 import lance
-from lance.types import ImageType, Point2dType, Box2dType, LabelType
+from lance.types import Box2dType, ImageType, LabelType, Point2dType
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -51,8 +51,8 @@ def test_box2d(tmp_path):
     xmin, ymin = np.random.random(100), np.random.random(100)
     xmax, ymax = np.random.random(100), np.random.random(100)
     storage = pa.StructArray.from_arrays(
-        [xmin, ymin, xmax, ymax],
-        names=["xmin", "ymin", "xmax", "ymax"])
+        [xmin, ymin, xmax, ymax], names=["xmin", "ymin", "xmax", "ymax"]
+    )
     _test_extension_rt(tmp_path, box_type, storage)
 
 

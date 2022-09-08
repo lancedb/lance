@@ -20,7 +20,10 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
-from lance.version import __version__
+import lance.version
+
+__version__ = lance.version.__version__
+
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable
 from lance.types import register_extension_types
 

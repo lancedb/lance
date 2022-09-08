@@ -11,18 +11,19 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from abc import abstractmethod, ABC
 import io
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import IO
+from typing import IO, Union
 
 import numpy as np
-from PIL import Image as PILImage
 import pyarrow as pa
+from PIL import Image as PILImage
 from pyarrow import fs
 
-from lance.io import open_uri, copy
-from lance.types.base import LanceType
+from lance.io import copy, open_uri
+
+from .base import LanceType
 
 
 class ImageType(LanceType):
@@ -88,14 +89,15 @@ class Image(ABC):
     representations
     """
 
-    def __new__(cls, data: [bytes | str]):
+    def __new__(cls, data: Union[bytes, str]):
         if isinstance(data, bytes):
             img = object.__new__(EmbeddedImage)
         elif isinstance(data, str):
             img = object.__new__(ImageRef)
         else:
-            raise TypeError(f"{cls.__name__} can only handle bytes or str "
-                            f"but got {type(data)}")
+            raise TypeError(
+                f"{cls.__name__} can only handle bytes or str " f"but got {type(data)}"
+            )
         img.__init__(data)
         return img
 
@@ -131,7 +133,7 @@ class Image(ABC):
         pass
 
     @abstractmethod
-    def save(self, uri: [str | Path]) -> "Image":
+    def save(self, uri: Union[str, Path]) -> "Image":
         """Write this image to the given uri and return the new Image"""
         pass
 

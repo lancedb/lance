@@ -16,11 +16,11 @@ import os
 import shutil
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, IO, BinaryIO
+from typing import IO, BinaryIO, Optional, Union, Tuple
 from urllib.parse import urlparse
 
-from pyarrow import fs
 import requests
+from pyarrow import fs
 from requests.auth import AuthBase
 
 import lance
@@ -30,9 +30,9 @@ USER_AGENT = f"User-Agent: Lance/{lance.__version__} (contact@eto.ai)"
 
 
 def open_uri(
-        uri: str | Path,
+        uri: Union[str, Path],
         mode: str = "rb",
-        http_auth: Optional[AuthBase | tuple[str, str]] = None,
+        http_auth: Optional[Union[AuthBase, Tuple[str, str]]] = None,
         http_headers: Optional[dict] = None,
 ) -> IO:
     """Open URI for reading. Supports the following URI formats:
@@ -76,7 +76,7 @@ def open_uri(
         return filesystem.open_input_file(path)
 
 
-def copy(source: [str, Path], dest: [str, Path]) -> str:
+def copy(source: Union[str, Path], dest: Union[str, Path]) -> str:
     """Copy a file from source to destination, and return the URI of
     the copied file.
 
@@ -108,7 +108,7 @@ def copy(source: [str, Path], dest: [str, Path]) -> str:
 
     source_fs, source_path = fs.FileSystem.from_uri(str(source))
     dest_fs, dest_path = fs.FileSystem.from_uri(str(dest))
-    with (source_fs.open_input_file(source_path) as in_stream,
-          dest_fs.open_output_stream(dest_path) as out_stream):
-        shutil.copyfileobj(in_stream, out_stream)
+    with source_fs.open_input_file(source_path) as in_stream:
+        with dest_fs.open_output_stream(dest_path) as out_stream:
+            shutil.copyfileobj(in_stream, out_stream)
     return dest

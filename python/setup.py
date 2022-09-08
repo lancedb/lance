@@ -51,7 +51,7 @@ extensions = [
 ]
 
 about = {}
-with open(Path("rikai") / "version.py", "r") as fh:
+with open(Path("lance") / "version.py", "r") as fh:
     exec(fh.read(), about)
 
 this_directory = Path(__file__).parent

@@ -34,9 +34,9 @@ def test_open_https_uri():
 def test_local(tmp_path: Path):
     with open_uri(WIKIPEDIA) as fobj:
         img_bytes = fobj.read()
-        with open_uri(tmp_path / 'wikipedia.jpg', mode='wb') as fobj:
+        with open_uri(tmp_path / "wikipedia.jpg", mode="wb") as fobj:
             fobj.write(img_bytes)
-        with open_uri(tmp_path / 'wikipedia.jpg') as fobj:
+        with open_uri(tmp_path / "wikipedia.jpg") as fobj:
             assert img_bytes == fobj.read()
 
 

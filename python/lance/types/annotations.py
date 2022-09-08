@@ -13,7 +13,7 @@
 #  limitations under the License.
 import pyarrow as pa
 
-from lance.types import LanceType
+from .base import LanceType
 
 
 class Point2dType(LanceType):
@@ -23,9 +23,9 @@ class Point2dType(LanceType):
 
     def __init__(self):
         super(Point2dType, self).__init__(
-            pa.struct([pa.field("x", pa.float64()),
-                       pa.field("y", pa.float64())]),
-            "point2d")
+            pa.struct([pa.field("x", pa.float64()), pa.field("y", pa.float64())]),
+            "point2d",
+        )
 
     def __arrow_ext_serialize__(self):
         return b""
@@ -43,11 +43,16 @@ class Box2dType(LanceType):
 
     def __init__(self):
         super(Box2dType, self).__init__(
-            pa.struct([pa.field("xmin", pa.float64()),
-                       pa.field("ymin", pa.float64()),
-                       pa.field("xmax", pa.float64()),
-                       pa.field("ymax", pa.float64())]),
-            "box2d")
+            pa.struct(
+                [
+                    pa.field("xmin", pa.float64()),
+                    pa.field("ymin", pa.float64()),
+                    pa.field("xmax", pa.float64()),
+                    pa.field("ymax", pa.float64()),
+                ]
+            ),
+            "box2d",
+        )
 
     def __arrow_ext_serialize__(self):
         return b""
@@ -65,8 +70,7 @@ class LabelType(LanceType):
     """
 
     def __init__(self):
-        super(LabelType, self).__init__(
-            pa.dictionary(pa.int8(), pa.string()), "label")
+        super(LabelType, self).__init__(pa.dictionary(pa.int8(), pa.string()), "label")
 
     def __arrow_ext_serialize__(self):
         return b""
