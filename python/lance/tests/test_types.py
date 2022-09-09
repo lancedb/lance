@@ -21,6 +21,7 @@ import pytest
 import lance
 from lance.types import Box2dType, ImageType, LabelType, Point2dType
 from lance.types.box import Box2dArray
+from lance.types.label import LabelArray
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -55,6 +56,8 @@ def test_box2d(tmp_path):
         [xmin, ymin, xmax, ymax], names=["xmin", "ymin", "xmax", "ymax"]
     )
     ext_arr = _test_extension_rt(tmp_path, box_type, storage)
+    assert len(ext_arr.chunks) == 1
+    ext_arr = ext_arr.chunks[0]
     assert isinstance(ext_arr, Box2dArray)
     assert np.all(ext_arr.xmin == xmin)
     assert np.all(ext_arr.xmax == xmax)
@@ -98,7 +101,12 @@ def test_label(tmp_path):
     storage = pa.DictionaryArray.from_arrays(
         pa.array(indices, type=pa.int8()), pa.array(values, type=pa.string())
     )
-    _test_extension_rt(tmp_path, label_type, storage)
+    ext_arr = _test_extension_rt(tmp_path, label_type, storage)
+    assert len(ext_arr.chunks) == 1
+    ext_arr = ext_arr.chunks[0]
+    assert isinstance(ext_arr, LabelArray)
+    expected_arr = LabelArray.from_values(storage.to_numpy(False), values)
+    assert ext_arr == expected_arr
 
 
 def _test_extension_rt(tmp_path, ext_type, storage_arr):
@@ -108,4 +116,4 @@ def _test_extension_rt(tmp_path, ext_type, storage_arr):
     table = lance.dataset(str(tmp_path / "test.lance")).to_table()
     assert table["ext"].type == ext_type
     assert table["ext"].to_pylist() == arr.to_pylist()
-    return arr
+    return table["ext"]

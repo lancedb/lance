@@ -11,6 +11,9 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+from typing import Sequence
+
+import pandas as pd
 import pyarrow as pa
 
 from lance.types.base import LanceType
@@ -26,9 +29,53 @@ class LabelType(LanceType):
     def __init__(self):
         super(LabelType, self).__init__(pa.dictionary(pa.int8(), pa.string()), "label")
 
+    def __arrow_ext_class__(self):
+        return LabelArray
+
     def __arrow_ext_serialize__(self):
         return b""
 
     @classmethod
     def __arrow_ext_deserialize__(cls, type_self, storage_type, serialized):
         return LabelType()
+
+
+class LabelArray(pa.ExtensionArray):
+
+    @property
+    def names(self):
+        """Return all possible class names as a numpy array"""
+        return self.storage.dictionary.to_numpy()
+
+    @property
+    def ids(self):
+        return self.storage.indices.to_numpy()
+
+    @staticmethod
+    def from_values(values: Sequence[str],
+                    dictionary: Sequence[str]) -> "LabelArray":
+        """
+        Create a LabelArray using the given values
+
+        Examples
+        --------
+        In [3]: LabelArray.from_values(["dog", "cat"], dictionary=["horse", "cat", "dog"])
+        Out[3]:
+        <pyarrow.lib.ExtensionArray object at 0x7fc018cd9780>
+
+        -- dictionary:
+          [
+            "horse",
+            "cat",
+            "dog"
+          ]
+        -- indices:
+          [
+            2,
+            1
+          ]
+        """
+        cat = pd.Categorical(values, categories=dictionary)
+        storage = pa.DictionaryArray.from_arrays(cat.codes, dictionary,
+                                                 from_pandas=True)
+        return LabelArray.from_storage(LabelType(), storage)
