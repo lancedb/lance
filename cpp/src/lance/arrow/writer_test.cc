@@ -15,6 +15,7 @@
 #include "lance/arrow/writer.h"
 
 #include <arrow/builder.h>
+#include <arrow/io/api.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <fmt/format.h>
@@ -25,7 +26,6 @@
 #include <string>
 #include <vector>
 
-#include "lance/arrow/reader.h"
 #include "lance/arrow/testing.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
@@ -40,8 +40,8 @@ using arrow::ListBuilder;
 using arrow::StringBuilder;
 using arrow::StructBuilder;
 using arrow::Table;
-using lance::arrow::FileReader;
 using lance::format::Schema;
+using lance::io::FileReader;
 
 using std::make_shared;
 using std::map;
@@ -129,8 +129,8 @@ auto CocoDataset() {
 
 std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutputStream> sink) {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  INFO(::lance::arrow::FileReader::Make(infile).status());
-  auto reader = ::lance::arrow::FileReader::Make(infile).ValueOrDie();
+  INFO(::lance::io::FileReader::Make(infile).status());
+  auto reader = FileReader::Make(infile).ValueOrDie();
   return reader->ReadTable().ValueOrDie();
 }
 

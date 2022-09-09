@@ -16,6 +16,7 @@
 
 #include <arrow/dataset/file_base.h>
 
+#include <mutex>
 #include <string>
 
 namespace lance::arrow {
@@ -23,9 +24,9 @@ namespace lance::arrow {
 /// Lance File Format
 class LanceFileFormat : public ::arrow::dataset::FileFormat {
  public:
-  LanceFileFormat() = default;
+  LanceFileFormat();
 
-  ~LanceFileFormat() override = default;
+  ~LanceFileFormat();
 
   static std::shared_ptr<LanceFileFormat> Make();
 
@@ -49,6 +50,12 @@ class LanceFileFormat : public ::arrow::dataset::FileFormat {
       ::arrow::fs::FileLocator destination_locator) const override;
 
   std::shared_ptr<::arrow::dataset::FileWriteOptions> DefaultWriteOptions() override;
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+
+  std::mutex lock_;
 };
 
 class FileWriteOptions : public ::arrow::dataset::FileWriteOptions {

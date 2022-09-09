@@ -58,6 +58,14 @@ namespace lance::io {
   return ReadInt<int64_t>(buf->data() + buf->size() - 16);
 }
 
+::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
+    std::shared_ptr<::arrow::io::RandomAccessFile> in,
+    ::arrow::MemoryPool* pool) {
+    auto reader = std::make_unique<FileReader>(in, pool);
+    ARROW_RETURN_NOT_OK(reader->Open());
+    return reader;
+}
+
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
                        ::arrow::MemoryPool* pool) noexcept
     : file_(in), pool_(pool) {}
@@ -96,9 +104,17 @@ Status FileReader::Open() {
 
 const lance::format::Schema& FileReader::schema() const { return manifest_->schema(); }
 
-const lance::format::Manifest& FileReader::manifest() const { return *manifest_; }
+const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { return manifest_; }
 
 const lance::format::Metadata& FileReader::metadata() const { return *metadata_; }
+
+int64_t FileReader::length() const {
+  return metadata_->length();
+}
+
+int32_t FileReader::num_batches() const {
+  return metadata_->num_batches();
+}
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetScalar(
     const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const {

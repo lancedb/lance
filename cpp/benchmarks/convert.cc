@@ -12,17 +12,13 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include <arrow/dataset/discovery.h>
-#include <arrow/dataset/file_parquet.h>
 #include <arrow/filesystem/filesystem.h>
 #include <parquet/arrow/reader.h>
 
 #include <argparse/argparse.hpp>
-#include <filesystem>
 #include <iostream>
 #include <map>
 
-#include "lance/arrow/reader.h"
 #include "lance/arrow/writer.h"
 #include "bench_utils.h"
 

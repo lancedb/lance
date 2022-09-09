@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/arrow/reader.h"
+#include "lance/io/reader.h"
 
 #include <arrow/builder.h>
 #include <arrow/io/api.h>
@@ -23,9 +23,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/arrow/stl.h"
-#include "lance/arrow/type.h"
 #include "lance/arrow/writer.h"
-#include "lance/io/reader.h"
 
 TEST_CASE("Test List Array With Nulls") {
   auto int_builder = std::make_shared<::arrow::Int32Builder>();
@@ -45,7 +43,7 @@ TEST_CASE("Test List Array With Nulls") {
   CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  auto reader_result = lance::arrow::FileReader::Make(infile);
+  auto reader_result = lance::io::FileReader::Make(infile);
   INFO("Open file: " << reader_result.status());
   auto reader = std::move(reader_result.ValueOrDie());
   auto table_result = reader->ReadTable();

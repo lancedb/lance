@@ -21,17 +21,27 @@
 #include <memory>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/arrow/reader.h"
 #include "lance/format/schema.h"
+#include "lance/format/manifest.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
 #include "lance/io/writer.h"
+#include "lance/io/reader.h"
 
 const char kLanceFormatTypeName[] = "lance";
 
 namespace lance::arrow {
+
+class LanceFileFormat::Impl {
+ public:
+  std::shared_ptr<lance::format::Manifest> manifest;
+};
+
+LanceFileFormat::LanceFileFormat() : impl_(std::make_unique<Impl>()) {}
+
+LanceFileFormat::~LanceFileFormat() {}
 
 std::shared_ptr<LanceFileFormat> LanceFileFormat::Make() {
   return std::make_shared<LanceFileFormat>();
@@ -50,14 +60,22 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFileFormat::Inspect(
     const ::arrow::dataset::FileSource& source) const {
+  fmt::print("Inspect: File source={}\n", source.path());
+  if (impl_->manifest) {
+    impl_->manifest->schema();
+  }
+
   ARROW_ASSIGN_OR_RAISE(auto infile, source.Open());
-  ARROW_ASSIGN_OR_RAISE(auto reader, lance::arrow::FileReader::Make(infile));
-  return reader->GetSchema();
+  auto reader = std::make_shared<lance::io::FileReader>(infile);
+  ARROW_RETURN_NOT_OK(reader->Open());
+  impl_->manifest = reader->manifest();
+  return impl_->manifest->schema().ToArrow();
 }
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
+  fmt::print("Scan Batch: File source={}\n", file->source().path());
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
 
   auto reader = std::make_shared<lance::io::FileReader>(infile);

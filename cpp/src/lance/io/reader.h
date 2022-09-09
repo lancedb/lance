@@ -35,8 +35,12 @@ namespace lance::io {
 /// FileReader implementation.
 class FileReader {
  public:
+  static ::arrow::Result<std::unique_ptr<FileReader>> Make(
+      std::shared_ptr<::arrow::io::RandomAccessFile> in,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
   explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
-                      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
+             ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
   /// Opens the FileReader.
   ::arrow::Status Open();
@@ -72,7 +76,13 @@ class FileReader {
   const lance::format::Metadata& metadata() const;
 
   /// Get file manifest.
-  const lance::format::Manifest& manifest() const;
+  const std::shared_ptr<lance::format::Manifest>& manifest() const;
+
+  /// Returns the number of rows in the file.
+  int64_t length() const;
+
+  /// Returns the number of batches.
+  int32_t num_batches() const;
 
   /// Read one single row at the index.
   ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> Get(int32_t idx);
