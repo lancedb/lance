@@ -71,7 +71,6 @@ LoadDictionaryVisitor::LoadDictionaryVisitor(std::shared_ptr<::arrow::io::Random
 
 ::arrow::Status LoadDictionaryVisitor::Visit(std::shared_ptr<Field> root) {
   if (::arrow::is_dictionary(root->type()->id())) {
-    fmt::print("Loading dictionary for field: {}\n", root->name());
     ARROW_RETURN_NOT_OK(root->LoadDictionary(in_));
   }
   for (auto& child : root->fields()) {
