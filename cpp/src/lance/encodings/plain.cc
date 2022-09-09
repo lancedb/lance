@@ -216,6 +216,7 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
   }
 };
 
+/// Decoder for Fixed Size List.
 class FixedSizeListPlainDecoderImpl : public Decoder {
  public:
   FixedSizeListPlainDecoderImpl(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
@@ -234,14 +235,10 @@ class FixedSizeListPlainDecoderImpl : public Decoder {
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start = 0, std::optional<int32_t> length = std::nullopt) const override {
-    if (!length.has_value()) {
-      length = length_ - start;
-    }
-
+    auto len = std::min(length.value_or(length_), length_ - start);
     auto list_size = list_type_->list_size();
-    ARROW_ASSIGN_OR_RAISE(auto values,
-                          plain_decoder_.ToArray(start * list_size, length.value() * list_size));
-    return std::make_shared<::arrow::FixedSizeListArray>(type_, length.value(), values);
+    ARROW_ASSIGN_OR_RAISE(auto values, plain_decoder_.ToArray(start * list_size, len * list_size));
+    return std::make_shared<::arrow::FixedSizeListArray>(type_, len, values);
   }
 
  private:
