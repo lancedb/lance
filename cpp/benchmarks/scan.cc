@@ -33,9 +33,16 @@ void Scan(const std::string& uri, const std::vector<std::string>& columns) {
 
 int main(int argc, char* argv[]) {
   argparse::ArgumentParser parser("scan");
-  parser.add_description("Profile scanning performance");
+  parser.add_description("Profile scanning performance\n"
+      "Run it with:\n"
+      "\tCPUPROFILE_FREQUENCY=2000 LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libprofiler.so.0 "
+      "CPUPROFILE=scan.prof ./benchmarks/scan s3://bucket/path\n"
+      "Render results:\n"
+      "\tpprof -http=\"0.0.0.0:8888\" benchmarks/scan scan.prof");
 
   parser.add_argument("uri").help("Dataset URI");
+  parser.add_argument("-c", "--columns").help("The column names to scan")
+      .nargs(argparse::nargs_pattern::at_least_one);
 
   try {
     parser.parse_args(argc, argv);
@@ -45,5 +52,5 @@ int main(int argc, char* argv[]) {
     std::exit(1);
   }
 
-  Scan(parser.get("uri"), {"class"});
+  Scan(parser.get("uri"), parser.get<std::vector<std::string>>("--columns"));
 }
