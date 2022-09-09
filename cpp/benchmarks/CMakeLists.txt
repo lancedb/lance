@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-FetchContent_Declare(argparse URL https://github.com/p-ranav/argparse/archive/refs/tags/v2.5.tar.gz)
+FetchContent_Declare(argparse URL https://github.com/p-ranav/argparse/archive/refs/tags/v2.6.tar.gz)
 FetchContent_MakeAvailable(argparse)
 
 find_package(Parquet REQUIRED)
