@@ -13,6 +13,7 @@
 #  limitations under the License.
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from lance.types.base import LanceType
 
@@ -73,25 +74,32 @@ class Box2dArray(pa.ExtensionArray):
         """Compute the area of boxes"""
         return (self.xmax - self.xmin + 1) * (self.ymax - self.ymin + 1)
 
-    def _array2d(self):
-        return self.storage.values.to_numpy().reshape((len(self), 2))
+    def flatten(self):
+        values = self.storage.values
+        if len(self) == len(values) / 4:
+            return values
+        else:
+            return pc.list_flatten(self.storage)
+
+    def to_numpy(self):
+        return self.flatten().to_numpy().reshape((len(self), 4))
 
     @property
     def xmin(self) -> np.ndarray:
         """Return a numpy array of the min X-coord of each box"""
-        return self._array2d()[:, 0]
+        return self.to_numpy()[:, 0]
 
     @property
     def ymin(self) -> np.ndarray:
         """Return a numpy array of the min Y-coord of each box"""
-        return self._array2d()[:, 1]
+        return self.to_numpy()[:, 1]
 
     @property
     def xmax(self) -> np.ndarray:
         """Return a numpy array of the max X-coord of each box"""
-        return self._array2d()[:, 2]
+        return self.to_numpy()[:, 2]
 
     @property
     def ymax(self) -> np.ndarray:
         """Return a numpy array of the max Y-coord of each box"""
-        return self._array2d()[:, 3]
+        return self.to_numpy()[:, 3]

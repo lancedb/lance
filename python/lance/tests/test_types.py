@@ -57,7 +57,7 @@ def test_box2d(tmp_path):
     ext_arr = ext_arr.chunks[0]
     assert isinstance(ext_arr, Box2dArray)
     reshaped = data.reshape((100, 4))
-    xmin, xmax, ymin, ymax = (
+    xmin, ymin, xmax, ymax = (
         reshaped[:, 0], reshaped[:, 1], reshaped[:, 2], reshaped[:, 3]
     )
     assert np.all(ext_arr.xmin == xmin)
