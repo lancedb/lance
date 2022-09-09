@@ -75,14 +75,20 @@ class Box2dArray(pa.ExtensionArray):
         return (self.xmax - self.xmin + 1) * (self.ymax - self.ymin + 1)
 
     def flatten(self):
+        # If this is a slice, the default Arrow behavior does not
+        # return the sliced values properly
         values = self.storage.values
+        # If this is a full-length array then just default Arrow
         if len(self) == len(values) / 4:
             return values
         else:
+            # If this is a slice then we need to compute manually
             return pc.list_flatten(self.storage)
 
-    def to_numpy(self):
-        return self.flatten().to_numpy().reshape((len(self), 4))
+    def to_numpy(self, zero_copy_only=True):
+        return (self.flatten()
+                .to_numpy(zero_copy_only=zero_copy_only)
+                .reshape((len(self), 4)))
 
     @property
     def xmin(self) -> np.ndarray:
