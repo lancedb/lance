@@ -25,14 +25,7 @@ class Box2dType(LanceType):
 
     def __init__(self):
         super(Box2dType, self).__init__(
-            pa.struct(
-                [
-                    pa.field("xmin", pa.float64()),
-                    pa.field("ymin", pa.float64()),
-                    pa.field("xmax", pa.float64()),
-                    pa.field("ymax", pa.float64()),
-                ]
-            ),
+            pa.list_(pa.float64(), list_size=4),
             "box2d",
         )
 
@@ -80,22 +73,25 @@ class Box2dArray(pa.ExtensionArray):
         """Compute the area of boxes"""
         return (self.xmax - self.xmin + 1) * (self.ymax - self.ymin + 1)
 
+    def _array2d(self):
+        return self.storage.values.to_numpy().reshape((len(self), 2))
+
     @property
     def xmin(self) -> np.ndarray:
         """Return a numpy array of the min X-coord of each box"""
-        return self.storage.field("xmin").to_numpy()
-
-    @property
-    def xmax(self) -> np.ndarray:
-        """Return a numpy array of the max X-coord of each box"""
-        return self.storage.field("xmax").to_numpy()
+        return self._array2d()[:, 0]
 
     @property
     def ymin(self) -> np.ndarray:
         """Return a numpy array of the min Y-coord of each box"""
-        return self.storage.field("ymin").to_numpy()
+        return self._array2d()[:, 1]
+
+    @property
+    def xmax(self) -> np.ndarray:
+        """Return a numpy array of the max X-coord of each box"""
+        return self._array2d()[:, 2]
 
     @property
     def ymax(self) -> np.ndarray:
         """Return a numpy array of the max Y-coord of each box"""
-        return self.storage.field("ymax").to_numpy()
+        return self._array2d()[:, 3]

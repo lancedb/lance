@@ -29,7 +29,7 @@ class Point2dType(LanceType):
 
     def __init__(self):
         super(Point2dType, self).__init__(
-            pa.struct([pa.field("x", pa.float64()), pa.field("y", pa.float64())]),
+            pa.list_(pa.float64(), list_size=2),
             "point2d",
         )
 
