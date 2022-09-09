@@ -12,7 +12,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import numpy as np
-
 import pyarrow as pa
 
 from lance.types.base import LanceType
@@ -49,7 +48,6 @@ class Box2dType(LanceType):
 
 
 class Box2dArray(pa.ExtensionArray):
-
     def iou(self, others: "Box2dArray") -> np.ndarray:
         """
         Compute the intersection-over-union between these bounding boxes
@@ -72,8 +70,9 @@ class Box2dArray(pa.ExtensionArray):
         ymin_inter = np.maximum(self.ymin[:, np.newaxis], others.ymin)
         xmax_inter = np.minimum(self.xmax[:, np.newaxis], others.xmax)
         ymax_inter = np.minimum(self.ymax[:, np.newaxis], others.ymax)
-        intersection = (np.maximum(xmax_inter - xmin_inter + 1, 0) *
-                        np.maximum(ymax_inter - ymin_inter + 1, 0))
+        intersection = np.maximum(xmax_inter - xmin_inter + 1, 0) * np.maximum(
+            ymax_inter - ymin_inter + 1, 0
+        )
         union = area_self[:, np.newaxis] + area_others - intersection
         return intersection / union
 

@@ -16,7 +16,7 @@ import os
 import shutil
 from io import BytesIO
 from pathlib import Path
-from typing import IO, BinaryIO, Optional, Union, Tuple
+from typing import IO, BinaryIO, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
@@ -30,10 +30,10 @@ USER_AGENT = f"User-Agent: Lance/{lance.__version__} (contact@eto.ai)"
 
 
 def open_uri(
-        uri: Union[str, Path],
-        mode: str = "rb",
-        http_auth: Optional[Union[AuthBase, Tuple[str, str]]] = None,
-        http_headers: Optional[dict] = None,
+    uri: Union[str, Path],
+    mode: str = "rb",
+    http_auth: Optional[Union[AuthBase, Tuple[str, str]]] = None,
+    http_headers: Optional[dict] = None,
 ) -> IO:
     """Open URI for reading. Supports the following URI formats:
 

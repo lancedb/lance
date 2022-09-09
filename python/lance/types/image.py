@@ -22,7 +22,6 @@ from PIL import Image as PILImage
 from pyarrow import fs
 
 from lance.io import copy, open_uri
-
 from lance.types.base import LanceType
 
 

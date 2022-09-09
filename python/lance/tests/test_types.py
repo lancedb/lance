@@ -83,10 +83,12 @@ def _naive_iou(box_a, box_b):
             inter = max(0, xmax - xmin + 1) * max(0, ymax - ymin + 1)
             # compute the area of both the prediction and ground-truth
             # rectangles
-            area_i = ((box_a.xmax[i] - box_a.xmin[i] + 1) *
-                      (box_a.ymax[i] - box_a.ymin[i] + 1))
-            area_j = ((box_b.xmax[j] - box_b.xmin[j] + 1) *
-                      (box_b.ymax[j] - box_b.ymin[j] + 1))
+            area_i = (box_a.xmax[i] - box_a.xmin[i] + 1) * (
+                box_a.ymax[i] - box_a.ymin[i] + 1
+            )
+            area_j = (box_b.xmax[j] - box_b.xmin[j] + 1) * (
+                box_b.ymax[j] - box_b.ymin[j] + 1
+            )
             # compute the intersection over union by taking the intersection
             # area and dividing it by the sum of prediction + ground-truth
             # areas - the interesection area

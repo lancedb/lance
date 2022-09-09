@@ -41,7 +41,6 @@ class LabelType(LanceType):
 
 
 class LabelArray(pa.ExtensionArray):
-
     @property
     def names(self):
         """Return all possible class names as a numpy array"""
@@ -52,8 +51,7 @@ class LabelArray(pa.ExtensionArray):
         return self.storage.indices.to_numpy()
 
     @staticmethod
-    def from_values(values: Sequence[str],
-                    dictionary: Sequence[str]) -> "LabelArray":
+    def from_values(values: Sequence[str], dictionary: Sequence[str]) -> "LabelArray":
         """
         Create a LabelArray using the given values
 
@@ -76,6 +74,7 @@ class LabelArray(pa.ExtensionArray):
           ]
         """
         cat = pd.Categorical(values, categories=dictionary)
-        storage = pa.DictionaryArray.from_arrays(cat.codes, dictionary,
-                                                 from_pandas=True)
+        storage = pa.DictionaryArray.from_arrays(
+            cat.codes, dictionary, from_pandas=True
+        )
         return LabelArray.from_storage(LabelType(), storage)
