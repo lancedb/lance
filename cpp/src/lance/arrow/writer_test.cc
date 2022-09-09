@@ -30,6 +30,7 @@
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
+#include "lance/testing/io.h"
 
 using arrow::ArrayBuilder;
 using arrow::BooleanBuilder;
@@ -278,6 +279,42 @@ TEST_CASE("Write with batch size") {
     CHECK(batch->num_rows() == 5);
   }
   CHECK(batch_count == 20);
+}
+
+TEST_CASE("Write fixed size binary") {
+  auto dtype = ::arrow::fixed_size_binary(10);
+  auto builder = ::arrow::FixedSizeBinaryBuilder(dtype);
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append("1234567890").ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+  auto schema = ::arrow::schema({::arrow::field("bins", dtype)});
+  auto t = ::arrow::Table::Make(schema, {arr});
+
+  auto reader = lance::testing::MakeReader(t).ValueOrDie();
+  auto actual = reader->ReadTable().ValueOrDie();
+  CHECK(t->Equals(*actual));
+}
+
+TEST_CASE("Write fixed size list") {
+  auto list_size = 4;
+  auto dtype = ::arrow::fixed_size_list(::arrow::int32(), list_size);
+  auto int_builder = std::make_shared<::arrow::Int32Builder>();
+  auto builder = ::arrow::FixedSizeListBuilder(::arrow::default_memory_pool(), int_builder, dtype);
+
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append().ok());
+    for (int j = 0; j < list_size; j++) {
+      CHECK(int_builder->Append(i * list_size + j).ok());
+    }
+  }
+  auto arr = builder.Finish().ValueOrDie();
+  auto schema = ::arrow::schema({::arrow::field("list", dtype)});
+  auto t = ::arrow::Table::Make(schema, {arr});
+
+  auto reader = lance::testing::MakeReader(t).ValueOrDie();
+  auto actual = reader->ReadTable().ValueOrDie();
+  CHECK(t->Equals(*actual));
 }
 
 std::shared_ptr<::arrow::Table> MakeTable() {
