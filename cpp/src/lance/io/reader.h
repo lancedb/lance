@@ -37,10 +37,10 @@ class FileReader {
  public:
   static ::arrow::Result<std::unique_ptr<FileReader>> Make(
       std::shared_ptr<::arrow::io::RandomAccessFile> in,
-      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+      : arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
-             ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
+                      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
   /// Opens the FileReader.
   ::arrow::Status Open();
