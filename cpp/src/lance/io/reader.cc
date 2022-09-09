@@ -60,15 +60,17 @@ namespace lance::io {
 
 ::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
     std::shared_ptr<::arrow::io::RandomAccessFile> in,
+    std::shared_ptr<::lance::format::Manifest> manifest,
     ::arrow::MemoryPool* pool) {
-    auto reader = std::make_unique<FileReader>(in, pool);
+    auto reader = std::make_unique<FileReader>(in, manifest, pool);
     ARROW_RETURN_NOT_OK(reader->Open());
     return reader;
 }
 
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                       std::shared_ptr<::lance::format::Manifest> manifest,
                        ::arrow::MemoryPool* pool) noexcept
-    : file_(in), pool_(pool) {}
+    : file_(std::move(in)), pool_(pool), manifest_(std::move(manifest)) {}
 
 Status FileReader::Open() {
   ARROW_ASSIGN_OR_RAISE(auto size, file_->GetSize());
@@ -90,7 +92,13 @@ Status FileReader::Open() {
   ARROW_ASSIGN_OR_RAISE(
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
-  ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+  if (!manifest_) {
+    ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+    // We need read the dictionary from the same file.
+    auto visitor = format::LoadDictionaryVisitor(file_);
+    ARROW_RETURN_NOT_OK(visitor.VisitSchema(manifest_->schema()));
+  }
+
   // TODO: Let's assume that page position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 

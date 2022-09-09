@@ -60,4 +60,15 @@ class WriteDictionaryVisitor : public FieldVisitor {
   std::shared_ptr<::arrow::io::OutputStream> out_;
 };
 
+/// A Visitor to Load dictionary.
+class LoadDictionaryVisitor : public FieldVisitor {
+ public:
+  LoadDictionaryVisitor(std::shared_ptr<::arrow::io::RandomAccessFile>  in);
+
+  ::arrow::Status Visit(std::shared_ptr<Field> root) override;
+
+ private:
+  std::shared_ptr<::arrow::io::RandomAccessFile> in_;
+};
+
 }  // namespace lance::format

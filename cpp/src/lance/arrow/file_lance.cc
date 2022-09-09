@@ -62,12 +62,13 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     const ::arrow::dataset::FileSource& source) const {
   fmt::print("Inspect: File source={}\n", source.path());
   if (impl_->manifest) {
-    impl_->manifest->schema();
+    return impl_->manifest->schema().ToArrow();
   }
 
   ARROW_ASSIGN_OR_RAISE(auto infile, source.Open());
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
+  /// TODO: load dictionary here.
   impl_->manifest = reader->manifest();
   return impl_->manifest->schema().ToArrow();
 }
@@ -75,14 +76,11 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
-  fmt::print("Scan Batch: File source={}\n", file->source().path());
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
-
-  auto reader = std::make_shared<lance::io::FileReader>(infile);
-  ARROW_RETURN_NOT_OK(reader->Open());
+  ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
 
   auto batch_reader =
-      lance::io::RecordBatchReader(reader, options, ::arrow::internal::GetCpuThreadPool());
+      lance::io::RecordBatchReader(std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
   ARROW_RETURN_NOT_OK(batch_reader.Open());
   auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
   return generator;

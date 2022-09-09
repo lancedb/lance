@@ -232,6 +232,7 @@ class Field final {
   friend class FieldVisitor;
   friend class ToArrowVisitor;
   friend class WriteDictionaryVisitor;
+  friend class LoadDictionaryVisitor;
   friend class Schema;
   friend ::arrow::Status CopyField(std::shared_ptr<Field> new_field,
                                    std::shared_ptr<Field> field,

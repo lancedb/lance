@@ -35,11 +35,14 @@ namespace lance::io {
 /// FileReader implementation.
 class FileReader {
  public:
+  /// Factory method to create a FileReader.
   static ::arrow::Result<std::unique_ptr<FileReader>> Make(
       std::shared_ptr<::arrow::io::RandomAccessFile> in,
-      : arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+      std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                      std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
                       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
 
   /// Opens the FileReader.

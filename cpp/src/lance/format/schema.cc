@@ -187,10 +187,10 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   assert(::arrow::is_dictionary(type()->id()));
   auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
-  ///
   assert(dict_type->value_type()->Equals(::arrow::utf8()));
 
-  auto decoder = lance::encodings::VarBinaryDecoder<::arrow::StringType>(infile, ::arrow::utf8());
+  auto decoder =
+      lance::encodings::VarBinaryDecoder<::arrow::StringType>(std::move(infile), ::arrow::utf8());
   decoder.Reset(dictionary_offset_, dictionary_page_length_);
 
   ARROW_ASSIGN_OR_RAISE(auto dict_arr, decoder.ToArray());
@@ -251,6 +251,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     if (!dictionary()) {
       {
         std::scoped_lock lock(lock_);
+        fmt::print("Loading dictionary for field {} this={}\n", name_, fmt::ptr(this));
         if (!dictionary()) {
           /// Fetch dictionary on demand?
           ARROW_RETURN_NOT_OK(LoadDictionary(infile));
@@ -345,6 +346,7 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
   new_field->logical_type_ = logical_type_;
   new_field->extension_name_ = extension_name_;
   new_field->encoding_ = encoding_;
+  new_field->dictionary_ = dictionary_;
   new_field->dictionary_offset_ = dictionary_offset_;
   new_field->dictionary_page_length_ = dictionary_page_length_;
 
