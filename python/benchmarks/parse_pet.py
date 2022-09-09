@@ -218,10 +218,12 @@ def _get_xml(uri):
     help="Output format (parquet or lance)",
 )
 @click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
+@click.option("-g", "--group-size", type=int, default=1024, help="set max_rows_per_group in arrow")
+@click.option("--max-rows-per-file", type=int, default=0, help="set max_rows_per_file in arrow")
 @click.option(
     "-o", "--output", type=str, default="oxford_pet.lance", help="Output path"
 )
-def main(base_uri, fmt, embedded, output):
+def main(base_uri, fmt, embedded, output, group_size, max_rows_per_file):
     known_formats = ["lance", "parquet"]
     if fmt is not None:
         assert fmt in known_formats
@@ -238,8 +240,8 @@ def main(base_uri, fmt, embedded, output):
                 output_path=output,
                 partitioning=["split"],
                 existing_data_behavior="overwrite_or_ignore",
-                max_rows_per_group=128,
-                max_rows_per_file=256, # Create enough files for parallism
+                max_rows_per_group=group_size,
+                max_rows_per_file=max_rows_per_file, # Create enough files for parallelism
             )
         else:
             converter.save_df(df, f, output_path=output, partitioning=["split"])
