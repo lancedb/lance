@@ -26,7 +26,7 @@
 void Scan(const std::string& uri, const std::vector<std::string>& columns) {
   auto dataset = OpenDataset(uri);
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
-  scan_builder.Project(columns);
+  assert(scan_builder.Project(columns).ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
   fmt::print("Dataset count: {}\n", scanner->CountRows().ValueOrDie());
 }
