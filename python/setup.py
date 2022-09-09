@@ -50,6 +50,10 @@ extensions = [
     )
 ]
 
+about = {}
+with open(Path("lance") / "version.py", "r") as fh:
+    exec(fh.read(), about)
+
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
@@ -57,7 +61,7 @@ long_description = (this_directory / "README.md").read_text()
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="pylance",
-    version="0.0.5",
+    version=about["__version__"],
     author="Lance Developers",
     author_email="contact@eto.ai",
     description="Python extension for lance",
@@ -66,8 +70,8 @@ setup(
     long_description_content_type="text/markdown",
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
-    install_requires=["pyarrow>=9,<10"],
-    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click"]},
+    install_requires=["numpy", "pillow", "pyarrow>=9,<10", "requests"],
+    extras_require={"test": ["pytest>=6.0", "pandas", "duckdb", "click", "requests_mock"]},
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[

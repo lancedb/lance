@@ -19,7 +19,9 @@ import pyarrow as pa
 import pytest
 
 import lance
-from lance.types import *
+from lance.types import Box2dType, ImageType, LabelType, Point2dType
+from lance.types.box import Box2dArray
+from lance.types.label import LabelArray
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -41,16 +43,61 @@ def test_image_binary(tmp_path):
 
 def test_point(tmp_path):
     point_type = Point2dType()
-    data = [(float(x), float(x)) for x in range(100)]
-    storage = pa.array(data, pa.list_(pa.float64()))
+    points = np.random.random(100 * 2)
+    storage = pa.FixedSizeListArray.from_arrays(points, 2)
     _test_extension_rt(tmp_path, point_type, storage)
 
 
 def test_box2d(tmp_path):
     box_type = Box2dType()
-    data = [(float(x), float(x), float(x), float(x)) for x in range(100)]
-    storage = pa.array(data, pa.list_(pa.float64()))
-    _test_extension_rt(tmp_path, box_type, storage)
+    data = np.random.random(100 * 4)
+    storage = pa.FixedSizeListArray.from_arrays(data, 4)
+    ext_arr = _test_extension_rt(tmp_path, box_type, storage)
+    assert len(ext_arr.chunks) == 1
+    ext_arr = ext_arr.chunks[0]
+    assert isinstance(ext_arr, Box2dArray)
+    reshaped = data.reshape((100, 4))
+    xmin, ymin, xmax, ymax = (
+        reshaped[:, 0],
+        reshaped[:, 1],
+        reshaped[:, 2],
+        reshaped[:, 3],
+    )
+    assert np.all(ext_arr.xmin == xmin)
+    assert np.all(ext_arr.xmax == xmax)
+    assert np.all(ext_arr.ymin == ymin)
+    assert np.all(ext_arr.ymax == ymax)
+    actual_areas = ext_arr.area()
+    expected_areas = (xmax - xmin + 1) * (ymax - ymin + 1)
+    assert np.all(actual_areas == expected_areas)
+    actual_iou = ext_arr[:20].iou(ext_arr[90:])
+    expected_iou = _naive_iou(ext_arr[:20], ext_arr[90:])
+    assert np.all(actual_iou == expected_iou)
+
+
+def _naive_iou(box_a, box_b):
+    ious = np.zeros((len(box_a), len(box_b)))
+    for i in range(len(box_a)):
+        for j in range(len(box_b)):
+            xmin = max(box_a.xmin[i], box_b.xmin[j])
+            ymin = max(box_a.ymin[i], box_b.ymin[j])
+            xmax = min(box_a.xmax[i], box_b.xmax[j])
+            ymax = min(box_a.ymax[i], box_b.ymax[j])
+            # compute the area of intersection rectangle
+            inter = max(0, xmax - xmin + 1) * max(0, ymax - ymin + 1)
+            # compute the area of both the prediction and ground-truth
+            # rectangles
+            area_i = (box_a.xmax[i] - box_a.xmin[i] + 1) * (
+                box_a.ymax[i] - box_a.ymin[i] + 1
+            )
+            area_j = (box_b.xmax[j] - box_b.xmin[j] + 1) * (
+                box_b.ymax[j] - box_b.ymin[j] + 1
+            )
+            # compute the intersection over union by taking the intersection
+            # area and dividing it by the sum of prediction + ground-truth
+            # areas - the interesection area
+            ious[i, j] = inter / float(area_i + area_j - inter)
+    return ious
 
 
 def test_label(tmp_path):
@@ -60,7 +107,12 @@ def test_label(tmp_path):
     storage = pa.DictionaryArray.from_arrays(
         pa.array(indices, type=pa.int8()), pa.array(values, type=pa.string())
     )
-    _test_extension_rt(tmp_path, label_type, storage)
+    ext_arr = _test_extension_rt(tmp_path, label_type, storage)
+    assert len(ext_arr.chunks) == 1
+    ext_arr = ext_arr.chunks[0]
+    assert isinstance(ext_arr, LabelArray)
+    expected_arr = LabelArray.from_values(storage.to_numpy(False), values)
+    assert ext_arr == expected_arr
 
 
 def _test_extension_rt(tmp_path, ext_type, storage_arr):
@@ -69,4 +121,5 @@ def _test_extension_rt(tmp_path, ext_type, storage_arr):
     lance.write_table(table, str(tmp_path / "test.lance"))
     table = lance.dataset(str(tmp_path / "test.lance")).to_table()
     assert table["ext"].type == ext_type
-    assert table["ext"].to_pylist() == storage_arr.to_pylist()
+    assert table["ext"].to_pylist() == arr.to_pylist()
+    return table["ext"]
