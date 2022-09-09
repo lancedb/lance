@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-FetchContent_Declare(argparse URL https://github.com/p-ranav/argparse/archive/refs/tags/v2.5.tar.gz)
+FetchContent_Declare(argparse URL https://github.com/p-ranav/argparse/archive/refs/tags/v2.6.tar.gz)
 FetchContent_MakeAvailable(argparse)
 
 find_package(Parquet REQUIRED)
@@ -36,6 +36,7 @@ add_executable(convert convert.cc)
 target_link_libraries(
         convert
         lance
+        lance_benchmark
         argparse
 )
 target_include_directories(convert SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
@@ -48,3 +49,12 @@ target_link_libraries(
         Catch2::Catch2
 )
 target_include_directories(point_query SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
+
+add_executable(scan scan.cc)
+target_link_libraries(
+        scan
+        lance
+        lance_benchmark
+        argparse
+)
+target_include_directories(scan SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})

@@ -32,6 +32,10 @@ void ReadAll(const std::vector<std::string>& uris,
 std::shared_ptr<::arrow::io::RandomAccessFile> OpenUri(const std::string& uri,
                                                        bool ignore_error = false);
 
+/// Open Dataset from the URI.
+std::shared_ptr<::arrow::dataset::FileSystemDataset> OpenDataset(const std::string& uri,
+                                                                 const std::string& format = "lance");
+
 std::shared_ptr<::arrow::dataset::Scanner> OpenScanner(
     const std::string& uri,
     const std::vector<std::string>& columns,

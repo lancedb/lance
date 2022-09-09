@@ -80,6 +80,30 @@ std::shared_ptr<::arrow::io::RandomAccessFile> OpenUri(const std::string& uri, b
   }
 }
 
+/// Open Dataset from the URI.
+std::shared_ptr<::arrow::dataset::FileSystemDataset> OpenDataset(const std::string& uri,
+                                                                 const std::string& format) {
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
+  std::shared_ptr<arrow::dataset::FileFormat> file_format;
+  if (format == "lance") {
+    file_format.reset(new lance::arrow::LanceFileFormat());
+  } else if (format == "parquet") {
+    file_format.reset(new arrow::dataset::ParquetFileFormat());
+  } else {
+    fmt::print(stderr, "Unsupported file format: {}\n", format);
+    assert(false);
+  }
+  auto selector = ::arrow::fs::FileSelector();
+  selector.base_dir = path;
+  selector.recursive = true;
+  auto factory = arrow::dataset::FileSystemDatasetFactory::Make(
+                     fs, selector, file_format, arrow::dataset::FileSystemFactoryOptions())
+                     .ValueOrDie();
+  auto dataset = factory->Finish().ValueOrDie();
+  return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
+}
+
 void ReadAll(const std::string& uri, bool ignore_error) {
   auto infile = OpenUri(uri, ignore_error);
   if (infile) {
