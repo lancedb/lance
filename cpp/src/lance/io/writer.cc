@@ -91,7 +91,9 @@ FileWriter::~FileWriter() {}
 
   assert(field->type()->id() == arr->type_id());
   if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
-      ::arrow::is_large_binary_like(arr->type_id())) {
+      ::arrow::is_large_binary_like(arr->type_id()) ||
+      ::arrow::is_fixed_size_binary(arr->type_id()) ||
+      ::lance::arrow::is_fixed_size_list(arr->type_id())) {
     return WritePrimitiveArray(field, arr);
   } else if (lance::arrow::is_struct(arr->type())) {
     return WriteStructArray(field, arr);
@@ -100,8 +102,8 @@ FileWriter::~FileWriter() {}
   } else if (::arrow::is_dictionary(arr->type_id())) {
     return WriteDictionaryArray(field, arr);
   }
-  return ::arrow::Status::Invalid(
-      fmt::format("WriteArray: unsupported data type: {}", arr->type()->ToString()));
+  return ::arrow::Status::Invalid("FileWriter::WriteArray: unsupported data type: ",
+                                  arr->type()->ToString());
 }
 
 ::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
