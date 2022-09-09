@@ -72,8 +72,12 @@ inline bool is_extension(const std::shared_ptr<::arrow::DataType>& dtype) {
   return dtype->id() == ::arrow::Type::EXTENSION;
 }
 
+inline bool is_fixed_size_list(::arrow::Type::type type_id) {
+  return type_id == ::arrow::Type::FIXED_SIZE_LIST;
+}
+
 inline bool is_fixed_size_list(const std::shared_ptr<::arrow::DataType>& dtype) {
-  return dtype->id() == ::arrow::Type::FIXED_SIZE_LIST;
+  return is_fixed_size_list(dtype->id());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
