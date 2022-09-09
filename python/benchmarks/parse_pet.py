@@ -76,8 +76,9 @@ class OxfordPetConverter(DatasetConverter):
             no_index = pd.Index(names.values).difference(df.filename)
             self._data_quality_issues["missing_index"] = no_index
 
-        with_xmls['segmented'] = with_xmls.segmented.apply(
-            lambda x: pd.NA if pd.isnull(x) else bool(x)).astype(pd.BooleanDtype())
+        with_xmls["segmented"] = with_xmls.segmented.apply(
+            lambda x: pd.NA if pd.isnull(x) else bool(x)
+        ).astype(pd.BooleanDtype())
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -175,7 +176,7 @@ class OxfordPetConverter(DatasetConverter):
             source_schema,
             size_schema,
             pa.bool_(),
-            object_schema
+            object_schema,
         ]
         return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
 
@@ -217,10 +218,12 @@ def _get_xml(uri):
     help="Output format (parquet or lance)",
 )
 @click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
+@click.option("-g", "--group-size", type=int, default=1024, help="set max_rows_per_group in arrow")
+@click.option("--max-rows-per-file", type=int, default=0, help="set max_rows_per_file in arrow")
 @click.option(
     "-o", "--output", type=str, default="oxford_pet.lance", help="Output path"
 )
-def main(base_uri, fmt, embedded, output):
+def main(base_uri, fmt, embedded, output, group_size, max_rows_per_file):
     known_formats = ["lance", "parquet"]
     if fmt is not None:
         assert fmt in known_formats
@@ -231,7 +234,15 @@ def main(base_uri, fmt, embedded, output):
     df = converter.read_metadata()
     for f in fmt:
         if embedded:
-            converter.make_embedded_dataset(df, f, output_path=output, partitioning=["split"])
+            converter.make_embedded_dataset(
+                df,
+                f,
+                output_path=output,
+                partitioning=["split"],
+                existing_data_behavior="overwrite_or_ignore",
+                max_rows_per_group=group_size,
+                max_rows_per_file=max_rows_per_file, # Create enough files for parallelism
+            )
         else:
             converter.save_df(df, f, output_path=output, partitioning=["split"])
 

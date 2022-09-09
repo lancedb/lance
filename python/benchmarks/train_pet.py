@@ -6,11 +6,12 @@
 
 import io
 import os
+import time
 from typing import Callable, Optional
 
 import click
-import pyarrow.fs
 import pyarrow.compute as pc
+import pyarrow.fs
 import pytorch_lightning as pl
 import torch
 import torchvision
@@ -78,7 +79,7 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
         image_uri = os.path.join(self.root, "images", f"{self.images[idx]}.jpg")
         fs, path = pyarrow.fs.FileSystem.from_uri(image_uri)
         with fs.open_input_stream(path) as fobj:
-            img = Image.open(io.BytesIO(fobj.readall())).convert('RGB')
+            img = Image.open(io.BytesIO(fobj.readall())).convert("RGB")
             if self.transform:
                 img = self.transform(img)
             return img, self.labels[idx]
@@ -88,7 +89,9 @@ def collate_fn(batch):
     # TODO: Labels should be converted via torch.LanceDataset
     labels = torch.randint(0, 31, size=(len(batch[1]),))
     # TODO: Image conversion should in torch.LanceDataset
-    images = [transform(Image.open(io.BytesIO(data)).convert('RGB')) for data in batch[0]]
+    images = [
+        transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
+    ]
     return torch.stack(images), labels
 
 
@@ -105,6 +108,15 @@ class Classification(pl.LightningModule):
         self.model = model
         self.criterion = torch.nn.CrossEntropyLoss()
         self.benchmark = benchmark
+        self.fit_start_time = 0
+
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        self.fit_start_time = time.time()
+
+    def on_fit_end(self) -> None:
+        super().on_fit_end()
+        print(f"Training finished in {time.time() - self.fit_start_time} seconds")
 
     def training_step(self, batch, batch_idx):
         """
@@ -157,7 +169,7 @@ def train(
             dataset,
             columns=["image", "class"],
             batch_size=batch_size,
-            #filter=(pc.field("split") == "train")
+            # filter=(pc.field("split") == "train")
         )
         train_loader = torch.utils.data.DataLoader(
             dataset,

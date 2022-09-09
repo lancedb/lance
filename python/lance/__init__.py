@@ -19,7 +19,6 @@ from typing import List, Optional, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
-
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable
 from lance.types import register_extension_types
 
@@ -27,12 +26,12 @@ if platform.system() == "Linux":
     # TODO enable on MacOS
     register_extension_types()
 
-__all__ = ["dataset", "write_table", "scanner"]
+__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat"]
 
 
 def dataset(
     uri: str,
-) -> ds.Dataset:
+) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
