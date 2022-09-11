@@ -25,6 +25,8 @@ import lance.pytorch.data
 
 transform = T.Compose([EfficientNet_B0_Weights.DEFAULT.transforms()])
 
+NUM_CLASSES = 38
+
 
 def raw_collate_fn(batch):
     images = []
@@ -87,7 +89,7 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
 
 def collate_fn(batch):
     # TODO: Labels should be converted via torch.LanceDataset
-    labels = torch.randint(0, 31, size=(len(batch[1]),))
+    labels = torch.from_numpy(batch[1])
     # TODO: Image conversion should in torch.LanceDataset
     images = [
         transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
@@ -100,7 +102,9 @@ class Classification(pl.LightningModule):
 
     def __init__(
         self,
-        model: torch.nn.Module = torchvision.models.efficientnet_b0(),
+        model: torch.nn.Module = torchvision.models.efficientnet_b0(
+            num_classes=NUM_CLASSES
+        ),
         benchmark: Optional[str] = None,
     ) -> None:
         """Build a PyTorch classification model."""
