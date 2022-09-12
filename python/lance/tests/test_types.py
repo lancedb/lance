@@ -23,7 +23,9 @@ from lance.types import (
     Box2dArray,
     Box2dType,
     Image,
+    ImageBinary,
     ImageType,
+    ImageUri,
     LabelArray,
     LabelType,
     Point2dType,
@@ -132,7 +134,15 @@ def _test_extension_rt(tmp_path, ext_type, storage_arr):
 
 
 def test_pickle(tmp_path):
-    img = Image("uri")
+    img = Image.create("uri")
+    assert isinstance(img, ImageUri)
+    with (tmp_path / "image").open("wb") as fh:
+        pickle.dump(img, fh)
+    with (tmp_path / "image").open("rb") as fh:
+        assert img == pickle.load(fh)
+
+    img = Image.create(b"bytes")
+    assert isinstance(img, ImageBinary)
     with (tmp_path / "image").open("wb") as fh:
         pickle.dump(img, fh)
     with (tmp_path / "image").open("rb") as fh:

@@ -19,7 +19,14 @@ from pyarrow import ArrowKeyError
 
 from lance.types.base import Point2dType
 from lance.types.box import Box2dArray, Box2dType
-from lance.types.image import Image, ImageBinaryType, ImageType, ImageUriType
+from lance.types.image import (
+    Image,
+    ImageBinary,
+    ImageBinaryType,
+    ImageType,
+    ImageUri,
+    ImageUriType,
+)
 from lance.types.label import LabelArray, LabelType
 
 
