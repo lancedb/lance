@@ -86,9 +86,11 @@ class Box2dArray(pa.ExtensionArray):
             return pc.list_flatten(self.storage)
 
     def to_numpy(self, zero_copy_only=True):
-        return (self.flatten()
-                .to_numpy(zero_copy_only=zero_copy_only)
-                .reshape((len(self), 4)))
+        return (
+            self.flatten()
+            .to_numpy(zero_copy_only=zero_copy_only)
+            .reshape((len(self), 4))
+        )
 
     @property
     def xmin(self) -> np.ndarray:

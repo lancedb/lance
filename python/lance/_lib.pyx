@@ -12,14 +12,14 @@ from pathlib import Path
 from pyarrow import Table
 
 from pyarrow._dataset cimport (
-CDataset,
-CFileWriteOptions,
-CScanner,
-Dataset,
-FileFormat,
-FileWriteOptions,
-FileFragment,
-Partitioning
+    CDataset,
+    CFileWriteOptions,
+    CScanner,
+    Dataset,
+    FileFormat,
+    FileFragment,
+    FileWriteOptions,
+    Partitioning,
 )
 
 from pyarrow._dataset import Scanner, _forbid_instantiation
@@ -29,19 +29,24 @@ from pyarrow._fs cimport FileSystem
 from pyarrow.includes.common cimport *
 from pyarrow.includes.libarrow cimport COutputStream, CTable
 from pyarrow.includes.libarrow_dataset cimport (
-CFileFormat, CFileSystemDataset, CFileSystem, CFileFragment, CFragment
+    CFileFormat,
+    CFileFragment,
+    CFileSystem,
+    CFileSystemDataset,
+    CFragment,
 )
 from pyarrow.lib cimport (
-CExpression,
-GetResultValue,
-RecordBatchReader,
-check_status,
-get_writer,
-pyarrow_unwrap_table,
-Schema
+    CExpression,
+    GetResultValue,
+    RecordBatchReader,
+    Schema,
+    check_status,
+    get_writer,
+    pyarrow_unwrap_table,
 )
 
-from pyarrow.lib import tobytes, frombytes
+from pyarrow.lib import frombytes, tobytes
+
 
 cdef Expression _true = Expression._scalar(True)
 

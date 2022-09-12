@@ -18,8 +18,8 @@ from typing import List, Optional, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.fs
 import pyarrow.dataset
+import pyarrow.fs
 
 try:
     import torch
@@ -91,11 +91,12 @@ class LanceDataset(IterableDataset):
         """Yield dataset"""
         self._setup_dataset()
         for file_uri in self._files:
-            ds = pyarrow.dataset.dataset(
-                file_uri, filesystem=self._fs, format=lance.LanceFileFormat()
+            ds = lance.dataset(
+                file_uri,
+                filesystem=self._fs,
             )
-            scan = lance.scanner(
-                ds, columns=self.columns, batch_size=self.batch_size, filter=self.filter
+            scan = ds.scanner(
+                columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
                 yield [to_numpy(arr) for arr in batch.columns]
