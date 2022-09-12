@@ -16,6 +16,7 @@ import pytorch_lightning as pl
 import torch
 import torchvision
 import torchvision.transforms as T
+from torchdata.datapipes.iter import IterableWrapper
 from PIL import Image
 from torch import optim
 from torchvision.models.efficientnet import EfficientNet_B0_Weights
@@ -175,8 +176,11 @@ def train(
             batch_size=batch_size,
             # filter=(pc.field("split") == "train")
         )
+        # Use torchdata datapipe shuffler
+        datapipe = IterableWrapper(dataset)
+        shuffle_dp = datapipe.shuffle()
         train_loader = torch.utils.data.DataLoader(
-            dataset,
+            shuffle_dp,
             num_workers=num_workers,
             batch_size=None,
             collate_fn=collate_fn,
@@ -185,6 +189,7 @@ def train(
         dataset = RawOxfordPetDataset(dataset, transform=transform)
         train_loader = torch.utils.data.DataLoader(
             dataset,
+            shuffle=True,
             num_workers=num_workers,
             batch_size=batch_size,
             collate_fn=raw_collate_fn,
