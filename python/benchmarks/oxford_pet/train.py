@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 import torch
 import torchvision
 import torchvision.transforms as T
+from torchvision.transforms.functional import InterpolationMode
 from PIL import Image
 from torch import optim
 from torchdata.datapipes.iter import IterableWrapper
@@ -25,6 +26,32 @@ import lance
 import lance.pytorch.data
 
 NUM_CLASSES = 38
+
+
+class TrainTransform(torch.nn.Module):
+    """
+    https://github.com/pytorch/vision/blob/a89b1957a62e2f68f001d5d60268743edbe164d8/references/classification/presets.py#L6
+    """
+
+    def __init__(
+        self,
+        crop_size: float,
+        mean: tuple[float] = (0.485, 0.456, 0.406),
+        std: tuple[float] = (0.229, 0.224, 0.225),
+    ):
+        super().__init__()
+        self.transform = T.Compose(
+            [
+                T.RandomResizedCrop(crop_size, interpolation=InterpolationMode.BILINEAR),
+                T.RandomHorizontalFlip(),
+                T.PILToTensor(),
+                T.ConvertImageDtype(torch.float),
+                T.Normalize(mean=mean, std=std),
+            ]
+        )
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return self.transform(tensor)
 
 
 def raw_collate_fn(batch):
@@ -137,10 +164,13 @@ class Classification(pl.LightningModule):
         else:
             output = self.model(images)
             loss = self.criterion(output, labels)
+            self.log("loss", loss)
             return loss
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=(self.learning_rate))
+        # Use hyperparameters from https://github.com/pytorch/vision/tree/main/references/classification
+        #
+        optimizer = optim.SGD(self.parameters(), lr=(self.learning_rate), momentum=0.9, weight_decay=1e-4)
         return optimizer
 
 
@@ -181,10 +211,10 @@ def train(
 ):
     if model == "resnet":
         m = torchvision.models.resnet50(num_classes=NUM_CLASSES)
-        transform = ResNet50_Weights.DEFAULT.transforms()
+        transform = TrainTransform(crop_size=224)
     elif model == "efficientnet":
-        m = torchvision.models.efficientnet(num_classes=NUM_CLASSES)
-        transform = EfficientNet_B0_Weights.DEFAULT.transforms()
+        m = torchvision.models.efficientnet_b0(num_classes=NUM_CLASSES)
+        transform = TrainTransform(crop_size=224)
     else:
         raise ValueError(f"Unsupported model: {model}")
 
