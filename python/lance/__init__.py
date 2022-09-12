@@ -24,7 +24,7 @@ import lance.version
 
 __version__ = lance.version.__version__
 
-from lance.lib import BuildScanner, LanceFileFormat, WriteTable
+from lance.lib import BuildScanner, LanceFileFormat, WriteTable, _wrap_dataset
 from lance.types import register_extension_types
 
 if platform.system() == "Linux":
@@ -34,9 +34,7 @@ if platform.system() == "Linux":
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
 
 
-def dataset(
-    uri: str,
-) -> ds.FileSystemDataset:
+def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
@@ -46,50 +44,8 @@ def dataset(
         The uri to the lance data
     """
     fmt = LanceFileFormat()
-    return ds.dataset(uri, format=fmt)
-
-
-def scanner(
-    data: Union[str, Path, ds.Dataset],
-    columns: Optional[List[str]] = None,
-    filter: Optional[pc.Expression] = None,
-    batch_size: Optional[int] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
-) -> ds.Scanner:
-    """Build a PyArrow Dataset scanner.
-
-    It extends PyArrow Scanner with limit pushdown.
-
-    Parameters
-    ----------
-    data: uri, path or pyarrow dataset
-        The Dataset
-    columns: List[str], optional
-        Specify the columns to read.
-    filter: pc.Expression, optional
-        Apply filter to the scanner.
-    batch_size: int
-        The maximum number of records to scan for each batch.
-    limit: int
-        Limit the number of records to return in total.
-    offset: int
-        The offset to read the data from.
-
-    See Also
-    --------
-    https://arrow.apache.org/docs/python/generated/pyarrow.dataset.Scanner.html#pyarrow.dataset.Scanner
-    """
-    if isinstance(data, (str, Path)):
-        data = dataset(str(data))
-    return BuildScanner(
-        data,
-        columns=columns,
-        filter=filter,
-        batch_size=batch_size,
-        limit=limit,
-        offset=offset,
-    )
+    dataset = ds.dataset(uri, format=fmt, **kwargs)
+    return _wrap_dataset(dataset)
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
