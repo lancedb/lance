@@ -11,7 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
+import pickle
 import platform
 
 import numpy as np
@@ -19,9 +19,15 @@ import pyarrow as pa
 import pytest
 
 import lance
-from lance.types import Box2dType, ImageType, LabelType, Point2dType
-from lance.types.box import Box2dArray
-from lance.types.label import LabelArray
+from lance.types import (
+    Box2dArray,
+    Box2dType,
+    Image,
+    ImageType,
+    LabelArray,
+    LabelType,
+    Point2dType,
+)
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -123,3 +129,11 @@ def _test_extension_rt(tmp_path, ext_type, storage_arr):
     assert table["ext"].type == ext_type
     assert table["ext"].to_pylist() == arr.to_pylist()
     return table["ext"]
+
+
+def test_pickle(tmp_path):
+    img = Image("uri")
+    with (tmp_path / "image").open("wb") as fh:
+        pickle.dump(img, fh)
+    with (tmp_path / "image").open("rb") as fh:
+        assert img == pickle.load(fh)
