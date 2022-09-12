@@ -19,6 +19,7 @@ from torchvision.transforms.functional import InterpolationMode
 from PIL import Image
 from torch import optim
 from torchdata.datapipes.iter import IterableWrapper
+from pytorch_lightning.loggers import TensorBoardLogger
 from torchvision.models.efficientnet import EfficientNet_B0_Weights
 from torchvision.models.resnet import ResNet50_Weights
 
@@ -31,7 +32,9 @@ NUM_CLASSES = 38
 class TrainTransform(torch.nn.Module):
     """
     Image transform for training.
-    I
+
+    Adding random argumentations.
+
     https://github.com/pytorch/vision/blob/a89b1957a62e2f68f001d5d60268743edbe164d8/references/classification/presets.py#L6
     """
 
@@ -136,7 +139,7 @@ class Classification(pl.LightningModule):
         model: torch.nn.Module = torchvision.models.efficientnet_b0(
             num_classes=NUM_CLASSES
         ),
-        learning_rate=1e-3,
+        learning_rate=0.1,
         benchmark: Optional[str] = None,
     ) -> None:
         """Build a PyTorch classification model."""
@@ -166,7 +169,7 @@ class Classification(pl.LightningModule):
         else:
             output = self.model(images)
             loss = self.criterion(output, labels)
-            self.log("loss", loss)
+            self.log_dict({"loss": loss})
             return loss
 
     def configure_optimizers(self):
@@ -247,10 +250,13 @@ def train(
     else:
         raise ValueError("Unsupported data format")
 
+    logger = TensorBoardLogger("tensorboard", name=f"oxford_pet_{model}")
+
     model = Classification(benchmark=benchmark, model=m)
     trainer = pl.Trainer(
         limit_train_batches=100,
         max_epochs=epochs,
+        logger=logger,
         accelerator="gpu",
         devices=-1,
         auto_lr_find=True,
