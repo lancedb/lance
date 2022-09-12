@@ -24,7 +24,7 @@ import lance.version
 
 __version__ = lance.version.__version__
 
-from lance.lib import BuildScanner, LanceFileFormat, WriteTable
+from lance.lib import BuildScanner, LanceFileFormat, WriteTable, _wrap_dataset
 from lance.types import register_extension_types
 
 if platform.system() == "Linux":
@@ -46,7 +46,8 @@ def dataset(
         The uri to the lance data
     """
     fmt = LanceFileFormat()
-    return ds.dataset(uri, format=fmt)
+    dataset = ds.dataset(uri, format=fmt)
+    return _wrap_dataset(dataset)
 
 
 def scanner(

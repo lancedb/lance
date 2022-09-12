@@ -36,6 +36,16 @@ def test_simple_round_trips(tmp_path: Path):
     assert table == actual
 
 
+def test_head(tmp_path: Path):
+    table = pa.Table.from_pandas(
+        pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]})
+    )
+    write_table(table, tmp_path / "test.lance")
+    ds = dataset(str(tmp_path / "test.lance"))
+    actual = ds.head(2)
+    assert table[:2] == actual
+
+
 def test_write_categorical_values(tmp_path: Path):
     df = pd.DataFrame({"label": ["cat", "cat", "dog", "person"]})
     df["label"] = df["label"].astype("category")
