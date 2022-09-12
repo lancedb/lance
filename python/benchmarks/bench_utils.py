@@ -28,6 +28,7 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 
 import lance
+from lance.types.image import Image, ImageUri
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
@@ -39,7 +40,11 @@ def read_file(uri) -> bytes:
     return fs.open_input_file(key).read()
 
 
-def download_uris(uris: Iterable[str], func=read_file) -> Iterable[bytes]:
+def download_image(uri: str) -> Image:
+    return ImageUri(uri).to_embedded()
+
+
+def download_uris(uris: Iterable[str], func=download_image) -> Iterable[Image]:
     if isinstance(uris, pd.Series):
         uris = uris.values
     pool = mp.Pool(mp.cpu_count() - 1)
@@ -235,7 +240,7 @@ class DatasetConverter(ABC):
 
     def make_embedded_dataset(
         self,
-        table: Union[pa.Table | pd.DataFrame],
+        table: Union[pa.Table, pd.DataFrame],
         fmt="lance",
         output_path=None,
         **kwargs,

@@ -15,12 +15,14 @@
 
 import os
 import pathlib
+import sys
+
+sys.path.append("..")
 
 import click
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.fs
 import xmltodict
 
 from bench_utils import DatasetConverter, download_uris
@@ -168,10 +170,10 @@ class OxfordPetConverter(DatasetConverter):
         ]
         types = [
             pa.string(),
-            pa.dictionary(pa.uint8(), pa.string()),
-            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
             pa.int16(),
-            pa.dictionary(pa.uint8(), pa.string()),
+            pa.dictionary(pa.int8(), pa.string()),
             pa.string(),
             source_schema,
             size_schema,

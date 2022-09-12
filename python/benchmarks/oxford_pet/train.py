@@ -20,6 +20,7 @@ from torchdata.datapipes.iter import IterableWrapper
 from PIL import Image
 from torch import optim
 from torchvision.models.efficientnet import EfficientNet_B0_Weights
+from torchvision.models.resnet import ResNet50_Weights
 
 import lance
 import lance.pytorch.data
@@ -151,6 +152,7 @@ class Classification(pl.LightningModule):
     help="set pytorch DataLoader number of workers",
     show_default=True,
 )
+@click.option("-m", "--model", type=click.Choice(["resnet", "efficientnet"]))
 @click.option(
     "--format",
     "-F",
@@ -162,12 +164,22 @@ class Classification(pl.LightningModule):
 @click.argument("dataset")
 def train(
     dataset: str,
+    model: str,
     batch_size: int,
     epochs: int,
     benchmark: str,
     num_workers: int,
     data_format,
 ):
+    if model == "resnet":
+        m = torchvision.models.resnet50(num_classes=NUM_CLASSES)
+        transform = ResNet50_Weights.DEFAULT.transforms()
+    elif model == "efficientnet":
+        m = torchvision.models.efficientnet(num_classes=NUM_CLASSES)
+        transform = EfficientNet_B0_Weights.DEFAULT.transforms()
+    else:
+        raise ValueError(f"Unsupported model: {model}")
+
     print(f"Running benchmark: {benchmark}")
     if data_format == "lance":
         dataset = lance.pytorch.data.LanceDataset(
@@ -197,7 +209,7 @@ def train(
     else:
         raise ValueError("Unsupported data format")
 
-    model = Classification(benchmark=benchmark)
+    model = Classification(benchmark=benchmark, model=m)
     trainer = pl.Trainer(
         limit_train_batches=100, max_epochs=epochs, accelerator="gpu", devices=-1
     )
