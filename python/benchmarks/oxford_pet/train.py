@@ -107,6 +107,7 @@ class Classification(pl.LightningModule):
         model: torch.nn.Module = torchvision.models.efficientnet_b0(
             num_classes=NUM_CLASSES
         ),
+        learning_rate=1e-3,
         benchmark: Optional[str] = None,
     ) -> None:
         """Build a PyTorch classification model."""
@@ -115,6 +116,7 @@ class Classification(pl.LightningModule):
         self.criterion = torch.nn.CrossEntropyLoss()
         self.benchmark = benchmark
         self.fit_start_time = 0
+        self.learning_rate = learning_rate
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -138,7 +140,7 @@ class Classification(pl.LightningModule):
             return loss
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = optim.Adam(self.parameters(), lr=(self.learning_rate))
         return optimizer
 
 
@@ -166,7 +168,6 @@ class Classification(pl.LightningModule):
     type=click.Choice(["lance", "raw", "parquet"]),
     default="lance",
 )
-@click.option("--shuffle", is_flag=True, help="shuffle dataset")
 @click.option("--benchmark", type=click.Choice(["io", "train"]), default="train")
 @click.argument("dataset")
 def train(
@@ -174,7 +175,6 @@ def train(
     model: str,
     batch_size: int,
     epochs: int,
-    shuffle: bool,
     benchmark: str,
     num_workers: int,
     data_format,
@@ -196,10 +196,7 @@ def train(
             batch_size=batch_size,
             # filter=(pc.field("split") == "train")
         )
-        dp = IterableWrapper(dataset)
-        if shuffle:
-            # Use torchdata datapipe shuffler
-            dp = dp.shuffle()
+        dp = IterableWrapper(dataset).shuffle()
         train_loader = torch.utils.data.DataLoader(
             dp,
             num_workers=num_workers,
@@ -220,8 +217,13 @@ def train(
 
     model = Classification(benchmark=benchmark, model=m)
     trainer = pl.Trainer(
-        limit_train_batches=100, max_epochs=epochs, accelerator="gpu", devices=-1
+        limit_train_batches=100,
+        max_epochs=epochs,
+        accelerator="gpu",
+        devices=-1,
+        auto_lr_find=True,
     )
+    trainer.tune(model, train_dataloaders=train_loader)
     trainer.fit(model=model, train_dataloaders=train_loader)
 
 
