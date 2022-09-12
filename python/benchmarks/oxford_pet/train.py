@@ -10,22 +10,19 @@ import time
 from typing import Callable, Optional
 
 import click
-import pyarrow.compute as pc
 import pyarrow.fs
 import pytorch_lightning as pl
 import torch
 import torchvision
 import torchvision.transforms as T
-from torchdata.datapipes.iter import IterableWrapper
 from PIL import Image
 from torch import optim
+from torchdata.datapipes.iter import IterableWrapper
 from torchvision.models.efficientnet import EfficientNet_B0_Weights
 from torchvision.models.resnet import ResNet50_Weights
 
 import lance
 import lance.pytorch.data
-
-transform = T.Compose([EfficientNet_B0_Weights.DEFAULT.transforms()])
 
 NUM_CLASSES = 38
 
@@ -89,14 +86,17 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
             return img, self.labels[idx]
 
 
-def collate_fn(batch):
-    # TODO: Labels should be converted via torch.LanceDataset
-    labels = torch.from_numpy(batch[1])
-    # TODO: Image conversion should in torch.LanceDataset
-    images = [
-        transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
-    ]
-    return torch.stack(images), labels
+def collate_fn(transform):
+    def _collate_fn(batch):
+        # TODO: Labels should be converted via torch.LanceDataset
+        labels = torch.from_numpy(batch[1])
+        # TODO: Image conversion should in torch.LanceDataset
+        images = [
+            transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
+        ]
+        return torch.stack(images), labels
+
+    return _collate_fn
 
 
 class Classification(pl.LightningModule):
@@ -152,7 +152,13 @@ class Classification(pl.LightningModule):
     help="set pytorch DataLoader number of workers",
     show_default=True,
 )
-@click.option("-m", "--model", type=click.Choice(["resnet", "efficientnet"]))
+@click.option(
+    "-m",
+    "--model",
+    type=click.Choice(["resnet", "efficientnet"]),
+    default="resnet",
+    show_default=True,
+)
 @click.option(
     "--format",
     "-F",
@@ -160,6 +166,7 @@ class Classification(pl.LightningModule):
     type=click.Choice(["lance", "raw", "parquet"]),
     default="lance",
 )
+@click.option("--shuffle", is_flag=True, help="shuffle dataset")
 @click.option("--benchmark", type=click.Choice(["io", "train"]), default="train")
 @click.argument("dataset")
 def train(
@@ -167,6 +174,7 @@ def train(
     model: str,
     batch_size: int,
     epochs: int,
+    shuffle: bool,
     benchmark: str,
     num_workers: int,
     data_format,
@@ -188,14 +196,15 @@ def train(
             batch_size=batch_size,
             # filter=(pc.field("split") == "train")
         )
-        # Use torchdata datapipe shuffler
-        datapipe = IterableWrapper(dataset)
-        shuffle_dp = datapipe.shuffle()
+        dp = IterableWrapper(dataset)
+        if shuffle:
+            # Use torchdata datapipe shuffler
+            dp = dp.shuffle()
         train_loader = torch.utils.data.DataLoader(
-            shuffle_dp,
+            dp,
             num_workers=num_workers,
             batch_size=None,
-            collate_fn=collate_fn,
+            collate_fn=collate_fn(transform),
         )
     elif data_format == "raw":
         dataset = RawOxfordPetDataset(dataset, transform=transform)

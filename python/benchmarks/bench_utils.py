@@ -44,7 +44,7 @@ def download_image(uri: str) -> Image:
     return ImageUri(uri).to_embedded()
 
 
-def download_uris(uris: Iterable[str], func=download_image) -> Iterable[Image]:
+def download_uris(uris: Iterable[str], func=read_file) -> Iterable[Image]:
     if isinstance(uris, pd.Series):
         uris = uris.values
     pool = mp.Pool(mp.cpu_count() - 1)
