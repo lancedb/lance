@@ -30,6 +30,8 @@ NUM_CLASSES = 38
 
 class TrainTransform(torch.nn.Module):
     """
+    Image transform for training.
+    I
     https://github.com/pytorch/vision/blob/a89b1957a62e2f68f001d5d60268743edbe164d8/references/classification/presets.py#L6
     """
 
