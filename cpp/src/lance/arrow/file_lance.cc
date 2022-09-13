@@ -60,7 +60,6 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFileFormat::Inspect(
     const ::arrow::dataset::FileSource& source) const {
-  fmt::print("Inspect: File source={}\n", source.path());
   if (impl_->manifest) {
     return impl_->manifest->schema().ToArrow();
   }

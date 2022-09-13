@@ -16,6 +16,7 @@
 import os
 import pathlib
 import sys
+from urllib.parse import urlparse
 
 sys.path.append("..")
 
@@ -183,7 +184,10 @@ class OxfordPetConverter(DatasetConverter):
         return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
 
 
-def _get_xml(uri):
+def _get_xml(uri: str):
+    if not urlparse(uri).scheme:
+        uri = pathlib.Path(uri)
+
     fs, key = pa.fs.FileSystem.from_uri(uri)
     try:
         with fs.open_input_file(key) as fh:

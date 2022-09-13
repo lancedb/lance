@@ -27,6 +27,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
+from urllib.parse import urlparse
 
 import lance
 from lance.types.image import Image, ImageBinaryType
@@ -37,6 +38,8 @@ KNOWN_FORMATS = ["lance", "parquet", "raw"]
 
 
 def read_file(uri) -> bytes:
+    if not urlparse(uri).scheme:
+        uri = pathlib.Path(uri)
     fs, key = pyarrow.fs.FileSystem.from_uri(uri)
     return fs.open_input_file(key).read()
 
