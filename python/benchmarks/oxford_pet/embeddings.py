@@ -42,9 +42,6 @@ def collate_fn(batch):
     show_default=True,
 )
 def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
-    # print(checkpoint["state_dict"].keys())
-
-    # # resnet.load_state_dict(checkpoint["state_dict"]["model"])
     model = Classification.load_from_checkpoint(checkpoint)
 
     if data_format == "lance":

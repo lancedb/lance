@@ -4,25 +4,21 @@
 
 """
 
-import io
 import os
-import time
 from typing import Callable, Optional
 
 import click
-import pyarrow.fs
 import pytorch_lightning as pl
 import torch
 import torchvision
 import torchvision.transforms as T
-from torchvision.transforms.functional import InterpolationMode
-from PIL import Image
-from torchdata.datapipes.iter import IterableWrapper
+from common import Classification, RawOxfordPetDataset, collate_fn, raw_collate_fn
 from pytorch_lightning.loggers import TensorBoardLogger
+from torchdata.datapipes.iter import IterableWrapper
+from torchvision.transforms.functional import InterpolationMode
 
 import lance
 import lance.pytorch.data
-from common import Classification, RawOxfordPetDataset, raw_collate_fn
 
 NUM_CLASSES = 38
 
@@ -68,6 +64,7 @@ class TrainTransform(torch.nn.Module):
     help="set pytorch DataLoader number of workers",
     show_default=True,
 )
+@click.option("-m", "--model", type=click.Choice(["resnet"]), default="resnet")
 @click.option(
     "--format",
     "-F",
