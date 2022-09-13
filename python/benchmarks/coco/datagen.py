@@ -16,6 +16,9 @@ import pyarrow as pa
 from bench_utils import DatasetConverter
 from lance.types import ImageType
 
+import lance
+import lance.types
+
 
 class CocoConverter(DatasetConverter):
     def __init__(self, uri_root: str, version: str = "2017"):
@@ -41,6 +44,9 @@ class CocoConverter(DatasetConverter):
         category_df = pd.DataFrame(instances_json["categories"]).rename(
             {"id": "category_id"}, axis=1
         )
+        # df["bbox"] = lance.types.Box2dArray(df["bbox"])
+        # print(df, df.dtypes)
+        # print(df)
         annotations_df = df.merge(category_df, on="category_id")
         anno_df = (
             pd.DataFrame(
@@ -193,8 +199,8 @@ class CocoConverter(DatasetConverter):
             segmentation_type,
             pa.float64(),
             pa.bool_(),
-            pa.list_(pa.float32()),
-            pa.int8(),
+            pa.list_(pa.float32(), 4),
+            pa.int16(),
             pa.int64(),
             pa.dictionary(pa.int8(), pa.utf8()),
             pa.dictionary(pa.int8(), pa.utf8()),
@@ -220,7 +226,7 @@ def _aggregate_annotations(annotations):
 
 
 @click.command()
-@click.option("-u", "--base-uri", type=str, help="Coco dataset root")
+@click.argument("base_uri")
 @click.option(
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
 )
@@ -264,6 +270,14 @@ def main(
 ):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
+    # print(df)
+    # tab: pa.Table = pa.Table.from_pandas(
+    #     df, preserve_index=False, schema=converter.get_schema()
+    # )
+    # annotations = tab.column("annotations")
+    # print(tab.schema)
+    # print(annotations)
+    # return
     known_formats = ["lance", "parquet"]
     if fmt is not None:
         assert fmt in known_formats

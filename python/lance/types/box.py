@@ -29,7 +29,7 @@ class Box2dType(LanceType):
 
     def __init__(self):
         super(Box2dType, self).__init__(
-            pa.list_(pa.float64(), list_size=4),
+            pa.fix(pa.float64(), list_size=4),
             "box2d",
         )
 
