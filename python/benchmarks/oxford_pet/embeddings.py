@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+
+"""Generate embeddings"""
+
+
+import io
+import os
+
+import click
+import pandas as pd
+import torch
+import torchvision
+from common import Classification, RawOxfordPetDataset
+from PIL import Image
+from torchvision.models.feature_extraction import create_feature_extractor
+
+import lance
+
+transform = torchvision.models.ResNet50_Weights.DEFAULT.transforms()
+
+
+def collate_fn(batch):
+    pk = batch[1]
+    images = [
+        transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
+    ]
+    return torch.stack(images), pk
+
+
+@click.command()
+@click.argument("checkpoint")
+@click.argument("dataset")
+@click.option(
+    "-f", "--format", "data_format", type=click.Choice(["lance", "raw", "parquet"])
+)
+@click.option("-b", "--batch_size", type=int, default=128)
+@click.option(
+    "-w",
+    "--num_workers",
+    default=os.cpu_count(),
+    help="set pytorch DataLoader number of workers",
+    show_default=True,
+)
+def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
+    # print(checkpoint["state_dict"].keys())
+
+    # # resnet.load_state_dict(checkpoint["state_dict"]["model"])
+    model = Classification.load_from_checkpoint(checkpoint)
+
+    if data_format == "lance":
+        dataset = lance.pytorch.data.LanceDataset(
+            dataset,
+            columns=["image", "filename"],
+            batch_size=batch_size,
+            # filter=(pc.field("split") == "train")
+        )
+        train_loader = torch.utils.data.DataLoader(
+            dataset,
+            num_workers=num_workers,
+            batch_size=None,
+            collate_fn=collate_fn
+        )
+    elif data_format == "raw":
+        dataset = RawOxfordPetDataset(dataset, transform=transform)
+        train_loader = torch.utils.data.DataLoader(
+            dataset,
+            shuffle=True,
+            num_workers=num_workers,
+            batch_size=batch_size,
+            collate_fn=raw_collate_fn,
+        )
+    else:
+        raise ValueError("Unsupported data format")
+    model.eval()
+
+    extractor = create_feature_extractor(model.backbone, {"avgpool": "features"})
+    extractor = extractor.to("cuda")
+    for batch, pk in train_loader:
+        batch = batch.to("cuda")
+        features = extractor(batch)["features"].cpu()
+        print(features.shape)
+        print(pk)
+        break
+    #    print(batch)
+    #   break
+
+
+if __name__ == "__main__":
+    gen_embeddings()
