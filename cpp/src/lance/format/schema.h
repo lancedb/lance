@@ -230,6 +230,7 @@ class Field final {
   std::mutex lock_;
 
   friend class FieldVisitor;
+  friend class ReadDictionaryVisitor;
   friend class ToArrowVisitor;
   friend class WriteDictionaryVisitor;
   friend class Schema;

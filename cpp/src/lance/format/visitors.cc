@@ -65,4 +65,18 @@ WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::Outp
   return ::arrow::Status::OK();
 }
 
+/// LoadDictionaryVisitor
+ReadDictionaryVisitor::ReadDictionaryVisitor(std::shared_ptr<::arrow::io::RandomAccessFile> in)
+    : in_(std::move(in)) {}
+
+::arrow::Status ReadDictionaryVisitor::Visit(std::shared_ptr<Field> root) {
+  if (::arrow::is_dictionary(root->type()->id())) {
+    ARROW_RETURN_NOT_OK(root->LoadDictionary(in_));
+  }
+  for (auto& child : root->fields()) {
+    ARROW_RETURN_NOT_OK(Visit(child));
+  }
+  return ::arrow::Status::OK();
+}
+
 }  // namespace lance::format

@@ -58,9 +58,19 @@ namespace lance::io {
   return ReadInt<int64_t>(buf->data() + buf->size() - 16);
 }
 
+::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
+    std::shared_ptr<::arrow::io::RandomAccessFile> in,
+    std::shared_ptr<::lance::format::Manifest> manifest,
+    ::arrow::MemoryPool* pool) {
+    auto reader = std::make_unique<FileReader>(in, manifest, pool);
+    ARROW_RETURN_NOT_OK(reader->Open());
+    return reader;
+}
+
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
+                       std::shared_ptr<::lance::format::Manifest> manifest,
                        ::arrow::MemoryPool* pool) noexcept
-    : file_(in), pool_(pool) {}
+    : file_(std::move(in)), pool_(pool), manifest_(std::move(manifest)) {}
 
 Status FileReader::Open() {
   ARROW_ASSIGN_OR_RAISE(auto size, file_->GetSize());
@@ -82,7 +92,13 @@ Status FileReader::Open() {
   ARROW_ASSIGN_OR_RAISE(
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
-  ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+  if (!manifest_) {
+    ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+    // We need read the dictionary from the same file.
+    auto visitor = format::ReadDictionaryVisitor(file_);
+    ARROW_RETURN_NOT_OK(visitor.VisitSchema(manifest_->schema()));
+  }
+
   // TODO: Let's assume that page position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
@@ -96,9 +112,17 @@ Status FileReader::Open() {
 
 const lance::format::Schema& FileReader::schema() const { return manifest_->schema(); }
 
-const lance::format::Manifest& FileReader::manifest() const { return *manifest_; }
+const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { return manifest_; }
 
 const lance::format::Metadata& FileReader::metadata() const { return *metadata_; }
+
+int64_t FileReader::length() const {
+  return metadata_->length();
+}
+
+int32_t FileReader::num_batches() const {
+  return metadata_->num_batches();
+}
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetScalar(
     const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const {

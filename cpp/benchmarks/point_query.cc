@@ -24,7 +24,7 @@
 #include <string>
 
 #include "bench_utils.h"
-#include "lance/arrow/reader.h"
+#include "lance/io/reader.h"
 
 std::string uri;
 
@@ -57,7 +57,7 @@ void BenchmarkPointQueryOnParquet(const std::string& uri) {
 
 void BenchmarkPointQueryLance(const std::string& uri) {
   auto f = OpenUri(uri);
-  auto reader = ::lance::arrow::FileReader::Make(f).ValueOrDie();
+  auto reader = ::lance::io::FileReader::Make(f).ValueOrDie();
   auto length = reader->length();
 
   fmt::print("Open Lance File: {}\n", uri);
