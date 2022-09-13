@@ -29,7 +29,7 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 
 import lance
-from lance.types.image import Image, ImageType, ImageBinaryType
+from lance.types.image import Image, ImageBinaryType
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
@@ -41,11 +41,7 @@ def read_file(uri) -> bytes:
     return fs.open_input_file(key).read()
 
 
-def download_image(uri: str) -> Image:
-    return Image.create(uri).to_embedded()
-
-
-def download_uris(uris: Iterable[str], func=download_image) -> Iterable[Image]:
+def download_uris(uris: Iterable[str], func=read_file) -> Iterable[Image]:
     if isinstance(uris, pd.Series):
         uris = uris.values
     pool = mp.Pool(mp.cpu_count() - 1)
@@ -252,7 +248,8 @@ class DatasetConverter(ABC):
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
-        arr = pa.ExtensionArray.from_pandas(images, type=ImageBinaryType())
+        # TODO: improve ext type ergonomic
+        arr = pa.ExtensionArray.from_storage(ImageBinaryType(), pa.array(images))
         embedded = table.append_column(pa.field("image", ImageBinaryType()), arr)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
