@@ -9,6 +9,7 @@ import os
 import click
 import pandas as pd
 import torch
+import pyarrow
 import torchvision
 from common import Classification, RawOxfordPetDataset
 from PIL import Image
@@ -75,14 +76,19 @@ def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
 
     extractor = create_feature_extractor(model.backbone, {"avgpool": "features"})
     extractor = extractor.to("cuda")
-    for batch, pk in train_loader:
-        batch = batch.to("cuda")
-        features = extractor(batch)["features"].cpu()
-        print(features.shape)
-        print(pk)
-        break
-    #    print(batch)
-    #   break
+    with torch.no_grad():
+        dfs = []
+        for batch, pk in train_loader:
+            batch = batch.to("cuda")
+            features = extractor(batch)["features"].squeeze()
+            # print(features.tolist())
+            df = pd.DataFrame({
+                "pk": pk,
+                "features": features.tolist(),
+            })
+            dfs.append(df)
+        df = pd.concat(dfs)
+        lance.write_table(pyarrow.Table.from_pandas(df), "embeddings.lance")
 
 
 if __name__ == "__main__":
