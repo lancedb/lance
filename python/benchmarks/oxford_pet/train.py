@@ -12,7 +12,13 @@ import pytorch_lightning as pl
 import torch
 import torchvision
 import torchvision.transforms as T
-from common import Classification, RawOxfordPetDataset, collate_fn, raw_collate_fn
+from common import (
+    NUM_CLASSES,
+    Classification,
+    RawOxfordPetDataset,
+    collate_fn,
+    raw_collate_fn,
+)
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchdata.datapipes.iter import IterableWrapper
 from torchvision.transforms.functional import InterpolationMode
@@ -20,14 +26,12 @@ from torchvision.transforms.functional import InterpolationMode
 import lance
 import lance.pytorch.data
 
-NUM_CLASSES = 38
-
 
 class TrainTransform(torch.nn.Module):
     """
     Image transform for training.
 
-    Adding random argumentations.
+    Adding random augmentation.
 
     https://github.com/pytorch/vision/blob/a89b1957a62e2f68f001d5d60268743edbe164d8/references/classification/presets.py#L6
     """
@@ -84,12 +88,11 @@ def train(
     data_format,
 ):
 
+    transform = TrainTransform(crop_size=224)
     if model == "resnet":
         m = torchvision.models.resnet50(num_classes=NUM_CLASSES)
-        transform = TrainTransform(crop_size=224)
     elif model == "efficientnet":
         m = torchvision.models.efficientnet_b0(num_classes=NUM_CLASSES)
-        transform = TrainTransform(crop_size=224)
     else:
         raise ValueError(f"Unsupported model: {model}")
 

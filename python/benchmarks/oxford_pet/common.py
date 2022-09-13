@@ -3,14 +3,15 @@
 import io
 import os
 import time
-from typing import Optional, Callable
+from typing import Callable, Optional
 
 import pyarrow
 import pytorch_lightning as pl
 import torch
 import torchvision
-import lance.pytorch.data
 from PIL import Image
+
+import lance.pytorch.data
 
 NUM_CLASSES = 38
 

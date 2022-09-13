@@ -11,7 +11,7 @@ import pyarrow
 import torch
 import torchvision
 from common import Classification, RawOxfordPetDataset, raw_collate_fn
-from PIL import Image
+import PIL
 from torchvision.models.feature_extraction import create_feature_extractor
 
 import lance
@@ -22,7 +22,7 @@ transform = torchvision.models.ResNet50_Weights.DEFAULT.transforms()
 def collate_fn(batch):
     pk = batch[1]
     images = [
-        transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
+        transform(PIL.Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
     ]
     return torch.stack(images), pk
 
