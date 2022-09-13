@@ -14,6 +14,7 @@
 
 from pathlib import Path
 from typing import List, Optional, Union
+from urllib.parse import urlparse
 
 import numpy as np
 import pyarrow as pa
@@ -37,6 +38,8 @@ def to_numpy(arr: pa.Array):
     """Convert pyarrow array to numpy array"""
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
+    if pa.types.is_dictionary(arr.type):
+        return arr.indices.to_numpy()
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
     if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
         return np_arr.astype(np.bytes_)
@@ -61,6 +64,9 @@ class LanceDataset(IterableDataset):
         batch_size: Optional[int] = None,
     ):
         self.root = root
+        # Handle local relative path
+        if isinstance(root, str) and not urlparse(root).scheme:
+            self.root = Path(root)
         self.columns = columns if columns else []
         self.filter = filter
         self.batch_size = batch_size
@@ -73,7 +79,7 @@ class LanceDataset(IterableDataset):
 
     def _setup_dataset(self):
         """Lazy loading dataset in different process."""
-        if self._files is not None:
+        if self._files:
             return self._files
 
         self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)

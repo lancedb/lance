@@ -194,7 +194,7 @@ class ImageUri(Image):
 
     def to_embedded(self):
         with self.open() as img:
-            return Image(img.read())
+            return Image.create(img.read())
 
     def save(self, uri):
         return ImageUri(copy(self.uri, uri))

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import multiprocessing as mp
 import os
 import pathlib
@@ -26,8 +27,10 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
+from urllib.parse import urlparse
 
 import lance
+from lance.types.image import Image, ImageBinaryType
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
@@ -35,11 +38,13 @@ KNOWN_FORMATS = ["lance", "parquet", "raw"]
 
 
 def read_file(uri) -> bytes:
+    if not urlparse(uri).scheme:
+        uri = pathlib.Path(uri)
     fs, key = pyarrow.fs.FileSystem.from_uri(uri)
     return fs.open_input_file(key).read()
 
 
-def download_uris(uris: Iterable[str], func=read_file) -> Iterable[bytes]:
+def download_uris(uris: Iterable[str], func=read_file) -> Iterable[Image]:
     if isinstance(uris, pd.Series):
         uris = uris.values
     pool = mp.Pool(mp.cpu_count() - 1)
@@ -235,7 +240,7 @@ class DatasetConverter(ABC):
 
     def make_embedded_dataset(
         self,
-        table: Union[pa.Table | pd.DataFrame],
+        table: Union[pa.Table, pd.DataFrame],
         fmt="lance",
         output_path=None,
         **kwargs,
@@ -246,8 +251,9 @@ class DatasetConverter(ABC):
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
-        arr = pa.BinaryArray.from_pandas(images)
-        embedded = table.append_column(pa.field("image", pa.binary()), arr)
+        # TODO: improve ext type ergonomic
+        arr = pa.ExtensionArray.from_storage(ImageBinaryType(), pa.array(images))
+        embedded = table.append_column(pa.field("image", ImageBinaryType()), arr)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":

@@ -1,38 +1,19 @@
-#!/usr/bin/env python
-
-"""Train and evaluate models on Oxford pet dataset.
-
-"""
+#!/usr/bin/env python3
 
 import io
 import os
 import time
 from typing import Callable, Optional
 
-import click
-import pyarrow.compute as pc
-import pyarrow.fs
+import pyarrow
 import pytorch_lightning as pl
 import torch
 import torchvision
-import torchvision.transforms as T
 from PIL import Image
-from torch import optim
-from torchvision.models.efficientnet import EfficientNet_B0_Weights
 
-import lance
 import lance.pytorch.data
 
-transform = T.Compose([EfficientNet_B0_Weights.DEFAULT.transforms()])
-
-
-def raw_collate_fn(batch):
-    images = []
-    labels = []
-    for img, label in batch:
-        images.append(img)
-        labels.append(label)
-    return torch.stack(images), torch.tensor(labels)
+NUM_CLASSES = 38
 
 
 class RawOxfordPetDataset(torch.utils.data.Dataset):
@@ -85,30 +66,31 @@ class RawOxfordPetDataset(torch.utils.data.Dataset):
             return img, self.labels[idx]
 
 
-def collate_fn(batch):
-    # TODO: Labels should be converted via torch.LanceDataset
-    labels = torch.randint(0, 31, size=(len(batch[1]),))
-    # TODO: Image conversion should in torch.LanceDataset
-    images = [
-        transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
-    ]
-    return torch.stack(images), labels
-
-
 class Classification(pl.LightningModule):
     """Classification model to train"""
 
     def __init__(
         self,
-        model: torch.nn.Module = torchvision.models.efficientnet_b0(),
+        backbone: Optional[torch.nn.Module] = None,
+        learning_rate=0.1,
         benchmark: Optional[str] = None,
     ) -> None:
         """Build a PyTorch classification model."""
         super().__init__()
-        self.model = model
+        self.backbone = torchvision.models.resnet50(num_classes=NUM_CLASSES)
         self.criterion = torch.nn.CrossEntropyLoss()
         self.benchmark = benchmark
         self.fit_start_time = 0
+        self.learning_rate = learning_rate
+
+    @staticmethod
+    def get(name: str, **kwargs):
+        if name == "resnet":
+            return Classification(backbone=torchvision.models.resnet50(num_classes=NUM_CLASSES))
+        elif name == "efficientnet":
+            return Classification(backbone=torchvision.models.efficientnet_b0(num_classes=NUM_CLASSES))
+        else:
+            raise ValueError(f"Unsupported model: {name}")
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -127,73 +109,37 @@ class Classification(pl.LightningModule):
             # only test I/O
             pass
         else:
-            output = self.model(images)
+            output = self.backbone(images)
             loss = self.criterion(output, labels)
+            self.log_dict({"loss": loss})
             return loss
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        # Use hyperparameters from https://github.com/pytorch/vision/tree/main/references/classification
+        #
+        optimizer = torch.optim.SGD(
+            self.parameters(), lr=(self.learning_rate), momentum=0.9, weight_decay=1e-4
+        )
         return optimizer
 
 
-@click.command()
-@click.option("-b", "--batch_size", default=64, help="batch size", show_default=True)
-@click.option("-e", "--epochs", default=10, help="set max ephochs", show_default=True)
-@click.option(
-    "-w",
-    "--num_workers",
-    default=os.cpu_count(),
-    help="set pytorch DataLoader number of workers",
-    show_default=True,
-)
-@click.option(
-    "--format",
-    "-F",
-    "data_format",
-    type=click.Choice(["lance", "raw", "parquet"]),
-    default="lance",
-)
-@click.option("--benchmark", type=click.Choice(["io", "train"]), default="train")
-@click.argument("dataset")
-def train(
-    dataset: str,
-    batch_size: int,
-    epochs: int,
-    benchmark: str,
-    num_workers: int,
-    data_format,
-):
-    print(f"Running benchmark: {benchmark}")
-    if data_format == "lance":
-        dataset = lance.pytorch.data.LanceDataset(
-            dataset,
-            columns=["image", "class"],
-            batch_size=batch_size,
-            # filter=(pc.field("split") == "train")
-        )
-        train_loader = torch.utils.data.DataLoader(
-            dataset,
-            num_workers=num_workers,
-            batch_size=None,
-            collate_fn=collate_fn,
-        )
-    elif data_format == "raw":
-        dataset = RawOxfordPetDataset(dataset, transform=transform)
-        train_loader = torch.utils.data.DataLoader(
-            dataset,
-            num_workers=num_workers,
-            batch_size=batch_size,
-            collate_fn=raw_collate_fn,
-        )
-    else:
-        raise ValueError("Unsupported data format")
+def collate_fn(transform):
+    def _collate_fn(batch):
+        # TODO: convert label to int64 from Dataset?
+        labels = torch.from_numpy(batch[1]).to(torch.int64)
+        # TODO: Image conversion should in torch.LanceDataset
+        images = [
+            transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]
+        ]
+        return torch.stack(images), labels
 
-    model = Classification(benchmark=benchmark)
-    trainer = pl.Trainer(
-        limit_train_batches=100, max_epochs=epochs, accelerator="gpu", devices=-1
-    )
-    trainer.fit(model=model, train_dataloaders=train_loader)
+    return _collate_fn
 
 
-if __name__ == "__main__":
-    train()
+def raw_collate_fn(batch):
+    images = []
+    labels = []
+    for img, label in batch:
+        images.append(img)
+        labels.append(label)
+    return torch.stack(images), torch.tensor(labels)
