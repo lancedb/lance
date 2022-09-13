@@ -91,16 +91,16 @@ class Image(ABC):
     representations
     """
 
-    def __new__(cls, data: Union[bytes, str]):
+    @staticmethod
+    def create(data: Union[bytes, str]):
         if isinstance(data, bytes):
-            img = object.__new__(ImageBinary)
+            img = ImageBinary(data)
         elif isinstance(data, str):
-            img = object.__new__(ImageUri)
+            img = ImageUri(data)
         else:
             raise TypeError(
-                f"{cls.__name__} can only handle bytes or str " f"but got {type(data)}"
+                f"Image can only handle bytes or str " f"but got {type(data)}"
             )
-        img.__init__(data)
         return img
 
     @classmethod
