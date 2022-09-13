@@ -79,6 +79,9 @@ class LanceDataset(IterableDataset):
 
     def _setup_dataset(self):
         """Lazy loading dataset in different process."""
+        if self._files:
+            return self._files
+
         self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
         self._files = dataset(self.root).files
         worker_info = torch.utils.data.get_worker_info()
