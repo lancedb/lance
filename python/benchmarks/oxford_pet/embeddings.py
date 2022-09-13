@@ -7,8 +7,8 @@ import os
 
 import click
 import pandas as pd
-import torch
 import pyarrow
+import torch
 import torchvision
 from common import Classification, RawOxfordPetDataset, raw_collate_fn
 from PIL import Image
@@ -41,7 +41,10 @@ def collate_fn(batch):
     help="set pytorch DataLoader number of workers",
     show_default=True,
 )
-def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
+@click.option(
+    "-o", "--output", default="embeddings.lance", help="Output path", show_default=True
+)
+def gen_embeddings(checkpoint, dataset, output, batch_size, num_workers, data_format):
     model = Classification.load_from_checkpoint(checkpoint)
 
     if data_format == "lance":
@@ -52,10 +55,7 @@ def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
             # filter=(pc.field("split") == "train")
         )
         train_loader = torch.utils.data.DataLoader(
-            dataset,
-            num_workers=num_workers,
-            batch_size=None,
-            collate_fn=collate_fn
+            dataset, num_workers=num_workers, batch_size=None, collate_fn=collate_fn
         )
     elif data_format == "raw":
         dataset = RawOxfordPetDataset(dataset, transform=transform)
@@ -77,14 +77,15 @@ def gen_embeddings(checkpoint, dataset, batch_size, num_workers, data_format):
         for batch, pk in train_loader:
             batch = batch.to("cuda")
             features = extractor(batch)["features"].squeeze()
-            # print(features.tolist())
-            df = pd.DataFrame({
-                "pk": pk,
-                "features": features.tolist(),
-            })
+            df = pd.DataFrame(
+                {
+                    "pk": pk,
+                    "features": features.tolist(),
+                }
+            )
             dfs.append(df)
         df = pd.concat(dfs)
-        lance.write_table(pyarrow.Table.from_pandas(df), "embeddings.lance")
+        lance.write_table(pyarrow.Table.from_pandas(df, preserve_index=False), output)
 
 
 if __name__ == "__main__":
