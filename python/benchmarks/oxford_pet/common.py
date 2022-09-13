@@ -125,8 +125,8 @@ class Classification(pl.LightningModule):
 
 def collate_fn(transform):
     def _collate_fn(batch):
-        # TODO: Labels should be converted via torch.LanceDataset
-        labels = torch.from_numpy(batch[1])
+        # TODO: convert label to int64 from Dataset?
+        labels = torch.from_numpy(batch[1]).to(torch.int64)
         # TODO: Image conversion should in torch.LanceDataset
         images = [
             transform(Image.open(io.BytesIO(data)).convert("RGB")) for data in batch[0]

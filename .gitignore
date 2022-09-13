@@ -53,3 +53,6 @@ python/lance/_lib.cpp
 
 python/thirdparty/arrow/
 python/wheels
+
+logs
+*.ckpt

@@ -5,7 +5,6 @@
 """
 
 import os
-from typing import Callable, Optional
 
 import click
 import pytorch_lightning as pl
@@ -136,7 +135,7 @@ def train(
     )
     trainer.tune(model, train_dataloaders=train_loader)
     trainer.fit(model=model, train_dataloaders=train_loader)
-    trainer.save_checkpoint("model.ckt")
+    trainer.save_checkpoint("model.ckpt")
 
 
 if __name__ == "__main__":
