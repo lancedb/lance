@@ -95,7 +95,7 @@ Status FileReader::Open() {
   if (!manifest_) {
     ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
     // We need read the dictionary from the same file.
-    auto visitor = format::LoadDictionaryVisitor(file_);
+    auto visitor = format::ReadDictionaryVisitor(file_);
     ARROW_RETURN_NOT_OK(visitor.VisitSchema(manifest_->schema()));
   }
 

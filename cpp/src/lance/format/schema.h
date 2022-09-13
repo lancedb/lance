@@ -230,9 +230,9 @@ class Field final {
   std::mutex lock_;
 
   friend class FieldVisitor;
+  friend class ReadDictionaryVisitor;
   friend class ToArrowVisitor;
   friend class WriteDictionaryVisitor;
-  friend class LoadDictionaryVisitor;
   friend class Schema;
   friend ::arrow::Status CopyField(std::shared_ptr<Field> new_field,
                                    std::shared_ptr<Field> field,

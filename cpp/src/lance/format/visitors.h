@@ -60,10 +60,10 @@ class WriteDictionaryVisitor : public FieldVisitor {
   std::shared_ptr<::arrow::io::OutputStream> out_;
 };
 
-/// A Visitor to Load dictionary.
-class LoadDictionaryVisitor : public FieldVisitor {
+/// A Visitor to Read dictionary values from the input file.
+class ReadDictionaryVisitor : public FieldVisitor {
  public:
-  LoadDictionaryVisitor(std::shared_ptr<::arrow::io::RandomAccessFile>  in);
+  ReadDictionaryVisitor(std::shared_ptr<::arrow::io::RandomAccessFile> in);
 
   ::arrow::Status Visit(std::shared_ptr<Field> root) override;
 
