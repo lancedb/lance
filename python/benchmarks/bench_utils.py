@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import multiprocessing as mp
 import os
 import pathlib
@@ -28,7 +29,7 @@ import pyarrow.fs
 import pyarrow.parquet as pq
 
 import lance
-from lance.types.image import Image, ImageUri
+from lance.types.image import Image, ImageType, ImageBinaryType
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
@@ -251,8 +252,8 @@ class DatasetConverter(ABC):
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
-        arr = pa.BinaryArray.from_pandas(images)
-        embedded = table.append_column(pa.field("image", pa.binary()), arr)
+        arr = pa.ExtensionArray.from_pandas(images, type=ImageBinaryType())
+        embedded = table.append_column(pa.field("image", ImageBinaryType()), arr)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":
