@@ -2,7 +2,6 @@
 
 """Generate embeddings"""
 
-
 import io
 import os
 
@@ -11,7 +10,7 @@ import pandas as pd
 import torch
 import pyarrow
 import torchvision
-from common import Classification, RawOxfordPetDataset
+from common import Classification, RawOxfordPetDataset, raw_collate_fn
 from PIL import Image
 from torchvision.models.feature_extraction import create_feature_extractor
 
