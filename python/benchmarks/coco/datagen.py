@@ -1,9 +1,14 @@
 #!/usr/bin/env python
+
 """Parse coco dataset"""
 
 import json
 import os
 from collections import defaultdict
+import sys
+
+sys.path.append("..")
+
 
 import click
 import pandas as pd
@@ -13,7 +18,7 @@ from lance.types import ImageType
 
 
 class CocoConverter(DatasetConverter):
-    def __init__(self, uri_root, version="2017"):
+    def __init__(self, uri_root: str, version: str = "2017"):
         super(CocoConverter, self).__init__("coco", uri_root)
         self.version = version
 
@@ -219,7 +224,13 @@ def _aggregate_annotations(annotations):
 @click.option(
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
 )
-@click.option("-f", "--fmt", type=str, help="Output format (parquet or lance)")
+@click.option(
+    "-f",
+    "--fmt",
+    type=click.Choice(["lance", "parquet"]),
+    default="lance",
+    help="Output format (parquet or lance)",
+)
 @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
 @click.option(
     "-g",
@@ -242,7 +253,15 @@ def _aggregate_annotations(annotations):
     type=str,
     help="Output path. Default is {base_uri}/coco_links.{fmt}",
 )
-def main(base_uri, version, fmt, embedded, output_path, group_size: int, max_rows_per_file: int):
+def main(
+    base_uri,
+    version,
+    fmt,
+    embedded,
+    output_path,
+    group_size: int,
+    max_rows_per_file: int,
+):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
     known_formats = ["lance", "parquet"]
