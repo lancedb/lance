@@ -370,3 +370,32 @@ TEST_CASE("Extension type round-trip") {
   auto actual_table = ReadTable(sink);
   CHECK(table->Equals(*actual_table));
 }
+
+TEST_CASE("Write empty arrays") {
+  auto int_builder = std::make_shared<::arrow::Int32Builder>();
+  auto boolean_builder = std::make_shared<::arrow::BooleanBuilder>();
+  auto fixed_size_builder = std::make_shared<::arrow::FixedSizeListBuilder>(
+      ::arrow::default_memory_pool(), std::make_shared<::arrow::FloatBuilder>(), 4);
+
+  auto struct_field = ::arrow::struct_({
+      ::arrow::field("ints", ::arrow::int32()),
+      ::arrow::field("bools", ::arrow::boolean()),
+      ::arrow::field("fixed_size_list", ::arrow::fixed_size_list(::arrow::float32(), 4)),
+  });
+  auto struct_builder = std::make_shared<::arrow::StructBuilder>(
+      struct_field,
+      ::arrow::default_memory_pool(),
+      std::vector<std::shared_ptr<::arrow::ArrayBuilder>>(
+          {int_builder, boolean_builder, fixed_size_builder}));
+  auto list_builder = ::arrow::ListBuilder(::arrow::default_memory_pool(), struct_builder);
+
+  CHECK(list_builder.AppendNulls(5).ok());
+  auto arr = list_builder.Finish().ValueOrDie();
+  auto schema = ::arrow::schema({::arrow::field("values", ::arrow::list(struct_field))});
+  auto table = ::arrow::Table::Make(schema, {arr});
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+  auto actual_table = ReadTable(sink);
+  CHECK(table->Equals(*actual_table));
+}

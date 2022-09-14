@@ -126,13 +126,17 @@ class PlainDecoderImpl : public Decoder {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t start, std::optional<int32_t> length) const override {
     auto len = GetReadLength(start, length);
-    if (len <= 0) {
+    if (len < 0) {
       return ::arrow::Status::IndexError(
           fmt::format("{}::ToArray: out of range: start={}, length={}, page_length={}\n",
                       ToString(),
                       start,
                       length.value_or(-1),
                       length_));
+    }
+
+    if (len == 0) {
+      return MakeEmpty();
     }
     auto byte_width = type_->byte_width();
     ARROW_ASSIGN_OR_RAISE(auto buf,
@@ -182,6 +186,11 @@ class PlainDecoderImpl : public Decoder {
     return std::min(length.value_or(length_), length_ - start);
   }
 
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> MakeEmpty() const {
+    ARROW_ASSIGN_OR_RAISE(auto buffer, ::arrow::AllocateBuffer(0));
+    return std::make_shared<ArrayType>(type_, 0, std::move(buffer));
+  }
+
  private:
   using ArrayType = typename ::arrow::TypeTraits<T>::ArrayType;
   using BuilderType = typename ::arrow::TypeTraits<T>::BuilderType;
@@ -210,6 +219,11 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
           length.value_or(-1),
           length_));
     }
+
+    if (len == 0) {
+      return MakeEmpty();
+    }
+
     int64_t byte_length = ::arrow::bit_util::BytesForBits(len);
     ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
     return std::make_shared<::arrow::BooleanArray>(len, buf);
