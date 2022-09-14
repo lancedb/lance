@@ -1,5 +1,9 @@
+#!/usr/bin/env python
+#
+# Data augmentation during object detection training.
 #
 # Copied from https://raw.githubusercontent.com/pytorch/vision/main/references/detection/transforms.py
+#
 
 from typing import Dict, List, Optional, Tuple, Union
 

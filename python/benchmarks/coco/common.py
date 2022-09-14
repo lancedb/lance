@@ -28,11 +28,7 @@ def collate_fn(batch):
             "boxes": torch.tensor(boxes)
         }
         target.append(annotations)
-    images = []
-    for data in batch[0]:
-        # TODO: Image conversion via Extension type, in Dataset?
-        img = PIL.Image.open(io.BytesIO(data)).convert("RGB")
-        images.append(img)
+    images = batch[0]
     return images, target
 
 

@@ -70,6 +70,7 @@ def train(
             uri,
             columns=["image", "annotations.category_id", "annotations.bbox"],
             batch_size=batch_size,
+            transform=transform,
             # filter=(pc.field("split") == "train")
         )
         dp = IterableWrapper(dataset).shuffle()
