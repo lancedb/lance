@@ -8,6 +8,8 @@ import pytorch_lightning as pl
 import torch
 import torchvision
 
+import transforms as T
+
 
 def collate_fn(batch):
     # Collate for training

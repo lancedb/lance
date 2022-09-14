@@ -1,4 +1,4 @@
-# Benchmark on MS Coco dataset
+# PyTorch Benchmark on MS Coco dataset
 
 ## How to generate dataset
 

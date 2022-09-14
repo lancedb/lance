@@ -7,7 +7,7 @@ import os
 import click
 import pytorch_lightning as pl
 import torch
-from common import RawCocoDataset, ObjectDetection, collate_fn
+from common import ObjectDetection, RawCocoDataset, collate_fn
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchdata.datapipes.iter import IterableWrapper
 
