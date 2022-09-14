@@ -7,7 +7,7 @@ import os
 import click
 import pytorch_lightning as pl
 import torch
-from common import RawCocoDataset
+from common import RawCocoDataset, ObjectDetection, collate_fn
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchdata.datapipes.iter import IterableWrapper
 
@@ -57,7 +57,7 @@ def train(
     if data_format == "lance":
         dataset = lance.pytorch.data.LanceDataset(
             uri,
-            columns=["image", "annotations.class", "annotations.bbox"],
+            columns=["image", "annotations.category_id", "annotations.bbox"],
             batch_size=batch_size,
             # filter=(pc.field("split") == "train")
         )
@@ -66,7 +66,7 @@ def train(
             dp,
             num_workers=num_workers,
             batch_size=None,
-            collate_fn=collate_fn(transform),
+            collate_fn=collate_fn,
         )
     elif data_format == "raw":
         dataset = RawCocoDataset(uri, transform=transform)
@@ -89,6 +89,8 @@ def train(
         devices=-1,
         auto_lr_find=True,
     )
+    model = ObjectDetection()
+    trainer.tune(model, train_dataloaders=train_loader)
 
 
 if __name__ == "__main__":

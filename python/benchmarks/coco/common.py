@@ -1,10 +1,37 @@
 #!/usr/bin/env python
 
+import io
 from typing import Callable, Optional
 
+import PIL
 import pytorch_lightning as pl
 import torch
 import torchvision
+
+
+def collate_fn(batch):
+    # Collate for training
+    # TODO: consider what can be auto inferred.
+    #
+    target = []
+    # https://pytorch.org/vision/stable/models/generated/torchvision.models.detection.ssd300_vgg16.html\
+    #   #torchvision.models.detection.ssd300_vgg16
+    for raw_annotation in batch[1]:
+        labels, boxes = [], []
+        for elem in raw_annotation:
+            labels.append(elem["category_id"])
+            boxes.append(elem["bbox"])
+        annotations = {
+            "labels": torch.tensor(labels),
+            "boxes": torch.tensor(boxes)
+        }
+        target.append(annotations)
+    images = []
+    for data in batch[0]:
+        # TODO: Image conversion via Extension type, in Dataset?
+        img = PIL.Image.open(io.BytesIO(data)).convert("RGB")
+        images.append(img)
+    return images, target
 
 
 class RawCocoDataset(torch.utils.data.Dataset):
@@ -29,19 +56,26 @@ class RawCocoDataset(torch.utils.data.Dataset):
 
 
 class ObjectDetection(pl.LightningModule):
-    """General object detection model for training and inference benchmarks."""
+    """General object detection model for training and inference benchmarks.
+
+    Hyper parameters are referred to
+
+    https://github.com/pytorch/vision/blob/main/references/detection
+    """
     def __init__(self):
         super().__init__()
         self.backbond = torchvision.models.detection.ssd300_vgg16()
+        self.lr = 0
 
-    def training_step(self, *args, **kwargs):
-        return super().training_step(*args, **kwargs)
+    def training_step(self, batch, batch_idx):
+        images, targets = batch
+        print(targets)
+        loss_dict = self.backbond(images, targets)
+        print(loss_dict)
+        return loss_dict
 
     def configure_optimizers(self):
-        # Use hyperparameters from
-        # https://github.com/pytorch/vision/blob/main/references/detection
-        #
         optimizer = torch.optim.SGD(
-            self.parameters(), lr=(self.learning_rate), momentum=0.9, weight_decay=0.0005
+            self.parameters(), lr=self.lr, momentum=0.9, weight_decay=0.0005
         )
         return optimizer
