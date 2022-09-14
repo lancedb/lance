@@ -13,13 +13,23 @@ from torchdata.datapipes.iter import IterableWrapper
 
 import lance
 import lance.pytorch.data
+import transforms as T
+
+transform = T.Compose(
+    [
+        T.RandomPhotometricDistort(),
+        T.RandomZoomOut(fill=list(mean)),
+        T.RandomIoUCrop(),
+        T.RandomHorizontalFlip(),
+        T.PILToTensor(),
+        T.ConvertImageDtype(torch.float),
+    ]
+)
 
 
 @click.command()
 @click.argument("uri")
-@click.option(
-    "-b", "--batch_size", default=4, help="set batch size", show_default=True
-)
+@click.option("-b", "--batch_size", default=4, help="set batch size", show_default=True)
 @click.option(
     "-e",
     "--epoch",
