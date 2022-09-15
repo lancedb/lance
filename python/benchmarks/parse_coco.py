@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """Parse coco dataset"""
+
 import json
 import os
+from collections import defaultdict
 
 import click
 import pandas as pd
@@ -41,7 +43,7 @@ class CocoConverter(DatasetConverter):
                 }
             )
             .groupby("image_id")
-            .agg(list)
+            .agg(_aggregate_annotations)
         ).reset_index()
         images_df = pd.DataFrame(instances_json["images"]).rename(
             {"id": "image_id"}, axis=1
@@ -130,8 +132,8 @@ class CocoConverter(DatasetConverter):
             pa.dictionary(pa.uint8(), pa.utf8()),
             pa.dictionary(pa.uint8(), pa.utf8()),
         ]
-        schema = pa.list_(
-            pa.struct([pa.field(name, dtype) for name, dtype in zip(names, types)])
+        schema = pa.struct(
+            [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]
         )
         return schema
 
@@ -140,6 +142,14 @@ def _convert_segmentation(s):
     if isinstance(s, list):
         return {"polygon": s}
     return s
+
+
+def _aggregate_annotations(annotations):
+    ret = defaultdict(list)
+    for ann in annotations:
+        for k, v in ann.items():
+            ret[k].append(v)
+    return ret
 
 
 @click.command
