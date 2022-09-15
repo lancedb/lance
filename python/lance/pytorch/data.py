@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional, Union, Dict
 from urllib.parse import urlparse
 
 import numpy as np
@@ -68,7 +68,7 @@ class LanceDataset(IterableDataset):
     def __init__(
         self,
         root: Union[str, Path],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
@@ -78,6 +78,7 @@ class LanceDataset(IterableDataset):
 
         Parameters
         ----------
+<<<<<<< HEAD
         root : str or Path
             The root URI
         columns : list of str, optional
@@ -91,6 +92,18 @@ class LanceDataset(IterableDataset):
         mode : str
             Can be either a "record" or "batch" mode. It is used to decide how
             to apply transform and return.
+=======
+        root: str or pathlib.Path
+            The URI of the dataset.
+        columns: list of str
+            The columns of the dataset to read. It can be specified as a dictionary of column names mapping.
+        filter: pyarrow.compute.Expression, optional
+            The filter to apply
+        batch_size: int
+            Batch size to read from lance dataset.
+        transform: Callable, optional
+            The row-level transform to apply to the results.
+>>>>>>> 5884002 (allow to accept dictionary for alias)
         """
         self.root = root
         # Handle local relative path
@@ -143,6 +156,7 @@ class LanceDataset(IterableDataset):
                 columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
+<<<<<<< HEAD
                 tensors = [to_tensor(arr) for arr in batch.columns]
                 if self.mode == "batch":
                     if self.transform is not None:
@@ -160,3 +174,14 @@ class LanceDataset(IterableDataset):
                         if self.transform is not None:
                             record = self.transform(*record)
                         yield record
+=======
+                print(batch.columns)
+                result = [to_numpy(arr) for arr in batch.columns]
+                if self.transform is not None:
+                    print(result[1])
+                    for r in zip(*result):
+                        print(r)
+                    result = [self.transform(*r) for r in zip(*result)]
+                    print(result)
+                yield result
+>>>>>>> 5884002 (allow to accept dictionary for alias)

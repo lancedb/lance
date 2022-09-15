@@ -5,7 +5,6 @@
 # Copied from https://raw.githubusercontent.com/pytorch/vision/main/references/detection/transforms.py
 #
 
-from lib2to3.pgen2.token import OP
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
