@@ -18,7 +18,10 @@ import lance.pytorch.data
 
 
 def prepare_target(*args):
-    """Prepare dataset."""
+    """Prepare dataset.
+
+    TODO: this should be moved into Pytorch DataLoader
+    """
     images, annotations = args
     # TODO: convert numpy to tensor from pytorch dataset
     return images, {
