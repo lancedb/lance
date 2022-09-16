@@ -34,13 +34,6 @@ class Compose:
         return image, target
 
 
-class TargetAlias(torch.nn.Module):
-    """Alias a column to another name."""
-
-    def forward(self, image: Tensor, target: Optional[Dict[str, Tensor]]):
-        return image, target
-
-
 class RandomHorizontalFlip(T.RandomHorizontalFlip):
     def forward(
         self, image: Tensor, target: Optional[Dict[str, Tensor]] = None

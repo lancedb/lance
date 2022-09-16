@@ -51,7 +51,7 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
     # TODO: for NLP, how to return strings?
     if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
-        return np_arr.astype(np.bytes_)
+        return torch.tensor(np_arr.astype(np.bytes_))
     elif pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
         return np_arr.astype(np.str_)
     else:
@@ -78,7 +78,6 @@ class LanceDataset(IterableDataset):
 
         Parameters
         ----------
-<<<<<<< HEAD
         root : str or Path
             The root URI
         columns : list of str, optional
@@ -92,18 +91,6 @@ class LanceDataset(IterableDataset):
         mode : str
             Can be either a "record" or "batch" mode. It is used to decide how
             to apply transform and return.
-=======
-        root: str or pathlib.Path
-            The URI of the dataset.
-        columns: list of str
-            The columns of the dataset to read. It can be specified as a dictionary of column names mapping.
-        filter: pyarrow.compute.Expression, optional
-            The filter to apply
-        batch_size: int
-            Batch size to read from lance dataset.
-        transform: Callable, optional
-            The row-level transform to apply to the results.
->>>>>>> 5884002 (allow to accept dictionary for alias)
         """
         self.root = root
         # Handle local relative path
@@ -156,7 +143,6 @@ class LanceDataset(IterableDataset):
                 columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
-<<<<<<< HEAD
                 tensors = [to_tensor(arr) for arr in batch.columns]
                 if self.mode == "batch":
                     if self.transform is not None:
@@ -174,14 +160,4 @@ class LanceDataset(IterableDataset):
                         if self.transform is not None:
                             record = self.transform(*record)
                         yield record
-=======
-                print(batch.columns)
-                result = [to_numpy(arr) for arr in batch.columns]
-                if self.transform is not None:
-                    print(result[1])
-                    for r in zip(*result):
-                        print(r)
-                    result = [self.transform(*r) for r in zip(*result)]
-                    print(result)
-                yield result
->>>>>>> 5884002 (allow to accept dictionary for alias)
+

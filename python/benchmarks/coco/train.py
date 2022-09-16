@@ -5,19 +5,32 @@
 import os
 
 import click
+import numpy as np
 import pytorch_lightning as pl
 import torch
+import transforms as T
 from common import ObjectDetection, RawCocoDataset, collate_fn
 from pytorch_lightning.loggers import TensorBoardLogger
 from torchdata.datapipes.iter import IterableWrapper
 
 import lance
 import lance.pytorch.data
-import transforms as T
+
+
+def prepare_target(*args):
+    """Prepare dataset."""
+    images, annotations = args
+    # TODO: convert numpy to tensor from pytorch dataset
+    return images, {
+        "labels": torch.from_numpy(annotations["category_id"]),
+        "boxes": torch.from_numpy(np.stack(annotations["bbox"])),
+    }
+
 
 # https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
 transform = T.Compose(
     [
+        prepare_target,
         T.RandomPhotometricDistort(),
         T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
         T.RandomIoUCrop(),
@@ -94,7 +107,6 @@ def train(
 
     logger = TensorBoardLogger("logs", name=f"coco_{model_name}")
     trainer = pl.Trainer(
-        limit_train_batches=100,
         max_epochs=epoch,
         logger=logger,
         accelerator="gpu",

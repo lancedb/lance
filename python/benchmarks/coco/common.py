@@ -7,7 +7,6 @@ import PIL
 import pytorch_lightning as pl
 import torch
 import torchvision
-
 import transforms as T
 
 
@@ -67,9 +66,7 @@ class ObjectDetection(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
-        print(targets)
         loss_dict = self.backbond(images, targets)
-        print(loss_dict)
         return loss_dict
 
     def configure_optimizers(self):
