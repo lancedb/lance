@@ -28,6 +28,10 @@ class CocoConverter(DatasetConverter):
         df = pd.DataFrame(instances_json["annotations"])
         df["segmentation"] = df.segmentation.apply(_convert_segmentation)
         df["iscrowd"] = df.iscrowd.astype("bool")
+        # Convert coco dataset bounding box [x,y,width,height] to [x0,y0,x1,y1] format.
+        df["bbox"] = df.bbox.apply(
+            lambda arr: [arr[0], arr[1], arr[0] + arr[2], arr[1] + arr[3]]
+        )
         category_df = pd.DataFrame(instances_json["categories"]).rename(
             {"id": "category_id"}, axis=1
         )
