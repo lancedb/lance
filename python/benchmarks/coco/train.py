@@ -25,7 +25,7 @@ def prepare_target(*args):
     images, annotations = args
     # TODO: convert numpy to tensor from pytorch dataset
     return images, {
-        "labels": torch.from_numpy(annotations["category_id"]),
+        "labels": torch.from_numpy(annotations["category_id"]).type(torch.int64),
         "boxes": torch.from_numpy(np.stack(annotations["bbox"])),
     }
 
@@ -34,10 +34,10 @@ def prepare_target(*args):
 transform = T.Compose(
     [
         prepare_target,
-#        T.RandomPhotometricDistort(),
- #       T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
- #       T.RandomIoUCrop(),
-    #    T.RandomHorizontalFlip(),
+        T.RandomPhotometricDistort(),
+        T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
+        T.RandomIoUCrop(),
+        T.RandomHorizontalFlip(),
         T.PILToTensor(),
         T.ConvertImageDtype(torch.float),
     ]
@@ -46,7 +46,7 @@ transform = T.Compose(
 
 @click.command()
 @click.argument("uri")
-@click.option("-b", "--batch_size", default=4, help="set batch size", show_default=True)
+@click.option("-b", "--batch_size", default=32, help="set batch size", show_default=True)
 @click.option(
     "-e",
     "--epoch",
@@ -96,8 +96,8 @@ def train(
         dp = IterableWrapper(dataset).shuffle(buffer_size=64)
         train_loader = torch.utils.data.DataLoader(
             dp,
-            num_workers=2,
-            batch_size=4,
+            num_workers=num_workers,
+            batch_size=batch_size,
             collate_fn=collate_fn,
         )
     elif data_format == "raw":
@@ -121,7 +121,7 @@ def train(
         auto_lr_find=True,
     )
     model = ObjectDetection()
-    #trainer.tune(model, train_dataloaders=train_loader)
+    trainer.tune(model, train_dataloaders=train_loader)
     trainer.fit(model, train_dataloaders=train_loader)
 
 

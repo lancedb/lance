@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import io
+import sys
 from typing import Callable, Optional
 
 import PIL
@@ -57,10 +58,12 @@ class ObjectDetection(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
-        print("Training step: ", targets)
         loss_dict = self.backbond(images, targets)
-        print(loss_dict)
-        return loss_dict
+        loss = sum(loss for loss in loss_dict.values())
+        if torch.isinf(loss) or torch.isnan(loss):
+            print(f"Loss is {loss}, exit")
+            sys.exit(1)
+        return loss
 
     def configure_optimizers(self):
         optimizer = torch.optim.SGD(
