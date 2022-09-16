@@ -6,9 +6,12 @@ import os
 from collections import defaultdict
 
 import click
+import lance
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 from bench_utils import DatasetConverter
+from lance.types import ImageUriType, LabelType, Box2dType
 
 
 class CocoConverter(DatasetConverter):
@@ -65,8 +68,43 @@ class CocoConverter(DatasetConverter):
             return self._instances_to_df(split, json_data)
 
         df = pd.concat([read_split(split) for split in ["train", "val"]])
-        # df['date_captured'] = pd.to_datetime(df.date_captured)  # lance GH#98
+        df['date_captured'] = pd.to_datetime(df.date_captured)  # lance GH#98
         return df
+
+    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+        schema = self.get_schema()
+        arrays = []
+        for name, col in df.items():
+            field = schema.field(name)
+            arr = self._convert_field(field.type, col)
+            arrays.append(arr)
+        table = pa.Table.from_arrays(arrays, schema=schema)
+        return table
+
+    def _convert_field(self, typ, col):
+        if isinstance(typ, pa.ExtensionType):
+            storage = pa.array(col, type=typ.storage_type)
+            arr = pa.ExtensionArray.from_storage(typ, storage)
+        elif pa.types.is_list(typ):
+            native_arr = pa.array(col)
+            offsets = native_arr.offsets
+            return pa.ListArray.from_arrays(
+                offsets, self._convert_field(
+                    typ.value_type,
+                    native_arr.values.to_numpy(zero_copy_only=False)))
+        elif pa.types.is_struct(typ):
+            native_arr = pa.array(col)
+            arrays = []
+            for subfield in typ:
+                subarray = self._convert_field(
+                    subfield.type,
+                    native_arr.field(subfield.name).to_numpy(
+                        zero_copy_only=False))
+                arrays.append(subarray)
+            return pa.StructArray.from_arrays(arrays, fields=typ)
+        else:
+            arr = pa.array(col, type=typ)
+        return arr
 
     def image_uris(self, table):
         return table["image_uri"].to_numpy()
@@ -88,14 +126,14 @@ class CocoConverter(DatasetConverter):
         types = [
             pa.int64(),
             pa.utf8(),
-            pa.utf8(),
+            ImageUriType(),
             pa.int64(),
             pa.int64(),
-            pa.utf8(),
-            pa.utf8(),
+            pa.timestamp('ns'),
+            ImageUriType(),
             pa.int64(),
-            pa.dictionary(pa.uint8(), pa.utf8()),
-            pa.utf8(),
+            LabelType(),
+            ImageUriType(),
             self._ann_schema(),
         ]
         return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
@@ -104,16 +142,9 @@ class CocoConverter(DatasetConverter):
     def _ann_schema():
         segmentation_type = pa.struct(
             [
-                pa.field("polygon", pa.list_(pa.list_(pa.int32()))),
-                pa.field(
-                    "coco_rle",
-                    pa.struct(
-                        [
-                            pa.field("counts", pa.list_(pa.int32())),
-                            pa.field("size", pa.list_(pa.int32())),
-                        ]
-                    ),
-                ),
+                pa.field("counts", pa.list_(pa.int32())),
+                pa.field("polygon", pa.list_(pa.list_(pa.float32()))),
+                pa.field("size", pa.list_(pa.int32())),
             ]
         )
         names = [
@@ -124,17 +155,17 @@ class CocoConverter(DatasetConverter):
             "category_id",
             "id",
             "supercategory",
-            "name",
+            "name",  # category_id
         ]
         types = [
             segmentation_type,
             pa.float64(),
             pa.bool_(),
-            pa.list_(pa.float32()),
+            Box2dType(),
             pa.int16(),
             pa.int64(),
-            pa.dictionary(pa.uint8(), pa.utf8()),
-            pa.dictionary(pa.uint8(), pa.utf8()),
+            LabelType(),
+            LabelType()
         ]
         schema = pa.struct(
             [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]

@@ -223,7 +223,7 @@ class DatasetConverter(ABC):
 
     def save_df(self, df, fmt="lance", output_path=None):
         output_path = output_path or self.default_dataset_path(fmt, "links")
-        table = pa.Table.from_pandas(df, self.get_schema()).unify_dictionaries()
+        table = self._convert_metadata_df(df)
         if fmt == "parquet":
             pq.write_table(table, output_path)
         elif fmt == "lance":
@@ -233,6 +233,9 @@ class DatasetConverter(ABC):
                 format=lance.LanceFileFormat(),
             )
         return table
+
+    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+        return pa.Table.from_pandas(df, self.get_schema()).unify_dictionaries()
 
     @abstractmethod
     def image_uris(self, table):
@@ -246,8 +249,7 @@ class DatasetConverter(ABC):
         **kwargs,
     ):
         if isinstance(table, pd.DataFrame):
-            table = pa.Table.from_pandas(table, self.get_schema())
-        table = table.unify_dictionaries()
+            table = self._convert_metadata_df(table)
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))

@@ -36,7 +36,7 @@ class LabelType(LanceType):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, type_self, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return LabelType()
 
 
