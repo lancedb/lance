@@ -34,10 +34,10 @@ def prepare_target(*args):
 transform = T.Compose(
     [
         prepare_target,
-        T.RandomPhotometricDistort(),
-        T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
-        T.RandomIoUCrop(),
-        T.RandomHorizontalFlip(),
+#        T.RandomPhotometricDistort(),
+ #       T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
+ #       T.RandomIoUCrop(),
+    #    T.RandomHorizontalFlip(),
         T.PILToTensor(),
         T.ConvertImageDtype(torch.float),
     ]
@@ -56,7 +56,11 @@ transform = T.Compose(
     help="set how many epoch to run",
 )
 @click.option(
-    "-w", "--num_workers", default=os.cpu_count(), help="set Pytorch DataLoader workers"
+    "-w",
+    "--num_workers",
+    default=os.cpu_count(),
+    help="set Pytorch DataLoader workers",
+    show_default=True,
 )
 @click.option(
     "-m",
@@ -85,15 +89,15 @@ def train(
         dataset = lance.pytorch.data.LanceDataset(
             uri,
             columns=["image", "annotations.category_id", "annotations.bbox"],
-            batch_size=batch_size,
+            batch_size=64,
             transform=transform,
             # filter=(pc.field("split") == "train")
         )
-        dp = IterableWrapper(dataset).shuffle()
+        dp = IterableWrapper(dataset).shuffle(buffer_size=64)
         train_loader = torch.utils.data.DataLoader(
             dp,
-            num_workers=num_workers,
-            batch_size=None,
+            num_workers=2,
+            batch_size=4,
             collate_fn=collate_fn,
         )
     elif data_format == "raw":
@@ -117,7 +121,8 @@ def train(
         auto_lr_find=True,
     )
     model = ObjectDetection()
-    trainer.tune(model, train_dataloaders=train_loader)
+    #trainer.tune(model, train_dataloaders=train_loader)
+    trainer.fit(model, train_dataloaders=train_loader)
 
 
 if __name__ == "__main__":

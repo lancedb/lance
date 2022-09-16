@@ -11,25 +11,15 @@ import transforms as T
 
 
 def collate_fn(batch):
-    # Collate for training
-    # TODO: consider what can be auto inferred.
-    #
-    target = []
-    # https://pytorch.org/vision/stable/models/generated/torchvision.models.detection.ssd300_vgg16.html\
-    #   #torchvision.models.detection.ssd300_vgg16
-    print(batch[1])
-    for raw_annotation in batch[1]:
-        labels, boxes = [], []
-        for elem in raw_annotation:
-            labels.append(elem["category_id"])
-            boxes.append(elem["bbox"])
-        annotations = {
-            "labels": torch.tensor(labels),
-            "boxes": torch.tensor(boxes)
-        }
-        target.append(annotations)
-    images = batch[0]
-    return images, target
+    if not isinstance(batch, list):
+        # In case setting DataLoader.batch_size=None
+        batch = [batch]
+    images = []
+    targets = []
+    for record in batch:
+        images.append(record[0])
+        targets.append(record[1])
+    return images, targets
 
 
 class RawCocoDataset(torch.utils.data.Dataset):
@@ -63,11 +53,13 @@ class ObjectDetection(pl.LightningModule):
     def __init__(self):
         super().__init__()
         self.backbond = torchvision.models.detection.ssd300_vgg16()
-        self.lr = 0
+        self.lr = 0.1
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
+        print("Training step: ", targets)
         loss_dict = self.backbond(images, targets)
+        print(loss_dict)
         return loss_dict
 
     def configure_optimizers(self):
