@@ -268,18 +268,29 @@ class ImageUriScalar(pa.ExtensionScalar):
 class ImageArray(pa.ExtensionArray):
     @staticmethod
     def from_pandas(obj, mask=None, type=None, safe=True, memory_pool=None):
-        if len(obj) > 0:
+        if isinstance(obj, pa.ChunkedArray):
+            chunks = [ImageArray.from_pandas(c) for c in obj.chunks]
+            return pa.chunked_array(chunks, chunks[0].type)
+
+        if isinstance(obj, pa.Array):
+            if pa.types.is_binary(obj.type):
+                return ImageArray.from_storage(ImageBinary.DTYPE, obj)
+            elif pa.types.is_string(obj.type):
+                return ImageArray.from_storage(ImageUri.DTYPE, obj)
+
+        if isinstance(obj, (list, tuple, np.ndarray)) and len(obj) > 0:
             first = obj[0]
             if isinstance(first, Image):
                 return ImageArray.from_images(obj, mask, type, safe, memory_pool)
             elif isinstance(first, bytes):
-                return ImageArray.from_storage(
-                    ImageBinaryType(), pa.array(obj, type=pa.binary())
-                )
+                storage = pa.array(obj, mask=mask, type=pa.binary(),
+                                   safe=safe, memory_pool=memory_pool)
+                return ImageArray.from_pandas(storage)
             elif isinstance(first, str):
-                return ImageArray.from_storage(
-                    ImageUriType(), pa.array(obj, type=pa.string())
-                )
+                storage = pa.array(obj, mask=mask, type=pa.string(),
+                                   safe=safe, memory_pool=memory_pool)
+                return ImageArray.from_pandas(storage)
+
         return pa.ExtensionArray.from_pandas(
             obj, mask=mask, type=type, safe=safe, memory_pool=memory_pool
         )

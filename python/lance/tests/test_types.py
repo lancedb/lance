@@ -59,6 +59,15 @@ def test_image_array():
     assert isinstance(from_images.to_pylist()[0], Image)
 
 
+def test_image_array_chunks():
+    images = [pa.array(["uri1", "uri2"]),
+              pa.array(["uri3", "uri4"])]
+    chunks = pa.chunked_array(images, pa.string())
+    arr = ImageArray.from_pandas(chunks)
+    assert isinstance(arr, pa.ChunkedArray)
+    assert isinstance(arr.chunks[0], ImageArray)
+
+
 def _test_image(tmp_path, storage):
     image_type = ImageType.from_storage(storage.type)
     ext_arr = _test_extension_rt(tmp_path, image_type, storage)
