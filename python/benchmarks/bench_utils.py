@@ -252,8 +252,14 @@ class DatasetConverter(ABC):
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         # TODO: improve ext type ergonomic
-        arr = pa.ExtensionArray.from_storage(ImageBinaryType(), pa.array(images))
-        embedded = table.append_column(pa.field("image", ImageBinaryType()), arr)
+        storage_arr = pa.array(images)
+        if isinstance(storage_arr, pa.ChunkedArray):
+            # With large dataset, pa.array() returns ChunkedArray instead.
+            storage_arrs = storage_arr.chunks
+        else:
+            storage_arrs = [storage_arr]
+        chunked_image_arrs = [pa.ExtensionArray.from_storage(ImageBinaryType(), arr) for arr in storage_arrs]
+        embedded = table.append_column(pa.field("image", ImageBinaryType()), chunked_image_arrs)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":
