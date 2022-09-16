@@ -313,6 +313,7 @@ class ImageArray(pa.ExtensionArray):
                 storage = pa.array(obj, mask=mask, type=pa.string(),
                                    safe=safe, memory_pool=memory_pool)
                 return ImageArray.from_pandas(storage)
+            
         return pa.ExtensionArray.from_pandas(
             obj, mask=mask, type=type, safe=safe, memory_pool=memory_pool
         )
