@@ -17,6 +17,7 @@ def collate_fn(batch):
     target = []
     # https://pytorch.org/vision/stable/models/generated/torchvision.models.detection.ssd300_vgg16.html\
     #   #torchvision.models.detection.ssd300_vgg16
+    print(batch[1])
     for raw_annotation in batch[1]:
         labels, boxes = [], []
         for elem in raw_annotation:
