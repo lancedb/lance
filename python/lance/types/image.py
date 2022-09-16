@@ -47,6 +47,9 @@ class ImageType(LanceType, ABC):
         else:
             raise NotImplementedError(f"Unrecognized image storage type {storage_type}")
 
+    def __arrow_ext_class__(self):
+        return ImageArray
+
 
 class ImageUriType(ImageType):
     """
@@ -139,11 +142,38 @@ class Image(ABC):
         """Write this image to the given uri and return the new Image"""
         pass
 
+    @abstractmethod
+    def to_arrow_storage(self):
+        """Get the Arrow scalar storage value"""
+        pass
+
+    @property
+    @abstractmethod
+    def arrow_dtype(self):
+        """Return the Arrow Extension dtype"""
+        pass
+
+    def display(self, **kwargs):
+        """Return the jupyter compatible viz for this image"""
+        import base64
+        from IPython.display import Image as IPyImage
+
+        with self.open() as fobj:
+            data = fobj.read()
+            inferred_format = IPyImage(data).format
+            encoded = base64.b64encode(data).decode("utf-8")
+            url = f"data:image;base64,{encoded}"
+            return IPyImage(url=url, format=inferred_format)
+
+    def _repr_mimebundle_(self, include=None, exclude=None):
+        return self.display()._repr_mimebundle_(include=include, exclude=exclude)
+
 
 class ImageBinary(Image):
     """
     An In-memory Image
     """
+    DTYPE = ImageBinaryType()
 
     def __init__(self, data: bytes):
         self._bytes = data
@@ -173,11 +203,19 @@ class ImageBinary(Image):
     def __repr__(self):
         return "Image(<embedded>)"
 
+    def to_arrow_storage(self):
+        return self.bytes
+
+    @property
+    def arrow_dtype(self):
+        return ImageBinary.DTYPE
+
 
 class ImageUri(Image):
     """
     An externalized image represented by its uri
     """
+    DTYPE = ImageUriType()
 
     def __init__(self, uri: str):
         self._uri = uri
@@ -205,6 +243,13 @@ class ImageUri(Image):
     def __repr__(self):
         return f"Image({self.uri})"
 
+    def to_arrow_storage(self):
+        return self.uri
+
+    @property
+    def arrow_dtype(self):
+        return ImageUri.DTYPE
+
 
 class ImageBinaryScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
@@ -218,3 +263,59 @@ class ImageUriScalar(pa.ExtensionScalar):
 
     def as_py(self) -> Image:
         return ImageUri(self.value.as_py())
+
+
+class ImageArray(pa.ExtensionArray):
+    @staticmethod
+    def from_pandas(obj, mask=None, type=None, safe=True, memory_pool=None):
+        if len(obj) > 0:
+            first = obj[0]
+            if isinstance(first, Image):
+                return ImageArray.from_images(obj, mask, type, safe, memory_pool)
+            elif isinstance(first, bytes):
+                return ImageArray.from_storage(
+                    ImageBinaryType(), pa.array(obj, type=pa.binary())
+                )
+            elif isinstance(first, str):
+                return ImageArray.from_storage(
+                    ImageUriType(), pa.array(obj, type=pa.string())
+                )
+        return pa.ExtensionArray.from_pandas(
+            obj, mask=mask, type=type, safe=safe, memory_pool=memory_pool
+        )
+
+    @staticmethod
+    def from_images(images, type=None, mask=None, safe=True, memory_pool=None):
+        """
+        Create an ImageUriArray from Image instances
+        Parameters
+        ----------
+        images : sequence of Image
+        type : DataType, default None
+            If not specified then use the arrow_dtype of the first Image
+            instance
+        mask : array[bool], optional
+            Indicate which values are null (True) or not null (False).
+        safe : bool, default True
+            Check for overflows or other unsafe conversions.
+        memory_pool : pyarrow.MemoryPool, optional
+            If not passed, will allocate memory from the currently-set default
+            memory pool.
+        """
+        if len(images) > 0:
+            type = images[0].arrow_dtype
+            storage = pa.array(
+                [im.to_arrow_storage() for im in images],
+                mask=mask,
+                safe=safe,
+                memory_pool=memory_pool,
+            )
+        else:
+            storage = pa.array(images, type=type)
+        return pa.ExtensionArray.from_storage(type, storage)
+
+
+def _ensure_type(images, typ):
+    for im in images:
+        if not isinstance(im, typ):
+            raise TypeError(f"Expecting {typ} but got {type(im)}")
