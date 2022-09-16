@@ -268,6 +268,29 @@ class ImageUriScalar(pa.ExtensionScalar):
 class ImageArray(pa.ExtensionArray):
     @staticmethod
     def from_pandas(obj, mask=None, type=None, safe=True, memory_pool=None):
+        """
+        Create an ImageArray instance from a variety of formats. Specifically
+        this knows how to convert sequence of Image instances to ImageArray
+
+        Parameters
+        ----------
+        obj : ndarray, pandas.Series, array-like
+        mask : array (boolean), optional
+            Indicate which values are null (True) or not null (False).
+        type : pyarrow.DataType
+            Explicit type to attempt to coerce to, otherwise will be inferred
+            from the data.
+        safe : bool, default True
+            Check for overflows or other unsafe conversions.
+        memory_pool : pyarrow.MemoryPool, optional
+            If not passed, will allocate memory from the currently-set default
+            memory pool.
+
+        Returns
+        -------
+        array : pyarrow.Array or pyarrow.ChunkedArray
+            ChunkedArray is returned if object data overflows binary buffer.
+        """
         if isinstance(obj, pa.ChunkedArray):
             chunks = [ImageArray.from_pandas(c) for c in obj.chunks]
             return pa.chunked_array(chunks, chunks[0].type)
@@ -298,10 +321,11 @@ class ImageArray(pa.ExtensionArray):
     @staticmethod
     def from_images(images, type=None, mask=None, safe=True, memory_pool=None):
         """
-        Create an ImageUriArray from Image instances
+        Create an ImageArray from Image instances
+
         Parameters
         ----------
-        images : sequence of Image
+        images : sequence / iterable / ndarray / pandas.Series of Image
         type : DataType, default None
             If not specified then use the arrow_dtype of the first Image
             instance
@@ -316,13 +340,14 @@ class ImageArray(pa.ExtensionArray):
         if len(images) > 0:
             type = images[0].arrow_dtype
             storage = pa.array(
-                [im.to_arrow_storage() for im in images],
+                [im.to_arrow_storage() if im is not None else None for im in images],
                 mask=mask,
                 safe=safe,
                 memory_pool=memory_pool,
             )
         else:
-            storage = pa.array(images, type=type)
+            storage = pa.array([], type=type, mask=mask,
+                               safe=safe, memory_pool=memory_pool)
         return pa.ExtensionArray.from_storage(type, storage)
 
 
