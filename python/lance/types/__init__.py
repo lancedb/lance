@@ -21,6 +21,7 @@ from lance.types.base import Point2dType
 from lance.types.box import Box2dArray, Box2dType
 from lance.types.image import (
     Image,
+    ImageArray,
     ImageBinary,
     ImageBinaryType,
     ImageType,

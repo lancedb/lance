@@ -23,6 +23,7 @@ from lance.types import (
     Box2dArray,
     Box2dType,
     Image,
+    ImageArray,
     ImageBinary,
     ImageType,
     ImageUri,
@@ -38,15 +39,43 @@ if platform.system() != "Linux":
 def test_image(tmp_path):
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
-    image_type = ImageType.from_storage(storage.type)
-    _test_extension_rt(tmp_path, image_type, storage)
+    _test_image(tmp_path, storage)
 
 
 def test_image_binary(tmp_path):
     data = [b"<imagebytes>" for x in ["a", "b", "c"]]
-    storage = pa.StringArray.from_pandas(data)
+    storage = pa.BinaryArray.from_pandas(data)
+    _test_image(tmp_path, storage)
+
+
+def test_image_array():
+    images = [Image.create(x) for x in ["uri1", "uri2"]]
+    from_images = ImageArray.from_images(images)
+    from_pandas = ImageArray.from_pandas(images)
+    from_pandas_storage = ImageArray.from_pandas([x.uri for x in images])
+    assert from_images == from_pandas
+    assert from_pandas == from_pandas_storage
+    assert isinstance(from_images, ImageArray)
+    assert isinstance(from_images.to_pylist()[0], Image)
+
+
+def test_image_array_chunks():
+    images = [pa.array(["uri1", "uri2"]),
+              pa.array(["uri3", "uri4"])]
+    chunks = pa.chunked_array(images, pa.string())
+    arr = ImageArray.from_pandas(chunks)
+    assert isinstance(arr, pa.ChunkedArray)
+    assert isinstance(arr.chunks[0], ImageArray)
+
+
+def _test_image(tmp_path, storage):
     image_type = ImageType.from_storage(storage.type)
-    _test_extension_rt(tmp_path, image_type, storage)
+    ext_arr = _test_extension_rt(tmp_path, image_type, storage)
+    assert len(ext_arr.chunks) == 1
+    ext_arr = ext_arr.chunks[0]
+    assert isinstance(ext_arr, ImageArray)
+    expected_arr = ImageArray.from_pandas(storage.to_pylist())
+    assert ext_arr == expected_arr
 
 
 def test_point(tmp_path):

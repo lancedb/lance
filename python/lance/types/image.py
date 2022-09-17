@@ -47,6 +47,9 @@ class ImageType(LanceType, ABC):
         else:
             raise NotImplementedError(f"Unrecognized image storage type {storage_type}")
 
+    def __arrow_ext_class__(self):
+        return ImageArray
+
 
 class ImageUriType(ImageType):
     """
@@ -139,11 +142,38 @@ class Image(ABC):
         """Write this image to the given uri and return the new Image"""
         pass
 
+    @abstractmethod
+    def to_arrow_storage(self):
+        """Get the Arrow scalar storage value"""
+        pass
+
+    @property
+    @abstractmethod
+    def arrow_dtype(self):
+        """Return the Arrow Extension dtype"""
+        pass
+
+    def display(self, **kwargs):
+        """Return the jupyter compatible viz for this image"""
+        import base64
+        from IPython.display import Image as IPyImage
+
+        with self.open() as fobj:
+            data = fobj.read()
+            inferred_format = IPyImage(data).format
+            encoded = base64.b64encode(data).decode("utf-8")
+            url = f"data:image;base64,{encoded}"
+            return IPyImage(url=url, format=inferred_format)
+
+    def _repr_mimebundle_(self, include=None, exclude=None):
+        return self.display()._repr_mimebundle_(include=include, exclude=exclude)
+
 
 class ImageBinary(Image):
     """
     An In-memory Image
     """
+    DTYPE = ImageBinaryType()
 
     def __init__(self, data: bytes):
         self._bytes = data
@@ -173,11 +203,19 @@ class ImageBinary(Image):
     def __repr__(self):
         return "Image(<embedded>)"
 
+    def to_arrow_storage(self):
+        return self.bytes
+
+    @property
+    def arrow_dtype(self):
+        return ImageBinary.DTYPE
+
 
 class ImageUri(Image):
     """
     An externalized image represented by its uri
     """
+    DTYPE = ImageUriType()
 
     def __init__(self, uri: str):
         self._uri = uri
@@ -205,6 +243,13 @@ class ImageUri(Image):
     def __repr__(self):
         return f"Image({self.uri})"
 
+    def to_arrow_storage(self):
+        return self.uri
+
+    @property
+    def arrow_dtype(self):
+        return ImageUri.DTYPE
+
 
 class ImageBinaryScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
@@ -218,3 +263,95 @@ class ImageUriScalar(pa.ExtensionScalar):
 
     def as_py(self) -> Image:
         return ImageUri(self.value.as_py())
+
+
+class ImageArray(pa.ExtensionArray):
+    @staticmethod
+    def from_pandas(obj, mask=None, type=None, safe=True, memory_pool=None):
+        """
+        Create an ImageArray instance from a variety of formats. Specifically
+        this knows how to convert sequence of Image instances to ImageArray
+
+        Parameters
+        ----------
+        obj : ndarray, pandas.Series, array-like
+        mask : array (boolean), optional
+            Indicate which values are null (True) or not null (False).
+        type : pyarrow.DataType
+            Explicit type to attempt to coerce to, otherwise will be inferred
+            from the data.
+        safe : bool, default True
+            Check for overflows or other unsafe conversions.
+        memory_pool : pyarrow.MemoryPool, optional
+            If not passed, will allocate memory from the currently-set default
+            memory pool.
+
+        Returns
+        -------
+        array : pyarrow.Array or pyarrow.ChunkedArray
+            ChunkedArray is returned if object data overflows binary buffer.
+        """
+        if isinstance(obj, pa.ChunkedArray):
+            chunks = [ImageArray.from_pandas(c) for c in obj.chunks]
+            return pa.chunked_array(chunks, chunks[0].type)
+
+        if isinstance(obj, pa.Array):
+            if pa.types.is_binary(obj.type):
+                return ImageArray.from_storage(ImageBinary.DTYPE, obj)
+            elif pa.types.is_string(obj.type):
+                return ImageArray.from_storage(ImageUri.DTYPE, obj)
+
+        if isinstance(obj, (list, tuple, np.ndarray)) and len(obj) > 0:
+            first = obj[0]
+            if isinstance(first, Image):
+                return ImageArray.from_images(obj, mask, type, safe, memory_pool)
+            elif isinstance(first, bytes):
+                storage = pa.array(obj, mask=mask, type=pa.binary(),
+                                   safe=safe, memory_pool=memory_pool)
+                return ImageArray.from_pandas(storage)
+            elif isinstance(first, str):
+                storage = pa.array(obj, mask=mask, type=pa.string(),
+                                   safe=safe, memory_pool=memory_pool)
+                return ImageArray.from_pandas(storage)
+
+        return pa.ExtensionArray.from_pandas(
+            obj, mask=mask, type=type, safe=safe, memory_pool=memory_pool
+        )
+
+    @staticmethod
+    def from_images(images, type=None, mask=None, safe=True, memory_pool=None):
+        """
+        Create an ImageArray from Image instances
+
+        Parameters
+        ----------
+        images : sequence / iterable / ndarray / pandas.Series of Image
+        type : DataType, default None
+            If not specified then use the arrow_dtype of the first Image
+            instance
+        mask : array[bool], optional
+            Indicate which values are null (True) or not null (False).
+        safe : bool, default True
+            Check for overflows or other unsafe conversions.
+        memory_pool : pyarrow.MemoryPool, optional
+            If not passed, will allocate memory from the currently-set default
+            memory pool.
+        """
+        if len(images) > 0:
+            type = images[0].arrow_dtype
+            storage = pa.array(
+                [im.to_arrow_storage() if im is not None else None for im in images],
+                mask=mask,
+                safe=safe,
+                memory_pool=memory_pool,
+            )
+        else:
+            storage = pa.array([], type=type, mask=mask,
+                               safe=safe, memory_pool=memory_pool)
+        return pa.ExtensionArray.from_storage(type, storage)
+
+
+def _ensure_type(images, typ):
+    for im in images:
+        if not isinstance(im, typ):
+            raise TypeError(f"Expecting {typ} but got {type(im)}")

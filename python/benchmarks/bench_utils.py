@@ -30,7 +30,7 @@ import pyarrow.parquet as pq
 from urllib.parse import urlparse
 
 import lance
-from lance.types.image import Image, ImageBinaryType
+from lance.types.image import Image, ImageArray, ImageBinaryType
 
 __all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
@@ -251,15 +251,9 @@ class DatasetConverter(ABC):
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
-        # TODO: improve ext type ergonomic
-        storage_arr = pa.array(images)
-        if isinstance(storage_arr, pa.ChunkedArray):
-            # With large dataset, pa.array() returns ChunkedArray instead.
-            storage_arrs = storage_arr.chunks
-        else:
-            storage_arrs = [storage_arr]
-        chunked_image_arrs = [pa.ExtensionArray.from_storage(ImageBinaryType(), arr) for arr in storage_arrs]
-        embedded = table.append_column(pa.field("image", ImageBinaryType()), chunked_image_arrs)
+        image_arr = ImageArray.from_pandas(images)
+        embedded = table.append_column(pa.field("image", ImageBinaryType()),
+                                       image_arr)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":

@@ -156,7 +156,7 @@ def _aggregate_annotations(annotations):
     return ret
 
 
-@click.command
+@click.command()
 @click.option("-u", "--base-uri", type=str, help="Coco dataset root")
 @click.option(
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
