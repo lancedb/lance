@@ -73,6 +73,8 @@ class LabelArray(pa.ExtensionArray):
             1
           ]
         """
+        if isinstance(values, pa.Array):
+            values = values.to_numpy(False)
         cat = pd.Categorical(values, categories=dictionary)
         storage = pa.DictionaryArray.from_arrays(
             cat.codes, dictionary, from_pandas=True

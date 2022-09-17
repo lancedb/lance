@@ -176,7 +176,3 @@ def test_pickle(tmp_path):
         pickle.dump(img, fh)
     with (tmp_path / "image").open("rb") as fh:
         assert img == pickle.load(fh)
-
-
-def test_image_array(tmp_path):
-    pass
