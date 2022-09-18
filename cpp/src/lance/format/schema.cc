@@ -183,7 +183,8 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 }
 
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
-  assert(::arrow::is_dictionary(type()->id()));
+  auto data_type = storage_type();
+  assert(::arrow::is_dictionary(type()->storage_id()));
   auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
   assert(dict_type->value_type()->Equals(::arrow::utf8()));
 
@@ -222,14 +223,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   std::shared_ptr<lance::encodings::Decoder> decoder;
-  auto data_type = type();
-  auto storage_type = data_type;
-
-  if (lance::arrow::is_extension(data_type)) {
-    storage_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(data_type)->storage_type();
-    assert (storage_type != nullptr);
-  }
-
+  auto data_type = storage_type();
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
@@ -241,18 +235,18 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
                data_type->id() == ::arrow::Date32Type::type_id) {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else {
-      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, storage_type);
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, data_type);
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
       decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(
-          infile, storage_type);
+          infile, data_type);
     } else if (logical_type_ == "binary") {
       decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(
-          infile, storage_type);
+          infile, data_type);
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
-    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(storage_type);
+    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(data_type);
     if (!dictionary()) {
       {
         std::scoped_lock lock(lock_);
@@ -327,6 +321,14 @@ std::shared_ptr<::arrow::DataType> Field::type() const {
   } else {
     return lance::arrow::FromLogicalType(logical_type_).ValueOrDie();
   }
+}
+
+std::shared_ptr<::arrow::DataType> Field::storage_type() const {
+  auto data_type = type();
+  if (lance::arrow::is_extension(data_type)) {
+    return std::dynamic_pointer_cast<::arrow::ExtensionType>(data_type)->storage_type();
+  }
+  return data_type;
 }
 
 int32_t Field::id() const { return id_; }
