@@ -62,9 +62,9 @@ namespace lance::io {
     std::shared_ptr<::arrow::io::RandomAccessFile> in,
     std::shared_ptr<::lance::format::Manifest> manifest,
     ::arrow::MemoryPool* pool) {
-    auto reader = std::make_unique<FileReader>(in, manifest, pool);
-    ARROW_RETURN_NOT_OK(reader->Open());
-    return reader;
+  auto reader = std::make_unique<FileReader>(in, manifest, pool);
+  ARROW_RETURN_NOT_OK(reader->Open());
+  return reader;
 }
 
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
@@ -116,13 +116,9 @@ const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { r
 
 const lance::format::Metadata& FileReader::metadata() const { return *metadata_; }
 
-int64_t FileReader::length() const {
-  return metadata_->length();
-}
+int64_t FileReader::length() const { return metadata_->length(); }
 
-int32_t FileReader::num_batches() const {
-  return metadata_->num_batches();
-}
+int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetScalar(
     const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const {
@@ -315,13 +311,7 @@ int32_t FileReader::num_batches() const {
     int32_t batch_id,
     const ArrayReadParams& params) const {
   auto dtype = field->type();
-  /// If dtype is not extension type, the storage type is the same as dtype.
-  auto storage_type = dtype;
-  if (lance::arrow::is_extension(dtype)) {
-    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(dtype);
-    assert (ext_type != nullptr);
-    storage_type = ext_type->storage_type();
-  }
+  auto storage_type = field->storage_type();
 
   std::shared_ptr<::arrow::Array> storage_arr;
   if (is_struct(storage_type)) {
@@ -336,11 +326,7 @@ int32_t FileReader::num_batches() const {
   }
 
   if (lance::arrow::is_extension(dtype)) {
-    std::shared_ptr<::arrow::ExtensionType> ext_type =
-        ::arrow::GetExtensionType(field->extension_name());
-    if (ext_type != nullptr) {
-      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr);
-    }
+    return ::arrow::ExtensionType::WrapArray(dtype, storage_arr);
   }
   return storage_arr;
 }
@@ -397,7 +383,6 @@ int32_t FileReader::num_batches() const {
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
   int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
-  fmt::print("Get List field type: {}\n", field->field(0)->type()->ToString());
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));
