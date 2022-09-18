@@ -54,10 +54,12 @@ class FileWriter final : public ::arrow::dataset::FileWriter {
   ::arrow::Status WriteArray(const std::shared_ptr<format::Field>& field,
                              const std::shared_ptr<::arrow::Array>& arr);
 
-  /// Write fixed size array, including primitive arrays, fixed size binary array,
-  /// and fixed size list array.
-  ::arrow::Status WriteFixedSizedArray(const std::shared_ptr<format::Field>& field,
-                                       const std::shared_ptr<::arrow::Array>& arr);
+  /// Write Arrow Arrows with fixed length values, include:
+  ///  - primitive arrays
+  ///  - fixed sized binary array
+  ///  - fixed sized list array
+  ::arrow::Status WriteFixedLengthArray(const std::shared_ptr<format::Field>& field,
+                                        const std::shared_ptr<::arrow::Array>& arr);
 
   ::arrow::Status WriteStructArray(const std::shared_ptr<format::Field>& field,
                                    const std::shared_ptr<::arrow::Array>& arr);
