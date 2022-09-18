@@ -152,7 +152,7 @@ TEST_CASE("Fixed size binary") {
 
 TEST_CASE("Test storage type") {
   auto image_type = std::make_shared<lance::testing::ImageType>();
-  ::arrow::RegisterExtensionType(image_type);
+  CHECK(::arrow::RegisterExtensionType(image_type).ok());
   auto arrow_field = ::arrow::field("image", image_type);
   auto field = ::lance::format::Field(arrow_field);
 
@@ -165,7 +165,7 @@ TEST_CASE("Test storage type") {
 
 TEST_CASE("Test nested storage type") {
   auto annotation_type = std::make_shared<lance::testing::AnnotationType>();
-  ::arrow::RegisterExtensionType(annotation_type);
+  CHECK(::arrow::RegisterExtensionType(annotation_type).ok());
   auto arrow_field = ::arrow::field("annotation", annotation_type);
   auto field = ::lance::format::Field(arrow_field);
 
