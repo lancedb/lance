@@ -5,7 +5,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "lance/arrow/testing.h"
+#include "lance/testing/extension_types.h"
 
 const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
@@ -161,4 +161,26 @@ TEST_CASE("Test storage type") {
   CHECK(field.type()->Equals(image_type));
   INFO("Field storage type: " << field.storage_type()->ToString());
   CHECK(field.storage_type()->Equals(image_type->storage_type()));
+}
+
+TEST_CASE("Test nested storage type") {
+  auto annotation_type = std::make_shared<lance::testing::AnnotationType>();
+  ::arrow::RegisterExtensionType(annotation_type);
+  auto arrow_field = ::arrow::field("annotation", annotation_type);
+  auto field = ::lance::format::Field(arrow_field);
+
+  CHECK(field.is_extension_type());
+  INFO("Field data type: " << field.type()->ToString());
+  CHECK(field.type()->Equals(annotation_type));
+  INFO("Field storage type: " << field.storage_type()->ToString());
+  CHECK(field.storage_type()->Equals(::arrow::struct_({
+      ::arrow::field("class", ::arrow::int32()),
+      ::arrow::field("box",
+                     ::arrow::struct_({
+                         ::arrow::field("xmin", ::arrow::float64()),
+                         ::arrow::field("ymin", ::arrow::float64()),
+                         ::arrow::field("xmax", ::arrow::float64()),
+                         ::arrow::field("ymax", ::arrow::float64()),
+                     })),
+  })));
 }

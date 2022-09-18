@@ -26,10 +26,10 @@
 #include <string>
 #include <vector>
 
-#include "lance/arrow/testing.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
+#include "lance/testing/extension_types.h"
 #include "lance/testing/io.h"
 
 using arrow::ArrayBuilder;

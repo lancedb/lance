@@ -25,9 +25,9 @@
 #include <memory>
 
 #include "lance/arrow/stl.h"
-#include "lance/arrow/testing.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
+#include "lance/testing/extension_types.h"
 
 auto nested_schema = ::arrow::schema({::arrow::field("pk", ::arrow::int32()),
                                       ::arrow::field("objects",
