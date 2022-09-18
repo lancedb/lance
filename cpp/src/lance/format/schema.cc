@@ -54,6 +54,7 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
 }
 
 void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
+  auto type_id = dtype->id();
   if (::lance::arrow::is_struct(dtype)) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
@@ -64,10 +65,7 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
     encoding_ = pb::PLAIN;
-  }
-
-  auto type_id = dtype->id();
-  if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
+  } else if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = pb::VAR_BINARY;
   } else if (::arrow::is_primitive(type_id) || ::arrow::is_fixed_size_binary(type_id) ||
              lance::arrow::is_fixed_size_list(dtype)) {
@@ -310,6 +308,12 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
 };
 
 std::shared_ptr<::arrow::DataType> Field::type() const {
+  if (!extension_name_.empty()) {
+    auto ext_type = ::arrow::GetExtensionType(extension_name_);
+    if (ext_type) {
+      return ext_type;
+    }
+  }
   if (logical_type_ == "list") {
     assert(children_.size() == 1);
     return ::arrow::list(children_[0]->type());

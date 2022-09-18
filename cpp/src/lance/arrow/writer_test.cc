@@ -319,23 +319,52 @@ TEST_CASE("Write fixed size list") {
 
 std::shared_ptr<::arrow::Table> MakeTable() {
   auto ext_type = std::make_shared<::lance::testing::ImageType>();
-  auto uriBuilder = std::make_shared<::arrow::StringBuilder>();
-  auto dataBuilder = std::make_shared<::arrow::Int32Builder>();
-  auto imageBuilder = std::make_shared<::arrow::StructBuilder>(
+  auto uri_builder = std::make_shared<::arrow::StringBuilder>();
+  auto data_builder = std::make_shared<::arrow::Int32Builder>();
+  auto image_builder = std::make_shared<::arrow::StructBuilder>(
       ext_type->storage_type(),
       arrow::default_memory_pool(),
-      std::vector<std::shared_ptr<::arrow::ArrayBuilder>>({uriBuilder, dataBuilder}));
-  for (int i = 0; i < 4; i++) {
-    CHECK(imageBuilder->Append().ok());
-    CHECK(uriBuilder->Append(fmt::format("s3://{}", i)).ok());
-    CHECK(dataBuilder->Append(i).ok());
-  }
-  auto arr = imageBuilder->Finish().ValueOrDie();
-  INFO("array is " << arr->ToString());
+      std::vector<std::shared_ptr<::arrow::ArrayBuilder>>({uri_builder, data_builder}));
 
-  auto schema = ::arrow::schema({arrow::field("image_ext", ext_type)});
+  auto box_type = std::make_shared<::lance::testing::Box2dType>();
+  /// Value builders for xmin, ymin, xmax, ymax
+  std::vector<std::shared_ptr<::arrow::ArrayBuilder>> coor_builders;
+  for (int i = 0; i < 4; i++) {
+    coor_builders.emplace_back(std::make_shared<::arrow::DoubleBuilder>());
+  }
+  auto box_builder = std::make_shared<::arrow::StructBuilder>(
+      box_type->storage_type(), ::arrow::default_memory_pool(), coor_builders);
+  auto boxes_list_type = std::make_shared<::arrow::ListType>(box_type);
+  auto boxes_builder =
+      std::make_shared<::arrow::ListBuilder>(::arrow::default_memory_pool(), box_builder);
+
+  for (int i = 0; i < 4; i++) {
+    CHECK(image_builder->Append().ok());
+    CHECK(uri_builder->Append(fmt::format("s3://{}", i)).ok());
+    CHECK(data_builder->Append(i).ok());
+
+    CHECK(boxes_builder->Append().ok());
+    // Add five boxes per image
+    for (int j = 0; j < 5; j++) {
+      CHECK(box_builder->Append().ok());
+      for (auto& cood_builder : coor_builders) {
+        CHECK(std::dynamic_pointer_cast<::arrow::DoubleBuilder>(cood_builder)->Append(0.5).ok());
+      }
+    }
+  }
+  auto image_arr = image_builder->Finish().ValueOrDie();
+  auto boxes_arr =
+      std::dynamic_pointer_cast<::arrow::ListArray>(boxes_builder->Finish().ValueOrDie());
+  INFO("array is " << image_arr->ToString());
+
+  auto schema = ::arrow::schema(
+      {arrow::field("image_ext", ext_type), ::arrow::field("boxes", boxes_list_type)});
   std::vector<std::shared_ptr<::arrow::Array>> cols;
-  cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, arr));
+  cols.push_back(::arrow::ExtensionType::WrapArray(ext_type, image_arr));
+  cols.push_back(
+      ::arrow::ListArray::FromArrays(
+          *boxes_arr->offsets(), *::arrow::ExtensionType::WrapArray(box_type, boxes_arr->values()))
+          .ValueOrDie());
   return ::arrow::Table::Make(std::move(schema), std::move(cols));
 }
 
@@ -356,7 +385,7 @@ TEST_CASE("Write extension but read storage if not registered") {
   CHECK(image_field->logical_type() == "struct");
   CHECK(image_field->extension_name() == "");
   CHECK(!(image_field->is_extension_type()));
-  CHECK(lance_schema.GetFieldsCount() == 3);
+  CHECK(lance_schema.GetFieldsCount() == 9);
 }
 
 TEST_CASE("Extension type round-trip") {
@@ -368,6 +397,7 @@ TEST_CASE("Extension type round-trip") {
 
   // We can read it back without the extension
   auto actual_table = ReadTable(sink);
+  INFO("Actual table: " << actual_table->ToString() << "\nExpected table: " << table->ToString());
   CHECK(table->Equals(*actual_table));
 }
 

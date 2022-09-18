@@ -393,6 +393,7 @@ int32_t FileReader::num_batches() const {
   auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
   int32_t start_pos = offsets->Value(0);
   int32_t array_length = offsets->Value(offsets_arr->length() - 1) - start_pos;
+  fmt::print("Get List field type: {}\n", field->field(0)->type()->ToString());
   ARROW_ASSIGN_OR_RAISE(
       auto values,
       GetArray(field->fields()[0], batch_id, ArrayReadParams(start_pos, array_length)));

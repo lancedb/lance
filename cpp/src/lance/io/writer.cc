@@ -89,6 +89,10 @@ FileWriter::~FileWriter() {}
     return WriteArray(field, ext_array->storage());
   }
 
+  fmt::print("Field(name={}): type->id={} arr->type_id={}\n",
+             field->name(),
+             field->type()->id(),
+             arr->type_id());
   assert(field->type()->id() == arr->type_id());
   if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
       ::arrow::is_large_binary_like(arr->type_id()) ||
