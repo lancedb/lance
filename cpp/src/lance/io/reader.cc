@@ -62,9 +62,9 @@ namespace lance::io {
     std::shared_ptr<::arrow::io::RandomAccessFile> in,
     std::shared_ptr<::lance::format::Manifest> manifest,
     ::arrow::MemoryPool* pool) {
-    auto reader = std::make_unique<FileReader>(in, manifest, pool);
-    ARROW_RETURN_NOT_OK(reader->Open());
-    return reader;
+  auto reader = std::make_unique<FileReader>(in, manifest, pool);
+  ARROW_RETURN_NOT_OK(reader->Open());
+  return reader;
 }
 
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
@@ -116,13 +116,9 @@ const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { r
 
 const lance::format::Metadata& FileReader::metadata() const { return *metadata_; }
 
-int64_t FileReader::length() const {
-  return metadata_->length();
-}
+int64_t FileReader::length() const { return metadata_->length(); }
 
-int32_t FileReader::num_batches() const {
-  return metadata_->num_batches();
-}
+int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetScalar(
     const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const {
@@ -315,28 +311,22 @@ int32_t FileReader::num_batches() const {
     int32_t batch_id,
     const ArrayReadParams& params) const {
   auto dtype = field->type();
-  Result<std::shared_ptr<::arrow::Array>> storage_arr;
-  if (is_struct(dtype)) {
-    storage_arr = GetStructArray(field, batch_id, params);
-  } else if (is_list(dtype)) {
-    storage_arr = GetListArray(field, batch_id, params);
-  } else if (::arrow::is_dictionary(dtype->id())) {
-    storage_arr = GetDictionaryArray(field, batch_id, params);
+  auto storage_type = field->storage_type();
+
+  std::shared_ptr<::arrow::Array> storage_arr;
+  if (is_struct(storage_type)) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetStructArray(field, batch_id, params));
+  } else if (is_list(storage_type)) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetListArray(field, batch_id, params));
+  } else if (::arrow::is_dictionary(storage_type->id())) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetDictionaryArray(field, batch_id, params));
   } else {
     ARROW_ASSIGN_OR_RAISE(auto primitive_arr, GetPrimitiveArray(field, batch_id, params));
-    storage_arr = primitive_arr->View(dtype);
+    ARROW_ASSIGN_OR_RAISE(storage_arr, primitive_arr->View(storage_type));
   }
 
-  if (!storage_arr.ok()) {
-    return storage_arr;
-  }
-
-  if (field->is_extension_type()) {
-    std::shared_ptr<::arrow::ExtensionType> ext_type =
-        ::arrow::GetExtensionType(field->extension_name());
-    if (ext_type != nullptr && storage_arr.ok()) {
-      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
-    }
+  if (lance::arrow::is_extension(dtype)) {
+    return ::arrow::ExtensionType::WrapArray(dtype, storage_arr);
   }
   return storage_arr;
 }

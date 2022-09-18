@@ -46,7 +46,7 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       extension_name_(arrow::GetExtensionName(field->type()).value_or("")),
       encoding_(pb::NONE) {
   if (is_extension_type()) {
-    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
+    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(field->type());
     Init(ext_type->storage_type());
   } else {
     Init(field->type());
@@ -54,6 +54,7 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
 }
 
 void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
+  auto type_id = dtype->id();
   if (::lance::arrow::is_struct(dtype)) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
@@ -64,10 +65,7 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
     encoding_ = pb::PLAIN;
-  }
-
-  auto type_id = dtype->id();
-  if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
+  } else if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = pb::VAR_BINARY;
   } else if (::arrow::is_primitive(type_id) || ::arrow::is_fixed_size_binary(type_id) ||
              lance::arrow::is_fixed_size_list(dtype)) {
@@ -185,8 +183,9 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 }
 
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
-  assert(::arrow::is_dictionary(type()->id()));
-  auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(type());
+  auto data_type = storage_type();
+  assert(::arrow::is_dictionary(data_type->storage_id()));
+  auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(data_type);
   assert(dict_type->value_type()->Equals(::arrow::utf8()));
 
   auto decoder =
@@ -224,7 +223,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> Field::GetDecoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   std::shared_ptr<lance::encodings::Decoder> decoder;
-  auto data_type = type();
+  auto data_type = storage_type();
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
@@ -236,22 +235,21 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
                data_type->id() == ::arrow::Date32Type::type_id) {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else {
-      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, data_type);
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
-      decoder =
-          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile, type());
+      decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(
+          infile, data_type);
     } else if (logical_type_ == "binary") {
-      decoder =
-          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile, type());
+      decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(
+          infile, data_type);
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
-    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
+    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(data_type);
     if (!dictionary()) {
       {
         std::scoped_lock lock(lock_);
-        fmt::print("Loading dictionary for field {} this={}\n", name_, fmt::ptr(this));
         if (!dictionary()) {
           /// Fetch dictionary on demand?
           ARROW_RETURN_NOT_OK(LoadDictionary(infile));
@@ -276,15 +274,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   }
 }
 
-std::shared_ptr<::arrow::Field> Field::ToArrow() const {
-  if (is_extension_type()) {
-    auto ext_type = ::arrow::GetExtensionType(extension_name_);
-    if (ext_type != nullptr) {
-      return ::arrow::field(name(), ext_type);
-    }
-  }
-  return ::arrow::field(name(), type());
-}
+std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }
 
 std::vector<lance::format::pb::Field> Field::ToProto() const {
   std::vector<lance::format::pb::Field> pb_fields;
@@ -309,22 +299,34 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   return pb_fields;
 };
 
-std::shared_ptr<::arrow::DataType> Field::type() const {
-  if (logical_type_ == "list") {
-    assert(children_.size() == 1);
-    return ::arrow::list(children_[0]->type());
-  } else if (logical_type_ == "list.struct") {
-    assert(children_.size() == 1);
-    return ::arrow::list(children_[0]->type());
-  } else if (logical_type_ == "struct") {
+std::shared_ptr<::arrow::DataType> GetArrowDataType(const Field& field, auto type_accessor) {
+  auto logical_type = field.logical_type();
+  if (logical_type == "list" || logical_type == "list.struct") {
+    assert(field.fields().size() == 1);
+    return ::arrow::list(type_accessor(field.field(0)));
+  } else if (logical_type == "struct") {
     std::vector<std::shared_ptr<::arrow::Field>> sub_types;
-    for (auto& child : children_) {
-      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), child->type()));
+    for (const auto& child : field.fields()) {
+      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), type_accessor(child)));
     }
     return ::arrow::struct_(sub_types);
   } else {
-    return lance::arrow::FromLogicalType(logical_type_).ValueOrDie();
+    return lance::arrow::FromLogicalType(logical_type).ValueOrDie();
   }
+}
+
+std::shared_ptr<::arrow::DataType> Field::type() const {
+  if (is_extension_type()) {
+    if (auto ext_type = ::arrow::GetExtensionType(extension_name_)) {
+      return ext_type;
+    }
+    // No registered ExtensionType is found, fall back to storage type instead.
+  }
+  return GetArrowDataType(*this, [](const auto& field) { return field->type(); });
+}
+
+std::shared_ptr<::arrow::DataType> Field::storage_type() const {
+  return GetArrowDataType(*this, [](const auto& field) { return field->storage_type(); });
 }
 
 int32_t Field::id() const { return id_; }

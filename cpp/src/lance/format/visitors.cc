@@ -51,7 +51,7 @@ WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::Outp
     : out_(out) {}
 
 ::arrow::Status WriteDictionaryVisitor::Visit(std::shared_ptr<Field> root) {
-  if (::arrow::is_dictionary(root->type()->id())) {
+  if (::arrow::is_dictionary(root->storage_type()->id())) {
     assert(root->dictionary());
     auto decoder =
         std::dynamic_pointer_cast<lance::encodings::DictionaryEncoder>(root->GetEncoder(out_));

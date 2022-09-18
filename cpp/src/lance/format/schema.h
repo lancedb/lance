@@ -142,9 +142,14 @@ class Field final {
 
   std::shared_ptr<::arrow::DataType> type() const;
 
+  /// Returns the storage type of the field.
+  /// If this is extension type, return the type of the underneath array.
+  /// Otherwise, it returns the same as type().
+  std::shared_ptr<::arrow::DataType> storage_type() const;
+
   std::string name() const;
 
-  const std::string& logical_type() { return logical_type_; };
+  const std::string& logical_type() const { return logical_type_; };
 
   const std::string& extension_name() { return extension_name_; }
 

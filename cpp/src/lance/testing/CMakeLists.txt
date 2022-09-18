@@ -15,6 +15,7 @@
 add_library(
         lance_testing
         OBJECT
+        extension_types.h
         io.cc
         io.h
 )

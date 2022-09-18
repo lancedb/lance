@@ -89,12 +89,12 @@ FileWriter::~FileWriter() {}
     return WriteArray(field, ext_array->storage());
   }
 
-  assert(field->type()->id() == arr->type_id());
-  if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
-      ::arrow::is_large_binary_like(arr->type_id()) ||
-      ::arrow::is_fixed_size_binary(arr->type_id()) ||
-      ::lance::arrow::is_fixed_size_list(arr->type_id())) {
-    return WritePrimitiveArray(field, arr);
+  // If field is an extension type, storage_id is the underneath storage arr's type id.
+  // Otherwise, storage_id is the same as type()->id()
+  assert(field->type()->storage_id() == arr->type_id());
+
+  if (arrow::is_fixed_length(arr->type_id())) {
+    return WriteFixedLengthArray(field, arr);
   } else if (lance::arrow::is_struct(arr->type())) {
     return WriteStructArray(field, arr);
   } else if (lance::arrow::is_list(arr->type())) {
@@ -106,8 +106,8 @@ FileWriter::~FileWriter() {}
                                   arr->type()->ToString());
 }
 
-::arrow::Status FileWriter::WritePrimitiveArray(const std::shared_ptr<format::Field>& field,
-                                                const std::shared_ptr<::arrow::Array>& arr) {
+::arrow::Status FileWriter::WriteFixedLengthArray(const std::shared_ptr<format::Field>& field,
+                                                  const std::shared_ptr<::arrow::Array>& arr) {
   auto field_id = field->id();
   auto encoder = field->GetEncoder(destination_);
   auto type = field->type();
@@ -139,7 +139,7 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::WriteStructArray(const std::shared_ptr<format::Field>& field,
                                              const std::shared_ptr<::arrow::Array>& arr) {
-  assert(arrow::is_struct(field->type()));
+  assert(arrow::is_struct(field->type()->storage_id()));
   auto struct_arr = std::static_pointer_cast<::arrow::StructArray>(arr);
   assert(field->fields().size() == static_cast<size_t>(struct_arr->num_fields()));
   for (auto child : field->fields()) {
@@ -160,7 +160,7 @@ FileWriter::~FileWriter() {}
       auto offsets_datum,
       ::arrow::compute::CallFunction(
           "subtract", {list_arr->offsets(), list_arr->offsets()->GetScalar(0).ValueOrDie()}));
-  ARROW_RETURN_NOT_OK(WritePrimitiveArray(field, offsets_datum.make_array()));
+  ARROW_RETURN_NOT_OK(WriteFixedLengthArray(field, offsets_datum.make_array()));
 
   auto start_offset = list_arr->value_offset(0);
   auto last_offset = list_arr->value_offset(arr->length());

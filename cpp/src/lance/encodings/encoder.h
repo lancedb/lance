@@ -60,6 +60,11 @@ class Encoder {
 ///
 class Decoder {
  public:
+  /// Constructor of Decoder
+  ///
+  /// \param infile the opened input file.
+  /// \param type the data type of the data on disk. Note that it can not be extension type.
+  /// \param pool memory pool.
   Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
           std::shared_ptr<::arrow::DataType> type,
           ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;

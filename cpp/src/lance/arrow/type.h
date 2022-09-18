@@ -54,8 +54,11 @@ inline auto is_list(const std::shared_ptr<::arrow::DataType>& dtype) {
 }
 
 /// Returns True if the data type is a struct.
+inline bool is_struct(::arrow::Type::type type_id) { return type_id == ::arrow::Type::STRUCT; }
+
+/// Returns True if the data type is a struct.
 inline bool is_struct(const std::shared_ptr<::arrow::DataType>& dtype) {
-  return dtype->id() == ::arrow::Type::STRUCT;
+  return is_struct(dtype->id());
 }
 
 /// Returns True if the data type is a map.
@@ -78,6 +81,17 @@ inline bool is_fixed_size_list(::arrow::Type::type type_id) {
 
 inline bool is_fixed_size_list(const std::shared_ptr<::arrow::DataType>& dtype) {
   return is_fixed_size_list(dtype->id());
+}
+
+/// Returns True if every value has the same length.
+inline bool is_fixed_length(::arrow::Type::type type_id) {
+  return ::arrow::is_primitive(type_id) || ::arrow::is_binary_like(type_id) ||
+         ::arrow::is_large_binary_like(type_id) || ::arrow::is_fixed_size_binary(type_id) ||
+         is_fixed_size_list(type_id);
+}
+
+inline bool is_fixed_length(const std::shared_ptr<::arrow::DataType>& data_type) {
+  return is_fixed_length(data_type->id());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::ArrayBuilder>> GetArrayBuilder(
