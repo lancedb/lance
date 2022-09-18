@@ -391,6 +391,8 @@ TEST_CASE("Write extension but read storage if not registered") {
 TEST_CASE("Extension type round-trip") {
   auto ext_type = std::make_shared<::lance::testing::ImageType>();
   CHECK(arrow::RegisterExtensionType(ext_type).ok());
+  auto box_type = std::make_shared<::lance::testing::Box2dType>();
+  CHECK(arrow::RegisterExtensionType(box_type).ok());
   auto table = MakeTable();
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
   CHECK(lance::arrow::WriteTable(*table, sink).ok());

@@ -54,8 +54,13 @@ inline auto is_list(const std::shared_ptr<::arrow::DataType>& dtype) {
 }
 
 /// Returns True if the data type is a struct.
+inline bool is_struct(::arrow::Type::type type_id) {
+  return type_id == ::arrow::Type::STRUCT;
+}
+
+/// Returns True if the data type is a struct.
 inline bool is_struct(const std::shared_ptr<::arrow::DataType>& dtype) {
-  return dtype->id() == ::arrow::Type::STRUCT;
+  return is_struct(dtype->id());
 }
 
 /// Returns True if the data type is a map.

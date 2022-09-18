@@ -46,7 +46,7 @@ Field::Field(const std::shared_ptr<::arrow::Field>& field)
       extension_name_(arrow::GetExtensionName(field->type()).value_or("")),
       encoding_(pb::NONE) {
   if (is_extension_type()) {
-    auto ext_type = std::static_pointer_cast<::arrow::ExtensionType>(field->type());
+    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(field->type());
     Init(ext_type->storage_type());
   } else {
     Init(field->type());
@@ -275,12 +275,6 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
 }
 
 std::shared_ptr<::arrow::Field> Field::ToArrow() const {
-  if (is_extension_type()) {
-    auto ext_type = ::arrow::GetExtensionType(extension_name_);
-    if (ext_type != nullptr) {
-      return ::arrow::field(name(), ext_type);
-    }
-  }
   return ::arrow::field(name(), type());
 }
 
@@ -308,9 +302,9 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
 };
 
 std::shared_ptr<::arrow::DataType> Field::type() const {
-  if (!extension_name_.empty()) {
+  if (is_extension_type()) {
     auto ext_type = ::arrow::GetExtensionType(extension_name_);
-    if (ext_type) {
+    if (ext_type != nullptr) {
       return ext_type;
     }
   }

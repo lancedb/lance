@@ -89,11 +89,14 @@ FileWriter::~FileWriter() {}
     return WriteArray(field, ext_array->storage());
   }
 
-  fmt::print("Field(name={}): type->id={} arr->type_id={}\n",
-             field->name(),
-             field->type()->id(),
-             arr->type_id());
-  assert(field->type()->id() == arr->type_id());
+  if (lance::arrow::is_extension(field->type())) {
+    // Follow through to write the storage array for the extension type.
+    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(field->type());
+    assert (ext_type->storage_id() == arr->type_id());
+  } else {
+    assert(field->type()->id() == arr->type_id());
+  }
+
   if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
       ::arrow::is_large_binary_like(arr->type_id()) ||
       ::arrow::is_fixed_size_binary(arr->type_id()) ||
@@ -143,7 +146,7 @@ FileWriter::~FileWriter() {}
 
 ::arrow::Status FileWriter::WriteStructArray(const std::shared_ptr<format::Field>& field,
                                              const std::shared_ptr<::arrow::Array>& arr) {
-  assert(arrow::is_struct(field->type()));
+  assert(arrow::is_struct(field->type()->storage_id()));
   auto struct_arr = std::static_pointer_cast<::arrow::StructArray>(arr);
   assert(field->fields().size() == static_cast<size_t>(struct_arr->num_fields()));
   for (auto child : field->fields()) {
