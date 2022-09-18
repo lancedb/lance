@@ -332,10 +332,10 @@ int32_t FileReader::num_batches() const {
     ARROW_ASSIGN_OR_RAISE(storage_arr, GetDictionaryArray(field, batch_id, params));
   } else {
     ARROW_ASSIGN_OR_RAISE(auto primitive_arr, GetPrimitiveArray(field, batch_id, params));
-    ARROW_ASSIGN_OR_RAISE(storage_arr, primitive_arr->View(dtype));
+    ARROW_ASSIGN_OR_RAISE(storage_arr, primitive_arr->View(storage_type));
   }
 
-  if (field->is_extension_type()) {
+  if (lance::arrow::is_extension(dtype)) {
     std::shared_ptr<::arrow::ExtensionType> ext_type =
         ::arrow::GetExtensionType(field->extension_name());
     if (ext_type != nullptr) {

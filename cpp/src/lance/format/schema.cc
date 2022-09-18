@@ -223,6 +223,13 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   std::shared_ptr<lance::encodings::Decoder> decoder;
   auto data_type = type();
+  auto storage_type = data_type;
+
+  if (lance::arrow::is_extension(data_type)) {
+    storage_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(data_type)->storage_type();
+    assert (storage_type != nullptr);
+  }
+
   if (encoding() == pb::Encoding::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
@@ -234,18 +241,18 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
                data_type->id() == ::arrow::Date32Type::type_id) {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else {
-      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, type());
+      decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, storage_type);
     }
   } else if (encoding_ == pb::Encoding::VAR_BINARY) {
     if (logical_type_ == "string") {
-      decoder =
-          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(infile, type());
+      decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(
+          infile, storage_type);
     } else if (logical_type_ == "binary") {
-      decoder =
-          std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(infile, type());
+      decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(
+          infile, storage_type);
     }
   } else if (encoding_ == pb::Encoding::DICTIONARY) {
-    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(type());
+    auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(storage_type);
     if (!dictionary()) {
       {
         std::scoped_lock lock(lock_);
@@ -273,9 +280,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
   }
 }
 
-std::shared_ptr<::arrow::Field> Field::ToArrow() const {
-  return ::arrow::field(name(), type());
-}
+std::shared_ptr<::arrow::Field> Field::ToArrow() const { return ::arrow::field(name(), type()); }
 
 std::vector<lance::format::pb::Field> Field::ToProto() const {
   std::vector<lance::format::pb::Field> pb_fields;
