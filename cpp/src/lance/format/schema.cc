@@ -299,15 +299,15 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   return pb_fields;
 };
 
-std::shared_ptr<::arrow::DataType> GetArrowDataType(const Field& field, auto type_accesor) {
+std::shared_ptr<::arrow::DataType> GetArrowDataType(const Field& field, auto type_accessor) {
   auto logical_type = field.logical_type();
   if (logical_type == "list" || logical_type == "list.struct") {
     assert(field.fields().size() == 1);
-    return ::arrow::list(field.field(0)->type());
+    return ::arrow::list(type_accessor(field.field(0)));
   } else if (logical_type == "struct") {
     std::vector<std::shared_ptr<::arrow::Field>> sub_types;
     for (const auto& child : field.fields()) {
-      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), type_accesor(child)));
+      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), type_accessor(child)));
     }
     return ::arrow::struct_(sub_types);
   } else {
