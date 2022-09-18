@@ -249,7 +249,6 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     if (!dictionary()) {
       {
         std::scoped_lock lock(lock_);
-        fmt::print("Loading dictionary for field {} this={}\n", name_, fmt::ptr(this));
         if (!dictionary()) {
           /// Fetch dictionary on demand?
           ARROW_RETURN_NOT_OK(LoadDictionary(infile));

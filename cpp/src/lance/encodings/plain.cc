@@ -265,7 +265,7 @@ class FixedSizeListPlainDecoderImpl : public Decoder {
 PlainDecoder::~PlainDecoder() {}
 
 ::arrow::Status PlainDecoder::Init() {
-  switch (type_->id()) {
+  switch (type_->storage_id()) {
     case ::arrow::Type::BOOL:
       impl_.reset(new BooleanPlainDecoderImpl(infile_, type_));
       break;
