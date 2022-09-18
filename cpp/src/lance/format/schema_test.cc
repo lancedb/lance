@@ -149,3 +149,16 @@ TEST_CASE("Fixed size binary") {
   CHECK(field.encoding() == ::lance::format::pb::PLAIN);
   CHECK(field.logical_type() == "fixed_size_binary:100");
 }
+
+TEST_CASE("Test storage type") {
+  auto image_type = std::make_shared<lance::testing::ImageType>();
+  ::arrow::RegisterExtensionType(image_type);
+  auto arrow_field = ::arrow::field("image", image_type);
+  auto field = ::lance::format::Field(arrow_field);
+
+  CHECK(field.is_extension_type());
+  INFO("Field data type: " << field.type()->ToString());
+  CHECK(field.type()->Equals(image_type));
+  INFO("Field storage type: " << field.storage_type()->ToString());
+  CHECK(field.storage_type()->Equals(image_type->storage_type()));
+}
