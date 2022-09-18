@@ -89,13 +89,9 @@ FileWriter::~FileWriter() {}
     return WriteArray(field, ext_array->storage());
   }
 
-  if (lance::arrow::is_extension(field->type())) {
-    // Follow through to write the storage array for the extension type.
-    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(field->type());
-    assert (ext_type->storage_id() == arr->type_id());
-  } else {
-    assert(field->type()->id() == arr->type_id());
-  }
+  // If field is an extension type, storage_id is the underneath storage arr's type id.
+  // Otherwise, storage_id is the same as type()->id()
+  assert (field->type()->storage_id() == arr->type_id());
 
   if (::arrow::is_primitive(arr->type_id()) || ::arrow::is_binary_like(arr->type_id()) ||
       ::arrow::is_large_binary_like(arr->type_id()) ||
