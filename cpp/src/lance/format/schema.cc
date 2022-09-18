@@ -299,6 +299,22 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   return pb_fields;
 };
 
+std::shared_ptr<::arrow::DataType> GetArrowDataType(const Field& field, auto type_accesor) {
+  auto logical_type = field.logical_type();
+  if (logical_type == "list" || logical_type == "list.struct") {
+    assert(field.fields().size() == 1);
+    return ::arrow::list(field.field(0)->type());
+  } else if (logical_type == "struct") {
+    std::vector<std::shared_ptr<::arrow::Field>> sub_types;
+    for (const auto& child : field.fields()) {
+      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), type_accesor(child)));
+    }
+    return ::arrow::struct_(sub_types);
+  } else {
+    return lance::arrow::FromLogicalType(logical_type).ValueOrDie();
+  }
+}
+
 std::shared_ptr<::arrow::DataType> Field::type() const {
   if (is_extension_type()) {
     if (auto ext_type = ::arrow::GetExtensionType(extension_name_)) {
@@ -306,29 +322,11 @@ std::shared_ptr<::arrow::DataType> Field::type() const {
     }
     // No registered ExtensionType is found, fall back to storage type instead.
   }
-  if (logical_type_ == "list") {
-    assert(children_.size() == 1);
-    return ::arrow::list(children_[0]->type());
-  } else if (logical_type_ == "list.struct") {
-    assert(children_.size() == 1);
-    return ::arrow::list(children_[0]->type());
-  } else if (logical_type_ == "struct") {
-    std::vector<std::shared_ptr<::arrow::Field>> sub_types;
-    for (auto& child : children_) {
-      sub_types.emplace_back(std::make_shared<::arrow::Field>(child->name(), child->type()));
-    }
-    return ::arrow::struct_(sub_types);
-  } else {
-    return lance::arrow::FromLogicalType(logical_type_).ValueOrDie();
-  }
+  return GetArrowDataType(*this, [](const auto& field) { return field->type(); });
 }
 
 std::shared_ptr<::arrow::DataType> Field::storage_type() const {
-  auto data_type = type();
-  if (lance::arrow::is_extension(data_type)) {
-    return std::dynamic_pointer_cast<::arrow::ExtensionType>(data_type)->storage_type();
-  }
-  return data_type;
+  return GetArrowDataType(*this, [](const auto& field) { return field->storage_type(); });
 }
 
 int32_t Field::id() const { return id_; }

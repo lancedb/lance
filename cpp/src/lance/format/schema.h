@@ -149,7 +149,7 @@ class Field final {
 
   std::string name() const;
 
-  const std::string& logical_type() { return logical_type_; };
+  const std::string& logical_type() const { return logical_type_; };
 
   const std::string& extension_name() { return extension_name_; }
 
