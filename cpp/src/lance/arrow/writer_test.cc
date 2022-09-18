@@ -401,6 +401,9 @@ TEST_CASE("Extension type round-trip") {
   auto actual_table = ReadTable(sink);
   INFO("Actual table: " << actual_table->ToString() << "\nExpected table: " << table->ToString());
   CHECK(table->Equals(*actual_table));
+
+  CHECK(actual_table->GetColumnByName("boxes")->type()->Equals(::arrow::list(box_type)));
+  CHECK(actual_table->GetColumnByName("image_ext")->type()->Equals(ext_type));
 }
 
 TEST_CASE("Write empty arrays") {
