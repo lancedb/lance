@@ -315,27 +315,31 @@ int32_t FileReader::num_batches() const {
     int32_t batch_id,
     const ArrayReadParams& params) const {
   auto dtype = field->type();
-  Result<std::shared_ptr<::arrow::Array>> storage_arr;
-  if (is_struct(dtype)) {
-    storage_arr = GetStructArray(field, batch_id, params);
-  } else if (is_list(dtype)) {
-    storage_arr = GetListArray(field, batch_id, params);
-  } else if (::arrow::is_dictionary(dtype->id())) {
-    storage_arr = GetDictionaryArray(field, batch_id, params);
-  } else {
-    ARROW_ASSIGN_OR_RAISE(auto primitive_arr, GetPrimitiveArray(field, batch_id, params));
-    storage_arr = primitive_arr->View(dtype);
+  /// If dtype is not extension type, the storage type is the same as dtype.
+  auto storage_type = dtype;
+  if (lance::arrow::is_extension(dtype)) {
+    auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(dtype);
+    assert (ext_type != nullptr);
+    storage_type = ext_type->storage_type();
   }
 
-  if (!storage_arr.ok()) {
-    return storage_arr;
+  std::shared_ptr<::arrow::Array> storage_arr;
+  if (is_struct(storage_type)) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetStructArray(field, batch_id, params));
+  } else if (is_list(storage_type)) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetListArray(field, batch_id, params));
+  } else if (::arrow::is_dictionary(storage_type->id())) {
+    ARROW_ASSIGN_OR_RAISE(storage_arr, GetDictionaryArray(field, batch_id, params));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(auto primitive_arr, GetPrimitiveArray(field, batch_id, params));
+    ARROW_ASSIGN_OR_RAISE(storage_arr, primitive_arr->View(dtype));
   }
 
   if (field->is_extension_type()) {
     std::shared_ptr<::arrow::ExtensionType> ext_type =
         ::arrow::GetExtensionType(field->extension_name());
-    if (ext_type != nullptr && storage_arr.ok()) {
-      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr.ValueOrDie());
+    if (ext_type != nullptr) {
+      return ::arrow::ExtensionType::WrapArray(ext_type, storage_arr);
     }
   }
   return storage_arr;
