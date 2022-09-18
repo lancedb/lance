@@ -303,8 +303,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
 
 std::shared_ptr<::arrow::DataType> Field::type() const {
   if (is_extension_type()) {
-    auto ext_type = ::arrow::GetExtensionType(extension_name_);
-    if (ext_type != nullptr) {
+    if (auto ext_type = ::arrow::GetExtensionType(extension_name_)) {
       return ext_type;
     }
   }
