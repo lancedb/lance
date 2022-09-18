@@ -306,6 +306,7 @@ std::shared_ptr<::arrow::DataType> Field::type() const {
     if (auto ext_type = ::arrow::GetExtensionType(extension_name_)) {
       return ext_type;
     }
+    // No registered ExtensionType is found, fall back to storage type instead.
   }
   if (logical_type_ == "list") {
     assert(children_.size() == 1);
