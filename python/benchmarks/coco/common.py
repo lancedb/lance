@@ -4,11 +4,11 @@ import io
 import json
 import os
 import sys
+import time
 from typing import Callable, Dict, Optional
 
 import numpy as np
 import PIL
-import pyarrow as pa
 import pytorch_lightning as pl
 import torch
 import torchvision
@@ -110,6 +110,15 @@ class ObjectDetection(pl.LightningModule):
         super().__init__()
         self.backbond = torchvision.models.detection.ssd300_vgg16()
         self.lr = 0.1
+        self.fit_start_time = 0
+
+    def on_fit_start(self) -> None:
+        super().on_fit_start()
+        self.fit_start_time = time.time()
+
+    def on_fit_end(self) -> None:
+        super().on_fit_end()
+        print(f"Training finished in {time.time() - self.fit_start_time} seconds")
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
