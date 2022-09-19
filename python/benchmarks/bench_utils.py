@@ -39,7 +39,7 @@ KNOWN_FORMATS = ["lance", "parquet", "raw"]
 
 def read_file(uri) -> bytes:
     if not urlparse(uri).scheme:
-        uri = pathlib.Path(uri)
+        uri = pathlib.Path(uri).expanduser().absolute()
     fs, key = pyarrow.fs.FileSystem.from_uri(uri)
     return fs.open_input_file(key).read()
 
