@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import os
 import pickle
 import platform
 
@@ -22,6 +23,8 @@ import lance
 from lance.types import (
     Box2dArray,
     Box2dType,
+    Box3dArray,
+    Box3dType,
     Image,
     ImageArray,
     ImageBinary,
@@ -30,6 +33,7 @@ from lance.types import (
     LabelArray,
     LabelType,
     Point2dType,
+    Point3dType,
 )
 
 if platform.system() != "Linux":
@@ -78,62 +82,96 @@ def _test_image(tmp_path, storage):
 
 
 def test_point(tmp_path):
-    point_type = Point2dType()
-    points = np.random.random(100 * 2)
-    storage = pa.FixedSizeListArray.from_arrays(points, 2)
-    _test_extension_rt(tmp_path, point_type, storage)
+    for point_type in [Point2dType(), Point3dType()]:
+        ndims = point_type.ndims
+        points = np.random.random(100 * ndims)
+        storage = pa.FixedSizeListArray.from_arrays(points, ndims)
+        storage_path = tmp_path / str(ndims)
+        os.makedirs(storage_path, exist_ok=True)
+        _test_extension_rt(storage_path, point_type, storage)
 
 
-def test_box2d(tmp_path):
-    box_type = Box2dType()
-    data = np.random.random(100 * 4)
-    storage = pa.FixedSizeListArray.from_arrays(data, 4)
-    ext_arr = _test_extension_rt(tmp_path, box_type, storage)
-    assert len(ext_arr.chunks) == 1
-    ext_arr = ext_arr.chunks[0]
-    assert isinstance(ext_arr, Box2dArray)
-    reshaped = data.reshape((100, 4))
-    xmin, ymin, xmax, ymax = (
-        reshaped[:, 0],
-        reshaped[:, 1],
-        reshaped[:, 2],
-        reshaped[:, 3],
+def test_box(tmp_path):
+    for box_type in [Box2dType(), Box3dType()]:
+        ndims = box_type.ndims
+        data = np.random.random(100 * 2 * ndims)
+        storage = pa.FixedSizeListArray.from_arrays(data, 2 * ndims)
+        storage_path = tmp_path / str(ndims)
+        os.makedirs(storage_path, exist_ok=True)
+        ext_arr = _test_extension_rt(storage_path, box_type, storage)
+        assert len(ext_arr.chunks) == 1
+        ext_arr = ext_arr.chunks[0]
+        assert ext_arr.ndims == ndims
+        # check points
+        reshaped = data.reshape((100, 2 * ext_arr.ndims))
+        _check_points(ext_arr, reshaped, ndims)
+        _check_size(ext_arr, reshaped, ndims)
+        _check_iou(ext_arr[:20], ext_arr[90:])
+
+
+def _check_points(ext_arr, reshaped, ndims):
+    assert np.all(ext_arr.xmin == reshaped[:, 0])
+    assert np.all(ext_arr.ymin == reshaped[:, 1])
+    assert np.all(ext_arr.xmax == reshaped[:, ndims])
+    assert np.all(ext_arr.ymax == reshaped[:, ndims + 1])
+    if ndims == 3:
+        assert np.all(ext_arr.zmin == reshaped[:, 2])
+        assert np.all(ext_arr.zmax == reshaped[:, ndims + 2])
+
+
+def _check_size(ext_arr, reshaped, ndims):
+    actual_sizes = ext_arr._box_sizes()
+    expected_size = (reshaped[:, ndims] - reshaped[:, 0] + 1) * (
+        reshaped[:, ndims + 1] - reshaped[:, 1] + 1
     )
-    assert np.all(ext_arr.xmin == xmin)
-    assert np.all(ext_arr.xmax == xmax)
-    assert np.all(ext_arr.ymin == ymin)
-    assert np.all(ext_arr.ymax == ymax)
-    actual_areas = ext_arr.area()
-    expected_areas = (xmax - xmin + 1) * (ymax - ymin + 1)
-    assert np.all(actual_areas == expected_areas)
-    actual_iou = ext_arr[:20].iou(ext_arr[90:])
-    expected_iou = _naive_iou(ext_arr[:20], ext_arr[90:])
+    if ndims == 3:
+        expected_size *= reshaped[:, ndims + 2] - reshaped[:, 2] + 1
+    assert np.all(actual_sizes == expected_size)
+
+    if ndims == 2:
+        assert np.all(ext_arr.area() == ext_arr._box_sizes())
+    elif ndims == 3:
+        assert np.all(ext_arr.volume() == ext_arr._box_sizes())
+
+
+def _check_iou(box_arr1, box_arr2):
+    actual_iou = box_arr1.iou(box_arr2)
+    expected_iou = _naive_iou(box_arr1, box_arr2)
     assert np.all(actual_iou == expected_iou)
 
 
-def _naive_iou(box_a, box_b):
-    ious = np.zeros((len(box_a), len(box_b)))
-    for i in range(len(box_a)):
-        for j in range(len(box_b)):
-            xmin = max(box_a.xmin[i], box_b.xmin[j])
-            ymin = max(box_a.ymin[i], box_b.ymin[j])
-            xmax = min(box_a.xmax[i], box_b.xmax[j])
-            ymax = min(box_a.ymax[i], box_b.ymax[j])
-            # compute the area of intersection rectangle
-            inter = max(0, xmax - xmin + 1) * max(0, ymax - ymin + 1)
-            # compute the area of both the prediction and ground-truth
-            # rectangles
-            area_i = (box_a.xmax[i] - box_a.xmin[i] + 1) * (
-                box_a.ymax[i] - box_a.ymin[i] + 1
-            )
-            area_j = (box_b.xmax[j] - box_b.xmin[j] + 1) * (
-                box_b.ymax[j] - box_b.ymin[j] + 1
-            )
-            # compute the intersection over union by taking the intersection
-            # area and dividing it by the sum of prediction + ground-truth
-            # areas - the interesection area
-            ious[i, j] = inter / float(area_i + area_j - inter)
+def _naive_iou(box_a_arr, box_b_arr):
+    assert box_a_arr.ndims == box_b_arr.ndims
+    ndims = box_a_arr.ndims
+    ious = np.zeros((len(box_a_arr), len(box_b_arr)))
+    for i, box_i in enumerate(box_a_arr.to_numpy()):
+        for j, box_j in enumerate(box_b_arr.to_numpy()):
+            area_i = _box_size(box_i, ndims)
+            area_j = _box_size(box_j, ndims)
+            inter_ij = _intersection(box_i, box_j, ndims)
+            ious[i, j] = inter_ij / float(area_i + area_j - inter_ij)
     return ious
+
+
+def _box_size(box, ndims):
+    size = _length(box, 0, ndims) * _length(box, 1, ndims)
+    if ndims == 3:
+        size *= _length(box, 2, ndims)
+    return size
+
+
+def _length(box, axis, ndims):
+    return max(0, box[axis + ndims] - box[axis] + 1)
+
+
+def _intersection(box_a, box_b, ndims):
+    inter_box = [None] * ndims * 2
+    for i in range(ndims):
+        inter_min_i = max(box_a[i], box_b[i])
+        inter_max_i = min(box_a[i + ndims], box_b[i + ndims])
+        inter_box[i] = inter_min_i
+        inter_box[i + ndims] = inter_max_i
+    return _box_size(inter_box, ndims)
 
 
 def test_label(tmp_path):

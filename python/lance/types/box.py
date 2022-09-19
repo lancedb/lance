@@ -11,6 +11,9 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+from abc import ABC, abstractmethod
+from typing import Union
+
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -20,8 +23,8 @@ from lance.types.base import LanceType
 
 class Box2dType(LanceType):
     """
-    A rectangular box in 2D space (usually used for bounding boxes).
-    Represented as 2 Point2Ds (top-left and bottom-right corners)
+    A bounding box in 2-dimensional space. Each box is represented by
+    2 2-dimensional points
     """
 
     def __init__(self):
@@ -30,84 +33,211 @@ class Box2dType(LanceType):
             "box2d",
         )
 
+    @property
+    def ndims(self):
+        return 2
+
     def __arrow_ext_class__(self):
         return Box2dArray
-
-    def __arrow_ext_serialize__(self):
-        return b""
 
     @classmethod
     def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return Box2dType()
 
+    def __arrow_ext_serialize__(self):
+        return b""
 
-class Box2dArray(pa.ExtensionArray):
-    def iou(self, others: "Box2dArray") -> np.ndarray:
-        """
-        Compute the intersection-over-union between these bounding boxes
-        and the given bounding boxes.
 
-        Return
-        ------
-        ious: a 2-d np.ndarray
-            If n = len(self), m = len(others) then returned ious should
-            have shape (n, m)
-        """
-        if not isinstance(others, Box2dArray):
-            raise TypeError("Only box2d knows iou")
-        area_self = self.area()
-        if self is others:
-            area_others = area_self
-        else:
-            area_others = others.area()
-        xmin_inter = np.maximum(self.xmin[:, np.newaxis], others.xmin)
-        ymin_inter = np.maximum(self.ymin[:, np.newaxis], others.ymin)
-        xmax_inter = np.minimum(self.xmax[:, np.newaxis], others.xmax)
-        ymax_inter = np.minimum(self.ymax[:, np.newaxis], others.ymax)
-        intersection = np.maximum(xmax_inter - xmin_inter + 1, 0) * np.maximum(
-            ymax_inter - ymin_inter + 1, 0
+class Box3dType(LanceType):
+    """
+    A bounding box in 3-dimensional space. Each box is represented by
+    2 3-dimensional points
+    """
+
+    def __init__(self):
+        super(Box3dType, self).__init__(
+            pa.list_(pa.float64(), list_size=6),
+            "box3d",
         )
-        union = area_self[:, np.newaxis] + area_others - intersection
-        return intersection / union
 
-    def area(self) -> np.ndarray:
-        """Compute the area of boxes"""
-        return (self.xmax - self.xmin + 1) * (self.ymax - self.ymin + 1)
+    @property
+    def ndims(self):
+        return 3
+
+    def __arrow_ext_class__(self):
+        return Box3dArray
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return Box3dType()
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+
+class BoxNdArray(pa.ExtensionArray, ABC):
+    @property
+    @abstractmethod
+    def ndims(self):
+        """The number of dimensions of each bounding box in this array"""
+        pass
 
     def flatten(self):
+        """
+        Return a flattened 1-d array
+        """
         # If this is a slice, the default Arrow behavior does not
         # return the sliced values properly
         values = self.storage.values
         # If this is a full-length array then just default Arrow
-        if len(self) == len(values) / 4:
+        if len(self) == len(values) / (self.ndims * 2):
             return values
         else:
             # If this is a slice then we need to compute manually
             return pc.list_flatten(self.storage)
 
     def to_numpy(self, zero_copy_only=True):
+        """
+        Return a homogeneous 2-d numpy array where each row represents the
+        2 points defining each bounding box
+
+        For a 2-d box, each row will have (xmin, ymin, xmax, ymax)
+        For a 3-d box, each row will have (xmin, ymin, zmin, xmax, ymax, zmax)
+        """
         return (
             self.flatten()
             .to_numpy(zero_copy_only=zero_copy_only)
-            .reshape((len(self), 4))
+            .reshape((len(self), (self.ndims * 2)))
         )
+
+    def get_length(self, axis: Union[int, str]):
+        axis = self._sanitize_axis(axis)
+        return self.get_max(axis) - self.get_min(axis) + 1
+
+    def get_min(self, axis: Union[int, str]):
+        """
+        Get a 1-d numpy array of the minimums for each box along given axis
+
+        Parameters
+        ----------
+        axis: int or str
+            0 is 'x', 1 is 'y', 2 is 'z`
+        """
+        axis = self._sanitize_axis(axis)
+        return self.to_numpy()[:, axis]
+
+    def get_max(self, axis: Union[int, str]):
+        """
+        Get a 1-d numpy array of the maximums for each box along given axis
+
+        Parameters
+        ----------
+        axis: int or str
+            0 is 'x', 1 is 'y', 2 is 'z`
+        """
+        axis = self._sanitize_axis(axis)
+        return self.to_numpy()[:, self.ndims + axis]
+
+    def _sanitize_axis(self, axis):
+        if isinstance(axis, str):
+            axis = {"x": 0, "y": 1, "z": 2}[axis]
+        if axis < 0 or axis >= self.ndims:
+            raise ValueError(
+                f"Axis {axis} is greater the number of box " f"dimensions in this array"
+            )
+        return axis
 
     @property
     def xmin(self) -> np.ndarray:
         """Return a numpy array of the min X-coord of each box"""
-        return self.to_numpy()[:, 0]
+        return self.get_min("x")
 
     @property
     def ymin(self) -> np.ndarray:
         """Return a numpy array of the min Y-coord of each box"""
-        return self.to_numpy()[:, 1]
+        return self.get_min("y")
 
     @property
     def xmax(self) -> np.ndarray:
         """Return a numpy array of the max X-coord of each box"""
-        return self.to_numpy()[:, 2]
+        return self.get_max("x")
 
     @property
     def ymax(self) -> np.ndarray:
         """Return a numpy array of the max Y-coord of each box"""
-        return self.to_numpy()[:, 3]
+        return self.get_max("y")
+
+    def _box_sizes(self):
+        sizes = self.get_length(0)
+        for i in range(1, self.ndims):
+            sizes *= self.get_length(i)
+        return sizes
+
+    def iou(self, others: "BoxNdArray") -> np.ndarray:
+        """
+        Compute the intersection-over-union between these bounding boxes
+        and the given bounding boxes.
+
+        Return
+        ------
+        ious: an np.ndarray
+            If n = len(self), m = len(others) then returned ious should
+            have shape (n, m)
+        """
+        if not isinstance(others, BoxNdArray):
+            raise TypeError("Need BoxNDArray to compute IOU")
+        if self.ndims != others.ndims:
+            raise ValueError("ndims must be equal to compute IOU")
+        size_self = self._box_sizes()
+        if self is others:
+            size_others = size_self
+        else:
+            size_others = others._box_sizes()
+
+        min_inter = [
+            np.maximum(self.get_min(axis)[:, np.newaxis], others.get_min(axis))
+            for axis in range(self.ndims)
+        ]
+        max_inter = [
+            np.minimum(self.get_max(axis)[:, np.newaxis], others.get_max(axis))
+            for axis in range(self.ndims)
+        ]
+        intersection = np.maximum(max_inter[0] - min_inter[0] + 1, 0)
+        for i in range(1, self.ndims):
+            intersection *= np.maximum(max_inter[i] - min_inter[i] + 1, 0)
+        union = size_self[:, np.newaxis] + size_others - intersection
+        return intersection / union
+
+
+class Box2dArray(BoxNdArray):
+    """Array of 2d bounding boxes"""
+
+    @property
+    def ndims(self):
+        return 2
+
+    def area(self) -> np.ndarray:
+        """Compute the area of boxes"""
+        return self._box_sizes()
+
+
+class Box3dArray(BoxNdArray):
+    """Array of 3d bounding boxes"""
+
+    @property
+    def ndims(self):
+        return 3
+
+    def volume(self) -> np.ndarray:
+        """Compute the area of boxes"""
+        return self._box_sizes()
+
+    @property
+    def zmin(self) -> np.ndarray:
+        """Return a numpy array of the min Z-coord of each box"""
+        return self.get_min("z")
+
+    @property
+    def zmax(self) -> np.ndarray:
+        """Return a numpy array of the max Z-coord of each box"""
+        return self.get_max("z")
