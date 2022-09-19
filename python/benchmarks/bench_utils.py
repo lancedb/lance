@@ -221,16 +221,17 @@ class DatasetConverter(ABC):
         suffix = f"_{flavor}" if flavor else ""
         return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
-    def save_df(self, df, fmt="lance", output_path=None):
+    def save_df(self, df, fmt="lance", output_path=None, **kwargs):
         output_path = output_path or self.default_dataset_path(fmt, "links")
         table = self._convert_metadata_df(df)
         if fmt == "parquet":
-            pq.write_table(table, output_path)
+            pq.write_table(table, output_path, **kwargs)
         elif fmt == "lance":
             pa.dataset.write_dataset(
                 table,
                 output_path,
                 format=lance.LanceFileFormat(),
+                **kwargs,
             )
         return table
 
