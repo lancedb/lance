@@ -361,3 +361,8 @@ def _ensure_type(images, typ):
     for im in images:
         if not isinstance(im, typ):
             raise TypeError(f"Expecting {typ} but got {type(im)}")
+
+
+def is_image(t: pa.DataType) -> bool:
+    """Returns True if the type is image type"""
+    return isinstance(t, ImageType)

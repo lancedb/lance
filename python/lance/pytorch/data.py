@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -35,7 +35,7 @@ __all__ = ["LanceDataset"]
 
 
 def to_numpy(arr: pa.Array):
-    """Convert pyarrow array to numpy array"""
+    """Convert pyarrow array to Pytorch Tensors"""
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
     if pa.types.is_dictionary(arr.type):
@@ -60,9 +60,25 @@ class LanceDataset(IterableDataset):
         self,
         root: Union[str, Path],
         columns: Optional[List[str]] = None,
-        filter: Optional[pc.Expression] = None,
         batch_size: Optional[int] = None,
+        filter: Optional[pc.Expression] = None,
+        transform: Optional[Callable] = None,
     ):
+        """LanceDataset
+
+        Parameters
+        ----------
+        root : str or Path
+            The root URI
+        columns : list of str, optional
+            List of the column names.
+        batch_size : int, optional
+            The batch size.
+        filter : filter
+            The filter to apply to the scanner.
+        transform : Callable, optional
+            Apply transform to each of the example.
+        """
         self.root = root
         # Handle local relative path
         if isinstance(root, str) and not urlparse(root).scheme:
@@ -70,6 +86,8 @@ class LanceDataset(IterableDataset):
         self.columns = columns if columns else []
         self.filter = filter
         self.batch_size = batch_size
+        self.transform = transform
+
         self._dataset: pa.dataset.FileSystemDataset = None
         self._fs: Optional[pyarrow.fs.FileSystem] = None
         self._files: Optional[List[str]] = None
