@@ -11,7 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-from abc import abstractmethod, ABC
+from abc import ABC, abstractmethod
 from typing import Union
 
 import numpy as np
@@ -76,7 +76,6 @@ class Box3dType(LanceType):
 
 
 class BoxNdArray(pa.ExtensionArray, ABC):
-
     @property
     @abstractmethod
     def ndims(self):
@@ -141,31 +140,32 @@ class BoxNdArray(pa.ExtensionArray, ABC):
 
     def _sanitize_axis(self, axis):
         if isinstance(axis, str):
-            axis = {'x': 0, 'y': 1, 'z': 2}[axis]
+            axis = {"x": 0, "y": 1, "z": 2}[axis]
         if axis < 0 or axis >= self.ndims:
-            raise ValueError(f"Axis {axis} is greater the number of box "
-                             f"dimensions in this array")
+            raise ValueError(
+                f"Axis {axis} is greater the number of box " f"dimensions in this array"
+            )
         return axis
 
     @property
     def xmin(self) -> np.ndarray:
         """Return a numpy array of the min X-coord of each box"""
-        return self.get_min('x')
+        return self.get_min("x")
 
     @property
     def ymin(self) -> np.ndarray:
         """Return a numpy array of the min Y-coord of each box"""
-        return self.get_min('y')
+        return self.get_min("y")
 
     @property
     def xmax(self) -> np.ndarray:
         """Return a numpy array of the max X-coord of each box"""
-        return self.get_max('x')
+        return self.get_max("x")
 
     @property
     def ymax(self) -> np.ndarray:
         """Return a numpy array of the max Y-coord of each box"""
-        return self.get_max('y')
+        return self.get_max("y")
 
     def _box_sizes(self):
         sizes = self.get_length(0)
@@ -194,12 +194,14 @@ class BoxNdArray(pa.ExtensionArray, ABC):
         else:
             size_others = others._box_sizes()
 
-        min_inter = [np.maximum(self.get_min(axis)[:, np.newaxis],
-                                others.get_min(axis))
-                     for axis in range(self.ndims)]
-        max_inter = [np.minimum(self.get_max(axis)[:, np.newaxis],
-                                others.get_max(axis))
-                     for axis in range(self.ndims)]
+        min_inter = [
+            np.maximum(self.get_min(axis)[:, np.newaxis], others.get_min(axis))
+            for axis in range(self.ndims)
+        ]
+        max_inter = [
+            np.minimum(self.get_max(axis)[:, np.newaxis], others.get_max(axis))
+            for axis in range(self.ndims)
+        ]
         intersection = np.maximum(max_inter[0] - min_inter[0] + 1, 0)
         for i in range(1, self.ndims):
             intersection *= np.maximum(max_inter[i] - min_inter[i] + 1, 0)
@@ -233,9 +235,9 @@ class Box3dArray(BoxNdArray):
     @property
     def zmin(self) -> np.ndarray:
         """Return a numpy array of the min Z-coord of each box"""
-        return self.get_min('z')
+        return self.get_min("z")
 
     @property
     def zmax(self) -> np.ndarray:
         """Return a numpy array of the max Z-coord of each box"""
-        return self.get_max('z')
+        return self.get_max("z")

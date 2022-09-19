@@ -22,8 +22,9 @@ import pytest
 import lance
 from lance.types import (
     Box2dArray,
-    Box3dArray,
     Box2dType,
+    Box3dArray,
+    Box3dType,
     Image,
     ImageArray,
     ImageBinary,
@@ -31,7 +32,8 @@ from lance.types import (
     ImageUri,
     LabelArray,
     LabelType,
-    Point2dType, Box3dType, Point3dType,
+    Point2dType,
+    Point3dType,
 )
 
 if platform.system() != "Linux":
@@ -119,8 +121,9 @@ def _check_points(ext_arr, reshaped, ndims):
 
 def _check_size(ext_arr, reshaped, ndims):
     actual_sizes = ext_arr._box_sizes()
-    expected_size = ((reshaped[:, ndims] - reshaped[:, 0] + 1) *
-                     (reshaped[:, ndims + 1] - reshaped[:, 1] + 1))
+    expected_size = (reshaped[:, ndims] - reshaped[:, 0] + 1) * (
+        reshaped[:, ndims + 1] - reshaped[:, 1] + 1
+    )
     if ndims == 3:
         expected_size *= reshaped[:, ndims + 2] - reshaped[:, 2] + 1
     assert np.all(actual_sizes == expected_size)

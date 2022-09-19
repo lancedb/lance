@@ -77,8 +77,7 @@ class Polygon2dType(LanceType):
 
     def __init__(self):
         super(Polygon2dType, self).__init__(
-            pa.list_(pa.list_(pa.float64(), list_size=2)),
-            "polygon2d"
+            pa.list_(pa.list_(pa.float64(), list_size=2)), "polygon2d"
         )
 
     @property
@@ -100,8 +99,7 @@ class Polygon3dType(LanceType):
 
     def __init__(self):
         super(Polygon3dType, self).__init__(
-            pa.list_(pa.list_(pa.float64(), list_size=3)),
-            "polygon3d"
+            pa.list_(pa.list_(pa.float64(), list_size=3)), "polygon3d"
         )
 
     @property

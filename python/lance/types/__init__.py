@@ -17,10 +17,8 @@ import platform
 import pyarrow as pa
 from pyarrow import ArrowKeyError
 
-from lance.types.base import (
-    Point2dType, Point3dType, Polygon2dType, Polygon3dType
-)
-from lance.types.box import Box2dArray, Box3dArray, Box2dType, Box3dType
+from lance.types.base import Point2dType, Point3dType, Polygon2dType, Polygon3dType
+from lance.types.box import Box2dArray, Box2dType, Box3dArray, Box3dType
 from lance.types.image import (
     Image,
     ImageArray,
@@ -43,7 +41,7 @@ def register_extension_types():
         Point3dType(),
         Box2dType(),
         Box3dType(),
-        LabelType()
+        LabelType(),
     ]
     for t in types:
         try:
