@@ -54,6 +54,9 @@ class RawCocoDataset(torch.utils.data.Dataset):
                 self.images[img["id"]] = img
             for ann in annotation_payload["annotations"]:
                 image_id = ann["image_id"]
+                bbox = ann["bbox"]
+                if bbox[2] == 0 or bbox[3] == 0:
+                    continue
                 self.images[image_id]["annotations"].append(ann)
 
         # Remove all empty annotations images.
