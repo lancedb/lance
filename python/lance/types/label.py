@@ -36,7 +36,7 @@ class LabelType(LanceType):
         return b""
 
     @classmethod
-    def __arrow_ext_deserialize__(cls, type_self, storage_type, serialized):
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
         return LabelType()
 
 
@@ -73,6 +73,8 @@ class LabelArray(pa.ExtensionArray):
             1
           ]
         """
+        if isinstance(values, pa.Array):
+            values = values.to_numpy(False)
         cat = pd.Categorical(values, categories=dictionary)
         storage = pa.DictionaryArray.from_arrays(
             cat.codes, dictionary, from_pandas=True

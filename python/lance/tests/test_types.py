@@ -60,8 +60,7 @@ def test_image_array():
 
 
 def test_image_array_chunks():
-    images = [pa.array(["uri1", "uri2"]),
-              pa.array(["uri3", "uri4"])]
+    images = [pa.array(["uri1", "uri2"]), pa.array(["uri3", "uri4"])]
     chunks = pa.chunked_array(images, pa.string())
     arr = ImageArray.from_pandas(chunks)
     assert isinstance(arr, pa.ChunkedArray)

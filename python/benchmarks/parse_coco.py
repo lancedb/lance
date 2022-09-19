@@ -9,6 +9,7 @@ import click
 import pandas as pd
 import pyarrow as pa
 from bench_utils import DatasetConverter
+from lance.types import ImageType
 
 
 class CocoConverter(DatasetConverter):
@@ -36,7 +37,6 @@ class CocoConverter(DatasetConverter):
             {"id": "category_id"}, axis=1
         )
         annotations_df = df.merge(category_df, on="category_id")
-        # annotations_df['iscrowd'] = annotations_df.iscrowd.astype(bool)
         anno_df = (
             pd.DataFrame(
                 {
@@ -65,8 +65,70 @@ class CocoConverter(DatasetConverter):
             return self._instances_to_df(split, json_data)
 
         df = pd.concat([read_split(split) for split in ["train", "val"]])
-        # df['date_captured'] = pd.to_datetime(df.date_captured)  # lance GH#98
+        df['date_captured'] = pd.to_datetime(df.date_captured)  # lance GH#98
         return df
+
+    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+        """Convert each metdata column to pyarrow with lance types"""
+        schema = self.get_schema()
+        arrays = []
+        for name, col in df.items():
+            field = schema.field(name)
+            arr = self._convert_field(field.name, field.type, col)
+            arrays.append(arr)
+        table = pa.Table.from_arrays(arrays, schema=schema)
+        return table
+
+    def _convert_field(self, name, typ, col):
+        if isinstance(typ, pa.ExtensionType):
+            storage = pa.array(col, type=typ.storage_type)
+            arr = pa.ExtensionArray.from_storage(typ, storage)
+        elif pa.types.is_list(typ):
+            native_arr = pa.array(col)
+            offsets = native_arr.offsets
+            values = native_arr.values.to_numpy(zero_copy_only=False)
+            return pa.ListArray.from_arrays(
+                offsets, self._convert_field(
+                    f'{name}.elements', typ.value_type, values)
+            )
+        elif pa.types.is_struct(typ):
+            native_arr = pa.array(col)
+            arrays = []
+            for subfield in typ:
+                sub_arr = native_arr.field(subfield.name)
+                if name == 'annotations' and subfield.name == 'name':
+                    converted = self._convert_name_column(
+                        sub_arr, native_arr.field('category_id')
+                    )
+                else:
+                    converted = self._convert_field(
+                        f"{name}.{subfield.name}",
+                        subfield.type,
+                        sub_arr.to_numpy(zero_copy_only=False)
+                    )
+                arrays.append(converted)
+            return pa.StructArray.from_arrays(arrays, fields=typ)
+        else:
+            arr = pa.array(col, type=typ)
+        return arr
+
+    def _convert_name_column(self, name_arr, category_id_arr):
+        coco_classes = pd.read_csv("coco_classes.csv", header=0, index_col=None)
+        # let's make sure the actual data matches
+        check = pd.Series(dict(zip(name_arr.values.to_numpy(False),
+                                   category_id_arr.values.to_numpy(False)))
+                          ).to_frame(name='check_id')
+        joined = coco_classes.set_index('name').join(check, how='right')
+        mask = pd.notnull(joined.check_id)
+        filtered = joined[mask]
+        if not (filtered.check_id == filtered.category_id).all():
+            raise ValueError(f"Category id check failed")
+        dict_arr = pa.DictionaryArray.from_pandas(
+            pd.Categorical(name_arr.values.to_numpy(False),
+                           coco_classes.name.values)
+        )
+        assert not pd.isna(dict_arr.indices.to_numpy()).all()
+        return pa.ListArray.from_arrays(name_arr.offsets, dict_arr)
 
     def image_uris(self, table):
         return table["image_uri"].to_numpy()
@@ -88,14 +150,14 @@ class CocoConverter(DatasetConverter):
         types = [
             pa.int64(),
             pa.utf8(),
-            pa.utf8(),
+            ImageType.from_storage(pa.utf8()),
             pa.int64(),
             pa.int64(),
-            pa.utf8(),
-            pa.utf8(),
+            pa.timestamp('ns'),
+            ImageType.from_storage(pa.utf8()),
             pa.int64(),
-            pa.dictionary(pa.uint8(), pa.utf8()),
-            pa.utf8(),
+            pa.dictionary(pa.int8(), pa.utf8()),
+            ImageType.from_storage(pa.utf8()),
             self._ann_schema(),
         ]
         return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
@@ -104,16 +166,9 @@ class CocoConverter(DatasetConverter):
     def _ann_schema():
         segmentation_type = pa.struct(
             [
-                pa.field("polygon", pa.list_(pa.list_(pa.int32()))),
-                pa.field(
-                    "coco_rle",
-                    pa.struct(
-                        [
-                            pa.field("counts", pa.list_(pa.int32())),
-                            pa.field("size", pa.list_(pa.int32())),
-                        ]
-                    ),
-                ),
+                pa.field("counts", pa.list_(pa.int32())),
+                pa.field("polygon", pa.list_(pa.list_(pa.float32()))),
+                pa.field("size", pa.list_(pa.int32())),
             ]
         )
         names = [
@@ -131,10 +186,10 @@ class CocoConverter(DatasetConverter):
             pa.float64(),
             pa.bool_(),
             pa.list_(pa.float32()),
-            pa.int16(),
+            pa.int8(),
             pa.int64(),
-            pa.dictionary(pa.uint8(), pa.utf8()),
-            pa.dictionary(pa.uint8(), pa.utf8()),
+            pa.dictionary(pa.int8(), pa.utf8()),
+            pa.dictionary(pa.int8(), pa.utf8()),
         ]
         schema = pa.struct(
             [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]

@@ -156,6 +156,7 @@ class Image(ABC):
     def display(self, **kwargs):
         """Return the jupyter compatible viz for this image"""
         import base64
+
         from IPython.display import Image as IPyImage
 
         with self.open() as fobj:
@@ -173,6 +174,7 @@ class ImageBinary(Image):
     """
     An In-memory Image
     """
+
     DTYPE = ImageBinaryType()
 
     def __init__(self, data: bytes):
@@ -215,6 +217,7 @@ class ImageUri(Image):
     """
     An externalized image represented by its uri
     """
+
     DTYPE = ImageUriType()
 
     def __init__(self, uri: str):
@@ -306,12 +309,14 @@ class ImageArray(pa.ExtensionArray):
             if isinstance(first, Image):
                 return ImageArray.from_images(obj, mask, type, safe, memory_pool)
             elif isinstance(first, bytes):
-                storage = pa.array(obj, mask=mask, type=pa.binary(),
-                                   safe=safe, memory_pool=memory_pool)
+                storage = pa.array(
+                    obj, mask=mask, type=pa.binary(), safe=safe, memory_pool=memory_pool
+                )
                 return ImageArray.from_pandas(storage)
             elif isinstance(first, str):
-                storage = pa.array(obj, mask=mask, type=pa.string(),
-                                   safe=safe, memory_pool=memory_pool)
+                storage = pa.array(
+                    obj, mask=mask, type=pa.string(), safe=safe, memory_pool=memory_pool
+                )
                 return ImageArray.from_pandas(storage)
 
         return pa.ExtensionArray.from_pandas(
@@ -346,8 +351,9 @@ class ImageArray(pa.ExtensionArray):
                 memory_pool=memory_pool,
             )
         else:
-            storage = pa.array([], type=type, mask=mask,
-                               safe=safe, memory_pool=memory_pool)
+            storage = pa.array(
+                [], type=type, mask=mask, safe=safe, memory_pool=memory_pool
+            )
         return pa.ExtensionArray.from_storage(type, storage)
 
 
