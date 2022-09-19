@@ -277,7 +277,6 @@ class ImageUriScalar(pa.ExtensionScalar):
         return ImageUri(self.value.as_py())
 
 
-<<<<<<< HEAD
 class ImageArray(pa.ExtensionArray):
     @staticmethod
     def from_pandas(obj, mask=None, type=None, safe=True, memory_pool=None):
