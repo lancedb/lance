@@ -16,6 +16,10 @@ from torchdata.datapipes.iter import IterableWrapper
 import lance
 import lance.pytorch.data
 
+import torch.multiprocessing
+
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 
 def prepare_target(*args):
     """Prepare dataset.
@@ -46,7 +50,9 @@ transform = T.Compose(
 
 @click.command()
 @click.argument("uri")
-@click.option("-b", "--batch_size", default=32, help="set batch size", show_default=True)
+@click.option(
+    "-b", "--batch_size", default=32, help="set batch size", show_default=True
+)
 @click.option(
     "-e",
     "--epoch",
@@ -99,15 +105,17 @@ def train(
             num_workers=num_workers,
             batch_size=batch_size,
             collate_fn=collate_fn,
+            pin_memory=True,
         )
     elif data_format == "raw":
         dataset = RawCocoDataset(uri, transform=transform)
         train_loader = torch.utils.data.DataLoader(
             dataset,
-            shuffle=True,
+            # shuffle=True,
             num_workers=num_workers,
             batch_size=batch_size,
-            collate_fn=raw_collate_fn,
+            collate_fn=collate_fn,
+            pin_memory=True,
         )
     else:
         raise ValueError("Unsupported data format")
