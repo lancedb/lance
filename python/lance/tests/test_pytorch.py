@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from pathlib import Path
-
-import pyarrow as pa
+import PIL
 
 import lance
 from lance.pytorch.data import LanceDataset
+from lance.types import ImageArray, ImageBinary
 
 
 def test_data_loader(tmp_path: Path):
@@ -35,3 +38,24 @@ def test_data_loader(tmp_path: Path):
     dataset = LanceDataset(tmp_path / "lance", batch_size=4)
     id_batch, value_batch = next(iter(dataset))
     assert id_batch.shape == torch.Size([4])
+
+
+def test_dataset_with_image(tmp_path: Path):
+    images = []
+    for _ in range(10):
+        images.append(
+            ImageBinary.from_numpy(
+                np.random.randint(0, 256, size=(32, 32), dtype=np.uint8)
+            )
+        )
+    image_arr = ImageArray.from_images(images)
+
+    tab = pa.Table.from_arrays([image_arr], names=["image"])
+    lance.write_table(tab, tmp_path / "lance")
+
+    dataset = LanceDataset(tmp_path / "lance", batch_size=4)
+    batch = next(iter(dataset))
+    print(batch)
+    assert len(batch) == 4
+    assert all([isinstance(p, PIL.Image.Image) for p in batch])
+

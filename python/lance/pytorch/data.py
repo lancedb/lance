@@ -30,16 +30,19 @@ except ImportError as e:
 
 import lance
 from lance import dataset
+from lance.types.image import is_image
 
 __all__ = ["LanceDataset"]
 
 
-def to_numpy(arr: pa.Array):
+def to_tensor(arr: pa.Array):
     """Convert pyarrow array to Pytorch Tensors"""
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
     if pa.types.is_dictionary(arr.type):
         return arr.indices.to_numpy()
+    if is_image(arr.type):
+        return [img.to_pil() for img in arr.tolist()]
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
     if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
         return np_arr.astype(np.bytes_)
@@ -123,4 +126,8 @@ class LanceDataset(IterableDataset):
                 columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
-                yield [to_numpy(arr) for arr in batch.columns]
+                tensors = [to_tensor(arr) for arr in batch.columns]
+                if len(tensors) == 1:
+                    # Only one column to return
+                    yield tensors[0]
+                yield tensors
