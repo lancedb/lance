@@ -23,15 +23,12 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 def prepare_target(*args):
     """Prepare dataset.
-
-    TODO: this should be moved into Pytorch DataLoader
     """
     images, annotations = args
-    print("Prepare taget:", annotations, args)
     # TODO: convert numpy to tensor from pytorch dataset
     return images, {
-        "labels": torch.from_numpy(annotations["category_id"]).type(torch.int64),
-        "boxes": torch.from_numpy(np.stack(annotations["bbox"])),
+        "labels": annotations["category_id"].type(torch.int64),
+        "boxes": annotations["bbox"],
     }
 
 

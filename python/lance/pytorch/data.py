@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Callable, Dict, List, Mapping, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -31,13 +31,25 @@ except ImportError as e:
 
 import lance
 from lance import dataset
-from lance.types import is_image_type
+from lance.types import Image, is_image_type
 
 __all__ = ["LanceDataset"]
 
 
+def _data_to_tensor(data: Any) -> Union[torch.Tensor, PIL.Image.Image]:
+    if isinstance(data, Image):
+        return data.to_pil()
+    elif isinstance(data, dict):
+        return {k: to_tensor(v) for k, v in data.items()}
+    else:
+        return torch.tensor(data)
+
+
 def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
+    if not isinstance(arr, pa.Array):
+        return _data_to_tensor(arr)
+
     if pa.types.is_struct(arr.type):
         return {
             arr.type[i].name: to_tensor(arr.field(i))
@@ -45,7 +57,6 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
         }
     elif isinstance(arr, Mapping):
         return {k: to_tensor(v) for k, v in arr.items()}
-
 
     if is_image_type(arr.type):
         return [img.to_pil() for img in arr.tolist()]
@@ -60,7 +71,7 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
     # TODO: for NLP, how to return strings?
     if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
-        return torch.tensor(np_arr.astype(np.bytes_))
+        return np_arr.astype(np.bytes_)
     elif pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
         return np_arr.astype(np.str_)
     else:
@@ -153,8 +164,8 @@ class LanceDataset(IterableDataset):
                 columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
-                tensors = [to_tensor(arr) for arr in batch.columns]
                 if self.mode == "batch":
+                    tensors = [to_tensor(arr) for arr in batch.columns]
                     if self.transform is not None:
                         tensors = self.transform(*tensors)
                     if (
@@ -167,13 +178,10 @@ class LanceDataset(IterableDataset):
                     yield tensors
                 elif self.mode == "record":
                     for row in batch.to_pylist():
-                        print("Record: ", row)
                         record = [
-                            row[batch.field(col).name]
+                            to_tensor(row[batch.field(col).name])
                             for col in range(batch.num_columns)
                         ]
-                        print("Before transform: ", record)
                         if self.transform is not None:
                             record = self.transform(*record)
                         yield record
-
