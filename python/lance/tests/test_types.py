@@ -35,8 +35,8 @@ from lance.types import (
     LabelType,
     Point2dType,
     Point3dType,
+    is_image_type,
 )
-from lance.types import is_image_type
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)

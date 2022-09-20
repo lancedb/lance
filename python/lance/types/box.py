@@ -180,8 +180,7 @@ class BoxNdArray(pa.ExtensionArray, ABC):
         return self.get_max("y")
 
     def _box_sizes(self):
-        return np.multiply.reduce([self.get_axis_len(i)
-                                   for i in range(self.ndims)])
+        return np.multiply.reduce([self.get_axis_len(i) for i in range(self.ndims)])
 
     def iou(self, others: "BoxNdArray") -> np.ndarray:
         """
@@ -212,10 +211,9 @@ class BoxNdArray(pa.ExtensionArray, ABC):
             np.minimum.outer(self.get_max(axis), others.get_max(axis))
             for axis in range(self.ndims)
         ]
-        intersection = np.multiply.reduce([
-            np.maximum(max_inter[i] - min_inter[i] + 1, 0)
-            for i in range(self.ndims)
-        ])
+        intersection = np.multiply.reduce(
+            [np.maximum(max_inter[i] - min_inter[i] + 1, 0) for i in range(self.ndims)]
+        )
         union = np.add.outer(size_self, size_others) - intersection
         return intersection / union
 

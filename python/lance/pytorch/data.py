@@ -44,7 +44,9 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
     if pa.types.is_dictionary(arr.type):
-        return torch.from_numpy(arr.indices.to_numpy(zero_copy_only=False, writable=True))
+        return torch.from_numpy(
+            arr.indices.to_numpy(zero_copy_only=False, writable=True)
+        )
 
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
     # TODO: for NLP, how to return strings?
@@ -70,7 +72,7 @@ class LanceDataset(IterableDataset):
         batch_size: Optional[int] = None,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
-        mode: str = "record"
+        mode: str = "record",
     ):
         """LanceDataset
 
@@ -145,8 +147,11 @@ class LanceDataset(IterableDataset):
                 if self.mode == "batch":
                     if self.transform is not None:
                         tensors = self.transform(*tensors)
-                    if len(self.columns) == 1 and isinstance(tensors, list) and \
-                        len(tensors) == 1:  # Assuming transform does not change the formation.
+                    if (
+                        len(self.columns) == 1
+                        and isinstance(tensors, list)
+                        and len(tensors) == 1
+                    ):  # Assuming transform does not change the formation.
                         # Only one column to return
                         tensors = tensors[0]
                     yield tensors

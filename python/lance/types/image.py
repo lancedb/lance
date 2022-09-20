@@ -184,7 +184,7 @@ class ImageBinary(Image):
     @classmethod
     def from_numpy(cls, arr: np.ndarray, format: str = "png"):
         """Construct an Image from a numpy array."""
-        img: PILImage = PILImage.fromarray(arr).convert('RGB')
+        img: PILImage = PILImage.fromarray(arr).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format=format)
         return ImageBinary(data=buf.getvalue())
