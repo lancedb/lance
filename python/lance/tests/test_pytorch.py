@@ -36,7 +36,7 @@ def test_data_loader(tmp_path: Path):
 
     lance.write_table(tab, tmp_path / "lance")
 
-    dataset = LanceDataset(tmp_path / "lance", batch_size=4)
+    dataset = LanceDataset(tmp_path / "lance", batch_size=4, mode="batch")
     id_batch, value_batch = next(iter(dataset))
     assert id_batch.shape == torch.Size([4])
     assert torch.is_tensor(id_batch)
@@ -62,7 +62,7 @@ def test_dataset_with_ext_types(tmp_path: Path):
     tab = pa.Table.from_arrays([image_arr, labels_arr], names=["image", "label"])
     lance.write_table(tab, tmp_path / "lance")
 
-    dataset = LanceDataset(tmp_path / "lance", batch_size=4)
+    dataset = LanceDataset(tmp_path / "lance", batch_size=4, mode="batch")
     batch = next(iter(dataset))
     assert len(batch) == 2 and all([len(col) == 4 for col in batch])
     images, labels = batch
