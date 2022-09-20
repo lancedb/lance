@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 import io
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -179,6 +180,14 @@ class ImageBinary(Image):
 
     def __init__(self, data: bytes):
         self._bytes = data
+
+    @classmethod
+    def from_numpy(cls, arr: np.ndarray, format: str = "png"):
+        """Construct an Image from a numpy array."""
+        img: PILImage = PILImage.fromarray(arr).convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format=format)
+        return ImageBinary(data=buf.getvalue())
 
     @property
     def bytes(self) -> bytes:
@@ -361,3 +370,8 @@ def _ensure_type(images, typ):
     for im in images:
         if not isinstance(im, typ):
             raise TypeError(f"Expecting {typ} but got {type(im)}")
+
+
+def is_image_type(t: pa.DataType) -> bool:
+    """Returns True if the type is an image type"""
+    return isinstance(t, ImageType)
