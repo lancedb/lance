@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-
-import numpy as np
-import pyarrow as pa
 import pytest
-import pandas as pd
 
 torch = pytest.importorskip("torch")
 
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 import PIL
+import pyarrow as pa
 
 import lance
 from lance.pytorch.data import LanceDataset
