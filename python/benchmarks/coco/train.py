@@ -27,6 +27,7 @@ def prepare_target(*args):
     TODO: this should be moved into Pytorch DataLoader
     """
     images, annotations = args
+    print("Prepare taget:", annotations, args)
     # TODO: convert numpy to tensor from pytorch dataset
     return images, {
         "labels": torch.from_numpy(annotations["category_id"]).type(torch.int64),
@@ -95,7 +96,7 @@ def train(
         dataset = lance.pytorch.data.LanceDataset(
             uri,
             columns=["image", "annotations.category_id", "annotations.bbox"],
-            batch_size=64,
+            batch_size=2,
             transform=transform,
             # filter=(pc.field("split") == "train")
         )

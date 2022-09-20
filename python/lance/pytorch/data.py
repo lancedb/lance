@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Callable, List, Optional, Union, Dict
+from typing import Callable, Dict, List, Mapping, Optional, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -38,6 +38,15 @@ __all__ = ["LanceDataset"]
 
 def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
+    if pa.types.is_struct(arr.type):
+        return {
+            arr.type[i].name: to_tensor(arr.field(i))
+            for i in range(arr.type.num_fields)
+        }
+    elif isinstance(arr, Mapping):
+        return {k: to_tensor(v) for k, v in arr.items()}
+
+
     if is_image_type(arr.type):
         return [img.to_pil() for img in arr.tolist()]
 
@@ -55,6 +64,7 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     elif pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
         return np_arr.astype(np.str_)
     else:
+        print(np_arr)
         return torch.from_numpy(np_arr)
 
 
@@ -156,7 +166,13 @@ class LanceDataset(IterableDataset):
                         tensors = tensors[0]
                     yield tensors
                 elif self.mode == "record":
-                    for record in zip(*tensors):
+                    for row in batch.to_pylist():
+                        print("Record: ", row)
+                        record = [
+                            row[batch.field(col).name]
+                            for col in range(batch.num_columns)
+                        ]
+                        print("Before transform: ", record)
                         if self.transform is not None:
                             record = self.transform(*record)
                         yield record
