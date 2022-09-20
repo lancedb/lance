@@ -110,7 +110,19 @@ class BoxNdArray(pa.ExtensionArray, ABC):
             .reshape((len(self), (self.ndims * 2)))
         )
 
-    def get_length(self, axis: Union[int, str]):
+    def get_axis_len(self, axis: Union[int, str]):
+        """
+        Get the length along the given axis
+
+        Parameters
+        ----------
+        axis: int or str
+            0 is 'x', 1 is 'y', 2 is 'z`
+
+        Return
+        ------
+        len: int
+        """
         axis = self._sanitize_axis(axis)
         return self.get_max(axis) - self.get_min(axis) + 1
 
@@ -168,10 +180,7 @@ class BoxNdArray(pa.ExtensionArray, ABC):
         return self.get_max("y")
 
     def _box_sizes(self):
-        sizes = self.get_length(0)
-        for i in range(1, self.ndims):
-            sizes *= self.get_length(i)
-        return sizes
+        return np.multiply.reduce([self.get_axis_len(i) for i in range(self.ndims)])
 
     def iou(self, others: "BoxNdArray") -> np.ndarray:
         """
@@ -195,17 +204,17 @@ class BoxNdArray(pa.ExtensionArray, ABC):
             size_others = others._box_sizes()
 
         min_inter = [
-            np.maximum(self.get_min(axis)[:, np.newaxis], others.get_min(axis))
+            np.maximum.outer(self.get_min(axis), others.get_min(axis))
             for axis in range(self.ndims)
         ]
         max_inter = [
-            np.minimum(self.get_max(axis)[:, np.newaxis], others.get_max(axis))
+            np.minimum.outer(self.get_max(axis), others.get_max(axis))
             for axis in range(self.ndims)
         ]
-        intersection = np.maximum(max_inter[0] - min_inter[0] + 1, 0)
-        for i in range(1, self.ndims):
-            intersection *= np.maximum(max_inter[i] - min_inter[i] + 1, 0)
-        union = size_self[:, np.newaxis] + size_others - intersection
+        intersection = np.multiply.reduce(
+            [np.maximum(max_inter[i] - min_inter[i] + 1, 0) for i in range(self.ndims)]
+        )
+        union = np.add.outer(size_self, size_others) - intersection
         return intersection / union
 
 
