@@ -1,9 +1,14 @@
 #!/usr/bin/env python
+
 """Parse coco dataset"""
 
 import json
 import os
 from collections import defaultdict
+import sys
+
+sys.path.append("..")
+
 
 import click
 import pandas as pd
@@ -11,9 +16,12 @@ import pyarrow as pa
 from bench_utils import DatasetConverter
 from lance.types import ImageType
 
+import lance
+import lance.types
+
 
 class CocoConverter(DatasetConverter):
-    def __init__(self, uri_root, version="2017"):
+    def __init__(self, uri_root: str, version: str = "2017"):
         super(CocoConverter, self).__init__("coco", uri_root)
         self.version = version
 
@@ -188,8 +196,8 @@ class CocoConverter(DatasetConverter):
             segmentation_type,
             pa.float64(),
             pa.bool_(),
-            pa.list_(pa.float32()),
-            pa.int8(),
+            pa.list_(pa.float32(), 4),
+            pa.int16(),
             pa.int64(),
             pa.dictionary(pa.int8(), pa.utf8()),
             pa.dictionary(pa.int8(), pa.utf8()),
@@ -215,11 +223,17 @@ def _aggregate_annotations(annotations):
 
 
 @click.command()
-@click.option("-u", "--base-uri", type=str, help="Coco dataset root")
+@click.argument("base_uri")
 @click.option(
     "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
 )
-@click.option("-f", "--fmt", type=str, help="Output format (parquet or lance)")
+@click.option(
+    "-f",
+    "--fmt",
+    type=click.Choice(["lance", "parquet"]),
+    default="lance",
+    help="Output format (parquet or lance)",
+)
 @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
 @click.option(
     "-g",
@@ -242,7 +256,15 @@ def _aggregate_annotations(annotations):
     type=str,
     help="Output path. Default is {base_uri}/coco_links.{fmt}",
 )
-def main(base_uri, version, fmt, embedded, output_path, group_size: int, max_rows_per_file: int):
+def main(
+    base_uri,
+    version,
+    fmt,
+    embedded,
+    output_path,
+    group_size: int,
+    max_rows_per_file: int,
+):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
     known_formats = ["lance", "parquet"]

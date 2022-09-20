@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Union
 from urllib.parse import urlparse
 
 import numpy as np
@@ -31,13 +31,33 @@ except ImportError as e:
 
 import lance
 from lance import dataset
-from lance.types import is_image_type
+from lance.types import Image, is_image_type
 
 __all__ = ["LanceDataset"]
 
 
+def _data_to_tensor(data: Any) -> Union[torch.Tensor, PIL.Image.Image]:
+    if isinstance(data, Image):
+        return data.to_pil()
+    elif isinstance(data, dict):
+        return {k: to_tensor(v) for k, v in data.items()}
+    else:
+        return torch.tensor(data)
+
+
 def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
+    if not isinstance(arr, pa.Array):
+        return _data_to_tensor(arr)
+
+    if pa.types.is_struct(arr.type):
+        return {
+            arr.type[i].name: to_tensor(arr.field(i))
+            for i in range(arr.type.num_fields)
+        }
+    elif isinstance(arr, Mapping):
+        return {k: to_tensor(v) for k, v in arr.items()}
+
     if is_image_type(arr.type):
         return [img.to_pil() for img in arr.tolist()]
 
@@ -68,7 +88,7 @@ class LanceDataset(IterableDataset):
     def __init__(
         self,
         root: Union[str, Path],
-        columns: Optional[List[str]] = None,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
@@ -143,8 +163,8 @@ class LanceDataset(IterableDataset):
                 columns=self.columns, batch_size=self.batch_size, filter=self.filter
             )
             for batch in scan.to_reader():
-                tensors = [to_tensor(arr) for arr in batch.columns]
                 if self.mode == "batch":
+                    tensors = [to_tensor(arr) for arr in batch.columns]
                     if self.transform is not None:
                         tensors = self.transform(*tensors)
                     if (
@@ -156,7 +176,11 @@ class LanceDataset(IterableDataset):
                         tensors = tensors[0]
                     yield tensors
                 elif self.mode == "record":
-                    for record in zip(*tensors):
+                    for row in batch.to_pylist():
+                        record = [
+                            to_tensor(row[batch.field(col).name])
+                            for col in range(batch.num_columns)
+                        ]
                         if self.transform is not None:
                             record = self.transform(*record)
                         yield record
