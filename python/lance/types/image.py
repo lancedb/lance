@@ -372,6 +372,6 @@ def _ensure_type(images, typ):
             raise TypeError(f"Expecting {typ} but got {type(im)}")
 
 
-def is_image(t: pa.DataType) -> bool:
-    """Returns True if the type is image type"""
+def is_image_type(t: pa.DataType) -> bool:
+    """Returns True if the type is an image type"""
     return isinstance(t, ImageType)

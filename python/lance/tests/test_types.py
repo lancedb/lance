@@ -36,7 +36,7 @@ from lance.types import (
     Point2dType,
     Point3dType,
 )
-from lance.types.image import is_image
+from lance.types import is_image_type
 
 if platform.system() != "Linux":
     pytest.skip(allow_module_level=True)
@@ -77,7 +77,7 @@ def _test_image(tmp_path, storage):
     image_type = ImageType.from_storage(storage.type)
     ext_arr = _test_extension_rt(tmp_path, image_type, storage)
     assert len(ext_arr.chunks) == 1
-    assert is_image(ext_arr.type)
+    assert is_image_type(ext_arr.type)
     ext_arr = ext_arr.chunks[0]
     assert isinstance(ext_arr, ImageArray)
     expected_arr = ImageArray.from_pandas(storage.to_pylist())

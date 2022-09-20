@@ -27,6 +27,7 @@ from lance.types.image import (
     ImageType,
     ImageUri,
     ImageUriType,
+    is_image_type
 )
 from lance.types.label import LabelArray, LabelType
 

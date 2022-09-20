@@ -31,14 +31,14 @@ except ImportError as e:
 
 import lance
 from lance import dataset
-from lance.types.image import is_image
+from lance.types import is_image_type
 
 __all__ = ["LanceDataset"]
 
 
 def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
-    if is_image(arr.type):
+    if is_image_type(arr.type):
         return [img.to_pil() for img in arr.tolist()]
 
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
@@ -145,7 +145,8 @@ class LanceDataset(IterableDataset):
                 if self.mode == "batch":
                     if self.transform is not None:
                         tensors = self.transform(*tensors)
-                    if len(tensors) == 1:
+                    if len(self.columns) == 1 and isinstance(tensors, list) and \
+                        len(tensors) == 1:  # Assuming transform does not change the formation.
                         # Only one column to return
                         tensors = tensors[0]
                     yield tensors
