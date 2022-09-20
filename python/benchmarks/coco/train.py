@@ -6,7 +6,6 @@ import os
 from typing import Callable
 
 import click
-import numpy as np
 import pytorch_lightning as pl
 import torch
 import transforms as T
@@ -35,6 +34,10 @@ def prepare_target(*args):
 def get_transform(benchmark: str) -> Callable:
     if benchmark == "io":
         return prepare_target
+    elif benchmark == "no_augmentation":
+        return T.Compose(
+            [prepare_target, T.PILToTensor(), T.ConvertImageDtype(torch.float)]
+        )
     elif benchmark == "train":
         # https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
         return T.Compose(
@@ -48,6 +51,8 @@ def get_transform(benchmark: str) -> Callable:
                 T.ConvertImageDtype(torch.float),
             ]
         )
+    else:
+        raise ValueError("Unsupported benchmark: ", benchmark)
 
 
 # https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
@@ -94,7 +99,7 @@ transform = T.Compose(
 @click.option(
     "-B",
     "--benchmark",
-    type=click.Choice(["io", "train"]),
+    type=click.Choice(["io", "no_augmentation", "train"]),
     default="train",
     help="Specify the benchmark to run",
     show_default=True,

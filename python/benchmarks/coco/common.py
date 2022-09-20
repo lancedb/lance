@@ -124,12 +124,12 @@ class ObjectDetection(pl.LightningModule):
         print(f"Training finished in {time.time() - self.fit_start_time} seconds")
 
     def training_step(self, batch, batch_idx):
-        if self._benchmark != "train":
+        if self._benchmark == "io":
             return
         images, targets = batch
         loss_dict = self.backbond(images, targets)
         loss = sum(loss for loss in loss_dict.values())
-        if torch.isinf(loss) or torch.isnan(loss):
+        if torch.isinf(loss) or torch.isnan(loss) and self._benchmark == "train":
             print(f"Loss is {loss}, exit")
             sys.exit(1)
         return loss
