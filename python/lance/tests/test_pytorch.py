@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
+import pandas as pd
 
 torch = pytest.importorskip("torch")
 
@@ -40,22 +41,26 @@ def test_data_loader(tmp_path: Path):
     assert id_batch.shape == torch.Size([4])
 
 
-def test_dataset_with_image(tmp_path: Path):
+def test_dataset_with_ext_types(tmp_path: Path):
     images = []
-    for _ in range(10):
+    labels = []
+    for i in range(10):
         images.append(
             ImageBinary.from_numpy(
                 np.random.randint(0, 256, size=(32, 32), dtype=np.uint8)
             )
         )
-    image_arr = ImageArray.from_images(images)
+        labels.append(["cat", "dog", "goat"][i % 3])
 
-    tab = pa.Table.from_arrays([image_arr], names=["image"])
+    image_arr = ImageArray.from_images(images)
+    labels_arr = pa.DictionaryArray.from_pandas(pd.Series(labels, dtype="category"))
+
+    tab = pa.Table.from_arrays([image_arr, labels_arr], names=["image", "label"])
     lance.write_table(tab, tmp_path / "lance")
 
     dataset = LanceDataset(tmp_path / "lance", batch_size=4)
     batch = next(iter(dataset))
-    print(batch)
-    assert len(batch) == 4
-    assert all([isinstance(p, PIL.Image.Image) for p in batch])
-
+    assert len(batch) == 2 and all([len(col) == 4 for col in batch])
+    images, labels = batch
+    assert all([isinstance(p, PIL.Image.Image) for p in images])
+    assert torch.equal(labels, torch.tensor([0, 1, 2, 0], dtype=torch.int8))

@@ -35,12 +35,12 @@ from lance.types.image import is_image
 __all__ = ["LanceDataset"]
 
 
-def to_tensor(arr: pa.Array):
+def to_tensor(arr: pa.Array) -> torch.Tensor:
     """Convert pyarrow array to Pytorch Tensors"""
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
     if pa.types.is_dictionary(arr.type):
-        return arr.indices.to_numpy()
+        return torch.from_numpy(arr.indices.to_numpy(zero_copy_only=False, writable=True))
     if is_image(arr.type):
         return [img.to_pil() for img in arr.tolist()]
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
