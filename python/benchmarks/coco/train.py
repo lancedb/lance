@@ -22,8 +22,7 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 def prepare_target(*args):
-    """Prepare dataset.
-    """
+    """Prepare dataset."""
     images, annotations = args
     # TODO: convert numpy to tensor from pytorch dataset
     return images, {
@@ -72,6 +71,14 @@ transform = T.Compose(
     "model_name",
     type=click.Choice(["ssd"]),
     help="Choose the network to run",
+)
+@click.option(
+    "-B",
+    "--benchmark",
+    type=click.Choice(["io", "train"]),
+    default="train",
+    help="Specify the benchmark to run",
+    show_default=True,
 )
 @click.option(
     "-f",
