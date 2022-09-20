@@ -36,7 +36,7 @@ from lance.types.image import is_image
 __all__ = ["LanceDataset"]
 
 
-def to_tensor(arr: pa.Array) -> Union[torch.Tensor | PIL.Image.Image]:
+def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
     if is_image(arr.type):
         return [img.to_pil() for img in arr.tolist()]
