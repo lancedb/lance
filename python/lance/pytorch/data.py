@@ -70,6 +70,7 @@ class LanceDataset(IterableDataset):
         batch_size: Optional[int] = None,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
+        mode: str = "record"
     ):
         """LanceDataset
 
@@ -85,6 +86,9 @@ class LanceDataset(IterableDataset):
             The filter to apply to the scanner.
         transform : Callable, optional
             Apply transform to each of the example.
+        mode : str
+            Can be either a "record" or "batch" mode. It is used to decide how
+            to apply transform and return.
         """
         self.root = root
         # Handle local relative path
@@ -94,6 +98,10 @@ class LanceDataset(IterableDataset):
         self.filter = filter
         self.batch_size = batch_size
         self.transform = transform
+
+        if mode not in ["batch", "record"]:
+            raise ValueError(f"Mode must be either 'batch' or 'record', got '{mode}'")
+        self.mode = mode
 
         self._dataset: pa.dataset.FileSystemDataset = None
         self._fs: Optional[pyarrow.fs.FileSystem] = None
@@ -119,7 +127,10 @@ class LanceDataset(IterableDataset):
             ]
 
     def __iter__(self):
-        """Yield dataset"""
+        """Obtain the iterator of the dataset.
+
+        Either returning a record or a batch is controlled by the "mode" parameter.
+        """
         self._setup_dataset()
         for file_uri in self._files:
             ds = lance.dataset(
@@ -131,7 +142,15 @@ class LanceDataset(IterableDataset):
             )
             for batch in scan.to_reader():
                 tensors = [to_tensor(arr) for arr in batch.columns]
-                if len(tensors) == 1:
-                    # Only one column to return
-                    yield tensors[0]
-                yield tensors
+                if self.mode == "batch":
+                    if self.transform is not None:
+                        tensors = self.transform(*tensors)
+                    if len(tensors) == 1:
+                        # Only one column to return
+                        yield tensors[0]
+                    yield tensors
+                elif self.mode == "record":
+                    for record in zip(*tensors):
+                        if self.transform is not None:
+                            record = self.transform(*record)
+                        yield record
