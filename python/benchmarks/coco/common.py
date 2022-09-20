@@ -3,11 +3,9 @@
 import io
 import json
 import os
-import sys
 import time
 from typing import Tuple, Callable, Dict, Optional
 
-import numpy as np
 import PIL
 import pytorch_lightning as pl
 import torch
@@ -110,7 +108,7 @@ class ObjectDetection(pl.LightningModule):
 
     def __init__(self, benchmark: str = "train"):
         super().__init__()
-        self.backbond = torchvision.models.detection.ssd300_vgg16()
+        self.backbone = torchvision.models.detection.ssd300_vgg16()
         self.lr = 0.1
         self.fit_start_time = 0
         self._benchmark = benchmark
@@ -127,11 +125,10 @@ class ObjectDetection(pl.LightningModule):
         if self._benchmark == "io":
             return
         images, targets = batch
-        loss_dict = self.backbond(images, targets)
+        loss_dict = self.backbone(images, targets)
         loss = sum(loss for loss in loss_dict.values())
         if torch.isinf(loss) or torch.isnan(loss) and self._benchmark == "train":
-            print(f"Loss is {loss}, exit")
-            sys.exit(1)
+            raise RuntimeError(f"Loss is {loss}, exit")
         return loss
 
     def configure_optimizers(self):

@@ -55,20 +55,6 @@ def get_transform(benchmark: str) -> Callable:
         raise ValueError("Unsupported benchmark: ", benchmark)
 
 
-# https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
-transform = T.Compose(
-    [
-        prepare_target,
-        T.RandomPhotometricDistort(),
-        T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
-        T.RandomIoUCrop(),
-        T.RandomHorizontalFlip(),
-        T.PILToTensor(),
-        T.ConvertImageDtype(torch.float),
-    ]
-)
-
-
 @click.command()
 @click.argument("uri")
 @click.option(

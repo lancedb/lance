@@ -75,7 +75,6 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
     elif pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
         return np_arr.astype(np.str_)
     else:
-        print(np_arr)
         return torch.from_numpy(np_arr)
 
 

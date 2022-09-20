@@ -44,9 +44,6 @@ class CocoConverter(DatasetConverter):
         category_df = pd.DataFrame(instances_json["categories"]).rename(
             {"id": "category_id"}, axis=1
         )
-        # df["bbox"] = lance.types.Box2dArray(df["bbox"])
-        # print(df, df.dtypes)
-        # print(df)
         annotations_df = df.merge(category_df, on="category_id")
         anno_df = (
             pd.DataFrame(
@@ -270,14 +267,6 @@ def main(
 ):
     converter = CocoConverter(base_uri, version=version)
     df = converter.read_metadata()
-    # print(df)
-    # tab: pa.Table = pa.Table.from_pandas(
-    #     df, preserve_index=False, schema=converter.get_schema()
-    # )
-    # annotations = tab.column("annotations")
-    # print(tab.schema)
-    # print(annotations)
-    # return
     known_formats = ["lance", "parquet"]
     if fmt is not None:
         assert fmt in known_formats
