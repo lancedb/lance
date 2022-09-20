@@ -3,6 +3,7 @@
 # Training over coco dataset.
 
 import os
+from typing import Callable
 
 import click
 import numpy as np
@@ -29,6 +30,24 @@ def prepare_target(*args):
         "labels": annotations["category_id"].type(torch.int64),
         "boxes": annotations["bbox"],
     }
+
+
+def get_transform(benchmark: str) -> Callable:
+    if benchmark == "io":
+        return prepare_target
+    elif benchmark == "train":
+        # https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
+        return T.Compose(
+            [
+                prepare_target,
+                T.RandomPhotometricDistort(),
+                T.RandomZoomOut(fill=list((123.0, 117.0, 104.0))),
+                T.RandomIoUCrop(),
+                T.RandomHorizontalFlip(),
+                T.PILToTensor(),
+                T.ConvertImageDtype(torch.float),
+            ]
+        )
 
 
 # https://github.com/pytorch/vision/blob/24890d718f5a73586ef093371912b5b37a5b0d46/references/detection/presets.py#L37
@@ -95,13 +114,14 @@ def train(
     num_workers: int,
     model_name: str,
     data_format: str,
+    benchmark: str,
 ):
     if data_format == "lance":
         dataset = lance.pytorch.data.LanceDataset(
             uri,
             columns=["image", "annotations.category_id", "annotations.bbox"],
             batch_size=2,
-            transform=transform,
+            transform=get_transform(benchmark),
             # filter=(pc.field("split") == "train")
         )
         dp = IterableWrapper(dataset).shuffle(buffer_size=64)
@@ -113,7 +133,7 @@ def train(
             pin_memory=True,
         )
     elif data_format == "raw":
-        dataset = RawCocoDataset(uri, transform=transform)
+        dataset = RawCocoDataset(uri, transform=get_transform(benchmark))
         train_loader = torch.utils.data.DataLoader(
             dataset,
             # shuffle=True,
@@ -133,8 +153,9 @@ def train(
         devices=-1,
         auto_lr_find=True,
     )
-    model = ObjectDetection()
-    trainer.tune(model, train_dataloaders=train_loader)
+    model = ObjectDetection(benchmark=benchmark)
+    if benchmark == "train":
+        trainer.tune(model, train_dataloaders=train_loader)
     trainer.fit(model, train_dataloaders=train_loader)
 
 

@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import time
-from typing import Callable, Dict, Optional
+from typing import Tuple, Callable, Dict, Optional
 
 import numpy as np
 import PIL
@@ -76,7 +76,7 @@ class RawCocoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.image_ids)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[PIL.Image.Image, torch.Tensor]:
         image_id = self.image_ids[idx]
         img = self.images[image_id]
         image = self._load_image(img)
@@ -85,11 +85,13 @@ class RawCocoDataset(torch.utils.data.Dataset):
         for ann in img["annotations"]:
             labels.append(torch.tensor(ann["category_id"]))
             bbox = ann["bbox"]
-            boxes.append(np.array([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]]))
+            boxes.append(
+                torch.tensor([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]])
+            )
 
         target = {
-            "category_id": np.array(labels),
-            "bbox": np.array(boxes),
+            "category_id": torch.tensor(labels),
+            "bbox": torch.stack(boxes),
         }
         # print(image, target)
 
@@ -106,11 +108,12 @@ class ObjectDetection(pl.LightningModule):
     https://github.com/pytorch/vision/blob/main/references/detection
     """
 
-    def __init__(self):
+    def __init__(self, benchmark: str = "train"):
         super().__init__()
         self.backbond = torchvision.models.detection.ssd300_vgg16()
         self.lr = 0.1
         self.fit_start_time = 0
+        self._benchmark = benchmark
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -121,6 +124,8 @@ class ObjectDetection(pl.LightningModule):
         print(f"Training finished in {time.time() - self.fit_start_time} seconds")
 
     def training_step(self, batch, batch_idx):
+        if self._benchmark != "train":
+            return
         images, targets = batch
         loss_dict = self.backbond(images, targets)
         loss = sum(loss for loss in loss_dict.values())
