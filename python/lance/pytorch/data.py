@@ -17,6 +17,7 @@ from typing import Callable, List, Optional, Union
 from urllib.parse import urlparse
 
 import numpy as np
+import PIL
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset
@@ -35,21 +36,24 @@ from lance.types.image import is_image
 __all__ = ["LanceDataset"]
 
 
-def to_tensor(arr: pa.Array) -> torch.Tensor:
+def to_tensor(arr: pa.Array) -> Union[torch.Tensor | PIL.Image.Image]:
     """Convert pyarrow array to Pytorch Tensors"""
+    if is_image(arr.type):
+        return [img.to_pil() for img in arr.tolist()]
+
     # TODO: arrow.to_numpy(writable=True) makes a new copy of data.
     # Investigate how to directly perform zero-copy into Torch Tensor.
     if pa.types.is_dictionary(arr.type):
         return torch.from_numpy(arr.indices.to_numpy(zero_copy_only=False, writable=True))
-    if is_image(arr.type):
-        return [img.to_pil() for img in arr.tolist()]
+
     np_arr = arr.to_numpy(zero_copy_only=False, writable=True)
+    # TODO: for NLP, how to return strings?
     if pa.types.is_binary(arr.type) or pa.types.is_large_binary(arr.type):
         return np_arr.astype(np.bytes_)
     elif pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
         return np_arr.astype(np.str_)
     else:
-        return np_arr
+        return torch.from_numpy(np_arr)
 
 
 class LanceDataset(IterableDataset):

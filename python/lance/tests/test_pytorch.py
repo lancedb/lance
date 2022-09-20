@@ -39,6 +39,10 @@ def test_data_loader(tmp_path: Path):
     dataset = LanceDataset(tmp_path / "lance", batch_size=4)
     id_batch, value_batch = next(iter(dataset))
     assert id_batch.shape == torch.Size([4])
+    assert torch.is_tensor(id_batch)
+    assert torch.equal(id_batch, torch.tensor([0, 1, 2, 3]))
+    assert torch.is_tensor(value_batch)
+    assert torch.equal(value_batch, torch.tensor([10, 11, 12, 13]))
 
 
 def test_dataset_with_ext_types(tmp_path: Path):
