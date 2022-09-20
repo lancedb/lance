@@ -147,7 +147,7 @@ class LanceDataset(IterableDataset):
                         tensors = self.transform(*tensors)
                     if len(tensors) == 1:
                         # Only one column to return
-                        yield tensors[0]
+                        tensors = tensors[0]
                     yield tensors
                 elif self.mode == "record":
                     for record in zip(*tensors):
