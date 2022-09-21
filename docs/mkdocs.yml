@@ -1,0 +1,19 @@
+site_name: Lance, A Columnar Format for Computer Vision
+repo_url: https://github.com/eto-ai/lance
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+nav:
+  - index.md
+  - start.md
+  - spec.md
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+

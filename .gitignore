@@ -56,3 +56,5 @@ python/wheels
 
 logs
 *.ckpt
+
+docs/site
