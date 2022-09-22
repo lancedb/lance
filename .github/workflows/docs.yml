@@ -36,12 +36,12 @@ jobs:
           cache-dependency-path: "docs/requirements.txt"
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y -V ca-certificates lsb-release wget
+          sudo apt -y -qq update
+          sudo apt install -y -q -ca-certificates lsb-release wget
           wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt update
-          sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev
+          sudo apt install -y -q ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt -y -q update
+          sudo apt install -y -q libarrow-dev libarrow-dataset-dev libparquet-dev
       - name: Build cpp
         working-directory: cpp
         run: |
@@ -50,7 +50,9 @@ jobs:
           make -j
       - name: Build Python
         working-directory: python
-        run: python setup.py develop
+        run: |
+          pip install -r ../docs/requirements.txt
+          python setup.py develop
       - name: Setup Pages
         uses: actions/configure-pages@v2
       - name: Upload artifact
