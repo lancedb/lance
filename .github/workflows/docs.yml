@@ -34,25 +34,12 @@ jobs:
           python-version: "3.10"
           cache: 'pip'
           cache-dependency-path: "docs/requirements.txt"
-      - name: Install dependencies
-        run: |
-          sudo apt -y -qq update
-          sudo apt install -y -qq ca-certificates lsb-release wget doxygen
-          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt install -y -qq ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt -y -q update
-          sudo apt install -y -qq libarrow-dev libarrow-dataset-dev libparquet-dev
-      - name: Build cpp
-        working-directory: cpp
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cd build
-          make -j
       - name: Build Python
         working-directory: python
         run: |
-          pip install -r ../docs/requirements.txt
-          python setup.py develop
+          ./tools/build_wheel.sh cp310
+          python -m pip install -r ../docs/requirements.txt
+          python -m pip install $(ls wheels/*.whl)
       - name: Build docs
         working-directory: docs
         run: make html
