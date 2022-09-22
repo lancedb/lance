@@ -37,11 +37,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
-          sudo apt install -y -q ca-certificates lsb-release wget
+          sudo apt install -y -qq ca-certificates lsb-release wget doxygen
           wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-          sudo apt install -y -q ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y -qq ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
           sudo apt -y -q update
-          sudo apt install -y -q libarrow-dev libarrow-dataset-dev libparquet-dev
+          sudo apt install -y -qq libarrow-dev libarrow-dataset-dev libparquet-dev
       - name: Build cpp
         working-directory: cpp
         run: |
