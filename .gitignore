@@ -56,3 +56,6 @@ python/wheels
 
 logs
 *.ckpt
+
+docs/_build
+docs/api/python

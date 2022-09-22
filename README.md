@@ -1,8 +1,9 @@
 # Lance: A Columnar Data Format for Computer Vision
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
+[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
 
-![PyPi](https://img.shields.io/pypi/v/pylance)
+[![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
