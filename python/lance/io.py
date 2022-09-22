@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """IO utilities"""
+
 import os
 import shutil
 from io import BytesIO
@@ -82,16 +83,16 @@ def copy(source: Union[str, Path], dest: Union[str, Path]) -> str:
 
     Parameters
     ----------
-    source : str
+    source : str or Path
         The source URI to copy from
-    dest : str
+    dest : str or Path
         The destination uri or the destination directory. If ``dest`` is
-        a URI ends with a "/", it represents a directory.
+        an URI ends with "/", it represents a directory.
 
     Return
     ------
     str
-        Return the URI of destination.
+        The URI of destination.
     """
     parsed_source = urlparse(source)
     if dest and dest.endswith("/"):
