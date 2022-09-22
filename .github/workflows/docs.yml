@@ -24,7 +24,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -32,13 +32,30 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
+          cache: 'pip'
           cache-dependency-path: "docs/requirements.txt"
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y -V ca-certificates lsb-release wget
+          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt update
+          sudo apt install -y -V libarrow-dev libarrow-dataset-dev libparquet-dev
+      - name: Build cpp
+        working-directory: cpp
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cd build
+          make -j
+      - name: Build Python
+        working-directory: python
+        run: python setup.py develop
       - name: Setup Pages
         uses: actions/configure-pages@v2
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v1
         with:
-          # Upload entire repository
           path: 'docs/_build'
       - name: Deploy to GitHub Pages
         id: deployment
