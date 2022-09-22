@@ -4,8 +4,8 @@ build:
   tools:
     python: "3.10"
 
-mkdocs:
-  configuration: docs/mkdocs.yml
+sphinx:
+   configuration: docs/conf.py
 
 python:
   install:
