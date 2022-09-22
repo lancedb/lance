@@ -38,6 +38,9 @@ class ImageType(LanceType, ABC):
     def __arrow_ext_serialize__(self):
         return b""
 
+    def __arrow_ext_class__(self):
+        return ImageArray
+
     @classmethod
     def from_storage(cls, storage_type):
         # TODO consider parameterizing types to support utf* variants
