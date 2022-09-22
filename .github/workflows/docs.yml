@@ -37,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
-          sudo apt install -y -q -ca-certificates lsb-release wget
+          sudo apt install -y -q ca-certificates lsb-release wget
           wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
           sudo apt install -y -q ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
           sudo apt -y -q update
