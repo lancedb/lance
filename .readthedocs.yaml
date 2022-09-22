@@ -4,13 +4,13 @@ build:
   tools:
     python: "3.10"
   jobs:
-    pre_create_environment:
-      - apt -y update
-      - apt install -y -V ca-certificates lsb-release wget
+    pre_system_dependencies:
+      - sudo apt -y update
+      - sudo apt install -y -V ca-certificates lsb-release wget
       - wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-      - apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-      - apt -y update
-      - apt -y install cmake libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev libprotobuf-dev
+      - sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+      - sudo apt -y update
+      - sudo apt -y install cmake libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev libprotobuf-dev
 sphinx:
    configuration: docs/conf.py
 
