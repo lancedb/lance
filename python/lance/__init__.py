@@ -33,8 +33,6 @@ if platform.system() == "Linux":
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
 
 
-
-
 def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
