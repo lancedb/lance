@@ -53,12 +53,15 @@ jobs:
         run: |
           pip install -r ../docs/requirements.txt
           python setup.py develop
+      - name: Build docs
+        working-directory: docs
+        run: make html
       - name: Setup Pages
         uses: actions/configure-pages@v2
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v1
         with:
-          path: 'docs/_build'
+          path: 'docs/_build/html'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v1

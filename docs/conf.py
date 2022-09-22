@@ -48,6 +48,7 @@ author = "Lance Developer"
 extensions = [
     "breathe",
     "sphinx.ext.autodoc",
+    "sphinx.ext.githubpages",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
 ]
