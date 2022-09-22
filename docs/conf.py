@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.abspath("../python"))
 
 
 def run_apidoc(_):
+    on_rtd = os.environ.get('READTHEDOCS') == 'True'
+    if on_rtd:
+        subprocess.check_call("cd ../cpp; cmake -B build; cmake --build build")
     from sphinx.ext.apidoc import main
 
     shutil.rmtree("api/python", ignore_errors=True)
