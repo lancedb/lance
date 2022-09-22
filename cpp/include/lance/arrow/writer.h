@@ -19,15 +19,16 @@
 #include <arrow/type_fwd.h>
 #include <lance/arrow/file_lance.h>
 
+/// @brief Public Arrow API.
 namespace lance::arrow {
 
-/// Write an Arrow Table into the destination.
+/// Write an Arrow Table into the destination file..
 ///
-/// \param table arrow table.
-/// \param sink the output stream to write it to.
+/// \param table Apache Arrow table.
+/// \param sink the output stream to write the table to.
 /// \param options File write options, optional.
 ///
-/// \return Status::OK() if succeed.
+/// \return `::arrow::Status::OK()` if succeed.
 ::arrow::Status WriteTable(const ::arrow::Table& table,
                            std::shared_ptr<::arrow::io::OutputStream> sink,
                            FileWriteOptions options = FileWriteOptions());

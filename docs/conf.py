@@ -14,14 +14,18 @@
 import os
 import sys
 import shutil
+import subprocess
 
 sys.path.insert(0, os.path.abspath("../python"))
+
 
 def run_apidoc(_):
     from sphinx.ext.apidoc import main
 
-    shutil.rmtree("api", ignore_errors=True)
+    shutil.rmtree("api/python", ignore_errors=True)
     main(["-f", "-o", "api/python", "../python/lance"])
+
+    subprocess.check_call("doxygen", shell=True)
 
 
 def setup(app):
@@ -30,9 +34,9 @@ def setup(app):
 
 # -- Project information -----------------------------------------------------
 
-project = 'Lance'
-copyright = '2022, Lance Developer'
-author = 'Lance Developer'
+project = "Lance"
+copyright = "2022, Lance Developer"
+author = "Lance Developer"
 
 
 # -- General configuration ---------------------------------------------------
@@ -41,6 +45,7 @@ author = 'Lance Developer'
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
+    "breathe",
     "sphinx.ext.autodoc",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
@@ -52,12 +57,12 @@ napoleon_include_private_with_doc = False
 napoleon_include_special_with_doc = False
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
+templates_path = ["_templates"]
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 
 # -- Options for HTML output -------------------------------------------------
@@ -65,9 +70,14 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'alabaster'
+html_theme = "alabaster"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+html_static_path = ["_static"]
+
+
+breathe_projects = {"cpp": "_build/cpp/xml/"}
+
+breathe_default_project = "cpp"
