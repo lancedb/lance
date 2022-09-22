@@ -4,7 +4,7 @@ import io
 import json
 import os
 import time
-from typing import Tuple, Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 import PIL
 import pytorch_lightning as pl

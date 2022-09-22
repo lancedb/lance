@@ -20,6 +20,7 @@ import time
 from abc import ABC, abstractmethod
 from functools import wraps
 from typing import Iterable, Union
+from urllib.parse import urlparse
 
 import click
 import pandas as pd
@@ -27,7 +28,6 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs
 import pyarrow.parquet as pq
-from urllib.parse import urlparse
 
 import lance
 from lance.types.image import Image, ImageArray, ImageBinaryType
@@ -255,8 +255,7 @@ class DatasetConverter(ABC):
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         image_arr = ImageArray.from_pandas(images)
-        embedded = table.append_column(pa.field("image", ImageBinaryType()),
-                                       image_arr)
+        embedded = table.append_column(pa.field("image", ImageBinaryType()), image_arr)
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":

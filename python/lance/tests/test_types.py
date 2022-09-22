@@ -55,10 +55,12 @@ def test_image_binary(tmp_path):
 
 
 def test_image_array():
-    images = [Image.create(x) for x in ["uri1", "uri2"]]
+    images = [Image.create(x) for x in ["uri1", "uri2", None, "uri4"]]
     from_images = ImageArray.from_images(images)
     from_pandas = ImageArray.from_pandas(images)
-    from_pandas_storage = ImageArray.from_pandas([x.uri for x in images])
+    from_pandas_storage = ImageArray.from_pandas(
+        [None if x is None else x.uri for x in images]
+    )
     assert from_images == from_pandas
     assert from_pandas == from_pandas_storage
     assert isinstance(from_images, ImageArray)

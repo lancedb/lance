@@ -25,9 +25,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import xmltodict
-
 from bench_utils import DatasetConverter, download_uris
-
 
 # Oxford PET has dataset quality issues:
 #
@@ -224,8 +222,12 @@ def _get_xml(uri: str):
     help="Output format (parquet or lance)",
 )
 @click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
-@click.option("-g", "--group-size", type=int, default=1024, help="set max_rows_per_group in arrow")
-@click.option("--max-rows-per-file", type=int, default=0, help="set max_rows_per_file in arrow")
+@click.option(
+    "-g", "--group-size", type=int, default=1024, help="set max_rows_per_group in arrow"
+)
+@click.option(
+    "--max-rows-per-file", type=int, default=0, help="set max_rows_per_file in arrow"
+)
 @click.option(
     "-o", "--output", type=str, default="oxford_pet.lance", help="Output path"
 )
@@ -247,7 +249,7 @@ def main(base_uri, fmt, embedded, output, group_size, max_rows_per_file):
                 partitioning=["split"],
                 existing_data_behavior="overwrite_or_ignore",
                 max_rows_per_group=group_size,
-                max_rows_per_file=max_rows_per_file, # Create enough files for parallelism
+                max_rows_per_file=max_rows_per_file,  # Create enough files for parallelism
             )
         else:
             converter.save_df(df, f, output_path=output, partitioning=["split"])

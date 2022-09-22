@@ -21,6 +21,7 @@ import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
 from . import version
+
 __version__ = version.__version__
 
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable, _wrap_dataset

@@ -14,6 +14,7 @@
 #  limitations under the License.
 import numpy as np
 import pyarrow as pa
+
 from lance.types.box import Box2dArray, Box2dType
 
 
@@ -39,10 +40,8 @@ def iou_naive(num_boxes: int):
             inter = max(0, xmax - xmin + 1) * max(0, ymax - ymin + 1)
             # compute the area of both the prediction and ground-truth
             # rectangles
-            area_i = ((xmax_arr[i] - xmin_arr[i] + 1) *
-                      (ymax_arr[i] - ymin_arr[i] + 1))
-            area_j = ((xmax_arr[j] - xmin_arr[j] + 1) *
-                      (ymax_arr[j] - ymin_arr[j] + 1))
+            area_i = (xmax_arr[i] - xmin_arr[i] + 1) * (ymax_arr[i] - ymin_arr[i] + 1)
+            area_j = (xmax_arr[j] - xmin_arr[j] + 1) * (ymax_arr[j] - ymin_arr[j] + 1)
             # compute the intersection over union by taking the intersection
             # area and dividing it by the sum of prediction + ground-truth
             # areas - the interesection area
@@ -56,8 +55,7 @@ def iou_vectorized(num_boxes: int):
     xmax_arr = (np.random.randn(num_boxes) + 10) * 10
     ymax_arr = (np.random.randn(num_boxes) + 10) * 10
     storage = pa.StructArray.from_arrays(
-        [xmin_arr, ymin_arr, xmax_arr, ymax_arr],
-        names=["xmin", "ymin", "xmax", "ymax"]
+        [xmin_arr, ymin_arr, xmax_arr, ymax_arr], names=["xmin", "ymin", "xmax", "ymax"]
     )
     box_arr = Box2dArray.from_storage(Box2dType(), storage)
     return box_arr.iou(box_arr)
