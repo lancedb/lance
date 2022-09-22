@@ -23,9 +23,7 @@ def run_apidoc(_):
     from sphinx.ext.apidoc import main
 
     shutil.rmtree("api/python", ignore_errors=True)
-    subprocess.check_call("cd ../python; python setup.py build", shell=True)
     main(["-f", "-o", "api/python", "../python/lance"])
-
     subprocess.check_call("doxygen", shell=True)
 
 
