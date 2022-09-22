@@ -26,7 +26,7 @@ This results in some major pain-points:
 * Reproducibility and data versioning is extremely difficult to achieve
 
 Lance to the rescue
-~~~~~~~~~~~~~~~~~~~
+-------------------
 To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
 
 * Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
