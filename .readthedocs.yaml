@@ -5,12 +5,12 @@ build:
     python: "3.10"
   jobs:
     pre_create_environment:
-      - sudo apt -y update
-      - sudo apt install -y -V ca-certificates lsb-release wget
+      - apt -y update
+      - apt install -y -V ca-certificates lsb-release wget
       - wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-      - sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
-      - sudo apt -y update
-      - sudo apt -y install cmake libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev libprotobuf-dev
+      - apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+      - apt -y update
+      - apt -y install cmake libarrow-dev libarrow-dataset-dev libparquet-dev libarrow-python-dev libprotobuf-dev
 sphinx:
    configuration: docs/conf.py
 
