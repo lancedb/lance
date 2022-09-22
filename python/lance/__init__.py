@@ -20,7 +20,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
-import lance.version
+from . import version
+__version__ = version.__version__
+
 from lance.lib import BuildScanner, LanceFileFormat, WriteTable, _wrap_dataset
 from lance.types import register_extension_types
 
@@ -31,7 +33,7 @@ if platform.system() == "Linux":
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
 
 
-__version__ = lance.version.__version__
+
 
 def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
     """
