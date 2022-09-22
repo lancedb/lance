@@ -4,20 +4,19 @@
 
 import json
 import os
-from collections import defaultdict
 import sys
+from collections import defaultdict
 
 sys.path.append("..")
-
 
 import click
 import pandas as pd
 import pyarrow as pa
 from bench_utils import DatasetConverter
-from lance.types import ImageType
 
 import lance
 import lance.types
+from lance.types import ImageType
 
 
 class CocoConverter(DatasetConverter):
@@ -72,9 +71,20 @@ class CocoConverter(DatasetConverter):
             json_data = self._get_instances_json(split)
             return self._instances_to_df(split, json_data)
 
-        df = pd.concat([read_split(split) for split in ["train", "val"]])
-        df["date_captured"] = pd.to_datetime(df.date_captured)  # lance GH#98
+        splits = [read_split(split) for split in ["train", "val"]]
+        test_images = self._get_test_images("test")
+        splits.append(pd.DataFrame({"image_uri": test_images, "split": "test"}))
+        df = pd.concat(splits)
+        df["date_captured"] = pd.to_datetime(df.date_captured)
         return df
+
+    def _get_test_images(self, dirname: str = "test"):
+        uri = os.path.join(self.uri_root, f"{dirname}{self.version}")
+        fs, path = pa.fs.FileSystem.from_uri(uri)
+        return [
+            os.path.join(uri, file.base_name)
+            for file in fs.get_file_info(pa.fs.FileSelector(path, recursive=True))
+        ]
 
     def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
         """Convert each metdata column to pyarrow with lance types"""

@@ -15,9 +15,10 @@
 import io
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import IO, Union
+from typing import IO, Optional, Union
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 from PIL import Image as PILImage
 from pyarrow import fs
@@ -37,6 +38,9 @@ class ImageType(LanceType, ABC):
     def __arrow_ext_serialize__(self):
         return b""
 
+    def __arrow_ext_class__(self):
+        return ImageArray
+
     @classmethod
     def from_storage(cls, storage_type):
         # TODO consider parameterizing types to support utf* variants
@@ -47,9 +51,6 @@ class ImageType(LanceType, ABC):
             return ImageBinaryType()
         else:
             raise NotImplementedError(f"Unrecognized image storage type {storage_type}")
-
-    def __arrow_ext_class__(self):
-        return ImageArray
 
 
 class ImageUriType(ImageType):
@@ -96,7 +97,9 @@ class Image(ABC):
     """
 
     @staticmethod
-    def create(data: Union[bytes, str]):
+    def create(data: Optional[Union[bytes, str]]):
+        if pd.isna(data):
+            return None
         if isinstance(data, bytes):
             img = ImageBinary(data)
         elif isinstance(data, str):
@@ -112,7 +115,7 @@ class Image(ABC):
         """
         Construct Image from result of Image.to_dict
         """
-        return Image(data.get("data", data.get("uri")))
+        return Image.create(data.get("data", data.get("uri")))
 
     @abstractmethod
     def open(self) -> IO:
@@ -266,14 +269,18 @@ class ImageUri(Image):
 class ImageBinaryScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
 
-    def as_py(self) -> Image:
+    def as_py(self) -> Optional[Image]:
+        if pd.isna(self.value):
+            return None
         return ImageBinary(self.value.as_py())
 
 
 class ImageUriScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
 
-    def as_py(self) -> Image:
+    def as_py(self) -> Optional[Image]:
+        if pd.isna(self.value):
+            return None
         return ImageUri(self.value.as_py())
 
 

@@ -8,6 +8,7 @@ from typing import Callable
 import click
 import pytorch_lightning as pl
 import torch
+import torch.multiprocessing
 import transforms as T
 from common import ObjectDetection, RawCocoDataset, collate_fn
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -15,8 +16,6 @@ from torchdata.datapipes.iter import IterableWrapper
 
 import lance
 import lance.pytorch.data
-
-import torch.multiprocessing
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
