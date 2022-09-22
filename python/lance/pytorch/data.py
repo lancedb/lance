@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Lance PyTorch Dataset"""
+
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Union
 from urllib.parse import urlparse
