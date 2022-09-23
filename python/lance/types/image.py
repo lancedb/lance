@@ -97,9 +97,12 @@ class Image(ABC):
     """
 
     @staticmethod
-    def create(data: Optional[Union[bytes, str]]):
+    def create(data: Optional[Union[bytes, bytearray, str]]):
         if pd.isna(data):
             return None
+        if isinstance(data, bytearray):
+            data = bytes(data)
+
         if isinstance(data, bytes):
             img = ImageBinary(data)
         elif isinstance(data, str):

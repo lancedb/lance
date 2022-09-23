@@ -43,6 +43,8 @@ def _data_to_tensor(data: Any) -> Union[torch.Tensor, PIL.Image.Image]:
         return data.to_pil()
     elif isinstance(data, dict):
         return {k: to_tensor(v) for k, v in data.items()}
+    elif isinstance(data, str):
+        return data
     else:
         return torch.tensor(data)
 

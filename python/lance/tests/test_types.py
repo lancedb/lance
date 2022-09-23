@@ -218,3 +218,10 @@ def test_pickle(tmp_path):
         pickle.dump(img, fh)
     with (tmp_path / "image").open("rb") as fh:
         assert img == pickle.load(fh)
+
+    img = Image.create(bytearray(b"bytes"))
+    assert isinstance(img, ImageBinary)
+    with (tmp_path / "image").open("wb") as fh:
+        pickle.dump(img, fh)
+    with (tmp_path / "image").open("rb") as fh:
+        assert img == pickle.load(fh)
