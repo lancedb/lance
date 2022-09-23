@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <arrow/dataset/api.h>
 #include <arrow/result.h>
 #include <arrow/table.h>
 
@@ -25,8 +26,15 @@
 
 namespace lance::testing {
 
+/// Make temporary directory and returns the directory path.
+::arrow::Result<std::string> MakeTemporaryDir();
+
 /// Make lance::io::FileReader from an Arrow Table.
 ::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
+    const std::shared_ptr<::arrow::Table>& table);
+
+/// Make a FileSystem Dataset from the table.
+::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
     const std::shared_ptr<::arrow::Table>& table);
 
 /// A ExecNode that scans a Table in memory.
