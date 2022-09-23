@@ -477,7 +477,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
 
     auto actual_field = GetField(components[0]);
     if (!actual_field) {
-      return ::arrow::Status::Invalid("Field {} dose not exist.", name);
+      return ::arrow::Status::Invalid("Field {} does not exist.", name);
     }
     auto view_field = view->GetField(components[0]);
     if (!view_field) {
@@ -495,7 +495,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   for (auto& arrow_field : arrow_schema.fields()) {
     auto field = GetField(arrow_field->name());
     if (!field) {
-      return ::arrow::Status::Invalid(fmt::format("Field {} dose not exist", arrow_field->name()));
+      return ::arrow::Status::Invalid(fmt::format("Field {} does not exist", arrow_field->name()));
     }
     auto proj_field = field->Project(arrow_field);
     projection->AddField(proj_field);
