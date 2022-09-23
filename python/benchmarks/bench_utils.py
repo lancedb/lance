@@ -275,17 +275,33 @@ class DatasetConverter(ABC):
         @click.command()
         @click.argument("base_uri")
         @click.option(
-            "-f", "--fmt", type=FORMATS, default="lance", help="Output format (parquet or lance)",
+            "-f",
+            "--fmt",
+            type=FORMATS,
+            default="lance",
+            help="Output format (parquet or lance)",
         )
         @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
         @click.option(
-            "-g", "--group-size", type=int, default=1024, help="group size", show_default=True,
+            "-g",
+            "--group-size",
+            type=int,
+            default=1024,
+            help="group size",
+            show_default=True,
         )
         @click.option(
-            "--max-rows-per-file", type=int, default=0, help="max rows per file", show_default=True,
+            "--max-rows-per-file",
+            type=int,
+            default=0,
+            help="max rows per file",
+            show_default=True,
         )
         @click.option(
-            "-o", "--output-path", type=str, help="Output path. Default is under the base_uri",
+            "-o",
+            "--output-path",
+            type=str,
+            help="Output path. Default is under the base_uri",
         )
         def main(
             base_uri,

@@ -26,7 +26,6 @@ import pyarrow as pa
 import xmltodict
 from bench_utils import DatasetConverter, download_uris
 
-
 # Oxford PET has dataset quality issues:
 #
 # The following exists in the XMLs but are not part of the list.txt index
