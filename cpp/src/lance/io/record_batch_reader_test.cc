@@ -12,7 +12,6 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include <arrow/builder.h>
 #include <arrow/compute/api.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
@@ -54,36 +53,4 @@ TEST_CASE("Scan partitioned dataset with nonexistent column") {
   auto scan_builder = dataset->NewScan().ValueOrDie();
   // Woo column does not exist in the dataset, split column does not exist in the lance file.
   CHECK(!scan_builder->Project({"value", "split", "woo"}).ok());
-}
-
-// GH-188
-TEST_CASE("Filter over empty list") {
-  auto values_arr = ToArray({1, 2, 3}).ValueOrDie();
-
-  auto elem_builder = std::make_shared<::arrow::FloatBuilder>();
-  auto list_builder = ::arrow::ListBuilder(::arrow::default_memory_pool(), elem_builder);
-  CHECK(list_builder.Append().ok());
-  CHECK(elem_builder->AppendValues({0.1, 0.2}).ok());
-  CHECK(list_builder.AppendNull().ok());
-  CHECK(list_builder.Append().ok());
-  CHECK(elem_builder->Append(11.1).ok());
-  auto list_arr = list_builder.Finish().ValueOrDie();
-
-  auto schema = ::arrow::schema({::arrow::field("ints", ::arrow::int32()),
-                                 ::arrow::field("floats", ::arrow::list(::arrow::float32()))});
-  auto t = ::arrow::Table::Make(schema, {values_arr, list_arr});
-
-  auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
-  auto scan_builder = dataset->NewScan().ValueOrDie();
-
-  // This filter should result in an empty list array
-  CHECK(scan_builder
-            ->Filter(::arrow::compute::equal(::arrow::compute::field_ref("ints"),
-                                             ::arrow::compute::literal(100)))
-            .ok());
-  auto scanner = scan_builder->Finish().ValueOrDie();
-
-  auto actual = scanner->ToTable().ValueOrDie();
-  CHECK(actual->num_rows() == 0);
-  CHECK(t->schema()->Equals(actual->schema()));
 }
