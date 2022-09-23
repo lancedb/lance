@@ -153,10 +153,15 @@ class PlainDecoderImpl : public Decoder {
       return Decoder::Take(indices);
     }
 
+    if (indices->length() == 0) {
+      return MakeEmpty();
+    }
+
     int32_t start = indices->Value(0);
     int32_t length = indices->Value(indices->length() - 1) - start + 1;
     if (indices->length() == 0 || start < 0 || start + length > length_) {
-      return ::arrow::Status::Invalid("PlainDecoder::Take: Indices array is not valid");
+      return ::arrow::Status::Invalid(fmt::format(
+          "PlainDecoder::Take: Indices array is not valid: start={}, length={}", start, length));
     }
     // For the simplicity, we read all data in batch to reduce random I/O.
     // And apply indices later.
@@ -265,7 +270,7 @@ class FixedSizeListPlainDecoderImpl : public Decoder {
 PlainDecoder::~PlainDecoder() {}
 
 ::arrow::Status PlainDecoder::Init() {
-  assert (!arrow::is_extension(type_));
+  assert(!arrow::is_extension(type_));
   switch (type_->id()) {
     case ::arrow::Type::BOOL:
       impl_.reset(new BooleanPlainDecoderImpl(infile_, type_));
