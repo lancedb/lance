@@ -39,6 +39,7 @@ To solve these pain-points, we are building Lance, an open-source columnar data 
    :maxdepth: 2
 
    quickstart
+   howtos
    API References <./api/api>
 
 
