@@ -41,3 +41,16 @@ TEST_CASE("Scan partitioned dataset") {
   INFO("Expected table: " << t->ToString() << " \nActual table: " << sorted_table->ToString());
   CHECK(t->Equals(*sorted_table));
 }
+
+TEST_CASE("Scan partitioned dataset with nonexistent column") {
+  auto value_arr = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto split_arr = ToArray({"train", "train", "eval", "test", "train"}).ValueOrDie();
+
+  auto schema = ::arrow::schema(
+      {::arrow::field("value", ::arrow::int32()), ::arrow::field("split", ::arrow::utf8())});
+  auto t = ::arrow::Table::Make(schema, {value_arr, split_arr});
+  auto dataset = lance::testing::MakeDataset(t, {"split"}).ValueOrDie();
+  auto scan_builder = dataset->NewScan().ValueOrDie();
+  // Woo column does not exist in the dataset, split column does not exist in the lance file.
+  CHECK(!scan_builder->Project({"value", "split", "woo"}).ok());
+}
