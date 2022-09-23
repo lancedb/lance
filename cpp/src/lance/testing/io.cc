@@ -78,14 +78,17 @@ namespace lance::testing {
       std::make_shared<::arrow::dataset::HivePartitioning>(partition_schema);
   write_options.basename_template = "part{i}.lance";
 
-  fmt::print("Scanner: {}\n", scanner->ToTable().ValueOrDie()->ToString());
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(write_options, scanner));
 
+  // Read the dataset back
   ::arrow::fs::FileSelector selector;
   selector.base_dir = write_options.base_dir;
+  selector.recursive = true;
+  ::arrow::dataset::FileSystemFactoryOptions factory_options;
+  factory_options.partitioning = write_options.partitioning;
   ARROW_ASSIGN_OR_RAISE(auto factory,
                         ::arrow::dataset::FileSystemDatasetFactory::Make(
-                            fs, selector, format, ::arrow::dataset::FileSystemFactoryOptions()));
+                            fs, selector, format, factory_options));
   return factory->Finish();
 }
 
