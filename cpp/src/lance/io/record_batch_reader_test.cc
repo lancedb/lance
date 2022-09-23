@@ -12,6 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include <arrow/compute/api.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <fmt/format.h>
@@ -33,7 +34,10 @@ TEST_CASE("Scan partitioned dataset") {
 
   auto dataset = lance::testing::MakeDataset(t, {"split"}).ValueOrDie();
   auto scanner = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie();
-  auto actual = scanner->ToTable().ValueOrDie();
-  fmt::print("Actual table: {}\n", actual->ToString());
-  CHECK(t->Equals(*actual));
+  auto actual = scanner->ToTable().ValueOrDie()->CombineChunks().ValueOrDie();
+  auto indices = ::arrow::compute::SortIndices(*actual->GetColumnByName("value")).ValueOrDie();
+  auto new_datum = ::arrow::compute::Take(actual, indices).ValueOrDie();
+  auto sorted_table = new_datum.table();
+  INFO("Expected table: " << t->ToString() << " \nActual table: " << sorted_table->ToString());
+  CHECK(t->Equals(*sorted_table));
 }
