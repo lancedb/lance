@@ -36,3 +36,4 @@ target_include_directories(io SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(io format lance_io_exec)
 
 add_lance_test(reader_test)
+add_lance_test(record_batch_reader_test)
