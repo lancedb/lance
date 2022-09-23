@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import PIL
 import pyarrow as pa
+import pyarrow.compute as pc
 
 import lance
 from lance.pytorch.data import LanceDataset
@@ -68,3 +69,21 @@ def test_dataset_with_ext_types(tmp_path: Path):
     images, labels = batch
     assert all([isinstance(p, PIL.Image.Image) for p in images])
     assert torch.equal(labels, torch.tensor([0, 1, 2, 0], dtype=torch.int8))
+
+
+def test_data_loader_with_filter(tmp_path: Path):
+    torch.Tensor([1, 2, 3])
+    ids = pa.array(range(10))
+    values = pa.array(range(10, 20))
+    split = pa.array(["train", "val"] * 5)
+    tab = pa.Table.from_arrays([ids, values, split], names=["id", "value", "split"])
+
+    lance.write_table(tab, tmp_path / "lance")
+
+    dataset = LanceDataset(tmp_path / "lance", filter=pc.field("split") == "train")
+    for id, value, split in dataset:
+        assert split == "train"
+        assert id % 2 == 0
+        assert torch.is_tensor(id)
+        assert (value - 10) % 2 == 0
+        assert torch.is_tensor(value)
