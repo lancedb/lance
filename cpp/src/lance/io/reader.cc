@@ -15,6 +15,7 @@
 #include "lance/io/reader.h"
 
 #include <arrow/array/concatenate.h>
+#include <arrow/array/util.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
@@ -27,6 +28,7 @@
 #include <memory>
 
 #include "lance/arrow/type.h"
+#include "lance/arrow/utils.h"
 #include "lance/encodings/binary.h"
 #include "lance/encodings/plain.h"
 #include "lance/format/format.h"
@@ -353,8 +355,7 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
     // TODO: GH-39. We should improve the read behavior to use indices to save some I/Os.
     auto& indices = params.indices.value();
     if (indices->length() == 0) {
-      return ::arrow::Status::IndexError(fmt::format(
-          "FileReader::GetListArray: indices is empty: field={}({})", field->name(), field->id()));
+      return ::arrow::MakeEmptyArray(field->type());
     }
     auto start = static_cast<int32_t>(indices->Value(0));
     auto length = static_cast<int32_t>(indices->Value(indices->length() - 1) - start + 1);
