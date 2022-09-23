@@ -19,10 +19,12 @@
 #include <arrow/io/api.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
+#include <fmt/format.h>
 
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include "lance/arrow/file_lance.h"
@@ -32,7 +34,7 @@
 namespace lance::testing {
 
 ::arrow::Result<std::string> MakeTemporaryDir() {
-  std::string temp = "lance-test-XXXXXX";
+  std::string temp = (std::filesystem::temp_directory_path() / "lance-test-XXXXXX");
   auto temp_dir = mkdtemp(temp.data());
   if (temp_dir == nullptr) {
     return ::arrow::Status::IOError(strerror(errno));
@@ -51,20 +53,32 @@ namespace lance::testing {
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
-    const std::shared_ptr<::arrow::Table>& table) {
+    const std::shared_ptr<::arrow::Table>& table, const std::vector<std::string>& partitions) {
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
-  auto dataset = ::arrow::dataset::InMemoryDataset(table);
-  ARROW_ASSIGN_OR_RAISE(auto scanner_builder, dataset.NewScan());
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
+  ARROW_ASSIGN_OR_RAISE(auto scanner_builder, dataset->NewScan());
   ARROW_ASSIGN_OR_RAISE(auto scanner, scanner_builder->Finish());
 
   auto format = lance::arrow::LanceFileFormat::Make();
+
   ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
-  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+
+  auto tmp_dir = "file://" + MakeTemporaryDir().ValueOrDie();
+  std::string path;
+  std::vector<std::shared_ptr<::arrow::Field>> partition_fields;
+  for (auto& part_col : partitions) {
+    partition_fields.emplace_back(table->schema()->GetFieldByName(part_col));
+  }
+  auto partition_schema = ::arrow::schema(partition_fields);
+  auto fs = ::arrow::fs::FileSystemFromUri(tmp_dir, &path).ValueOrDie();
   write_options.file_write_options = format->DefaultWriteOptions();
   write_options.filesystem = fs;
-  write_options.base_dir = MakeTemporaryDir().ValueOrDie();
+  write_options.base_dir = path;
+  write_options.partitioning =
+      std::make_shared<::arrow::dataset::HivePartitioning>(partition_schema);
   write_options.basename_template = "part{i}.lance";
 
+  fmt::print("Scanner: {}\n", scanner->ToTable().ValueOrDie()->ToString());
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(write_options, scanner));
 
   ::arrow::fs::FileSelector selector;

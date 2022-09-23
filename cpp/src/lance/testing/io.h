@@ -34,8 +34,13 @@ namespace lance::testing {
     const std::shared_ptr<::arrow::Table>& table);
 
 /// Make a FileSystem Dataset from the table.
+///
+/// \param table The table to write
+/// \param partitions the column names of partitioning.
+/// \return a FileSystem Dataset with lance format.
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
-    const std::shared_ptr<::arrow::Table>& table);
+    const std::shared_ptr<::arrow::Table>& table,
+    const std::vector<std::string>& partitions = {});
 
 /// A ExecNode that scans a Table in memory.
 ///

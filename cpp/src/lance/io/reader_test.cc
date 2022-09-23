@@ -15,6 +15,7 @@
 #include "lance/io/reader.h"
 
 #include <arrow/builder.h>
+#include <arrow/compute/api.h>
 #include <arrow/io/api.h>
 #include <arrow/table.h>
 #include <fmt/format.h>
@@ -101,16 +102,27 @@ TEST_CASE("Get List Array With Indices") {
 }
 
 TEST_CASE("Filter over dictionary base") {
-  auto dict_builder = std::make_shared<::arrow::DictionaryBuilder<::arrow::StringType>>();
-  for (auto& category : {"car", "horse", "plane", "bike", "cat"}) {
-    CHECK(dict_builder->Append(category).ok());
-  };
-  auto dict_arr = dict_builder->Finish().ValueOrDie();
-  fmt::print("{}\n", dict_arr->ToString());
+  auto indices = lance::arrow::ToArray<int8_t>({0, 1, 1, 2}).ValueOrDie();
+  auto dict = lance::arrow::ToArray({"car", "horse", "plane", "bike", "cat"}).ValueOrDie();
+  auto dict_arr =
+      ::arrow::DictionaryArray::FromArrays(::arrow::dictionary(::arrow::int8(), ::arrow::utf8()),
+                                           std::static_pointer_cast<::arrow::Array>(indices),
+                                           std::static_pointer_cast<::arrow::Array>(dict))
+          .ValueOrDie();
   auto value_arr = lance::arrow::ToArray({1, 2, 3, 4, 5}).ValueOrDie();
 
   auto schema = ::arrow::schema(
       {::arrow::field("category", ::arrow::dictionary(::arrow::int8(), ::arrow::utf8())),
        ::arrow::field("value", ::arrow::int32())});
   auto tab = ::arrow::Table::Make(schema, {dict_arr, value_arr});
+
+  auto dataset = lance::testing::MakeDataset(tab).ValueOrDie();
+  auto scan_builder = dataset->NewScan().ValueOrDie();
+  CHECK(scan_builder
+            ->Filter(::arrow::compute::equal(::arrow::compute::field_ref("category"),
+                                             ::arrow::compute::literal("bike")))
+            .ok());
+  auto scanner = scan_builder->Finish().ValueOrDie();
+  auto actual = scanner->ToTable().ValueOrDie();
+  CHECK(actual->num_rows() == 0);
 }
