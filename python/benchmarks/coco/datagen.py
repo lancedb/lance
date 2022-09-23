@@ -9,13 +9,10 @@ from collections import defaultdict
 
 sys.path.append("..")
 
-import click
 import pandas as pd
 import pyarrow as pa
 from bench_utils import DatasetConverter
 
-import lance
-import lance.types
 from lance.types import ImageType
 
 
@@ -232,71 +229,6 @@ def _aggregate_annotations(annotations):
     return ret
 
 
-@click.command()
-@click.argument("base_uri")
-@click.option(
-    "-v", "--version", type=str, default="2017", help="Dataset version. Default 2017"
-)
-@click.option(
-    "-f",
-    "--fmt",
-    type=click.Choice(["lance", "parquet"]),
-    default="lance",
-    help="Output format (parquet or lance)",
-)
-@click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
-@click.option(
-    "-g",
-    "--group-size",
-    type=int,
-    default=1024,
-    help="set the group size",
-    show_default=True,
-)
-@click.option(
-    "--max-rows-per-file",
-    type=int,
-    default=0,
-    help="set the max rows per file",
-    show_default=True,
-)
-@click.option(
-    "-o",
-    "--output-path",
-    type=str,
-    help="Output path. Default is {base_uri}/coco_links.{fmt}",
-)
-def main(
-    base_uri,
-    version,
-    fmt,
-    embedded,
-    output_path,
-    group_size: int,
-    max_rows_per_file: int,
-):
-    converter = CocoConverter(base_uri, version=version)
-    df = converter.read_metadata()
-    known_formats = ["lance", "parquet"]
-    if fmt is not None:
-        assert fmt in known_formats
-        fmt = [fmt]
-    else:
-        fmt = known_formats
-
-    kwargs = {
-        "existing_data_behavior": "overwrite_or_ignore",
-        "partitioning": ["split"],
-        "partitioning_flavor": "hive",
-        "max_rows_per_group": group_size,
-        "max_rows_per_file": max_rows_per_file,
-    }
-    for f in fmt:
-        if embedded:
-            converter.make_embedded_dataset(df, f, output_path, **kwargs)
-        else:
-            return converter.save_df(df, f, output_path, **kwargs)
-
-
 if __name__ == "__main__":
+    main = CocoConverter.create_main()
     main()

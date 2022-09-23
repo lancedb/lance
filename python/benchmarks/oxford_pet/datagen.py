@@ -20,7 +20,6 @@ from urllib.parse import urlparse
 
 sys.path.append("..")
 
-import click
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -211,49 +210,6 @@ def _get_xml(uri: str):
         return {}
 
 
-@click.command
-@click.option(
-    "-u", "--base-uri", type=str, required=True, help="Oxford Pet dataset root"
-)
-@click.option(
-    "-f",
-    "--fmt",
-    type=click.Choice(["parquet", "lance"]),
-    help="Output format (parquet or lance)",
-)
-@click.option("-e", "--embedded", type=bool, default=True, help="store embedded images")
-@click.option(
-    "-g", "--group-size", type=int, default=1024, help="set max_rows_per_group in arrow"
-)
-@click.option(
-    "--max-rows-per-file", type=int, default=0, help="set max_rows_per_file in arrow"
-)
-@click.option(
-    "-o", "--output", type=str, default="oxford_pet.lance", help="Output path"
-)
-def main(base_uri, fmt, embedded, output, group_size, max_rows_per_file):
-    known_formats = ["lance", "parquet"]
-    if fmt is not None:
-        assert fmt in known_formats
-        fmt = [fmt]
-    else:
-        fmt = known_formats
-    converter = OxfordPetConverter(base_uri)
-    df = converter.read_metadata()
-    for f in fmt:
-        if embedded:
-            converter.make_embedded_dataset(
-                df,
-                f,
-                output_path=output,
-                partitioning=["split"],
-                existing_data_behavior="overwrite_or_ignore",
-                max_rows_per_group=group_size,
-                max_rows_per_file=max_rows_per_file,  # Create enough files for parallelism
-            )
-        else:
-            converter.save_df(df, f, output_path=output, partitioning=["split"])
-
-
 if __name__ == "__main__":
+    main = OxfordPetConverter.create_main()
     main()

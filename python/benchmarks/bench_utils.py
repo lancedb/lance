@@ -267,3 +267,68 @@ class DatasetConverter(ABC):
     @abstractmethod
     def get_schema(self):
         pass
+
+    @classmethod
+    def create_main(cls):
+        FORMATS = click.Choice(["lance", "parquet"])
+
+        @click.command()
+        @click.argument("base_uri")
+        @click.option(
+            "-f",
+            "--fmt",
+            type=FORMATS,
+            default="lance",
+            help="Output format (parquet or lance)",
+        )
+        @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
+        @click.option(
+            "-g",
+            "--group-size",
+            type=int,
+            default=1024,
+            help="group size",
+            show_default=True,
+        )
+        @click.option(
+            "--max-rows-per-file",
+            type=int,
+            default=0,
+            help="max rows per file",
+            show_default=True,
+        )
+        @click.option(
+            "-o",
+            "--output-path",
+            type=str,
+            help="Output path. Default is under the base_uri",
+        )
+        def main(
+            base_uri,
+            fmt,
+            embedded,
+            output_path,
+            group_size: int,
+            max_rows_per_file: int,
+        ):
+            converter = cls(base_uri)
+            df = converter.read_metadata()
+            known_formats = ["lance", "parquet"]
+            if fmt is not None:
+                assert fmt in known_formats
+                fmt = [fmt]
+            else:
+                fmt = known_formats
+
+            kwargs = {
+                "existing_data_behavior": "overwrite_or_ignore",
+                "max_rows_per_group": group_size,
+                "max_rows_per_file": max_rows_per_file,
+            }
+            for f in fmt:
+                if embedded:
+                    converter.make_embedded_dataset(df, f, output_path, **kwargs)
+                else:
+                    return converter.save_df(df, f, output_path, **kwargs)
+
+        return main
