@@ -40,13 +40,13 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   if (batch.eof()) {
     return ScanBatch::Null();
   }
-  if (batch.batch->num_rows() == 0) {
+  if (batch.length() == 0) {
     return batch;
   }
   ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Apply(*batch.batch));
   auto [indices, values] = indices_and_values;
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
-  return ScanBatch::Filtered(values, batch.batch_id, indices);
+  return ScanBatch(values, batch.batch_id, indices);
 }
 
 ::arrow::Result<

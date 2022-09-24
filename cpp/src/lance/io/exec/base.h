@@ -40,14 +40,6 @@ struct ScanBatch {
   /// Return a null ScanBatch indicates EOF.
   static ScanBatch Null();
 
-  /// Constructor with a record batch and batch id.
-  ///
-  /// \param records A record batch of values to return
-  /// \param batch_id the id of the batch
-  static ScanBatch Filtered(std::shared_ptr<::arrow::RecordBatch> records,
-                            int32_t batch_id,
-                            std::shared_ptr<::arrow::Int32Array> indices);
-
   /// Construct an empty response.
   ScanBatch() = default;
 
@@ -55,10 +47,19 @@ struct ScanBatch {
   ///
   /// \param records A record batch of values to return
   /// \param batch_id the id of the batch
-  ScanBatch(std::shared_ptr<::arrow::RecordBatch> records, int32_t batch_id);
+  /// \param indices the indices from filter. Optional
+  ScanBatch(std::shared_ptr<::arrow::RecordBatch> records,
+            int32_t batch_id,
+            std::shared_ptr<::arrow::Int32Array> indices = nullptr);
 
   /// Returns True if the end of file is reached.
   bool eof() const { return !batch; }
+
+  /// Make a zero-copy slice from this batch.
+  ScanBatch Slice(int64_t offset, int64_t length) const;
+
+  /// The length of this batch.
+  int64_t length() const;
 };
 
 /// I/O execute base node.

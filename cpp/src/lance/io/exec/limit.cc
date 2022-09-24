@@ -55,24 +55,15 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
   auto batch_size = batch.batch->num_rows();
   auto left = std::max(offset_, seen_);
   auto right = std::min(seen_ + batch_size, offset_ + limit_);
-  std::shared_ptr<::arrow::RecordBatch> record_batch;
-  std::shared_ptr<::arrow::Array> indices;
+  ScanBatch limited_batch;
   if (left < right) {
-    record_batch = batch.batch->Slice(left - seen_, right - left);
-    if (batch.indices) {
-      indices = batch.indices->Slice(left - seen_, right - left);
-    }
+    limited_batch = batch.Slice(left - seen_, right - left);
   } else {
     /// No intersection, skip the whole batch.
-    ARROW_ASSIGN_OR_RAISE(record_batch, ::arrow::RecordBatch::MakeEmpty(batch.batch->schema()));
-    if (batch.indices) {
-      ARROW_ASSIGN_OR_RAISE(indices, ::arrow::MakeEmptyArray(::arrow::int32()));
-    }
+    limited_batch = batch.Slice(0, 0);
   }
-  seen_ += batch_size;
-  return ScanBatch::Filtered(record_batch,
-                             batch.batch_id,
-                             std::dynamic_pointer_cast<::arrow::Int32Array>(indices));
+  seen_ += limited_batch.length();
+  return limited_batch;
 }
 
 std::string Limit::ToString() const {
