@@ -26,8 +26,12 @@
 
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/schema.h"
 #include "lance/testing/extension_types.h"
+#include "lance/testing/io.h"
+
+using lance::arrow::ToArray;
 
 auto nested_schema = ::arrow::schema({::arrow::field("pk", ::arrow::int32()),
                                       ::arrow::field("objects",
@@ -202,4 +206,66 @@ TEST_CASE("Test ScanBatchesAsync with batch size") {
     CHECK(batch.record_batch->num_rows() == kBatchSize);
   }
   CHECK(num_batches == kTotalValues / kBatchSize);
+}
+
+// GH-188
+TEST_CASE("Filter over empty list") {
+  auto values_arr = ToArray({1, 2, 3}).ValueOrDie();
+
+  auto elem_builder = std::make_shared<::arrow::FloatBuilder>();
+  auto list_builder = ::arrow::ListBuilder(::arrow::default_memory_pool(), elem_builder);
+  CHECK(list_builder.Append().ok());
+  CHECK(elem_builder->AppendValues({0.1, 0.2}).ok());
+  CHECK(list_builder.AppendNull().ok());
+  CHECK(list_builder.Append().ok());
+  CHECK(elem_builder->Append(11.1).ok());
+  auto list_arr = list_builder.Finish().ValueOrDie();
+
+  auto schema = ::arrow::schema({::arrow::field("ints", ::arrow::int32()),
+                                 ::arrow::field("floats", ::arrow::list(::arrow::float32()))});
+  auto t = ::arrow::Table::Make(schema, {values_arr, list_arr});
+
+  auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
+  auto scan_builder = dataset->NewScan().ValueOrDie();
+
+  // This filter should result in an empty list array
+  CHECK(scan_builder
+            ->Filter(::arrow::compute::equal(::arrow::compute::field_ref("ints"),
+                                             ::arrow::compute::literal(100)))
+            .ok());
+  auto scanner = scan_builder->Finish().ValueOrDie();
+
+  auto actual = scanner->ToTable().ValueOrDie();
+  CHECK(actual->num_rows() == 0);
+  CHECK(t->schema()->Equals(actual->schema()));
+}
+
+TEST_CASE("Filter with limit") {
+  auto values_arr = ToArray({1, 2, 3}).ValueOrDie();
+
+  auto elem_builder = std::make_shared<::arrow::FloatBuilder>();
+  auto list_builder = ::arrow::ListBuilder(::arrow::default_memory_pool(), elem_builder);
+  CHECK(list_builder.Append().ok());
+  CHECK(elem_builder->AppendValues({0.1, 0.2}).ok());
+  CHECK(list_builder.AppendNull().ok());
+  CHECK(list_builder.Append().ok());
+  CHECK(elem_builder->Append(11.1).ok());
+  auto list_arr = list_builder.Finish().ValueOrDie();
+
+  auto schema = ::arrow::schema({::arrow::field("ints", ::arrow::int32()),
+                                 ::arrow::field("floats", ::arrow::list(::arrow::float32()))});
+  auto t = ::arrow::Table::Make(schema, {values_arr, list_arr});
+  auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
+  auto scan_builder = lance::arrow::ScannerBuilder(dataset);
+  CHECK(scan_builder
+            .Filter(::arrow::compute::equal(::arrow::compute::field_ref("ints"),
+                                            ::arrow::compute::literal(100)))
+            .ok());
+  CHECK(scan_builder.Limit(20).ok());
+
+  auto scanner = scan_builder.Finish().ValueOrDie();
+
+  auto actual = scanner->ToTable().ValueOrDie();
+  CHECK(actual->num_rows() == 0);
+  CHECK(t->schema()->Equals(actual->schema()));
 }

@@ -192,8 +192,7 @@ class PlainDecoderImpl : public Decoder {
   }
 
   ::arrow::Result<std::shared_ptr<::arrow::Array>> MakeEmpty() const {
-    ARROW_ASSIGN_OR_RAISE(auto buffer, ::arrow::AllocateBuffer(0));
-    return std::make_shared<ArrayType>(type_, 0, std::move(buffer));
+    return ::arrow::MakeEmptyArray(type_, pool_);
   }
 
  private:
