@@ -52,7 +52,7 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
     return batch;
   }
   // Find intersection of two ranges (offset, offset + limit) and (seen, seen + batch_size).
-  auto batch_size = batch.batch->num_rows();
+  auto batch_size = batch.length();
   auto left = std::max(offset_, seen_);
   auto right = std::min(seen_ + batch_size, offset_ + limit_);
   ScanBatch limited_batch;
@@ -62,7 +62,7 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
     /// No intersection, skip the whole batch.
     limited_batch = batch.Slice(0, 0);
   }
-  seen_ += limited_batch.length();
+  seen_ += batch.length();
   return limited_batch;
 }
 
