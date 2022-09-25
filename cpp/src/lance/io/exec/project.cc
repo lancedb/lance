@@ -28,7 +28,9 @@
 
 namespace lance::io::exec {
 
-Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
+Project::Project(std::unique_ptr<ExecNode> child,
+                 std::shared_ptr<lance::format::Schema> projected_schema)
+    : child_(std::move(child)), projected_schema_(std::move(projected_schema)) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     std::shared_ptr<FileReader> reader,
@@ -38,6 +40,9 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
   if (projected_arrow_schema->num_fields() == 0) {
     projected_arrow_schema = scan_options->dataset_schema;
   }
+  fmt::print("Scan Options:\nprojected={}\n-----\ndataset={}\n-----\n",
+             scan_options->projected_schema->ToString(),
+             scan_options->dataset_schema->ToString());
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
 
   std::optional<int64_t> limit;
@@ -65,19 +70,30 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
     ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
     /// (*optionally) Limit -> Scan
+    fmt::print("Build scan with schema: {}\n", projected_schema->ToString());
     ARROW_ASSIGN_OR_RAISE(child, Scan::Make(reader, projected_schema, scan_options->batch_size));
     if (limit.has_value()) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
     }
   }
-  return std::unique_ptr<Project>(new Project(std::move(child)));
+  fmt::print("Create Project: projected schema={}\n", projected_schema->ToString());
+  return std::unique_ptr<Project>(new Project(std::move(child), std::move(projected_schema)));
 }
 
 std::string Project::ToString() const { return "Project"; }
 
 ::arrow::Result<ScanBatch> Project::Next() {
   assert(child_);
-  return child_->Next();
+  ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
+  if (batch.eof()) {
+    return batch;
+  }
+  fmt::print("Projected schema: {}\n, data schema: {}\n",
+             projected_schema_->ToString(),
+             !batch.eof() ? batch.batch->schema()->ToString() : "{}");
+  ARROW_ASSIGN_OR_RAISE(auto projected_batch,
+                        lance::arrow::ApplyProjection(batch.batch, *projected_schema_));
+  return ScanBatch(projected_batch, batch.batch_id, batch.indices);
 }
 
 }  // namespace lance::io::exec

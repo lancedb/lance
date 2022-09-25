@@ -67,17 +67,7 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     auto schema = lance::format::Schema(scanner->options()->dataset_schema);
     auto columns = columns_.value();
 
-    if (::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
-      for (auto& filtered_column :
-           ::arrow::compute::FieldsInExpression(scanner->options()->filter)) {
-        auto filtered_col_name = ColumnNameFromFieldRef(filtered_column);
-        if (std::find(std::begin(columns), std::end(columns), filtered_col_name) == columns.end()) {
-          columns.emplace_back(filtered_col_name);
-        }
-      }
-    }
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
-    scanner->options()->dataset_schema = projected_schema->ToArrow();
     ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
                           scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
 
@@ -96,7 +86,7 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     }
     ARROW_ASSIGN_OR_RAISE(auto project_desc,
                           ::arrow::dataset::ProjectionDescr::FromNames(
-                              top_names, *scanner->options()->dataset_schema));
+                              top_names, *projected_schema->ToArrow()));
     scanner->options()->projected_schema = project_desc.schema;
     scanner->options()->projection = project_desc.expression;
   }
