@@ -19,11 +19,15 @@
 #include <arrow/status.h>
 #include <arrow/util/future.h>
 #include <arrow/util/thread_pool.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <tuple>
 
 #include "lance/format/metadata.h"
+#include "lance/format/schema.h"
+#include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
@@ -33,7 +37,7 @@ namespace lance::io {
 RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
                                      std::shared_ptr<::arrow::dataset::ScanOptions> options,
                                      ::arrow::internal::ThreadPool* thread_pool) noexcept
-    : reader_(std::move(reader)), options_(std::move(options)), thread_pool_(thread_pool) {
+    : reader_(reader), options_(options), thread_pool_(thread_pool) {
   assert(thread_pool_);
 }
 
@@ -47,7 +51,7 @@ RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
     : reader_(std::move(other.reader_)),
       options_(std::move(other.options_)),
       project_(std::move(other.project_)),
-      thread_pool_(other.thread_pool_) {}
+      thread_pool_(std::move(other.thread_pool_)) {}
 
 ::arrow::Status RecordBatchReader::Open() {
   ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_));

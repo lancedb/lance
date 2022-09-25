@@ -69,6 +69,15 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
                           scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
     scanner->options()->projected_schema = projected_schema->ToArrow();
+
+    std::vector<std::string> top_names;
+    for (const auto& field : projected_schema->fields()) {
+      top_names.emplace_back(field->name());
+    }
+    ARROW_ASSIGN_OR_RAISE(auto project_desc,
+                          ::arrow::dataset::ProjectionDescr::FromNames(
+                              top_names, *scanner->options()->dataset_schema));
+    scanner->options()->projection = project_desc.expression;
   }
 
   if (scanner->options()->fragment_scan_options) {

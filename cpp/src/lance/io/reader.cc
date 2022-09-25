@@ -289,6 +289,7 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(
     const lance::format::Schema& schema, int32_t batch_id, const ArrayReadParams& params) const {
+  assert(!schema.fields().empty());
   std::vector<std::shared_ptr<::arrow::Array>> arrs;
   /// TODO: GH-43. Read field in parallel.
   for (auto& field : schema.fields()) {
