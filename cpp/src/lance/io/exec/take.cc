@@ -47,8 +47,10 @@ Take::Take(std::shared_ptr<FileReader> reader,
     ARROW_ASSIGN_OR_RAISE(auto rest_columns,
                           reader_->ReadBatch(*schema_, batch_id, filtered.indices));
     assert(filtered.batch->num_rows() == rest_columns->num_rows());
+    fmt::print("Rest columns: {}\n", rest_columns->ToString());
     ARROW_ASSIGN_OR_RAISE(auto merged_batch,
                           lance::arrow::MergeRecordBatches(filtered.batch, rest_columns));
+    fmt::print("Merged batch: {}\n", merged_batch->ToString());
     return ScanBatch(merged_batch, filtered.batch_id);
   }
 }

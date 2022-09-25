@@ -16,6 +16,7 @@
 
 #include <arrow/result.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <string>
 #include <vector>

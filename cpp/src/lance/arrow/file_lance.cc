@@ -78,6 +78,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
 
+  fmt::print("File reader schema: {}\n", reader->schema());
   auto batch_reader =
       lance::io::RecordBatchReader(std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
   ARROW_RETURN_NOT_OK(batch_reader.Open());

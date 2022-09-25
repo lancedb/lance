@@ -84,9 +84,9 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
         }
       }
     }
-    ARROW_ASSIGN_OR_RAISE(auto project_desc,
-                          ::arrow::dataset::ProjectionDescr::FromNames(
-                              top_names, *projected_schema->ToArrow()));
+    ARROW_ASSIGN_OR_RAISE(
+        auto project_desc,
+        ::arrow::dataset::ProjectionDescr::FromNames(top_names, *projected_schema->ToArrow()));
     scanner->options()->projected_schema = project_desc.schema;
     scanner->options()->projection = project_desc.expression;
   }
@@ -101,6 +101,9 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     }
   }
 
+  fmt::print("Build scanner: dataset schema={}\nproject schema={}\n",
+             scanner->options()->dataset_schema,
+             scanner->options()->projected_schema);
   return scanner;
 }
 
