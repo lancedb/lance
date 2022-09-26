@@ -16,6 +16,7 @@
 
 #include <arrow/result.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <string>
 #include <vector>
@@ -121,6 +122,45 @@ std::string ColumnNameFromFieldRef(const ::arrow::FieldRef& ref) {
     }
   }
   return name;
+}
+
+::arrow::Result<std::shared_ptr<::arrow::StructArray>> ApplyProjection(
+    const ::arrow::StructArray& arr, const format::Field& field) {
+  assert(is_struct(field.type()->id()));
+
+  std::vector<std::shared_ptr<::arrow::Array>> columns;
+  std::vector<std::string> names;
+  for (auto& child : field.fields()) {
+    auto col = arr.GetFieldByName(child->name());
+    if (!col) {
+      return ::arrow::Status::Invalid(fmt::format("Column {} not found", child->name()));
+    }
+    if (is_struct(col->type_id())) {
+      ARROW_ASSIGN_OR_RAISE(
+          col, ApplyProjection(*std::dynamic_pointer_cast<::arrow::StructArray>(col), *child));
+    }
+    names.emplace_back(child->name());
+    columns.emplace_back(col);
+  }
+  return ::arrow::StructArray::Make(columns, names);
+};
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ApplyProjection(
+    const std::shared_ptr<::arrow::RecordBatch>& batch, const format::Schema& projected_schema) {
+  std::vector<std::shared_ptr<::arrow::Array>> columns;
+  for (const auto& field : projected_schema.fields()) {
+    auto col = batch->GetColumnByName(field->name());
+    if (!col) {
+      continue;
+    }
+    if (is_struct(col->type_id())) {
+      ARROW_ASSIGN_OR_RAISE(
+          col, ApplyProjection(*std::dynamic_pointer_cast<::arrow::StructArray>(col), *field));
+    }
+
+    columns.emplace_back(col);
+  }
+  return ::arrow::RecordBatch::Make(projected_schema.ToArrow(), batch->num_rows(), columns);
 }
 
 }  // namespace lance::arrow

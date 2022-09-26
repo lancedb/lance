@@ -20,6 +20,8 @@
 
 #include <memory>
 
+#include "lance/format/schema.h"
+
 namespace lance::arrow {
 
 /// Merge two same-length record batches into one.
@@ -32,6 +34,9 @@ namespace lance::arrow {
     const std::shared_ptr<::arrow::StructArray>& lhs,
     const std::shared_ptr<::arrow::StructArray>& rhs,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ApplyProjection(
+    const std::shared_ptr<::arrow::RecordBatch>& batch, const format::Schema& projected_schema);
 
 std::string ColumnNameFromFieldRef(const ::arrow::FieldRef& ref);
 

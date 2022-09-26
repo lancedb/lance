@@ -21,14 +21,13 @@
 #include <memory>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/format/schema.h"
 #include "lance/format/manifest.h"
+#include "lance/format/schema.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
 #include "lance/io/writer.h"
-#include "lance/io/reader.h"
 
 const char kLanceFormatTypeName[] = "lance";
 
@@ -77,12 +76,10 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
-
-  auto batch_reader =
-      lance::io::RecordBatchReader(std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
+  auto batch_reader = lance::io::RecordBatchReader(
+      std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
   ARROW_RETURN_NOT_OK(batch_reader.Open());
-  auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
-  return generator;
+  return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::FileWriter>> LanceFileFormat::MakeWriter(

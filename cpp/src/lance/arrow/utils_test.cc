@@ -23,6 +23,8 @@
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 
+using lance::arrow::ToArray;
+
 TEST_CASE("Merge simple structs") {
   auto a = lance::arrow::ToArray<int32_t>({1, 2, 3}).ValueOrDie();
   auto left = ::arrow::StructArray::Make({a}, {"a"}).ValueOrDie();
@@ -92,4 +94,43 @@ TEST_CASE("Merge nested structs") {
 
   INFO("Actual data: " << points->ToString() << " Expected: " << expected_arr->ToString());
   CHECK(points->Equals(expected_arr));
+}
+
+TEST_CASE("Apply projection") {
+  std::vector<std::string> names({"one", "two", "three"});
+  auto int_values = ToArray({1, 2, 3}).ValueOrDie();
+  auto str_values = ToArray(names).ValueOrDie();
+
+  auto ids_builder = std::make_shared<::arrow::Int16Builder>();
+  auto names_builder = std::make_shared<::arrow::StringBuilder>();
+  auto struct_type = arrow::struct_(
+      {::arrow::field("ids", ::arrow::int16()), ::arrow::field("names", ::arrow::utf8())});
+  auto annotations_builder = ::arrow::StructBuilder(
+      struct_type, ::arrow::default_memory_pool(), {ids_builder, names_builder});
+
+  for (int i = 1; i <= 3; i++) {
+    CHECK(annotations_builder.Append().ok());
+    CHECK(ids_builder->Append(i).ok());
+    CHECK(names_builder->Append(names[i - 1]).ok());
+  }
+  auto ann_arr = annotations_builder.Finish().ValueOrDie();
+
+  auto arrow_schema = ::arrow::schema({::arrow::field("ints", ::arrow::int32()),
+                                       ::arrow::field("strings", ::arrow::utf8()),
+                                       ::arrow::field("annotations", struct_type)});
+  auto schema = ::lance::format::Schema(arrow_schema);
+  auto record_batch =
+      ::arrow::RecordBatch::Make(arrow_schema, 3, {int_values, str_values, ann_arr});
+  auto projected_schema = schema.Project({"ints", "annotations.names"}).ValueOrDie();
+  auto projected = lance::arrow::ApplyProjection(record_batch, *projected_schema).ValueOrDie();
+  CHECK(projected->schema()->Equals(projected_schema->ToArrow()));
+  CHECK(projected->GetColumnByName("strings") == nullptr);
+  CHECK(projected->GetColumnByName("ints")->Equals(int_values));
+
+  auto actual_ann_arr = projected->GetColumnByName("annotations");
+  CHECK(actual_ann_arr);
+  CHECK(lance::arrow::is_struct(actual_ann_arr->type_id()));
+  auto ann_struct_arr = std::dynamic_pointer_cast<::arrow::StructArray>(actual_ann_arr);
+  CHECK(ann_struct_arr->GetFieldByName("names")->length() == 3);
+  CHECK(ann_struct_arr->GetFieldByName("ids") == nullptr);
 }

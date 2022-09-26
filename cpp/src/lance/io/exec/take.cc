@@ -14,6 +14,10 @@
 
 #include "lance/io/exec/take.h"
 
+#include <arrow/result.h>
+
+#include <memory>
+
 #include "lance/arrow/utils.h"
 
 namespace lance::io::exec {

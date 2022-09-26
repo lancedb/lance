@@ -17,9 +17,7 @@
 #include <arrow/dataset/dataset.h>
 #include <arrow/dataset/scanner.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
-#include "lance/arrow/file_lance.h"
 #include "lance/arrow/file_lance_ext.h"
 #include "lance/arrow/utils.h"
 #include "lance/format/schema.h"
@@ -67,37 +65,18 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     auto schema = lance::format::Schema(scanner->options()->dataset_schema);
     auto columns = columns_.value();
 
-    if (::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
-      for (auto& filtered_column :
-           ::arrow::compute::FieldsInExpression(scanner->options()->filter)) {
-        auto filtered_col_name = ColumnNameFromFieldRef(filtered_column);
-        if (std::find(std::begin(columns), std::end(columns), filtered_col_name) == columns.end()) {
-          columns.emplace_back(filtered_col_name);
-        }
-      }
-    }
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
-    scanner->options()->dataset_schema = projected_schema->ToArrow();
     ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
                           scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
+    scanner->options()->projected_schema = projected_schema->ToArrow();
 
-    /// Only keep the top level column names to build the output schema.
     std::vector<std::string> top_names;
     for (const auto& field : projected_schema->fields()) {
-      auto name = field->name();
-      if (auto it = std::find(top_names.begin(), top_names.end(), name); it == top_names.end()) {
-        auto dot_pos = name.find_first_of(".");
-        if (dot_pos == std::string::npos) {
-          top_names.emplace_back(name);
-        } else {
-          top_names.emplace_back(name.substr(0, dot_pos));
-        }
-      }
+      top_names.emplace_back(field->name());
     }
     ARROW_ASSIGN_OR_RAISE(auto project_desc,
                           ::arrow::dataset::ProjectionDescr::FromNames(
                               top_names, *scanner->options()->dataset_schema));
-    scanner->options()->projected_schema = project_desc.schema;
     scanner->options()->projection = project_desc.expression;
   }
 
@@ -110,7 +89,6 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
       scanner->options()->batch_readahead = 1;
     }
   }
-
   return scanner;
 }
 

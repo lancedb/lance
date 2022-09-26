@@ -19,7 +19,6 @@
 #include <fmt/format.h>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/scan.h"
@@ -28,7 +27,9 @@
 
 namespace lance::io::exec {
 
-Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
+Project::Project(std::unique_ptr<ExecNode> child,
+                 std::shared_ptr<lance::format::Schema> projected_schema)
+    : child_(std::move(child)), projected_schema_(std::move(projected_schema)) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
     std::shared_ptr<FileReader> reader,
@@ -70,14 +71,19 @@ Project::Project(std::unique_ptr<ExecNode> child) : child_(std::move(child)) {}
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
     }
   }
-  return std::unique_ptr<Project>(new Project(std::move(child)));
+  return std::unique_ptr<Project>(new Project(std::move(child), std::move(projected_schema)));
 }
 
 std::string Project::ToString() const { return "Project"; }
 
 ::arrow::Result<ScanBatch> Project::Next() {
+
   assert(child_);
-  return child_->Next();
+  ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
+  if (batch.eof()) {
+    return batch;
+  }
+  return batch.Project(*projected_schema_);
 }
 
 }  // namespace lance::io::exec

@@ -74,7 +74,6 @@ TEST_CASE("Build Scanner with nested struct") {
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
   auto scanner = result.ValueOrDie();
-  fmt::print("Projected: {}\n", scanner->options()->projected_schema);
 
   auto expected_proj_schema = ::arrow::schema({::arrow::field(
       "objects", ::arrow::list(::arrow::struct_({::arrow::field("val", ::arrow::int64())})))});
@@ -119,14 +118,13 @@ std::shared_ptr<::arrow::dataset::Scanner> MakeScanner(std::shared_ptr<::arrow::
   auto result = scanner_builder.Finish();
   CHECK(result.ok());
   auto scanner = result.ValueOrDie();
-  fmt::print("Projected: {}\n", scanner->options()->projected_schema);
   return scanner;
 }
 
 TEST_CASE("Scanner with extension") {
-  auto table = MakeTable();
   auto ext_type = std::make_shared<::lance::testing::ParametricType>(1);
   CHECK(::arrow::RegisterExtensionType(ext_type).ok());
+  auto table = MakeTable();
   auto scanner = MakeScanner(table);
 
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
@@ -268,4 +266,27 @@ TEST_CASE("Filter with limit") {
   auto actual = scanner->ToTable().ValueOrDie();
   CHECK(actual->num_rows() == 0);
   CHECK(t->schema()->Equals(actual->schema()));
+}
+
+TEST_CASE("Scanner projection should not include filter columns") {
+  auto ints_arr = ToArray({1, 2, 3}).ValueOrDie();
+  auto strings_arr = ToArray({"one", "two", "three"}).ValueOrDie();
+
+  auto schema = ::arrow::schema(
+      {::arrow::field("ints", ::arrow::int32()), ::arrow::field("strs", ::arrow::utf8())});
+  auto t = ::arrow::Table::Make(schema, {ints_arr, strings_arr});
+  auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
+  auto scan_builder = lance::arrow::ScannerBuilder(dataset);
+  CHECK(scan_builder
+            .Filter(::arrow::compute::equal(::arrow::compute::field_ref("ints"),
+                                            ::arrow::compute::literal(2)))
+            .ok());
+  CHECK(scan_builder.Project({"strs"}).ok());
+
+  auto scanner = scan_builder.Finish().ValueOrDie();
+  auto actual = scanner->ToTable().ValueOrDie();
+  auto expected_schema = ::arrow::schema({::arrow::field("strs", ::arrow::utf8())});
+  INFO("Expected schema: " << expected_schema->ToString()
+                           << "\nGot: " << actual->schema()->ToString());
+  CHECK(actual->schema()->Equals(expected_schema));
 }
