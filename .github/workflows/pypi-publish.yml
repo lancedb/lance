@@ -1,0 +1,29 @@
+name: Build and upload python wheels
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-publish-wheel:
+    strategy:
+      matrix:
+        os: ["ubuntu-22.04", "macos-12"]
+        python-minor-version: [ "8", "9", "10" ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: build_linux_wheel.yml
+        if: ${{ matrix.os == "ubuntu-22.04" }}
+        with:
+          python-minor-version: ${{ matrix.python-minor-version }}
+      - uses: build_mac_wheel.yml
+        if: ${{ matrix.os == "macos-12" }}
+        with:
+          python-minor-version: ${{ matrix.python-minor-version }}
+      - uses: upload_wheel.yml
+        with:
+          os: ${{ matrix.os }}

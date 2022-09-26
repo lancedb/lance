@@ -24,6 +24,7 @@ jobs:
         ref: main
         persist-credentials: false
         fetch-depth: 0
+        lfs: true
     - name: Set git configs for bumpversion
       run: |
         git config user.name 'Lance Release'
