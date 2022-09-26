@@ -1,0 +1,28 @@
+name: Reusable workflow to build a Lance wheel
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      python-minor-version:
+        required: true
+        type: string
+
+jobs:
+  build-wheel:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: ./.github/workflows/build_linux_wheel.yml
+        if: ${{ matrix.os == "ubuntu-22.04" }}
+        with:
+          python-minor-version: ${{ matrix.python-minor-version }}
+      - uses: ./.github/workflows/build_mac_wheel.yml
+        if: ${{ matrix.os == "macos-12" }}
+        with:
+          python-minor-version: ${{ matrix.python-minor-version }}

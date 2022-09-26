@@ -16,14 +16,10 @@ jobs:
       run:
         working-directory: python
     steps:
-      - uses: build_linux_wheel.yml
-        if: ${{ matrix.os == "ubuntu-22.04" }}
-        with:
-          python-minor-version: ${{ matrix.python-minor-version }}
-      - uses: build_mac_wheel.yml
-        if: ${{ matrix.os == "macos-12" }}
-        with:
-          python-minor-version: ${{ matrix.python-minor-version }}
-      - uses: upload_wheel.yml
-        with:
-          os: ${{ matrix.os }}
+    - uses: ./.github/workflows/build_wheel.yml
+      with:
+        os: ${{ matrix.os }}
+        python-minor-version: ${{ matrix.python-minor-version }}
+    - uses: upload_wheel.yml
+      with:
+        os: ${{ matrix.os }}
