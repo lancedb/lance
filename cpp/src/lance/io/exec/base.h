@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+/// Forward Declaration.
+namespace lance::format {
+class Schema;
+}
+
 namespace lance::io::exec {
 
 /// Emitted results from each ExecNode
@@ -60,6 +65,9 @@ struct ScanBatch {
 
   /// The length of this batch.
   int64_t length() const;
+
+  /// Project selected columns over the Scanned Batch.
+  ::arrow::Result<ScanBatch> Project(const lance::format::Schema& projected_schema);
 };
 
 /// I/O execute base node.

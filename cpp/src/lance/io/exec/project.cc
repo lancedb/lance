@@ -19,7 +19,6 @@
 #include <fmt/format.h>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/arrow/utils.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/scan.h"
@@ -84,9 +83,7 @@ std::string Project::ToString() const { return "Project"; }
   if (batch.eof()) {
     return batch;
   }
-  ARROW_ASSIGN_OR_RAISE(auto projected_batch,
-                        lance::arrow::ApplyProjection(batch.batch, *projected_schema_));
-  return ScanBatch(projected_batch, batch.batch_id, batch.indices);
+  return batch.Project(*projected_schema_);
 }
 
 }  // namespace lance::io::exec
