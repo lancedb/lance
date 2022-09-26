@@ -5,21 +5,42 @@ on:
     types: [published]
 
 jobs:
-  build-and-publish-wheel:
+  linux:
+    timeout-minutes: 30
     strategy:
       matrix:
-        os: ["ubuntu-22.04", "macos-12"]
         python-minor-version: [ "8", "9", "10" ]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: python
+    runs-on: "ubuntu-22.04"
     steps:
-    - uses: ./.github/workflows/build_wheel.yml
+    - uses: actions/checkout@v3
       with:
-        os: ${{ matrix.os }}
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.${{ matrix.python-minor-version }}
+    - uses: ./.github/workflows/build_linux_wheel
+      with:
         python-minor-version: ${{ matrix.python-minor-version }}
-    - uses: upload_wheel.yml
+    - uses: ./.github/workflows/upload_wheel
       with:
-        os: ${{ matrix.os }}
+        python-minor-version: ${{ matrix.python-minor-version }}
+  mac:
+    timeout-minutes: 30
+    runs-on: "macos-12"
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+    - uses: ./.github/workflows/build_mac_wheel
+      with:
+        python-minor-version: "10"
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        python-minor-version: "10"
