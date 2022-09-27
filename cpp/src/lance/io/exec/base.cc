@@ -32,7 +32,7 @@ ScanBatch ScanBatch::Slice(int64_t off, int64_t length) const {
   auto sliced_batch = batch->Slice(off, length);
   decltype(indices) sliced_indices;
   if (indices) {
-    sliced_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices->Slice(offset, length));
+    sliced_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices->Slice(off, length));
   }
   return ScanBatch(sliced_batch, batch_id, offset, sliced_indices);
 }
