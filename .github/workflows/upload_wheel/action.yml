@@ -9,6 +9,9 @@ inputs:
     required: false
     description: "pypi or testpypi"
     default: "pypi"
+  token:
+    required: true
+    description: "release token for the repo"
 
 runs:
   using: "composite"
@@ -22,6 +25,6 @@ runs:
     working-directory: python
     env:
       TWINE_USERNAME: __token__
-      TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      TWINE_PASSWORD: ${{ inputs.token }}
     shell: bash
     run: twine upload --repository ${{ inputs.repo }} wheels/*.whl

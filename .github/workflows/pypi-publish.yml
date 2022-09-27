@@ -39,6 +39,8 @@ jobs:
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
+        token: ${{ secrets.PYPI_TOKEN }}
+        repo: "pypi"
   mac:
     timeout-minutes: 30
     runs-on: "macos-12"
@@ -58,3 +60,5 @@ jobs:
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: "10"
+        token: ${{ secrets.PYPI_TOKEN }}
+        repo: "pypi"
