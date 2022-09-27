@@ -1,10 +1,8 @@
-name: Python
+name: Build and upload python wheels
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  release:
+    types: [published]
 
 jobs:
   linux:
@@ -25,7 +23,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-    - uses: ./.github/workflows/run_tests
+    - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
   mac:
@@ -43,6 +41,6 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: "10"
-    - uses: ./.github/workflows/run_tests
+    - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: "10"

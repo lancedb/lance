@@ -1,0 +1,15 @@
+# We create a composite action to be re-used both for testing and for releasing
+name: build-linux-wheel
+description: "Build a manylinux wheel for lance"
+inputs:
+  python-minor-version:
+    description: "8, 9, 10"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: "Build linux wheel"
+      shell: bash
+      working-directory: python
+      run: |
+        ./tools/build_wheel.sh $(echo cp3${{ inputs.python-minor-version }})
