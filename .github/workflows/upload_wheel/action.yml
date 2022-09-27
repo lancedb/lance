@@ -5,6 +5,10 @@ inputs:
   os:
     required: true
     description: "ubuntu-22.04 or macos-12"
+  repo:
+    required: false
+    description: "pypi or testpypi"
+    default: "pypi"
 
 runs:
   using: "composite"
@@ -20,4 +24,4 @@ runs:
       TWINE_USERNAME: __token__
       TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
     shell: bash
-    run: twine upload wheels/*.whl
+    run: twine upload --repository ${{ inputs.repo }} wheels/*.whl
