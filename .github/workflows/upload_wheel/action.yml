@@ -10,7 +10,6 @@ runs:
   using: "composite"
   steps:
   - name: Install dependencies
-    working-directory: python
     shell: bash
     run: |
       python -m pip install --upgrade pip
