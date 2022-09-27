@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'actually push the commit and tags'
+        description: 'Just create the local commit/tags but do not push it'
         required: true
-        default: "true"
+        default: "false"
         type: choice
         options:
           - "true"
@@ -41,6 +41,6 @@ jobs:
       if: ${{ inputs.dry_run }} == "false"
       uses: changhiskhan/github-push-action@master
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
+        github_token: ${{ secrets.RELEASE_TOKEN }}
         branch: main
         tags: true
