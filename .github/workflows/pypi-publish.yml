@@ -1,8 +1,20 @@
 name: Build and upload python wheels
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Just print the twine command'
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      ref:
+        description: 'Which release tag?'
+        required: true
+        type: string
 
 jobs:
   linux:
@@ -14,6 +26,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
       with:
+        ref: ${{ inputs.ref }}
         fetch-depth: 0
         lfs: true
     - name: Set up Python
@@ -32,6 +45,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
       with:
+        ref: ${{ inputs.ref }}
         fetch-depth: 0
         lfs: true
     - name: Set up Python
