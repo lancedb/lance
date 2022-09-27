@@ -20,20 +20,21 @@
 
 namespace lance::io::exec {
 
-ScanBatch ScanBatch::Null() { return ScanBatch(nullptr, -1); }
+ScanBatch ScanBatch::Null() { return ScanBatch(nullptr, -1, 0); }
 
 ScanBatch::ScanBatch(std::shared_ptr<::arrow::RecordBatch> records,
                      int32_t bid,
+                     int32_t offset,
                      std::shared_ptr<::arrow::Int32Array> idx)
-    : batch(std::move(records)), batch_id(bid), indices(std::move(idx)) {}
+    : batch(std::move(records)), batch_id(bid), offset(offset), indices(std::move(idx)) {}
 
-ScanBatch ScanBatch::Slice(int64_t offset, int64_t length) const {
-  auto sliced_batch = batch->Slice(offset, length);
+ScanBatch ScanBatch::Slice(int64_t off, int64_t length) const {
+  auto sliced_batch = batch->Slice(off, length);
   decltype(indices) sliced_indices;
   if (indices) {
     sliced_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices->Slice(offset, length));
   }
-  return ScanBatch(sliced_batch, batch_id, sliced_indices);
+  return ScanBatch(sliced_batch, batch_id, offset, sliced_indices);
 }
 
 int64_t ScanBatch::length() const {
@@ -46,7 +47,7 @@ int64_t ScanBatch::length() const {
 ::arrow::Result<ScanBatch> ScanBatch::Project(const lance::format::Schema& projected_schema) {
   ARROW_ASSIGN_OR_RAISE(auto projected_batch,
                         lance::arrow::ApplyProjection(batch, projected_schema));
-  return ScanBatch{projected_batch, batch_id, indices};
+  return ScanBatch{projected_batch, batch_id, offset, indices};
 }
 
 }  // namespace lance::io::exec

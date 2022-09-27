@@ -290,3 +290,49 @@ TEST_CASE("Scanner projection should not include filter columns") {
                            << "\nGot: " << actual->schema()->ToString());
   CHECK(actual->schema()->Equals(expected_schema));
 }
+
+TEST_CASE("Test filter with smaller batch size than block size") {
+  std::vector<int32_t> ints(200);
+  std::iota(std::begin(ints), std::end(ints), 0);
+  auto ints_arr = ToArray(ints).ValueOrDie();
+  std::vector<std::string> strs(ints.size());
+  std::transform(
+      std::begin(ints), std::end(ints), std::begin(strs), [](auto v) { return std::to_string(v); });
+  auto strs_arr = ToArray(strs).ValueOrDie();
+
+  auto schema = ::arrow::schema(
+      {::arrow::field("ints", ::arrow::int32()), ::arrow::field("strs", ::arrow::utf8())});
+  auto table = ::arrow::Table::Make(schema, {ints_arr, strs_arr});
+
+  const uint64_t kGroupSize = 64;
+  auto dataset = lance::testing::MakeDataset(table, {}, kGroupSize).ValueOrDie();
+
+  auto scan_builder = lance::arrow::ScannerBuilder(dataset);
+  // WHERE ints % 5 == 0
+  auto status = scan_builder.Filter(::arrow::compute::equal(
+      ::arrow::compute::call(
+          "subtract",
+          {::arrow::compute::field_ref("ints"),
+           ::arrow::compute::call(
+               "multiply",
+               {::arrow::compute::call(
+                    "divide", {::arrow::compute::field_ref("ints"), ::arrow::compute::literal(5)}),
+                ::arrow::compute::literal(5)})}),
+      ::arrow::compute::literal(0)));
+  INFO("Build filter status: " << status.message());
+  CHECK(status.ok());
+  CHECK(scan_builder.Project({"strs"}).ok());
+  CHECK(scan_builder.BatchSize(7).ok());  // Some number that is not dividable by the group size.
+  auto scanner = scan_builder.Finish().ValueOrDie();
+  auto actual = scanner->ToTable().ValueOrDie();
+  fmt::print("Actual table: {}\n", actual->ToString());
+
+  std::vector<std::string> expected_strs;
+  for (size_t i = 0; i < ints.size() / 5; i++) {
+    expected_strs.emplace_back(std::to_string(i * 5));
+  }
+  auto expected_arr = ToArray(expected_strs).ValueOrDie();
+  auto expected = ::arrow::Table::Make(::arrow::schema({::arrow::field("strs", ::arrow::utf8())}),
+                                       {expected_arr});
+  CHECK(actual->Equals(*expected));
+}

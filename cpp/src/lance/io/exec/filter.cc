@@ -46,7 +46,7 @@ bool Filter::HasFilter(const ::arrow::compute::Expression& filter) {
   ARROW_ASSIGN_OR_RAISE(auto indices_and_values, Apply(*batch.batch));
   auto [indices, values] = indices_and_values;
   ARROW_ASSIGN_OR_RAISE(auto values_arr, values->ToStructArray());
-  return ScanBatch(values, batch.batch_id, indices);
+  return ScanBatch(values, batch.batch_id, batch.offset, indices);
 }
 
 ::arrow::Result<

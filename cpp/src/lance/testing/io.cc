@@ -53,7 +53,9 @@ namespace lance::testing {
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
-    const std::shared_ptr<::arrow::Table>& table, const std::vector<std::string>& partitions) {
+    const std::shared_ptr<::arrow::Table>& table,
+    const std::vector<std::string>& partitions,
+    uint64_t max_rows_per_group) {
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   ARROW_ASSIGN_OR_RAISE(auto scanner_builder, dataset->NewScan());
@@ -77,6 +79,9 @@ namespace lance::testing {
   write_options.partitioning =
       std::make_shared<::arrow::dataset::HivePartitioning>(partition_schema);
   write_options.basename_template = "part{i}.lance";
+  if (max_rows_per_group > 0) {
+    write_options.max_rows_per_group = max_rows_per_group;
+  }
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(write_options, scanner));
 
@@ -86,9 +91,9 @@ namespace lance::testing {
   selector.recursive = true;
   ::arrow::dataset::FileSystemFactoryOptions factory_options;
   factory_options.partitioning = write_options.partitioning;
-  ARROW_ASSIGN_OR_RAISE(auto factory,
-                        ::arrow::dataset::FileSystemDatasetFactory::Make(
-                            fs, selector, format, factory_options));
+  ARROW_ASSIGN_OR_RAISE(
+      auto factory,
+      ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, factory_options));
   return factory->Finish();
 }
 
@@ -110,6 +115,7 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
   ARROW_RETURN_NOT_OK(reader_->ReadNext(&batch));
   return io::exec::ScanBatch{
       batch,
+      0,
       0,
   };
 }
