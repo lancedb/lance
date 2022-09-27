@@ -65,6 +65,7 @@ Scan::Scan(std::shared_ptr<FileReader> reader,
   return ScanBatch{
       batch,
       batch_id,
+      offset,
   };
 }
 

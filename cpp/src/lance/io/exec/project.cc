@@ -77,13 +77,13 @@ Project::Project(std::unique_ptr<ExecNode> child,
 std::string Project::ToString() const { return "Project"; }
 
 ::arrow::Result<ScanBatch> Project::Next() {
-
   assert(child_);
   ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   if (batch.eof()) {
     return batch;
   }
-  return batch.Project(*projected_schema_);
+  return batch;
+//  return batch.Project(*projected_schema_);
 }
 
 }  // namespace lance::io::exec

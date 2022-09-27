@@ -45,15 +45,21 @@ Take::Take(std::shared_ptr<FileReader> reader,
   }
   assert(filtered.indices);
   const auto batch_id = filtered.batch_id;
+  auto offset = filtered.offset;
   if (!schema_ || schema_->fields().empty()) {
-    return ScanBatch(filtered.batch, batch_id);
+    return ScanBatch(filtered.batch, batch_id, offset);
   } else {
+    auto offset_datum = ::arrow::Datum(offset);
+    ARROW_ASSIGN_OR_RAISE(auto adjusted_offsets,
+                          ::arrow::compute::Add(filtered.indices, offset_datum));
+    auto adjusted_offsets_arr =
+        std::dynamic_pointer_cast<::arrow::Int32Array>(adjusted_offsets.make_array());
     ARROW_ASSIGN_OR_RAISE(auto rest_columns,
-                          reader_->ReadBatch(*schema_, batch_id, filtered.indices));
+                          reader_->ReadBatch(*schema_, batch_id, adjusted_offsets_arr));
     assert(filtered.batch->num_rows() == rest_columns->num_rows());
     ARROW_ASSIGN_OR_RAISE(auto merged_batch,
                           lance::arrow::MergeRecordBatches(filtered.batch, rest_columns));
-    return ScanBatch(merged_batch, filtered.batch_id);
+    return ScanBatch(merged_batch, filtered.batch_id, offset);
   }
 }
 
