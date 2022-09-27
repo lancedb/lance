@@ -31,7 +31,7 @@ jobs:
       uses: ./.github/workflows/bump-version
       with:
         part: "patch"
-        tag: ""
+        tag: "--no-tag"
     - name: Print the version and tag
       working-directory: python
       run: |
