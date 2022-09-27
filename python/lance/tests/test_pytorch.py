@@ -87,3 +87,9 @@ def test_data_loader_with_filter(tmp_path: Path):
         assert torch.is_tensor(id)
         assert (value - 10) % 2 == 0
         assert torch.is_tensor(value)
+
+def test_data_loader_projection(tmp_path: Path):
+    ids = pa.array(range(10))
+    values = pa.array([f"num-{i}" for i in ids])
+    print(values)
+    pass
