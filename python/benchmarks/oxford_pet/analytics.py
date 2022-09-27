@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 from typing import Optional
 
 import duckdb
@@ -9,8 +10,11 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset
+
+sys.path.append("..")
+
 from bench_utils import BenchmarkSuite, download_uris
-from parse_pet import OxfordPetConverter
+from datagen import OxfordPetConverter
 
 import lance
 
@@ -38,8 +42,7 @@ def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
         query = "SELECT image, class FROM ds WHERE class='pug' " "LIMIT 50 OFFSET 20"
         return duckdb.query(query).to_df()
     elif fmt == "lance":
-        scanner = lance.scanner(
-            uri,
+        scanner = lance.dataset(uri).scanner(
             columns=["image", "class"],
             filter=pc.field("class") == "pug",
             limit=50,
@@ -77,7 +80,7 @@ def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
     c = OxfordPetConverter(base_uri)
     df = c.read_metadata()
     filtered = df.loc[df["class"] == klass, ["class", "filename"]]
-    limited: pd.DataFrame = filtered[offset : offset + limit]
+    limited: pd.DataFrame = filtered[offset: offset + limit]
     uris = [os.path.join(base_uri, f"images/{x}.jpg") for x in limited.filename.values]
     return limited.assign(images=download_uris(pd.Series(uris)))
 

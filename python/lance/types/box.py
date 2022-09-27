@@ -88,6 +88,7 @@ class BoxNdArray(pa.ExtensionArray, ABC):
         """
         # If this is a slice, the default Arrow behavior does not
         # return the sliced values properly
+        # TODO .values doesn't deal with NAs
         values = self.storage.values
         # If this is a full-length array then just default Arrow
         if len(self) == len(values) / (self.ndims * 2):

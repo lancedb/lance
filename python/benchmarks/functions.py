@@ -54,8 +54,9 @@ def iou_vectorized(num_boxes: int):
     ymin_arr = np.random.randn(num_boxes) + 1
     xmax_arr = (np.random.randn(num_boxes) + 10) * 10
     ymax_arr = (np.random.randn(num_boxes) + 10) * 10
-    storage = pa.StructArray.from_arrays(
-        [xmin_arr, ymin_arr, xmax_arr, ymax_arr], names=["xmin", "ymin", "xmax", "ymax"]
+    storage = pa.FixedSizeListArray.from_arrays(
+        np.stack([xmin_arr, ymin_arr, xmax_arr, ymax_arr]).T.reshape(-1),
+        list_size=4
     )
     box_arr = Box2dArray.from_storage(Box2dType(), storage)
     return box_arr.iou(box_arr)

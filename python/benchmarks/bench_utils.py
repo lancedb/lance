@@ -116,13 +116,7 @@ class BenchmarkSuite:
 
     def create_main(self):
         @click.command
-        @click.option(
-            "-u",
-            "--base-uri",
-            required=True,
-            type=str,
-            help="Base uri to the benchmark dataset catalog",
-        )
+        @click.argument("base_uri")
         @click.option(
             "-f", "--format", "fmt", help="'lance', 'parquet', or 'raw'. Omit for all"
         )
@@ -147,7 +141,6 @@ class BenchmarkSuite:
                 fmt = [fmt]
             else:
                 fmt = KNOWN_FORMATS
-            base_uri = f"{base_uri}/datasets/{self.name}"
 
             def run_benchmark(bmark):
                 b = bmark.repeat(repeats or 1)
@@ -320,12 +313,17 @@ class DatasetConverter(ABC):
             else:
                 fmt = known_formats
 
-            kwargs = {
-                "existing_data_behavior": "overwrite_or_ignore",
-                "max_rows_per_group": group_size,
-                "max_rows_per_file": max_rows_per_file,
-            }
             for f in fmt:
+                if f == 'lance':
+                    kwargs = {
+                        "existing_data_behavior": "overwrite_or_ignore",
+                        "max_rows_per_group": group_size,
+                        "max_rows_per_file": max_rows_per_file,
+                    }
+                elif f == 'parquet':
+                    kwargs = {
+                        'row_group_size': group_size,
+                    }
                 if embedded:
                     converter.make_embedded_dataset(df, f, output_path, **kwargs)
                 else:

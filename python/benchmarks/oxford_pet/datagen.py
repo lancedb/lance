@@ -26,6 +26,7 @@ import pyarrow as pa
 import xmltodict
 from bench_utils import DatasetConverter, download_uris
 
+
 # Oxford PET has dataset quality issues:
 #
 # The following exists in the XMLs but are not part of the list.txt index
@@ -79,7 +80,61 @@ class OxfordPetConverter(DatasetConverter):
         with_xmls["segmented"] = with_xmls.segmented.apply(
             lambda x: pd.NA if pd.isnull(x) else bool(x)
         ).astype(pd.BooleanDtype())
+
+        def _convert(obj_list):
+            keys = ["name", "pose", "truncated", "occluded", "bndbox", "difficult"]
+            defaults = ["", "", False, False, [], False]
+            if isinstance(obj_list, list):
+                dd = {}
+                for obj in obj_list:
+                    box = obj['bndbox']
+                    obj['bndbox'] = [box['xmin'], box['ymin'],
+                                     box['xmax'], box['ymax']]
+                    for k in keys:
+                        dd.setdefault(k, []).append(obj[k])
+                return dd
+            return dict(zip(keys, [[]] * len(keys)))
+
+        with_xmls["object"] = with_xmls["object"].apply(_convert)
         return with_xmls
+
+    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+        """Convert each metdata column to pyarrow with lance types"""
+        schema = self.get_schema()
+        arrays = []
+        for name, col in df.items():
+            field = schema.field(name)
+            arr = self._convert_field(field.name, field.type, col)
+            arrays.append(arr)
+        table = pa.Table.from_arrays(arrays, schema=schema)
+        return table
+
+    def _convert_field(self, name, typ, col):
+        if isinstance(typ, pa.ExtensionType):
+            storage = pa.array(col, type=typ.storage_type)
+            arr = pa.ExtensionArray.from_storage(typ, storage)
+        elif pa.types.is_list(typ):
+            native_arr = pa.array(col)
+            offsets = native_arr.offsets
+            values = native_arr.values.to_numpy(zero_copy_only=False)
+            return pa.ListArray.from_arrays(
+                offsets, self._convert_field(f"{name}.elements", typ.value_type, values)
+            )
+        elif pa.types.is_struct(typ):
+            native_arr = pa.array(col)
+            arrays = []
+            for subfield in typ:
+                sub_arr = native_arr.field(subfield.name)
+                converted = self._convert_field(
+                    f"{name}.{subfield.name}",
+                    subfield.type,
+                    sub_arr.to_numpy(zero_copy_only=False),
+                )
+                arrays.append(converted)
+            return pa.StructArray.from_arrays(arrays, fields=typ)
+        else:
+            arr = pa.array(col, type=typ)
+        return arr
 
     def _get_index(self, name: str) -> pd.DataFrame:
         list_txt = os.path.join(self.uri_root, f"annotations/{name}.txt")
@@ -134,25 +189,15 @@ class OxfordPetConverter(DatasetConverter):
                 pa.field("depth", pa.uint8()),
             ]
         )
-        bbox = pa.struct(
+        object_schema = pa.struct(
             [
-                pa.field("xmin", pa.int32()),
-                pa.field("ymin", pa.int32()),
-                pa.field("xmax", pa.int32()),
-                pa.field("ymax", pa.int32()),
+                pa.field("name", pa.list_(pa.string())),
+                pa.field("pose", pa.list_(pa.string())),
+                pa.field("truncated", pa.list_(pa.bool_())),
+                pa.field("occluded", pa.list_(pa.bool_())),
+                pa.field("bndbox", pa.list_(pa.list_(pa.float32(), 4))),
+                pa.field("difficult", pa.list_(pa.bool_())),
             ]
-        )
-        object_schema = pa.list_(
-            pa.struct(
-                [
-                    pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
-                    pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
-                    pa.field("truncated", pa.bool_()),
-                    pa.field("occluded", pa.bool_()),
-                    pa.field("bndbox", bbox),
-                    pa.field("difficult", pa.bool_()),
-                ]
-            )
         )
         names = [
             "filename",

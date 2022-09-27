@@ -110,43 +110,16 @@ class CocoConverter(DatasetConverter):
             arrays = []
             for subfield in typ:
                 sub_arr = native_arr.field(subfield.name)
-                if name == "annotations" and subfield.name == "name":
-                    converted = self._convert_name_column(
-                        sub_arr, native_arr.field("category_id")
-                    )
-                else:
-                    converted = self._convert_field(
-                        f"{name}.{subfield.name}",
-                        subfield.type,
-                        sub_arr.to_numpy(zero_copy_only=False),
-                    )
+                converted = self._convert_field(
+                    f"{name}.{subfield.name}",
+                    subfield.type,
+                    sub_arr.to_numpy(zero_copy_only=False),
+                )
                 arrays.append(converted)
             return pa.StructArray.from_arrays(arrays, fields=typ)
         else:
             arr = pa.array(col, type=typ)
         return arr
-
-    def _convert_name_column(self, name_arr, category_id_arr):
-        coco_classes = pd.read_csv("coco_classes.csv", header=0, index_col=None)
-        # let's make sure the actual data matches
-        check = pd.Series(
-            dict(
-                zip(
-                    name_arr.values.to_numpy(False),
-                    category_id_arr.values.to_numpy(False),
-                )
-            )
-        ).to_frame(name="check_id")
-        joined = coco_classes.set_index("name").join(check, how="right")
-        mask = pd.notnull(joined.check_id)
-        filtered = joined[mask]
-        if not (filtered.check_id == filtered.category_id).all():
-            raise ValueError(f"Category id check failed")
-        dict_arr = pa.DictionaryArray.from_pandas(
-            pd.Categorical(name_arr.values.to_numpy(False), coco_classes.name.values)
-        )
-        assert not pd.isna(dict_arr.indices.to_numpy()).all()
-        return pa.ListArray.from_arrays(name_arr.offsets, dict_arr)
 
     def image_uris(self, table):
         return table["image_uri"].to_numpy()
@@ -206,8 +179,8 @@ class CocoConverter(DatasetConverter):
             pa.list_(pa.float32(), 4),
             pa.int16(),
             pa.int64(),
-            pa.dictionary(pa.int8(), pa.utf8()),
-            pa.dictionary(pa.int8(), pa.utf8()),
+            pa.string(),
+            pa.string()
         ]
         schema = pa.struct(
             [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]
