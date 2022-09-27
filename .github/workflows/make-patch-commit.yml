@@ -1,0 +1,46 @@
+name: Create .dev0 version
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'actually push the commit and tags'
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out main
+      uses: actions/checkout@v3
+      with:
+        ref: main
+        persist-credentials: false
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - name: Call bumpversion
+      uses: ./.github/workflows/bump-version
+      with:
+        part: "patch"
+        tag: ""
+    - name: Print the version and tag
+      working-directory: python
+      run: |
+        cat lance/version.py
+        git tag | cat
+    - name: Push new version and tag
+      if: ${{ inputs.dry_run }} == "false"
+      uses: changhiskhan/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        branch: main
+        tags: true
