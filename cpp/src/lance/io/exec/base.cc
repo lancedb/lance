@@ -44,10 +44,4 @@ int64_t ScanBatch::length() const {
   return batch->num_rows();
 }
 
-::arrow::Result<ScanBatch> ScanBatch::Project(const lance::format::Schema& projected_schema) {
-  ARROW_ASSIGN_OR_RAISE(auto projected_batch,
-                        lance::arrow::ApplyProjection(batch, projected_schema));
-  return ScanBatch{projected_batch, batch_id, offset, indices};
-}
-
 }  // namespace lance::io::exec

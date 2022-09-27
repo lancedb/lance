@@ -325,7 +325,6 @@ TEST_CASE("Test filter with smaller batch size than block size") {
   CHECK(scan_builder.BatchSize(7).ok());  // Some number that is not dividable by the group size.
   auto scanner = scan_builder.Finish().ValueOrDie();
   auto actual = scanner->ToTable().ValueOrDie();
-  fmt::print("Actual table: {}\n", actual->ToString());
 
   std::vector<std::string> expected_strs;
   for (size_t i = 0; i < ints.size() / 5; i++) {

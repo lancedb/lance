@@ -90,3 +90,14 @@ def test_data_loader_with_filter(tmp_path: Path):
         assert torch.is_tensor(id)
         assert (value - 10) % 2 == 0
         assert torch.is_tensor(value)
+
+def test_data_loader_projection(tmp_path: Path):
+    ids = pa.array(range(10))
+    values = pa.array([f"num-{i}" for i in ids])
+    tab = pa.Table.from_arrays([ids, values], names=["id", "value"])
+    lance.write_table(tab, tmp_path / "lance")
+
+    dataset = LanceDataset(tmp_path / "lance", columns=["value"], filter=pc.field("id") >= 5)
+    for elem, expected_id in zip(dataset, range(5, 10)):
+        assert elem == f"num-{expected_id}"
+
