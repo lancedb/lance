@@ -187,4 +187,6 @@ class LanceDataset(IterableDataset):
                         ]
                         if self.transform is not None:
                             record = self.transform(*record)
+                        if batch.num_columns == 1:
+                            record = record[0]
                         yield record
