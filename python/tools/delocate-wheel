@@ -32,8 +32,7 @@ def main():
         out_dir = args.wheel_dir
         out_wheel = wheel
         if out_dir:
-            if not os.path.exists(out_dir):
-                os.makedirs(out_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
             out_wheel = os.path.join(out_dir, os.path.basename(wheel))
 
         copied = delocate_wheel(
