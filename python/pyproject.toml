@@ -27,6 +27,10 @@ before-build = [
 [tool.cibuildwheel.macos]
 # We only support native build for now, because homebrew only installs native libarrow and protobuf.
 archs = ["native"]
+repair-wheel-command = [
+  "delocate-listdeps {wheel}",
+  "./python/tools/delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}",
+]
 
 [tool.cibuildwheel.macos.environment]
 MACOSX_DEPLOYMENT_TARGET = "10.15"

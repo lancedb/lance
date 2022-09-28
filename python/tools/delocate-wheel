@@ -1,0 +1,51 @@
+#!/usr/bin/env python
+
+"""Monkey patching delocate wheel support exclude.
+
+See
+https://github.com/matthew-brett/delocate/blob/master/delocate/cmd/delocate_wheel.py
+"""
+
+import os
+import sys
+from argparse import ArgumentParser
+
+from delocate import delocate_wheel
+
+
+def lib_filter_func(name):
+    ignored_paths = ["/usr/lib", "/opt/homebrew", "/usr/local"]
+    for path in ignored_paths:
+        if name.startswith(path):
+            return False
+    return True
+
+
+def main():
+    parser = ArgumentParser()
+    parser.add_argument("--require-archs", metavar="ARCH")
+    parser.add_argument("-w", "--wheel-dir")
+    parser.add_argument("wheel", nargs="+")
+
+    args = parser.parse_args()
+    print(args)
+    for wheel in args.wheel:
+        out_dir = args.wheel_dir
+        out_wheel = wheel
+        if out_dir:
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+            out_wheel = os.path.join(out_dir, os.path.basename(wheel))
+
+        copied = delocate_wheel(
+            wheel,
+            out_wheel,
+            lib_filt_func=lib_filter_func,
+            lib_sdir=".dylibs",
+            require_archs=args.require_archs,
+            executable_path=os.path.dirname(sys.executable),
+        )
+
+
+if __name__ == "__main__":
+    main()
