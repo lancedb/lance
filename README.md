@@ -51,7 +51,7 @@ import duckdb
 
 # Understand Label distribution of Oxford Pet Dataset
 ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
-duckdb.query('select class, count(1) from ds group by class').to_arrow_table()
+duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
 
 ## What makes Lance different
