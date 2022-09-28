@@ -28,7 +28,6 @@ def main():
     parser.add_argument("wheel", nargs="+")
 
     args = parser.parse_args()
-    print(args)
     for wheel in args.wheel:
         out_dir = args.wheel_dir
         out_wheel = wheel
