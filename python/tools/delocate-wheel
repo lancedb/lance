@@ -20,7 +20,7 @@ from delocate.wheeltools import InWheelCtx
 def main():
     parser = ArgumentParser()
     parser.add_argument("--require-archs", metavar="ARCH")
-    parser.add_argument("-w", "--wheel-dir")
+    parser.add_argument("-w", "--wheel-dir", required=True)
     parser.add_argument("wheel", nargs="+")
 
     args = parser.parse_args()
