@@ -12,6 +12,20 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+import click
+
 import numpy as np
 import pyarrow as pa
 
@@ -62,12 +76,15 @@ def iou_vectorized(num_boxes: int):
     return box_arr.iou(box_arr)
 
 
-if __name__ == "__main__":
+@click.command()
+@click.option("-n", type=int, default=10000, help="max number of boxes")
+def main(n: int):
     import time
 
     n_repeats = 10
     results = {}
-    for num_boxes in [10, 100, 1000, 10000]:
+    num_boxes = 10
+    while num_boxes < n:
         for is_vectorized in [True, False]:
             repeats = []
             for i in range(n_repeats):
@@ -77,4 +94,9 @@ if __name__ == "__main__":
                 duration_ns = end - start
                 repeats.append(duration_ns)
             results[(num_boxes, is_vectorized)] = np.mean(repeats)
+        num_boxes *= 10
     print(results)
+
+
+if __name__ == "__main__":
+    main()

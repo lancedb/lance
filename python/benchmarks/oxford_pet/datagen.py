@@ -18,13 +18,15 @@ import pathlib
 import sys
 from urllib.parse import urlparse
 
-sys.path.append("..")
-
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import xmltodict
-from bench_utils import DatasetConverter, download_uris
+
+from lance.io import download_uris
+
+sys.path.append("..")
+from converter import DatasetConverter
 
 
 # Oxford PET has dataset quality issues:
@@ -45,7 +47,9 @@ class OxfordPetConverter(DatasetConverter):
         super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
         self._data_quality_issues = {}
 
-    def read_metadata(self, check_quality=False) -> pd.DataFrame:
+    def read_metadata(self,
+                      num_rows: int = 0,
+                      check_quality=False) -> pd.DataFrame:
         df = self._get_index("list")
         self._to_category(df)
         trainval = self._get_index("trainval")
@@ -58,13 +62,21 @@ class OxfordPetConverter(DatasetConverter):
         split.name = "split"
         split = split.reset_index()
         with_split = df.merge(split, how="left", on="filename")
+        if num_rows > 0:
+            by_split = with_split.groupby("split")
+            sizes = by_split.size()
+            rows = np.round(sizes / sizes.sum() * num_rows).astype(int).to_dict()
+            with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
+
         xml_files = (
             os.path.join(self.uri_root, "annotations", "xmls/")
             + with_split.filename
             + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
-        with_xmls = pd.concat([with_split, ann_df.drop(columns=["filename"])], axis=1)
+        with_xmls = pd.concat([with_split.reset_index(drop=True),
+                               ann_df.drop(columns=["filename"])],
+                              axis=1)
 
         if check_quality:
             trainval = df[df.split.isin(["train", "val"])]
@@ -82,14 +94,12 @@ class OxfordPetConverter(DatasetConverter):
         ).astype(pd.BooleanDtype())
 
         def _convert(obj_list):
+            # change list<struct> to struct<list>
             keys = ["name", "pose", "truncated", "occluded", "bndbox", "difficult"]
             defaults = ["", "", False, False, [], False]
             if isinstance(obj_list, list):
                 dd = {}
                 for obj in obj_list:
-                    box = obj['bndbox']
-                    obj['bndbox'] = [box['xmin'], box['ymin'],
-                                     box['xmax'], box['ymax']]
                     for k in keys:
                         dd.setdefault(k, []).append(obj[k])
                 return dd
@@ -97,44 +107,6 @@ class OxfordPetConverter(DatasetConverter):
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
         return with_xmls
-
-    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
-        """Convert each metdata column to pyarrow with lance types"""
-        schema = self.get_schema()
-        arrays = []
-        for name, col in df.items():
-            field = schema.field(name)
-            arr = self._convert_field(field.name, field.type, col)
-            arrays.append(arr)
-        table = pa.Table.from_arrays(arrays, schema=schema)
-        return table
-
-    def _convert_field(self, name, typ, col):
-        if isinstance(typ, pa.ExtensionType):
-            storage = pa.array(col, type=typ.storage_type)
-            arr = pa.ExtensionArray.from_storage(typ, storage)
-        elif pa.types.is_list(typ):
-            native_arr = pa.array(col)
-            offsets = native_arr.offsets
-            values = native_arr.values.to_numpy(zero_copy_only=False)
-            return pa.ListArray.from_arrays(
-                offsets, self._convert_field(f"{name}.elements", typ.value_type, values)
-            )
-        elif pa.types.is_struct(typ):
-            native_arr = pa.array(col)
-            arrays = []
-            for subfield in typ:
-                sub_arr = native_arr.field(subfield.name)
-                converted = self._convert_field(
-                    f"{name}.{subfield.name}",
-                    subfield.type,
-                    sub_arr.to_numpy(zero_copy_only=False),
-                )
-                arrays.append(converted)
-            return pa.StructArray.from_arrays(arrays, fields=typ)
-        else:
-            arr = pa.array(col, type=typ)
-        return arr
 
     def _get_index(self, name: str) -> pd.DataFrame:
         list_txt = os.path.join(self.uri_root, f"annotations/{name}.txt")
@@ -244,12 +216,8 @@ def _get_xml(uri: str):
                 obj["truncated"] = bool(int(obj["truncated"]))
                 obj["occluded"] = bool(int(obj["occluded"]))
                 obj["difficult"] = bool(int(obj["difficult"]))
-                obj["bndbox"] = {
-                    "xmin": int(obj["bndbox"]["xmin"]),
-                    "xmax": int(obj["bndbox"]["xmax"]),
-                    "ymin": int(obj["bndbox"]["ymin"]),
-                    "ymax": int(obj["bndbox"]["ymax"]),
-                }
+                obj["bndbox"] = [int(obj["bndbox"][pt])
+                                 for pt in ["xmin", "ymin", "xmax", "ymax"]]
             return dd
     except Exception:
         return {}

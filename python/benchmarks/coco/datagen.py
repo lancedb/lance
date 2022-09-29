@@ -6,14 +6,17 @@ import json
 import os
 import sys
 from collections import defaultdict
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+
+from lance.types import ImageType
 
 sys.path.append("..")
 
-import pandas as pd
-import pyarrow as pa
-from bench_utils import DatasetConverter
-
-from lance.types import ImageType
+from converter import DatasetConverter
 
 
 class CocoConverter(DatasetConverter):
@@ -63,7 +66,7 @@ class CocoConverter(DatasetConverter):
         # TODO join images_df.license to instances_json['license']
         return images_df.merge(anno_df, on="image_id")
 
-    def read_metadata(self) -> pd.DataFrame:
+    def read_metadata(self, num_rows: int = 0) -> pd.DataFrame:
         def read_split(split):
             json_data = self._get_instances_json(split)
             return self._instances_to_df(split, json_data)
@@ -71,9 +74,18 @@ class CocoConverter(DatasetConverter):
         splits = [read_split(split) for split in ["train", "val"]]
         test_images = self._get_test_images("test")
         splits.append(pd.DataFrame({"image_uri": test_images, "split": "test"}))
-        df = pd.concat(splits)
+        df = self._concat_frames(splits, num_rows)
         df["date_captured"] = pd.to_datetime(df.date_captured)
         return df
+
+    def _concat_frames(self,
+                       frames: Iterable[pd.DataFrame],
+                       num_rows: int) -> pd.DataFrame:
+        if num_rows > 0:
+            sizes = np.array([len(df) for df in frames])
+            rows = np.round(sizes / sizes.sum() * num_rows).astype(int)
+            return pd.concat([df.sample(n) for df, n in zip(frames, rows)])
+        return pd.concat(frames)
 
     def _get_test_images(self, dirname: str = "test"):
         uri = os.path.join(self.uri_root, f"{dirname}{self.version}")
@@ -82,44 +94,6 @@ class CocoConverter(DatasetConverter):
             os.path.join(uri, file.base_name)
             for file in fs.get_file_info(pa.fs.FileSelector(path, recursive=True))
         ]
-
-    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
-        """Convert each metdata column to pyarrow with lance types"""
-        schema = self.get_schema()
-        arrays = []
-        for name, col in df.items():
-            field = schema.field(name)
-            arr = self._convert_field(field.name, field.type, col)
-            arrays.append(arr)
-        table = pa.Table.from_arrays(arrays, schema=schema)
-        return table
-
-    def _convert_field(self, name, typ, col):
-        if isinstance(typ, pa.ExtensionType):
-            storage = pa.array(col, type=typ.storage_type)
-            arr = pa.ExtensionArray.from_storage(typ, storage)
-        elif pa.types.is_list(typ):
-            native_arr = pa.array(col)
-            offsets = native_arr.offsets
-            values = native_arr.values.to_numpy(zero_copy_only=False)
-            return pa.ListArray.from_arrays(
-                offsets, self._convert_field(f"{name}.elements", typ.value_type, values)
-            )
-        elif pa.types.is_struct(typ):
-            native_arr = pa.array(col)
-            arrays = []
-            for subfield in typ:
-                sub_arr = native_arr.field(subfield.name)
-                converted = self._convert_field(
-                    f"{name}.{subfield.name}",
-                    subfield.type,
-                    sub_arr.to_numpy(zero_copy_only=False),
-                )
-                arrays.append(converted)
-            return pa.StructArray.from_arrays(arrays, fields=typ)
-        else:
-            arr = pa.array(col, type=typ)
-        return arr
 
     def image_uris(self, table):
         return table["image_uri"].to_numpy()
@@ -179,8 +153,8 @@ class CocoConverter(DatasetConverter):
             pa.list_(pa.float32(), 4),
             pa.int16(),
             pa.int64(),
-            pa.string(),
-            pa.string()
+            pa.string(),  # TODO https://github.com/duckdb/duckdb/issues/4812
+            pa.string()  # TODO https://github.com/duckdb/duckdb/issues/4812
         ]
         schema = pa.struct(
             [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]

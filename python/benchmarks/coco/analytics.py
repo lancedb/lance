@@ -8,9 +8,11 @@ import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
+from lance.io import download_uris
+
 sys.path.append("..")
 
-from bench_utils import BenchmarkSuite, download_uris, get_dataset, get_uri
+from suite import BenchmarkSuite, get_dataset, get_uri
 from datagen import CocoConverter
 
 import lance
@@ -90,7 +92,7 @@ def _filter_data_lance(base_uri: str, klass="cat", offset=20, limit=50, flavor=N
         limit=50,
         offset=20,
     )
-    return scanner.to_table().to_pandas()
+    return scanner.to_table()
 
 
 def _filter_data_parquet(base_uri: str, klass="cat", offset=20, limit=50, flavor=None):
