@@ -6,19 +6,15 @@ See
 https://github.com/matthew-brett/delocate/blob/master/delocate/cmd/delocate_wheel.py
 """
 
+import glob
 import os
-import sys
+import shutil
 from argparse import ArgumentParser
 
-from delocate import delocate_wheel
-
-
-def lib_filter_func(name):
-    ignored_paths = ["/usr/lib", "/opt/homebrew", "/usr/local"]
-    for path in ignored_paths:
-        if name.startswith(path):
-            return False
-    return True
+from delocate import wheel_libs
+from delocate.delocating import filter_system_libs
+from delocate.tools import add_rpath, get_install_names, set_install_name
+from delocate.wheeltools import InWheelCtx
 
 
 def main():
@@ -35,14 +31,35 @@ def main():
             os.makedirs(out_dir, exist_ok=True)
             out_wheel = os.path.join(out_dir, os.path.basename(wheel))
 
-        copied = delocate_wheel(
-            wheel,
-            out_wheel,
-            lib_filt_func=lib_filter_func,
-            lib_sdir=".dylibs",
-            require_archs=args.require_archs,
-            executable_path=os.path.dirname(sys.executable),
-        )
+        lance_lib = [
+            p for p in wheel_libs(wheel, ignore_missing=True).keys() if "liblance." in p
+        ][0]
+
+        with InWheelCtx(wheel, out_wheel):
+            lance_dylib_path = None
+            lance_dylib_path = os.path.join("lance", os.path.basename(lance_lib))
+            shutil.copy(lance_lib, lance_dylib_path)
+
+            install_names = get_install_names(lance_dylib_path)
+            for name in install_names:
+                if filter_system_libs(name):
+                    if "protobuf" in name:
+                        shutil.copy(name, os.path.join("lance", os.path.basename(name)))
+                        set_install_name(
+                            lance_dylib_path,
+                            name,
+                            f"@loader_path/{os.path.basename(name)}",
+                        )
+                    else:
+                        set_install_name(
+                            lance_dylib_path, name, f"@rpath/{os.path.basename(name)}"
+                        )
+            add_rpath(lance_dylib_path, "@rpath/../pyarrow")
+
+            cython_so = glob.glob("lance/lib.cpython*.so")[0]
+            set_install_name(
+                cython_so, "@rpath/liblance.dylib", "@loader_path/liblance.dylib"
+            )
 
 
 if __name__ == "__main__":
