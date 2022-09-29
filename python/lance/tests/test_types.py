@@ -14,11 +14,9 @@
 
 import os
 import pickle
-import platform
 
 import numpy as np
 import pyarrow as pa
-import pytest
 
 import lance
 from lance.types import (
