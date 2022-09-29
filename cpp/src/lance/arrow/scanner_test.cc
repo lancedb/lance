@@ -216,7 +216,8 @@ TEST_CASE("Filter over empty list") {
 {"ints": 1, "floats": [0.1, 0.2]},
 {"ints": 2},
 {"ints": 3, "floats": [11.1]}
-])").ValueOrDie();
+])")
+               .ValueOrDie();
 
   auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
   auto scan_builder = dataset->NewScan().ValueOrDie();
@@ -239,7 +240,8 @@ TEST_CASE("Filter with limit") {
   auto t = TableFromJSON(schema, R"([
 {"ints": 1, "floats": [0.1, 0.2]},
 {"ints": 2, "floats": [11.1]}
-])").ValueOrDie();
+])")
+               .ValueOrDie();
 
   auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
@@ -258,8 +260,7 @@ TEST_CASE("Filter with limit") {
 TEST_CASE("Scanner projection should not include filter columns") {
   auto schema = ::arrow::schema(
       {::arrow::field("ints", ::arrow::int32(), false), ::arrow::field("strs", ::arrow::utf8())});
-  auto t = TableFromJSON(schema, R"([{"ints": 1, "strs": "one"}])")
-               .ValueOrDie();
+  auto t = TableFromJSON(schema, R"([{"ints": 1, "strs": "one"}])").ValueOrDie();
   auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
   CHECK(scan_builder
@@ -319,4 +320,26 @@ TEST_CASE("Test filter with smaller batch size than block size") {
   auto expected = ::arrow::Table::Make(::arrow::schema({::arrow::field("strs", ::arrow::utf8())}),
                                        {expected_arr});
   CHECK(actual->Equals(*expected));
+}
+
+// GH-204
+TEST_CASE("Test projection over nested field") {
+  auto schema =
+      ::arrow::schema({::arrow::field("id", ::arrow::int64()),
+                       ::arrow::field("annotations",
+                                      ::arrow::struct_({
+                                          ::arrow::field("name", ::arrow::list(::arrow::utf8())),
+                                          ::arrow::field("value", ::arrow::list(::arrow::int32())),
+                                      }))});
+  auto table =
+      TableFromJSON(schema, R"([{"id": 1, "annotations": {"name": ["a", "b"], "value": [1]}}])")
+          .ValueOrDie();
+  fmt::print("Table is: {}\n", table->ToString());
+
+  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto scan_builder = lance::arrow::ScannerBuilder(dataset);
+  CHECK(scan_builder.Project({"annotations.name"}).ok());
+  auto scanner = scan_builder.Finish().ValueOrDie();
+  auto actual = scanner->ToTable().ValueOrDie();
+  fmt::print("Actual talbe: {}\n", actual->ToString());
 }
