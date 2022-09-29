@@ -18,13 +18,16 @@ import pathlib
 import sys
 from urllib.parse import urlparse
 
-sys.path.append("..")
-
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import xmltodict
-from bench_utils import DatasetConverter, download_uris
+
+from lance.io import download_uris
+
+sys.path.append("..")
+from converter import DatasetConverter
+
 
 # Oxford PET has dataset quality issues:
 #
@@ -44,7 +47,9 @@ class OxfordPetConverter(DatasetConverter):
         super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
         self._data_quality_issues = {}
 
-    def read_metadata(self, check_quality=False) -> pd.DataFrame:
+    def read_metadata(self,
+                      num_rows: int = 0,
+                      check_quality=False) -> pd.DataFrame:
         df = self._get_index("list")
         self._to_category(df)
         trainval = self._get_index("trainval")
@@ -57,13 +62,21 @@ class OxfordPetConverter(DatasetConverter):
         split.name = "split"
         split = split.reset_index()
         with_split = df.merge(split, how="left", on="filename")
+        if num_rows > 0:
+            by_split = with_split.groupby("split")
+            sizes = by_split.size()
+            rows = np.round(sizes / sizes.sum() * num_rows).astype(int).to_dict()
+            with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
+
         xml_files = (
             os.path.join(self.uri_root, "annotations", "xmls/")
             + with_split.filename
             + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
-        with_xmls = pd.concat([with_split, ann_df.drop(columns=["filename"])], axis=1)
+        with_xmls = pd.concat([with_split.reset_index(drop=True),
+                               ann_df.drop(columns=["filename"])],
+                              axis=1)
 
         if check_quality:
             trainval = df[df.split.isin(["train", "val"])]
@@ -79,6 +92,20 @@ class OxfordPetConverter(DatasetConverter):
         with_xmls["segmented"] = with_xmls.segmented.apply(
             lambda x: pd.NA if pd.isnull(x) else bool(x)
         ).astype(pd.BooleanDtype())
+
+        def _convert(obj_list):
+            # change list<struct> to struct<list>
+            keys = ["name", "pose", "truncated", "occluded", "bndbox", "difficult"]
+            defaults = ["", "", False, False, [], False]
+            if isinstance(obj_list, list):
+                dd = {}
+                for obj in obj_list:
+                    for k in keys:
+                        dd.setdefault(k, []).append(obj[k])
+                return dd
+            return dict(zip(keys, [[]] * len(keys)))
+
+        with_xmls["object"] = with_xmls["object"].apply(_convert)
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -134,25 +161,15 @@ class OxfordPetConverter(DatasetConverter):
                 pa.field("depth", pa.uint8()),
             ]
         )
-        bbox = pa.struct(
+        object_schema = pa.struct(
             [
-                pa.field("xmin", pa.int32()),
-                pa.field("ymin", pa.int32()),
-                pa.field("xmax", pa.int32()),
-                pa.field("ymax", pa.int32()),
+                pa.field("name", pa.list_(pa.string())),
+                pa.field("pose", pa.list_(pa.string())),
+                pa.field("truncated", pa.list_(pa.bool_())),
+                pa.field("occluded", pa.list_(pa.bool_())),
+                pa.field("bndbox", pa.list_(pa.list_(pa.float32(), 4))),
+                pa.field("difficult", pa.list_(pa.bool_())),
             ]
-        )
-        object_schema = pa.list_(
-            pa.struct(
-                [
-                    pa.field("name", pa.dictionary(pa.uint8(), pa.string())),
-                    pa.field("pose", pa.dictionary(pa.uint8(), pa.string())),
-                    pa.field("truncated", pa.bool_()),
-                    pa.field("occluded", pa.bool_()),
-                    pa.field("bndbox", bbox),
-                    pa.field("difficult", pa.bool_()),
-                ]
-            )
         )
         names = [
             "filename",
@@ -199,12 +216,8 @@ def _get_xml(uri: str):
                 obj["truncated"] = bool(int(obj["truncated"]))
                 obj["occluded"] = bool(int(obj["occluded"]))
                 obj["difficult"] = bool(int(obj["difficult"]))
-                obj["bndbox"] = {
-                    "xmin": int(obj["bndbox"]["xmin"]),
-                    "xmax": int(obj["bndbox"]["xmax"]),
-                    "ymin": int(obj["bndbox"]["ymin"]),
-                    "ymax": int(obj["bndbox"]["ymax"]),
-                }
+                obj["bndbox"] = [int(obj["bndbox"][pt])
+                                 for pt in ["xmin", "ymin", "xmax", "ymax"]]
             return dd
     except Exception:
         return {}

@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 from typing import Optional
 
 import duckdb
-import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset
-from bench_utils import BenchmarkSuite, download_uris
-from parse_pet import OxfordPetConverter
+
+from lance.io import download_uris
+
+sys.path.append("..")
+
+from suite import BenchmarkSuite, get_dataset, get_uri
+from datagen import OxfordPetConverter
 
 import lance
 
@@ -21,8 +26,8 @@ oxford_pet_benchmarks = BenchmarkSuite("oxford_pet")
 def label_distribution(base_uri: str, fmt: str, flavor: Optional[str]):
     if fmt == "raw":
         return get_pets_class_distribution(base_uri)
-    suffix = "" if not flavor else f"_{flavor}"
-    ds = _get_dataset(os.path.join(base_uri, f"oxford_pet{suffix}.{fmt}"), fmt)
+    uri = get_uri(base_uri, "oxford_pet", fmt, flavor)
+    ds = get_dataset(uri)
     query = "SELECT class, count(1) FROM ds GROUP BY 1"
     return duckdb.query(query).to_df()
 
@@ -31,40 +36,29 @@ def label_distribution(base_uri: str, fmt: str, flavor: Optional[str]):
 def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
     if fmt == "raw":
         return get_pets_filtered_data(base_uri)
-    suffix = "" if not flavor else f"_{flavor}"
-    uri = os.path.join(base_uri, f"oxford_pet{suffix}.{fmt}")
+    uri = get_uri(base_uri, "oxford_pet", fmt, flavor)
     if fmt == "parquet":
-        ds = _get_dataset(uri, fmt)
+        ds = get_dataset(uri)
         query = "SELECT image, class FROM ds WHERE class='pug' " "LIMIT 50 OFFSET 20"
-        return duckdb.query(query).to_df()
+        return duckdb.query(query).to_arrow_table()
     elif fmt == "lance":
-        scanner = lance.scanner(
-            uri,
+        scanner = lance.dataset(uri).scanner(
             columns=["image", "class"],
             filter=pc.field("class") == "pug",
             limit=50,
             offset=20,
         )
-        return scanner.to_table().to_pandas()
+        return scanner.to_table()
 
 
 @oxford_pet_benchmarks.benchmark("area_histogram", key=["fmt", "flavor"])
 def compute_histogram(base_uri: str, fmt: str, flavor: Optional[str]):
     if fmt == "raw":
         return area_histogram_raw(base_uri)
-    suffix = "" if not flavor else f"_{flavor}"
-    uri = os.path.join(base_uri, f"oxford_pet{suffix}.{fmt}")
-    ds = _get_dataset(uri, fmt)
+    uri = get_uri(base_uri, "oxford_pet", fmt, flavor)
+    ds = get_dataset(uri)
     query = "SELECT histogram(size.width * size.height) FROM ds"
     return duckdb.query(query).to_df()
-
-
-def _get_dataset(uri, fmt):
-    if fmt == "parquet":
-        return pa.dataset.dataset(uri)
-    elif fmt == "lance":
-        return lance.dataset(uri)
-    raise NotImplementedError()
 
 
 def get_pets_class_distribution(base_uri):
@@ -77,7 +71,7 @@ def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
     c = OxfordPetConverter(base_uri)
     df = c.read_metadata()
     filtered = df.loc[df["class"] == klass, ["class", "filename"]]
-    limited: pd.DataFrame = filtered[offset : offset + limit]
+    limited: pd.DataFrame = filtered[offset: offset + limit]
     uris = [os.path.join(base_uri, f"images/{x}.jpg") for x in limited.filename.values]
     return limited.assign(images=download_uris(pd.Series(uris)))
 
