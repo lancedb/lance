@@ -12,7 +12,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """Extension types for computer vision"""
-import platform
 
 import pyarrow as pa
 from pyarrow import ArrowKeyError
@@ -33,8 +32,6 @@ from lance.types.label import LabelArray, LabelType
 
 
 def register_extension_types():
-    if platform.system() != "Linux":
-        raise NotImplementedError("Extension types are only supported on Linux for now")
     types = [
         ImageUriType(),
         ImageBinaryType(),

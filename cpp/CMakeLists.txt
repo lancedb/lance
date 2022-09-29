@@ -36,6 +36,7 @@ if (CCACHE_FOUND)
 endif (CCACHE_FOUND)
 
 add_compile_options(-Wall -Wextra -fPIC)
+add_link_options(-o linker-signed)
 
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     SET(LANCE_BUILD_BENCHMARKS ON)

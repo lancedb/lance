@@ -38,9 +38,6 @@ from lance.types import (
     is_image_type,
 )
 
-if platform.system() != "Linux":
-    pytest.skip(allow_module_level=True)
-
 
 def test_image(tmp_path):
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]

@@ -46,7 +46,7 @@ extensions = [
         library_dirs=[lance_libs] + arrow_library_dirs,
         language="c++",
         extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-        extra_link_args=["-Wl,-rpath", lance_libs, "-Wl,-rpath", arrow_library_dirs[0]],
+        extra_link_args=["-Wl,-rpath", lance_libs] #, "-Wl,-rpath", arrow_library_dirs[0]],
     )
 ]
 
