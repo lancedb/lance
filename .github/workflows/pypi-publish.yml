@@ -1,20 +1,8 @@
 name: Build and upload python wheels
 
 on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Just print the twine command'
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
-      ref:
-        description: 'Which release tag?'
-        required: true
-        type: string
+  release:
+    types: [published]
 
 jobs:
   linux:
@@ -26,7 +14,6 @@ jobs:
     steps:
     - uses: actions/checkout@v3
       with:
-        ref: ${{ inputs.ref }}
         fetch-depth: 0
         lfs: true
     - name: Set up Python
@@ -44,6 +31,9 @@ jobs:
   mac:
     timeout-minutes: 30
     runs-on: "macos-12"
+    strategy:
+      matrix:
+        python-minor-version: ["8", "9", "10"]
     steps:
     - uses: actions/checkout@v3
       with:
@@ -53,12 +43,12 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.10"
+        python-version: 3.${{ matrix.python-minor-version }}
     - uses: ./.github/workflows/build_mac_wheel
       with:
-        python-minor-version: "10"
+        python-minor-version: ${{ matrix.python-minor-version }}
     - uses: ./.github/workflows/upload_wheel
       with:
-        python-minor-version: "10"
+        python-minor-version: ${{ matrix.python-minor-version }}
         token: ${{ secrets.PYPI_TOKEN }}
         repo: "pypi"
