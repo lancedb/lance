@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import platform
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -24,14 +23,12 @@ from . import version
 
 __version__ = version.__version__
 
-from lance.lib import BuildScanner, LanceFileFormat, WriteTable, _wrap_dataset
+from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset
 from lance.types import register_extension_types
 
-if platform.system() == "Linux":
-    # TODO enable on MacOS
-    register_extension_types()
-
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
+
+register_extension_types()
 
 
 def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:

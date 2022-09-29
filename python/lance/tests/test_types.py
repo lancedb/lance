@@ -14,11 +14,9 @@
 
 import os
 import pickle
-import platform
 
 import numpy as np
 import pyarrow as pa
-import pytest
 
 import lance
 from lance.types import (
@@ -37,9 +35,6 @@ from lance.types import (
     Point3dType,
     is_image_type,
 )
-
-if platform.system() != "Linux":
-    pytest.skip(allow_module_level=True)
 
 
 def test_image(tmp_path):
