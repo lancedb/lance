@@ -54,4 +54,4 @@ jobs:
     - name: Run test
       working-directory: python/benchmarks/functions
       run: |
-        ./functions.py 100
+        ./functions.py -n 100
