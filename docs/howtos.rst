@@ -1,5 +1,9 @@
-How To
-=========
+How-To Guides
+=============
+
+.. toctree::
+   :maxdepth: 3
+
 
 Label Analyze
 -------------
@@ -57,7 +61,7 @@ Calculate label distribution
 .. testcode::
 
     duckdb.query(
-        "SELECT count(1), class FROM dataset GROUP BY 2 ORDER BY class")
+        "SELECT count(1) as cnt, class FROM dataset GROUP BY 2 ORDER BY class")
 
 
 Calculate Label Distribution among splits
@@ -65,9 +69,29 @@ Calculate Label Distribution among splits
 
 .. testcode::
 
-    duckdb.query("""
+    print(duckdb.query("""
         SELECT
             count(1) as cnt, class, split
         FROM dataset
-        GROUP BY 3, 2 ORDER BY class
-    """)
+        GROUP BY 3, 2 ORDER BY class, split
+    """).to_df())
+
+
+.. testoutput::
+    :options: +NORMALIZE_WHITESPACE
+
+         cnt              class  split
+    0     98         Abyssinian   test
+    1     50         Abyssinian  train
+    2     50         Abyssinian    val
+    3    100             Bengal   test
+    4     50             Bengal  train
+    ..   ...                ...    ...
+    106   50    wheaten_terrier  train
+    107   50    wheaten_terrier    val
+    108  100  yorkshire_terrier   test
+    109   50  yorkshire_terrier  train
+    110   50  yorkshire_terrier    val
+
+    [111 rows x 3 columns]
+
