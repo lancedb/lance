@@ -1,16 +1,8 @@
 name: Create .dev0 version
 
 on:
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Just create the local commit/tags but do not push it'
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
+  release:
+    types: [published]
 
 jobs:
   bump-version:
@@ -38,7 +30,6 @@ jobs:
         cat lance/version.py
         git tag | cat
     - name: Push new version and tag
-      if: ${{ inputs.dry_run }} == "false"
       uses: changhiskhan/github-push-action@master
       with:
         github_token: ${{ secrets.RELEASE_TOKEN }}
