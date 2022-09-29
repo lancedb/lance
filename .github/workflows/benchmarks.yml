@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - gha
 
 jobs:
   dataset:
@@ -28,11 +29,11 @@ jobs:
       working-directory: python
       run: |
         pip3 install $(ls wheels/pylance-*-cp310*.whl)[test]
-        pip3 install xmltodict pycocotools
+        pip3 install xmltodict pycocotools fsspec s3fs
     - name: Run test
       working-directory: python/benchmarks
       run: |
-        ./test_dataset.sh ${{ matrix.dataset }} 20
+        ./test_dataset.sh ${{ matrix.dataset }} 40
   functions:
     timeout-minutes: 30
     runs-on: "ubuntu-22.04"
