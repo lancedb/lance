@@ -28,6 +28,7 @@ jobs:
       working-directory: python
       run: |
         pip3 install $(ls wheels/pylance-*-cp310*.whl)[test]
+        pip3 install xmltodict pycocotools
     - name: Run test
       working-directory: python/benchmarks
       run: |
@@ -51,7 +52,6 @@ jobs:
       working-directory: python
       run: |
         pip3 install $(ls wheels/pylance-*-cp310*.whl)[test]
-        pip3 install xmltodict pycocotools
     - name: Run test
       working-directory: python/benchmarks/functions
       run: |
