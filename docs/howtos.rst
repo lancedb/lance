@@ -1,4 +1,4 @@
-Cookbooks
+How To
 =========
 
 Label Analyze
@@ -15,7 +15,6 @@ as example, to explore and understand the dataset using `Lance` and `DuckDB <htt
 
     dataset = lance.dataset(
         "s3://eto-public/datasets/oxford_pet/oxford_pet.lance",
-        partitioning=pa.dataset.partitioning(field_names=["split"])
     )
 
 Take a look of the dataset schema to understand what data we have.
@@ -24,9 +23,10 @@ Take a look of the dataset schema to understand what data we have.
 
     >>> dataset.schema
     filename: string
-    class: dictionary<values=string, indices=uint8, ordered=0>
-    species: dictionary<values=string, indices=uint8, ordered=0>
+    class: dictionary<values=string, indices=int8, ordered=0>
+    species: dictionary<values=string, indices=int8, ordered=0>
     breed: int16
+    split: dictionary<values=string, indices=int8, ordered=0>
     folder: string
     source: struct<database: string, annotation: string, image: string>
       child 0, database: string
@@ -50,9 +50,9 @@ Take a look of the dataset schema to understand what data we have.
               child 3, ymax: int32
           child 5, difficult: bool
     image: binary
-    split: string
 
-Calculate label distribution.
+Calculate label distribution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. testcode::
 
@@ -60,17 +60,14 @@ Calculate label distribution.
         "SELECT count(1), class FROM dataset GROUP BY 2 ORDER BY class")
 
 
-Calculate Label Distribution among splits.
+Calculate Label Distribution among splits
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. testcode::
 
-    print(duckdb.query("""
+    duckdb.query("""
         SELECT
             count(1) as cnt, class, split
         FROM dataset
         GROUP BY 3, 2 ORDER BY class
-    """).df())
-
-.. testoutput::
-
-    123
+    """)
