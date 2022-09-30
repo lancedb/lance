@@ -361,7 +361,8 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
 }
 
 std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arrow_field) const {
-  assert(name_ == arrow_field->name());
+//  assert(name_ == arrow_field->name());
+  fmt::print("Field::Project: self={} arrow={}\n", name_, arrow_field->name());
   auto new_field = Copy();
   auto dtype = arrow_field->type();
   if (::lance::arrow::is_extension(dtype)) {

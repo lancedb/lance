@@ -70,6 +70,9 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::ReadBatch() const {
   ARROW_ASSIGN_OR_RAISE(auto batch, project_->Next());
+  if (batch.batch) {
+    fmt::print("RecordBatchReader::ReadBatch: batch={}\n", batch.batch->ToString());
+  }
   return batch.batch;
 }
 

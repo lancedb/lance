@@ -340,6 +340,13 @@ TEST_CASE("Test projection over nested field") {
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
   CHECK(scan_builder.Project({"annotations.name"}).ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
-  auto actual = scanner->ToTable().ValueOrDie();
-  fmt::print("Actual talbe: {}\n", actual->ToString());
+  auto result = scanner->ToTable();
+  CHECK(result.ok());
+  auto actual = result.ValueOrDie();
+  auto expected_schema = ::arrow::schema({::arrow::field(
+      "annotations", ::arrow::struct_({::arrow::field("name", ::arrow::list(::arrow::utf8()))}))});
+  CHECK(actual->schema()->Equals(expected_schema));
+  auto expected_table =
+      TableFromJSON(expected_schema, R"([{"annotations": {"name": ["a", "b"]}}])").ValueOrDie();
+  CHECK(actual->Equals(*expected_table));
 }
