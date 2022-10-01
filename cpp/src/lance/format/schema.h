@@ -68,6 +68,12 @@ class Schema final {
   /// \return the projected schema. Or nullptr if the expression does not contain any field.
   ::arrow::Result<std::shared_ptr<Schema>> Project(const ::arrow::compute::Expression& expr) const;
 
+  /// Merge this Schema with another Schema, and returns the new Schema.
+  ///
+  /// \param other the schema to be merged with.
+  /// \return A new schema with the fields from both inputs.
+  ::arrow::Result<std::shared_ptr<Schema>> Merge(const Schema& other);
+
   /// Exclude (subtract) the fields from the given schema.
   ///
   /// \param other the schema to be excluded. It must to be a strict subset of this schema.
@@ -179,6 +185,18 @@ class Field final {
 
   /// Returns the direct child with the name. Returns nullptr if such field does not exist.
   std::shared_ptr<Field> Get(const std::string_view& name) const;
+
+  /// Merge the field with another and returns the new copy of the merged field.
+  ///
+  /// The two fields must:
+  ///  - have the same name
+  ///  - are the same data structure, i.e., struct or list.
+  ///
+  /// \param other The other field to merged from.
+  /// \return a newly merged Field if success.
+  /// \param other
+  /// \return
+  ::arrow::Result<std::shared_ptr<Field>> Merge(const Field& other) const;
 
   /// Check if two fields are equal.
   ///

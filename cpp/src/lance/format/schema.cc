@@ -382,6 +382,50 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   return new_field;
 }
 
+::arrow::Result<std::shared_ptr<Field>> Field::Merge(const Field& other) const {
+  if (name_ != other.name_) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Field::merge: attempt to merge two fields with different names: {} != {}",
+                    name_,
+                    other.name_));
+  };
+  if (logical_type_ != other.logical_type_) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Field::merge: attempt to merge two fields with different type: {} != {}",
+                    logical_type_,
+                    other.logical_type_));
+  }
+  auto field = Copy();
+  auto dtype = type();
+
+  assert(dtype->Equals(other.type()));
+
+  if (arrow::is_struct(dtype->id())) {
+    for (auto& child : children_) {
+      auto other_child = other.Get(child->name_);
+      if (other_child) {
+        // Both sides have the field, let's merge them.
+        ARROW_ASSIGN_OR_RAISE(auto merged, child->Merge(other));
+        field->AddChild(merged);
+      } else {
+        // Only I have the field.
+        field->AddChild(child->Copy(true));
+      }
+    }
+    for (auto& child : other.children_) {
+      if (Get(child->name_) == nullptr) {
+        // Have not seen this child before
+        field->AddChild(child->Copy(true));
+      }
+    }
+  } else if (::arrow::is_list_like(dtype->id())) {
+    // list.item.Merge(OtherList.item)
+    ARROW_ASSIGN_OR_RAISE(auto item, children_[0]->Merge(*other.children_[0]));
+    field->AddChild(item);
+  }
+  return field;
+}
+
 bool Field::Equals(const Field& other, bool check_id) const {
   if (check_id && (id_ != other.id_ || parent_ != other.parent_)) {
     return false;
@@ -514,6 +558,20 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
     columns.emplace_back(std::string(*ref.name()));
   }
   return Project(columns);
+}
+
+::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const Schema& other) {
+  auto schema = Copy();
+  for (auto& field : other.fields()) {
+    auto existed_field = schema->GetField(field->name_);
+    if (existed_field) {
+      ARROW_ASSIGN_OR_RAISE(auto merged, existed_field->Merge(*field));
+      schema->AddField(merged);
+    } else {
+      schema->AddField(existed_field->Copy(true));
+    }
+  }
+  return schema;
 }
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(const Schema& other) const {
