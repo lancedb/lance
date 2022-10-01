@@ -391,7 +391,7 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   };
   if (logical_type_ != other.logical_type_) {
     return ::arrow::Status::Invalid(
-        fmt::format("Field::merge: attempt to merge two fields with different type: {} != {}",
+        fmt::format("Field::merge: attempt to merge two fields with different types: {} != {}",
                     logical_type_,
                     other.logical_type_));
   }
