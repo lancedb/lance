@@ -398,8 +398,6 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   auto field = Copy();
   auto dtype = type();
 
-  assert(dtype->Equals(other.type()));
-
   if (arrow::is_struct(dtype->id())) {
     for (auto& child : children_) {
       auto other_child = other.Get(child->name_);
@@ -561,14 +559,19 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
 }
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const Schema& other) const {
-  auto schema = Copy();
-  for (auto& field : other.fields()) {
-    auto existed_field = schema->GetField(field->name_);
-    if (existed_field) {
-      ARROW_ASSIGN_OR_RAISE(auto merged, existed_field->Merge(*field));
+  auto schema = std::make_shared<Schema>();
+  for (auto& field : fields()) {
+    auto existing_field = other.GetField(field->name_);
+    if (existing_field) {
+      ARROW_ASSIGN_OR_RAISE(auto merged, field->Merge(*existing_field));
       schema->AddField(merged);
     } else {
       schema->AddField(field->Copy(true));
+    }
+  }
+  for (auto& other_field : other.fields()) {
+    if (schema->GetField(other_field->name_) == nullptr) {
+      schema->AddField(other_field->Copy(true));
     }
   }
   return schema;

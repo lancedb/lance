@@ -191,7 +191,7 @@ void CheckMergeSchema(const std::shared_ptr<::arrow::Schema>& left,
   lance::format::Schema left_schema(left);
   lance::format::Schema right_schema(right);
   auto merged = left_schema.Merge(right_schema).ValueOrDie();
-  INFO("Merged schema: " << merged->ToArrow() << " Expected: " << expected->ToString());
+  INFO("Merged schema: " << merged->ToArrow()->ToString() << " Expected: " << expected->ToString());
   CHECK(merged->ToArrow()->Equals(expected));
 }
 
@@ -201,4 +201,19 @@ TEST_CASE("Test merge schema") {
                    ::arrow::schema({::arrow::field("b", ::arrow::utf8())}),
                    ::arrow::schema({::arrow::field("a", ::arrow::int32()),
                                     {::arrow::field("b", ::arrow::utf8())}}));
+
+  // CHeck two struct fields "s: struct<foo:float32>" and "s: struct<bar:int64>".
+  CheckMergeSchema(::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("foo", ::arrow::float32()),
+                                                   }))}),
+                   ::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("bar", ::arrow::int64()),
+                                                   }))}),
+                   ::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("foo", ::arrow::float32()),
+                                                       ::arrow::field("bar", ::arrow::int64()),
+                                                   }))}));
 }
