@@ -193,8 +193,6 @@ class Field final {
   ///
   /// \param other The other field to merged from.
   /// \return a newly merged Field if success.
-  /// \param other
-  /// \return
   ::arrow::Result<std::shared_ptr<Field>> Merge(const Field& other) const;
 
   /// Check if two fields are equal.
