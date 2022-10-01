@@ -216,4 +216,15 @@ TEST_CASE("Test merge schema") {
                                                        ::arrow::field("foo", ::arrow::float32()),
                                                        ::arrow::field("bar", ::arrow::int64()),
                                                    }))}));
+
+  // Check "s: list<struct<foo:int32>>" and "s: list<struct<bar:string>>"
+  CheckMergeSchema(
+      ::arrow::schema({::arrow::field(
+          "s", ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32())})))}),
+      ::arrow::schema({::arrow::field(
+          "s", ::arrow::list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}),
+      ::arrow::schema({::arrow::field(
+          "s",
+          ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
+                                          ::arrow::field("bar", ::arrow::utf8())})))}));
 }
