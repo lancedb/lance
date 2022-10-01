@@ -469,7 +469,7 @@ Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Fie
   }
 }
 
-Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
+Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   for (auto f : schema->fields()) {
     fields_.emplace_back(make_shared<Field>(f));
   }
@@ -560,7 +560,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   return Project(columns);
 }
 
-::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const Schema& other) {
+::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const Schema& other) const {
   auto schema = Copy();
   for (auto& field : other.fields()) {
     auto existed_field = schema->GetField(field->name_);
@@ -568,7 +568,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
       ARROW_ASSIGN_OR_RAISE(auto merged, existed_field->Merge(*field));
       schema->AddField(merged);
     } else {
-      schema->AddField(existed_field->Copy(true));
+      schema->AddField(field->Copy(true));
     }
   }
   return schema;

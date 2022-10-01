@@ -184,3 +184,21 @@ TEST_CASE("Test nested storage type") {
                      })),
   })));
 }
+
+void CheckMergeSchema(const std::shared_ptr<::arrow::Schema>& left,
+                      const std::shared_ptr<::arrow::Schema>& right,
+                      const std::shared_ptr<::arrow::Schema>& expected) {
+  lance::format::Schema left_schema(left);
+  lance::format::Schema right_schema(right);
+  auto merged = left_schema.Merge(right_schema).ValueOrDie();
+  INFO("Merged schema: " << merged->ToArrow() << " Expected: " << expected->ToString());
+  CHECK(merged->ToArrow()->Equals(expected));
+}
+
+TEST_CASE("Test merge schema") {
+  // Merge two primitive fields.
+  CheckMergeSchema(::arrow::schema({::arrow::field("a", ::arrow::int32())}),
+                   ::arrow::schema({::arrow::field("b", ::arrow::utf8())}),
+                   ::arrow::schema({::arrow::field("a", ::arrow::int32()),
+                                    {::arrow::field("b", ::arrow::utf8())}}));
+}

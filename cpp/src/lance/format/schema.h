@@ -37,9 +37,8 @@ class Schema final {
  public:
   Schema() = default;
 
-  /// Build the Schema from Arrow.
-  /// TODO: Should we make it factory method so that it can return Result<>?
-  Schema(std::shared_ptr<::arrow::Schema> schema);
+  /// Construct Lance Schema from Arrow Schema.
+  Schema(const std::shared_ptr<::arrow::Schema>& schema);
 
   Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields);
 
@@ -72,7 +71,7 @@ class Schema final {
   ///
   /// \param other the schema to be merged with.
   /// \return A new schema with the fields from both inputs.
-  ::arrow::Result<std::shared_ptr<Schema>> Merge(const Schema& other);
+  ::arrow::Result<std::shared_ptr<Schema>> Merge(const Schema& other) const;
 
   /// Exclude (subtract) the fields from the given schema.
   ///
