@@ -149,7 +149,12 @@ template <HasFields T>
     ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(*left_struct, *right_struct));
     return ::arrow::field(name, ::arrow::struct_(merged_fields));
   } else if (::arrow::is_list_like(left_type->id()) && ::arrow::is_list_like(right_type->id())) {
-    // Merge two var-length list
+    // Merge two var-length lists
+    auto left_list = std::dynamic_pointer_cast<::arrow::ListType>(left_type);
+    auto right_list = std::dynamic_pointer_cast<::arrow::ListType>(right_type);
+    ARROW_ASSIGN_OR_RAISE(auto merged_field,
+                          MergeField(*left_list->value_field(), *right_list->value_field()));
+    return ::arrow::field(name, ::arrow::list(merged_field->type()));
   }
   return lhs.Copy();
 }
