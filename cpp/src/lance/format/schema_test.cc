@@ -228,3 +228,11 @@ TEST_CASE("Test merge schema") {
           ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
                                           ::arrow::field("bar", ::arrow::utf8())})))}));
 }
+
+//TEST_CASE("Merge two different fixed size list") {
+//  auto list_schema1 =
+//      ::arrow::schema({::arrow::field("list", ::arrow::fixed_size_list(::arrow::int32(), 4))});
+//  auto list_schema2 =
+//      ::arrow::schema({::arrow::field("list", ::arrow::fixed_size_list(::arrow::int32(), 2))});
+////  auto result =
+//}

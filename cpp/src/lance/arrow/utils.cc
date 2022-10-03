@@ -15,6 +15,7 @@
 #include "lance/arrow/utils.h"
 
 #include <arrow/result.h>
+#include <arrow/type_traits.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -102,6 +103,57 @@ namespace lance::arrow {
     arrays.emplace_back(rhs->GetFieldByName(name));
   }
   return ::arrow::StructArray::Make(arrays, names);
+}
+
+template <typename T>
+concept HasFields = (std::same_as<T, ::arrow::Schema> || std::same_as<T, ::arrow::StructType>);
+
+template <HasFields T>
+::arrow::Result<std::vector<std::shared_ptr<::arrow::Field>>> MergeFieldWithChildren(const T& lhs,
+                                                                                     const T& rhs) {
+  std::vector<std::shared_ptr<::arrow::Field>> fields;
+  for (const auto& field : lhs.fields()) {
+    auto right_field = rhs.GetFieldByName(field->name());
+    if (!right_field) {
+      fields.emplace_back(field);
+    } else {
+    }
+  }
+  return fields;
+};
+
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeField(const ::arrow::Field& lhs,
+                                                            const ::arrow::Field& rhs) {
+  if (lhs.name() != rhs.name()) {
+    return ::arrow::Status::Invalid(fmt::format(
+        "Attempt to merge fields with different names: {} != {}", lhs.name(), rhs.name()));
+  }
+  const auto& name = lhs.name();
+  auto left_type = lhs.type();
+  auto right_type = rhs.type();
+  if (is_struct(left_type->id()) && is_struct(right_type->id())) {
+    // Merge two structs
+    auto left_struct = std::dynamic_pointer_cast<::arrow::StructType>(left_type);
+    auto right_struct = std::dynamic_pointer_cast<::arrow::StructType>(right_type);
+    ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(*left_struct, *right_struct));
+    return ::arrow::field(name, ::arrow::struct_(merged_fields));
+  } else if (::arrow::is_list_like(left_type->id()) && ::arrow::is_list_like(right_type->id())) {
+    // Merge two var-length list
+  }
+  return std::make_shared<::arrow::Field>(lhs);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Schema>> MergeSchema(const ::arrow::Schema& lhs,
+                                                              const ::arrow::Schema& rhs) {
+  std::vector<std::shared_ptr<::arrow::Field>> fields;
+  for (const auto& field : lhs.fields()) {
+    auto right_field = rhs.GetFieldByName(field->name());
+    if (!right_field) {
+      fields.emplace_back(field);
+    } else {
+    }
+  }
+  return ::arrow::schema(fields);
 }
 
 }  // namespace lance::arrow
