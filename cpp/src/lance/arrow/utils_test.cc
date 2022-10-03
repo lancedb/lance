@@ -22,7 +22,9 @@
 
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
+#include "lance/testing/extension_types.h"
 
+using lance::arrow::MergeSchema;
 using lance::arrow::ToArray;
 
 TEST_CASE("Merge simple structs") {
@@ -94,4 +96,114 @@ TEST_CASE("Merge nested structs") {
 
   INFO("Actual data: " << points->ToString() << " Expected: " << expected_arr->ToString());
   CHECK(points->Equals(expected_arr));
+}
+
+TEST_CASE("Test merge schema") {
+  // Merge two primitive fields.
+  auto merged = MergeSchema(*::arrow::schema({::arrow::field("a", ::arrow::int32())}),
+                            *::arrow::schema({::arrow::field("b", ::arrow::utf8())}))
+                    .ValueOrDie();
+  INFO("Merged schema: " << merged->ToString());
+  CHECK(merged->Equals(::arrow::schema(
+      {::arrow::field("a", ::arrow::int32()), {::arrow::field("b", ::arrow::utf8())}})));
+
+  // Merge primitive fields with the same name, but different type.
+  auto result = MergeSchema(*::arrow::schema({::arrow::field("a", ::arrow::int32())}),
+                            *::arrow::schema({::arrow::field("a", ::arrow::utf8())}));
+  CHECK(result.status().IsInvalid());
+
+  // Merge struct<foo:float32> and struct<bar:int64>
+  merged =
+      MergeSchema(*::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("foo", ::arrow::float32()),
+                                                   }))}),
+                  *::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("bar", ::arrow::int64()),
+                                                   }))}))
+          .ValueOrDie();
+  CHECK(
+      merged->Equals(::arrow::schema({::arrow::field("s",
+                                                     ::arrow::struct_({
+                                                         ::arrow::field("foo", ::arrow::float32()),
+                                                         ::arrow::field("bar", ::arrow::int64()),
+                                                     }))})));
+}
+
+TEST_CASE("Test merge two lists") {
+  // Check "s: list<struct<foo:int32>>" and "s: list<struct<bar:string>>"
+  auto merged =
+      MergeSchema(
+          *::arrow::schema({::arrow::field(
+              "s", ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32())})))}),
+          *::arrow::schema({::arrow::field(
+              "s", ::arrow::list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}))
+          .ValueOrDie();
+  auto expected = ::arrow::schema(
+      {::arrow::field("s",
+                      ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
+                                                      ::arrow::field("bar", ::arrow::utf8())})))});
+  INFO("Expected schema: " << expected->ToString() << "\nGot: " << merged->ToString());
+  CHECK(merged->Equals(expected));
+
+  // Check "s: large_list<struct<foo:int32>>" and "s: large_list<struct<bar:string>>"
+  merged =
+      MergeSchema(
+          *::arrow::schema({::arrow::field(
+              "s",
+              ::arrow::large_list(::arrow::struct_({::arrow::field("foo", ::arrow::int32())})))}),
+          *::arrow::schema({::arrow::field(
+              "s",
+              ::arrow::large_list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}))
+          .ValueOrDie();
+  expected = ::arrow::schema({::arrow::field(
+      "s",
+      ::arrow::large_list(::arrow::struct_(
+          {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))});
+  INFO("Expected schema: " << expected->ToString() << "\nGot: " << merged->ToString());
+  CHECK(merged->Equals(expected));
+}
+
+TEST_CASE("Test merge two fixed size lists") {
+  // Merge "s: fixed_size_list<struct<foo:int32>, 4>" and
+  // "s: fixed_size_list<struct<bar:string>, 4>"
+  auto merged =
+      MergeSchema(*::arrow::schema({::arrow::field(
+                      "s",
+                      ::arrow::fixed_size_list(
+                          ::arrow::struct_({::arrow::field("foo", ::arrow::int32())}), 4))}),
+                  *::arrow::schema({::arrow::field(
+                      "s",
+                      ::arrow::fixed_size_list(
+                          ::arrow::struct_({::arrow::field("bar", ::arrow::utf8())}), 4))}))
+          .ValueOrDie();
+  CHECK(merged->Equals(::arrow::schema({::arrow::field(
+      "s",
+      ::arrow::fixed_size_list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
+                                                 ::arrow::field("bar", ::arrow::utf8())}),
+                               4))})));
+
+  // Merge two different sized lists
+  auto result = MergeSchema(
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 2))}),
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 4))}));
+  CHECK(result.status().IsInvalid());
+
+  // Merge two fixed sized list with different types and same length
+  result = MergeSchema(
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::utf8(), 4))}),
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 4))}));
+  CHECK(result.status().IsInvalid());
+}
+
+TEST_CASE("Test merge extension types") {
+  auto merged = MergeSchema(*::arrow::schema({::arrow::field("box", lance::testing::box2d())}),
+                            *::arrow::schema({::arrow::field("box", lance::testing::box2d())}))
+                    .ValueOrDie();
+  CHECK(merged->Equals(::arrow::schema({::arrow::field("box", lance::testing::box2d())})));
+
+  auto result = MergeSchema(*::arrow::schema({::arrow::field("ann", lance::testing::box2d())}),
+                            *::arrow::schema({::arrow::field("ann", lance::testing::image())}));
+  CHECK(result.status().IsInvalid());
 }

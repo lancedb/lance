@@ -37,9 +37,8 @@ class Schema final {
  public:
   Schema() = default;
 
-  /// Build the Schema from Arrow.
-  /// TODO: Should we make it factory method so that it can return Result<>?
-  Schema(std::shared_ptr<::arrow::Schema> schema);
+  /// Construct Lance Schema from Arrow Schema.
+  Schema(const std::shared_ptr<::arrow::Schema>& schema);
 
   Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields);
 

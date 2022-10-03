@@ -86,6 +86,8 @@ class Box2dType : public ::arrow::ExtensionType {
   std::string Serialize() const override { return "box2d-ext"; }
 };
 
+inline std::shared_ptr<ImageType> image() { return std::make_shared<ImageType>(); }
+
 // A parametric type where the extension_name() is always the same
 class ParametricType : public ::arrow::ExtensionType {
  public:
@@ -126,6 +128,8 @@ class ParametricType : public ::arrow::ExtensionType {
   int32_t parameter_;
 };
 
+inline std::shared_ptr<Box2dType> box2d() { return std::make_shared<Box2dType>(); }
+
 class AnnotationType : public ::arrow::ExtensionType {
  public:
   AnnotationType()
@@ -156,6 +160,8 @@ class AnnotationType : public ::arrow::ExtensionType {
 
   std::string Serialize() const override { return "annotations-ext"; }
 };
+
+inline std::shared_ptr<AnnotationType> annotation() { return std::make_shared<AnnotationType>(); }
 
 }  // namespace testing
 }  // namespace lance

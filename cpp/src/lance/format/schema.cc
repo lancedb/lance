@@ -425,7 +425,7 @@ Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Fie
   }
 }
 
-Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
+Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   for (auto f : schema->fields()) {
     fields_.emplace_back(make_shared<Field>(f));
   }
