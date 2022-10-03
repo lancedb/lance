@@ -22,6 +22,7 @@
 
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
+#include "lance/testing/extension_types.h"
 
 using lance::arrow::MergeSchema;
 using lance::arrow::ToArray;
@@ -193,5 +194,16 @@ TEST_CASE("Test merge two fixed size lists") {
   result = MergeSchema(
       *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::utf8(), 4))}),
       *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 4))}));
+  CHECK(result.status().IsInvalid());
+}
+
+TEST_CASE("Test merge extension types") {
+  auto merged = MergeSchema(*::arrow::schema({::arrow::field("box", lance::testing::box2d())}),
+                            *::arrow::schema({::arrow::field("box", lance::testing::box2d())}))
+                    .ValueOrDie();
+  CHECK(merged->Equals(::arrow::schema({::arrow::field("box", lance::testing::box2d())})));
+
+  auto result = MergeSchema(*::arrow::schema({::arrow::field("ann", lance::testing::box2d())}),
+                            *::arrow::schema({::arrow::field("ann", lance::testing::image())}));
   CHECK(result.status().IsInvalid());
 }
