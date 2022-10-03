@@ -177,15 +177,6 @@ template <VarLenListType L>
                         ::arrow::fixed_size_list(merged_field->type(), left_list->list_size()));
 }
 
-::arrow::Result<std::shared_ptr<::arrow::Field>> MergeExtensionFields(const ::arrow::Field& lhs,
-                                                                      const ::arrow::Field& rhs) {
-  if (!lhs.Equals(rhs)) {
-    return ::arrow::Status::Invalid(
-        fmt::format("Attempt to merge two different extension types: {} != {}", lhs, rhs));
-  }
-  return lhs.Copy();
-}
-
 ::arrow::Result<std::shared_ptr<::arrow::Field>> MergeStructFields(const ::arrow::Field& lhs,
                                                                    const ::arrow::Field& rhs) {
   if (!is_struct(rhs.type()->id())) {
@@ -207,8 +198,6 @@ template <VarLenListType L>
   }
 
   switch (lhs.type()->id()) {
-    case ::arrow::Type::EXTENSION:
-      return MergeExtensionFields(lhs, rhs);
     case ::arrow::Type::LIST:
       return MergeListFields<::arrow::ListType>(lhs, rhs);
     case ::arrow::Type::LARGE_LIST:
@@ -218,12 +207,13 @@ template <VarLenListType L>
     case ::arrow::Type::STRUCT:
       return MergeStructFields(lhs, rhs);
     default:
+      // primitive types, extension types, dictionary, and etc
       break;
   }
 
-  // It should be primitive types now.
-  if (!::arrow::is_primitive(lhs.type()->id())) {
-    return ::arrow::Status::Invalid(fmt::format("Merge unsupported type: {} != {}", lhs, rhs));
+  if (!lhs.Equals(rhs)) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two different types: {} != {}", lhs, rhs));
   }
   return lhs.MergeWith(rhs);
 }
