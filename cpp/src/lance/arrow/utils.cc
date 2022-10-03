@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <concepts>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,7 @@ namespace lance::arrow {
 template <typename T>
 concept HasFields = (std::same_as<T, ::arrow::Schema> || std::same_as<T, ::arrow::StructType>);
 
+// Forward Declaration.
 ::arrow::Result<std::shared_ptr<::arrow::Field>> MergeField(const ::arrow::Field& lhs,
                                                             const ::arrow::Field& rhs);
 
@@ -133,6 +135,21 @@ template <HasFields T>
   return fields;
 };
 
+template <typename T>
+concept VarLenListType = (std::same_as<T, ::arrow::ListType> ||
+                          std::same_as<T, ::arrow::LargeListType>);
+
+template <VarLenListType L>
+::arrow::Result<std::shared_ptr<::arrow::DataType>> MergeListTypes(
+    const std::shared_ptr<::arrow::DataType>& lhs, const std::shared_ptr<::arrow::DataType>& rhs) {
+  assert(lhs->id() == rhs->id());
+  auto left_list = std::dynamic_pointer_cast<L>(lhs);
+  auto right_list = std::dynamic_pointer_cast<L>(rhs);
+  ARROW_ASSIGN_OR_RAISE(auto merged_field,
+                        MergeField(*left_list->value_field(), *right_list->value_field()));
+  return std::make_shared<L>(merged_field->type());
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::Field>> MergeField(const ::arrow::Field& lhs,
                                                             const ::arrow::Field& rhs) {
   if (lhs.name() != rhs.name()) {
@@ -142,19 +159,24 @@ template <HasFields T>
   const auto& name = lhs.name();
   auto left_type = lhs.type();
   auto right_type = rhs.type();
-  if (is_struct(left_type->id()) && is_struct(right_type->id())) {
+  if (is_struct(left_type->id())) {
+    if (!is_struct(right_type->id())) {
+      return ::arrow::Status::Invalid(fmt::format(
+          "Attempt to merge two structs: {} != {}", left_type->ToString(), right_type->ToString()));
+    }
     // Merge two structs
     auto left_struct = std::dynamic_pointer_cast<::arrow::StructType>(left_type);
     auto right_struct = std::dynamic_pointer_cast<::arrow::StructType>(right_type);
     ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(*left_struct, *right_struct));
     return ::arrow::field(name, ::arrow::struct_(merged_fields));
-  } else if (::arrow::is_list_like(left_type->id()) && ::arrow::is_list_like(right_type->id())) {
-    // Merge two var-length lists
-    auto left_list = std::dynamic_pointer_cast<::arrow::ListType>(left_type);
-    auto right_list = std::dynamic_pointer_cast<::arrow::ListType>(right_type);
-    ARROW_ASSIGN_OR_RAISE(auto merged_field,
-                          MergeField(*left_list->value_field(), *right_list->value_field()));
-    return ::arrow::field(name, ::arrow::list(merged_field->type()));
+  } else if (left_type->id() == ::arrow::Type::LIST) {
+    ARROW_ASSIGN_OR_RAISE(auto merged_type,
+                          MergeListTypes<::arrow::ListType>(left_type, right_type));
+    return ::arrow::field(name, merged_type);
+  } else if (left_type->id() == ::arrow::Type::LARGE_LIST) {
+    ARROW_ASSIGN_OR_RAISE(auto merged_type,
+                          MergeListTypes<::arrow::LargeListType>(left_type, right_type));
+    return ::arrow::field(name, merged_type);
   }
   return lhs.Copy();
 }

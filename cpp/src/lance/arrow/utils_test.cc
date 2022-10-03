@@ -123,9 +123,11 @@ TEST_CASE("Test merge schema") {
                                                          ::arrow::field("foo", ::arrow::float32()),
                                                          ::arrow::field("bar", ::arrow::int64()),
                                                      }))})));
+}
 
+TEST_CASE("Test merge two lists") {
   // Check "s: list<struct<foo:int32>>" and "s: list<struct<bar:string>>"
-  merged =
+  auto merged =
       MergeSchema(
           *::arrow::schema({::arrow::field(
               "s", ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32())})))}),
@@ -135,5 +137,20 @@ TEST_CASE("Test merge schema") {
   CHECK(merged->Equals(::arrow::schema({::arrow::field(
       "s",
       ::arrow::list(::arrow::struct_(
+          {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))})));
+
+  // Check "s: large_list<struct<foo:int32>>" and "s: large_list<struct<bar:string>>"
+  merged =
+      MergeSchema(
+          *::arrow::schema({::arrow::field(
+              "s",
+              ::arrow::large_list(::arrow::struct_({::arrow::field("foo", ::arrow::int32())})))}),
+          *::arrow::schema({::arrow::field(
+              "s",
+              ::arrow::large_list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}))
+          .ValueOrDie();
+  CHECK(merged->Equals(::arrow::schema({::arrow::field(
+      "s",
+      ::arrow::large_list(::arrow::struct_(
           {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))})));
 }
