@@ -23,6 +23,7 @@
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 
+using lance::arrow::MergeSchema;
 using lance::arrow::ToArray;
 
 TEST_CASE("Merge simple structs") {
@@ -94,4 +95,14 @@ TEST_CASE("Merge nested structs") {
 
   INFO("Actual data: " << points->ToString() << " Expected: " << expected_arr->ToString());
   CHECK(points->Equals(expected_arr));
+}
+
+TEST_CASE("Test merge schema") {
+  // Merge two primitive fields.
+  auto merged = MergeSchema(*::arrow::schema({::arrow::field("a", ::arrow::int32())}),
+                            *::arrow::schema({::arrow::field("b", ::arrow::utf8())}))
+                    .ValueOrDie();
+  INFO("Merged schema: " << merged->ToString());
+  CHECK(merged->Equals(::arrow::schema(
+      {::arrow::field("a", ::arrow::int32()), {::arrow::field("b", ::arrow::utf8())}})));
 }

@@ -108,6 +108,9 @@ namespace lance::arrow {
 template <typename T>
 concept HasFields = (std::same_as<T, ::arrow::Schema> || std::same_as<T, ::arrow::StructType>);
 
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeField(const ::arrow::Field& lhs,
+                                                            const ::arrow::Field& rhs);
+
 template <HasFields T>
 ::arrow::Result<std::vector<std::shared_ptr<::arrow::Field>>> MergeFieldWithChildren(const T& lhs,
                                                                                      const T& rhs) {
@@ -117,6 +120,14 @@ template <HasFields T>
     if (!right_field) {
       fields.emplace_back(field);
     } else {
+      ARROW_ASSIGN_OR_RAISE(auto merged, MergeField(*field, *right_field));
+      fields.emplace_back(merged);
+    }
+  }
+  for (const auto& field : rhs.fields()) {
+    auto left_field = lhs.GetFieldByName(field->name());
+    if (!left_field) {
+      fields.emplace_back(field);
     }
   }
   return fields;
@@ -140,20 +151,13 @@ template <HasFields T>
   } else if (::arrow::is_list_like(left_type->id()) && ::arrow::is_list_like(right_type->id())) {
     // Merge two var-length list
   }
-  return std::make_shared<::arrow::Field>(lhs);
+  return lhs.Copy();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> MergeSchema(const ::arrow::Schema& lhs,
                                                               const ::arrow::Schema& rhs) {
-  std::vector<std::shared_ptr<::arrow::Field>> fields;
-  for (const auto& field : lhs.fields()) {
-    auto right_field = rhs.GetFieldByName(field->name());
-    if (!right_field) {
-      fields.emplace_back(field);
-    } else {
-    }
-  }
-  return ::arrow::schema(fields);
+  ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(lhs, rhs));
+  return ::arrow::schema(merged_fields);
 }
 
 }  // namespace lance::arrow
