@@ -106,6 +106,11 @@ TEST_CASE("Test merge schema") {
   CHECK(merged->Equals(::arrow::schema(
       {::arrow::field("a", ::arrow::int32()), {::arrow::field("b", ::arrow::utf8())}})));
 
+  // Merge primitive fields with the same name, but different type.
+  auto result = MergeSchema(*::arrow::schema({::arrow::field("a", ::arrow::int32())}),
+                            *::arrow::schema({::arrow::field("a", ::arrow::utf8())}));
+  CHECK(result.status().IsInvalid());
+
   // Merge struct<foo:float32> and struct<bar:int64>
   merged =
       MergeSchema(*::arrow::schema({::arrow::field("s",
@@ -134,10 +139,12 @@ TEST_CASE("Test merge two lists") {
           *::arrow::schema({::arrow::field(
               "s", ::arrow::list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}))
           .ValueOrDie();
-  CHECK(merged->Equals(::arrow::schema({::arrow::field(
-      "s",
-      ::arrow::list(::arrow::struct_(
-          {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))})));
+  auto expected = ::arrow::schema(
+      {::arrow::field("s",
+                      ::arrow::list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
+                                                      ::arrow::field("bar", ::arrow::utf8())})))});
+  INFO("Expected schema: " << expected->ToString() << "\nGot: " << merged->ToString());
+  CHECK(merged->Equals(expected));
 
   // Check "s: large_list<struct<foo:int32>>" and "s: large_list<struct<bar:string>>"
   merged =
@@ -149,10 +156,12 @@ TEST_CASE("Test merge two lists") {
               "s",
               ::arrow::large_list(::arrow::struct_({::arrow::field("bar", ::arrow::utf8())})))}))
           .ValueOrDie();
-  CHECK(merged->Equals(::arrow::schema({::arrow::field(
+  expected = ::arrow::schema({::arrow::field(
       "s",
       ::arrow::large_list(::arrow::struct_(
-          {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))})));
+          {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))});
+  INFO("Expected schema: " << expected->ToString() << "\nGot: " << merged->ToString());
+  CHECK(merged->Equals(expected));
 }
 
 TEST_CASE("Test merge two fixed size lists") {

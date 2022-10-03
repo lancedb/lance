@@ -142,17 +142,61 @@ concept VarLenListType = (std::same_as<T, ::arrow::ListType> ||
 
 /// Merge two var-length list types (`::arrow::List` or `::arrow::LargeList`).
 template <VarLenListType L>
-::arrow::Result<std::shared_ptr<::arrow::DataType>> MergeListTypes(
-    const std::shared_ptr<::arrow::DataType>& lhs, const std::shared_ptr<::arrow::DataType>& rhs) {
-  if (lhs->id() != rhs->id()) {
-    return ::arrow::Status::Invalid(fmt::format(
-        "Attempt to merge two different lists: {} != {}", lhs->ToString(), rhs->ToString()));
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeListFields(const ::arrow::Field& lhs,
+                                                                 const ::arrow::Field& rhs) {
+  assert(lhs.type()->id() == L::type_id);
+  if (lhs.type()->id() != rhs.type()->id()) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two different lists: {} != {}", lhs, rhs));
   }
-  auto left_list = std::dynamic_pointer_cast<L>(lhs);
-  auto right_list = std::dynamic_pointer_cast<L>(rhs);
+  auto left_list = std::dynamic_pointer_cast<L>(lhs.type());
+  auto right_list = std::dynamic_pointer_cast<L>(rhs.type());
   ARROW_ASSIGN_OR_RAISE(auto merged_field,
                         MergeField(*left_list->value_field(), *right_list->value_field()));
-  return std::make_shared<L>(merged_field->type());
+  return ::arrow::field(lhs.name(), std::make_shared<L>(merged_field->type()));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeFixedSizeListFields(
+    const ::arrow::Field& lhs, const ::arrow::Field& rhs) {
+  assert(lhs.type()->id() == ::arrow::Type::FIXED_SIZE_LIST);
+  if (lhs.type()->id() != rhs.type()->id()) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two different fixed_size_list lists: {} != {}", lhs, rhs));
+  }
+  auto left_list = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(lhs.type());
+  auto right_list = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(rhs.type());
+  if (left_list->list_size() != right_list->list_size()) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two fixed size lists with different size: {} != {}",
+                    left_list->list_size(),
+                    right_list->list_size()));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto merged_field,
+                        MergeField(*left_list->value_field(), *right_list->value_field()));
+  return ::arrow::field(lhs.name(),
+                        ::arrow::fixed_size_list(merged_field->type(), left_list->list_size()));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeExtensionFields(const ::arrow::Field& lhs,
+                                                                      const ::arrow::Field& rhs) {
+  if (!lhs.Equals(rhs)) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two different extension types: {} != {}", lhs, rhs));
+  }
+  return lhs.Copy();
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Field>> MergeStructFields(const ::arrow::Field& lhs,
+                                                                   const ::arrow::Field& rhs) {
+  if (!is_struct(rhs.type()->id())) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Attempt to merge two structs: {} != {}", lhs, rhs));
+  }
+  // Merge two structs
+  auto left_struct = std::dynamic_pointer_cast<::arrow::StructType>(lhs.type());
+  auto right_struct = std::dynamic_pointer_cast<::arrow::StructType>(rhs.type());
+  ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(*left_struct, *right_struct));
+  return ::arrow::field(lhs.name(), ::arrow::struct_(merged_fields));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Field>> MergeField(const ::arrow::Field& lhs,
@@ -161,55 +205,26 @@ template <VarLenListType L>
     return ::arrow::Status::Invalid(fmt::format(
         "Attempt to merge fields with different names: {} != {}", lhs.name(), rhs.name()));
   }
-  const auto& name = lhs.name();
-  auto left_type = lhs.type();
-  auto right_type = rhs.type();
-  if (is_extension(left_type)) {
-    // We consider extension type as primitive type.
-    if (!left_type->Equals(right_type)) {
-      return ::arrow::Status::Invalid(fmt::format("Attempt to merge two extension types: {} != {}",
-                                                  left_type->ToString(),
-                                                  right_type->ToString()));
-    }
-    return lhs.Copy();
-  } else if (is_struct(left_type->id())) {
-    if (!is_struct(right_type->id())) {
-      return ::arrow::Status::Invalid(fmt::format(
-          "Attempt to merge two structs: {} != {}", left_type->ToString(), right_type->ToString()));
-    }
-    // Merge two structs
-    auto left_struct = std::dynamic_pointer_cast<::arrow::StructType>(left_type);
-    auto right_struct = std::dynamic_pointer_cast<::arrow::StructType>(right_type);
-    ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(*left_struct, *right_struct));
-    return ::arrow::field(name, ::arrow::struct_(merged_fields));
-  } else if (left_type->id() == ::arrow::Type::LIST) {
-    ARROW_ASSIGN_OR_RAISE(auto merged_type,
-                          MergeListTypes<::arrow::ListType>(left_type, right_type));
-    return ::arrow::field(name, merged_type);
-  } else if (left_type->id() == ::arrow::Type::LARGE_LIST) {
-    ARROW_ASSIGN_OR_RAISE(auto merged_type,
-                          MergeListTypes<::arrow::LargeListType>(left_type, right_type));
-    return ::arrow::field(name, merged_type);
-  } else if (left_type->id() == ::arrow::Type::FIXED_SIZE_LIST) {
-    if (right_type->id() != ::arrow::Type::FIXED_SIZE_LIST) {
-      return ::arrow::Status::Invalid(fmt::format("Attempt to merge two different types: {} != {}",
-                                                  left_type->ToString(),
-                                                  right_type->ToString()));
-    }
-    auto left_list = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(left_type);
-    auto right_list = std::dynamic_pointer_cast<::arrow::FixedSizeListType>(right_type);
-    if (left_list->list_size() != right_list->list_size()) {
-      return ::arrow::Status::Invalid(
-          fmt::format("Attempt to merge two fixed size lists with different size: {} != {}",
-                      left_list->list_size(),
-                      right_list->list_size()));
-    }
-    ARROW_ASSIGN_OR_RAISE(auto merged_field,
-                          MergeField(*left_list->value_field(), *right_list->value_field()));
-    return ::arrow::field(name,
-                          ::arrow::fixed_size_list(merged_field->type(), left_list->list_size()));
+
+  switch (lhs.type()->id()) {
+    case ::arrow::Type::EXTENSION:
+      return MergeExtensionFields(lhs, rhs);
+    case ::arrow::Type::LIST:
+      return MergeListFields<::arrow::ListType>(lhs, rhs);
+    case ::arrow::Type::LARGE_LIST:
+      return MergeListFields<::arrow::LargeListType>(lhs, rhs);
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      return MergeFixedSizeListFields(lhs, rhs);
+    case ::arrow::Type::STRUCT:
+      return MergeStructFields(lhs, rhs);
+    default:
+      break;
   }
+
   // It should be primitive types now.
+  if (!::arrow::is_primitive(lhs.type()->id())) {
+    return ::arrow::Status::Invalid(fmt::format("Merge unsupported type: {} != {}", lhs, rhs));
+  }
   return lhs.MergeWith(rhs);
 }
 
