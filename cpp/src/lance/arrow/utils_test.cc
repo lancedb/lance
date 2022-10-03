@@ -154,3 +154,35 @@ TEST_CASE("Test merge two lists") {
       ::arrow::large_list(::arrow::struct_(
           {::arrow::field("foo", ::arrow::int32()), ::arrow::field("bar", ::arrow::utf8())})))})));
 }
+
+TEST_CASE("Test merge two fixed size lists") {
+  // Merge "s: fixed_size_list<struct<foo:int32>, 4>" and
+  // "s: fixed_size_list<struct<bar:string>, 4>"
+  auto merged =
+      MergeSchema(*::arrow::schema({::arrow::field(
+                      "s",
+                      ::arrow::fixed_size_list(
+                          ::arrow::struct_({::arrow::field("foo", ::arrow::int32())}), 4))}),
+                  *::arrow::schema({::arrow::field(
+                      "s",
+                      ::arrow::fixed_size_list(
+                          ::arrow::struct_({::arrow::field("bar", ::arrow::utf8())}), 4))}))
+          .ValueOrDie();
+  CHECK(merged->Equals(::arrow::schema({::arrow::field(
+      "s",
+      ::arrow::fixed_size_list(::arrow::struct_({::arrow::field("foo", ::arrow::int32()),
+                                                 ::arrow::field("bar", ::arrow::utf8())}),
+                               4))})));
+
+  // Merge two different sized lists
+  auto result = MergeSchema(
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 2))}),
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 4))}));
+  CHECK(result.status().IsInvalid());
+
+  // Merge two fixed sized list with different types and same length
+  result = MergeSchema(
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::utf8(), 4))}),
+      *::arrow::schema({::arrow::field("l", ::arrow::fixed_size_list(::arrow::int32(), 4))}));
+  CHECK(result.status().IsInvalid());
+}
