@@ -71,6 +71,15 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   return impl_->manifest->schema().ToArrow();
 }
 
+::arrow::Future<::arrow::util::optional<int64_t>> LanceFileFormat::CountRows(
+    const std::shared_ptr<::arrow::dataset::FileFragment>& file,
+    ::arrow::compute::Expression predicate,
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {   
+  ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
+  ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
+  return ::arrow::util::make_optional<int64_t>(reader->metadata().length());
+}
+
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
