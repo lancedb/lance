@@ -105,4 +105,22 @@ TEST_CASE("Test merge schema") {
   INFO("Merged schema: " << merged->ToString());
   CHECK(merged->Equals(::arrow::schema(
       {::arrow::field("a", ::arrow::int32()), {::arrow::field("b", ::arrow::utf8())}})));
+
+  // Merge struct<foo:float32> and struct<bar:int64>
+  merged =
+      MergeSchema(*::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("foo", ::arrow::float32()),
+                                                   }))}),
+                  *::arrow::schema({::arrow::field("s",
+                                                   ::arrow::struct_({
+                                                       ::arrow::field("bar", ::arrow::int64()),
+                                                   }))}))
+          .ValueOrDie();
+  CHECK(
+      merged->Equals(::arrow::schema({::arrow::field("s",
+                                                     ::arrow::struct_({
+                                                         ::arrow::field("foo", ::arrow::float32()),
+                                                         ::arrow::field("bar", ::arrow::int64()),
+                                                     }))})));
 }
