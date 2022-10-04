@@ -16,6 +16,7 @@
 
 #include <arrow/dataset/dataset.h>
 #include <arrow/dataset/scanner.h>
+#include <arrow/type.h>
 #include <fmt/format.h>
 
 #include "lance/arrow/file_lance_ext.h"
@@ -66,9 +67,20 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     auto columns = columns_.value();
 
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
+
+    scanner->options()->projected_schema = projected_schema->ToArrow();
+    auto dataset_schema = scanner->options()->projected_schema;
+    if (::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
+      ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(scanner->options()->filter));
+      // This is a hack for GH204. To make filter column and projection columns all available
+      //
+      ARROW_ASSIGN_OR_RAISE(dataset_schema,
+                            lance::arrow::MergeSchema(*dataset_schema, *filter_schema->ToArrow()));
+    }
+
+    scanner->options()->dataset_schema = dataset_schema;
     ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
                           scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
-    scanner->options()->projected_schema = projected_schema->ToArrow();
 
     std::vector<std::string> top_names;
     for (const auto& field : projected_schema->fields()) {

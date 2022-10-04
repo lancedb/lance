@@ -39,4 +39,5 @@ namespace lance::arrow {
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> MergeSchema(const ::arrow::Schema& lhs,
                                                               const ::arrow::Schema& rhs);
 
+
 }  // namespace lance::arrow

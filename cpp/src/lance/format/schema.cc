@@ -511,7 +511,23 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   }
   std::vector<std::string> columns;
   for (auto& ref : ::arrow::compute::FieldsInExpression(expr)) {
-    columns.emplace_back(std::string(*ref.name()));
+    std::string column_name;
+    if (ref.IsName()) {
+      column_name = std::string(*ref.name());
+    } else if (ref.IsNested()) {
+      assert(ref.nested_refs());
+      for (auto& r : *ref.nested_refs()) {
+        if (r.IsFieldPath()) {
+          continue;
+        }
+        // TODO: Use SplitJoin
+        if (!column_name.empty()) {
+          column_name += ".";
+        }
+        column_name += *r.name();
+      }
+    }
+    columns.emplace_back(column_name);
   }
   return Project(columns);
 }
