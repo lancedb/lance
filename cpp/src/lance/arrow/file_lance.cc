@@ -71,6 +71,31 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   return impl_->manifest->schema().ToArrow();
 }
 
+::arrow::Future<::arrow::util::optional<int64_t>> LanceFileFormat::CountRows(
+    const std::shared_ptr<::arrow::dataset::FileFragment>& file,
+    ::arrow::compute::Expression predicate,
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
+  if (predicate.Equals(::arrow::compute::literal(true))) {
+    // Fast path.
+    auto executor = options->io_context.executor();
+    assert(executor != nullptr);
+    auto result = executor->Submit(
+        [&](const auto& file) -> ::arrow::Result<::arrow::util::optional<int64_t>> {
+          ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
+          ARROW_ASSIGN_OR_RAISE(auto reader,
+                                lance::io::FileReader::Make(infile, this->impl_->manifest));
+          return ::arrow::util::make_optional(reader->length());
+        },
+        file);
+    if (!result.ok()) {
+      return result.status();
+    }
+    return result.ValueOrDie();
+  }
+  // If filter presented, slow path
+  return FileFormat::CountRows(file, predicate, options);
+}
+
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
