@@ -40,7 +40,7 @@ add_link_options(-o linker-signed)
 
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     SET(LANCE_BUILD_BENCHMARKS ON)
-    #add_compile_options(-Werror)
+    add_compile_options(-Werror)
 endif ()
 
 # TODO: Fix on linux
