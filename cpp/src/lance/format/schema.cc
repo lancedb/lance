@@ -16,6 +16,7 @@
 
 #include <arrow/status.h>
 #include <arrow/type.h>
+#include <arrow/util/key_value_metadata.h>
 #include <arrow/util/string.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -412,7 +413,9 @@ bool Field::operator==(const Field& other) const { return Equals(other, true); }
 
 //------ Schema
 
-Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields) {
+Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields,
+               const google::protobuf::Map<std::string, std::string>& metadata)
+    : metadata_(std::begin(metadata), std::end(metadata)) {
   for (auto& f : pb_fields) {
     auto field = std::make_shared<Field>(f);
     if (field->parent_id() < 0) {
@@ -428,6 +431,9 @@ Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Fie
 Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   for (auto f : schema->fields()) {
     fields_.emplace_back(make_shared<Field>(f));
+  }
+  if (schema->metadata()) {
+    schema->metadata()->ToUnorderedMap(&metadata_);
   }
   AssignIds();
 }
