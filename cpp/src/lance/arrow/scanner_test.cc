@@ -341,6 +341,7 @@ TEST_CASE("Test projection over nested field") {
   CHECK(scan_builder.Project({"annotations.name"}).ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
   auto result = scanner->ToTable();
+  INFO("Scanner to table result: " << result.status().ToString());
   CHECK(result.ok());
   auto actual = result.ValueOrDie();
   auto expected_schema = ::arrow::schema({::arrow::field(
