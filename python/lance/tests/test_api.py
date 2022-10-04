@@ -77,3 +77,13 @@ def test_write_dataset(tmp_path: Path):
     assert actual == pa.Table.from_pandas(
         pd.DataFrame({"label": [123, 789], "values": [22, 2.24]})
     )
+
+
+def test_write_dataset_with_metadata(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}], metadata={"k1": "v1", "k2": "v2"})
+    ds.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
+
+    actual = dataset(str(tmp_path / "test.lance")).to_table()
+    schema: pa.Schema = actual.schema
+    assert schema.metadata[b"k1"] == b"v1"
+    assert schema.metadata[b"k2"] == b"v2"

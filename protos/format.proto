@@ -43,6 +43,9 @@ Format:
 message Manifest {
   // All fields of the dataset, including the nested fields.
   repeated Field fields = 1;
+
+  // Dataset metadata.
+  map<string, bytes> metadata = 2;
 }
 
 // Metadata of one Lane file.

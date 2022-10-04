@@ -17,10 +17,10 @@
 #include <arrow/compute/api.h>
 #include <arrow/type.h>
 
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "lance/encodings/encoder.h"
@@ -40,7 +40,12 @@ class Schema final {
   /// Construct Lance Schema from Arrow Schema.
   Schema(const std::shared_ptr<::arrow::Schema>& schema);
 
-  Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields);
+  /// Construct Lance Schema from Protobuf.
+  ///
+  /// \param pb_fields the fields described in protobuf.
+  /// \param metadata the metadata pairs.
+  Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields,
+         const google::protobuf::Map<std::string, std::string>& metadata = {});
 
   ~Schema() = default;
 
@@ -91,6 +96,11 @@ class Schema final {
   /// \return the field if found. Return nullptr if not found.
   std::shared_ptr<Field> GetField(const std::string& name) const;
 
+  /// Schema metadata, k/v pairs.
+  const std::unordered_map<std::string, std::string>& metadata() const {
+    return metadata_;
+  }
+
   std::string ToString() const;
 
   bool Equals(const std::shared_ptr<Schema>& other, bool check_id = true) const;
@@ -110,6 +120,9 @@ class Schema final {
   bool RemoveField(int32_t id);
 
   std::vector<std::shared_ptr<Field>> fields_;
+
+  /// Schema metadata
+  std::unordered_map<std::string, std::string> metadata_;
 };
 
 /// \brief Field is the metadata of a column on disk.
