@@ -32,6 +32,9 @@ Manifest::Manifest(Manifest&& other) noexcept
     auto pb_field = pb.add_fields();
     *pb_field = field;
   }
+  for (const auto& [key, value] : schema_->metadata()) {
+    (*pb.mutable_metadata())[key] = value;
+  }
   return io::WriteProto(out, pb);
 }
 

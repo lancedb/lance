@@ -683,7 +683,13 @@ std::shared_ptr<::arrow::Schema> Schema::ToArrow() const {
   for (auto f : fields_) {
     arrow_fields.emplace_back(f->ToArrow());
   }
-  return ::arrow::schema(arrow_fields);
+
+  std::shared_ptr<::arrow::KeyValueMetadata> arrow_metadata;
+  if (!metadata_.empty()) {
+    arrow_metadata = std::make_shared<::arrow::KeyValueMetadata>(metadata_);
+  }
+
+  return ::arrow::schema(arrow_fields, arrow_metadata);
 }
 
 pb::Field::Type Field::GetNodeType() const {

@@ -96,6 +96,11 @@ class Schema final {
   /// \return the field if found. Return nullptr if not found.
   std::shared_ptr<Field> GetField(const std::string& name) const;
 
+  /// Schema metadata, k/v pairs.
+  const std::unordered_map<std::string, std::string>& metadata() const {
+    return metadata_;
+  }
+
   std::string ToString() const;
 
   bool Equals(const std::shared_ptr<Schema>& other, bool check_id = true) const;
