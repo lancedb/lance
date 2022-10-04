@@ -63,31 +63,25 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
   ///
   /// TODO: contribute this change to Apache Arrow.
   if (columns_.has_value()) {
-    auto schema = lance::format::Schema(scanner->options()->dataset_schema);
+    auto original_dataset_schema = scanner->options()->dataset_schema;
+    auto schema = lance::format::Schema(original_dataset_schema);
     auto columns = columns_.value();
 
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
-    ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
-                          scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
-    scanner->options()->projected_schema = projected_schema->ToArrow();
 
+    scanner->options()->projected_schema = projected_schema->ToArrow();
     auto dataset_schema = scanner->options()->projected_schema;
     if (::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
-      fmt::print("Project filter: {}\n", scanner->options()->filter);
       ARROW_ASSIGN_OR_RAISE(auto filter_schema, schema.Project(scanner->options()->filter));
-      fmt::print("After : {}\n", filter_schema);
       // This is a hack for GH204. To make filter column and projection columns all available
       //
-      fmt::print("Filter schema: {}\n", filter_schema);
-      ARROW_ASSIGN_OR_RAISE(auto dataset_schema,
+      ARROW_ASSIGN_OR_RAISE(dataset_schema,
                             lance::arrow::MergeSchema(*dataset_schema, *filter_schema->ToArrow()));
     }
-    fmt::print("Filter dataset schema: {}\norigin dataset={}\nProjection={}\n-----------\n\n",
-               dataset_schema,
-               scanner->options()->dataset_schema,
-               scanner->options()->projection);
-    // TODO: we need reorder too.
+
     scanner->options()->dataset_schema = dataset_schema;
+    ARROW_ASSIGN_OR_RAISE(scanner->options()->filter,
+                          scanner->options()->filter.Bind(*scanner->options()->dataset_schema));
 
     std::vector<std::string> top_names;
     for (const auto& field : projected_schema->fields()) {
@@ -97,7 +91,6 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
                           ::arrow::dataset::ProjectionDescr::FromNames(
                               top_names, *scanner->options()->dataset_schema));
     scanner->options()->projection = project_desc.expression;
-    fmt::print("Project expression: {}\n", project_desc.expression);
   }
 
   if (scanner->options()->fragment_scan_options) {

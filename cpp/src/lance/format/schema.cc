@@ -362,7 +362,6 @@ std::shared_ptr<Field> Field::Copy(bool include_children) const {
 
 std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arrow_field) const {
   //  assert(name_ == arrow_field->name());
-  fmt::print("Field::Project: self={} arrow={}\n", name_, arrow_field->name());
   auto new_field = Copy();
   auto dtype = arrow_field->type();
   if (::lance::arrow::is_extension(dtype)) {
@@ -510,7 +509,6 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
     /// All scalar?
     return nullptr;
   }
-  fmt::print("It has field\n");
   std::vector<std::string> columns;
   for (auto& ref : ::arrow::compute::FieldsInExpression(expr)) {
     std::string column_name;
@@ -519,7 +517,6 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
     } else if (ref.IsNested()) {
       assert(ref.nested_refs());
       for (auto& r : *ref.nested_refs()) {
-        fmt::print("Nested field: {}\n", r.ToString());
         if (r.IsFieldPath()) {
           continue;
         }
@@ -530,7 +527,6 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
         column_name += *r.name();
       }
     }
-    fmt::print("Append column name: {}\n", column_name);
     columns.emplace_back(column_name);
   }
   return Project(columns);
