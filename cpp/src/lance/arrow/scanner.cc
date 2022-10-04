@@ -63,8 +63,7 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
   ///
   /// TODO: contribute this change to Apache Arrow.
   if (columns_.has_value()) {
-    auto original_dataset_schema = scanner->options()->dataset_schema;
-    auto schema = lance::format::Schema(original_dataset_schema);
+    auto schema = lance::format::Schema(scanner->options()->dataset_schema);
     auto columns = columns_.value();
 
     ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(columns));
