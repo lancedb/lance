@@ -216,8 +216,7 @@ TEST_CASE("Filter over empty list") {
 {"ints": 1, "floats": [0.1, 0.2]},
 {"ints": 2},
 {"ints": 3, "floats": [11.1]}
-])")
-               .ValueOrDie();
+])").ValueOrDie();
 
   auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
   auto scan_builder = dataset->NewScan().ValueOrDie();
@@ -240,8 +239,7 @@ TEST_CASE("Filter with limit") {
   auto t = TableFromJSON(schema, R"([
 {"ints": 1, "floats": [0.1, 0.2]},
 {"ints": 2, "floats": [11.1]}
-])")
-               .ValueOrDie();
+])").ValueOrDie();
 
   auto dataset = lance::testing::MakeDataset(t).ValueOrDie();
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
