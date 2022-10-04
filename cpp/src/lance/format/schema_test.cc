@@ -1,11 +1,33 @@
+//  Copyright 2022 Lance Authors
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+
 #include "lance/format/schema.h"
 
 #include <arrow/type.h>
+#include <arrow/util/key_value_metadata.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "lance/arrow/stl.h"
 #include "lance/testing/extension_types.h"
+#include "lance/testing/io.h"
+#include "lance/testing/json.h"
+
+using lance::arrow::ToArray;
+using lance::testing::MakeDataset;
+using lance::testing::TableFromJSON;
 
 const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
@@ -183,4 +205,16 @@ TEST_CASE("Test nested storage type") {
                          ::arrow::field("ymax", ::arrow::float64()),
                      })),
   })));
+}
+
+TEST_CASE("Test schema metadata") {
+  auto schema = ::arrow::schema({::arrow::field("val", ::arrow::int32())},
+                                ::arrow::KeyValueMetadata::Make({"k1", "k2"}, {"v1", "v2"}));
+
+  auto table = ::arrow::Table::Make(schema, {ToArray({1, 2, 3}).ValueOrDie()});
+
+  auto dataset = MakeDataset(table).ValueOrDie();
+  CHECK(dataset->schema()->metadata());
+  CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
+  CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
 }
