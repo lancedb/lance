@@ -185,10 +185,10 @@ pub struct Schema {
 
 impl Schema {
     /// Create a Schema from arrow schema.
-    pub fn new(schema: &arrow::datatypes::Schema) -> Schema {
+    pub fn new(schema: &arrow2::datatypes::Schema) -> Schema {
         Schema {
             fields: schema
-                .fields()
+                .fields
                 .iter()
                 .map(Field::new)
                 .collect(),
