@@ -18,7 +18,11 @@ use arrow::array::{make_array, new_empty_array, ArrayDataBuilder, ArrayRef, Int3
 use arrow::buffer::MutableBuffer;
 use arrow::compute::{subtract_scalar_dyn, take};
 use arrow::datatypes::{ArrowPrimitiveType, Int32Type};
+use arrow2::datatypes::PrimitiveType;
+use arrow2::types::NativeType;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::sync::Arc;
+use arrow2::array::{Array, MutablePrimitiveArray};
 
 use crate::encodings::Decoder;
 
@@ -37,14 +41,21 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
             page_length,
         }
     }
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<ArrayRef> {
+    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>, dt: PrimitiveType) -> Arc<dyn Array> {
 
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
-        let mut buf = vec![0u8; read_len * T::get_byte_width()];
+        let byte_size = std::mem::size_of::<T>();
+        let mut buf = vec![0u8; read_len * byte_size];//TODO is it right?
         (*self.file).read_exact(& mut buf)?;
-        todo!()
+        let mut builder = MutablePrimitiveArray::with_capacity(read_len);
+        for i in 0..read_len {
+            let slice = buf.slice(i * byte_size, (i+1)*byte_size);
+            let v = T::from_le_bytes(slice);//TODO is it right?
+            builder.push(v);
+        }
+        builder.into_arc()
     }
 }
 
