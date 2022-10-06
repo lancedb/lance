@@ -65,3 +65,4 @@ docs/_build
 docs/api/python
 
 **/.ipynb_checkpoints/
+docs/notebooks
