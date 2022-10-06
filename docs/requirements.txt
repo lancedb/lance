@@ -4,6 +4,8 @@ breathe
 cython
 pandas
 piccolo-theme
+duckdb
+jupyterlab
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision

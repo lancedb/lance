@@ -36,9 +36,10 @@ To solve these pain-points, we are building Lance, an open-source columnar data 
 
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
 
-   quickstart
+   Quickstart <./notebooks/quickstart>
+   howtos
    API References <./api/api>
 
 
