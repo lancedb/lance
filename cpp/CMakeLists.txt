@@ -36,6 +36,7 @@ if (CCACHE_FOUND)
 endif (CCACHE_FOUND)
 
 add_compile_options(-Wall -Wextra -fPIC)
+add_link_options(-o linker-signed)
 
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     SET(LANCE_BUILD_BENCHMARKS ON)
@@ -92,7 +93,7 @@ include_directories(src)
 include_directories(${CMAKE_BINARY_DIR}/src)  # for format.pb.{h/cc}
 
 function(add_lance_test test_name)
-    if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+    if (CMAKE_BUILD_TYPE STREQUAL Debug)
         add_executable(${test_name} ${test_name}.cc)
         target_link_libraries(${test_name}
                 Catch2::Catch2WithMain
@@ -105,7 +106,7 @@ function(add_lance_test test_name)
     endif ()
 endfunction()
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+if (CMAKE_BUILD_TYPE STREQUAL Debug)
     include(CTest)
     include(Catch)
     set(test_libs Catch2::Catch2WithMain $<TARGET_OBJECTS:lance_testing>)

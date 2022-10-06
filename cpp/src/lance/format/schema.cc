@@ -16,6 +16,7 @@
 
 #include <arrow/status.h>
 #include <arrow/type.h>
+#include <arrow/util/key_value_metadata.h>
 #include <arrow/util/string.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -412,7 +413,9 @@ bool Field::operator==(const Field& other) const { return Equals(other, true); }
 
 //------ Schema
 
-Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields) {
+Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Field>& pb_fields,
+               const google::protobuf::Map<std::string, std::string>& metadata)
+    : metadata_(std::begin(metadata), std::end(metadata)) {
   for (auto& f : pb_fields) {
     auto field = std::make_shared<Field>(f);
     if (field->parent_id() < 0) {
@@ -425,9 +428,12 @@ Schema::Schema(const google::protobuf::RepeatedPtrField<::lance::format::pb::Fie
   }
 }
 
-Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
+Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   for (auto f : schema->fields()) {
     fields_.emplace_back(make_shared<Field>(f));
+  }
+  if (schema->metadata()) {
+    schema->metadata()->ToUnorderedMap(&metadata_);
   }
   AssignIds();
 }
@@ -477,7 +483,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
 
     auto actual_field = GetField(components[0]);
     if (!actual_field) {
-      return ::arrow::Status::Invalid("Field {} dose not exist.", name);
+      continue;
     }
     auto view_field = view->GetField(components[0]);
     if (!view_field) {
@@ -495,7 +501,7 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   for (auto& arrow_field : arrow_schema.fields()) {
     auto field = GetField(arrow_field->name());
     if (!field) {
-      return ::arrow::Status::Invalid(fmt::format("Field {} dose not exist", arrow_field->name()));
+      continue;
     }
     auto proj_field = field->Project(arrow_field);
     projection->AddField(proj_field);
@@ -511,7 +517,23 @@ Schema::Schema(std::shared_ptr<::arrow::Schema> schema) {
   }
   std::vector<std::string> columns;
   for (auto& ref : ::arrow::compute::FieldsInExpression(expr)) {
-    columns.emplace_back(std::string(*ref.name()));
+    std::string column_name;
+    if (ref.IsName()) {
+      column_name = std::string(*ref.name());
+    } else if (ref.IsNested()) {
+      assert(ref.nested_refs());
+      for (auto& r : *ref.nested_refs()) {
+        if (r.IsFieldPath()) {
+          continue;
+        }
+        // TODO: Use SplitJoin
+        if (!column_name.empty()) {
+          column_name += ".";
+        }
+        column_name += *r.name();
+      }
+    }
+    columns.emplace_back(column_name);
   }
   return Project(columns);
 }
@@ -661,7 +683,13 @@ std::shared_ptr<::arrow::Schema> Schema::ToArrow() const {
   for (auto f : fields_) {
     arrow_fields.emplace_back(f->ToArrow());
   }
-  return ::arrow::schema(arrow_fields);
+
+  std::shared_ptr<::arrow::KeyValueMetadata> arrow_metadata;
+  if (!metadata_.empty()) {
+    arrow_metadata = std::make_shared<::arrow::KeyValueMetadata>(metadata_);
+  }
+
+  return ::arrow::schema(arrow_fields, arrow_metadata);
 }
 
 pb::Field::Type Field::GetNodeType() const {

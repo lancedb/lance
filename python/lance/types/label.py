@@ -48,30 +48,34 @@ class LabelArray(pa.ExtensionArray):
 
     @property
     def ids(self):
+        """Return as Label IDs (int)."""
         return self.storage.indices.to_numpy()
 
     @staticmethod
     def from_values(values: Sequence[str], dictionary: Sequence[str]) -> "LabelArray":
         """
-        Create a LabelArray using the given values
+        Create a `LabelArray` using the given values
 
         Examples
         --------
-        In [3]: LabelArray.from_values(["dog", "cat"], dictionary=["horse", "cat", "dog"])
-        Out[3]:
-        <pyarrow.lib.ExtensionArray object at 0x7fc018cd9780>
 
-        -- dictionary:
-          [
-            "horse",
-            "cat",
-            "dog"
-          ]
-        -- indices:
-          [
-            2,
-            1
-          ]
+        .. code-block:: python
+
+            In [3]: LabelArray.from_values(["dog", "cat"], dictionary=["horse", "cat", "dog"])
+            Out[3]:
+            <pyarrow.lib.ExtensionArray object at 0x7fc018cd9780>
+
+            -- dictionary:
+            [
+                "horse",
+                "cat",
+                "dog"
+            ]
+            -- indices:
+            [
+                2,
+                1
+            ]
         """
         if isinstance(values, pa.Array):
             values = values.to_numpy(False)

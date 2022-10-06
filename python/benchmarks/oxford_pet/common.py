@@ -86,9 +86,13 @@ class Classification(pl.LightningModule):
     @staticmethod
     def get(name: str, **kwargs):
         if name == "resnet":
-            return Classification(backbone=torchvision.models.resnet50(num_classes=NUM_CLASSES))
+            return Classification(
+                backbone=torchvision.models.resnet50(num_classes=NUM_CLASSES)
+            )
         elif name == "efficientnet":
-            return Classification(backbone=torchvision.models.efficientnet_b0(num_classes=NUM_CLASSES))
+            return Classification(
+                backbone=torchvision.models.efficientnet_b0(num_classes=NUM_CLASSES)
+            )
         else:
             raise ValueError(f"Unsupported model: {name}")
 

@@ -1,8 +1,9 @@
 # Lance: A Columnar Data Format for Computer Vision
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
+[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
 
-![PyPi](https://img.shields.io/pypi/v/pylance)
+[![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
@@ -49,8 +50,8 @@ import lance
 import duckdb
 
 # Understand Label distribution of Oxford Pet Dataset
-ds = lance.dataset("s3://eto-public/datasets/oxford_pet/pet.lance")
-duckdb.query('select label, count(1) from ds group by label').to_arrow_table()
+ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
+duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
 
 ## What makes Lance different

@@ -12,19 +12,25 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include <arrow/builder.h>
 #include <arrow/dataset/discovery.h>
-#include <arrow/table.h>
 #include <arrow/type.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
+#include <numeric>
 #include <string>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/stl.h"
 #include "lance/arrow/writer.h"
+#include "lance/testing/io.h"
+#include "lance/testing/json.h"
 
 namespace fs = std::filesystem;
+
+using lance::arrow::ToArray;
+using lance::testing::MakeDataset;
+using lance::testing::TableFromJSON;
 
 TEST_CASE("FileSystemFactory Test") {
   auto tmpdir = fs::temp_directory_path();
@@ -32,10 +38,8 @@ TEST_CASE("FileSystemFactory Test") {
   auto uri = std::string("file://") + path.string();
 
   auto schema = arrow::schema({arrow::field("key", arrow::utf8())});
-  arrow::StringBuilder builder;
-  CHECK(builder.AppendValues({"one", "two", "three"}).ok());
-  auto arr = builder.Finish().ValueOrDie();
-  auto table = arrow::Table::Make(schema, {arr});
+  auto table =
+      TableFromJSON(schema, R"([{"key": "one"}, {"key": "two"}, {"key": "three"}])").ValueOrDie();
   auto fs = arrow::fs::FileSystemFromUriOrPath(path).ValueOrDie();
 
   {
@@ -58,4 +62,19 @@ TEST_CASE("FileSystemFactory Test") {
   auto actual_table = scanner->ToTable().ValueOrDie();
   INFO("Expect table: " << table->ToString() << " Actual table: " << actual_table->ToString());
   CHECK(table->Equals(*actual_table));
+}
+
+TEST_CASE("Test CountRows fast path") {
+  auto tmpdir = fs::temp_directory_path();
+  auto path = tmpdir / "test.lance";
+  auto uri = std::string("file://") + path.string();
+
+  auto schema = arrow::schema({arrow::field("key", arrow::utf8())});
+  std::vector<int32_t> values(1000);
+  std::iota(std::begin(values), std::end(values), 1);
+  auto table = ::arrow::Table::Make(schema, {ToArray(values).ValueOrDie()});
+
+  auto dataset = MakeDataset(table, {}, 32).ValueOrDie();
+  auto scanner = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie();
+  CHECK(scanner->CountRows().ValueOrDie() == 1000);
 }

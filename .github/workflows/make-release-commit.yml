@@ -1,0 +1,55 @@
+name: Create release commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Just create the local commit/tags but do not push it'
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      part:
+        description: 'What kind of release is this?'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - minor
+          - major
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out main
+      uses: actions/checkout@v3
+      with:
+        ref: main
+        persist-credentials: false
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+    - name: Call bumpversion
+      uses: ./.github/workflows/bump-version
+      with:
+        part: ${{ inputs.part }}
+        tag: ""
+    - name: Print the version and tag
+      working-directory: python
+      run: |
+        cat lance/version.py
+        git tag | cat
+    - name: Push new version and tag
+      if: ${{ inputs.dry_run }} == "false"
+      uses: changhiskhan/github-push-action@master
+      with:
+        github_token: ${{ secrets.RELEASE_TOKEN }}
+        branch: main
+        tags: true

@@ -21,14 +21,13 @@
 #include <memory>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/format/schema.h"
 #include "lance/format/manifest.h"
+#include "lance/format/schema.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/project.h"
 #include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
 #include "lance/io/writer.h"
-#include "lance/io/reader.h"
 
 const char kLanceFormatTypeName[] = "lance";
 
@@ -72,17 +71,40 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   return impl_->manifest->schema().ToArrow();
 }
 
+::arrow::Future<::arrow::util::optional<int64_t>> LanceFileFormat::CountRows(
+    const std::shared_ptr<::arrow::dataset::FileFragment>& file,
+    ::arrow::compute::Expression predicate,
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
+  if (predicate.Equals(::arrow::compute::literal(true))) {
+    // Fast path.
+    auto executor = options->io_context.executor();
+    assert(executor != nullptr);
+    auto result = executor->Submit(
+        [&](const auto& file) -> ::arrow::Result<::arrow::util::optional<int64_t>> {
+          ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
+          ARROW_ASSIGN_OR_RAISE(auto reader,
+                                lance::io::FileReader::Make(infile, this->impl_->manifest));
+          return ::arrow::util::make_optional(reader->length());
+        },
+        file);
+    if (!result.ok()) {
+      return result.status();
+    }
+    return result.ValueOrDie();
+  }
+  // If filter presented, slow path
+  return FileFormat::CountRows(file, predicate, options);
+}
+
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
-
-  auto batch_reader =
-      lance::io::RecordBatchReader(std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
+  auto batch_reader = lance::io::RecordBatchReader(
+      std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
   ARROW_RETURN_NOT_OK(batch_reader.Open());
-  auto generator = ::arrow::RecordBatchGenerator(std::move(batch_reader));
-  return generator;
+  return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::FileWriter>> LanceFileFormat::MakeWriter(

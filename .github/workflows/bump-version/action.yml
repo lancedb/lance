@@ -1,0 +1,25 @@
+name: Bump version for releases
+description: "Call bumpversion"
+inputs:
+  part:
+    description: 'What kind of release is this?'
+    required: true
+    default: 'release'
+  tag:
+    description: '--no-tag or nothing'
+    required: true
+    default: '--no-tag'
+runs:
+  using: "composite"
+  steps:
+  - name: Set git configs for bumpversion
+    shell: bash
+    run: |
+      git config user.name 'Lance Release'
+      git config user.email 'lance-dev@eto.ai'
+  - name: Create release version and tags
+    working-directory: python
+    shell: bash
+    run: |
+      pip3 install bump2version
+      bumpversion ${{ inputs.part }} ${{ inputs.tag }}

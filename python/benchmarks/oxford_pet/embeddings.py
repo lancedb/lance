@@ -7,11 +7,11 @@ import os
 
 import click
 import pandas as pd
+import PIL
 import pyarrow
 import torch
 import torchvision
 from common import Classification, RawOxfordPetDataset, raw_collate_fn
-import PIL
 from torchvision.models.feature_extraction import create_feature_extractor
 
 import lance

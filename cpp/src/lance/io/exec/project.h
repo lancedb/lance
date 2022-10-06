@@ -21,8 +21,8 @@
 #include <memory>
 #include <optional>
 
+#include "lance/format/schema.h"
 #include "lance/io/exec/base.h"
-
 
 namespace lance::io {
 class FileReader;
@@ -54,9 +54,11 @@ class Project : ExecNode {
   std::string ToString() const override;
 
  private:
-  Project(std::unique_ptr<ExecNode> child);
+  Project(std::unique_ptr<ExecNode> child, std::shared_ptr<lance::format::Schema> projected_schema);
 
   std::unique_ptr<ExecNode> child_;
+
+  std::shared_ptr<lance::format::Schema> projected_schema_;
 };
 
 }  // namespace lance::io::exec

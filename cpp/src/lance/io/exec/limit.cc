@@ -14,6 +14,7 @@
 
 #include "lance/io/exec/limit.h"
 
+#include <arrow/array/util.h>
 #include <arrow/record_batch.h>
 #include <fmt/format.h>
 
@@ -51,18 +52,18 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
     return batch;
   }
   // Find intersection of two ranges (offset, offset + limit) and (seen, seen + batch_size).
-  auto batch_size = batch.batch->num_rows();
+  auto batch_size = batch.length();
   auto left = std::max(offset_, seen_);
   auto right = std::min(seen_ + batch_size, offset_ + limit_);
-  std::shared_ptr<::arrow::RecordBatch> record_batch;
+  ScanBatch limited_batch;
   if (left < right) {
-    record_batch = batch.batch->Slice(left - seen_, right - left);
+    limited_batch = batch.Slice(left - seen_, right - left);
   } else {
     /// No intersection, skip the whole batch.
-    ARROW_ASSIGN_OR_RAISE(record_batch, ::arrow::RecordBatch::MakeEmpty(batch.batch->schema()));
+    limited_batch = batch.Slice(0, 0);
   }
-  seen_ += batch_size;
-  return ScanBatch{record_batch, batch.batch_id};
+  seen_ += batch.length();
+  return limited_batch;
 }
 
 std::string Limit::ToString() const {

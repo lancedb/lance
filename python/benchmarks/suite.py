@@ -1,69 +1,29 @@
-#!/usr/bin/env python3
-# Copyright 2022 Lance Developers
+#  Copyright (c) 2022. Lance Developers
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+#      http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
 
-import multiprocessing as mp
-import os
+"""Benchmark suite"""
 import pathlib
 import time
-from abc import ABC, abstractmethod
 from functools import wraps
-from typing import Iterable, Union
 
 import click
 import pandas as pd
-import pyarrow as pa
 import pyarrow.dataset as ds
-import pyarrow.fs
-import pyarrow.parquet as pq
-from urllib.parse import urlparse
 
 import lance
-from lance.types.image import Image, ImageArray, ImageBinaryType
-
-__all__ = ["download_uris", "timeit", "get_dataset", "get_uri", "BenchmarkSuite"]
 
 KNOWN_FORMATS = ["lance", "parquet", "raw"]
-
-
-def read_file(uri) -> bytes:
-    if not urlparse(uri).scheme:
-        uri = pathlib.Path(uri).expanduser().absolute()
-    fs, key = pyarrow.fs.FileSystem.from_uri(uri)
-    return fs.open_input_file(key).read()
-
-
-def download_uris(uris: Iterable[str], func=read_file) -> Iterable[Image]:
-    if isinstance(uris, pd.Series):
-        uris = uris.values
-    pool = mp.Pool(mp.cpu_count() - 1)
-    data = pool.map(func, uris)
-    return data
-
-
-def timeit(func):
-    @wraps(func)
-    def timeit_wrapper(*args, **kwargs):
-        start_time = time.perf_counter()
-        result = func(*args, **kwargs)
-        end_time = time.perf_counter()
-        total_time = end_time - start_time
-        # first item in the args, ie `args[0]` is `self`
-        print(f"Function {func.__name__}{args} {kwargs} Took {total_time:.4f} seconds")
-        return result
-
-    return timeit_wrapper
 
 
 def get_dataset(uri: str) -> ds.Dataset:
@@ -95,6 +55,8 @@ def get_uri(base_uri: str, dataset_name: str, fmt: str, flavor: str = None) -> s
 
 
 class BenchmarkSuite:
+    """A group of related performance benchmarks"""
+
     def __init__(self, name: str):
         self.name = name
         self._benchmarks = {}
@@ -115,14 +77,8 @@ class BenchmarkSuite:
         return self._benchmarks.values()
 
     def create_main(self):
-        @click.command
-        @click.option(
-            "-u",
-            "--base-uri",
-            required=True,
-            type=str,
-            help="Base uri to the benchmark dataset catalog",
-        )
+        @click.command()
+        @click.argument("base_uri")
         @click.option(
             "-f", "--format", "fmt", help="'lance', 'parquet', or 'raw'. Omit for all"
         )
@@ -147,7 +103,6 @@ class BenchmarkSuite:
                 fmt = [fmt]
             else:
                 fmt = KNOWN_FORMATS
-            base_uri = f"{base_uri}/datasets/{self.name}"
 
             def run_benchmark(bmark):
                 b = bmark.repeat(repeats or 1)
@@ -167,6 +122,8 @@ class BenchmarkSuite:
 
 
 class Benchmark:
+    """A single performance benchmark with convenience to repeat and time"""
+
     def __init__(self, name, func, key=None, num_runs=1):
         self.name = name
         self.func = func
@@ -206,65 +163,3 @@ class Benchmark:
             return timeit_wrapper
 
         return benchmark_decorator
-
-
-class DatasetConverter(ABC):
-    def __init__(self, name, uri_root):
-        self.name = name
-        self.uri_root = uri_root
-
-    @abstractmethod
-    def read_metadata(self) -> pd.DataFrame:
-        pass
-
-    def default_dataset_path(self, fmt, flavor=None):
-        suffix = f"_{flavor}" if flavor else ""
-        return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
-
-    def save_df(self, df, fmt="lance", output_path=None, **kwargs):
-        output_path = output_path or self.default_dataset_path(fmt, "links")
-        table = self._convert_metadata_df(df)
-        if fmt == "parquet":
-            pq.write_table(table, output_path, **kwargs)
-        elif fmt == "lance":
-            pa.dataset.write_dataset(
-                table,
-                output_path,
-                format=lance.LanceFileFormat(),
-                **kwargs,
-            )
-        return table
-
-    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
-        return pa.Table.from_pandas(df, self.get_schema()).unify_dictionaries()
-
-    @abstractmethod
-    def image_uris(self, table):
-        pass
-
-    def make_embedded_dataset(
-        self,
-        table: Union[pa.Table, pd.DataFrame],
-        fmt="lance",
-        output_path=None,
-        **kwargs,
-    ):
-        if isinstance(table, pd.DataFrame):
-            table = self._convert_metadata_df(table)
-        output_path = output_path or self.default_dataset_path(fmt)
-        uris = self.image_uris(table)
-        images = download_uris(pd.Series(uris))
-        image_arr = ImageArray.from_pandas(images)
-        embedded = table.append_column(pa.field("image", ImageBinaryType()),
-                                       image_arr)
-        if fmt == "parquet":
-            pq.write_table(embedded, output_path, **kwargs)
-        elif fmt == "lance":
-            pa.dataset.write_dataset(
-                embedded, output_path, format=lance.LanceFileFormat(), **kwargs
-            )
-        return embedded
-
-    @abstractmethod
-    def get_schema(self):
-        pass

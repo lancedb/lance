@@ -44,7 +44,9 @@ class TrainTransform(torch.nn.Module):
         super().__init__()
         self.transform = T.Compose(
             [
-                T.RandomResizedCrop(crop_size, interpolation=InterpolationMode.BILINEAR),
+                T.RandomResizedCrop(
+                    crop_size, interpolation=InterpolationMode.BILINEAR
+                ),
                 T.RandomHorizontalFlip(),
                 T.PILToTensor(),
                 T.ConvertImageDtype(torch.float),
@@ -54,7 +56,6 @@ class TrainTransform(torch.nn.Module):
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         return self.transform(tensor)
-
 
 
 @click.command()

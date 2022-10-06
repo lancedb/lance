@@ -12,19 +12,22 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """IO utilities"""
+
+import multiprocessing as mp
 import os
+import pathlib
 import shutil
 from io import BytesIO
 from pathlib import Path
-from typing import IO, BinaryIO, Optional, Tuple, Union
+from typing import IO, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
-from pyarrow import fs
 from requests.auth import AuthBase
 
 import lance
 from lance.logging import logger
+from pyarrow import fs
 
 USER_AGENT = f"User-Agent: Lance/{lance.__version__} (contact@eto.ai)"
 
@@ -82,16 +85,16 @@ def copy(source: Union[str, Path], dest: Union[str, Path]) -> str:
 
     Parameters
     ----------
-    source : str
+    source : str or Path
         The source URI to copy from
-    dest : str
+    dest : str or Path
         The destination uri or the destination directory. If ``dest`` is
-        a URI ends with a "/", it represents a directory.
+        an URI ends with "/", it represents a directory.
 
     Return
     ------
     str
-        Return the URI of destination.
+        The URI of destination.
     """
     parsed_source = urlparse(source)
     if dest and dest.endswith("/"):
@@ -112,3 +115,36 @@ def copy(source: Union[str, Path], dest: Union[str, Path]) -> str:
         with dest_fs.open_output_stream(dest_path) as out_stream:
             shutil.copyfileobj(in_stream, out_stream)
     return dest
+
+
+def read_file(uri: str) -> bytes:
+    """
+    Download a single file from given uri
+
+    Parameters
+    ----------
+    uri: str
+        The uri from where the file should be downloaded
+    """
+    if not urlparse(uri).scheme:
+        uri = pathlib.Path(uri).expanduser().absolute()
+    _fs, key = fs.FileSystem.from_uri(uri)
+    return _fs.open_input_file(key).read()
+
+
+def download_uris(uris, num_workers=mp.cpu_count() - 1, func=read_file):
+    """
+    Download an iterable of uris in parallel
+
+    Parameters
+    ----------
+    uris: list-like of str
+        Uris to be downloaded
+    num_workers: int, default multiprocessing.cpu_count() - 1
+        The number of workers to spin up in the Pool
+    func: str -> bytes, default read_file
+        Can be overridden to provide custom behavior or pre/post-processing
+    """
+    pool = mp.Pool(num_workers)
+    data = pool.map(func, uris)
+    return data

@@ -12,13 +12,12 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 """Extension types for computer vision"""
-import platform
 
 import pyarrow as pa
 from pyarrow import ArrowKeyError
 
-from lance.types.base import Point2dType
-from lance.types.box import Box2dArray, Box2dType
+from lance.types.base import Point2dType, Point3dType, Polygon2dType, Polygon3dType
+from lance.types.box import Box2dArray, Box2dType, Box3dArray, Box3dType
 from lance.types.image import (
     Image,
     ImageArray,
@@ -27,19 +26,24 @@ from lance.types.image import (
     ImageType,
     ImageUri,
     ImageUriType,
+    is_image_type,
 )
 from lance.types.label import LabelArray, LabelType
 
 
 def register_extension_types():
-    if platform.system() != "Linux":
-        raise NotImplementedError("Extension types are only supported on Linux for now")
-    try:
-        pa.register_extension_type(ImageUriType())
-        pa.register_extension_type(ImageBinaryType())
-        pa.register_extension_type(Point2dType())
-        pa.register_extension_type(Box2dType())
-        pa.register_extension_type(LabelType())
-    except ArrowKeyError:
-        # already registered
-        pass
+    types = [
+        ImageUriType(),
+        ImageBinaryType(),
+        Point2dType(),
+        Point3dType(),
+        Box2dType(),
+        Box3dType(),
+        LabelType(),
+    ]
+    for t in types:
+        try:
+            pa.register_extension_type(t)
+        except ArrowKeyError:
+            # already registered
+            pass

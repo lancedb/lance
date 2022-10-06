@@ -20,6 +20,8 @@
 
 #include <memory>
 
+#include "lance/format/schema.h"
+
 namespace lance::arrow {
 
 /// Merge two same-length record batches into one.
@@ -33,6 +35,9 @@ namespace lance::arrow {
     const std::shared_ptr<::arrow::StructArray>& rhs,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
-std::string ColumnNameFromFieldRef(const ::arrow::FieldRef& ref);
+/// Merge two Arrow Schemas if they are compatible.
+::arrow::Result<std::shared_ptr<::arrow::Schema>> MergeSchema(const ::arrow::Schema& lhs,
+                                                              const ::arrow::Schema& rhs);
+
 
 }  // namespace lance::arrow

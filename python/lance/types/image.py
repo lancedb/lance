@@ -11,12 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 import io
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import IO, Union
+from typing import IO, Optional, Union
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 from PIL import Image as PILImage
 from pyarrow import fs
@@ -36,6 +38,9 @@ class ImageType(LanceType, ABC):
     def __arrow_ext_serialize__(self):
         return b""
 
+    def __arrow_ext_class__(self):
+        return ImageArray
+
     @classmethod
     def from_storage(cls, storage_type):
         # TODO consider parameterizing types to support utf* variants
@@ -46,9 +51,6 @@ class ImageType(LanceType, ABC):
             return ImageBinaryType()
         else:
             raise NotImplementedError(f"Unrecognized image storage type {storage_type}")
-
-    def __arrow_ext_class__(self):
-        return ImageArray
 
 
 class ImageUriType(ImageType):
@@ -95,7 +97,12 @@ class Image(ABC):
     """
 
     @staticmethod
-    def create(data: Union[bytes, str]):
+    def create(data: Optional[Union[bytes, bytearray, str]]):
+        if pd.isna(data):
+            return None
+        if isinstance(data, bytearray):
+            data = bytes(data)
+
         if isinstance(data, bytes):
             img = ImageBinary(data)
         elif isinstance(data, str):
@@ -111,7 +118,7 @@ class Image(ABC):
         """
         Construct Image from result of Image.to_dict
         """
-        return Image(data.get("data", data.get("uri")))
+        return Image.create(data.get("data", data.get("uri")))
 
     @abstractmethod
     def open(self) -> IO:
@@ -179,6 +186,14 @@ class ImageBinary(Image):
 
     def __init__(self, data: bytes):
         self._bytes = data
+
+    @classmethod
+    def from_numpy(cls, arr: np.ndarray, format: str = "png"):
+        """Construct an Image from a numpy array."""
+        img: PILImage = PILImage.fromarray(arr).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format=format)
+        return ImageBinary(data=buf.getvalue())
 
     @property
     def bytes(self) -> bytes:
@@ -257,14 +272,18 @@ class ImageUri(Image):
 class ImageBinaryScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
 
-    def as_py(self) -> Image:
+    def as_py(self) -> Optional[Image]:
+        if pd.isna(self.value):
+            return None
         return ImageBinary(self.value.as_py())
 
 
 class ImageUriScalar(pa.ExtensionScalar):
     """Used by ExtensionArray.to_pylist()"""
 
-    def as_py(self) -> Image:
+    def as_py(self) -> Optional[Image]:
+        if pd.isna(self.value):
+            return None
         return ImageUri(self.value.as_py())
 
 
@@ -361,3 +380,8 @@ def _ensure_type(images, typ):
     for im in images:
         if not isinstance(im, typ):
             raise TypeError(f"Expecting {typ} but got {type(im)}")
+
+
+def is_image_type(t: pa.DataType) -> bool:
+    """Returns True if the type is an image type"""
+    return isinstance(t, ImageType)

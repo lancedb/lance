@@ -15,19 +15,33 @@
 #include "lance/io/exec/base.h"
 
 #include <memory>
+
+#include "lance/arrow/utils.h"
+
 namespace lance::io::exec {
 
-ScanBatch ScanBatch::Null() { return ScanBatch(nullptr, -1); }
+ScanBatch ScanBatch::Null() { return ScanBatch(nullptr, -1, 0); }
 
-ScanBatch::ScanBatch(std::shared_ptr<::arrow::RecordBatch> records, int32_t bid)
-    : batch(records), batch_id(bid) {}
+ScanBatch::ScanBatch(std::shared_ptr<::arrow::RecordBatch> records,
+                     int32_t bid,
+                     int32_t offset,
+                     std::shared_ptr<::arrow::Int32Array> idx)
+    : batch(std::move(records)), batch_id(bid), offset(offset), indices(std::move(idx)) {}
 
-ScanBatch ScanBatch::Filtered(std::shared_ptr<::arrow::RecordBatch> records,
-                              int32_t batch_id,
-                              std::shared_ptr<::arrow::Int32Array> indices) {
-  auto batch = ScanBatch(records, batch_id);
-  batch.indices = std::move(indices);
-  return batch;
+ScanBatch ScanBatch::Slice(int64_t off, int64_t length) const {
+  auto sliced_batch = batch->Slice(off, length);
+  decltype(indices) sliced_indices;
+  if (indices) {
+    sliced_indices = std::dynamic_pointer_cast<::arrow::Int32Array>(indices->Slice(off, length));
+  }
+  return ScanBatch(sliced_batch, batch_id, offset, sliced_indices);
+}
+
+int64_t ScanBatch::length() const {
+  if (!batch) {
+    return 0;
+  }
+  return batch->num_rows();
 }
 
 }  // namespace lance::io::exec

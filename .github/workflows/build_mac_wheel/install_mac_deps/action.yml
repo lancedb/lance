@@ -1,0 +1,10 @@
+name: install_mac_deps
+description: "Install mac dependencies"
+runs:
+  using: "composite"
+  steps:
+    - name: "brew install base libs"
+      shell: bash
+      run: |        
+        brew update
+        brew install apache-arrow protobuf
