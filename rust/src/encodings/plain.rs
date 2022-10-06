@@ -19,11 +19,13 @@ use arrow::buffer::MutableBuffer;
 use arrow::compute::{subtract_scalar_dyn, take};
 use arrow::datatypes::{ArrowPrimitiveType, Int32Type};
 use arrow2::datatypes::PrimitiveType;
-use arrow2::types::NativeType;
+use arrow2::types::{NativeType};
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
 use arrow2::array::{Array, MutablePrimitiveArray};
-
+use arrow2::array::Int32Array as Int32Array2;
+use arrow2::array::{new_empty_array as new_empty_array2, NullArray, PrimitiveArray};
+use arrow2::compute::arithmetics::basic::{sub_scalar, NativeArithmetics};
 use crate::encodings::Decoder;
 
 /// Plain Decoder
@@ -41,7 +43,8 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
             page_length,
         }
     }
-    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>, dt: PrimitiveType) -> Arc<dyn Array> {
+
+    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>) -> Arc<dyn Array> {
 
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
@@ -56,6 +59,38 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
             builder.push(v);
         }
         builder.into_arc()
+    }
+
+    fn take2<T: NativeType>(&mut self, indices: &Int32Array2) -> arrow2::error::Result<Box<dyn Array>> {
+        if indices.len() == 0 {
+            return Ok(new_empty_array2(T::PRIMITIVE.into()));
+        }
+
+        // let start = indices.value(0);
+        // let length = indices.values().last().map(|i| i - start);
+
+        let start = indices.value(0);
+        let length = indices.values().last().map(|i| i - start);
+
+        // // Not sure why it needs cast.
+        // let values = <PlainDecoder<'a, R> as Decoder<T>>::decode(self, start, &length)?;
+        let values = self.decode2(start, &length);
+        // let reset_indices = match subtract_scalar_dyn::<Int32Type>(&values, start) {
+        //     Ok(arr) => arr,
+        //     Err(e) => return Err(Error::new(ErrorKind::InvalidData, e.to_string())),
+        // };
+        let reset_indices = sub_scalar(&values, &start);
+        // match take(
+        //     &values,
+        //     reset_indices.as_any().downcast_ref::<Int32Array>().unwrap(),
+        //     None,
+        // ) {
+        //     Ok(arr) => Ok(arr),
+        //     Err(e) => Err(Error::new(ErrorKind::InvalidData, format!("Error take indices: {}", e)))
+        // }
+        use arrow2::compute::take::{take as take2};
+
+        take2(&values, &reset_indices)
     }
 }
 
