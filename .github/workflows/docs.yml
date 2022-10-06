@@ -14,9 +14,9 @@ on:
 #  id-token: write
 
 # Allow one concurrent deployment
-concurrency:
-  group: "pages"
-  cancel-in-progress: true
+#concurrency:
+#  group: "pages"
+#  cancel-in-progress: true
 
 jobs:
   # Single deploy job since we're just deploying
@@ -52,6 +52,6 @@ jobs:
         uses: actions/upload-pages-artifact@v1
         with:
           path: 'docs/_build/html'
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v1
+            #- name: Deploy to GitHub Pages
+            #id: deployment
+            #uses: actions/deploy-pages@v1
