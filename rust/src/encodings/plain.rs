@@ -37,6 +37,15 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
             page_length,
         }
     }
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<ArrayRef> {
+
+        let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
+        (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
+        // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
+        let mut buf = vec![0u8; read_len * T::get_byte_width()];
+        (*self.file).read_exact(& mut buf)?;
+        todo!()
+    }
 }
 
 impl<'a, R: Read + Seek, T: ArrowPrimitiveType> Decoder<T> for PlainDecoder<'a, R> {

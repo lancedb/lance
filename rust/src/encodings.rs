@@ -19,6 +19,7 @@ use std::io::Result;
 
 use arrow::array::{Array, ArrayRef, Int32Array};
 use arrow::datatypes::ArrowPrimitiveType;
+use arrow2::datatypes::PrimitiveType;
 
 pub mod plain;
 
