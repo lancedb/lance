@@ -36,7 +36,7 @@ jobs:
           cache-dependency-path: "docs/requirements.txt"
       - name: Install dependencies
         run: |
-          sudo apt install -y -qq doxygen
+          sudo apt install -y -qq doxygen pandoc
       - name: Build Python
         working-directory: python
         run: |
