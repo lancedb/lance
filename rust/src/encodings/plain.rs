@@ -14,13 +14,16 @@
 
 //! Plain encoding
 
-use arrow2::types::{NativeType};
-use std::io::{Read, Result, Seek, SeekFrom};
+use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
+
 use arrow2::array::{Array, MutablePrimitiveArray};
+use arrow2::array::new_empty_array as new_empty_array2;
 use arrow2::array::Int32Array as Int32Array2;
-use arrow2::array::{new_empty_array as new_empty_array2};
-use arrow2::compute::arithmetics::basic::{sub_scalar};
+use arrow2::compute::arithmetics::basic::sub_scalar;
+use arrow2::compute::take::take;
+use arrow2::types::NativeType;
+
 use crate::encodings::Decoder;
 
 /// Plain Decoder
@@ -72,15 +75,14 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
 
         let start = indices.value(0);
         let length = indices.values().last().map(|i| i - start);
-
-        let values = self.decode2::<T>(start, &length)?;
-
+        let values = <PlainDecoder<'a, R> as Decoder<T>>::decode(self, start, &length)?;
         let reset_indices = sub_scalar(&indices, &start);
 
-        use arrow2::compute::take::{take as take2};
-
-        let res = take2(values.as_ref(), &reset_indices);
-        res.into()
+        let res = take(values.as_ref(), &reset_indices);
+        match res {
+            Ok(arr) => Ok(arr),
+            Err(e) => Err(Error::new(ErrorKind::InvalidData, format!("Error take indices: {}", e)))
+        }
     }
 
     fn value(&self, i: usize) -> Result<T> {
