@@ -22,11 +22,13 @@ use arrow2::datatypes::PrimitiveType;
 use arrow2::types::{NativeType};
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
+use std::ops::Sub;
 use arrow2::array::{Array, MutablePrimitiveArray};
 use arrow2::array::Int32Array as Int32Array2;
 use arrow2::array::{new_empty_array as new_empty_array2, NullArray, PrimitiveArray};
 use arrow2::compute::arithmetics::basic::{sub_scalar, NativeArithmetics};
 use crate::encodings::Decoder;
+use arrow2::types::{Index};
 
 /// Plain Decoder
 pub struct PlainDecoder<'a, R: Read + Seek> {
@@ -44,24 +46,29 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
         }
     }
 
-    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>) -> Arc<dyn Array> {
-
+    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>) -> Result<Arc<dyn Array>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
         let byte_size = std::mem::size_of::<T>();
         let mut buf = vec![0u8; read_len * byte_size];//TODO is it right?
-        (*self.file).read_exact(& mut buf)?;
+        (*self.file).read_exact(&mut buf)?;
         let mut builder = MutablePrimitiveArray::with_capacity(read_len);
         for i in 0..read_len {
-            let slice = buf.slice(i * byte_size, (i+1)*byte_size);
-            let v = T::from_le_bytes(slice);//TODO is it right?
-            builder.push(v);
+            let slice = &buf[i * byte_size..(i + 1) * byte_size];
+            let mut bytes = T::Bytes::default();
+            for j in 0..slice.len() {//TODO is there a better way?
+                bytes[j] = slice[j]
+            }
+
+            let v = T::from_le_bytes(bytes);//TODO is it right?
+            builder.push(Option::Some(v));
         }
-        builder.into_arc()
+
+        Ok(builder.into_arc())
     }
 
-    fn take2<T: NativeType>(&mut self, indices: &Int32Array2) -> arrow2::error::Result<Box<dyn Array>> {
+    fn take2<T: NativeType + Index + NativeArithmetics + Sub<Output = T>>(&mut self, indices: &Int32Array2) -> arrow2::error::Result<Box<dyn Array>> {
         if indices.len() == 0 {
             return Ok(new_empty_array2(T::PRIMITIVE.into()));
         }
@@ -74,12 +81,12 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
 
         // // Not sure why it needs cast.
         // let values = <PlainDecoder<'a, R> as Decoder<T>>::decode(self, start, &length)?;
-        let values = self.decode2(start, &length);
+        let values = self.decode2(start, &length)?;
         // let reset_indices = match subtract_scalar_dyn::<Int32Type>(&values, start) {
         //     Ok(arr) => arr,
         //     Err(e) => return Err(Error::new(ErrorKind::InvalidData, e.to_string())),
         // };
-        let reset_indices = sub_scalar(&values, &start);
+        let reset_indices = sub_scalar(&values as &PrimitiveArray<T>, &start as &T);
         // match take(
         //     &values,
         //     reset_indices.as_any().downcast_ref::<Int32Array>().unwrap(),
@@ -90,7 +97,7 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
         // }
         use arrow2::compute::take::{take as take2};
 
-        take2(&values, &reset_indices)
+        take2(&values as &PrimitiveArray<T>, &reset_indices)
     }
 }
 
@@ -109,7 +116,7 @@ impl<'a, R: Read + Seek, T: ArrowPrimitiveType> Decoder<T> for PlainDecoder<'a, 
                 return Err(Error::new(
                     ErrorKind::InvalidData,
                     format!("Invalid builder: {}", e),
-                ))
+                ));
             }
         };
         Ok(make_array(data))
