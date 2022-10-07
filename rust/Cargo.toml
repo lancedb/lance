@@ -16,7 +16,6 @@ name = "lance"
 crate-type=["staticlib", "cdylib", "lib"]
 
 [dependencies]
-arrow = { version = "20.0", default-features = false }
 arrow2 = {version = "0.14.2", features = ["compute_arithmetics", "compute_take"]}
 clap = { version = "3", features = ["derive"] }
 prost = "0.11.0"
