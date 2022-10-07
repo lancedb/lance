@@ -46,7 +46,7 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
         }
     }
 
-    fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>) -> Result<Arc<dyn Array>> {
+    pub fn decode2<T: NativeType>(&mut self, offset: i32, length: &Option<i32>) -> Result<Arc<dyn Array>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
@@ -81,12 +81,12 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
 
         // // Not sure why it needs cast.
         // let values = <PlainDecoder<'a, R> as Decoder<T>>::decode(self, start, &length)?;
-        let values = self.decode2(start, &length)?;
+        let values = self.decode2::<T>(start, &length)?;
         // let reset_indices = match subtract_scalar_dyn::<Int32Type>(&values, start) {
         //     Ok(arr) => arr,
         //     Err(e) => return Err(Error::new(ErrorKind::InvalidData, e.to_string())),
         // };
-        let reset_indices = sub_scalar(&values as &PrimitiveArray<T>, &start as &T);
+        let reset_indices = sub_scalar(&indices, &start);
         // match take(
         //     &values,
         //     reset_indices.as_any().downcast_ref::<Int32Array>().unwrap(),
@@ -97,7 +97,7 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
         // }
         use arrow2::compute::take::{take as take2};
 
-        take2(&values as &PrimitiveArray<T>, &reset_indices)
+        take2(values.as_ref(), &reset_indices)
     }
 }
 
