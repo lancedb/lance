@@ -18,6 +18,7 @@
 #include <arrow/result.h>
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -56,6 +57,7 @@ class Limit : public ExecNode {
   int64_t seen_ = 0;
 
   std::unique_ptr<ExecNode> child_;
+  std::mutex lock_;
 };
 
 }  // namespace lance::io::exec

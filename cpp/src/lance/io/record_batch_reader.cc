@@ -26,8 +26,6 @@
 #include <tuple>
 
 #include "lance/format/metadata.h"
-#include "lance/format/schema.h"
-#include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/project.h"
 #include "lance/io/reader.h"

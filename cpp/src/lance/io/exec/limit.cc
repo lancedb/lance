@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <mutex>
 
 #include "lance/io/exec/scan.h"
 #include "lance/io/reader.h"
@@ -52,18 +53,24 @@ Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noe
     return batch;
   }
   // Find intersection of two ranges (offset, offset + limit) and (seen, seen + batch_size).
+  auto start = 0;
+  auto length = 0;
   auto batch_size = batch.length();
-  auto left = std::max(offset_, seen_);
-  auto right = std::min(seen_ + batch_size, offset_ + limit_);
-  ScanBatch limited_batch;
-  if (left < right) {
-    limited_batch = batch.Slice(left - seen_, right - left);
-  } else {
-    /// No intersection, skip the whole batch.
-    limited_batch = batch.Slice(0, 0);
+
+  {
+    std::lock_guard guard(lock_);
+
+    auto left = std::max(offset_, seen_);
+    auto right = std::min(seen_ + batch_size, offset_ + limit_);
+    if (left < right) {
+      start = left - seen_;
+      length = right - left;
+    }
+    seen_ += batch_size;
   }
-  seen_ += batch.length();
-  return limited_batch;
+  fmt::print("Limit::Next: seen_={} offset_={}, limit={}, batch_size={}, length={} this={}\n",
+             seen_, offset_, limit_, batch_size, length, fmt::ptr(this));
+  return batch.Slice(start, length);
 }
 
 std::string Limit::ToString() const {
