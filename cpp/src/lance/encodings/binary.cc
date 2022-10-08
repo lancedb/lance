@@ -43,8 +43,7 @@ Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& d
 
   ARROW_ASSIGN_OR_RAISE(auto offsets_position, out_->Tell());
   offsets_builder_.Reset();
-  assert(arr->length() > 0);
-  /// Reset the slice's first offset to zero.
+  // Reset the slice's first offset to zero.
   for (int64_t i = 0; i <= arr->length(); ++i) {
     ARROW_RETURN_NOT_OK(
         offsets_builder_.Append(values_position + arr->value_offset(i) - start_offset));
