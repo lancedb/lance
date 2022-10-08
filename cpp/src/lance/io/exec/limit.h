@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include "lance/io/exec/base.h"
+#include "lance/io/exec/counter.h"
 
 namespace lance::io::exec {
 
@@ -36,12 +37,11 @@ class Limit : public ExecNode {
   Limit() = delete;
 
   /// Factory method.
-  static ::arrow::Result<std::unique_ptr<ExecNode>> Make(int64_t limit,
-                                                         int64_t offset,
+  static ::arrow::Result<std::unique_ptr<ExecNode>> Make(std::shared_ptr<Counter> counter,
                                                          std::unique_ptr<ExecNode> child) noexcept;
 
   /// Construct a Limit Clause with limit, and optionally, with offset.
-  explicit Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept;
+  explicit Limit(std::shared_ptr<Counter> counter, std::unique_ptr<ExecNode> child) noexcept;
 
   /// Apply the limits and returns the next batch.
   ::arrow::Result<ScanBatch> Next() override;
@@ -52,12 +52,8 @@ class Limit : public ExecNode {
   std::string ToString() const override;
 
  private:
-  int64_t limit_ = 0;
-  int64_t offset_ = 0;
-  int64_t seen_ = 0;
-
+  std::shared_ptr<Counter> counter_;
   std::unique_ptr<ExecNode> child_;
-  std::mutex lock_;
 };
 
 }  // namespace lance::io::exec

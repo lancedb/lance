@@ -41,14 +41,12 @@ Project::Project(std::unique_ptr<ExecNode> child,
   }
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
 
-  std::optional<int64_t> limit;
-  int64_t offset;
+  std::shared_ptr<Counter> counter;
   if (scan_options->fragment_scan_options &&
       lance::arrow::IsLanceFragmentScanOptions(*scan_options->fragment_scan_options)) {
     auto fso = std::dynamic_pointer_cast<lance::arrow::LanceFragmentScanOptions>(
         scan_options->fragment_scan_options);
-    limit = fso->limit;
-    offset = fso->offset;
+    counter = fso->counter;
   }
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
@@ -59,16 +57,16 @@ Project::Project(std::unique_ptr<ExecNode> child,
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_node,
                           Scan::Make(reader, filter_scan_schema, scan_options->batch_size));
     ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(filter_scan_node)));
-    if (limit.has_value()) {
-      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
+    if (counter) {
+      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
     ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
     ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
     /// (*optionally) Limit -> Scan
     ARROW_ASSIGN_OR_RAISE(child, Scan::Make(reader, projected_schema, scan_options->batch_size));
-    if (limit.has_value()) {
-      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(limit.value(), offset, std::move(child)));
+    if (counter) {
+      ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
   }
   return std::unique_ptr<Project>(new Project(std::move(child), std::move(projected_schema)));

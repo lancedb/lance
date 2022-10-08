@@ -99,6 +99,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
+  fmt::print("LanceFileFormat::ScanBatchesAsync: scan_options={}\n", fmt::ptr(options));
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
   auto batch_reader = lance::io::RecordBatchReader(
