@@ -66,3 +66,7 @@ docs/api/python
 
 **/.ipynb_checkpoints/
 docs/notebooks
+
+# Rust
+Cargo.lock
+target
