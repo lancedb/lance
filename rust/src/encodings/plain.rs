@@ -18,8 +18,8 @@ use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
 
 use arrow2::array::{Array, MutablePrimitiveArray};
-use arrow2::array::new_empty_array as new_empty_array2;
-use arrow2::array::Int32Array as Int32Array2;
+use arrow2::array::new_empty_array;
+use arrow2::array::Int32Array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
 use arrow2::types::NativeType;
@@ -68,9 +68,9 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
         Ok(builder.into_arc())
     }
 
-    fn take(&mut self, indices: &Int32Array2) -> Result<Box<dyn Array>> {
+    fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>> {
         if indices.len() == 0 {
-            return Ok(new_empty_array2(T::PRIMITIVE.into()));
+            return Ok(new_empty_array(T::PRIMITIVE.into()));
         }
 
         let start = indices.value(0);
