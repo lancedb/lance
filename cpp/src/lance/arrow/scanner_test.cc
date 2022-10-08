@@ -349,3 +349,18 @@ TEST_CASE("Test projection over nested field") {
       TableFromJSON(expected_schema, R"([{"annotations": {"name": ["a", "b"]}}])").ValueOrDie();
   CHECK(actual->Equals(*expected_table));
 }
+
+TEST_CASE("Test apply limit to multiple files") {
+  std::vector<int> values(1000);
+  std::iota(values.begin(), values.end(), 1);
+  auto arr = ToArray(values).ValueOrDie();
+  auto schema = ::arrow::schema({::arrow::field("value", ::arrow::int32())});
+  auto table = ::arrow::Table::Make(schema, {arr});
+  auto dataset = lance::testing::MakeDataset(table, {}, 50, 200).ValueOrDie();
+  auto scan_builder = lance::arrow::ScannerBuilder(dataset);
+  CHECK(scan_builder.Project({"value"}).ok());
+  CHECK(scan_builder.Limit(10, 20).ok());
+  auto scanner = scan_builder.Finish().ValueOrDie();
+  auto actual = scanner->ToTable().ValueOrDie();
+  CHECK(actual->num_rows() == 10);
+}
