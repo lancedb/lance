@@ -38,11 +38,13 @@ namespace lance::testing {
 /// \param table The table to write
 /// \param partitions the column names of partitioning.
 /// \param max_rows_per_group the size of each batch group.
+/// \param max_rows_per_file the max number of rows per file.
 /// \return a FileSystem Dataset with lance format.
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
     const std::shared_ptr<::arrow::Table>& table,
     const std::vector<std::string>& partitions = {},
-    uint64_t max_rows_per_group = 0);
+    uint64_t max_rows_per_group = 0,
+    uint64_t max_rows_per_file = 0);
 
 /// A ExecNode that scans a Table in memory.
 ///

@@ -55,7 +55,8 @@ namespace lance::testing {
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> MakeDataset(
     const std::shared_ptr<::arrow::Table>& table,
     const std::vector<std::string>& partitions,
-    uint64_t max_rows_per_group) {
+    uint64_t max_rows_per_group,
+    uint64_t max_rows_per_file) {
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   ARROW_ASSIGN_OR_RAISE(auto scanner_builder, dataset->NewScan());
@@ -81,6 +82,9 @@ namespace lance::testing {
   write_options.basename_template = "part{i}.lance";
   if (max_rows_per_group > 0) {
     write_options.max_rows_per_group = max_rows_per_group;
+  }
+  if (max_rows_per_file > 0) {
+    write_options.max_rows_per_file = max_rows_per_file;
   }
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(write_options, scanner));

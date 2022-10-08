@@ -16,20 +16,21 @@
 
 #include <arrow/dataset/file_base.h>
 
-#include <cstdint>
-#include <optional>
+#include "lance/io/exec/counter.h"
 
 namespace lance::arrow {
 
+/// Lance FragmentScanOptions.
+///
+/// Extra lance scan options.
 class LanceFragmentScanOptions : public ::arrow::dataset::FragmentScanOptions {
  public:
   LanceFragmentScanOptions() = default;
 
-  std::string type_name() const override;
+  [[nodiscard]] std::string type_name() const override;
 
-  /// Support limit / offset pushdown
-  std::optional<int64_t> limit;
-  int64_t offset = 0;
+  /// Singleton of the Limit object shared between one Scan run.
+  std::shared_ptr<lance::io::exec::Counter> counter;
 };
 
 /// Check if the fragment scan option is LanceFragmentScanOptions.

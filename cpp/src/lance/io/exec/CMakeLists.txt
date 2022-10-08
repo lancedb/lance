@@ -1,7 +1,10 @@
 add_library(
         lance_io_exec
         OBJECT
+        base.cc
         base.h
+        counter.cc
+        counter.h
         filter.cc
         filter.h
         limit.cc
@@ -12,7 +15,7 @@ add_library(
         scan.h
         take.cc
         take.h
-        base.cc)
+)
 target_include_directories(lance_io_exec SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_dependencies(lance_io_exec format)
 

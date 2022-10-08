@@ -46,8 +46,7 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
     return ::arrow::Status::Invalid("Limit / offset is invalid: limit=", limit, " offset=", offset);
   }
   auto fragment_opts = std::make_shared<LanceFragmentScanOptions>();
-  fragment_opts->limit = limit;
-  fragment_opts->offset = offset;
+  fragment_opts->counter = std::make_shared<lance::io::exec::Counter>(limit, offset);
 
   return builder_.FragmentScanOptions(fragment_opts);
 }
@@ -95,8 +94,8 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
   if (scanner->options()->fragment_scan_options) {
     auto fso = std::dynamic_pointer_cast<LanceFragmentScanOptions>(
         scanner->options()->fragment_scan_options);
-    if (fso->limit) {
-      scanner->options()->batch_size = fso->limit.value();
+    if (fso->counter) {
+      scanner->options()->batch_size = fso->counter->limit();
       /// We need to limit the parallelism for Project to calculate LIMIT / Offset
       scanner->options()->batch_readahead = 1;
     }

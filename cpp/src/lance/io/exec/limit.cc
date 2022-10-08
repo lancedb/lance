@@ -18,56 +18,33 @@
 #include <arrow/record_batch.h>
 #include <fmt/format.h>
 
-#include <algorithm>
-
 #include "lance/io/exec/scan.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
 
-::arrow::Result<std::unique_ptr<ExecNode>> Limit::Make(int64_t limit,
-                                                       int64_t offset,
+::arrow::Result<std::unique_ptr<ExecNode>> Limit::Make(std::shared_ptr<Counter> counter,
                                                        std::unique_ptr<ExecNode> child) noexcept {
-  auto limit_node = std::make_unique<Limit>(limit, offset, std::move(child));
-  if (limit_node->child_->type() == kScan) {
-    auto scan = dynamic_cast<Scan*>(limit_node->child_.get());
-    ARROW_RETURN_NOT_OK(scan->Seek(offset));
-    limit_node->seen_ = offset;
-  }
-  return std::unique_ptr<ExecNode>(limit_node.release());
+  auto limit_node = std::make_unique<Limit>(std::move(counter), std::move(child));
+  return limit_node;
 }
 
-Limit::Limit(int64_t limit, int64_t offset, std::unique_ptr<ExecNode> child) noexcept
-    : limit_(limit), offset_(offset), child_(std::move(child)) {
-  assert(offset >= 0);
-  assert(limit >= 0);
-}
+Limit::Limit(std::shared_ptr<Counter> counter, std::unique_ptr<ExecNode> child) noexcept
+    : counter_(std::move(counter)), child_(std::move(child)) {}
 
 ::arrow::Result<ScanBatch> Limit::Next() {
-  if (seen_ >= offset_ + limit_) {
+  if (!counter_->HasMore()) {
     return ScanBatch{};
   }
   ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   if (batch.eof()) {
     return batch;
   }
-  // Find intersection of two ranges (offset, offset + limit) and (seen, seen + batch_size).
-  auto batch_size = batch.length();
-  auto left = std::max(offset_, seen_);
-  auto right = std::min(seen_ + batch_size, offset_ + limit_);
-  ScanBatch limited_batch;
-  if (left < right) {
-    limited_batch = batch.Slice(left - seen_, right - left);
-  } else {
-    /// No intersection, skip the whole batch.
-    limited_batch = batch.Slice(0, 0);
-  }
-  seen_ += batch.length();
-  return limited_batch;
+  return counter_->Slice(batch);
 }
 
 std::string Limit::ToString() const {
-  return fmt::format("Limit(n={}, offset={})", limit_, offset_);
+  return fmt::format("Limit(n={}, offset={})", counter_->limit(), counter_->offset());
 }
 
 }  // namespace lance::io::exec

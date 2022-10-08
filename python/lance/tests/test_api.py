@@ -87,3 +87,14 @@ def test_write_dataset_with_metadata(tmp_path: Path):
     schema: pa.Schema = actual.schema
     assert schema.metadata[b"k1"] == b"v1"
     assert schema.metadata[b"k2"] == b"v2"
+
+
+def test_limit_cross_files(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": i, "b": i * 2} for i in range(2000)])
+    ds.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat(),
+                     max_rows_per_group=200, max_rows_per_file=500)
+
+    actual = dataset(tmp_path / "test.lance")
+    t = actual.scanner(columns=["a"], limit=10).to_table()
+    assert (len(t) == 10)
+
