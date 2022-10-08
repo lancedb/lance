@@ -76,7 +76,6 @@ std::string Project::ToString() const { return "Project"; }
 
 ::arrow::Result<ScanBatch> Project::Next() {
   assert(child_);
-  fmt::print("Project::Next: project={} child_={}\n", fmt::ptr(this), fmt::ptr(child_));
   ARROW_ASSIGN_OR_RAISE(auto batch, child_->Next());
   return batch;
 }
