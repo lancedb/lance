@@ -26,7 +26,7 @@ __version__ = version.__version__
 from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
+__all__ = ["dataset", "write_table", "LanceFileFormat", "__version__"]
 
 register_extension_types()
 

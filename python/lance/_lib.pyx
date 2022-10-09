@@ -159,6 +159,10 @@ cdef class LanceFileFormat(FileFormat):
 def WriteTable(table: Table,
                sink: Union[str, Path],
                batch_size: int):
+    if not isinstance(table, Table):
+        # segfaults if this check is not here
+        raise TypeError(f"table must be an pyarrow Table but "
+                        f"got {type(table)} instead")
     arrow_table = pyarrow_unwrap_table(table)
     cdef shared_ptr[COutputStream] out
     get_writer(sink, &out)
