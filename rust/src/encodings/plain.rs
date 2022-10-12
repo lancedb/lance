@@ -17,7 +17,7 @@
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::sync::Arc;
 
-use arrow2::array::{Array, MutablePrimitiveArray};
+use arrow2::array::{Array, MutableArray, MutablePrimitiveArray};
 use arrow2::array::new_empty_array;
 use arrow2::array::Int32Array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
@@ -46,7 +46,7 @@ impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
 impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
     type ArrowType = T;
 
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Arc<dyn Array>> {
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
@@ -65,7 +65,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
             builder.push(Option::Some(v));
         }
 
-        Ok(builder.into_arc())
+        Ok(builder.as_box())
     }
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>> {
