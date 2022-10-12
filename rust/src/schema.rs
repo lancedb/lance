@@ -121,7 +121,7 @@ impl Field {
         }.to_string()
     }
 
-    pub fn is_numeric(t: &DataType) -> bool {
+    fn is_numeric(t: &DataType) -> bool {
         use DataType::*;
         matches!(
             t,
