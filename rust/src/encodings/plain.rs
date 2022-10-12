@@ -15,7 +15,6 @@
 //! Plain encoding
 
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
-use std::sync::Arc;
 
 use arrow2::array::{Array, MutableArray, MutablePrimitiveArray};
 use arrow2::array::new_empty_array;
