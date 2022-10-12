@@ -26,29 +26,23 @@
 
 using std::string;
 
-int inspect(const argparse::ArgumentParser& args) {
-  auto uri = args.get<string>("uri");
-  fmt::print("Inspecting dataset: {}\n", uri);
-  auto result = lance::arrow::OpenDataset(uri);
-  if (!result.ok()) {
-    fmt::print(stderr, "{}\n", result.status());
-    return -1;
-  }
-  auto dataset = result.ValueOrDie();
-  auto frag_result = dataset->GetFragments();
-  if (!frag_result.ok()) {
-    fmt::print(stderr, "{}\n", frag_result.status().ToString());
-    return -1;
-  }
-  auto fragments = std::move(frag_result.ValueOrDie());
-  auto file_fragment =
-      std::dynamic_pointer_cast<::arrow::dataset::FileFragment>(fragments.Next().ValueOrDie());
-  auto infile = dataset->filesystem()->OpenInputFile(file_fragment->source().path()).ValueOrDie();
+::arrow::Status PrintSchema(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
+  auto files = dataset->files();
+  auto infile = dataset->filesystem()->OpenInputFile(files[0]).ValueOrDie();
   auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
   auto schema = reader->schema();
   fmt::print("Lance schema:\n", schema);
   lance::format::Print(schema);
-  return 0;
+  return ::arrow::Status::OK();
+}
+
+::arrow::Status inspect(const argparse::ArgumentParser& args) {
+  auto uri = args.get<string>("uri");
+  fmt::print("Inspecting dataset: {}\n", uri);
+  ARROW_ASSIGN_OR_RAISE(auto dataset, lance::arrow::OpenDataset(uri));
+  ARROW_RETURN_NOT_OK(PrintSchema(dataset));
+
+  return ::arrow::Status::OK();
 }
 
 int main(int argc, char** argv) {
@@ -68,8 +62,13 @@ int main(int argc, char** argv) {
     std::exit(1);
   }
 
+  ::arrow::Status status;
   if (parser.is_subcommand_used("inspect")) {
-    return inspect(inspect_parser);
+    status = inspect(inspect_parser);
+  }
+  if (!status.ok()) {
+    std::cerr << status.ToString() << "\n";
+    std::exit(1);
   }
   return 0;
 }
