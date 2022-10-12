@@ -12,6 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include <arrow/dataset/api.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -21,6 +22,7 @@
 
 #include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
+#include "lance/io/reader.h"
 
 using std::string;
 
@@ -33,13 +35,18 @@ int inspect(const argparse::ArgumentParser& args) {
     return -1;
   }
   auto dataset = result.ValueOrDie();
-  fmt::print("Schema: {} {}\n", dataset->schema(), dataset->schema()->field_names());
   auto frag_result = dataset->GetFragments();
   if (!frag_result.ok()) {
     fmt::print(stderr, "{}\n", frag_result.status().ToString());
     return -1;
   }
   auto fragments = std::move(frag_result.ValueOrDie());
+  auto file_fragment =
+      std::dynamic_pointer_cast<::arrow::dataset::FileFragment>(fragments.Next().ValueOrDie());
+  auto infile = dataset->filesystem()->OpenInputFile(file_fragment->source().path()).ValueOrDie();
+  auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
+  auto schema = reader->schema();
+  fmt::print("Lance schema:\n{}\n", schema);
 
   return 0;
 }

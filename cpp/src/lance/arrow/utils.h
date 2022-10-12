@@ -41,6 +41,7 @@ namespace lance::arrow {
                                                               const ::arrow::Schema& rhs);
 
 /// Open Lance dataset from URI.
-::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> OpenDataset(const std::string& uri);
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
+    const std::string& uri);
 
 }  // namespace lance::arrow

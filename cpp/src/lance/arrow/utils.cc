@@ -227,7 +227,7 @@ template <VarLenListType L>
   return ::arrow::schema(merged_fields);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> OpenDataset(const std::string& uri) {
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(const std::string& uri) {
   std::string path;
   ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUri(uri, &path));
   ::arrow::fs::FileSelector selector;
@@ -239,7 +239,8 @@ template <VarLenListType L>
   ARROW_ASSIGN_OR_RAISE(auto factory,
                         ::arrow::dataset::FileSystemDatasetFactory::Make(
                             fs, selector, format, ::arrow::dataset::FileSystemFactoryOptions()));
-  return factory->Finish();
+  ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
+  return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
 }
 
 }  // namespace lance::arrow
