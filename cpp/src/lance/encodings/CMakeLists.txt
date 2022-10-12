@@ -29,3 +29,4 @@ target_include_directories(encodings SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(binary_test)
 add_lance_test(plain_test)
+add_dependencies(encodings format)

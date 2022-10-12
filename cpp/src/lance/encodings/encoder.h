@@ -21,6 +21,7 @@
 #include <concepts>
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "lance/arrow/type.h"
 
@@ -29,10 +30,26 @@ class RandomAccessFile;
 class OutputStream;
 }  // namespace arrow::io
 
+namespace lance::format::pb {
+enum Encoding : int;
+}
+
 namespace lance::encodings {
 
 template <typename T>
 concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
+
+/// Encoding Enum
+enum Encoding {
+  NONE = 0,
+  PLAIN = 1,
+  VAR_BINARY = 2,
+  DICTIONARY = 3,
+};
+
+Encoding FromProto(lance::format::pb::Encoding pb);
+lance::format::pb::Encoding ToProto(Encoding encoding);
+std::string ToString(Encoding encoding);
 
 /// Encoder. Encodes an array and write it to the output stream.
 ///
