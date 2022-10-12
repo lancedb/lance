@@ -53,7 +53,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 
 ::arrow::Result<bool> LanceFileFormat::IsSupported(
     [[maybe_unused]] const ::arrow::dataset::FileSource& source) const {
-  return true;
+  return source.path().ends_with(".lance");
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFileFormat::Inspect(

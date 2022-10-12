@@ -28,6 +28,7 @@
 #include <string>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/utils.h"
 #include "lance/arrow/writer.h"
 #include "lance/io/reader.h"
 
