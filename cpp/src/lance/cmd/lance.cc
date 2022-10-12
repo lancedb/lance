@@ -34,6 +34,12 @@ int inspect(const argparse::ArgumentParser& args) {
   }
   auto dataset = result.ValueOrDie();
   fmt::print("Schema: {} {}\n", dataset->schema(), dataset->schema()->field_names());
+  auto frag_result = dataset->GetFragments();
+  if (!frag_result.ok()) {
+    fmt::print(stderr, "{}\n", frag_result.status().ToString());
+    return -1;
+  }
+  auto fragments = std::move(frag_result.ValueOrDie());
 
   return 0;
 }
