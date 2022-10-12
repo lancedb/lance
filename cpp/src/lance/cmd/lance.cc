@@ -46,8 +46,8 @@ int inspect(const argparse::ArgumentParser& args) {
   auto infile = dataset->filesystem()->OpenInputFile(file_fragment->source().path()).ValueOrDie();
   auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
   auto schema = reader->schema();
-  fmt::print("Lance schema:\n{}\n", schema);
-
+  fmt::print("Lance schema:\n", schema);
+  lance::format::Print(schema);
   return 0;
 }
 

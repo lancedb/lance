@@ -701,8 +701,23 @@ pb::Field::Type Field::GetNodeType() const {
   }
 }
 
+void Print(const Field& field, const std::string& path, int indent = 0) {
+  auto full_path = path.empty() ? field.name() : path + "." + field.name();
+  fmt::print("{:{}}{}: id={}, type={}, encoding={}\n",
+             " ",
+             indent * 2,
+             full_path,
+             field.id(),
+             field.logical_type(),
+             lance::encodings::ToString(field.encoding()));
+  for (auto& child : field.fields()) {
+    Print(*child, full_path, indent + 1);
+  }
+}
+
 void Print(const Schema& schema) {
   for (auto field : schema.fields()) {
+    Print(*field, "");
   }
 }
 
