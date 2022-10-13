@@ -27,8 +27,6 @@ namespace lance::encodings {
 
 Encoding FromProto(lance::format::pb::Encoding pb) {
   switch (pb) {
-    case lance::format::pb::NONE:
-      return Encoding::NONE;
     case format::pb::PLAIN:
       return PLAIN;
     case format::pb::VAR_BINARY:
@@ -36,7 +34,7 @@ Encoding FromProto(lance::format::pb::Encoding pb) {
     case format::pb::DICTIONARY:
       return DICTIONARY;
     default:
-      assert(false);
+      return NONE;
   }
 }
 
