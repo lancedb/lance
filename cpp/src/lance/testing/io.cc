@@ -28,6 +28,7 @@
 #include <string>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/utils.h"
 #include "lance/arrow/writer.h"
 #include "lance/io/reader.h"
 
@@ -90,15 +91,7 @@ namespace lance::testing {
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(write_options, scanner));
 
   // Read the dataset back
-  ::arrow::fs::FileSelector selector;
-  selector.base_dir = write_options.base_dir;
-  selector.recursive = true;
-  ::arrow::dataset::FileSystemFactoryOptions factory_options;
-  factory_options.partitioning = write_options.partitioning;
-  ARROW_ASSIGN_OR_RAISE(
-      auto factory,
-      ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, factory_options));
-  return factory->Finish();
+  return lance::arrow::OpenDataset(write_options.base_dir, write_options.partitioning);
 }
 
 TableScan::TableScan(const ::arrow::Table& table, int64_t batch_size)

@@ -125,6 +125,9 @@ class Schema final {
   std::unordered_map<std::string, std::string> metadata_;
 };
 
+/// Pretty print Lance Schema.
+void Print(const Schema& schema);
+
 /// \brief Field is the metadata of a column on disk.
 class Field final {
  public:
@@ -167,13 +170,11 @@ class Field final {
 
   bool is_extension_type() const { return !extension_name_.empty(); }
 
-  void set_encoding(lance::format::pb::Encoding encoding);
-
   const std::shared_ptr<::arrow::Array>& dictionary() const;
 
   ::arrow::Status set_dictionary(std::shared_ptr<::arrow::Array> dict_arr);
 
-  lance::format::pb::Encoding encoding() const { return encoding_; };
+  lance::encodings::Encoding encoding() const { return encoding_; };
 
   ::arrow::Result<std::shared_ptr<lance::encodings::Decoder>> GetDecoder(
       std::shared_ptr<::arrow::io::RandomAccessFile> infile);
@@ -237,7 +238,7 @@ class Field final {
   std::string name_;
   std::string logical_type_;
   std::string extension_name_;
-  lance::format::pb::Encoding encoding_ = lance::format::pb::Encoding::NONE;
+  lance::encodings::Encoding encoding_ = lance::encodings::NONE;
 
   // Dictionary type
   int64_t dictionary_offset_ = -1;
@@ -255,6 +256,7 @@ class Field final {
                                    std::shared_ptr<Field> field,
                                    std::vector<std::string> components,
                                    std::size_t comp_idx);
+  friend void Print(const Field& field, const std::string& path, int indent);
 
   std::vector<std::shared_ptr<Field>> children_;
 };

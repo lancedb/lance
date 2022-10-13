@@ -23,6 +23,8 @@ project(lance CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+option(LANCE_BUILD_CMD "Build lance command line tool" ON)
+
 # Default to Debug build if not specified
 if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
     set(CMAKE_BUILD_TYPE Debug)
@@ -43,7 +45,6 @@ if (CMAKE_BUILD_TYPE STREQUAL Debug)
     add_compile_options(-Werror)
 endif ()
 
-# TODO: Fix on linux
 Include(FetchContent)
 
 # TODO: We can remove this package once std::format is available.
@@ -61,6 +62,16 @@ if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     )
     list(APPEND available_contents catch2)
 endif ()
+
+if (LANCE_BUILD_CMD)
+    FetchContent_Declare(
+            argparse
+            GIT_REPOSITORY https://github.com/p-ranav/argparse.git
+            GIT_TAG v2.9
+    )
+    list(APPEND available_contents argparse)
+endif ()
+
 FetchContent_MakeAvailable(${available_contents})
 
 include_directories(${fmt_SOURCE_DIR}/include)

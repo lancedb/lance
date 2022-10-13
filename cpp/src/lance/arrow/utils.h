@@ -15,6 +15,7 @@
 #pragma once
 
 #include <arrow/array.h>
+#include <arrow/dataset/dataset.h>
 #include <arrow/record_batch.h>
 #include <arrow/result.h>
 
@@ -39,5 +40,8 @@ namespace lance::arrow {
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> MergeSchema(const ::arrow::Schema& lhs,
                                                               const ::arrow::Schema& rhs);
 
+/// Open Lance dataset from URI.
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
+    const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning = nullptr);
 
 }  // namespace lance::arrow

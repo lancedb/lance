@@ -29,7 +29,9 @@
 #include "lance/arrow/type.h"
 #include "lance/encodings/binary.h"
 #include "lance/encodings/dictionary.h"
+#include "lance/encodings/encoder.h"
 #include "lance/encodings/plain.h"
+#include "lance/format/format.pb.h"
 
 using std::make_shared;
 using std::string;
@@ -37,15 +39,14 @@ using std::vector;
 
 namespace lance::format {
 
-Field::Field() : id_(-1), parent_(-1), encoding_(pb::NONE) {}
+Field::Field() : id_(-1), parent_(-1) {}
 
 Field::Field(const std::shared_ptr<::arrow::Field>& field)
     : id_(0),
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
-      extension_name_(arrow::GetExtensionName(field->type()).value_or("")),
-      encoding_(pb::NONE) {
+      extension_name_(arrow::GetExtensionName(field->type()).value_or("")) {
   if (is_extension_type()) {
     auto ext_type = std::dynamic_pointer_cast<::arrow::ExtensionType>(field->type());
     Init(ext_type->storage_type());
@@ -65,14 +66,14 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
     auto list_type = std::static_pointer_cast<::arrow::ListType>(dtype);
     children_.emplace_back(
         std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
-    encoding_ = pb::PLAIN;
+    encoding_ = encodings::PLAIN;
   } else if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
-    encoding_ = pb::VAR_BINARY;
+    encoding_ = encodings::VAR_BINARY;
   } else if (::arrow::is_primitive(type_id) || ::arrow::is_fixed_size_binary(type_id) ||
              lance::arrow::is_fixed_size_list(dtype)) {
-    encoding_ = pb::PLAIN;
+    encoding_ = encodings::PLAIN;
   } else if (::arrow::is_dictionary(type_id)) {
-    encoding_ = pb::DICTIONARY;
+    encoding_ = encodings::DICTIONARY;
   }
 }
 
@@ -82,7 +83,7 @@ Field::Field(const pb::Field& pb)
       name_(pb.name()),
       logical_type_(pb.logical_type()),
       extension_name_(pb.extension_name()),
-      encoding_(pb.encoding()),
+      encoding_(lance::encodings::FromProto(pb.encoding())),
       dictionary_offset_(pb.dictionary_offset()),
       dictionary_page_length_(pb.dictionary_page_length()) {}
 
@@ -151,15 +152,16 @@ std::shared_ptr<Field> Field::Get(const std::string_view& name) const {
 }
 
 std::string Field::ToString() const {
+  auto str = fmt::format("{}({}): {}, encoding={}",
+                         name_,
+                         id_,
+                         type()->ToString(),
+                         lance::encodings::ToString(encoding_));
+
   if (is_extension_type()) {
-    return fmt::format("{}({}): {}, encoding={}, extension_name={}",
-                       name_,
-                       id_,
-                       type()->ToString(),
-                       encoding_,
-                       extension_name_);
+    str = fmt::format("{}, extension_name={}", str, extension_name_);
   }
-  return fmt::format("{}({}): {}, encoding={}", name_, id_, type()->ToString(), encoding_);
+  return str;
 }
 
 std::string Field::name() const {
@@ -170,8 +172,6 @@ std::string Field::name() const {
     return name_;
   }
 }
-
-void Field::set_encoding(lance::format::pb::Encoding encoding) { encoding_ = encoding; }
 
 const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
 
@@ -207,11 +207,11 @@ int32_t Field::GetFieldsCount() const {
 std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::OutputStream> sink) {
   switch (encoding_) {
-    case pb::Encoding::PLAIN:
+    case encodings::PLAIN:
       return std::make_shared<lance::encodings::PlainEncoder>(sink);
-    case pb::Encoding::VAR_BINARY:
+    case encodings::VAR_BINARY:
       return std::make_shared<lance::encodings::VarBinaryEncoder>(sink);
-    case pb::Encoding::DICTIONARY:
+    case encodings::DICTIONARY:
       return std::make_shared<lance::encodings::DictionaryEncoder>(sink);
     default:
       fmt::print(stderr, "Encoding {} is not supported\n", encoding_);
@@ -225,7 +225,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
   std::shared_ptr<lance::encodings::Decoder> decoder;
   auto data_type = storage_type();
-  if (encoding() == pb::Encoding::PLAIN) {
+  if (encoding() == encodings::PLAIN) {
     if (logical_type_ == "list" || logical_type_ == "list.struct") {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, ::arrow::int32());
     } else if (data_type->id() == ::arrow::TimestampType::type_id ||
@@ -238,7 +238,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
     } else {
       decoder = std::make_shared<lance::encodings::PlainDecoder>(infile, data_type);
     }
-  } else if (encoding_ == pb::Encoding::VAR_BINARY) {
+  } else if (encoding_ == encodings::VAR_BINARY) {
     if (logical_type_ == "string") {
       decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::StringType>>(
           infile, data_type);
@@ -246,7 +246,7 @@ std::shared_ptr<lance::encodings::Encoder> Field::GetEncoder(
       decoder = std::make_shared<lance::encodings::VarBinaryDecoder<::arrow::BinaryType>>(
           infile, data_type);
     }
-  } else if (encoding_ == pb::Encoding::DICTIONARY) {
+  } else if (encoding_ == encodings::DICTIONARY) {
     auto dict_type = std::static_pointer_cast<::arrow::DictionaryType>(data_type);
     if (!dictionary()) {
       {
@@ -286,7 +286,7 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_id(id_);
   field.set_logical_type(logical_type_);
   field.set_extension_name(extension_name_);
-  field.set_encoding(encoding_);
+  field.set_encoding(::lance::encodings::ToProto(encoding_));
   field.set_dictionary_offset(dictionary_offset_);
   field.set_dictionary_page_length(dictionary_page_length_);
   field.set_type(GetNodeType());
@@ -699,6 +699,30 @@ pb::Field::Type Field::GetNodeType() const {
     return pb::Field::REPEATED;
   } else {
     return pb::Field::LEAF;
+  }
+}
+
+void Print(const Field& field, const std::string& path, int indent = 0) {
+  auto full_path = path.empty() ? field.name() : path + "." + field.name();
+  fmt::print("{:{}}{}: id={}, type={}, encoding={}",
+             " ",
+             indent * 2,
+             full_path,
+             field.id(),
+             field.logical_type(),
+             lance::encodings::ToString(field.encoding()));
+  if (field.is_extension_type()) {
+    fmt::print(", extension={}", field.extension_name_);
+  }
+  fmt::print("\n");
+  for (auto& child : field.fields()) {
+    Print(*child, full_path, indent + 1);
+  }
+}
+
+void Print(const Schema& schema) {
+  for (auto field : schema.fields()) {
+    Print(*field, "");
   }
 }
 

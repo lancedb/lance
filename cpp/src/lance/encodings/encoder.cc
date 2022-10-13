@@ -21,7 +21,52 @@
 
 #include <memory>
 
+#include "lance/format/format.pb.h"
+
 namespace lance::encodings {
+
+Encoding FromProto(lance::format::pb::Encoding pb) {
+  switch (pb) {
+    case format::pb::PLAIN:
+      return PLAIN;
+    case format::pb::VAR_BINARY:
+      return VAR_BINARY;
+    case format::pb::DICTIONARY:
+      return DICTIONARY;
+    default:
+      return NONE;
+  }
+}
+
+lance::format::pb::Encoding ToProto(Encoding encoding) {
+  switch (encoding) {
+    case NONE:
+      return lance::format::pb::NONE;
+    case PLAIN:
+      return lance::format::pb::PLAIN;
+    case VAR_BINARY:
+      return lance::format::pb::VAR_BINARY;
+    case DICTIONARY:
+      return lance::format::pb::DICTIONARY;
+  }
+  // Make gcc happy
+  return lance::format::pb::NONE;
+}
+
+std::string ToString(Encoding encoding) {
+  switch (encoding) {
+    case NONE:
+      return "NONE";
+    case PLAIN:
+      return "PLAIN";
+    case VAR_BINARY:
+      return "VAR_BINARY";
+    case DICTIONARY:
+      return "DICTIONARY";
+  }
+  // Make gcc happy
+  return "NONE";
+}
 
 Decoder::Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
                  std::shared_ptr<::arrow::DataType> type,

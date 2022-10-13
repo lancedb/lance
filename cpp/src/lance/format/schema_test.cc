@@ -161,14 +161,14 @@ TEST_CASE("Fixed size list") {
   auto arrow_field =
       ::arrow::field("fixed_size_list", ::arrow::fixed_size_list(::arrow::int32(), 4));
   auto field = ::lance::format::Field(arrow_field);
-  CHECK(field.encoding() == ::lance::format::pb::PLAIN);
+  CHECK(field.encoding() == ::lance::encodings::PLAIN);
   CHECK(field.logical_type() == "fixed_size_list:int32:4");
 }
 
 TEST_CASE("Fixed size binary") {
   auto arrow_field = ::arrow::field("fs_binary", ::arrow::fixed_size_binary(100));
   auto field = ::lance::format::Field(arrow_field);
-  CHECK(field.encoding() == ::lance::format::pb::PLAIN);
+  CHECK(field.encoding() == ::lance::encodings::PLAIN);
   CHECK(field.logical_type() == "fixed_size_binary:100");
 }
 

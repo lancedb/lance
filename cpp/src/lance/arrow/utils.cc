@@ -14,6 +14,8 @@
 
 #include "lance/arrow/utils.h"
 
+#include <arrow/dataset/discovery.h>
+#include <arrow/filesystem/api.h>
 #include <arrow/result.h>
 #include <arrow/type_traits.h>
 #include <fmt/format.h>
@@ -23,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
 
 namespace lance::arrow {
@@ -222,6 +225,27 @@ template <VarLenListType L>
                                                               const ::arrow::Schema& rhs) {
   ARROW_ASSIGN_OR_RAISE(auto merged_fields, MergeFieldWithChildren(lhs, rhs));
   return ::arrow::schema(merged_fields);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
+    const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning) {
+  std::string path;
+  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
+  ::arrow::fs::FileSelector selector;
+  selector.base_dir = path;
+  selector.recursive = true;
+  selector.allow_not_found = true;
+  auto format = lance::arrow::LanceFileFormat::Make();
+
+  auto options = ::arrow::dataset::FileSystemFactoryOptions();
+  if (partitioning) {
+    options.partitioning = partitioning;
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto factory,
+      ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, options));
+  ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
+  return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
 }
 
 }  // namespace lance::arrow
