@@ -704,13 +704,17 @@ pb::Field::Type Field::GetNodeType() const {
 
 void Print(const Field& field, const std::string& path, int indent = 0) {
   auto full_path = path.empty() ? field.name() : path + "." + field.name();
-  fmt::print("{:{}}{}: id={}, type={}, encoding={}\n",
+  fmt::print("{:{}}{}: id={}, type={}, encoding={}",
              " ",
              indent * 2,
              full_path,
              field.id(),
              field.logical_type(),
              lance::encodings::ToString(field.encoding()));
+  if (field.is_extension_type()) {
+    fmt::print(", extension={}", field.extension_name_);
+  }
+  fmt::print("\n");
   for (auto& child : field.fields()) {
     Print(*child, full_path, indent + 1);
   }

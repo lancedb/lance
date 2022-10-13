@@ -227,7 +227,8 @@ template <VarLenListType L>
   return ::arrow::schema(merged_fields);
 }
 
-::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(const std::string& uri) {
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
+    const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning) {
   std::string path;
   ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUri(uri, &path));
   ::arrow::fs::FileSelector selector;
@@ -236,9 +237,13 @@ template <VarLenListType L>
   selector.allow_not_found = true;
   auto format = lance::arrow::LanceFileFormat::Make();
 
-  ARROW_ASSIGN_OR_RAISE(auto factory,
-                        ::arrow::dataset::FileSystemDatasetFactory::Make(
-                            fs, selector, format, ::arrow::dataset::FileSystemFactoryOptions()));
+  auto options = ::arrow::dataset::FileSystemFactoryOptions();
+  if (partitioning) {
+    options.partitioning = partitioning;
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto factory,
+      ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, options));
   ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
   return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
 }

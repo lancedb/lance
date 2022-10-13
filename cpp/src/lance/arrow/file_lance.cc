@@ -21,7 +21,6 @@
 #include <memory>
 
 #include "lance/arrow/file_lance_ext.h"
-#include "lance/format/format.pb.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/exec/project.h"

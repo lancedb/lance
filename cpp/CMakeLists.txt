@@ -138,7 +138,6 @@ if (LANCE_BUILD_BENCHMARKS)
 endif ()
 
 add_library(lance SHARED ${lance_objects})
-add_library(lance_static STATIC ${lance_objects})
 target_link_libraries(lance PUBLIC
         ${Protobuf_LIBRARIES}
         ${ARROW_SHARED_LIB}

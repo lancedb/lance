@@ -256,6 +256,7 @@ class Field final {
                                    std::shared_ptr<Field> field,
                                    std::vector<std::string> components,
                                    std::size_t comp_idx);
+  friend void Print(const Field& field, const std::string& path, int indent);
 
   std::vector<std::shared_ptr<Field>> children_;
 };
