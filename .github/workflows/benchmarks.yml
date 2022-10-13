@@ -33,7 +33,7 @@ jobs:
     - name: Run test
       working-directory: python/benchmarks
       run: |
-        ./test_dataset.sh ${{ matrix.dataset }} 40
+        ./test_dataset.sh ${{ matrix.dataset }} 200
   functions:
     timeout-minutes: 30
     runs-on: "ubuntu-22.04"

@@ -69,9 +69,9 @@ class OxfordPetConverter(DatasetConverter):
             with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
 
         xml_files = (
-                os.path.join(self.uri_root, "annotations", "xmls/")
-                + with_split.filename
-                + ".xml"
+            os.path.join(self.uri_root, "annotations", "xmls/")
+            + with_split.filename
+            + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
         with_xmls = pd.concat(
@@ -108,9 +108,9 @@ class OxfordPetConverter(DatasetConverter):
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
         with_xmls["external_image"] = with_xmls["filename"].apply(
-            lambda x: os.path.join(self.uri_root, f"images/{x}.jpg"))
-        (with_xmls.reset_index(drop=True)
-         .reset_index(names=["_pk"], inplace=True))
+            lambda x: os.path.join(self.uri_root, f"images/{x}.jpg")
+        )
+        with_xmls = with_xmls.reset_index(drop=True).reset_index(names=["_pk"])
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
