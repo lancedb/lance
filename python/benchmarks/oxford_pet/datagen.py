@@ -47,9 +47,7 @@ class OxfordPetConverter(DatasetConverter):
         super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
         self._data_quality_issues = {}
 
-    def read_metadata(self,
-                      num_rows: int = 0,
-                      check_quality=False) -> pd.DataFrame:
+    def read_metadata(self, num_rows: int = 0, check_quality=False) -> pd.DataFrame:
         df = self._get_index("list")
         self._to_category(df)
         trainval = self._get_index("trainval")
@@ -74,9 +72,10 @@ class OxfordPetConverter(DatasetConverter):
             + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
-        with_xmls = pd.concat([with_split.reset_index(drop=True),
-                               ann_df.drop(columns=["filename"])],
-                              axis=1)
+        with_xmls = pd.concat(
+            [with_split.reset_index(drop=True), ann_df.drop(columns=["filename"])],
+            axis=1,
+        )
 
         if check_quality:
             trainval = df[df.split.isin(["train", "val"])]
@@ -106,6 +105,7 @@ class OxfordPetConverter(DatasetConverter):
             return dict(zip(keys, [[]] * len(keys)))
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
+        with_xmls.reset_index(names=["_pk"], inplace=True)
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -172,6 +172,7 @@ class OxfordPetConverter(DatasetConverter):
             ]
         )
         names = [
+            "_pk",
             "filename",
             "class",
             "species",
@@ -184,6 +185,7 @@ class OxfordPetConverter(DatasetConverter):
             "object",
         ]
         types = [
+            pa.int16(),
             pa.string(),
             pa.dictionary(pa.int8(), pa.string()),
             pa.dictionary(pa.int8(), pa.string()),
@@ -195,7 +197,10 @@ class OxfordPetConverter(DatasetConverter):
             pa.bool_(),
             object_schema,
         ]
-        return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
+        return pa.schema(
+            [pa.field(name, dtype) for name, dtype in zip(names, types)],
+            metadata={"primary_key": "_pk"},
+        )
 
 
 def _get_xml(uri: str):
@@ -216,8 +221,9 @@ def _get_xml(uri: str):
                 obj["truncated"] = bool(int(obj["truncated"]))
                 obj["occluded"] = bool(int(obj["occluded"]))
                 obj["difficult"] = bool(int(obj["difficult"]))
-                obj["bndbox"] = [int(obj["bndbox"][pt])
-                                 for pt in ["xmin", "ymin", "xmax", "ymax"]]
+                obj["bndbox"] = [
+                    int(obj["bndbox"][pt]) for pt in ["xmin", "ymin", "xmax", "ymax"]
+                ]
             return dd
     except Exception:
         return {}
