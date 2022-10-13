@@ -16,6 +16,7 @@
 import os
 import pathlib
 import sys
+from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
@@ -24,6 +25,7 @@ import pyarrow as pa
 import xmltodict
 
 from lance.io import download_uris
+from lance.types import ImageUriType
 
 sys.path.append("..")
 from converter import DatasetConverter
@@ -47,9 +49,7 @@ class OxfordPetConverter(DatasetConverter):
         super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
         self._data_quality_issues = {}
 
-    def read_metadata(self,
-                      num_rows: int = 0,
-                      check_quality=False) -> pd.DataFrame:
+    def read_metadata(self, num_rows: int = 0, check_quality=False) -> pd.DataFrame:
         df = self._get_index("list")
         self._to_category(df)
         trainval = self._get_index("trainval")
@@ -69,14 +69,15 @@ class OxfordPetConverter(DatasetConverter):
             with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
 
         xml_files = (
-            os.path.join(self.uri_root, "annotations", "xmls/")
-            + with_split.filename
-            + ".xml"
+                os.path.join(self.uri_root, "annotations", "xmls/")
+                + with_split.filename
+                + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
-        with_xmls = pd.concat([with_split.reset_index(drop=True),
-                               ann_df.drop(columns=["filename"])],
-                              axis=1)
+        with_xmls = pd.concat(
+            [with_split.reset_index(drop=True), ann_df.drop(columns=["filename"])],
+            axis=1,
+        )
 
         if check_quality:
             trainval = df[df.split.isin(["train", "val"])]
@@ -106,6 +107,10 @@ class OxfordPetConverter(DatasetConverter):
             return dict(zip(keys, [[]] * len(keys)))
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
+        with_xmls["external_image"] = with_xmls["filename"].apply(
+            lambda x: os.path.join(self.uri_root, f"images/{x}.jpg"))
+        (with_xmls.reset_index(drop=True)
+         .reset_index(names=["_pk"], inplace=True))
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
@@ -140,11 +145,8 @@ class OxfordPetConverter(DatasetConverter):
         suffix = f"_{flavor}" if flavor else ""
         return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
-    def image_uris(self, table):
-        return [
-            os.path.join(self.uri_root, f"images/{x}.jpg")
-            for x in table["filename"].to_numpy()
-        ]
+    def image_uris(self, table) -> List[str]:
+        return table["external_image"]
 
     def get_schema(self):
         source_schema = pa.struct(
@@ -172,6 +174,7 @@ class OxfordPetConverter(DatasetConverter):
             ]
         )
         names = [
+            "_pk",
             "filename",
             "class",
             "species",
@@ -182,8 +185,10 @@ class OxfordPetConverter(DatasetConverter):
             "size",
             "segmented",
             "object",
+            "external_image",
         ]
         types = [
+            pa.int16(),
             pa.string(),
             pa.dictionary(pa.int8(), pa.string()),
             pa.dictionary(pa.int8(), pa.string()),
@@ -194,8 +199,12 @@ class OxfordPetConverter(DatasetConverter):
             size_schema,
             pa.bool_(),
             object_schema,
+            ImageUriType(),
         ]
-        return pa.schema([pa.field(name, dtype) for name, dtype in zip(names, types)])
+        return pa.schema(
+            [pa.field(name, dtype) for name, dtype in zip(names, types)],
+            metadata={"primary_key": "_pk"},
+        )
 
 
 def _get_xml(uri: str):
@@ -216,8 +225,9 @@ def _get_xml(uri: str):
                 obj["truncated"] = bool(int(obj["truncated"]))
                 obj["occluded"] = bool(int(obj["occluded"]))
                 obj["difficult"] = bool(int(obj["difficult"]))
-                obj["bndbox"] = [int(obj["bndbox"][pt])
-                                 for pt in ["xmin", "ymin", "xmax", "ymax"]]
+                obj["bndbox"] = [
+                    int(obj["bndbox"][pt]) for pt in ["xmin", "ymin", "xmax", "ymax"]
+                ]
             return dd
     except Exception:
         return {}

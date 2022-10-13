@@ -34,7 +34,7 @@ void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
   auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
   auto schema = reader->schema();
   PrintLine();
-  fmt::print("Lance schema:\n", schema);
+  fmt::print("Schema:\n", schema);
   lance::format::Print(schema);
   return ::arrow::Status::OK();
 }

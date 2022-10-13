@@ -1,0 +1,3 @@
+xmltodict
+click
+s3fs
