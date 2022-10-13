@@ -24,22 +24,19 @@
 #include <string>
 
 #include "lance/arrow/type.h"
+#include "lance/format/format.pb.h"
 
 namespace arrow::io {
 class RandomAccessFile;
 class OutputStream;
 }  // namespace arrow::io
 
-namespace lance::format::pb {
-enum Encoding : int;
-}
-
 namespace lance::encodings {
 
 template <typename T>
 concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
 
-/// Encoding Enum
+/// Encoding type Enum
 enum Encoding {
   NONE = 0,
   PLAIN = 1,
@@ -47,8 +44,11 @@ enum Encoding {
   DICTIONARY = 3,
 };
 
+/// Convert protobuf to Encoding type
 Encoding FromProto(lance::format::pb::Encoding pb);
+/// Convert encoding type to protobuf.
 lance::format::pb::Encoding ToProto(Encoding encoding);
+/// Convert Encoding to string.
 std::string ToString(Encoding encoding);
 
 /// Encoder. Encodes an array and write it to the output stream.
