@@ -230,7 +230,7 @@ template <VarLenListType L>
 ::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
     const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning) {
   std::string path;
-  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUri(uri, &path));
+  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
   ::arrow::fs::FileSelector selector;
   selector.base_dir = path;
   selector.recursive = true;
