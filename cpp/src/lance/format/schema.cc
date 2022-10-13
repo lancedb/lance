@@ -724,6 +724,12 @@ void Print(const Schema& schema) {
   for (auto field : schema.fields()) {
     Print(*field, "");
   }
+  if (!schema.metadata().empty()) {
+    fmt::print("Metadata:\n");
+    for (auto& [k, v] : schema.metadata()) {
+      fmt::print("  {}: {}\n", k, v);
+    }
+  }
 }
 
 }  // namespace lance::format
