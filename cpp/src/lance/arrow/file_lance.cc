@@ -25,6 +25,7 @@
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/exec/project.h"
+#include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
 #include "lance/io/writer.h"
 
