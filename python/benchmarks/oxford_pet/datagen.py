@@ -16,6 +16,7 @@
 import os
 import pathlib
 import sys
+from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
@@ -24,6 +25,7 @@ import pyarrow as pa
 import xmltodict
 
 from lance.io import download_uris
+from lance.types import ImageUriType
 
 sys.path.append("..")
 from converter import DatasetConverter
@@ -67,9 +69,9 @@ class OxfordPetConverter(DatasetConverter):
             with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
 
         xml_files = (
-            os.path.join(self.uri_root, "annotations", "xmls/")
-            + with_split.filename
-            + ".xml"
+                os.path.join(self.uri_root, "annotations", "xmls/")
+                + with_split.filename
+                + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
         with_xmls = pd.concat(
@@ -105,6 +107,8 @@ class OxfordPetConverter(DatasetConverter):
             return dict(zip(keys, [[]] * len(keys)))
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
+        with_xmls["external_image"] = with_xmls["filename"].apply(
+            lambda x: os.path.join(self.uri_root, f"images/{x}.jpg"))
         with_xmls.reset_index(names=["_pk"], inplace=True)
         return with_xmls
 
@@ -140,11 +144,8 @@ class OxfordPetConverter(DatasetConverter):
         suffix = f"_{flavor}" if flavor else ""
         return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
-    def image_uris(self, table):
-        return [
-            os.path.join(self.uri_root, f"images/{x}.jpg")
-            for x in table["filename"].to_numpy()
-        ]
+    def image_uris(self, table) -> List[str]:
+        return table["external_image"]
 
     def get_schema(self):
         source_schema = pa.struct(
@@ -183,6 +184,7 @@ class OxfordPetConverter(DatasetConverter):
             "size",
             "segmented",
             "object",
+            "external_image",
         ]
         types = [
             pa.int16(),
@@ -196,6 +198,7 @@ class OxfordPetConverter(DatasetConverter):
             size_schema,
             pa.bool_(),
             object_schema,
+            ImageUriType(),
         ]
         return pa.schema(
             [pa.field(name, dtype) for name, dtype in zip(names, types)],
