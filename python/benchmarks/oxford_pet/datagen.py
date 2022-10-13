@@ -109,7 +109,8 @@ class OxfordPetConverter(DatasetConverter):
         with_xmls["object"] = with_xmls["object"].apply(_convert)
         with_xmls["external_image"] = with_xmls["filename"].apply(
             lambda x: os.path.join(self.uri_root, f"images/{x}.jpg"))
-        with_xmls.reset_index(names=["_pk"], inplace=True)
+        (with_xmls.reset_index(drop=True)
+         .reset_index(names=["_pk"], inplace=True))
         return with_xmls
 
     def _get_index(self, name: str) -> pd.DataFrame:
