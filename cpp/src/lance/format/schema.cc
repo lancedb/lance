@@ -31,6 +31,7 @@
 #include "lance/encodings/dictionary.h"
 #include "lance/encodings/encoder.h"
 #include "lance/encodings/plain.h"
+#include "lance/format/format.pb.h"
 
 using std::make_shared;
 using std::string;
