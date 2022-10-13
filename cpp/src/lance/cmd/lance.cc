@@ -51,8 +51,8 @@ void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
     num_batches += reader->num_batches();
     total += reader->length();
   }
-  fmt::print("  Number of batches: {}\n", num_batches);
   fmt::print("  Total records: {}\n", total);
+  fmt::print("  Number of batches: {}\n", num_batches);
   fmt::print("  Mean batch size: {}\n", total / num_batches + 1);
   return ::arrow::Status::OK();
 }

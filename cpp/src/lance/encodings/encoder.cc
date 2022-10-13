@@ -49,6 +49,8 @@ lance::format::pb::Encoding ToProto(Encoding encoding) {
     case DICTIONARY:
       return lance::format::pb::DICTIONARY;
   }
+  // Make gcc happy
+  return lance::format::pb::NONE;
 }
 
 std::string ToString(Encoding encoding) {
@@ -62,6 +64,8 @@ std::string ToString(Encoding encoding) {
     case DICTIONARY:
       return "DICTIONARY";
   }
+  // Make gcc happy
+  return "NONE";
 }
 
 Decoder::Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
