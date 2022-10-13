@@ -26,13 +26,33 @@
 
 using std::string;
 
+void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
+
 ::arrow::Status PrintSchema(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
   auto files = dataset->files();
   auto infile = dataset->filesystem()->OpenInputFile(files[0]).ValueOrDie();
   auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
   auto schema = reader->schema();
+  PrintLine();
   fmt::print("Lance schema:\n", schema);
   lance::format::Print(schema);
+  return ::arrow::Status::OK();
+}
+
+::arrow::Status PrintSummary(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
+  assert(dataset);
+  PrintLine();
+  fmt::print("Summary: \n");
+  int num_batches = 0;
+  int total = 0;
+  for (auto file : dataset->files()) {
+    ARROW_ASSIGN_OR_RAISE(auto infile, dataset->filesystem()->OpenInputFile(file));
+    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
+    num_batches += reader->num_batches();
+    total += reader->length();
+  }
+  fmt::print("  Number of batches: {}\n", num_batches);
+  fmt::print("  Total records: {}\n", total);
   return ::arrow::Status::OK();
 }
 
@@ -40,6 +60,7 @@ using std::string;
   auto uri = args.get<string>("uri");
   fmt::print("Inspecting dataset: {}\n", uri);
   ARROW_ASSIGN_OR_RAISE(auto dataset, lance::arrow::OpenDataset(uri));
+  ARROW_RETURN_NOT_OK(PrintSummary(dataset));
   ARROW_RETURN_NOT_OK(PrintSchema(dataset));
 
   return ::arrow::Status::OK();
