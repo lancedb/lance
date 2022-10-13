@@ -53,6 +53,7 @@ void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
   }
   fmt::print("  Number of batches: {}\n", num_batches);
   fmt::print("  Total records: {}\n", total);
+  fmt::print("  Mean batch size: {}\n", total / num_batches + 1);
   return ::arrow::Status::OK();
 }
 
