@@ -6,6 +6,8 @@
 [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
+[![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
+
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
 environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
 queries to training scans.
@@ -40,7 +42,7 @@ We've provided Linux and MacOS wheels for Lance in PyPI. You can install Lance p
 pip install pylance
 ```
 
-Thanks for its Apache Arrow-first APIs, `lance` can be used as a native `Arrow` extension.
+Thanks to its Apache Arrow-first APIs, `lance` can be used as a native `Arrow` extension.
 For example, it enables users to directly use `DuckDB` to analyze lance dataset
 via [DuckDB's Arrow integration](https://duckdb.org/docs/guides/python/sql_on_arrow).
 
