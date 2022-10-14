@@ -6,7 +6,7 @@
 [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
-[![](https://dcbadge.vercel.app/api/server/qs7kJxmMjU?style=flat)](https://discord.gg/qs7kJxmMjU)
+[![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
 environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
