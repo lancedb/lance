@@ -131,21 +131,21 @@ template <ArrowType T>
 
   const int64_t kMinimalBatchBytes = 128 * 1024;  // 128K
 
-  std::vector<std::shared_ptr<::arrow::Array>> arrs;
-  // Read positions in batch
-  std::vector<int32_t> batch_offsets;
-
   typename ::arrow::TypeTraits<T>::BuilderType builder;
   builder.Reserve(indices->length());
 
-  auto read_batch = [&](const std::vector<int32_t>& offsets) {
+  // Read positions in batch
+  std::vector<int32_t> batch_offsets;
+
+  auto read_batch = [&](const std::vector<int32_t>& offsets) -> ::arrow::Status {
     auto start = offsets[0];
     auto length = offsets.back() - start + 1;
     ARROW_ASSIGN_OR_RAISE(auto arr, ToArray(start, length));
     auto binary_arr = std::dynamic_pointer_cast<ArrayType>(arr);
-    for (auto& offset : offsets) {
-      builder.Append(binary_arr->Value(offset - start));
+    for (auto offset : offsets) {
+      ARROW_RETURN_NOT_OK(builder.Append(binary_arr->Value(offset - start)));
     }
+    return ::arrow::Status::OK();
   };
 
   for (int64_t i = 0; i < indices->length(); i++) {
@@ -155,7 +155,7 @@ template <ArrowType T>
     if (!batch_offsets.empty()) {
       if (pos - positions->Value(batch_offsets[0] - start) > kMinimalBatchBytes) {
         // Read the batch now.
-        read_batch(batch_offsets);
+        ARROW_RETURN_NOT_OK(read_batch(batch_offsets));
         batch_offsets.clear();
       }
     }
@@ -163,7 +163,7 @@ template <ArrowType T>
   }
 
   if (!batch_offsets.empty()) {
-    read_batch(batch_offsets);
+    ARROW_RETURN_NOT_OK(read_batch(batch_offsets));
   }
 
   return builder.Finish();
