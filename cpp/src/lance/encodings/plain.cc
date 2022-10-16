@@ -191,10 +191,6 @@ class PlainDecoderImpl : public Decoder {
     return std::min(length.value_or(length_), length_ - start);
   }
 
-  ::arrow::Result<std::shared_ptr<::arrow::Array>> MakeEmpty() const {
-    return ::arrow::MakeEmptyArray(type_, pool_);
-  }
-
  private:
   using ArrayType = typename ::arrow::TypeTraits<T>::ArrayType;
   using BuilderType = typename ::arrow::TypeTraits<T>::BuilderType;

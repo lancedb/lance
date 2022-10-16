@@ -116,6 +116,9 @@ class Decoder {
       std::shared_ptr<::arrow::Int32Array> indices) const;
 
  protected:
+  /// Make empty array.
+  virtual ::arrow::Result<std::shared_ptr<::arrow::Array>> MakeEmpty() const;
+
   std::shared_ptr<::arrow::io::RandomAccessFile> infile_;
   std::shared_ptr<::arrow::DataType> type_;
   int64_t position_ = -1;

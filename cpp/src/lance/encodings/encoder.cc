@@ -97,4 +97,8 @@ void Decoder::Reset(int64_t position, int32_t length) {
   return builder->Finish();
 }
 
+::arrow::Result<std::shared_ptr<::arrow::Array>> Decoder::MakeEmpty() const {
+  return ::arrow::MakeEmptyArray(type_, pool_);
+}
+
 }  // namespace lance::encodings
