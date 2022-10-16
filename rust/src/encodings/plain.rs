@@ -54,7 +54,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
         if TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>() {
             let slice = bytemuck::cast_slice_mut(&mut buffer);
             (*self.file).read_exact(slice)?;
-            let arr  = PrimitiveArray::from_vec(buffer);
+            let arr = PrimitiveArray::from_vec(buffer);
             Ok(Box::new(arr))
         } else {
             let mut slice = vec![0u8; read_len * std::mem::size_of::<T>()];
@@ -72,7 +72,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
                     *slot = T::from_le_bytes(a);
                     Result::Ok(())
                 })?;
-            let arr  = PrimitiveArray::from_vec(buffer);
+            let arr = PrimitiveArray::from_vec(buffer);
             Ok(Box::new(arr))
         }
     }
