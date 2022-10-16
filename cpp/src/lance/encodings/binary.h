@@ -76,7 +76,15 @@ class VarBinaryDecoder : public Decoder {
   ::arrow::Result<std::shared_ptr<::arrow::Array>> ToArray(
       int32_t idx = 0, std::optional<int32_t> length = std::nullopt) const override;
 
+  /// Take Binary By Indices
+  ::arrow::Result<std::shared_ptr<::arrow::Array>> Take(
+      std::shared_ptr<::arrow::Int32Array> indices) const override;
+
  private:
+  /// Get the file positions of the records between offsets [start, start + length)
+  ::arrow::Result<std::shared_ptr<::arrow::Int64Array>> ReadPositions(int32_t start,
+                                                                      int32_t length) const;
+
   using OffsetType = VarBinaryEncoder::OffsetType;
   using OffsetCType = typename VarBinaryEncoder::OffsetType::c_type;
   using OffsetArrayType = typename ::arrow::TypeTraits<VarBinaryEncoder::OffsetType>::ArrayType;
@@ -96,6 +104,73 @@ template <ArrowType T>
 }
 
 template <ArrowType T>
+::arrow::Result<std::shared_ptr<::arrow::Int64Array>> VarBinaryDecoder<T>::ReadPositions(
+    int32_t start, int32_t length) const {
+  auto buf = infile_->ReadAt(position_ + start * sizeof(int64_t), (length + 1) * sizeof(int64_t));
+  if (!buf.ok()) {
+    return ::arrow::Status::IOError(fmt::format(
+        "VarBinaryDecoder::ReadPositions: failed to read positions: start={}, length={}: {}",
+        start,
+        length,
+        buf.status().message()));
+  }
+  return std::make_shared<typename ::arrow::TypeTraits<OffsetType>::ArrayType>(length + 1, *buf);
+}
+
+template <ArrowType T>
+::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::Take(
+    std::shared_ptr<::arrow::Int32Array> indices) const {
+  if (indices->length() == 0) {
+    return MakeEmpty();
+  }
+  auto start = indices->Value(0);
+  auto last = indices->Value(indices->length() - 1);
+  auto length = last - start + 1;
+  ARROW_ASSIGN_OR_RAISE(auto positions, ReadPositions(start, length));
+  assert(positions->length() == length + 1);
+
+  const int64_t kMinimalBatchBytes = 128 * 1024;  // 128K
+
+  std::vector<std::shared_ptr<::arrow::Array>> arrs;
+  // Read positions in batch
+  std::vector<int32_t> batch_offsets;
+
+  typename ::arrow::TypeTraits<T>::BuilderType builder;
+  builder.Reserve(indices->length());
+  for (int64_t i = 0; i < indices->length(); i++) {
+    int cur_offset = indices->Value(i);
+    int position_idx = cur_offset - start;
+    int pos = positions->Value(position_idx);
+    if (!batch_offsets.empty()) {
+      if (pos - positions->Value(batch_offsets[0]) > kMinimalBatchBytes) {
+        // Read the batch now.
+        auto batch_start = batch_offsets[0];
+        auto batch_length = batch_offsets.back() - batch_start + 1;
+        ARROW_ASSIGN_OR_RAISE(auto arr, ToArray(batch_start, batch_length));
+        auto binary_arr = std::dynamic_pointer_cast<ArrayType>(arr);
+        for (auto& offset : batch_offsets) {
+          builder.Append(binary_arr->Value(offset - batch_start));
+        }
+        batch_offsets.clear();
+      }
+    }
+    batch_offsets.emplace_back(cur_offset);
+  }
+
+  if (!batch_offsets.empty()) {
+    auto batch_start = batch_offsets[0];
+    auto batch_length = batch_offsets.back() - batch_start + 1;
+    ARROW_ASSIGN_OR_RAISE(auto arr, ToArray(batch_start, batch_length));
+    auto binary_arr = std::dynamic_pointer_cast<ArrayType>(arr);
+    for (auto& offset : batch_offsets) {
+      builder.Append(binary_arr->Value(offset - batch_start));
+    }
+  }
+  
+  return builder.Finish();
+}
+
+template <ArrowType T>
 ::arrow::Result<std::shared_ptr<::arrow::Array>> VarBinaryDecoder<T>::ToArray(
     int32_t start, std::optional<int32_t> length) const {
   auto len = std::min(length.value_or(length_), length_ - start);
@@ -107,17 +182,7 @@ template <ArrowType T>
                     length_));
   }
 
-  auto offsets_buf =
-      infile_->ReadAt(position_ + start * sizeof(OffsetCType), (len + 1) * sizeof(OffsetCType));
-  if (!offsets_buf.ok()) {
-    return ::arrow::Status::IOError(
-        fmt::format("VarBinaryDecoder::ToArray: failed to read offset: start={}, length={}: {}",
-                    start,
-                    len,
-                    offsets_buf.status().message()));
-  }
-  auto positions =
-      std::make_shared<typename ::arrow::TypeTraits<OffsetType>::ArrayType>(len + 1, *offsets_buf);
+  ARROW_ASSIGN_OR_RAISE(auto positions, ReadPositions(start, len));
   auto start_offset = positions->Value(0);
 
   ::arrow::Int32Builder builder;
