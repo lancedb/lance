@@ -15,8 +15,9 @@
 //! Lance Dataset Schema
 
 use std::fmt;
+use std::fmt::Debug;
 
-use arrow2::datatypes::DataType;
+use arrow2::datatypes::{DataType, TimeUnit};
 
 use crate::encodings::Encoding;
 use crate::format::pb;
@@ -115,8 +116,17 @@ impl Field {
             DataType::Float16 => "halffloat",
             DataType::Float32 => "float",
             DataType::Float64 => "double",
+            DataType::Date32 => "date32:day",
+            DataType::Date64 => "date64:ms",
+            DataType::Time32(unit) => format!("time32:{}", to_str(unit)),
+            DataType::Time64(unit) => format!("time64:{}", to_str(unit)),
+            DataType::Timestamp(unit, _) => format!("timestamp:{}", to_str(unit)),
             DataType::Binary => "binary",
             DataType::Utf8 => "string",
+            DataType::LargeBinary => "largebinary",
+            DataType::LargeUtf8 => "largestring",
+            DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", len),
+            DataType::FixedSizeList(v, len) => format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len),
             _ => panic!(),
         }.to_string()
     }
@@ -153,6 +163,15 @@ impl Field {
             }
         }
         None
+    }
+}
+
+fn to_str(unit: &TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => { "s" }
+        TimeUnit::Millisecond => { "ms" }
+        TimeUnit::Microsecond => { "us" }
+        TimeUnit::Nanosecond => { "ns" }
     }
 }
 
