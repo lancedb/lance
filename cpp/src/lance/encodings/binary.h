@@ -142,7 +142,7 @@ template <ArrowType T>
     int position_idx = cur_offset - start;
     int pos = positions->Value(position_idx);
     if (!batch_offsets.empty()) {
-      if (pos - positions->Value(batch_offsets[0]) > kMinimalBatchBytes) {
+      if (pos - positions->Value(batch_offsets[0] - start) > kMinimalBatchBytes) {
         // Read the batch now.
         auto batch_start = batch_offsets[0];
         auto batch_length = batch_offsets.back() - batch_start + 1;
@@ -166,7 +166,7 @@ template <ArrowType T>
       builder.Append(binary_arr->Value(offset - batch_start));
     }
   }
-  
+
   return builder.Finish();
 }
 
