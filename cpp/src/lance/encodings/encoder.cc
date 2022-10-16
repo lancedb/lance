@@ -87,7 +87,6 @@ void Decoder::Reset(int64_t position, int32_t length) {
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> Decoder::Take(
     std::shared_ptr<::arrow::Int32Array> indices) const {
-  fmt::print("Decoder::Take: {}\n", indices->ToString());
   ARROW_ASSIGN_OR_RAISE(auto builder, ::lance::arrow::GetArrayBuilder(type_, pool_));
   ARROW_RETURN_NOT_OK(builder->Reserve(indices->length()));
   // TODO: use arrow thread pool
