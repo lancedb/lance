@@ -132,7 +132,7 @@ template <ArrowType T>
   const int64_t kMinimalBatchBytes = 128 * 1024;  // 128K
 
   typename ::arrow::TypeTraits<T>::BuilderType builder;
-  builder.Reserve(indices->length());
+  ARROW_RETURN_NOT_OK(builder.Reserve(indices->length()));
 
   // Read positions in batch
   std::vector<int32_t> batch_offsets;
