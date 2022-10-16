@@ -14,9 +14,10 @@
 
 //! Plain encoding
 
+use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
-use arrow2::array::{Array, MutableArray, MutablePrimitiveArray};
+use arrow2::array::{Array, MutableArray, MutablePrimitiveArray, PrimitiveArray};
 use arrow2::array::new_empty_array;
 use arrow2::array::Int32Array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
@@ -48,23 +49,32 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
     fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
-        // let mut mutable_buf = Buffer::new(read_len * T::get_byte_width());
-        let byte_size = std::mem::size_of::<T>();
-        let mut buf = vec![0u8; read_len * byte_size];//TODO is it right?
-        (*self.file).read_exact(&mut buf)?;
-        let mut builder = MutablePrimitiveArray::with_capacity(read_len);
-        for i in 0..read_len {
-            let slice = &buf[i * byte_size..(i + 1) * byte_size];
-            let mut bytes = T::Bytes::default();
-            for j in 0..slice.len() {//TODO is there a better way?
-                bytes[j] = slice[j]
-            }
+        let mut buffer = vec![T::default(); read_len];
 
-            let v = T::from_le_bytes(bytes);//TODO is it right?
-            builder.push(Option::Some(v));
+        if TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>() {
+            let slice = bytemuck::cast_slice_mut(&mut buffer);
+            (*self.file).read_exact(slice)?;
+            let arr  = PrimitiveArray::from_vec(buffer);
+            Ok(Box::new(arr))
+        } else {
+            let mut slice = vec![0u8; read_len * std::mem::size_of::<T>()];
+            (*self.file).read_exact(&mut slice)?;
+            let chunks = slice.chunks_exact(std::mem::size_of::<T>());
+            buffer
+                .as_mut_slice()
+                .iter_mut()
+                .zip(chunks)
+                .try_for_each(|(slot, chunk)| {
+                    let a: T::Bytes = match chunk.try_into() {
+                        Ok(a) => a,
+                        Err(_) => unreachable!(),
+                    };
+                    *slot = T::from_le_bytes(a);
+                    Result::Ok(())
+                })?;
+            let arr  = PrimitiveArray::from_vec(buffer);
+            Ok(Box::new(arr))
         }
-
-        Ok(builder.as_box())
     }
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>> {

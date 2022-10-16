@@ -20,6 +20,7 @@ arrow2 = {version = "0.14.2", features = ["compute_arithmetics", "compute_take"]
 clap = { version = "3", features = ["derive"] }
 prost = "0.11.0"
 byteorder = "1.4"
+bytemuck = "1.12.1"
 
 [build-dependencies]
 prost-build = { version = "0.11" }
