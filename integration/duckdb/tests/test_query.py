@@ -35,3 +35,9 @@ def test_in_rectangle(db: duckdb.DuckDBPyConnection):
     tbl = pa.Table.from_pylist([{"point": [1, 2]}, {"point": [10, 20]}])
     df = db.query("""SELECT in_rectangle(point, [[5, 10], [30, 40]]) AS contain FROM tbl""").to_df()
     assert_series_equal(df.contain, pd.Series([False, True]), check_names=False)
+
+
+def test_list_argmax(db: duckdb.DuckDBPyConnection):
+    for dtype in ["INT", "BIGINT", "FLOAT", "DOUBLE"]:
+        df = db.query(f"""SELECT list_argmax([1, 2, 3, 2, 1]::{dtype}[]) as idx""").to_df()
+        assert_series_equal(df.idx, pd.Series([2], name='idx', dtype='int32'))
