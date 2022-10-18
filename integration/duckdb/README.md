@@ -1,6 +1,6 @@
 # Lance DuckDB Extension
 
-*Linux Only*
+*Linux Only for now*.
 
 ## Functions
 
@@ -27,10 +27,10 @@ SELECT predict('resnet', image) as pred FROM images
 
 Vector functions
 
-| Function                                        | Description                               |
-|-------------------------------------------------|-------------------------------------------|
-| `l2_distance(list[float], list[float])`         | Calculate L2 distance between two vectors |
-| `rect_contains(list[float], list[list[float]])` | Whether the point is in a bounding box    |
+| Function                         | Description                               |
+|----------------------------------|-------------------------------------------|
+| `l2_distance(list, list)`        | Calculate L2 distance between two vectors |
+| `in_rectangle(list, list[list])` | Whether the point is in a bounding box    |
 
 
 ## Development
