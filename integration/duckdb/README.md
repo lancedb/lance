@@ -2,6 +2,8 @@
 
 *Linux Only for now*.
 
+Lance DuckDB extension allows user to run Machine Learning tasks via DuckDB + Lance.
+
 ## Functions
 
 List / Array functions
