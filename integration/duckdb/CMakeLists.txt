@@ -78,16 +78,18 @@ endif()
 
 include_directories(src)
 set(LANCE_EXT_SOURCES
-    # src/contains.cc
-    # src/contains.h
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
     src/lance/duckdb/list_functions.h
     src/lance/duckdb/vector_functions.cc
     src/lance/duckdb/vector_functions.h
-    # src/ml/catalog.cc src/ml/catalog.h src/ml/pytorch.cc src/ml/pytorch.h
-    # src/ml/functions.cc src/ml/functions.h src/similarity.cc src/similarity.h
-)
+    src/lance/duckdb/ml/catalog.cc
+    src/lance/duckdb/ml/catalog.h
+    src/lance/duckdb/ml/pytorch.cc
+    src/lance/duckdb/ml/pytorch.h
+    src/lance/duckdb/ml/functions.cc
+    src/lance/duckdb/ml/functions.h
+    )
 
 set(EXTENSION_STATIC_BUILD 1)
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
