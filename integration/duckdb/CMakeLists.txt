@@ -83,6 +83,8 @@ set(LANCE_EXT_SOURCES
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
     src/lance/duckdb/list_functions.h
+    src/lance/duckdb/vector_functions.cc
+    src/lance/duckdb/vector_functions.h
     # src/ml/catalog.cc src/ml/catalog.h src/ml/pytorch.cc src/ml/pytorch.h
     # src/ml/functions.cc src/ml/functions.h src/similarity.cc src/similarity.h
 )

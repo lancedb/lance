@@ -19,6 +19,7 @@
 //#include "contains.h"
 //#include "ml/functions.h"
 #include "lance/duckdb/list_functions.h"
+#include "lance/duckdb/vector_functions.h"
 
 class LanceExtension : public ::duckdb::Extension {
  public:
@@ -31,6 +32,11 @@ class LanceExtension : public ::duckdb::Extension {
     for (auto& func : lance::duckdb::GetListFunctions()) {
       catalog.CreateFunction(context, func.get());
     }
+
+    for (auto& func : lance::duckdb::GetVectorFunctions()) {
+      catalog.CreateFunction(context, func.get());
+    }
+
   //    auto func = lance::duckdb::GetListFunctions();
   //    catalog.CreateFunction(context, &func);
   //

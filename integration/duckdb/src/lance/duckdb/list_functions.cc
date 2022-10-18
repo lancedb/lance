@@ -44,7 +44,6 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions() {
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
                                ::duckdb::LogicalType::INTEGER,
                                ListArgMax<int64_t>));
-  functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(list_argmax));
   list_argmax.AddFunction(
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
                                ::duckdb::LogicalType::INTEGER,
@@ -57,6 +56,7 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions() {
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
                                ::duckdb::LogicalType::INTEGER,
                                ListArgMax<double>));
+  functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(list_argmax));
 
   return functions;
 }
