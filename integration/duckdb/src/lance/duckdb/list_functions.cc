@@ -36,26 +36,42 @@ void ListArgMax(::duckdb::DataChunk &args,
   }
 }
 
+::duckdb::ScalarFunction ListArgMaxOp(const ::duckdb::LogicalType &type) {
+  switch (type.InternalType()) {
+    case ::duckdb::PhysicalType::INT32:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
+                                      ::duckdb::LogicalType::INTEGER,
+                                      ListArgMax<int>);
+    default:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
+                                      ::duckdb::LogicalType::INTEGER,
+                                      ListArgMax<float>);
+  }
+}
+
+std::unique_ptr<::duckdb::FunctionData> ListArgMaxBind(
+    ::duckdb::ClientContext &context,
+    ::duckdb::ScalarFunction &function,
+    std::vector<std::unique_ptr<::duckdb::Expression>> &arguments) {
+  auto input_type = arguments[0]->return_type;
+  auto name = std::move(function.name);
+  function = ListArgMaxOp(input_type);
+  function.name = std::move(name);
+  if (function.bind) {
+    return function.bind(context, function, arguments);
+  }
+  return nullptr;
+}
+
 std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions() {
   std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> functions;
 
   ::duckdb::ScalarFunctionSet list_argmax("list_argmax");
   list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
+      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::ANY)},
                                ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<int64_t>));
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<int>));
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<float>));
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<double>));
+                               nullptr,
+                               ListArgMaxBind));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(list_argmax));
 
   return functions;

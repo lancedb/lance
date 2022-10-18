@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
+#include <iostream>
 #include <memory>
 
 namespace lance::duckdb {
@@ -38,6 +39,49 @@ void L2Distance(::duckdb::DataChunk &args,
     }
     result.SetValue(i, sum);
   }
+}
+
+::duckdb::ScalarFunction L2DistanceOp(const ::duckdb::LogicalType &type) {
+  if (type.InternalType() != ::duckdb::PhysicalType::LIST) {
+    throw ::duckdb::BinderException("l2_distance expects list type, got: ", type.ToString());
+  }
+  auto child_type = ::duckdb::ListType::GetChildType(type);
+  switch (child_type.InternalType()) {
+    case ::duckdb::PhysicalType::INT32:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
+                                       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
+                                      ::duckdb::LogicalType::INTEGER,
+                                      L2Distance<int>);
+    case ::duckdb::PhysicalType::INT64:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
+                                       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
+                                      ::duckdb::LogicalType::BIGINT,
+                                      L2Distance<int64_t>);
+    case ::duckdb::PhysicalType::FLOAT:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
+                                       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
+                                      ::duckdb::LogicalType::FLOAT,
+                                      L2Distance<float>);
+    default:
+      return ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
+                                       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
+                                      ::duckdb::LogicalType::DOUBLE,
+                                      L2Distance<double>);
+  }
+}
+
+std::unique_ptr<::duckdb::FunctionData> L2DistanceBind(
+    ::duckdb::ClientContext &context,
+    ::duckdb::ScalarFunction &function,
+    std::vector<std::unique_ptr<::duckdb::Expression>> &arguments) {
+  auto input_type = arguments[0]->return_type;
+  auto name = std::move(function.name);
+  function = L2DistanceOp(input_type);
+  function.name = std::move(name);
+  if (function.bind) {
+    return function.bind(context, function, arguments);
+  }
+  return nullptr;
 }
 
 void IsInRectangle(::duckdb::DataChunk &args,
@@ -64,43 +108,15 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetVectorFunctions() 
 
   ::duckdb::ScalarFunctionSet l2_distance("l2_distance");
   l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
-                               ::duckdb::LogicalType::INTEGER,
-                               L2Distance<int>));
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
-                               ::duckdb::LogicalType::BIGINT,
-                               L2Distance<int64_t>));
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
-                               ::duckdb::LogicalType::FLOAT,
-                               L2Distance<float>));
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
-                               ::duckdb::LogicalType::DOUBLE,
-                               L2Distance<double>));
+      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::ANY),
+                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::ANY)},
+                               ::duckdb::LogicalType::ANY,
+                               nullptr,
+                               L2DistanceBind));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(l2_distance));
 
   ::duckdb::ScalarFunctionSet in_rectangle("in_rectangle");
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
+  /// All upcast to double
   in_rectangle.AddFunction(::duckdb::ScalarFunction(
       {::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
        ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE))},
