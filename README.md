@@ -51,6 +51,15 @@ ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
 
+## Directory
+
+```
+/cpp - C++ Lance Core
+/python - Lance Python Wrapper
+/integrations/duckdb - Lance DuckDB Extension
+/python/notebooks - Example Jupyter Notebooks
+```
+
 ## What makes Lance different
 
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://docs.google.com/document/d/1kknVcqRK65YqGkKASuQ40apr2A2DyK0Qtx5nhCPCdqQ/edit).
