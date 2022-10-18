@@ -63,49 +63,49 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetVectorFunctions() 
   std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> functions;
 
   ::duckdb::ScalarFunctionSet l2_distance("l2_distance");
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
-                               ::duckdb::LogicalType::INTEGER,
-                               L2Distance<int>));
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
-                               ::duckdb::LogicalType::BIGINT,
-                               L2Distance<int64_t>));
+//  l2_distance.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
+//                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
+//                               ::duckdb::LogicalType::INTEGER,
+//                               L2Distance<int>));
+//  l2_distance.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
+//                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
+//                               ::duckdb::LogicalType::BIGINT,
+//                               L2Distance<int64_t>));
   l2_distance.AddFunction(
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
                                 ::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
                                ::duckdb::LogicalType::FLOAT,
                                L2Distance<float>));
-  l2_distance.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
-                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
-                               ::duckdb::LogicalType::DOUBLE,
-                               L2Distance<double>));
+//  l2_distance.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
+//                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
+//                               ::duckdb::LogicalType::DOUBLE,
+//                               L2Distance<double>));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(l2_distance));
 
   ::duckdb::ScalarFunctionSet in_rectangle("in_rectangle");
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
+//  in_rectangle.AddFunction(::duckdb::ScalarFunction(
+//      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER),
+//       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER))},
+//      ::duckdb::LogicalType::BOOLEAN,
+//      IsInRectangle));
+//  in_rectangle.AddFunction(::duckdb::ScalarFunction(
+//      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT),
+//       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT))},
+//      ::duckdb::LogicalType::BOOLEAN,
+//      IsInRectangle));
   in_rectangle.AddFunction(::duckdb::ScalarFunction(
       {::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
        ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT))},
       ::duckdb::LogicalType::BOOLEAN,
       IsInRectangle));
-  in_rectangle.AddFunction(::duckdb::ScalarFunction(
-      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
-       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE))},
-      ::duckdb::LogicalType::BOOLEAN,
-      IsInRectangle));
+//  in_rectangle.AddFunction(::duckdb::ScalarFunction(
+//      {::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE),
+//       ::duckdb::LogicalType::LIST(::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE))},
+//      ::duckdb::LogicalType::BOOLEAN,
+//      IsInRectangle));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(in_rectangle));
 
   return functions;

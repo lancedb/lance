@@ -40,22 +40,22 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions() {
   std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> functions;
 
   ::duckdb::ScalarFunctionSet list_argmax("list_argmax");
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<int64_t>));
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<int>));
+//  list_argmax.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::INTEGER)},
+//                               ::duckdb::LogicalType::INTEGER,
+//                               ListArgMax<int>));
+//  list_argmax.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::BIGINT)},
+//                               ::duckdb::LogicalType::INTEGER,
+//                               ListArgMax<int64_t>));
   list_argmax.AddFunction(
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
                                ::duckdb::LogicalType::INTEGER,
                                ListArgMax<float>));
-  list_argmax.AddFunction(
-      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<double>));
+//  list_argmax.AddFunction(
+//      ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::DOUBLE)},
+//                               ::duckdb::LogicalType::INTEGER,
+//                               ListArgMax<double>));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(list_argmax));
 
   return functions;
