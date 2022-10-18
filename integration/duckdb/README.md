@@ -35,7 +35,17 @@ Vector functions
 
 ## Development
 
-```shell
+Currently, Machine Learning functions only works on Linux.
 
-make
+To build the extension, run:
+
+```shell
+make release-linux
+```
+
+Load extension in Python
+```python
+import duckdb
+duckdb.install_extension("./path/to/lance.duckdb_extension")
+duckdb.load_extension("lance")
 ```
