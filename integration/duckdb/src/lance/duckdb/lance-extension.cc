@@ -16,9 +16,8 @@
 
 #include <duckdb.hpp>
 
-//#include "contains.h"
-//#include "ml/functions.h"
 #include "lance/duckdb/list_functions.h"
+#include "lance/duckdb/ml/functions.h"
 #include "lance/duckdb/vector_functions.h"
 
 class LanceExtension : public ::duckdb::Extension {
@@ -29,27 +28,21 @@ class LanceExtension : public ::duckdb::Extension {
     auto &context = *con.context;
     auto &catalog = ::duckdb::Catalog::GetCatalog(context);
 
-    for (auto& func : lance::duckdb::GetListFunctions()) {
+    for (auto &func : lance::duckdb::GetListFunctions()) {
       catalog.CreateFunction(context, func.get());
     }
 
-    for (auto& func : lance::duckdb::GetVectorFunctions()) {
+    for (auto &func : lance::duckdb::GetVectorFunctions()) {
       catalog.CreateFunction(context, func.get());
     }
 
-  //    auto func = lance::duckdb::GetListFunctions();
-  //    catalog.CreateFunction(context, &func);
-  //
-  //    func = lance::duckdb::IsInRectangleFunction();
-  //    catalog.CreateFunction(context, &func);
-  //
-  //    for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
-  //      catalog.CreateFunction(context, func.get());
-  //    }
-  //
-  //    for (auto& func : lance::duckdb::ml::GetMLTableFunctions()) {
-  //      catalog.CreateTableFunction(context, func.get());
-  //    }
+    for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
+      catalog.CreateFunction(context, func.get());
+    }
+
+    for (auto &func : lance::duckdb::ml::GetMLTableFunctions()) {
+      catalog.CreateTableFunction(context, func.get());
+    }
 
     con.Commit();
   }

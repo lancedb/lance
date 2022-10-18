@@ -16,14 +16,11 @@
 
 #include <torch/script.h>
 
-#include <duckdb.hpp>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <opencv2/opencv.hpp>
 #include <string>
-#include <utility>
 
 namespace lance::duckdb::ml {
 
@@ -123,34 +120,12 @@ void Predict(::duckdb::DataChunk& args,
   model->Execute(args, state, result);
 }
 
-void ListArgMax(::duckdb::DataChunk& args,
-                ::duckdb::ExpressionState& state,
-                ::duckdb::Vector& result) {
-  result.SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
-  for (::duckdb::idx_t i = 0; i < args.size(); i++) {
-    // TODO: vectorize argmax.
-    auto values = ::duckdb::ListValue::GetChildren(args.data[0].GetValue(i));
-    auto max_iter = std::max_element(std::begin(values), std::end(values), [](auto a, auto b) {
-      return a.template GetValue<float>() < b.template GetValue<float>();
-    });
-    auto idx_max = std::distance(std::begin(values), max_iter);
-    result.SetValue(i, idx_max);
-  }
-}
-
 std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetPyTorchFunctions() {
   /// Initialize singleton
   auto catalog = ModelCatalog::Get();
   assert(catalog != nullptr);
 
   std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> functions;
-
-  functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(
-      ::duckdb::ScalarFunction("list_argmax",
-                               {::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT)},
-                               ::duckdb::LogicalType::INTEGER,
-                               ListArgMax)));
-
   // Predict
   ::duckdb::ScalarFunctionSet predict("predict");
   predict.AddFunction(
