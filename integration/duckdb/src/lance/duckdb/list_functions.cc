@@ -70,7 +70,7 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions() {
   list_argmax.AddFunction(
       ::duckdb::ScalarFunction({::duckdb::LogicalType::LIST(::duckdb::LogicalType::ANY)},
                                ::duckdb::LogicalType::INTEGER,
-                               ListArgMax<int>,
+                               nullptr,
                                ListArgMaxBind));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(list_argmax));
 

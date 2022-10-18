@@ -26,6 +26,9 @@ def test_l2_distance(db: duckdb.DuckDBPyConnection):
     expected = pd.Series(((embeddings - v1) ** 2).sum(axis=1))
     assert np.allclose(df.score.to_numpy(), expected)
 
+    df = db.query("""SELECT l2_distance([1, 2], [1, 2]) as score""").to_df()
+    assert_series_equal(df.score, pd.Series([0], name="score", dtype='int32'))
+
 
 def test_in_rectangle(db: duckdb.DuckDBPyConnection):
     tbl = pa.Table.from_pylist([{"box": [[1, 2], [3, 4]]}, {"box": [[10, 20], [30, 45]]}])
