@@ -43,7 +43,10 @@ fn main() {
             let f = File::open(path).unwrap();
             let reader = FileReader::new(f).unwrap();
             println!("Number of RecordBatch: {}", reader.num_chunks());
-            println!("Schema: {}\n", reader.schema())
+            println!("Schema: {}\n", reader.schema());
+            use std::any::TypeId;
+            let is_little_endian = TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>();
+            println!("Is little endian {:?}", is_little_endian)
         }
     }
 }

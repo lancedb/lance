@@ -16,9 +16,10 @@
 
 use std::fmt;
 use std::io::Result;
+use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int32Array};
-use arrow::datatypes::ArrowPrimitiveType;
+use arrow2::array::{Array, Int32Array};
+use arrow2::types::NativeType;
 
 pub mod plain;
 
@@ -46,12 +47,12 @@ pub trait Encoder {
 }
 
 /// Decoder.
-pub trait Decoder<T: ArrowPrimitiveType> {
+pub trait Decoder<T: NativeType> {
     type ArrowType;
 
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<ArrayRef>;
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> ;
 
-    fn take(&mut self, indices: &Int32Array) -> Result<ArrayRef>;
+    fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>>;
 
-    fn value(&self, i: usize) -> Result<T::Native>;
+    fn value(&self, i: usize) -> Result<T>;
 }
