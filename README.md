@@ -51,14 +51,14 @@ ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
 
-## Directory
+## Important directories
 
-```
-/cpp - C++ Lance Core
-/python - Lance Python Wrapper
-/integrations/duckdb - Lance DuckDB Extension
-/python/notebooks - Example Jupyter Notebooks
-```
+| Directory                                  | Description                            |
+|--------------------------------------------|----------------------------------------|
+| [cpp](./cpp)                               | Source code for Eto services and sites |
+| [python](./python)                         | Infrastructure as code                 |
+| [notebooks](./python/notebooks)            | Build scripts for supporting services  |
+| [duckdb extension](./integration/duckdb)   | Lance Duckdb extension                 |
 
 ## What makes Lance different
 
