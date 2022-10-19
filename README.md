@@ -2,9 +2,9 @@
 
 <center>SELECT predict(‘resnet’, image) FROM dataset</center>
 
-Lance is a database plugin designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
+Lance is an Arrow compatible data format and DuckDB extension designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
 
-Lance currently supports DuckDB and Apache Arrow.
+Lance is deep learning for humans.
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
