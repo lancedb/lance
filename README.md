@@ -1,6 +1,8 @@
 # Lance: Deep Learning with DuckDB and Arrow
 
-```SELECT predict(‘resnet’, image) FROM dataset```
+```sql
+SELECT predict(‘resnet’, image) FROM dataset
+```
 
 Lance is an Arrow and DuckDB compatible extension designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
 
@@ -55,9 +57,9 @@ duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 
 | Directory                                  | Description                            |
 |--------------------------------------------|----------------------------------------|
-| [cpp](./cpp)                               | Source code for Eto services and sites |
-| [python](./python)                         | Infrastructure as code                 |
-| [notebooks](./python/notebooks)            | Build scripts for supporting services  |
+| [cpp](./cpp)                               | Core Lance Format |
+| [python](./python)                         | Python SDK (Pylance)                |
+| [notebooks](./python/notebooks)            | Jupyter Notebooks                      |
 | [duckdb extension](./integration/duckdb)   | Lance Duckdb extension                 |
 
 ## What makes Lance different
