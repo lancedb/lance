@@ -15,8 +15,9 @@
 //! Lance Dataset Schema
 
 use std::fmt;
+use std::fmt::Debug;
 
-use arrow::datatypes::DataType;
+use arrow2::datatypes::{DataType, TimeUnit};
 
 use crate::encodings::Encoding;
 use crate::format::pb;
@@ -38,19 +39,19 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn new(field: &arrow::datatypes::Field) -> Field {
+    pub fn new(field: &arrow2::datatypes::Field) -> Field {
         Field {
             id: -1,
             parent_id: -1,
-            name: field.name().clone(),
-            logical_type: field.data_type().to_string(),
+            name: field.name.clone(),
+            logical_type: Self::type_str(field.data_type().to_logical_type()),
             extension_name: String::new(),
             encoding: match field.data_type() {
-                t if DataType::is_numeric(t) => Some(Encoding::Plain),
+                t if Self::is_numeric(t) => Some(Encoding::Plain),
                 DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                     Some(Encoding::VarBinary)
                 }
-                DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
+                DataType::Dictionary(_, _, _) => Some(Encoding::Dictionary),
                 _ => None,
             },
             node_type: 0,
@@ -100,6 +101,53 @@ impl Field {
         }
     }
 
+    /// Return Arrow Data Type name.
+    pub fn type_str(t: &DataType) -> String {
+        match t {
+            DataType::Boolean => "bool",
+            DataType::UInt8 => "uint8",
+            DataType::Int8 => "int8",
+            DataType::UInt16 => "uint16",
+            DataType::Int16 => "int16",
+            DataType::UInt32 => "uint32",
+            DataType::Int32 => "int32",
+            DataType::UInt64 => "uint64",
+            DataType::Int64 => "int64",
+            DataType::Float16 => "halffloat",
+            DataType::Float32 => "float",
+            DataType::Float64 => "double",
+            DataType::Date32 => "date32:day",
+            DataType::Date64 => "date64:ms",
+            DataType::Time32(unit) => format!("time32:{}", to_str(unit)),
+            DataType::Time64(unit) => format!("time64:{}", to_str(unit)),
+            DataType::Timestamp(unit, _) => format!("timestamp:{}", to_str(unit)),
+            DataType::Binary => "binary",
+            DataType::Utf8 => "string",
+            DataType::LargeBinary => "largebinary",
+            DataType::LargeUtf8 => "largestring",
+            DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", len),
+            DataType::FixedSizeList(v, len) => format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len),
+            _ => panic!(),
+        }.to_string()
+    }
+
+    fn is_numeric(t: &DataType) -> bool {
+        use DataType::*;
+        matches!(
+            t,
+            UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Int8
+                | Int16
+                | Int32
+                | Int64
+                | Float32
+                | Float64
+        )
+    }
+
     fn insert(&mut self, child: Field) {
         self.children.push(child)
     }
@@ -115,6 +163,15 @@ impl Field {
             }
         }
         None
+    }
+}
+
+fn to_str(unit: &TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => { "s" }
+        TimeUnit::Millisecond => { "ms" }
+        TimeUnit::Microsecond => { "us" }
+        TimeUnit::Nanosecond => { "ns" }
     }
 }
 
@@ -147,10 +204,10 @@ pub struct Schema {
 
 impl Schema {
     /// Create a Schema from arrow schema.
-    pub fn new(schema: &arrow::datatypes::Schema) -> Schema {
+    pub fn new(schema: &arrow2::datatypes::Schema) -> Schema {
         Schema {
             fields: schema
-                .fields()
+                .fields
                 .iter()
                 .map(Field::new)
                 .collect(),

@@ -57,6 +57,10 @@ python/wheels
 logs
 *.ckpt
 
+# Rust
+Cargo.lock
+target
+
 docs/_build
 docs/api/python
 
