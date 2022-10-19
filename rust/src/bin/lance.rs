@@ -46,7 +46,7 @@ fn main() {
             println!("Schema: {}\n", reader.schema());
             use std::any::TypeId;
             let is_little_endian = TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>();
-            println!("is little endian {:?}", is_little_endian)
+            println!("Is little endian {:?}", is_little_endian)
         }
     }
 }
