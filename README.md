@@ -1,30 +1,30 @@
-# Lance: A Columnar Data Format for Computer Vision
+# Lance: Deep Learning with DuckDB and Arrow
 
-![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
-[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
+<center>SELECT predict(‘resnet’, image) FROM dataset</center>
 
-[![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
-![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+Lance is an Arrow and DuckDB compatible extension designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
 
-[![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
+Lance is deep learning for humans.
 
-Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
-environments. Lance delivers blazing fast performance for image and video data use cases from exploratory data analysis to training and evaluation.
+![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
-Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from Parquet with a single line of code.
+Lance delivers blazing fast performance for visual data use cases from exploratory data analysis to training and evaluation.
+
+Lance is powered by <i>Lance Format</i>, an alternative to Parquet that is optimized with visual data. With first class Apache Arrow integration, Lance Format is queryable using DuckDB out of the box and can be converted from Parquet with a single line of code.
 
 ## What problems does Lance solve?
 
 Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML Engineering and Data Science community.
 
 ### Working with computer vision data for ML is different from working with tabular data:
-- Performance: images, video, audio and point clouds are large blobs that are difficult and slow to query by existing engines
-- Nested semantics: data annotations are almost always deeply nested, which means metadata and nested fields are written to separate files, and stored in different locations (i.e. S3 vs CSV/XML)
-- Siloed datasets across tools: exploratory data analysis, labeling, training and evaluation uses different tools requiring different formats, with no source of truth, making consistent versioning and reproducibility challenging
-- Vector space: increasingly ML is making use of vector-based semantics and embeddings, but it is challenging to query across both vectors and other column types in a performant and usable way
+- Visual data are large blobs that are difficult and slow to query by existing engines
+- Annotations are deeply nested and stored in different locations (i.e. S3 vs CSV/XML)
+- Exploratory data analysis, labeling, training and evaluation uses different tools requiring different formats that are optimized for certain use cases, but this leads to fragmentation and complicates lineage
+- Deep learning is increasingly making use of vector-based semantics and embeddings, it is challenging to query across both vectors and other column types in a performant and usable way
 
 ### Lance to the rescue
 To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
+- Use SQL to run embeddings, models and other arbitarily complex transformations fast!
 - Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
 - Rich ML data types and integrations to eliminate manual data conversions
 - Support for vector and search indices, versioning, and schema evolution
@@ -58,8 +58,7 @@ duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 | [cpp](./cpp)                               | Source code for Eto services and sites |
 | [python](./python)                         | Infrastructure as code                 |
 | [notebooks](./python/notebooks)            | Build scripts for supporting services  |
-| [duckdb extension](./integration/duckdb)  | Lance Duckdb extension                 |
-
+| [duckdb extension](./integration/duckdb)   | Lance Duckdb extension                 |
 
 ## What makes Lance different
 
