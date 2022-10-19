@@ -58,7 +58,7 @@ duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 | [cpp](./cpp)                               | Source code for Eto services and sites |
 | [python](./python)                         | Infrastructure as code                 |
 | [notebooks](./python/notebooks)            | Build scripts for supporting services  |
-| [duckdb extension](./integrations/duckdb)  | Lance Duckdb extension                 |
+| [duckdb extension](./integration/duckdb)  | Lance Duckdb extension                 |
 
 
 ## What makes Lance different
