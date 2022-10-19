@@ -1,6 +1,6 @@
 # Lance: Deep Learning with DuckDB and Arrow
 
-<center>SELECT predict(‘resnet’, image) FROM dataset</center>
+```SELECT predict(‘resnet’, image) FROM dataset```
 
 Lance is an Arrow and DuckDB compatible extension designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
 
