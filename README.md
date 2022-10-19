@@ -9,24 +9,19 @@
 [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
 Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
-environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
-queries to training scans.
+environments. Lance delivers blazing fast performance for image and video data use cases from exploratory data analysis to training and evaluation.
 
-Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
+Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from Parquet with a single line of code.
 
 ## What problems does Lance solve?
 
-Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML engineering community.
+Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML Engineering and Data Science community.
 
-### Working with vision data for ML is different from working with tabular data:
-- Training, analytics, and labeling uses different tools requiring different formats
-- Data annotations are almost always deeply nested
-- Images / videos are large blobs that are difficult to query by existing engines
-
-### This results in some major pain-points:
-- Too much time spent on low level data munging
-- Multiple copies creates data quality issues, even for well-known datasets
-- Reproducibility and data versioning is extremely difficult to achieve
+### Working with computer vision data for ML is different from working with tabular data:
+- Performance: images, video, audio and point clouds are large blobs that are difficult and slow to query by existing engines
+- Nested semantics: data annotations are almost always deeply nested, which means metadata and nested fields are written to separate files, and stored in different locations (i.e. S3 vs CSV/XML)
+- Siloed datasets across tools: exploratory data analysis, labeling, training and evaluation uses different tools requiring different formats, with no source of truth, making consistent versioning and reproducibility challenging
+- Vector space: increasingly ML is making use of vector-based semantics and embeddings, but it is challenging to query across both vectors and other column types in a performant and usable way
 
 ### Lance to the rescue
 To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
@@ -55,6 +50,16 @@ import duckdb
 ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
+
+## Important directories
+
+| Directory                                  | Description                            |
+|--------------------------------------------|----------------------------------------|
+| [cpp](./cpp)                               | Source code for Eto services and sites |
+| [python](./python)                         | Infrastructure as code                 |
+| [notebooks](./python/notebooks)            | Build scripts for supporting services  |
+| [duckdb extension](./integrations/duckdb)  | Various dev / test tools               |
+
 
 ## What makes Lance different
 
