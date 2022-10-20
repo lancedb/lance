@@ -7,8 +7,14 @@ endif()
 project(lance_duckdb CXX)
 
 option(LANCE_BUILD_PYTORCH "Build with PyTorch")
-if(UNIX AND NOT APPLE)
-  set(LANCE_BUILD_PYTORCH TRUE)
+# if(UNIX AND NOT APPLE)
+set(LANCE_BUILD_PYTORCH TRUE)
+# endif()
+
+set(OS_ARCH "amd64")
+string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
+if(IS_ARM)
+  set(OS_ARCH "arm64")
 endif()
 
 # Default to Debug build if not specified if (NOT DEFINED CMAKE_BUILD_TYPE OR
@@ -24,7 +30,7 @@ else()
   set(EXTENSION_STATIC_BUILD 1)
 endif()
 
-set(BUILD_UNITTESTS FALSE)  # For duckdb
+set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
@@ -34,29 +40,35 @@ list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
 
-  if(APPLE)
-    message(FATAL_ERROR "PyTorch integration is only supported on Linux now")
+  # if(APPLE) message(FATAL_ERROR "PyTorch integration is only supported on
+  # Linux now") endif()
+
+  if (OS_ARCH STREQUAL "amd64")
+    set(CPU_BASELINE AVX2)
   endif()
 
-  set(CPU_BASELINE AVX2)
   set(BUILD_LIST
       imgcodecs
       CACHE INTERNAL "Do not build static duckdb extension")
   set(BUILD_SHARED_LIBS OFF)
   FetchContent_Declare(
-    OpenCV URL https://github.com/opencv/opencv/archive/refs/tags/4.5.5.tar.gz
-               CMAKE_ARGS -DBUILD_UNITTESTS=imgcodecs)
+    OpenCV URL https://github.com/opencv/opencv/archive/refs/tags/4.5.5.tar.gz)
   list(APPEND available_contents OpenCV)
 
-  FetchContent_Declare(
-    Torch
-    URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.12.1%2Bcpu.zip
-  )
-  list(APPEND available_contents Torch)
+  if(APPLE)
+    FetchContent_Declare(
+            Torch
+            GIT_REPOSITORY https://github.com/pytorch/pytorch)
+  else()
+    FetchContent_Declare(
+      Torch
+      URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.12.1%2Bcpu.zip
+    )
+    list(APPEND available_contents Torch)
+  endif()
 endif()
 
 FetchContent_MakeAvailable(${available_contents})
-unset(BUILD_UNITTEST)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -90,8 +102,7 @@ set(LANCE_EXT_SOURCES
     src/lance/duckdb/ml/pytorch.cc
     src/lance/duckdb/ml/pytorch.h
     src/lance/duckdb/ml/functions.cc
-    src/lance/duckdb/ml/functions.h
-    )
+    src/lance/duckdb/ml/functions.h)
 
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
 if(APPLE)
