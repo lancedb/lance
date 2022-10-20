@@ -59,11 +59,11 @@ if(LANCE_BUILD_PYTORCH)
         DOWNLOAD
         https://files.pythonhosted.org/packages/5a/e8/82c14c28360dafe02877b28c70218c8b6ca8a0f2fbb0515b2abd027ca251/torch-1.12.0-cp310-none-macosx_11_0_arm64.whl
         ${CMAKE_BINARY_DIR}/torch.zip)
-      file(ARCHIVE_EXTRACT INPUT torch.zip DESTINATION
+      file(ARCHIVE_EXTRACT INPUT ${CMAKE_BINARY_DIR}/torch.zip DESTINATION
            ${CMAKE_BINARY_DIR}/thirdparty)
       file(REMOVE ${CMAKE_BINARY_DIR}/torch.zip)
 
-      set(Torch_DIR "${CMAKE_BINARY_DIR}/thirdparty/torch/share/cmake/Torch")
+      set(torch_SOURCE_DIR ${CMAKE_BINARY_DIR}/thirdparty/torch/)
     endif()
   else()
     FetchContent_Declare(
@@ -82,9 +82,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 include_directories(${duckdb_SOURCE_DIR}/src/include)
 
 if(LANCE_BUILD_PYTORCH)
-  if("${Torch_DIR}" STREQUAL "")
-    set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
-  endif()
+  set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
 
   set(OpenCV_DIR ${CMAKE_CURRENT_BINARY_DIR})
   include_directories(${OpenCV_INCLUDE_DIRS})
