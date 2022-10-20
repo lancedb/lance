@@ -168,6 +168,8 @@ class LanceDataset(IterableDataset):
             )
             for batch in scan.to_reader():
                 if self.mode == "batch":
+                    if batch.num_rows == 0:
+                        continue
                     tensors = [to_tensor(arr) for arr in batch.columns]
                     if self.transform is not None:
                         tensors = self.transform(*tensors)
