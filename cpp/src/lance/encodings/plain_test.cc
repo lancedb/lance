@@ -118,6 +118,27 @@ TEST_CASE("Write boolean array") {
             ->Equals(decoder.Take(indices).ValueOrDie()));
 }
 
+TEST_CASE("Get boolean offsets in the middle of a byte") {
+  arrow::BooleanBuilder builder;
+  for (int i = 0; i < 10; i++) {
+    CHECK(builder.Append(i < 5).ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+  lance::encodings::PlainEncoder encoder(sink);
+  auto offset = encoder.Write(arr).ValueOrDie();
+
+  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
+  lance::encodings::PlainDecoder decoder(infile, arr->type());
+  CHECK(decoder.Init().ok());
+  decoder.Reset(offset, arr->length());
+
+  auto actual = decoder.ToArray(3, 4).ValueOrDie();
+  INFO("Expected [true, true, false, false], got " << actual->ToString());
+  CHECK(actual->Equals(lance::arrow::ToArray({true, true, false, false}).ValueOrDie()));
+}
+
 void TestWriteFixedSizeArray(const std::shared_ptr<::arrow::Array>& arr) {
   auto out = arrow::io::BufferOutputStream::Create().ValueOrDie();
 

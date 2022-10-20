@@ -224,9 +224,13 @@ class BooleanPlainDecoderImpl : public PlainDecoderImpl<::arrow::BooleanType> {
       return MakeEmpty();
     }
 
-    int64_t byte_length = ::arrow::bit_util::BytesForBits(len);
+    // The length after calculating byte alignment of the start.
+    int32_t storage_length = start % 8 + len;
+    int64_t byte_length = ::arrow::bit_util::BytesForBits(storage_length);
+
     ARROW_ASSIGN_OR_RAISE(auto buf, infile_->ReadAt(position_ + start / 8, byte_length));
-    return std::make_shared<::arrow::BooleanArray>(len, buf);
+    auto storage_arr = std::make_shared<::arrow::BooleanArray>(storage_length, buf);
+    return storage_arr->Slice(start % 8, len);
   }
 };
 

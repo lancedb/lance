@@ -108,9 +108,8 @@ def test_filter_resulted_empty_return(tmp_path: Path):
     values = pa.array([i.as_py() > 5 for i in ids])
     table = pa.Table.from_arrays([ids, values], names=["id", "bignum"])
     lance.write_table(table, tmp_path / "lance")
-    print(table)
 
     dataset = LanceDataset(tmp_path / "lance", columns=["id"], filter=pc.field("bignum") == True, mode="batch",
                            batch_size=2)
-    actual_ids = list(dataset)
-    print(actual_ids)
+    actual_ids = torch.stack(list(dataset))
+    assert torch.equal(actual_ids, torch.stack([torch.tensor([6, 7]), torch.tensor([8, 9])]))
