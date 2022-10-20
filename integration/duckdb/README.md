@@ -1,6 +1,6 @@
 # Lance DuckDB Extension
 
-*Linux Only for now*.
+*Linux and macOS only for now*.
 
 Lance DuckDB extension allows user to run Machine Learning tasks via DuckDB + Lance.
 
@@ -36,8 +36,6 @@ Vector functions
 
 
 ## Development
-
-Currently, Machine Learning functions only works on Linux.
 
 To build the extension, run:
 
