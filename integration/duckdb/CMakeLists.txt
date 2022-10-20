@@ -6,19 +6,13 @@ endif()
 
 project(lance_duckdb CXX)
 
-option(LANCE_BUILD_PYTORCH "Build with PyTorch")
-# if(UNIX AND NOT APPLE)
-set(LANCE_BUILD_PYTORCH TRUE)
-# endif()
+option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
 
 set(OS_ARCH "amd64")
 string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
 if(IS_ARM)
   set(OS_ARCH "arm64")
 endif()
-
-# Default to Debug build if not specified if (NOT DEFINED CMAKE_BUILD_TYPE OR
-# CMAKE_BUILD_TYPE STREQUAL "") set(CMAKE_BUILD_TYPE Debug) endif ()
 
 include(FetchContent)
 
@@ -34,8 +28,7 @@ set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-  GIT_TAG v0.5.1
-  CMAKE_ARGS -DBUILD_UNITTESTS=FALSE)
+  GIT_TAG v0.5.1)
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
@@ -60,6 +53,7 @@ if(LANCE_BUILD_PYTORCH)
         URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip)
       list(APPEND available_contents Torch)
     else()
+      # Apple Silicon
       # libtorch does not have apple silicon release yet. Temporary solution.
       file(
         DOWNLOAD
@@ -88,7 +82,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 include_directories(${duckdb_SOURCE_DIR}/src/include)
 
 if(LANCE_BUILD_PYTORCH)
-  # set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
+  if("${Torch_DIR}" STREQUAL "")
+    set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
+  endif()
+
   set(OpenCV_DIR ${CMAKE_CURRENT_BINARY_DIR})
   include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -97,7 +94,7 @@ if(LANCE_BUILD_PYTORCH)
     ${OpenCV_SOURCE_DIR}/modules/imgcodecs/include
     ${OpenCV_SOURCE_DIR}/modules/imgproc/include ${CMAKE_CURRENT_BINARY_DIR})
 
-  find_package(torch REQUIRED)
+  find_package(Torch REQUIRED)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
