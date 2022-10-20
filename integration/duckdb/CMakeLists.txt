@@ -40,7 +40,7 @@ list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
 
-  if (OS_ARCH STREQUAL "amd64")
+  if(OS_ARCH STREQUAL "amd64")
     set(CPU_BASELINE AVX2)
   endif()
 
@@ -48,21 +48,28 @@ if(LANCE_BUILD_PYTORCH)
       imgcodecs
       CACHE INTERNAL "Do not build static duckdb extension")
   set(BUILD_SHARED_LIBS OFF)
+  set(BUILD_ZLIB OFF)
   FetchContent_Declare(
     OpenCV URL https://github.com/opencv/opencv/archive/refs/tags/4.5.5.tar.gz)
   list(APPEND available_contents OpenCV)
 
   if(APPLE)
-    if (OS_ARCH STREQUAL "amd64")
+    if(OS_ARCH STREQUAL "amd64")
       FetchContent_Declare(
         Torch
-        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip
-      )
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip)
       list(APPEND available_contents Torch)
     else()
-      FetchContent_Declare(
-            Torch
-            GIT_REPOSITORY https://github.com/pytorch/pytorch)
+      # libtorch does not have apple silicon release yet. Temporary solution.
+      file(
+        DOWNLOAD
+        https://files.pythonhosted.org/packages/5a/e8/82c14c28360dafe02877b28c70218c8b6ca8a0f2fbb0515b2abd027ca251/torch-1.12.0-cp310-none-macosx_11_0_arm64.whl
+        ${CMAKE_BINARY_DIR}/torch.zip)
+      file(ARCHIVE_EXTRACT INPUT torch.zip DESTINATION
+           ${CMAKE_BINARY_DIR}/thirdparty)
+      file(REMOVE ${CMAKE_BINARY_DIR}/torch.zip)
+
+      set(Torch_DIR "${CMAKE_BINARY_DIR}/thirdparty/torch/share/cmake/Torch")
     endif()
   else()
     FetchContent_Declare(
@@ -81,7 +88,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 include_directories(${duckdb_SOURCE_DIR}/src/include)
 
 if(LANCE_BUILD_PYTORCH)
-  set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
+  # set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
   set(OpenCV_DIR ${CMAKE_CURRENT_BINARY_DIR})
   include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -90,8 +97,7 @@ if(LANCE_BUILD_PYTORCH)
     ${OpenCV_SOURCE_DIR}/modules/imgcodecs/include
     ${OpenCV_SOURCE_DIR}/modules/imgproc/include ${CMAKE_CURRENT_BINARY_DIR})
 
-  # TODO: it is CPU version for now.
-  find_package(Torch REQUIRED)
+  find_package(torch REQUIRED)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
