@@ -1,1 +1,1 @@
-python/notebooks -linguist-detectable
+python/notebooks/** linguist-vendored
