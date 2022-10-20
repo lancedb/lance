@@ -31,8 +31,8 @@ void ListArgMax(::duckdb::DataChunk &args,
     auto max_iter = std::max_element(std::begin(values), std::end(values), [](auto a, auto b) {
       return a.template GetValue<T>() < b.template GetValue<T>();
     });
-    auto idx_max = std::distance(std::begin(values), max_iter);
-    result.SetValue(i, idx_max);
+    auto idx_max = static_cast<int>(std::distance(std::begin(values), max_iter));
+    result.SetValue(i, ::duckdb::Value(idx_max));
   }
 }
 

@@ -40,9 +40,6 @@ list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
 
-  # if(APPLE) message(FATAL_ERROR "PyTorch integration is only supported on
-  # Linux now") endif()
-
   if (OS_ARCH STREQUAL "amd64")
     set(CPU_BASELINE AVX2)
   endif()
@@ -56,9 +53,17 @@ if(LANCE_BUILD_PYTORCH)
   list(APPEND available_contents OpenCV)
 
   if(APPLE)
-    FetchContent_Declare(
+    if (OS_ARCH STREQUAL "amd64")
+      FetchContent_Declare(
+        Torch
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip
+      )
+      list(APPEND available_contents Torch)
+    else()
+      FetchContent_Declare(
             Torch
             GIT_REPOSITORY https://github.com/pytorch/pytorch)
+    endif()
   else()
     FetchContent_Declare(
       Torch

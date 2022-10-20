@@ -50,7 +50,7 @@ std::string ShapeString(const torch::Tensor& tensor) {
 /// Convert OpenCV image to PyTorch Tensor
 torch::Tensor ToTensor(const cv::Mat& image) {
   at::TensorOptions options(at::kFloat);
-  auto tensor = torch::from_blob(image.data, at::IntList({1, image.rows, image.cols, 3}), options);
+  auto tensor = torch::from_blob(image.data, {1, image.rows, image.cols, 3}, options);
   return tensor.permute({0, 3, 1, 2});
 }
 
@@ -97,7 +97,7 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
     std::vector<::duckdb::Value> values;
     auto softmax = output[0].softmax(0);
     for (int i = 0; i < softmax.size(0); i++) {
-      values.emplace_back(::duckdb::Value::FLOAT(*softmax[i].data<float>()));
+      values.emplace_back(::duckdb::Value::FLOAT(*softmax[i].data_ptr<float>()));
     }
     result.SetValue(i, ::duckdb::Value::LIST(values));
   }
