@@ -6,13 +6,13 @@ endif()
 
 project(lance_duckdb CXX)
 
-option(LANCE_BUILD_PYTORCH "Build with PyTorch")
-if(UNIX AND NOT APPLE)
-  set(LANCE_BUILD_PYTORCH TRUE)
-endif()
+option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
 
-# Default to Debug build if not specified if (NOT DEFINED CMAKE_BUILD_TYPE OR
-# CMAKE_BUILD_TYPE STREQUAL "") set(CMAKE_BUILD_TYPE Debug) endif ()
+set(OS_ARCH "amd64")
+string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
+if(IS_ARM)
+  set(OS_ARCH "arm64")
+endif()
 
 include(FetchContent)
 
@@ -24,34 +24,54 @@ else()
   set(EXTENSION_STATIC_BUILD 1)
 endif()
 
+set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-  GIT_TAG v0.5.1
-  CMAKE_ARGS -DBUILD_UNITTESTS=FALSE)
+  GIT_TAG v0.5.1)
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
 
-  if(APPLE)
-    message(FATAL_ERROR "PyTorch integration is only supported on Linux now")
+  if(OS_ARCH STREQUAL "amd64")
+    set(CPU_BASELINE AVX2)
   endif()
 
-  set(CPU_BASELINE AVX2)
   set(BUILD_LIST
       imgcodecs
       CACHE INTERNAL "Do not build static duckdb extension")
   set(BUILD_SHARED_LIBS OFF)
+  set(BUILD_ZLIB OFF)
   FetchContent_Declare(
-    OpenCV URL https://github.com/opencv/opencv/archive/refs/tags/4.5.5.tar.gz
-               CMAKE_ARGS -DBUILD_UNITTESTS=imgcodecs)
+    OpenCV URL https://github.com/opencv/opencv/archive/refs/tags/4.5.5.tar.gz)
   list(APPEND available_contents OpenCV)
 
-  FetchContent_Declare(
-    Torch
-    URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.12.1%2Bcpu.zip
-  )
-  list(APPEND available_contents Torch)
+  if(APPLE)
+    if(OS_ARCH STREQUAL "amd64")
+      FetchContent_Declare(
+        Torch
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip)
+      list(APPEND available_contents Torch)
+    else()
+      # Apple Silicon
+      # libtorch does not have apple silicon release yet. Temporary solution.
+      file(
+        DOWNLOAD
+        https://files.pythonhosted.org/packages/5a/e8/82c14c28360dafe02877b28c70218c8b6ca8a0f2fbb0515b2abd027ca251/torch-1.12.0-cp310-none-macosx_11_0_arm64.whl
+        ${CMAKE_BINARY_DIR}/torch.zip)
+      file(ARCHIVE_EXTRACT INPUT ${CMAKE_BINARY_DIR}/torch.zip DESTINATION
+           ${CMAKE_BINARY_DIR}/thirdparty)
+      file(REMOVE ${CMAKE_BINARY_DIR}/torch.zip)
+
+      set(torch_SOURCE_DIR ${CMAKE_BINARY_DIR}/thirdparty/torch/)
+    endif()
+  else()
+    FetchContent_Declare(
+      Torch
+      URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.12.1%2Bcpu.zip
+    )
+    list(APPEND available_contents Torch)
+  endif()
 endif()
 
 FetchContent_MakeAvailable(${available_contents})
@@ -63,6 +83,7 @@ include_directories(${duckdb_SOURCE_DIR}/src/include)
 
 if(LANCE_BUILD_PYTORCH)
   set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
+
   set(OpenCV_DIR ${CMAKE_CURRENT_BINARY_DIR})
   include_directories(${OpenCV_INCLUDE_DIRS})
 
@@ -71,7 +92,6 @@ if(LANCE_BUILD_PYTORCH)
     ${OpenCV_SOURCE_DIR}/modules/imgcodecs/include
     ${OpenCV_SOURCE_DIR}/modules/imgproc/include ${CMAKE_CURRENT_BINARY_DIR})
 
-  # TODO: it is CPU version for now.
   find_package(Torch REQUIRED)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
@@ -88,10 +108,8 @@ set(LANCE_EXT_SOURCES
     src/lance/duckdb/ml/pytorch.cc
     src/lance/duckdb/ml/pytorch.h
     src/lance/duckdb/ml/functions.cc
-    src/lance/duckdb/ml/functions.h
-    )
+    src/lance/duckdb/ml/functions.h)
 
-set(EXTENSION_STATIC_BUILD 1)
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
 if(APPLE)
   target_link_libraries(lance_loadable_extension duckdb)
