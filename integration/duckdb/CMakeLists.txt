@@ -24,6 +24,7 @@ else()
   set(EXTENSION_STATIC_BUILD 1)
 endif()
 
+set(BUILD_UNITTESTS FALSE)  # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
@@ -55,6 +56,7 @@ if(LANCE_BUILD_PYTORCH)
 endif()
 
 FetchContent_MakeAvailable(${available_contents})
+unset(BUILD_UNITTEST)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -91,7 +93,6 @@ set(LANCE_EXT_SOURCES
     src/lance/duckdb/ml/functions.h
     )
 
-set(EXTENSION_STATIC_BUILD 1)
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
 if(APPLE)
   target_link_libraries(lance_loadable_extension duckdb)
