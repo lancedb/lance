@@ -34,3 +34,4 @@ jobs:
       working-directory: python/notebooks
       run: |
         jupyter nbconvert --to notebook --execute quickstart.ipynb
+        jupyter nbconvert --to notebook --execute ingestion.ipynb
