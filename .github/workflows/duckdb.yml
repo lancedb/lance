@@ -3,11 +3,10 @@ on:
   push:
     branches:
       - main
-    paths:
-      - integration/duckdb/**
   pull_request:
     paths:
       - integration/duckdb/**
+      - .github/workflows/duckdb*
 jobs:
   build:
     runs-on: ubuntu-22.04
