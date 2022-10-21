@@ -1,0 +1,37 @@
+name: DuckDB Extension
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - integration/duckdb/**
+  pull_request:
+    paths:
+      - integration/duckdb/**
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./integration/duckdb
+    steps:
+      - uses: actions/checkout@v2
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1
+      - name: Cmake
+        run: cmake -B build
+      - name: Build
+        run: make -C build -j
+  mac-build:
+    runs-on: macos-12
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./integration/duckdb
+    steps:
+      - uses: actions/checkout@v2
+      - name: Cmake
+        run: cmake -B build
+      - name: Build
+        run: make -C build -j
