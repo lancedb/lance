@@ -46,7 +46,45 @@ message Manifest {
 
   // Dataset metadata.
   map<string, bytes> metadata = 2;
+
+  // Format / Specification version
+  int32 format = 3;
+
+  // Snapshot version
+  uint64 version = 4;
+
+  // List of the partitioned fields.
+  repeated int32 partition_fields = 5;
+  
+  repeated DataFragment fragments = 6;
 }
+
+// Partition field to value pair.
+message Partition {
+  int32 field = 1;
+  bytes value = 2;
+}
+
+// Data fragment. A fragment is a set of files which represent the
+// different columns of the same rows.
+// If column exists in the schema, but the related file does not exist,
+// treat this column as nulls.
+message DataFragment {
+  uint64 id = 1;
+  repeated DataFile files = 2;
+  uint64 length = 3;
+  
+  repeated Partition partition = 4;
+}
+
+/// Lance Data File
+message DataFile {
+  // Relative path to the root.
+  string path = 1;
+  // The ids of the fields/columns in this file
+  repeated int32 fields = 2;
+}
+
 
 // Metadata of one Lane file.
 message Metadata {

@@ -24,6 +24,7 @@ add_library(
         OBJECT
         ${PROTO_HDRS}
         ${PROTO_SRCS}
+        data_fragment.h
         format.h
         manifest.cc
         manifest.h
@@ -35,7 +36,7 @@ add_library(
         schema.h
         visitors.cc
         visitors.h
-)
+        data_fragment.cc data_file.h)
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(metadata_test)
