@@ -70,7 +70,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
                         Err(_) => unreachable!(),
                     };
                     *slot = T::from_le_bytes(a);
-                    Ok(())
+                    Ok::<(), Error>(())
                 })?;
             let arr = PrimitiveArray::from_vec(buffer);
             Ok(Box::new(arr))
