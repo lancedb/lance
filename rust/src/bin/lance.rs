@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::fs::File;
+use std::fs::{File, read};
 
 use clap::{Parser, Subcommand};
 
@@ -33,6 +33,11 @@ enum Commands {
         #[clap(value_parser)]
         path: std::path::PathBuf,
     },
+    Show {
+        /// Path to the lance dataset.
+        #[clap(value_parser)]
+        path: std::path::PathBuf,
+    },
 }
 
 fn main() {
@@ -47,6 +52,14 @@ fn main() {
             use std::any::TypeId;
             let is_little_endian = TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>();
             println!("Is little endian {:?}", is_little_endian)
+        }
+        Commands::Show { path } => {
+            let f = File::open(path).unwrap();
+            let reader = FileReader::new(f).unwrap();
+            println!("Number of RecordBatch: {}", reader.num_chunks());
+            println!("Schema: {}\n", reader.schema());
+            let chunk = reader.get(0);
+            println!("chunk sample: {:?}", chunk)
         }
     }
 }

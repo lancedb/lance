@@ -13,11 +13,14 @@
 //  limitations under the License.
 
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use arrow2::array::Array;
+use arrow2::datatypes::DataType;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::format::pb;
-use crate::schema::Schema;
+use crate::page_table::PageTable;
+use crate::schema::{Field, Schema};
 
 static MAGIC_NUMBER: &str = "LANC";
 
@@ -27,6 +30,7 @@ pub struct FileReader<R: Read + Seek> {
     schema: Schema,
     // TODO: impl a Metadata
     metadata: pb::Metadata,
+    page_table: PageTable,
 }
 
 trait ProtoReader<P: prost::Message + Default> {
@@ -82,10 +86,14 @@ impl<R: Read + Seek> FileReader<R> {
         let metadata: crate::format::pb::Metadata = ProtoParser::read(&mut f, metadata_pos)?;
         let manifest: crate::format::pb::Manifest =
             ProtoParser::read(&mut f, metadata.manifest_position as i64)?;
+        let num_columns = manifest.fields.len();
+        let num_batches = metadata.batch_offsets.len() - 1;
+        let page_table = PageTable::make(&mut f, metadata.page_table_position, num_columns, num_batches);
         Ok(FileReader {
             file: f,
             schema: Schema::from_proto(&manifest.fields),
             metadata,
+            page_table,
         })
     }
 
@@ -95,5 +103,51 @@ impl<R: Read + Seek> FileReader<R> {
 
     pub fn num_chunks(&self) -> i32 {
         self.metadata.batch_offsets.len() as i32 - 1
+    }
+
+    pub fn get(&self, idx: u32) -> Box<dyn Array> {
+        let schema = self.schema();
+        for field in &schema.fields {
+            let num_batches = self.metadata.batch_offsets.len() - 1;
+            for batch_id in 0..num_batches {
+                let value: Box<dyn Array> = get_array(&field, batch_id, ArrayParams { offset: 0, len: None });
+            }
+        }
+        todo!()
+    }
+
+
+    fn get_array(field: &Field, batch_id: usize, array_params: ArrayParams) -> Box<dyn Array> {
+        let d_type = field.data_type();
+        let storage_type = field.storage_type();
+        let storage_array: Box<dyn Array> = match storage_type {
+            DataType::List(_) => { get_list_array(field, batch_id, &array_params) }
+            DataType::Struct(_) => { get_struct_array(field, batch_id, &array_params) }
+            DataType::Dictionary(_, _, _) => { get_dictionary_array(field, batch_id, &array_params) }
+            _ => {
+                get_primitive_array(field, batch_id, &array_params)
+            }
+        };
+
+        storage_array
+    }
+
+    fn get_list_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+        todo!()
+    }
+
+    fn get_struct_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+        todo!()
+    }
+
+    fn get_dictionary_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+        todo!()
+    }
+
+    fn get_primitive_array(&self, field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+        let field_id = field.id;
+        let page_info = self.page_table.get_page_info(field_id, batch_id);
+        // field.get_decoder(&self.file);
+        todo!()
     }
 }
