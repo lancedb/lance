@@ -19,6 +19,8 @@
 
 #include <memory>
 
+#include "lance/format/format.pb.h"
+
 namespace lance::format {
 
 class Schema;
@@ -55,10 +57,15 @@ class Manifest final {
   /// Get schema of the dataset.
   const Schema& schema() const;
 
+  uint64_t version() const;
+
  private:
+  Manifest(const lance::format::pb::Manifest& pb);
 
   /// Table schema.
   std::shared_ptr<Schema> schema_;
+
+  std::uint64_t version_ = 1;
 };
 
 }  // namespace lance::format

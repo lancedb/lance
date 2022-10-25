@@ -44,7 +44,6 @@ TEST_CASE("Create new dataset") {
   write_options.filesystem = fs;
   write_options.base_dir = path;
   write_options.file_write_options = format->DefaultWriteOptions();
-  write_options.basename_template = "part{i}.lance";
 
   auto status = lance::arrow::LanceDataset::Write(
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
