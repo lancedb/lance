@@ -223,8 +223,11 @@ TEST_CASE("Test schema metadata") {
 TEST_CASE("Test merge two schemas") {
   auto base_schema = Schema(::arrow::schema({::arrow::field("a", ::arrow::int32())}));
   auto merged =
-      base_schema.Merge(*::arrow::schema({::arrow::field("b", ::arrow::utf8())})).ValueOrDie();
+      base_schema.Merge(*::arrow::schema({::arrow::field("b", ::arrow::list(::arrow::utf8()))}))
+          .ValueOrDie();
   auto a = merged->GetField("a");
   CHECK(a->id() == 1);
   CHECK(merged->GetField("b")->id() == 2);
+
+//  base_schema = Schema(::arrow::schema({::}))
 }
