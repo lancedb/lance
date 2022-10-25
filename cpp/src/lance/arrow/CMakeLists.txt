@@ -19,7 +19,6 @@ add_library(
         arrow
         OBJECT
         dataset.cc
-        dataset.h
         file_lance.cc
         file_lance_ext.h
         scanner.cc
