@@ -42,7 +42,7 @@ namespace lance::format {
 Field::Field() : id_(-1), parent_(-1) {}
 
 Field::Field(const std::shared_ptr<::arrow::Field>& field)
-    : id_(0),
+    : id_(-1),
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
@@ -334,7 +334,7 @@ int32_t Field::id() const { return id_; }
 
 void Field::SetId(int32_t parent_id, int32_t* current_id) {
   parent_ = parent_id;
-  if (id_ == 0) {
+  if (id_ < 0) {
     id_ = (*current_id);
     *current_id += 1;
   }
@@ -700,7 +700,7 @@ int32_t Schema::GetMaxId() const {
       }
       return ::arrow::Status::OK();
     }
-    int32_t max_id_ = 0;
+    int32_t max_id_ = -1;
   };
   auto visitor = MaxIdVisitor();
   if (!visitor.VisitSchema(*this).ok()) {
