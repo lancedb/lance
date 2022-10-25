@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "lance/format/format.pb.h"
+#include "lance/arrow/file_lance_ext.h"
 
 namespace lance::format {
 
@@ -70,6 +71,8 @@ class Manifest final {
   std::shared_ptr<Schema> schema_;
 
   std::uint64_t version_ = 1;
+
+  std::vector<arrow::LanceFragment> fragments_;
 };
 
 }  // namespace lance::format

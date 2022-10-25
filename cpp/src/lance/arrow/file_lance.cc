@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <memory>
+#include <utility>
 
 #include "lance/arrow/file_lance_ext.h"
 #include "lance/format/manifest.h"
@@ -134,5 +135,12 @@ std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTyp
 bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso) {
   return fso.type_name() == kLanceFormatTypeName;
 }
+
+LanceFile::LanceFile(std::string path, const std::vector<int32_t>& fields)
+    : path_(std::move(path)), fields_(std::begin(fields), std::end(fields)) {}
+
+const std::string& LanceFile::path() const { return path_; }
+
+const std::vector<int32_t>& LanceFile::fields() const { return fields_; }
 
 }  // namespace lance::arrow

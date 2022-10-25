@@ -31,6 +31,7 @@ namespace fs = std::filesystem;
 namespace lance::arrow {
 
 const std::string kLatestManifest = "_latest.manifest";
+const std::string kDataDir = "data";
 
 std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
   if (version.has_value()) {
@@ -85,9 +86,9 @@ LanceDataset::~LanceDataset() {}
   auto& fs = options.filesystem;
 
   auto lance_option = options;
-  lance_option.base_dir += "/data";
+  lance_option.base_dir = fs::path(base_dir) / kDataDir;
   auto partitioning = std::move(lance_option.partitioning);
-  // TODO: support partition via lance manifest .
+  // TODO: support partition via lance manifest.
   lance_option.partitioning =
       std::make_shared<::arrow::dataset::FilenamePartitioning>(::arrow::schema({}));
 

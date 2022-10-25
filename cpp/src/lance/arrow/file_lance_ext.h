@@ -16,9 +16,39 @@
 
 #include <arrow/dataset/file_base.h>
 
+#include <vector>
+
 #include "lance/io/exec/counter.h"
 
 namespace lance::arrow {
+
+/// One lance file, with a potential subset of columns.
+class LanceFile {
+ public:
+  LanceFile(std::string path, const std::vector<int32_t>& fields);
+
+  const std::string& path() const;
+
+  const std::vector<int32_t>& fields() const;
+
+ private:
+  std::string path_;
+  std::vector<int32_t> fields_;
+};
+
+class LanceFragment : public ::arrow::dataset::Fragment {
+ public:
+  LanceFragment();
+
+  virtual ~LanceFragment() = default;
+
+  std::string type_name() const override { return "lance"; }
+
+  ::arrow::Status Valildate() const;
+
+ private:
+  std::vector<LanceFile> files_;
+};
 
 /// Lance FragmentScanOptions.
 ///
