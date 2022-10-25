@@ -1,39 +1,26 @@
-# Lance: Deep Learning with DuckDB and Arrow
+# Lance
+
+**Blazing fast exploration and analysis of machine learning visual data using SQL**
 
 ```sql
 SELECT predict(‘resnet’, image) FROM dataset
 ```
 
-Lance is an Arrow and DuckDB compatible extension designed to help you explore, get insights and use machine-learning on your large-scale visual data, such as video, images, point clouds, audio natively.
-
-Lance is deep learning for humans.
-
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
-Lance delivers blazing fast performance for visual data use cases from exploratory data analysis to training and evaluation.
+Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
-Lance is powered by <i>Lance Format</i>, an alternative to Parquet that is optimized with visual data. With first class Apache Arrow integration, Lance Format is queryable using DuckDB out of the box and can be converted from Parquet with a single line of code.
+* Use arbitary ML functions in SQL for running model predictions and embedding-based similarity-search.
 
-## What problems does Lance solve?
+* [Coming soon] Visualize, slice and drill-into visual datasets to inspect embeddings, labels/annotations, metrics and more.
 
-Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML Engineering and Data Science community.
+* [Coming soon] Version, compare and diff visual datasets easily.
 
-### Working with computer vision data for ML is different from working with tabular data:
-- Visual data are large blobs that are difficult and slow to query by existing engines
-- Annotations are deeply nested and stored in different locations (i.e. S3 vs CSV/XML)
-- Exploratory data analysis, labeling, training and evaluation uses different tools requiring different formats that are optimized for certain use cases, but this leads to fragmentation and complicates lineage
-- Deep learning is increasingly making use of vector-based semantics and embeddings, it is challenging to query across both vectors and other column types in a performant and usable way
+Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for visual data use cases.
 
-### Lance to the rescue
-To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
-- Use SQL to run embeddings, models and other arbitarily complex transformations fast!
-- Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
-- Rich ML data types and integrations to eliminate manual data conversions
-- Support for vector and search indices, versioning, and schema evolution
+Lance currently supports DuckDB.
 
 ## Quick Start
-
-We've provided Linux and MacOS wheels for Lance in PyPI. You can install Lance python bindings via:
 
 ```
 pip install pylance
