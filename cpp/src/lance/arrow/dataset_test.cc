@@ -66,4 +66,12 @@ TEST_CASE("Create new dataset") {
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
   INFO("Write dataset: " << status.message());
   CHECK(status.ok());
+
+  actual_dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(actual_dataset != nullptr);
+  actual_table =
+      actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  auto combined_table = ::arrow::ConcatenateTables({table, table2}).ValueOrDie();
+  INFO("Expect table: " << combined_table->ToString() << " Got: " << actual_table->ToString());
+  CHECK(actual_table->Equals(*combined_table));
 }

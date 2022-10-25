@@ -102,8 +102,8 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
     manifest = std::make_shared<lance::format::Manifest>(schema);
   } else {
     // Bump the version
-    auto cur_manifest = cur_dataset->impl_->manifest;
-    manifest = cur_manifest->BumpVersion();
+    manifest = cur_dataset->impl_->manifest;
+    manifest->BumpVersion();
   }
   // Write manifest file
   auto lance_option = options;
@@ -132,7 +132,6 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
   auto metadata_collector = [&paths, data_dir, &mutex](::arrow::dataset::FileWriter* writer) {
     auto w = dynamic_cast<lance::io::FileWriter*>(writer);
     assert(w != nullptr);
-    fmt::print("write to {}\n", w->destination().path);
     auto relative = fs::relative(w->destination().path, data_dir);
     {
       std::lock_guard guard(mutex);
@@ -141,13 +140,10 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
     return ::arrow::Status::OK();
   };
   lance_option.writer_post_finish = metadata_collector;
-  // TODO: collecting files;
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
-  fmt::print("Collected path: {}\n", paths);
   manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
-  fmt::print("After pending paths({}), got {}\n", paths.size(), manifest->fragments().size());
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / "_versions").string();
@@ -196,7 +192,6 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
     fragments.emplace_back(std::make_shared<LanceFragment>(
         impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema()));
   }
-  fmt::print("GetFragmentsImpl: {} {}\n", fragments.size());
   return ::arrow::MakeVectorIterator(fragments);
 }
 

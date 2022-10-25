@@ -43,6 +43,9 @@ class Manifest final {
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
 
+  /// Copy constructor.
+  Manifest(const Manifest& other) noexcept;
+
   ~Manifest() = default;
 
   /// Parse a Manifest from input file at the offset.
@@ -55,8 +58,8 @@ class Manifest final {
   /// \return The offset of the manifest.
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
 
-  /// Make a copy and increase the version number.
-  std::shared_ptr<Manifest> BumpVersion() const;
+  /// Increase the version number.
+  void BumpVersion();
 
   /// Get schema of the dataset.
   const Schema& schema() const;

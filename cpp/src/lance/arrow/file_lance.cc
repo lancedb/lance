@@ -163,8 +163,7 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
     ARROW_RETURN_NOT_OK(batch_reader.Open());
     return ::arrow::RecordBatchGenerator(std::move(batch_reader));
   }
-  // We should not reach here.
-  return ::arrow::Status::OK();
+  return ::arrow::Status::IOError("Lance Fragment has zero file");
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {

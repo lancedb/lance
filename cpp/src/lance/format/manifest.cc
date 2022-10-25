@@ -28,7 +28,13 @@ namespace lance::format {
 
 Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)), version_(1) {}
 
-Manifest::Manifest(Manifest&& other) noexcept : schema_(std::move(other.schema_)) {}
+Manifest::Manifest(Manifest&& other) noexcept
+    : schema_(std::move(other.schema_)),
+      version_(other.version_),
+      fragments_(std::move(other.fragments_)) {}
+
+Manifest::Manifest(const Manifest& other) noexcept
+    : schema_(other.schema_), version_(other.version_), fragments_(other.fragments()) {}
 
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
     : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
@@ -56,26 +62,20 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   for (const auto& fragment : fragments_) {
     pb.mutable_fragments()->Add(fragment->ToProto());
   }
-  fmt::print("Write pb fragments: {}\n", pb.fragments_size());
   return io::WriteProto(out, pb);
 }
 
-std::shared_ptr<Manifest> Manifest::BumpVersion() const {
-  auto new_version = std::shared_ptr<Manifest>(new Manifest(schema_));
-  new_version->version_ = version_ + 1;
-  return new_version;
+void Manifest::BumpVersion() {
+  version_ ++;
 }
 
 const Schema& Manifest::schema() const { return *schema_; }
 
 uint64_t Manifest::version() const { return version_; }
 
-const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const {
-  return fragments_;
-}
+const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
-void Manifest::AppendFragments(
-    const std::vector<std::shared_ptr<DataFragment>>& fragments) {
+void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments) {
   fragments_.insert(fragments_.end(), std::begin(fragments), std::end(fragments));
 }
 
