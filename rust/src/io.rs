@@ -13,8 +13,9 @@
 //  limitations under the License.
 
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
-use arrow2::array::Array;
+use arrow2::array::{Array, DictionaryKey};
 use arrow2::datatypes::DataType;
+use arrow2::types::Index;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -35,6 +36,11 @@ pub struct FileReader<R: Read + Seek> {
 
 trait ProtoReader<P: prost::Message + Default> {
     fn read<R: Read + Seek>(file: &mut R, pos: i64) -> Result<P>;
+}
+
+struct ArrayParams {
+    offset: u32,
+    len: Option<u32>,
 }
 
 struct ProtoParser;
@@ -110,7 +116,7 @@ impl<R: Read + Seek> FileReader<R> {
         for field in &schema.fields {
             let num_batches = self.metadata.batch_offsets.len() - 1;
             for batch_id in 0..num_batches {
-                let value: Box<dyn Array> = get_array(&field, batch_id, ArrayParams { offset: 0, len: None });
+                let value: Box<dyn Array> = Self::get_array(&field, batch_id, ArrayParams { offset: 0, len: None });
             }
         }
         todo!()
@@ -118,18 +124,20 @@ impl<R: Read + Seek> FileReader<R> {
 
 
     fn get_array(field: &Field, batch_id: usize, array_params: ArrayParams) -> Box<dyn Array> {
-        let d_type = field.data_type();
-        let storage_type = field.storage_type();
-        let storage_array: Box<dyn Array> = match storage_type {
-            DataType::List(_) => { get_list_array(field, batch_id, &array_params) }
-            DataType::Struct(_) => { get_struct_array(field, batch_id, &array_params) }
-            DataType::Dictionary(_, _, _) => { get_dictionary_array(field, batch_id, &array_params) }
-            _ => {
-                get_primitive_array(field, batch_id, &array_params)
-            }
-        };
-
-        storage_array
+        // TODO
+        // let d_type = field.data_type();
+        // let storage_type = field.storage_type();
+        // let storage_array: Box<dyn Array> = match storage_type {
+        //     DataType::List(_) => { get_list_array(field, batch_id, &array_params) }
+        //     DataType::Struct(_) => { get_struct_array(field, batch_id, &array_params) }
+        //     DataType::Dictionary(_, _, _) => { get_dictionary_array(field, batch_id, &array_params) }
+        //     _ => {
+        //         get_primitive_array(field, batch_id, &array_params)
+        //     }
+        // };
+        //
+        // storage_array
+        todo!()
     }
 
     fn get_list_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
@@ -145,7 +153,7 @@ impl<R: Read + Seek> FileReader<R> {
     }
 
     fn get_primitive_array(&self, field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
-        let field_id = field.id;
+        let field_id = field.id.to_usize();
         let page_info = self.page_table.get_page_info(field_id, batch_id);
         // field.get_decoder(&self.file);
         todo!()

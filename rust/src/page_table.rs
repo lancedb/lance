@@ -6,8 +6,10 @@ use arrow2::datatypes::DataType;
 use byteorder::{LittleEndian, ReadBytesExt};
 use prost::bytes::{Buf, BufMut};
 
+#[derive(Debug, Clone)]
 pub struct PageInfo(i64, i64);
 
+#[derive(Debug, Clone)]
 pub struct PageTable {
     page_info_map: Vec<Vec<PageInfo>>,
 }
@@ -42,7 +44,7 @@ impl PageTable {
         lt
     }
 
-    pub fn get_page_info(&self,column_id: i32, batch_id: usize) -> &PageInfo {
-        self.page_info_map[column_id][batch_id]
+    pub fn get_page_info(&self,column_id: usize, batch_id: usize) -> PageInfo {
+        self.page_info_map[column_id][batch_id].clone()
     }
 }
