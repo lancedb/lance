@@ -26,7 +26,7 @@ using arrow::Status;
 
 namespace lance::format {
 
-Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)) {}
+Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)), version_(1) {}
 
 Manifest::Manifest(Manifest&& other) noexcept : schema_(std::move(other.schema_)) {}
 
@@ -50,6 +50,12 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   }
   pb.set_version(version_);
   return io::WriteProto(out, pb);
+}
+
+std::shared_ptr<Manifest> Manifest::BumpVersion() const {
+  auto new_version = std::shared_ptr<Manifest>(new Manifest(schema_));
+  new_version->version_ = version_ + 1;
+  return new_version;
 }
 
 const Schema& Manifest::schema() const { return *schema_; }

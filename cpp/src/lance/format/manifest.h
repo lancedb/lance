@@ -54,9 +54,13 @@ class Manifest final {
   /// \return The offset of the manifest.
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
 
+  /// Make a copy and increase the version number.
+  std::shared_ptr<Manifest> BumpVersion() const;
+
   /// Get schema of the dataset.
   const Schema& schema() const;
 
+  /// Returns the version number.
   uint64_t version() const;
 
  private:

@@ -67,14 +67,21 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner) {
+  const auto& base_dir = options.base_dir;
   // Load previous latest Manifest if any.
-  ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, options.base_dir));
-  if (!cur_dataset) {
-  }
+  ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, base_dir));
 
+  std::shared_ptr<lance::format::Manifest> manifest;
+  if (!cur_dataset) {
+    // This is a completely new dataset, create Manifest with version 1.
+    auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
+    manifest = std::make_shared<lance::format::Manifest>(schema);
+  } else {
+    // Bump the version
+    auto cur_manifest = cur_dataset->impl_->manifest();
+    manifest = cur_manifest->BumpVersion();
+  }
   // Write manifest file
-  auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
-  auto manifest = lance::format::Manifest(schema);
   auto& fs = options.filesystem;
 
   auto lance_option = options;
@@ -103,20 +110,20 @@ LanceDataset::~LanceDataset() {}
     return ::arrow::Status::OK();
   };
   lance_option.writer_post_finish = metadata_collector;
+  // TODO: collecting files;
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
   // Write the manifest version file.
   // It only supports single writer at the moment.
-  auto version_dir = (fs::path(options.base_dir) / "_versions").string();
+  auto version_dir = (fs::path(base_dir) / "_versions").string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
-  auto manifest_path =
-      (fs::path(version_dir) / fmt::format("{}.manifest", manifest.version())).string();
+  auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(manifest.Write(out));
+    ARROW_RETURN_NOT_OK(manifest->Write(out));
   }
-  auto latest_manifest_path = (fs::path(options.base_dir) / "_latest.manifest").string();
+  auto latest_manifest_path = GetManifestPath(base_dir, std::nullopt);
   return fs->CopyFile(manifest_path, latest_manifest_path);
 }
 
