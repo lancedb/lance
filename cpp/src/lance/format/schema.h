@@ -78,6 +78,10 @@ class Schema final {
   /// \return The newly created schema, excluding any column in "other".
   ::arrow::Result<std::shared_ptr<Schema>> Exclude(const Schema& other) const;
 
+  /// Merge another (unsigned-id) schema, and reassign new Ids to the new fields.
+  ///
+  ::arrow::Result<std::shared_ptr<Schema>> Merge(const Schema& other) const;
+
   /// Add a new parent field.
   void AddField(std::shared_ptr<Field> f);
 

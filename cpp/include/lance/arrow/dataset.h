@@ -63,6 +63,10 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   std::string type_name() const override { return "lance"; }
 
+  /// Add one column.
+  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumn(
+      const std::shared_ptr<::arrow::Schema>& addon);
+
   ::arrow::Result<std::shared_ptr<Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
 
