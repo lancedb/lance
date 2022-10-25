@@ -605,19 +605,19 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
 }
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const ::arrow::Schema& arrow_schema) const {
-  auto merged = Copy();
-  for (auto& arrow_field : arrow_schema.fields()) {
-    auto field = merged->GetField(arrow_field->name());
-    if (field) {
-      // Nested.
-      auto type_id = arrow_field->type()->id();
-      if (::arrow::is_primitive(type_id) || ::arrow::is_dictionary(type_id) ||
-          ::arrow::is_base_binary_like(type_id)) {
-        return ::arrow::Status::Invalid("Leaf node already exist: ", field->name());
-      }
+  auto merged = std::make_shared<Schema>();
+  for (auto& field : fields_) {
+    auto arrow_field = arrow_schema.GetFieldByName(field->name());
+    if (arrow_field) {
+      ARROW_ASSIGN_OR_RAISE(auto new_field, field->Merge(*arrow_field));
+      merged->AddField(new_field);
     } else {
-      field = std::make_shared<Field>(arrow_field);
       merged->AddField(field);
+    }
+  }
+  for (auto& arrow_field : arrow_schema.fields()) {
+    if (!GetField(arrow_field->name())) {
+      merged->AddField(std::make_shared<Field>(arrow_field));
     }
   }
   // Assign to new IDs

@@ -81,7 +81,7 @@ class Schema final {
   /// Merge with new fields.
   ///
   /// \param arrow_schema the schema to be merged.
-  /// \return
+  /// \return A newly merged schema.
   ::arrow::Result<std::shared_ptr<Schema>> Merge(const ::arrow::Schema& arrow_schema) const;
 
   /// Add a new parent field.
