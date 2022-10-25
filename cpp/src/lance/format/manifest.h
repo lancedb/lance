@@ -19,8 +19,8 @@
 
 #include <memory>
 
-#include "lance/format/format.pb.h"
 #include "lance/arrow/file_lance_ext.h"
+#include "lance/format/format.pb.h"
 
 namespace lance::format {
 
@@ -65,6 +65,9 @@ class Manifest final {
   uint64_t version() const;
 
   const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments() const;
+
+  /// Append more fragments to the dataset.
+  void AppendFragments(const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments);
 
  private:
   Manifest(const lance::format::pb::Manifest& pb);

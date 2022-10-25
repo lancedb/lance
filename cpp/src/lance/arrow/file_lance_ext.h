@@ -59,12 +59,14 @@ class LanceFragment : public ::arrow::dataset::Fragment {
 
   std::string type_name() const override { return "lance"; }
 
+  /// Convert to protobuf.
   lance::format::pb::DataFragment ToProto() const;
 
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
  private:
+
   std::vector<LanceDataFile> files_;
 };
 

@@ -69,4 +69,9 @@ const std::vector<std::shared_ptr<lance::arrow::LanceFragment>>& Manifest::fragm
   return fragments_;
 }
 
+void Manifest::AppendFragments(
+    const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments) {
+  fragments_.insert(fragments_.end(), std::begin(fragments), std::end(fragments));
+}
+
 }  // namespace lance::format

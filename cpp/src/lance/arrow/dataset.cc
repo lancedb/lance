@@ -144,6 +144,7 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
   fmt::print("Collected path: {}\n", paths);
+  manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / "_versions").string();

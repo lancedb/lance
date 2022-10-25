@@ -172,6 +172,14 @@ LanceFragment::LanceFragment(const std::vector<LanceDataFile>& files)
   // Only support one file for now.
   assert(files_.size() == 1);
 
+  for (const auto& data_file : files_) {
+    // TODO
+    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
+    auto batch_reader = lance::io::RecordBatchReader(
+        std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
+    ARROW_RETURN_NOT_OK(batch_reader.Open());
+    return ::arrow::RecordBatchGenerator(std::move(batch_reader));
+  }
   return ::arrow::Status::OK();
 //  ARROW_ASSIGN_OR_RAISE(auto infile, );
 //  ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
