@@ -10,9 +10,9 @@ SELECT predict(‘resnet’, image) FROM dataset
 
 Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
-* Use arbitary ML functions in SQL for running model predictions, evaluation and embedding-based similarity search on visual datasets.
+* Use arbitary ML functions in SQL for use cases such as running model predictions and using embeddings for similarity-search.
 
-* [Coming soon] Make it easy to visualize, slice and drill-into visual datasets.
+* [Coming soon] Visualize, slice and drill-into visual datasets to inspect embeddings, labels/annotations, metrics and more.
 
 * [Coming soon] Version, compare and diff visual datasets easily.
 
