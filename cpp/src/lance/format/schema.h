@@ -120,6 +120,9 @@ class Schema final {
   /// (Re-)Assign Field IDs to all the fields.
   void AssignIds();
 
+  /// Get the max assigned ID.
+  int32_t GetMaxId() const;
+
   /// Make a full copy of the schema.
   std::shared_ptr<Schema> Copy() const;
 

@@ -334,8 +334,10 @@ int32_t Field::id() const { return id_; }
 
 void Field::SetId(int32_t parent_id, int32_t* current_id) {
   parent_ = parent_id;
-  id_ = (*current_id);
-  *current_id += 1;
+  if (id_ == 0) {
+    id_ = (*current_id);
+    *current_id += 1;
+  }
   for (auto& child : children_) {
     child->SetId(id_, current_id);
   }
@@ -619,6 +621,7 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
     }
   }
   // Assign to new IDs
+  merged->AssignIds();
   return merged;
 }
 
@@ -681,10 +684,29 @@ std::shared_ptr<Schema> Schema::Copy() const {
 }
 
 void Schema::AssignIds() {
-  int cur_id = 0;
+  int cur_id = GetMaxId() + 1;
   for (auto& field : fields_) {
     field->SetId(-1, &cur_id);
   }
+}
+
+int32_t Schema::GetMaxId() const {
+  class MaxIdVisitor : public FieldVisitor {
+   public:
+    ::arrow::Status Visit(std::shared_ptr<Field> field) override {
+      max_id_ = std::max(field->id(), max_id_);
+      for (auto& child : field->children_) {
+        ARROW_RETURN_NOT_OK(Visit(child));
+      }
+      return ::arrow::Status::OK();
+    }
+    int32_t max_id_ = 0;
+  };
+  auto visitor = MaxIdVisitor();
+  if (!visitor.VisitSchema(*this).ok()) {
+    fmt::print(stderr, "Error when collecting max ID");
+  }
+  return visitor.max_id_;
 }
 
 bool Schema::RemoveField(int32_t id) {

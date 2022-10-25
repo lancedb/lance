@@ -26,6 +26,7 @@
 #include "lance/testing/json.h"
 
 using lance::arrow::ToArray;
+using lance::format::Schema;
 using lance::testing::MakeDataset;
 using lance::testing::TableFromJSON;
 
@@ -217,4 +218,13 @@ TEST_CASE("Test schema metadata") {
   CHECK(dataset->schema()->metadata());
   CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
   CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
+}
+
+TEST_CASE("Test merge two schemas") {
+  auto base_schema = Schema(::arrow::schema({::arrow::field("a", ::arrow::int32())}));
+  auto merged =
+      base_schema.Merge(*::arrow::schema({::arrow::field("b", ::arrow::utf8())})).ValueOrDie();
+  auto a = merged->GetField("a");
+  CHECK(a->id() == 1);
+  CHECK(merged->GetField("b")->id() == 2);
 }
