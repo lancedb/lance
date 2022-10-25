@@ -23,9 +23,9 @@
 namespace lance::arrow {
 
 /// One lance file, with a potential subset of columns.
-class LanceFile {
+class LanceDataFile {
  public:
-  LanceFile(std::string path, const std::vector<int32_t>& fields);
+  LanceDataFile(std::string path, const std::vector<int32_t>& fields);
 
   const std::string& path() const;
 
@@ -38,16 +38,18 @@ class LanceFile {
 
 class LanceFragment : public ::arrow::dataset::Fragment {
  public:
-  LanceFragment();
+  LanceFragment(LanceDataFile file);
+
+  LanceFragment(const std::vector<LanceDataFile>& files);
 
   virtual ~LanceFragment() = default;
 
   std::string type_name() const override { return "lance"; }
 
-  ::arrow::Status Valildate() const;
+  ::arrow::Status Validate() const;
 
  private:
-  std::vector<LanceFile> files_;
+  std::vector<LanceDataFile> files_;
 };
 
 /// Lance FragmentScanOptions.

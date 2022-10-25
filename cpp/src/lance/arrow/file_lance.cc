@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include <memory>
+#include <set>
 #include <utility>
 
 #include "lance/arrow/file_lance_ext.h"
@@ -136,11 +137,30 @@ bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso
   return fso.type_name() == kLanceFormatTypeName;
 }
 
-LanceFile::LanceFile(std::string path, const std::vector<int32_t>& fields)
+LanceDataFile::LanceDataFile(std::string path, const std::vector<int32_t>& fields)
     : path_(std::move(path)), fields_(std::begin(fields), std::end(fields)) {}
 
-const std::string& LanceFile::path() const { return path_; }
+const std::string& LanceDataFile::path() const { return path_; }
 
-const std::vector<int32_t>& LanceFile::fields() const { return fields_; }
+const std::vector<int32_t>& LanceDataFile::fields() const { return fields_; }
+
+LanceFragment::LanceFragment(LanceDataFile file) : files_({std::move(file)}) {}
+
+LanceFragment::LanceFragment(const std::vector<LanceDataFile>& files)
+    : files_(std::begin(files), std::end(files)) {}
+
+::arrow::Status LanceFragment::Validate() const {
+  std::set<int32_t> seen;
+  for (const auto& file : files_) {
+    for (auto field_id : file.fields()) {
+      if (seen.contains(field_id)) {
+        return ::arrow::Status::Invalid(
+            "Fragment contains duplicated column: ", file.path(), field_id);
+      }
+      seen.insert(field_id);
+    }
+  }
+  return ::arrow::Status::OK();
+}
 
 }  // namespace lance::arrow
