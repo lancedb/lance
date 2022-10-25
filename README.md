@@ -8,15 +8,15 @@ SELECT predict(‘resnet’, image) FROM dataset
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
-Lance makes machine learning workflows with visual data easy (images, videos, point clouds, 3D assets, audio, and more), by allowing Developers, Analysts and Operations to:
+Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
-* Use arbitary ML functions in SQL over visual datasets, such as running predictions and using embeddings for similarity search.
+* Use arbitary ML functions in SQL for running model predictions, evaluation and embedding-based similarity search on visual datasets.
 
-* [Coming soon] Make it easy to visualize, slice and drill-into visual datasets with query speeds 50-100x than using Parquet.
+* [Coming soon] Make it easy to visualize, slice and drill-into visual datasets.
 
 * [Coming soon] Version, compare and diff visual datasets easily.
 
-Lance is powered by Lance Format, an Apache-Arrow supported columnar data format which is an alternative to Parquet, Iceberg and Delta that is optimized for visual data.
+Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for visual data use cases.
 
 Lance currently supports DuckDB.
 
