@@ -17,6 +17,8 @@
 #include <arrow/dataset/api.h>
 #include <arrow/status.h>
 #include <fmt/format.h>
+#include <uuid.h>
+#include <random>
 
 #include "lance/io/writer.h"
 
@@ -30,6 +32,15 @@ namespace lance::arrow {
   // TODO: support partition via lance manifest .
   lance_option.partitioning =
       std::make_shared<::arrow::dataset::FilenamePartitioning>(::arrow::schema({}));
+
+  std::random_device rd;
+  auto seed_data = std::array<int, std::mt19937::state_size> {};
+  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
+  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
+  std::mt19937 generator(seq);
+  uuids::uuid_random_generator gen{generator};
+  auto uuid = gen();
+  lance_option.basename_template = uuids::to_string(uuid) + "_{i}.lance";
 
   if (lance_option.format() == nullptr || lance_option.format()->type_name() != "lance") {
     return ::arrow::Status::Invalid("Must write with Lance format");
