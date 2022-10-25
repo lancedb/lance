@@ -383,6 +383,38 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   return new_field;
 }
 
+::arrow::Result<std::shared_ptr<Field>> Field::Merge(const ::arrow::Field& arrow_field) const {
+  if (name() != arrow_field.name()) {
+    return ::arrow::Status::Invalid(
+        "Attempt to merge two different fields: ", name(), "!=", arrow_field.name());
+  }
+  auto self_type = type();
+  if (self_type->id() != arrow_field.type()->id()) {
+    return ::arrow::Status::Invalid(
+        "Can not merge two fields: ", self_type->ToString(), "!=", arrow_field.type()->ToString());
+  };
+  auto new_field = Copy(true);
+  if (::arrow::is_list_like(self_type->id())) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field.type());
+    return children_[0]->Merge(*list_type->value_field());
+  } else if (lance::arrow::is_struct(self_type)) {
+    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field.type());
+    for (auto& arrow_child : struct_type->fields()) {
+      auto child = Get(arrow_child->name());
+      if (!child) {
+        new_field->children_.emplace_back(std::make_shared<Field>(arrow_child));
+      } else {
+        ARROW_ASSIGN_OR_RAISE(auto new_child_field, child->Merge(*arrow_child));
+        new_field->children_.emplace_back(new_child_field);
+      }
+    }
+  } else {
+    return ::arrow::Status::Invalid(
+        "Can not merge between: ", self_type->ToString(), " and ", arrow_field.type()->ToString());
+  }
+  return new_field;
+}
+
 bool Field::Equals(const Field& other, bool check_id) const {
   if (check_id && (id_ != other.id_ || parent_ != other.parent_)) {
     return false;
@@ -568,6 +600,26 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   auto visitor = SchemaExcludeVisitor(excluded);
   ARROW_RETURN_NOT_OK(visitor.VisitSchema(other));
   return excluded;
+}
+
+::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const ::arrow::Schema& arrow_schema) const {
+  auto merged = Copy();
+  for (auto& arrow_field : arrow_schema.fields()) {
+    auto field = merged->GetField(arrow_field->name());
+    if (field) {
+      // Nested.
+      auto type_id = arrow_field->type()->id();
+      if (::arrow::is_primitive(type_id) || ::arrow::is_dictionary(type_id) ||
+          ::arrow::is_base_binary_like(type_id)) {
+        return ::arrow::Status::Invalid("Leaf node already exist: ", field->name());
+      }
+    } else {
+      field = std::make_shared<Field>(arrow_field);
+      merged->AddField(field);
+    }
+  }
+  // Assign to new IDs
+  return merged;
 }
 
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
