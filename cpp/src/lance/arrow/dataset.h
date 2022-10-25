@@ -20,6 +20,7 @@
 #include <arrow/status.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -38,17 +39,31 @@ class DatasetVersion {
 ///
 class LanceDataset : public ::arrow::dataset::Dataset {
  public:
+  /// Copy constructor.
+  LanceDataset(const LanceDataset& other);
+
+  ~LanceDataset();
+
   /// Write a in-memory Arrow dataset to disk.
   ///
   /// If the dataset already exist, write new version.
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner);
 
-
+  /// Load dataset.
+  ///
+  /// \param fs File system object
+  /// \param base_uri base path to the dataset.
+  /// Returns nullptr if the dataset does not exist.
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
       std::shared_ptr<::arrow::fs::FileSystem> fs,
       std::string base_uri,
       std::optional<uint64_t> version = std::nullopt);
+
+  std::string type_name() const override { return "lance"; }
+
+  ::arrow::Result<std::shared_ptr<Dataset>> ReplaceSchema(
+      std::shared_ptr<::arrow::Schema> schema) const override;
 
   /// Get all sorted versions.
   std::vector<DatasetVersion> versions() const;
@@ -58,9 +73,15 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   ::arrow::Result<std::shared_ptr<LanceDataset>> version(uint64_t version) const;
 
+ protected:
+  ::arrow::Result<::arrow::dataset::FragmentIterator> GetFragmentsImpl(
+      ::arrow::compute::Expression predicate) override;
+
  private:
-  const std::string base_uri_;
-  std::shared_ptr<::arrow::fs::FileSystem> filesystem_;
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+
+  LanceDataset(std::unique_ptr<Impl> impl);
 };
 
 }  // namespace lance::arrow

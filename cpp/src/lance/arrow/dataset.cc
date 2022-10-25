@@ -30,8 +30,48 @@ namespace fs = std::filesystem;
 
 namespace lance::arrow {
 
+const std::string kLatestManifest = "_latest.manifest";
+
+std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
+  if (version.has_value()) {
+    return fs::path(base_uri) / "_versions" / fmt::format("{}.manifest", version.value());
+  } else {
+    return fs::path(base_uri) / kLatestManifest;
+  }
+}
+
+class LanceDataset::Impl {
+ public:
+  Impl() = delete;
+
+  Impl(std::shared_ptr<::arrow::fs::FileSystem> fs,
+       const std::string& base_uri,
+       std::shared_ptr<lance::format::Manifest> manifest)
+      : fs_(std::move(fs)), base_uri_(base_uri), manifest_(std::move(manifest)) {}
+
+  const std::shared_ptr<lance::format::Manifest>& manifest() const { return manifest_; }
+
+ private:
+  std::shared_ptr<::arrow::fs::FileSystem> fs_;
+  std::string base_uri_;
+  std::shared_ptr<lance::format::Manifest> manifest_;
+};
+
+LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
+    : ::arrow::dataset::Dataset(impl->manifest()->schema().ToArrow()), impl_(std::move(impl)) {}
+
+LanceDataset::LanceDataset(const LanceDataset& other)
+    : LanceDataset(std::make_unique<Impl>(*other.impl_)) {}
+
+LanceDataset::~LanceDataset() {}
+
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner) {
+  // Load previous latest Manifest if any.
+  ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, options.base_dir));
+  if (!cur_dataset) {
+  }
+
   // Write manifest file
   auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
   auto manifest = lance::format::Manifest(schema);
@@ -60,14 +100,14 @@ namespace lance::arrow {
   auto metadata_collector = [](::arrow::dataset::FileWriter* writer) {
     auto w = dynamic_cast<lance::io::FileWriter*>(writer);
     assert(w != nullptr);
-    fmt::print("Writer: {}\n", writer->destination().path);
     return ::arrow::Status::OK();
   };
   lance_option.writer_post_finish = metadata_collector;
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
-  // Write manifest file
+  // Write the manifest version file.
+  // It only supports single writer at the moment.
   auto version_dir = (fs::path(options.base_dir) / "_versions").string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
   auto manifest_path =
@@ -78,6 +118,39 @@ namespace lance::arrow {
   }
   auto latest_manifest_path = (fs::path(options.base_dir) / "_latest.manifest").string();
   return fs->CopyFile(manifest_path, latest_manifest_path);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(
+    std::shared_ptr<::arrow::fs::FileSystem> fs,
+    std::string base_uri,
+    std::optional<uint64_t> version) {
+  ARROW_ASSIGN_OR_RAISE(auto finfo, fs->GetFileInfo(base_uri));
+  if (finfo.type() == ::arrow::fs::FileType::NotFound) {
+    return nullptr;
+  }
+  auto manifest_path = GetManifestPath(base_uri, version);
+  ARROW_ASSIGN_OR_RAISE(finfo, fs->GetFileInfo(base_uri));
+  if (finfo.type() == ::arrow::fs::FileType::NotFound) {
+    return ::arrow::Status::IOError("Manifest not found: ", manifest_path);
+  }
+  std::shared_ptr<lance::format::Manifest> manifest;
+  {
+    ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(manifest_path));
+    ARROW_ASSIGN_OR_RAISE(auto parsed, lance::format::Manifest::Parse(in, 0));
+    manifest = std::move(parsed);
+  }
+  auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
+  return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
+}
+
+::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
+    [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {
+  return std::make_shared<LanceDataset>(*this);
+}
+
+::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
+    [[maybe_unused]] ::arrow::compute::Expression predicate) {
+  return ::arrow::Status::OK();
 }
 
 }  // namespace lance::arrow
