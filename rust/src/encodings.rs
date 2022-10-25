@@ -16,7 +16,6 @@
 
 use std::fmt;
 use std::io::Result;
-use std::sync::Arc;
 
 use arrow2::array::{Array, Int32Array};
 use arrow2::types::NativeType;
