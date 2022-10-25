@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <memory>
 #include <string>
 
 #include "lance/arrow/file_lance.h"
@@ -26,18 +27,25 @@
 
 using lance::arrow::ToArray;
 
+std::shared_ptr<::arrow::Table> ReadTable(const std::string& uri, std::optional<int32_t> version) {
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
+  auto actual_dataset = lance::arrow::LanceDataset::Make(fs, uri, version).ValueOrDie();
+  CHECK(actual_dataset != nullptr);
+  return actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+}
+
 TEST_CASE("Create new dataset") {
   auto ids = ToArray({1, 2, 3, 4, 5, 6, 8}).ValueOrDie();
   auto values = ToArray({"a", "b", "c", "d", "e", "f", "g"}).ValueOrDie();
-  auto table = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
-                                                     ::arrow::field("value", ::arrow::utf8())}),
-                                    {ids, values});
+  auto table1 = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                                      ::arrow::field("value", ::arrow::utf8())}),
+                                     {ids, values});
 
-  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto dataset = lance::testing::MakeDataset(table1).ValueOrDie();
 
   auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
   auto format = lance::arrow::LanceFileFormat::Make();
-  fmt::print("Base uri: {}\n", base_uri);
   ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
   std::string path;
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(base_uri, &path).ValueOrDie();
@@ -48,13 +56,6 @@ TEST_CASE("Create new dataset") {
   auto status = lance::arrow::LanceDataset::Write(
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
   CHECK(status.ok());
-
-  auto actual_dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(actual_dataset != nullptr);
-  auto actual_table =
-      actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
-  INFO("Expect table: " << table->ToString() << " Got: " << actual_table->ToString());
-  CHECK(actual_table->Equals(*table));
 
   ids = ToArray({100, 101, 102}).ValueOrDie();
   values = ToArray({"aaa", "bbb", "ccc"}).ValueOrDie();
@@ -67,11 +68,10 @@ TEST_CASE("Create new dataset") {
   INFO("Write dataset: " << status.message());
   CHECK(status.ok());
 
-  actual_dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(actual_dataset != nullptr);
-  actual_table =
-      actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
-  auto combined_table = ::arrow::ConcatenateTables({table, table2}).ValueOrDie();
-  INFO("Expect table: " << combined_table->ToString() << " Got: " << actual_table->ToString());
-  CHECK(actual_table->Equals(*combined_table));
+  auto table_v1 = ReadTable(base_uri, 1);
+  CHECK(table_v1->Equals(*table1));
+
+  auto table_v2 = ReadTable(base_uri, 2);
+  auto combined_table = ::arrow::ConcatenateTables({table1, table2}).ValueOrDie();
+  CHECK(table_v2->Equals(*combined_table));
 }
