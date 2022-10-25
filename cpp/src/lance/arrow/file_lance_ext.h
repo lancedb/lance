@@ -66,8 +66,13 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
  private:
-
   std::vector<LanceDataFile> files_;
+
+ private:
+  // The attributes below are not serialized to protobuf.
+  std::string data_uri_;
+  std::shared_ptr<::arrow::fs::FileSystem> fs_;
+  std::shared_ptr<lance::format::Schema> schema_;
 };
 
 /// Lance FragmentScanOptions.

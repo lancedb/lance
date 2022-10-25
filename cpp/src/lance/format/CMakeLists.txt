@@ -35,7 +35,7 @@ add_library(
         schema.h
         visitors.cc
         visitors.h
-)
+        data_fragment.h)
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(metadata_test)

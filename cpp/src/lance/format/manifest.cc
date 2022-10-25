@@ -31,7 +31,11 @@ Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)),
 Manifest::Manifest(Manifest&& other) noexcept : schema_(std::move(other.schema_)) {}
 
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
-    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {}
+    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
+  for (auto& pb_fragment : pb.fragments()) {
+    fragments_.emplace_back(std::make_shared<lance::arrow::LanceFragment>(pb_fragment));
+  }
+}
 
 ::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
     std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset) {
@@ -52,6 +56,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   for (const auto& fragment : fragments_) {
     pb.mutable_fragments()->Add(fragment->ToProto());
   }
+  fmt::print("Write pb fragments: {}\n", pb.fragments_size());
   return io::WriteProto(out, pb);
 }
 

@@ -87,6 +87,9 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner) {
   const auto& base_dir = options.base_dir;
+  const auto data_dir = (fs::path(base_dir) / kDataDir).string();
+  auto& fs = options.filesystem;
+
   // Load previous latest Manifest if any.
   ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, base_dir));
 
@@ -101,10 +104,7 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
     manifest = cur_manifest->BumpVersion();
   }
   // Write manifest file
-  auto& fs = options.filesystem;
-
   auto lance_option = options;
-  auto data_dir = (fs::path(base_dir) / kDataDir).string();
   lance_option.base_dir = data_dir;
   lance_option.existing_data_behavior = ::arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
   auto partitioning = std::move(lance_option.partitioning);
@@ -145,6 +145,7 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
 
   fmt::print("Collected path: {}\n", paths);
   manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
+  fmt::print("After pending paths({}), got {}\n", paths.size(), manifest->fragments().size());
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / "_versions").string();
@@ -189,9 +190,10 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
 ::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
     [[maybe_unused]] ::arrow::compute::Expression predicate) {
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments;
-  fragments.insert(fragments.begin(),
+  fragments.insert(fragments.end(),
                    impl_->manifest()->fragments().begin(),
                    impl_->manifest()->fragments().end());
+  fmt::print("GetFragmentsImpl: {} {}\n", fragments.size(), impl_->manifest()->fragments().size());
   return ::arrow::MakeVectorIterator(fragments);
 }
 

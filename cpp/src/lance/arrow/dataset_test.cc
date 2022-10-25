@@ -47,15 +47,21 @@ TEST_CASE("Create new dataset") {
 
   auto status = lance::arrow::LanceDataset::Write(
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
-  INFO("Write dataset: " << status.message());
   CHECK(status.ok());
+
+  auto actual_dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(actual_dataset != nullptr);
+  auto actual_table =
+      actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  INFO("Expect table: " << table->ToString() << " Got: " << actual_table->ToString());
+  CHECK(actual_table->Equals(*table));
 
   ids = ToArray({100, 101, 102}).ValueOrDie();
   values = ToArray({"aaa", "bbb", "ccc"}).ValueOrDie();
-  table = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
-                                                ::arrow::field("value", ::arrow::utf8())}),
-                               {ids, values});
-  dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto table2 = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                                      ::arrow::field("value", ::arrow::utf8())}),
+                                     {ids, values});
+  dataset = lance::testing::MakeDataset(table2).ValueOrDie();
   status = lance::arrow::LanceDataset::Write(
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
   INFO("Write dataset: " << status.message());

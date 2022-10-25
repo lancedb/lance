@@ -18,6 +18,7 @@
 #include <arrow/util/thread_pool.h>
 #include <fmt/format.h>
 
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <utility>
@@ -31,6 +32,8 @@
 #include "lance/io/writer.h"
 
 const char kLanceFormatTypeName[] = "lance";
+
+namespace fs = std::filesystem;
 
 namespace lance::arrow {
 
@@ -170,27 +173,26 @@ LanceFragment::LanceFragment(const std::vector<LanceDataFile>& files)
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
   // Only support one file for now.
+  // There will be more than one file when schema evolution happens, will implement it later.
   assert(files_.size() == 1);
 
+  fmt::print("ScanBatchAsync: fiels={}\n", files_.size());
   for (const auto& data_file : files_) {
-    // TODO
-    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
+    auto full_path = (fs::path(data_uri_) / data_file.path()).string();
+    fmt::print("Open full path: {}\n", full_path);
+    ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path));
+    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
     auto batch_reader = lance::io::RecordBatchReader(
         std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
     ARROW_RETURN_NOT_OK(batch_reader.Open());
     return ::arrow::RecordBatchGenerator(std::move(batch_reader));
   }
+  // We should not reach here.
   return ::arrow::Status::OK();
-//  ARROW_ASSIGN_OR_RAISE(auto infile, );
-//  ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
-//  auto batch_reader = lance::io::RecordBatchReader(
-//      std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
-//  ARROW_RETURN_NOT_OK(batch_reader.Open());
-//  return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
-  return ::arrow::Result<std::shared_ptr<::arrow::Schema>>();
+  return schema_->ToArrow();
 }
 
 lance::format::pb::DataFragment LanceFragment::ToProto() const {

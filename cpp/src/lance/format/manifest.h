@@ -70,14 +70,15 @@ class Manifest final {
   void AppendFragments(const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments);
 
  private:
-  Manifest(const lance::format::pb::Manifest& pb);
-
   /// Table schema.
   std::shared_ptr<Schema> schema_;
 
   std::uint64_t version_ = 1;
 
   std::vector<std::shared_ptr<arrow::LanceFragment>> fragments_;
+
+ private:
+  Manifest(const lance::format::pb::Manifest& pb);
 };
 
 }  // namespace lance::format
