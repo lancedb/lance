@@ -24,7 +24,9 @@
 #include <filesystem>
 #include <mutex>
 #include <random>
+#include <utility>
 
+#include "lance/arrow/file_lance_ext.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/writer.h"
@@ -53,33 +55,33 @@ class LanceDataset::Impl {
  public:
   Impl() = delete;
 
-  Impl(std::shared_ptr<::arrow::fs::FileSystem> fs,
-       const std::string& base_uri,
-       std::shared_ptr<lance::format::Manifest> manifest)
-      : fs_(std::move(fs)), base_uri_(base_uri), manifest_(std::move(manifest)) {}
+  Impl(std::shared_ptr<::arrow::fs::FileSystem> filesystem,
+       std::string uri,
+       std::shared_ptr<lance::format::Manifest> m)
+      : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
 
-  const std::shared_ptr<lance::format::Manifest>& manifest() const { return manifest_; }
+  std::string data_dir() const { return fs::path(base_uri) / kDataDir; }
 
- private:
-  std::shared_ptr<::arrow::fs::FileSystem> fs_;
-  std::string base_uri_;
-  std::shared_ptr<lance::format::Manifest> manifest_;
+  std::shared_ptr<::arrow::fs::FileSystem> fs;
+  std::string base_uri;
+  std::shared_ptr<lance::format::Manifest> manifest;
 };
 
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
-    : ::arrow::dataset::Dataset(impl->manifest()->schema().ToArrow()), impl_(std::move(impl)) {}
+    : ::arrow::dataset::Dataset(impl->manifest->schema().ToArrow()), impl_(std::move(impl)) {}
 
 LanceDataset::LanceDataset(const LanceDataset& other)
     : LanceDataset(std::make_unique<Impl>(*other.impl_)) {}
 
 LanceDataset::~LanceDataset() {}
 
-std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<std::string>& paths,
-                                                            const lance::format::Schema& schema) {
-  std::vector<std::shared_ptr<LanceFragment>> fragments;
+std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
+    const std::vector<std::string>& paths, const lance::format::Schema& schema) {
+  std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
   auto field_ids = schema.GetFieldIds();
   for (auto path : paths) {
-    fragments.emplace_back(std::make_shared<LanceFragment>(LanceDataFile(path, field_ids)));
+    fragments.emplace_back(
+        std::make_shared<lance::format::DataFragment>(lance::format::DataFile(path, field_ids)));
   }
   return fragments;
 }
@@ -100,7 +102,7 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
     manifest = std::make_shared<lance::format::Manifest>(schema);
   } else {
     // Bump the version
-    auto cur_manifest = cur_dataset->impl_->manifest();
+    auto cur_manifest = cur_dataset->impl_->manifest;
     manifest = cur_manifest->BumpVersion();
   }
   // Write manifest file
@@ -190,10 +192,11 @@ std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<st
 ::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
     [[maybe_unused]] ::arrow::compute::Expression predicate) {
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments;
-  fragments.insert(fragments.end(),
-                   impl_->manifest()->fragments().begin(),
-                   impl_->manifest()->fragments().end());
-  fmt::print("GetFragmentsImpl: {} {}\n", fragments.size(), impl_->manifest()->fragments().size());
+  for (const auto& data_fragment : impl_->manifest->fragments()) {
+    fragments.emplace_back(std::make_shared<LanceFragment>(
+        impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema()));
+  }
+  fmt::print("GetFragmentsImpl: {} {}\n", fragments.size());
   return ::arrow::MakeVectorIterator(fragments);
 }
 

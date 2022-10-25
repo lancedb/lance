@@ -19,7 +19,7 @@
 
 #include <memory>
 
-#include "lance/arrow/file_lance_ext.h"
+#include "lance/format/data_fragment.h"
 #include "lance/format/format.pb.h"
 
 namespace lance::format {
@@ -64,10 +64,10 @@ class Manifest final {
   /// Returns the version number.
   uint64_t version() const;
 
-  const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments() const;
+  const std::vector<std::shared_ptr<DataFragment>>& fragments() const;
 
   /// Append more fragments to the dataset.
-  void AppendFragments(const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments);
+  void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
 
  private:
   /// Table schema.
@@ -75,9 +75,8 @@ class Manifest final {
 
   std::uint64_t version_ = 1;
 
-  std::vector<std::shared_ptr<arrow::LanceFragment>> fragments_;
+  std::vector<std::shared_ptr<DataFragment>> fragments_;
 
- private:
   Manifest(const lance::format::pb::Manifest& pb);
 };
 

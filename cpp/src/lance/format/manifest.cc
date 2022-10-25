@@ -33,7 +33,7 @@ Manifest::Manifest(Manifest&& other) noexcept : schema_(std::move(other.schema_)
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
     : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
   for (auto& pb_fragment : pb.fragments()) {
-    fragments_.emplace_back(std::make_shared<lance::arrow::LanceFragment>(pb_fragment));
+    fragments_.emplace_back(std::make_shared<DataFragment>(pb_fragment));
   }
 }
 
@@ -70,12 +70,12 @@ const Schema& Manifest::schema() const { return *schema_; }
 
 uint64_t Manifest::version() const { return version_; }
 
-const std::vector<std::shared_ptr<lance::arrow::LanceFragment>>& Manifest::fragments() const {
+const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const {
   return fragments_;
 }
 
 void Manifest::AppendFragments(
-    const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments) {
+    const std::vector<std::shared_ptr<DataFragment>>& fragments) {
   fragments_.insert(fragments_.end(), std::begin(fragments), std::end(fragments));
 }
 

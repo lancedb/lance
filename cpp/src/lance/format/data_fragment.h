@@ -12,7 +12,49 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "lance/format/format.pb.h"
+#include "lance/format/format.h"
+
 namespace lance::format {
 
-class DataFragment {};
-}
+class DataFile : public ConvertToProto<pb::DataFile> {
+ public:
+  explicit DataFile(const format::pb::DataFile& pb);
+
+  DataFile(std::string path, const std::vector<int32_t>& fields);
+
+  /// Get the relative path of the data
+  const std::string& path() const;
+
+  const std::vector<int32_t>& fields() const;
+
+  pb::DataFile ToProto() const override;
+
+ private:
+  std::string path_;
+  std::vector<int32_t> fields_;
+};
+
+class DataFragment : public ConvertToProto<pb::DataFragment> {
+ public:
+  explicit DataFragment(const format::pb::DataFragment& pb);
+
+  explicit DataFragment(const DataFile& data_file);
+
+  DataFragment(std::vector<DataFile> data_files);
+
+  const std::vector<DataFile>& data_files() const;
+
+  pb::DataFragment ToProto() const override;
+
+ private:
+  std::vector<DataFile> files_;
+};
+
+}  // namespace lance::format

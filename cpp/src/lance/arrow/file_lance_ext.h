@@ -18,39 +18,17 @@
 
 #include <vector>
 
-#include "lance/format/format.pb.h"
+#include "lance/format/data_fragment.h"
 #include "lance/io/exec/counter.h"
 
 namespace lance::arrow {
 
-/// One lance file, with a potential subset of columns.
-class LanceDataFile {
- public:
-  explicit LanceDataFile(const format::pb::DataFile& pb);
-
-  LanceDataFile(std::string path, const std::vector<int32_t>& fields);
-
-  /// Get the relative path of the data
-  const std::string& path() const;
-
-  const std::vector<int32_t>& fields() const;
-
-  lance::format::pb::DataFile ToProto() const;
-
- private:
-  std::string path_;
-  std::vector<int32_t> fields_;
-};
-
 class LanceFragment : public ::arrow::dataset::Fragment {
  public:
-  explicit LanceFragment(const format::pb::DataFragment& pb);
-
-  /// Construct LanceFragment with one file.
-  explicit LanceFragment(LanceDataFile file);
-
-  /// Construct LanceFragment with files.
-  explicit LanceFragment(const std::vector<LanceDataFile>& files);
+  LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
+                std::string data_dir,
+                std::shared_ptr<lance::format::DataFragment> fragment,
+                std::shared_ptr<lance::format::Schema> schema);
 
   ~LanceFragment() override = default;
 
@@ -59,19 +37,13 @@ class LanceFragment : public ::arrow::dataset::Fragment {
 
   std::string type_name() const override { return "lance"; }
 
-  /// Convert to protobuf.
-  lance::format::pb::DataFragment ToProto() const;
-
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
  private:
-  std::vector<LanceDataFile> files_;
-
- private:
-  // The attributes below are not serialized to protobuf.
-  std::string data_uri_;
   std::shared_ptr<::arrow::fs::FileSystem> fs_;
+  std::string data_uri_;
+  std::shared_ptr<lance::format::DataFragment> fragment_;
   std::shared_ptr<lance::format::Schema> schema_;
 };
 
