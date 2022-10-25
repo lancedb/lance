@@ -49,4 +49,15 @@ TEST_CASE("Create new dataset") {
       write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
   INFO("Write dataset: " << status.message());
   CHECK(status.ok());
+
+  ids = ToArray({100, 101, 102}).ValueOrDie();
+  values = ToArray({"aaa", "bbb", "ccc"}).ValueOrDie();
+  table = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                                ::arrow::field("value", ::arrow::utf8())}),
+                               {ids, values});
+  dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  status = lance::arrow::LanceDataset::Write(
+      write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
+  INFO("Write dataset: " << status.message());
+  CHECK(status.ok());
 }

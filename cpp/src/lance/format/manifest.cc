@@ -49,6 +49,9 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
     (*pb.mutable_metadata())[key] = value;
   }
   pb.set_version(version_);
+  for (const auto& fragment : fragments_) {
+    pb.mutable_fragments()->Add(fragment->ToProto());
+  }
   return io::WriteProto(out, pb);
 }
 

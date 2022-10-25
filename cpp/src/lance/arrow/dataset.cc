@@ -17,10 +17,12 @@
 #include <arrow/dataset/api.h>
 #include <arrow/status.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <uuid.h>
 
 #include <algorithm>
 #include <filesystem>
+#include <mutex>
 #include <random>
 
 #include "lance/format/manifest.h"
@@ -34,6 +36,11 @@ namespace lance::arrow {
 const std::string kLatestManifest = "_latest.manifest";
 const std::string kDataDir = "data";
 
+/// Get Manifest file path for a version.
+///
+/// \param base_uri the base uri of the dataset
+/// \param version optional version number. If not specified, returns the latest version.
+/// \return string path to the manifest file.
 std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
   if (version.has_value()) {
     return fs::path(base_uri) / "_versions" / fmt::format("{}.manifest", version.value());
@@ -67,6 +74,16 @@ LanceDataset::LanceDataset(const LanceDataset& other)
 
 LanceDataset::~LanceDataset() {}
 
+std::vector<std::shared_ptr<LanceFragment>> CreateFragments(const std::vector<std::string>& paths,
+                                                            const lance::format::Schema& schema) {
+  std::vector<std::shared_ptr<LanceFragment>> fragments;
+  auto field_ids = schema.GetFieldIds();
+  for (auto path : paths) {
+    fragments.emplace_back(std::make_shared<LanceFragment>(LanceDataFile(path, field_ids)));
+  }
+  return fragments;
+}
+
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner) {
   const auto& base_dir = options.base_dir;
@@ -87,11 +104,13 @@ LanceDataset::~LanceDataset() {}
   auto& fs = options.filesystem;
 
   auto lance_option = options;
-  lance_option.base_dir = fs::path(base_dir) / kDataDir;
+  auto data_dir = (fs::path(base_dir) / kDataDir).string();
+  lance_option.base_dir = data_dir;
+  lance_option.existing_data_behavior = ::arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
   auto partitioning = std::move(lance_option.partitioning);
   // TODO: support partition via lance manifest.
   lance_option.partitioning =
-      std::make_shared<::arrow::dataset::FilenamePartitioning>(::arrow::schema({}));
+      std::make_shared<::arrow::dataset::HivePartitioning>(::arrow::schema({}));
 
   std::random_device rd;
   auto seed_data = std::array<int, std::mt19937::state_size>{};
@@ -106,9 +125,17 @@ LanceDataset::~LanceDataset() {}
     return ::arrow::Status::Invalid("Must write with Lance format");
   }
 
-  auto metadata_collector = [](::arrow::dataset::FileWriter* writer) {
+  std::vector<std::string> paths;
+  std::mutex mutex;
+  auto metadata_collector = [&paths, data_dir, &mutex](::arrow::dataset::FileWriter* writer) {
     auto w = dynamic_cast<lance::io::FileWriter*>(writer);
     assert(w != nullptr);
+    fmt::print("write to {}\n", w->destination().path);
+    auto relative = fs::relative(w->destination().path, data_dir);
+    {
+      std::lock_guard guard(mutex);
+      paths.emplace_back(relative);
+    }
     return ::arrow::Status::OK();
   };
   lance_option.writer_post_finish = metadata_collector;
@@ -116,6 +143,7 @@ LanceDataset::~LanceDataset() {}
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
+  fmt::print("Collected path: {}\n", paths);
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / "_versions").string();

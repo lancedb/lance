@@ -18,6 +18,7 @@
 
 #include <vector>
 
+#include "lance/format/format.pb.h"
 #include "lance/io/exec/counter.h"
 
 namespace lance::arrow {
@@ -25,11 +26,16 @@ namespace lance::arrow {
 /// One lance file, with a potential subset of columns.
 class LanceDataFile {
  public:
+  explicit LanceDataFile(const format::pb::DataFile& pb);
+
   LanceDataFile(std::string path, const std::vector<int32_t>& fields);
 
+  /// Get the relative path of the data
   const std::string& path() const;
 
   const std::vector<int32_t>& fields() const;
+
+  lance::format::pb::DataFile ToProto() const;
 
  private:
   std::string path_;
@@ -38,15 +44,25 @@ class LanceDataFile {
 
 class LanceFragment : public ::arrow::dataset::Fragment {
  public:
-  LanceFragment(LanceDataFile file);
+  explicit LanceFragment(const format::pb::DataFragment& pb);
 
-  LanceFragment(const std::vector<LanceDataFile>& files);
+  /// Construct LanceFragment with one file.
+  explicit LanceFragment(LanceDataFile file);
 
-  virtual ~LanceFragment() = default;
+  /// Construct LanceFragment with files.
+  explicit LanceFragment(const std::vector<LanceDataFile>& files);
+
+  ~LanceFragment() override = default;
+
+  ::arrow::Result<::arrow::RecordBatchGenerator> ScanBatchesAsync(
+      const std::shared_ptr<::arrow::dataset::ScanOptions>& options) override;
 
   std::string type_name() const override { return "lance"; }
 
-  ::arrow::Status Validate() const;
+  lance::format::pb::DataFragment ToProto() const;
+
+ protected:
+  ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
  private:
   std::vector<LanceDataFile> files_;
