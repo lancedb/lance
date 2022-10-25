@@ -142,11 +142,11 @@ bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso
 LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                              std::string data_dir,
                              std::shared_ptr<lance::format::DataFragment> fragment,
-                             std::shared_ptr<lance::format::Schema> schema)
+                             const format::Schema& schema)
     : fs_(std::move(fs)),
-      data_uri_(data_dir),
+      data_uri_(std::move(data_dir)),
       fragment_(std::move(fragment)),
-      schema_(std::move(schema)) {}
+      schema_(schema) {}
 
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
@@ -168,7 +168,7 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
-  return schema_->ToArrow();
+  return schema_.ToArrow();
 }
 
 

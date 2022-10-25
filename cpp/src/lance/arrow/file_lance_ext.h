@@ -28,7 +28,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                 std::string data_dir,
                 std::shared_ptr<lance::format::DataFragment> fragment,
-                std::shared_ptr<lance::format::Schema> schema);
+                const format::Schema& schema);
 
   ~LanceFragment() override = default;
 
@@ -44,7 +44,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   std::shared_ptr<::arrow::fs::FileSystem> fs_;
   std::string data_uri_;
   std::shared_ptr<lance::format::DataFragment> fragment_;
-  std::shared_ptr<lance::format::Schema> schema_;
+  const format::Schema& schema_;
 };
 
 /// Lance FragmentScanOptions.
