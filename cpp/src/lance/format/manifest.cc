@@ -62,4 +62,8 @@ const Schema& Manifest::schema() const { return *schema_; }
 
 uint64_t Manifest::version() const { return version_; }
 
+const std::vector<std::shared_ptr<lance::arrow::LanceFragment>>& Manifest::fragments() const {
+  return fragments_;
+}
+
 }  // namespace lance::format

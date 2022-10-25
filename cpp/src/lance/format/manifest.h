@@ -64,6 +64,8 @@ class Manifest final {
   /// Returns the version number.
   uint64_t version() const;
 
+  const std::vector<std::shared_ptr<arrow::LanceFragment>>& fragments() const;
+
  private:
   Manifest(const lance::format::pb::Manifest& pb);
 
@@ -72,7 +74,7 @@ class Manifest final {
 
   std::uint64_t version_ = 1;
 
-  std::vector<arrow::LanceFragment> fragments_;
+  std::vector<std::shared_ptr<arrow::LanceFragment>> fragments_;
 };
 
 }  // namespace lance::format

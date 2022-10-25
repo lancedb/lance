@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <uuid.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <random>
 
@@ -158,7 +159,11 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
     [[maybe_unused]] ::arrow::compute::Expression predicate) {
-  return ::arrow::Status::OK();
+  std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments;
+  fragments.insert(fragments.begin(),
+                   impl_->manifest()->fragments().begin(),
+                   impl_->manifest()->fragments().end());
+  return ::arrow::MakeVectorIterator(fragments);
 }
 
 }  // namespace lance::arrow
