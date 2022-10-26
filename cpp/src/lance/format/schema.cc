@@ -570,10 +570,6 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return excluded;
 }
 
-::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const Schema& other) const {
-  return ::arrow::Status::NotImplemented("not implemented");
-}
-
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
 
 std::shared_ptr<Field> Schema::GetField(int32_t id) const {

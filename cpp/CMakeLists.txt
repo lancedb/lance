@@ -81,7 +81,10 @@ endif ()
 
 FetchContent_MakeAvailable(${available_contents})
 
-include_directories(${fmt_SOURCE_DIR}/include ${uuid_SOURCE_DIR}/include)
+include_directories(
+        ${fmt_SOURCE_DIR}/include
+        ${uuid_SOURCE_DIR}/include
+)
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
 find_package(Protobuf REQUIRED)

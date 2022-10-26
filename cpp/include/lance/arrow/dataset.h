@@ -51,10 +51,11 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner);
 
-  /// Load dataset.
+  /// Load dataset, with a specific version.
   ///
   /// \param fs File system object
   /// \param base_uri base path to the dataset.
+  /// \param version optional version to load. If not presented, load the latest version.
   /// Returns nullptr if the dataset does not exist.
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
       std::shared_ptr<::arrow::fs::FileSystem> fs,
@@ -63,20 +64,8 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   std::string type_name() const override { return "lance"; }
 
-  /// Add one column.
-  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumn(
-      const std::shared_ptr<::arrow::Schema>& addon);
-
   ::arrow::Result<std::shared_ptr<Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
-
-  /// Get all sorted versions.
-  std::vector<DatasetVersion> versions() const;
-
-  /// Access to the latest version of dataset
-  DatasetVersion latest_version() const;
-
-  ::arrow::Result<std::shared_ptr<LanceDataset>> version(uint64_t version) const;
 
  protected:
   ::arrow::Result<::arrow::dataset::FragmentIterator> GetFragmentsImpl(
