@@ -68,3 +68,6 @@ integration/duckdb/manylinux-build
 python/notebooks/lance.duckdb_extension
 
 wheelhouse
+
+# pandas testing
+.hypothesis
