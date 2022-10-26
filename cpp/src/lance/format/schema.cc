@@ -392,13 +392,16 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   }
   auto self_type = type();
   if (self_type->id() != arrow_field.type()->id()) {
-    return ::arrow::Status::Invalid(
-        "Can not merge two fields: ", self_type->ToString(), "!=", arrow_field.type()->ToString());
+    return ::arrow::Status::Invalid("Can not merge two fields with different types: ",
+                                    self_type->ToString(),
+                                    "!=",
+                                    arrow_field.type()->ToString());
   };
   auto new_field = Copy(true);
   if (::arrow::is_list_like(self_type->id())) {
     auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field.type());
-    return children_[0]->Merge(*list_type->value_field());
+    fmt::print("List type: {} {}\n", list_type->ToString(), list_type->value_field()->ToString());
+    return children_[0]->children_[0]->Merge(*list_type->value_field());
   } else if (lance::arrow::is_struct(self_type)) {
     auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field.type());
     for (auto& arrow_child : struct_type->fields()) {
