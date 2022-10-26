@@ -23,6 +23,11 @@
 
 namespace lance::format {
 
+/// A physical file on disk.
+///
+/// It contains
+/// - The path to the file.
+/// - The ids of the columns stored in the file.
 class DataFile : public ConvertToProto<pb::DataFile> {
  public:
   explicit DataFile(const format::pb::DataFile& pb);
@@ -41,6 +46,8 @@ class DataFile : public ConvertToProto<pb::DataFile> {
   std::vector<int32_t> fields_;
 };
 
+/// POD of DataFragment
+///
 class DataFragment : public ConvertToProto<pb::DataFragment> {
  public:
   explicit DataFragment(const format::pb::DataFragment& pb);

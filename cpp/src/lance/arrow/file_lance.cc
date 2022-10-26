@@ -148,14 +148,14 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
       fragment_(std::move(fragment)),
       schema_(schema) {}
 
-
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
   // Only support one file for now.
+  assert(fragment_->data_files().size() == 1);
+
   // There will be more than one file when schema evolution happens, will implement it later.
   for (const auto& data_file : fragment_->data_files()) {
     auto full_path = (fs::path(data_uri_) / data_file.path()).string();
-    fmt::print("Open full path: {}\n", full_path);
     ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path));
     ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
     auto batch_reader = lance::io::RecordBatchReader(
@@ -169,6 +169,5 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
   return schema_.ToArrow();
 }
-
 
 }  // namespace lance::arrow

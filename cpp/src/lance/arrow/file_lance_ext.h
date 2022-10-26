@@ -23,6 +23,7 @@
 
 namespace lance::arrow {
 
+/// LanceFragment, a fragment of data.
 class LanceFragment : public ::arrow::dataset::Fragment {
  public:
   LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
