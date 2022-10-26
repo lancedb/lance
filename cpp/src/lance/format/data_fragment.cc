@@ -53,7 +53,8 @@ const std::vector<DataFile>& DataFragment::data_files() const {
 pb::DataFragment DataFragment::ToProto() const {
   auto proto = pb::DataFragment();
   for (auto& file : files_) {
-    proto.mutable_files()->Add(file.ToProto());
+    auto pb_file = proto.add_files();
+    *pb_file = file.ToProto();
   }
   return proto;
 }

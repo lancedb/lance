@@ -60,7 +60,8 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   }
   pb.set_version(version_);
   for (const auto& fragment : fragments_) {
-    pb.mutable_fragments()->Add(fragment->ToProto());
+    auto pb_fragment = pb.add_fragments();
+    *pb_fragment = fragment->ToProto();
   }
   return io::WriteProto(out, pb);
 }
