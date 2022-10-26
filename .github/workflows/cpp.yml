@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew update
-          brew install apache-arrow protobuf
+          brew install https://raw.githubusercontent.com/Homebrew/homebrew-core/f71673034b2618ed7b557ecaa3d47d87719b3df7/Formula/apache-arrow.rb protobuf
       - name: Cmake
         run: cmake -B build
       - name: Build
