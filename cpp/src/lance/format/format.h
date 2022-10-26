@@ -25,6 +25,7 @@ class Metadata;
 class Manifest;
 class Schema;
 
+/// Interface, converting to Protobuf.
 template <typename T>
 class ConvertToProto {
  public:

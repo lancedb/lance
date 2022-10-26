@@ -65,9 +65,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   return io::WriteProto(out, pb);
 }
 
-void Manifest::BumpVersion() {
-  version_ ++;
-}
+void Manifest::BumpVersion() { version_++; }
 
 const Schema& Manifest::schema() const { return *schema_; }
 
@@ -76,7 +74,7 @@ uint64_t Manifest::version() const { return version_; }
 const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
 void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments) {
-  fragments_.insert(fragments_.end(), std::begin(fragments), std::end(fragments));
+  fragments_.insert(std::end(fragments_), std::begin(fragments), std::end(fragments));
 }
 
 }  // namespace lance::format
