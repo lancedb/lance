@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           cd $(brew --repository)
-          git checkout 560f5717a  # Arrow 9.0
+          git checkout cf629b1175f  # Arrow 9.0
           brew install apache-arrow protobuf
       - name: Cmake
         run: cmake -B build
