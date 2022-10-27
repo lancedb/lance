@@ -53,20 +53,29 @@ TEST_CASE("Create new dataset") {
   write_options.base_dir = path;
   write_options.file_write_options = format->DefaultWriteOptions();
 
-  auto status = lance::arrow::LanceDataset::Write(
-      write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
-  CHECK(status.ok());
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie())
+            .ok());
 
   ids = ToArray({100, 101, 102}).ValueOrDie();
   values = ToArray({"aaa", "bbb", "ccc"}).ValueOrDie();
   auto table2 = ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
                                                       ::arrow::field("value", ::arrow::utf8())}),
                                      {ids, values});
+
+  // Version 2 is appending.
   dataset = lance::testing::MakeDataset(table2).ValueOrDie();
-  status = lance::arrow::LanceDataset::Write(
-      write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie());
-  INFO("Write dataset: " << status.message());
-  CHECK(status.ok());
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                          lance::arrow::LanceDataset::kAppend)
+            .ok());
+
+  // Version 3 is overwriting.
+  dataset = lance::testing::MakeDataset(table2).ValueOrDie();
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                          lance::arrow::LanceDataset::kOverwrite)
+            .ok());
 
   auto table_v1 = ReadTable(base_uri, 1);
   CHECK(table_v1->Equals(*table1));
@@ -74,4 +83,8 @@ TEST_CASE("Create new dataset") {
   auto table_v2 = ReadTable(base_uri, 2);
   auto combined_table = ::arrow::ConcatenateTables({table1, table2}).ValueOrDie();
   CHECK(table_v2->Equals(*combined_table));
+
+  // Only read the overwritten dataset.
+  auto table_v3 = ReadTable(base_uri, 3);
+  CHECK(table_v3->Equals(*table2));
 }

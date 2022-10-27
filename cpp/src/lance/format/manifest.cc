@@ -66,7 +66,14 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   return io::WriteProto(out, pb);
 }
 
-void Manifest::BumpVersion() { version_++; }
+std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
+  auto new_manifest = std::make_shared<Manifest>(*this);
+  new_manifest->version_++;
+  if (overwrite) {
+    new_manifest->fragments_.clear();
+  }
+  return new_manifest;
+}
 
 const Schema& Manifest::schema() const { return *schema_; }
 

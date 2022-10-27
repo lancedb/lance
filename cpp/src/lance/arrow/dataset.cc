@@ -117,26 +117,32 @@ LanceDataset::~LanceDataset() {}
     if (fs->GetFileInfo(base_dir)->type() != ::arrow::fs::FileType::NotFound) {
       return ::arrow::Status::AlreadyExists("Dataset ", base_dir, " already exists");
     }
-    // This is a completely new dataset, create Manifest with version 1.
-    auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
-    manifest = std::make_shared<lance::format::Manifest>(schema);
   } else {
     // Append or Overwrite
     ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, base_dir));
     if (!cur_dataset) {
       if (mode == kAppend) {
         return ::arrow::Status::IOError("Append to non-existed dataset: ", base_dir);
-      } else {
-        auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
-        manifest = std::make_shared<lance::format::Manifest>(schema);
       }
     } else {
       // TODO check schema
+      auto existing_manifest = cur_dataset->impl_->manifest;
+      auto existing_arrow_schema = existing_manifest->schema().ToArrow();
+      if (!scanner->dataset()->schema()->Equals(existing_manifest->schema().ToArrow())) {
+        return ::arrow::Status::IOError("Write dataset with different schema: ",
+                                        scanner->dataset()->schema()->ToString(),
+                                        " != ",
+                                        existing_arrow_schema->ToString());
+      }
 
       // Bump the version
-      manifest = cur_dataset->impl_->manifest;
-      manifest->BumpVersion();
+      manifest = cur_dataset->impl_->manifest->BumpVersion(mode == kOverwrite);
     }
+  }
+  if (!manifest) {
+    // This is a completely new dataset, create Manifest with version 1.
+    auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
+    manifest = std::make_shared<lance::format::Manifest>(schema);
   }
 
   // Write manifest file
