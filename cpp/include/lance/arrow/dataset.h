@@ -27,36 +27,42 @@
 
 namespace lance::arrow {
 
-class DatasetVersion {
- public:
-  /// Current version ID
-  uint64_t version() const;
-
- private:
-  uint64_t version_;
-};
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///
 class LanceDataset : public ::arrow::dataset::Dataset {
  public:
+  /// Dataset Write Mode
+  enum WriteMode {
+    /// Create a new dataset. Expect the dataset does not exist.
+    kCreate,
+    /// Append to an existing dataset.
+    kAppend,
+    /// Overwrite a dataset as a new version, or create new dataset if not exist.
+    kOverwrite,
+  };
+
   /// Copy constructor.
   LanceDataset(const LanceDataset& other);
 
-  ~LanceDataset();
+  ~LanceDataset() override;
 
   /// Write a in-memory Arrow dataset to disk.
   ///
-  /// If the dataset already exist, write new version.
+  /// \param options Arrow Dataset Write Options.
+  /// \param scanner the source dataset to be written.
+  /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  ///
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
-                               std::shared_ptr<::arrow::dataset::Scanner> scanner);
+                               std::shared_ptr<::arrow::dataset::Scanner> scanner,
+                               WriteMode mode = kCreate);
 
   /// Load dataset, with a specific version.
   ///
   /// \param fs File system object
   /// \param base_uri base path to the dataset.
   /// \param version optional version to load. If not presented, load the latest version.
-  /// Returns nullptr if the dataset does not exist.
+  /// \return A specific version of the dataset. Or return nullptr if the dataset does not exist.
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
       std::shared_ptr<::arrow::fs::FileSystem> fs,
       std::string base_uri,
@@ -75,7 +81,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   class Impl;
   std::unique_ptr<Impl> impl_;
 
-  LanceDataset(std::unique_ptr<Impl> impl);
+  explicit LanceDataset(std::unique_ptr<Impl> impl);
 };
 
 }  // namespace lance::arrow

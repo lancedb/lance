@@ -37,6 +37,9 @@ namespace lance::arrow {
 
 const std::string kLatestManifest = "_latest.manifest";
 const std::string kDataDir = "data";
+const std::string kVersionsDir = "_versions";
+
+namespace {
 
 /// Get Manifest file path for a version.
 ///
@@ -45,11 +48,36 @@ const std::string kDataDir = "data";
 /// \return string path to the manifest file.
 std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
   if (version.has_value()) {
-    return fs::path(base_uri) / "_versions" / fmt::format("{}.manifest", version.value());
+    return fs::path(base_uri) / kVersionsDir / fmt::format("{}.manifest", version.value());
   } else {
     return fs::path(base_uri) / kLatestManifest;
   }
 }
+
+std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
+    const std::vector<std::string>& paths, const lance::format::Schema& schema) {
+  std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
+  auto field_ids = schema.GetFieldIds();
+  for (auto path : paths) {
+    fragments.emplace_back(
+        std::make_shared<lance::format::DataFragment>(lance::format::DataFile(path, field_ids)));
+  }
+  return fragments;
+}
+
+std::string GetBasenameTemplate() {
+  std::random_device rd;
+  auto seed_data = std::array<int, std::mt19937::state_size>{};
+  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
+  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
+  std::mt19937 generator(seq);
+  uuids::uuid_random_generator gen{generator};
+  auto uuid = gen();
+
+  return uuids::to_string(uuid) + "_{i}.lance";
+}
+
+}  // namespace
 
 class LanceDataset::Impl {
  public:
@@ -61,6 +89,8 @@ class LanceDataset::Impl {
       : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
 
   std::string data_dir() const { return fs::path(base_uri) / kDataDir; }
+
+  std::string versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
 
   std::shared_ptr<::arrow::fs::FileSystem> fs;
   std::string base_uri;
@@ -75,36 +105,40 @@ LanceDataset::LanceDataset(const LanceDataset& other)
 
 LanceDataset::~LanceDataset() {}
 
-std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
-    const std::vector<std::string>& paths, const lance::format::Schema& schema) {
-  std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
-  auto field_ids = schema.GetFieldIds();
-  for (auto path : paths) {
-    fragments.emplace_back(
-        std::make_shared<lance::format::DataFragment>(lance::format::DataFile(path, field_ids)));
-  }
-  return fragments;
-}
-
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
-                                    std::shared_ptr<::arrow::dataset::Scanner> scanner) {
+                                    std::shared_ptr<::arrow::dataset::Scanner> scanner,
+                                    WriteMode mode) {
   const auto& base_dir = options.base_dir;
   const auto data_dir = (fs::path(base_dir) / kDataDir).string();
   auto& fs = options.filesystem;
 
-  // Load previous latest Manifest if any.
-  ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, base_dir));
-
   std::shared_ptr<lance::format::Manifest> manifest;
-  if (!cur_dataset) {
+  if (mode == kCreate) {
+    if (fs->GetFileInfo(base_dir)->type() != ::arrow::fs::FileType::NotFound) {
+      return ::arrow::Status::AlreadyExists("Dataset ", base_dir, " already exists");
+    }
     // This is a completely new dataset, create Manifest with version 1.
     auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
     manifest = std::make_shared<lance::format::Manifest>(schema);
   } else {
-    // Bump the version
-    manifest = cur_dataset->impl_->manifest;
-    manifest->BumpVersion();
+    // Append or Overwrite
+    ARROW_ASSIGN_OR_RAISE(auto cur_dataset, LanceDataset::Make(options.filesystem, base_dir));
+    if (!cur_dataset) {
+      if (mode == kAppend) {
+        return ::arrow::Status::IOError("Append to non-existed dataset: ", base_dir);
+      } else {
+        auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
+        manifest = std::make_shared<lance::format::Manifest>(schema);
+      }
+    } else {
+      // TODO check schema
+
+      // Bump the version
+      manifest = cur_dataset->impl_->manifest;
+      manifest->BumpVersion();
+    }
   }
+
   // Write manifest file
   auto lance_option = options;
   lance_option.base_dir = data_dir;
@@ -114,14 +148,7 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
   lance_option.partitioning =
       std::make_shared<::arrow::dataset::HivePartitioning>(::arrow::schema({}));
 
-  std::random_device rd;
-  auto seed_data = std::array<int, std::mt19937::state_size>{};
-  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
-  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
-  std::mt19937 generator(seq);
-  uuids::uuid_random_generator gen{generator};
-  auto uuid = gen();
-  lance_option.basename_template = uuids::to_string(uuid) + "_{i}.lance";
+  lance_option.basename_template = GetBasenameTemplate();
 
   if (lance_option.format() == nullptr || lance_option.format()->type_name() != "lance") {
     return ::arrow::Status::Invalid("Must write with Lance format");
@@ -146,7 +173,7 @@ std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
   manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
   // Write the manifest version file.
   // It only supports single writer at the moment.
-  auto version_dir = (fs::path(base_dir) / "_versions").string();
+  auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
   auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
