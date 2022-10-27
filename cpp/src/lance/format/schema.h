@@ -78,6 +78,12 @@ class Schema final {
   /// \return The newly created schema, excluding any column in "other".
   ::arrow::Result<std::shared_ptr<Schema>> Exclude(const Schema& other) const;
 
+  /// Merge with new fields.
+  ///
+  /// \param arrow_schema the schema to be merged.
+  /// \return A newly merged schema.
+  ::arrow::Result<std::shared_ptr<Schema>> Merge(const ::arrow::Schema& arrow_schema) const;
+
   /// Add a new parent field.
   void AddField(std::shared_ptr<Field> f);
 
@@ -113,6 +119,9 @@ class Schema final {
  private:
   /// (Re-)Assign Field IDs to all the fields.
   void AssignIds();
+
+  /// Get the max assigned ID.
+  int32_t GetMaxId() const;
 
   /// Make a full copy of the schema.
   std::shared_ptr<Schema> Copy() const;
@@ -215,6 +224,9 @@ class Field final {
 
   /// Project an arrow field to this field.
   std::shared_ptr<Field> Project(const std::shared_ptr<::arrow::Field>& arrow_field) const;
+
+  /// Merge an arrow field with this field.
+  ::arrow::Result<std::shared_ptr<Field>> Merge(const ::arrow::Field& arrow_field) const;
 
   /// Load dictionary array from disk.
   ::arrow::Status LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile);

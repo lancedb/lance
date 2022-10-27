@@ -42,7 +42,7 @@ namespace lance::format {
 Field::Field() : id_(-1), parent_(-1) {}
 
 Field::Field(const std::shared_ptr<::arrow::Field>& field)
-    : id_(0),
+    : id_(-1),
       parent_(-1),
       name_(field->name()),
       logical_type_(arrow::ToLogicalType(field->type()).ValueOrDie()),
@@ -334,8 +334,10 @@ int32_t Field::id() const { return id_; }
 
 void Field::SetId(int32_t parent_id, int32_t* current_id) {
   parent_ = parent_id;
-  id_ = (*current_id);
-  *current_id += 1;
+  if (id_ < 0) {
+    id_ = (*current_id);
+    *current_id += 1;
+  }
   for (auto& child : children_) {
     child->SetId(id_, current_id);
   }
@@ -379,6 +381,45 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   } else if (arrow::is_list(dtype)) {
     auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(dtype);
     new_field->AddChild(children_[0]->Project(list_type->value_field()));
+  }
+  return new_field;
+}
+
+::arrow::Result<std::shared_ptr<Field>> Field::Merge(const ::arrow::Field& arrow_field) const {
+  if (name() != arrow_field.name()) {
+    return ::arrow::Status::Invalid(
+        "Attempt to merge two different fields: ", name(), "!=", arrow_field.name());
+  }
+  auto self_type = type();
+  if (self_type->id() != arrow_field.type()->id()) {
+    return ::arrow::Status::Invalid("Can not merge two fields with different types: ",
+                                    self_type->ToString(),
+                                    " != ",
+                                    arrow_field.type()->ToString());
+  };
+  auto new_field = Copy(true);
+  if (::arrow::is_list_like(self_type->id())) {
+    auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field.type());
+
+    auto item_field = field(0);
+    ARROW_ASSIGN_OR_RAISE(auto new_item_field, item_field->Merge(*list_type->value_field()));
+    new_field->children_[0] = new_item_field;
+  } else if (lance::arrow::is_struct(self_type)) {
+    auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field.type());
+    for (auto& arrow_child : struct_type->fields()) {
+      bool found = false;
+      for (std::size_t i = 0; i < new_field->children_.size(); ++i) {
+        if (new_field->children_[i]->name_ == arrow_child->name()) {
+          ARROW_ASSIGN_OR_RAISE(new_field->children_[i],
+                                new_field->children_[i]->Merge(*arrow_child));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        new_field->children_.emplace_back(std::make_shared<Field>(arrow_child));
+      }
+    }
   }
   return new_field;
 }
@@ -570,6 +611,27 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return excluded;
 }
 
+::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const ::arrow::Schema& arrow_schema) const {
+  auto merged = std::make_shared<Schema>();
+  for (auto& field : fields_) {
+    auto arrow_field = arrow_schema.GetFieldByName(field->name());
+    if (arrow_field) {
+      ARROW_ASSIGN_OR_RAISE(auto new_field, field->Merge(*arrow_field));
+      merged->AddField(new_field);
+    } else {
+      merged->AddField(field);
+    }
+  }
+  for (auto& arrow_field : arrow_schema.fields()) {
+    if (!GetField(arrow_field->name())) {
+      merged->AddField(std::make_shared<Field>(arrow_field));
+    }
+  }
+  // Assign to new IDs
+  merged->AssignIds();
+  return merged;
+}
+
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
 
 std::shared_ptr<Field> Schema::GetField(int32_t id) const {
@@ -629,10 +691,29 @@ std::shared_ptr<Schema> Schema::Copy() const {
 }
 
 void Schema::AssignIds() {
-  int cur_id = 0;
+  int cur_id = GetMaxId() + 1;
   for (auto& field : fields_) {
     field->SetId(-1, &cur_id);
   }
+}
+
+int32_t Schema::GetMaxId() const {
+  class MaxIdVisitor : public FieldVisitor {
+   public:
+    ::arrow::Status Visit(std::shared_ptr<Field> field) override {
+      max_id_ = std::max(field->id(), max_id_);
+      for (auto& child : field->children_) {
+        ARROW_RETURN_NOT_OK(Visit(child));
+      }
+      return ::arrow::Status::OK();
+    }
+    int32_t max_id_ = -1;
+  };
+  auto visitor = MaxIdVisitor();
+  if (!visitor.VisitSchema(*this).ok()) {
+    fmt::print(stderr, "Error when collecting max ID");
+  }
+  return visitor.max_id_;
 }
 
 bool Schema::RemoveField(int32_t id) {
