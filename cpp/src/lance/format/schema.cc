@@ -407,17 +407,19 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   } else if (lance::arrow::is_struct(self_type)) {
     auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field.type());
     for (auto& arrow_child : struct_type->fields()) {
-      auto child = Get(arrow_child->name());
-      if (!child) {
+      bool found = false;
+      for (std::size_t i = 0; i < new_field->children_.size(); ++i) {
+        if (new_field->children_[i]->name_ == arrow_child->name()) {
+          ARROW_ASSIGN_OR_RAISE(new_field->children_[i],
+                                new_field->children_[i]->Merge(*arrow_child));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
         new_field->children_.emplace_back(std::make_shared<Field>(arrow_child));
-      } else {
-        ARROW_ASSIGN_OR_RAISE(auto new_child_field, child->Merge(*arrow_child));
-        new_field->children_.emplace_back(new_child_field);
       }
     }
-  } else {
-    return ::arrow::Status::Invalid(
-        "Can not merge between: ", self_type->ToString(), " and ", arrow_field.type()->ToString());
   }
   return new_field;
 }

@@ -234,8 +234,10 @@ TEST_CASE("Test merge two schemas") {
 TEST_CASE("Test merge two structs") {
   auto base_schema = Schema(::arrow::schema(
       {::arrow::field("a", ::arrow::struct_({::arrow::field("b", ::arrow::int32())}))}));
-  auto schema_c = ::arrow::schema(
-      {::arrow::field("a", ::arrow::struct_({::arrow::field("c", ::arrow::int64())}))});
+  auto schema_c =
+      ::arrow::schema({::arrow::field("a",
+                                      ::arrow::struct_({::arrow::field("b", ::arrow::int32()),
+                                                        ::arrow::field("c", ::arrow::int64())}))});
   auto merged = base_schema.Merge(*schema_c).ValueOrDie();
   auto a = merged->GetField("a");
   CHECK(a->id() == 0);
