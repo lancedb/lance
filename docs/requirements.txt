@@ -6,6 +6,7 @@ pandas
 piccolo-theme
 duckdb
 jupyterlab
+fastai
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
