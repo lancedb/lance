@@ -248,13 +248,13 @@ TEST_CASE("Test merge two structs") {
 }
 
 TEST_CASE("Test merge two list of structs") {
-  auto base_schema = Schema(::arrow::schema(
-      {::arrow::field("a",
-                      ::arrow::list({::arrow::field(
-                          "b", ::arrow::struct_({::arrow::field("b1", ::arrow::int32())}))}))}));
-  auto addon_schema = ::arrow::schema(
-      {::arrow::field("a",
-                      ::arrow::list({::arrow::field(
-                          "b", ::arrow::struct_({::arrow::field("b1", ::arrow::int32())}))}))});
+  auto base_schema = Schema(::arrow::schema({::arrow::field(
+      "a", ::arrow::list(::arrow::struct_({::arrow::field("b1", ::arrow::int32())})))}));
+  auto addon_schema = ::arrow::schema({::arrow::field(
+      "a", ::arrow::list(::arrow::struct_({::arrow::field("b2", ::arrow::utf8())})))});
   auto merged = base_schema.Merge(*addon_schema).ValueOrDie();
+  CHECK(merged->ToArrow()->Equals(::arrow::schema(
+      {::arrow::field("a",
+                      ::arrow::list(::arrow::struct_({::arrow::field("b1", ::arrow::int32()),
+                                                      ::arrow::field("b2", ::arrow::utf8())})))})));
 }
