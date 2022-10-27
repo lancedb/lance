@@ -88,3 +88,68 @@ TEST_CASE("Create new dataset") {
   auto table_v3 = ReadTable(base_uri, 3);
   CHECK(table_v3->Equals(*table2));
 }
+
+TEST_CASE("Create new dataset over existing dataset") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
+  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+
+  auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
+  auto format = lance::arrow::LanceFileFormat::Make();
+  ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(base_uri, &path).ValueOrDie();
+  write_options.filesystem = fs;
+  write_options.base_dir = path;
+  write_options.file_write_options = format->DefaultWriteOptions();
+
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                          lance::arrow::LanceDataset::kCreate)
+            .ok());
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                          lance::arrow::LanceDataset::kCreate)
+            .IsAlreadyExists());
+}
+
+TEST_CASE("Dataset append error cases") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
+  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+
+  auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
+  auto format = lance::arrow::LanceFileFormat::Make();
+  ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(base_uri, &path).ValueOrDie();
+  write_options.filesystem = fs;
+  write_options.base_dir = path;
+  write_options.file_write_options = format->DefaultWriteOptions();
+
+  SECTION("Append to non-existed path") {
+    CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                            dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                            lance::arrow::LanceDataset::kAppend)
+              .IsIOError());
+  }
+
+  SECTION("Append with different schema") {
+    write_options.base_dir = path + "_1";
+    CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                            dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                            lance::arrow::LanceDataset::kCreate)
+              .ok());
+    auto values = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+    table = ::arrow::Table::Make(::arrow::schema({::arrow::field("values", ::arrow::utf8())}),
+                                  {values});
+    dataset = lance::testing::MakeDataset(table).ValueOrDie();
+    auto status = lance::arrow::LanceDataset::Write(write_options,
+                                                    dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
+                                                    lance::arrow::LanceDataset::kAppend);
+    INFO("Status: " << status.message() << " is ok: " << status.ok());
+    CHECK(status.IsIOError());
+  }
+}

@@ -128,7 +128,7 @@ LanceDataset::~LanceDataset() {}
       // TODO check schema
       auto existing_manifest = cur_dataset->impl_->manifest;
       auto existing_arrow_schema = existing_manifest->schema().ToArrow();
-      if (!scanner->dataset()->schema()->Equals(existing_manifest->schema().ToArrow())) {
+      if (!scanner->dataset()->schema()->Equals(existing_arrow_schema)) {
         return ::arrow::Status::IOError("Write dataset with different schema: ",
                                         scanner->dataset()->schema()->ToString(),
                                         " != ",
