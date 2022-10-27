@@ -96,6 +96,9 @@ class Schema final {
   /// Count the number of all fields, including nested fields.
   int32_t GetFieldsCount() const;
 
+  /// Get all field ids.
+  std::vector<int32_t> GetFieldIds() const;
+
   /// Get the field by fully qualified field name.
   ///
   /// \param name the fully qualified name, i.e., "annotations.box.xmin".

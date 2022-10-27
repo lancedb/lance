@@ -25,4 +25,13 @@ class Metadata;
 class Manifest;
 class Schema;
 
+/// Interface, converting to Protobuf.
+template <typename T>
+class ConvertToProto {
+ public:
+  virtual ~ConvertToProto() = default;
+
+  virtual T ToProto() const = 0;
+};
+
 }  // namespace lance::format

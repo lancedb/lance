@@ -24,6 +24,8 @@ add_library(
         OBJECT
         ${PROTO_HDRS}
         ${PROTO_SRCS}
+        data_fragment.cc
+        data_fragment.h
         format.h
         manifest.cc
         manifest.h
