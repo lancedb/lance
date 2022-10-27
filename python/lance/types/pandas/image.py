@@ -13,6 +13,7 @@
 #  limitations under the License.
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Union
 
 import numpy as np
@@ -62,6 +63,8 @@ def _convert_value(x):
         return x.uri
     if isinstance(x, str):
         return x
+    if isinstance(x, Path):
+        return str(x)
     raise TypeError("ImageArray only understands NA, Image, and str scalars")
 
 
