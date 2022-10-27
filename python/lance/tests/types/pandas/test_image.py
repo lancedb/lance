@@ -3,6 +3,7 @@ import pandas as pd
 import pandas._testing as tm
 import pytest
 from pandas.compat import pa_version_under7p0
+from pandas.core.dtypes.common import is_string_dtype, is_object_dtype
 from pandas.errors import PerformanceWarning
 from pandas.tests.extension import base
 from pandas.tests.extension.conftest import *
@@ -62,7 +63,15 @@ def data_missing_for_sorting(dtype):
 
 
 class TestDtype(base.BaseDtypeTests):
-    pass
+
+    @pytest.mark.skip(reason="not a problem")
+    def test_is_not_string_type(self, dtype):
+        # super class didn't assert the value
+        assert not is_string_dtype(dtype)
+
+    def test_is_not_object_type(self, dtype):
+        # super class didn't assert the value
+        assert not is_object_dtype(dtype)
 
 
 class TestInterface(base.BaseInterfaceTests):

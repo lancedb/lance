@@ -32,7 +32,7 @@ from lance.types.image import ImageUri
 class ImageUriDtype(ExtensionDtype):
     name = 'image[uri]'
     type = Image
-    kind = 'U'
+    kind = 'O'
     na_value = pd.NA
 
     @classmethod
