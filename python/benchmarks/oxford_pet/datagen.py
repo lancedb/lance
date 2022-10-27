@@ -108,7 +108,7 @@ class OxfordPetConverter(DatasetConverter):
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
         with_xmls["external_image"] = with_xmls["filename"].apply(
-            lambda x: os.path.join(self.uri_root, f"images/{x}.jpg")
+            lambda x: os.path.join('s3://eto-public/datasets/oxford_pet', f"images/{x}.jpg")
         )
         with_xmls = with_xmls.reset_index(drop=True).reset_index(names=["_pk"])
         return with_xmls
@@ -146,7 +146,10 @@ class OxfordPetConverter(DatasetConverter):
         return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
 
     def image_uris(self, table) -> List[str]:
-        return table["external_image"]
+        prefix = 's3://eto-public/datasets/oxford_pet/'
+        uris = [os.path.join(self.uri_root, image_uri[len(prefix):])
+                for image_uri in table["external_image"].to_numpy()]
+        return uris
 
     def get_schema(self):
         source_schema = pa.struct(

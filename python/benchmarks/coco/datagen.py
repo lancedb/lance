@@ -61,7 +61,7 @@ class CocoConverter(DatasetConverter):
         )
         images_df["split"] = split
         images_df["image_uri"] = images_df["file_name"].apply(
-            lambda fname: os.path.join(self.uri_root, f"{split}{self.version}", fname)
+            lambda fname: os.path.join('s3://eto-public/datasets/coco', f"{split}{self.version}", fname)
         )
         # TODO join images_df.license to instances_json['license']
         return images_df.merge(anno_df, on="image_id")
@@ -88,7 +88,7 @@ class CocoConverter(DatasetConverter):
         return pd.concat(frames)
 
     def _get_test_images(self, dirname: str = "test"):
-        uri = os.path.join(self.uri_root, f"{dirname}{self.version}")
+        uri = os.path.join("s3://eto-public/datasets/coco", f"{dirname}{self.version}")
         fs, path = pa.fs.FileSystem.from_uri(uri)
         return [
             os.path.join(uri, file.base_name)
@@ -96,7 +96,12 @@ class CocoConverter(DatasetConverter):
         ]
 
     def image_uris(self, table):
-        return table["image_uri"].to_numpy()
+        prefix = 's3://eto-public/datasets/coco'
+        uris = np.array([
+            self.uri_root + image_uri[len(prefix):]
+            for image_uri in table["image_uri"].to_numpy()
+        ])
+        return uris
 
     def get_schema(self):
         names = [
