@@ -47,3 +47,6 @@ def register_extension_types():
         except ArrowKeyError:
             # already registered
             pass
+
+    # auto register pandas extension
+    from lance.types.pandas.image import ImageUriDtype
