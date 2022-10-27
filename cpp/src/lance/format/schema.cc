@@ -400,7 +400,11 @@ std::shared_ptr<Field> Field::Project(const std::shared_ptr<::arrow::Field>& arr
   auto new_field = Copy(true);
   if (::arrow::is_list_like(self_type->id())) {
     auto list_type = std::dynamic_pointer_cast<::arrow::ListType>(arrow_field.type());
-    fmt::print("List type: {} {}\n", list_type->ToString(), list_type->value_field()->ToString());
+    fmt::print("List type: {} {} {}\n",
+               children_[0]->children_[0]->type()->ToString(),
+               list_type->ToString(),
+               list_type->value_field()->ToString());
+
     return children_[0]->children_[0]->Merge(*list_type->value_field());
   } else if (lance::arrow::is_struct(self_type)) {
     auto struct_type = std::dynamic_pointer_cast<::arrow::StructType>(arrow_field.type());
