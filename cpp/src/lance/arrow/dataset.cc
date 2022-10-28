@@ -57,15 +57,13 @@ std::string GetManifestPath(const std::string& base_uri,
   }
 }
 
-std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
-    const std::vector<std::string>& paths, const lance::format::Schema& schema) {
-  std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
+auto CreateFragments(const std::vector<std::string>& paths, const lance::format::Schema& schema) {
   auto field_ids = schema.GetFieldIds();
-  for (auto path : paths) {
-    fragments.emplace_back(
-        std::make_shared<lance::format::DataFragment>(lance::format::DataFile(path, field_ids)));
-  }
-  return fragments;
+  return paths | views::transform([&field_ids](auto& path) {
+           return std::make_shared<lance::format::DataFragment>(
+               lance::format::DataFile(path, field_ids));
+         }) |
+         to<std::vector<std::shared_ptr<lance::format::DataFragment>>>;
 }
 
 std::string GetBasenameTemplate() {
