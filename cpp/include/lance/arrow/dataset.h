@@ -31,7 +31,7 @@ namespace lance::arrow {
 ///
 class DatasetVersion {
  public:
-  DatasetVersion(uint64_t version);
+  explicit DatasetVersion(uint64_t version);
 
   uint64_t version() const;
 
