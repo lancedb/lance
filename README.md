@@ -1,9 +1,10 @@
 <div align="center">
 <p align="center">
 
-<object data="https://raw.githubusercontent.com/eto-ai/lance/13dc540b8f0fe25c1d665186aeb6bf1729626969/lance_logo.svg" type="image/svg+xml"></object>
-
-**Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
+![lance_logo](https://user-images.githubusercontent.com/917119/198655673-2b46f2c5-8d76-4863-8816-bf28370157bf.svg)
+  
+**Blazing fast exploration and analysis of computer vision data using![Uploading lance_logo.svg…]()
+ SQL and DuckDB**
 
 ```sql
 SELECT predict(‘resnet’, image) FROM dataset
