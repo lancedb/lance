@@ -3,8 +3,7 @@
 
 ![lance_logo](https://user-images.githubusercontent.com/917119/198655673-2b46f2c5-8d76-4863-8816-bf28370157bf.svg)
   
-**Blazing fast exploration and analysis of computer vision data using![Uploading lance_logo.svg…]()
- SQL and DuckDB**
+**Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
 
 ```sql
 SELECT predict(‘resnet’, image) FROM dataset
