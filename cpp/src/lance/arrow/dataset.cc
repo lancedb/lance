@@ -203,8 +203,8 @@ LanceDataset::~LanceDataset() {}
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(
-    std::shared_ptr<::arrow::fs::FileSystem> fs,
-    std::string base_uri,
+    const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+    const std::string& base_uri,
     std::optional<uint64_t> version) {
   ARROW_ASSIGN_OR_RAISE(auto finfo, fs->GetFileInfo(base_uri));
   if (finfo.type() == ::arrow::fs::FileType::NotFound) {

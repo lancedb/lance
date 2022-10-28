@@ -75,8 +75,8 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param version optional version to load. If not presented, load the latest version.
   /// \return A specific version of the dataset. Or return nullptr if the dataset does not exist.
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
-      std::shared_ptr<::arrow::fs::FileSystem> fs,
-      std::string base_uri,
+      const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+      const std::string& base_uri,
       std::optional<uint64_t> version = std::nullopt);
 
   /// Get all the dataset version.
