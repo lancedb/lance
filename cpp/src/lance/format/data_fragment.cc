@@ -14,6 +14,10 @@
 
 #include "lance/format/data_fragment.h"
 
+#include <range/v3/view.hpp>
+
+using namespace ranges::views;
+
 namespace lance::format {
 
 DataFile::DataFile(const pb::DataFile& pb)
@@ -35,10 +39,9 @@ pb::DataFile DataFile::ToProto() const {
   return proto;
 }
 
-DataFragment::DataFragment(const pb::DataFragment& pb){
-  for (auto& pb_file : pb.files()) {
-    files_.emplace_back(DataFile(pb_file));
-  }
+DataFragment::DataFragment(const pb::DataFragment& pb) {
+  files_ = pb.files() | transform([](auto& pb_file) { return DataFile(pb_file); }) |
+           ranges::to<decltype(files_)>();
 }
 
 DataFragment::DataFragment(const DataFile& data_file)
@@ -46,9 +49,7 @@ DataFragment::DataFragment(const DataFile& data_file)
 
 DataFragment::DataFragment(std::vector<DataFile> data_files) : files_(std::move(data_files)) {}
 
-const std::vector<DataFile>& DataFragment::data_files() const {
-  return files_;
-}
+const std::vector<DataFile>& DataFragment::data_files() const { return files_; }
 
 pb::DataFragment DataFragment::ToProto() const {
   auto proto = pb::DataFragment();
@@ -58,6 +59,5 @@ pb::DataFragment DataFragment::ToProto() const {
   }
   return proto;
 }
-
 
 }  // namespace lance::format

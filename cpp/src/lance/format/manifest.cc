@@ -85,4 +85,6 @@ void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>&
   fragments_.insert(std::end(fragments_), std::begin(fragments), std::end(fragments));
 }
 
+arrow::DatasetVersion Manifest::ToDatasetVersion() const { return arrow::DatasetVersion{version_}; }
+
 }  // namespace lance::format

@@ -54,6 +54,13 @@ FetchContent_Declare(fmt
         )
 list(APPEND available_contents fmt)
 
+# TODO: Replace with std::range when it is available
+FetchContent_Declare(range
+        GIT_REPOSITORY https://github.com/ericniebler/range-v3.git
+        GIT_TAG 0.12.0
+        )
+list(APPEND available_contents range)
+
 set(UUID_BUILD_TESTS OFF)
 set(UUID_USING_CXX20_SPAN ON)
 FetchContent_Declare(uuid
@@ -84,6 +91,7 @@ FetchContent_MakeAvailable(${available_contents})
 include_directories(
         ${fmt_SOURCE_DIR}/include
         ${uuid_SOURCE_DIR}/include
+        ${range_SOURCE_DIR}/include
 )
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 

@@ -27,6 +27,17 @@
 
 namespace lance::arrow {
 
+/// Dataset Version
+///
+class DatasetVersion {
+ public:
+  DatasetVersion(uint64_t version);
+
+  uint64_t version() const;
+
+ private:
+  uint64_t version_;
+};
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///
@@ -67,6 +78,12 @@ class LanceDataset : public ::arrow::dataset::Dataset {
       std::shared_ptr<::arrow::fs::FileSystem> fs,
       std::string base_uri,
       std::optional<uint64_t> version = std::nullopt);
+
+  /// Get all the dataset version.
+  ::arrow::Result<std::vector<DatasetVersion>> versions() const;
+
+  /// Get the latest version of the dataset
+  DatasetVersion latest_version() const;
 
   std::string type_name() const override { return "lance"; }
 

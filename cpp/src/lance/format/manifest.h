@@ -19,6 +19,7 @@
 
 #include <memory>
 
+#include "lance/arrow/dataset.h"
 #include "lance/format/data_fragment.h"
 #include "lance/format/format.pb.h"
 
@@ -74,6 +75,8 @@ class Manifest final {
 
   /// Append more fragments to the dataset.
   void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
+
+  arrow::DatasetVersion ToDatasetVersion() const;
 
  private:
   /// Table schema.
