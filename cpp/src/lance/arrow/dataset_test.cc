@@ -99,6 +99,9 @@ TEST_CASE("Create new dataset") {
   for (auto [v, data_version] : zip(expected_version, versions)) {
     CHECK(v == data_version.version());
   }
+
+  auto latest = lance_dataset->latest_version().ValueOrDie();
+  CHECK(latest.version() == 3);
 }
 
 TEST_CASE("Create new dataset over existing dataset") {
