@@ -27,6 +27,9 @@ from lance.io import download_uris
 from lance.types import ImageArray, ImageBinaryType
 
 
+PUBLIC_URI_ROOT = "https://eto-public.s3.us-west-2.amazonaws.com/datasets/"
+
+
 class DatasetConverter(ABC):
     """Base class for converting raw => pandas => Arrow => Lance"""
 
