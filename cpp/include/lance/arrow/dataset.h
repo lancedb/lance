@@ -83,7 +83,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::vector<DatasetVersion>> versions() const;
 
   /// Get the latest version of the dataset
-  DatasetVersion latest_version() const;
+  ::arrow::Result<DatasetVersion> latest_version() const;
 
   std::string type_name() const override { return "lance"; }
 

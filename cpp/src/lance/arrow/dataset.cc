@@ -48,7 +48,8 @@ namespace {
 /// \param base_uri the base uri of the dataset
 /// \param version optional version number. If not specified, returns the latest version.
 /// \return string path to the manifest file.
-std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
+std::string GetManifestPath(const std::string& base_uri,
+                            std::optional<uint64_t> version = std::nullopt) {
   if (version.has_value()) {
     return fs::path(base_uri) / kVersionsDir / fmt::format("{}.manifest", version.value());
   } else {
@@ -233,6 +234,12 @@ LanceDataset::~LanceDataset() {}
     versions.emplace_back(manifest->ToDatasetVersion());
   }
   return versions;
+}
+
+::arrow::Result<DatasetVersion> LanceDataset::latest_version() const {
+  auto latest_version_path = GetManifestPath(impl_->base_uri);
+  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, latest_version_path));
+  return manifest->ToDatasetVersion();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
