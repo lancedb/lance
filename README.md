@@ -16,6 +16,7 @@ SELECT predict(‘resnet’, image) FROM dataset
 [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 [![Discord](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
+[![Downloads](https://pepy.tech/badge/pylance/month)](https://pepy.tech/project/pylance)
 
 </p>
 </div>
