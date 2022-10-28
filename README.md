@@ -31,8 +31,6 @@ Lance makes machine learning workflows with computer vision data easy (images, v
 
 Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for use cases using computer vision data.
 
-Lance currently supports DuckDB.
-
 ## Quick Start
 
 ```
