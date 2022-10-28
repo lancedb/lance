@@ -33,7 +33,7 @@
 #include "lance/io/writer.h"
 
 namespace fs = std::filesystem;
-using namespace ranges::views;
+using namespace ranges;
 
 namespace lance::arrow {
 
@@ -233,6 +233,7 @@ LanceDataset::~LanceDataset() {}
     ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, finfo.path()));
     versions.emplace_back(manifest->ToDatasetVersion());
   }
+  versions |= actions::sort([](auto& v1, auto& v2) { return v1.version() < v2.version(); });
   return versions;
 }
 
@@ -250,7 +251,7 @@ LanceDataset::~LanceDataset() {}
 ::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
     [[maybe_unused]] ::arrow::compute::Expression predicate) {
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments =
-      impl_->manifest->fragments() | transform([this](auto& data_fragment) {
+      impl_->manifest->fragments() | views::transform([this](auto& data_fragment) {
         return std::make_shared<LanceFragment>(
             impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema());
       }) |
