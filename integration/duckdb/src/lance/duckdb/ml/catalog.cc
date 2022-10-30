@@ -38,7 +38,8 @@ ModelCatalog* ModelCatalog::Get() {
 }
 
 bool ModelCatalog::Load(const std::string& name, const std::string& uri) {
-  if (models_.contains(name)) {
+  // nvcc doesn't support C++20 yet so can't use std::map::contains()
+  if (models_.find(name) != models_.end()) {
     return false;
   }
   auto entry = PyTorchModelEntry::Make(name, uri);

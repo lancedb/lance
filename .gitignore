@@ -65,6 +65,7 @@ docs/notebooks
 
 
 integration/duckdb/manylinux-build
+integration/duckdb/cuda-build
 python/notebooks/lance.duckdb_extension
 
 wheelhouse
