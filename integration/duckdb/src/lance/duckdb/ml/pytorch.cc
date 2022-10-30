@@ -60,6 +60,7 @@ std::unique_ptr<ModelEntry> PyTorchModelEntry::Make(const std::string& name,
   torch::jit::script::Module module;
   try {
     module = torch::jit::load(uri);
+    module.to(at::kCUDA);
   } catch (const c10::Error& e) {
     throw ::duckdb::IOException("Error loading the model: " + e.msg());
   }
@@ -86,12 +87,15 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
     rgb_mat.convertTo(fmat, cv::DataType<float>::type);
 
     // TODO: support batch mode
+
     auto input_tensor = ToTensor(fmat);
+    input_tensor.to(at::kCUDA);
     input_tensor = normalize(input_tensor);
 
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
     auto output = module_.forward(inputs).toTensor();
+    output.to(at::kCPU);
 
     // OMG this copying is painfully slow.
     std::vector<::duckdb::Value> values;
