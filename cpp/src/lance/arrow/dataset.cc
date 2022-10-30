@@ -229,7 +229,7 @@ LanceDataset::~LanceDataset() {}
   ARROW_ASSIGN_OR_RAISE(auto file_infos, impl_->fs->GetFileInfo(selector));
   for (const auto& finfo : file_infos) {
     ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, finfo.path()));
-    versions.emplace_back(manifest->ToDatasetVersion());
+    versions.emplace_back(manifest->GetDatasetVersion());
   }
   versions |= actions::sort([](auto& v1, auto& v2) { return v1.version() < v2.version(); });
   return versions;
@@ -238,7 +238,7 @@ LanceDataset::~LanceDataset() {}
 ::arrow::Result<DatasetVersion> LanceDataset::latest_version() const {
   auto latest_version_path = GetManifestPath(impl_->base_uri);
   ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, latest_version_path));
-  return manifest->ToDatasetVersion();
+  return manifest->GetDatasetVersion();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
