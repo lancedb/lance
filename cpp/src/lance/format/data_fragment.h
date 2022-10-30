@@ -37,8 +37,10 @@ class DataFile : public ConvertToProto<pb::DataFile> {
   /// Get the relative path of the data
   const std::string& path() const;
 
+  /// Fields in this data file.
   const std::vector<int32_t>& fields() const;
 
+  /// Convert to protobuf.
   pb::DataFile ToProto() const override;
 
  private:

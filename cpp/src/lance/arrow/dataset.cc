@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <mutex>
 #include <random>
+#include <range/v3/all.hpp>
 #include <utility>
 
 #include "lance/arrow/file_lance_ext.h"
@@ -32,6 +33,7 @@
 #include "lance/io/writer.h"
 
 namespace fs = std::filesystem;
+using namespace ranges;
 
 namespace lance::arrow {
 
@@ -46,7 +48,8 @@ namespace {
 /// \param base_uri the base uri of the dataset
 /// \param version optional version number. If not specified, returns the latest version.
 /// \return string path to the manifest file.
-std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t> version) {
+std::string GetManifestPath(const std::string& base_uri,
+                            std::optional<uint64_t> version = std::nullopt) {
   if (version.has_value()) {
     return fs::path(base_uri) / kVersionsDir / fmt::format("{}.manifest", version.value());
   } else {
@@ -54,15 +57,13 @@ std::string GetManifestPath(const std::string& base_uri, std::optional<uint64_t>
   }
 }
 
-std::vector<std::shared_ptr<lance::format::DataFragment>> CreateFragments(
-    const std::vector<std::string>& paths, const lance::format::Schema& schema) {
-  std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
+auto CreateFragments(const std::vector<std::string>& paths, const lance::format::Schema& schema) {
   auto field_ids = schema.GetFieldIds();
-  for (auto path : paths) {
-    fragments.emplace_back(
-        std::make_shared<lance::format::DataFragment>(lance::format::DataFile(path, field_ids)));
-  }
-  return fragments;
+  return paths | views::transform([&field_ids](auto& path) {
+           return std::make_shared<lance::format::DataFragment>(
+               lance::format::DataFile(path, field_ids));
+         }) |
+         to<std::vector<std::shared_ptr<lance::format::DataFragment>>>;
 }
 
 std::string GetBasenameTemplate() {
@@ -77,7 +78,17 @@ std::string GetBasenameTemplate() {
   return uuids::to_string(uuid) + "_{i}.lance";
 }
 
+::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
+    const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
+  ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(path));
+  return lance::format::Manifest::Parse(in, 0);
+}
+
 }  // namespace
+
+DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
+
+uint64_t DatasetVersion::version() const { return version_; }
 
 class LanceDataset::Impl {
  public:
@@ -191,8 +202,8 @@ LanceDataset::~LanceDataset() {}
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(
-    std::shared_ptr<::arrow::fs::FileSystem> fs,
-    std::string base_uri,
+    const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+    const std::string& base_uri,
     std::optional<uint64_t> version) {
   ARROW_ASSIGN_OR_RAISE(auto finfo, fs->GetFileInfo(base_uri));
   if (finfo.type() == ::arrow::fs::FileType::NotFound) {
@@ -203,14 +214,31 @@ LanceDataset::~LanceDataset() {}
   if (finfo.type() == ::arrow::fs::FileType::NotFound) {
     return ::arrow::Status::IOError("Manifest not found: ", manifest_path);
   }
-  std::shared_ptr<lance::format::Manifest> manifest;
-  {
-    ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(manifest_path));
-    ARROW_ASSIGN_OR_RAISE(auto parsed, lance::format::Manifest::Parse(in, 0));
-    manifest = std::move(parsed);
-  }
+  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(fs, manifest_path));
   auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
+}
+
+::arrow::Result<std::vector<DatasetVersion>> LanceDataset::versions() const {
+  std::vector<DatasetVersion> versions;
+  ::arrow::fs::FileSelector selector;
+  selector.base_dir = impl_->versions_dir();
+  selector.allow_not_found = true;
+  selector.recursive = false;
+
+  ARROW_ASSIGN_OR_RAISE(auto file_infos, impl_->fs->GetFileInfo(selector));
+  for (const auto& finfo : file_infos) {
+    ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, finfo.path()));
+    versions.emplace_back(manifest->GetDatasetVersion());
+  }
+  versions |= actions::sort([](auto& v1, auto& v2) { return v1.version() < v2.version(); });
+  return versions;
+}
+
+::arrow::Result<DatasetVersion> LanceDataset::latest_version() const {
+  auto latest_version_path = GetManifestPath(impl_->base_uri);
+  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, latest_version_path));
+  return manifest->GetDatasetVersion();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
@@ -220,11 +248,13 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Result<::arrow::dataset::FragmentIterator> LanceDataset::GetFragmentsImpl(
     [[maybe_unused]] ::arrow::compute::Expression predicate) {
-  std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments;
-  for (const auto& data_fragment : impl_->manifest->fragments()) {
-    fragments.emplace_back(std::make_shared<LanceFragment>(
-        impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema()));
-  }
+  std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments =
+      impl_->manifest->fragments() | views::transform([this](auto& data_fragment) {
+        return std::make_shared<LanceFragment>(
+            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema());
+      }) |
+      ranges::to<decltype(fragments)>;
+
   return ::arrow::MakeVectorIterator(fragments);
 }
 

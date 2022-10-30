@@ -26,7 +26,7 @@ class LanceFileFormat : public ::arrow::dataset::FileFormat {
  public:
   LanceFileFormat();
 
-  ~LanceFileFormat();
+  ~LanceFileFormat() override;
 
   static std::shared_ptr<LanceFileFormat> Make();
 
