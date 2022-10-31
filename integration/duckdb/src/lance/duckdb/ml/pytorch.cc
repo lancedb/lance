@@ -93,7 +93,7 @@ std::optional<cv::Mat> ReadImageFromDuckDBValue(::duckdb::Value image_bytes) {
 }
 
 /// Convert the input image to torch::Tensor and run it through the model (on the model's target device)
-torch::Tensor PyTorchModelEntry::RunInference(cv::Mat fmat) {
+torch::Tensor PyTorchModelEntry::MatToTensor(const cv::Mat& fmat) {
   auto input_tensor = ToTensor(fmat);
   input_tensor = normalize(input_tensor);
   if (device_ == "cuda") {
@@ -101,9 +101,7 @@ torch::Tensor PyTorchModelEntry::RunInference(cv::Mat fmat) {
   } else if (device_ == "cpu") {
     input_tensor = input_tensor.to(at::kCPU);
   }
-  std::vector<torch::jit::IValue> inputs;
-  inputs.push_back(input_tensor);
-  return module_.forward(inputs).toTensor();
+  return input_tensor;
 }
 
 /// Read the images from input data, run model inference, and return probabilities
@@ -112,10 +110,11 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
                                 ::duckdb::Vector& result) {
   result.SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
   for (int i = 0; i < args.size(); i++) {
-    // TODO: support batch mode
     auto fmat = ReadImageFromDuckDBValue(args.data[1].GetValue(i));
-    if(fmat.has_value()) {
-      auto output = RunInference(fmat.value());
+    if (fmat.has_value()) {
+      auto input_tensor = MatToTensor(fmat.value());
+      // TODO: support batch mode
+      auto output = module_.forward({ input_tensor }).toTensor();
       // OMG this copying is painfully slow.
       std::vector<::duckdb::Value> values;
       auto softmax = output[0].softmax(0).to(at::kCPU);

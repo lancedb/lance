@@ -43,13 +43,9 @@ class PyTorchModelEntry : ModelEntry {
                     torch::jit::script::Module module)
       : ModelEntry(name, uri, device), module_(std::move(module)) {
     module_.eval();
-    auto params = module_.named_parameters();
-    for (const auto &item : params) {
-
-    }
   }
 
-  torch::Tensor RunInference(cv::Mat fmat);
+  torch::Tensor MatToTensor(const cv::Mat& fmat);
 
   std::string name_;
   std::string uri_;
