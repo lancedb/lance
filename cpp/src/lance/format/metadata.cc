@@ -69,7 +69,7 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
 ::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateBatch(int32_t row_index) const {
   int64_t len = length();
   if (len == 0) {
-    return ::arrow::Status::IndexError(fmt::format("The offsets table is empty"));
+    return ::arrow::Status::IndexError("The offsets table is empty");
   }
 
   if (row_index < 0 || row_index >= len) {
@@ -80,7 +80,6 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
     return ::arrow::Status::IndexError("Row index out of range {} of {}", row_index, len);
   }
   int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it) - 1;
-  assert(bound_idx >= 0);
   // Offset within the batch.
   int32_t offset = row_index - pb_.batch_offsets(bound_idx);
   return std::tuple(bound_idx, offset);
