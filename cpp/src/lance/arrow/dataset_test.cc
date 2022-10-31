@@ -20,12 +20,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
 #include <string>
+#include <range/v3/view.hpp>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/stl.h"
 #include "lance/testing/io.h"
 
 using lance::arrow::ToArray;
+using namespace ranges::views;
+
 
 std::shared_ptr<::arrow::Table> ReadTable(const std::string& uri, std::optional<int32_t> version) {
   std::string path;
@@ -87,6 +90,18 @@ TEST_CASE("Create new dataset") {
   // Only read the overwritten dataset.
   auto table_v3 = ReadTable(base_uri, 3);
   CHECK(table_v3->Equals(*table2));
+
+  // Read dataset versions
+  auto lance_dataset = lance::arrow::LanceDataset::Make(fs, path).ValueOrDie();
+  auto versions = lance_dataset->versions().ValueOrDie();
+  CHECK(versions.size() == 3);
+  std::vector<uint64_t> expected_version({1, 2, 3});
+  for (auto [v, data_version] : zip(expected_version, versions)) {
+    CHECK(v == data_version.version());
+  }
+
+  auto latest = lance_dataset->latest_version().ValueOrDie();
+  CHECK(latest.version() == 3);
 }
 
 TEST_CASE("Create new dataset over existing dataset") {
