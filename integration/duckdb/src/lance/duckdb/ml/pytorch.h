@@ -29,7 +29,7 @@ namespace lance::duckdb::ml {
 /// PyTorch / TorchScript model entry
 class PyTorchModelEntry : ModelEntry {
  public:
-  static std::unique_ptr<ModelEntry> Make(const std::string &name, const std::string &uri);
+  static std::unique_ptr<ModelEntry> Make(const std::string &name, const std::string &uri, const std::string &device);
 
   std::string type() const override { return "torchscript"; }
 
@@ -38,9 +38,14 @@ class PyTorchModelEntry : ModelEntry {
                ::duckdb::Vector &result) override;
 
  private:
-  PyTorchModelEntry(std::string name, std::string uri, torch::jit::script::Module module)
-      : ModelEntry(name, uri), module_(std::move(module)) {
+  PyTorchModelEntry(std::string name, std::string uri, std::string device,
+                    torch::jit::script::Module module)
+      : ModelEntry(name, uri, device), module_(std::move(module)) {
     module_.eval();
+    auto params = module_.named_parameters();
+    for (const auto &item : params) {
+
+    }
   }
 
   std::string name_;

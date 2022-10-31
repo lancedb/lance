@@ -28,6 +28,7 @@ struct CreateModelFunctionData : public ::duckdb::TableFunctionData {
 
   std::string name;
   std::string uri;
+  std::string device;
   bool finished = false;
 };
 
@@ -39,6 +40,7 @@ std::unique_ptr<::duckdb::FunctionData> CreateModelBind(
   auto result = std::make_unique<CreateModelFunctionData>();
   result->name = input.inputs[0].GetValue<std::string>();
   result->uri = input.inputs[1].GetValue<std::string>();
+  result->device = input.inputs[2].GetValue<std::string>();
 
   return_types.push_back(::duckdb::LogicalType::BOOLEAN);
   names.emplace_back("Success");
@@ -55,7 +57,7 @@ void CreateModelFunction(::duckdb::ClientContext& context,
 
   auto catalog = ModelCatalog::Get();
   assert(catalog != nullptr);
-  catalog->Load(data.name, data.uri);
+  catalog->Load(data.name, data.uri, data.device);
   data.finished = true;
 }
 
@@ -80,6 +82,7 @@ void ShowModelsFunction(::duckdb::ClientContext& context,
     output.SetValue(0, i, model->name());
     output.SetValue(1, i, model->uri());
     output.SetValue(2, i, model->type());
+    output.SetValue(3, i, model->device());
     i++;
   }
   data->finished = true;
@@ -92,7 +95,7 @@ std::unique_ptr<::duckdb::FunctionData> ShowModelsBind(
     std::vector<std::string>& names) {
   auto result = std::make_unique<ShowModelsFunctionData>();
 
-  for (const auto& col : {"name", "uri", "type"}) {
+  for (const auto& col : {"name", "uri", "type", "device"}) {
     return_types.push_back(::duckdb::LogicalType::VARCHAR);
     names.emplace_back(col);
   }
@@ -144,7 +147,7 @@ std::vector<std::unique_ptr<::duckdb::CreateTableFunctionInfo>> GetMLTableFuncti
 
   ::duckdb::TableFunction create_model_func(
       "create_pytorch_model",
-      {::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::VARCHAR},
+      {::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::VARCHAR},
       CreateModelFunction,
       CreateModelBind);
   functions.emplace_back(std::make_unique<::duckdb::CreateTableFunctionInfo>(create_model_func));

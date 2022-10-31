@@ -55,16 +55,23 @@ torch::Tensor ToTensor(const cv::Mat& image) {
 }
 
 std::unique_ptr<ModelEntry> PyTorchModelEntry::Make(const std::string& name,
-                                                    const std::string& uri) {
+                                                    const std::string& uri,
+                                                    const std::string& device) {
   // Let's just support local model for now
   torch::jit::script::Module module;
   try {
     module = torch::jit::load(uri);
-    module.to(at::kCUDA);
+    if (device == "cuda") {
+      std::cerr << "Sending module to CUDA" << std::endl;
+      module.to(at::kCUDA);
+    } else if (device == "cpu") {
+      std::cerr << "Sending module to CPU" << std::endl;
+      module.to(at::kCPU);
+    }
   } catch (const c10::Error& e) {
     throw ::duckdb::IOException("Error loading the model: " + e.msg());
   }
-  return std::unique_ptr<ModelEntry>(new PyTorchModelEntry{name, uri, module});
+  return std::unique_ptr<ModelEntry>(new PyTorchModelEntry{name, uri, device, module});
 }
 
 void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
@@ -89,9 +96,14 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
     // TODO: support batch mode
 
     auto input_tensor = ToTensor(fmat);
-    input_tensor.to(at::kCUDA);
     input_tensor = normalize(input_tensor);
-
+    if (device_ == "cuda") {
+      std::cerr << "Sending input to CUDA" << std::endl;
+      input_tensor.to(at::kCUDA);
+    } else if (device_ == "cpu") {
+      std::cerr << "Sending input to CPU" << std::endl;
+      input_tensor.to(at::kCPU);
+    }
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
     auto output = module_.forward(inputs).toTensor();

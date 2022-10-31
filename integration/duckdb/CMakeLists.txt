@@ -105,26 +105,28 @@ if(LANCE_BUILD_PYTORCH)
 endif()
 
 include_directories(src)
+
+set(LANCE_EXT_SOURCE_COMMON
+    src/lance/duckdb/lance-extension.cc
+    src/lance/duckdb/list_functions.cc
+    src/lance/duckdb/list_functions.h
+    src/lance/duckdb/vector_functions.cc
+    src/lance/duckdb/vector_functions.h)
+
+set(LANCE_EXT_SOURCE_ML
+    src/lance/duckdb/ml/catalog.cc
+    src/lance/duckdb/ml/catalog.h
+    src/lance/duckdb/ml/pytorch.cc
+    src/lance/duckdb/ml/pytorch.h
+    src/lance/duckdb/ml/functions.cc
+    src/lance/duckdb/ml/functions.h)
+
 if(LANCE_BUILD_PYTORCH)
   set(LANCE_EXT_SOURCES
-      src/lance/duckdb/lance-extension.cc
-      src/lance/duckdb/list_functions.cc
-      src/lance/duckdb/list_functions.h
-      src/lance/duckdb/vector_functions.cc
-      src/lance/duckdb/vector_functions.h
-      src/lance/duckdb/ml/catalog.cc
-      src/lance/duckdb/ml/catalog.h
-      src/lance/duckdb/ml/pytorch.cc
-      src/lance/duckdb/ml/pytorch.h
-      src/lance/duckdb/ml/functions.cc
-      src/lance/duckdb/ml/functions.h)
+      ${LANCE_EXT_SOURCE_COMMON}
+      ${LANCE_EXT_SOURCE_ML})
 else()
-  set(LANCE_EXT_SOURCES
-      src/lance/duckdb/lance-extension.cc
-      src/lance/duckdb/list_functions.cc
-      src/lance/duckdb/list_functions.h
-      src/lance/duckdb/vector_functions.cc
-      src/lance/duckdb/vector_functions.h)
+  set(LANCE_EXT_SOURCES ${LANCE_EXT_SOURCE_COMMON})
 endif()
 
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
