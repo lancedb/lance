@@ -43,6 +43,17 @@ def run_model(db, resnet, device):
     actual_prob = torch.tensor(df["prob"].iloc[0])
     actual_class = torch.argmax(actual_prob)
 
+    probabilities = _get_expected(resnet, device, cat_path)
+    assert torch.equal(actual_class, torch.argmax(probabilities))
+    if device != 'cuda':
+        assert torch.allclose(actual_prob, probabilities)
+
+    argmax = (db.query("SELECT list_argmax(predict('resnet', img)) as pred FROM tbl")
+              .to_df().pred)
+    assert (argmax.values == torch.argmax(probabilities).numpy()).all()
+
+
+def _get_expected(resnet, device, cat_path):
     resnet.to(device)
     resnet.eval()
 
@@ -57,13 +68,8 @@ def run_model(db, resnet, device):
     batch: torch.Tensor = image_tensor.unsqueeze(0).to(device)
     with torch.no_grad():
         output = resnet(batch)
-    probabilities = torch.nn.functional.softmax(output[0], dim=0)
-    assert torch.equal(actual_class, torch.argmax(probabilities))
-    assert torch.allclose(actual_prob, probabilities)
-
-    argmax = (db.query("SELECT list_argmax(predict('resnet', img)) as pred FROM tbl")
-              .to_df().pred)
-    assert (argmax.values == torch.argmax(probabilities).numpy()).all()
+    probabilities = torch.nn.functional.softmax(output[0], dim=0).to('cpu')
+    return probabilities
 
 
 def _test_model(db, device, model, model_path):

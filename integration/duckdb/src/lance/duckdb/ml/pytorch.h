@@ -20,6 +20,7 @@
 #include <duckdb/parser/parsed_data/create_function_info.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 #include <memory>
+#include <opencv2/opencv.hpp>
 #include <vector>
 
 #include "lance/duckdb/ml/catalog.h"
@@ -47,6 +48,8 @@ class PyTorchModelEntry : ModelEntry {
 
     }
   }
+
+  torch::Tensor RunInference(cv::Mat fmat);
 
   std::string name_;
   std::string uri_;
