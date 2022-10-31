@@ -77,6 +77,7 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   }
   int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it);
   assert(bound_idx >= 0);
+//  TODO I doubt this statement is useless ↘️
   bound_idx = std::max(0, bound_idx - 1);
   // Offset within the batch.
   int32_t offset = row_index - pb_.batch_offsets(bound_idx);

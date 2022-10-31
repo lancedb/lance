@@ -19,7 +19,7 @@ use arrow2::types::Index;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use crate::format::pb;
+use crate::metadata::Metadata;
 use crate::page_table::PageTable;
 use crate::schema::{Field, Schema};
 
@@ -29,8 +29,7 @@ static MAGIC_NUMBER: &str = "LANC";
 pub struct FileReader<R: Read + Seek> {
     file: R,
     schema: Schema,
-    // TODO: impl a Metadata
-    metadata: pb::Metadata,
+    metadata: Metadata,
     page_table: PageTable,
 }
 
@@ -89,12 +88,13 @@ impl<R: Read + Seek> FileReader<R> {
     pub fn new(file: R) -> Result<Self> {
         let mut f = file;
         let metadata_pos = read_footer(&mut f)?;
-        let metadata: crate::format::pb::Metadata = ProtoParser::read(&mut f, metadata_pos)?;
+        let pb_meta: crate::format::pb::Metadata = ProtoParser::read(&mut f, metadata_pos)?;
         let manifest: crate::format::pb::Manifest =
-            ProtoParser::read(&mut f, metadata.manifest_position as i64)?;
+            ProtoParser::read(&mut f, pb_meta.manifest_position as i64)?;
         let num_columns = manifest.fields.len();
-        let num_batches = metadata.batch_offsets.len() - 1;
-        let page_table = PageTable::make(&mut f, metadata.page_table_position, num_columns, num_batches);
+        let num_batches = pb_meta.batch_offsets.len() - 1;
+        let page_table = PageTable::make(&mut f, pb_meta.page_table_position, num_columns, num_batches);
+        let metadata = Metadata::make(pb_meta);
         Ok(FileReader {
             file: f,
             schema: Schema::from_proto(&manifest.fields),
@@ -107,14 +107,17 @@ impl<R: Read + Seek> FileReader<R> {
         &self.schema
     }
 
-    pub fn num_chunks(&self) -> i32 {
-        self.metadata.batch_offsets.len() as i32 - 1
+    pub fn num_chunks(&self) -> usize {
+        self.metadata.num_chunks()
     }
 
     pub fn get(&self, idx: u32) -> Box<dyn Array> {
+        // FileReader::Get
         let schema = self.schema();
+        // ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(idx));
+        // auto [batch_id, idx_in_batch] = batch;
         for field in &schema.fields {
-            let num_batches = self.metadata.batch_offsets.len() - 1;
+            let num_batches = self.metadata.num_batches();
             for batch_id in 0..num_batches {
                 let value: Box<dyn Array> = Self::get_array(&field, batch_id, ArrayParams { offset: 0, len: None });
             }

@@ -56,8 +56,8 @@ fn main() {
         Commands::Show { path } => {
             let f = File::open(path).unwrap();
             let reader = FileReader::new(f).unwrap();
-            println!("Number of RecordBatch: {}", reader.num_chunks());
-            println!("Schema: {}\n", reader.schema());
+            // println!("Number of RecordBatch: {}", reader.num_chunks());
+            // println!("Schema: {}\n", reader.schema());
             let chunk = reader.get(0);
             println!("chunk sample: {:?}", chunk)
         }

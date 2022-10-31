@@ -16,6 +16,7 @@ pub mod encodings;
 pub mod io;
 pub mod schema;
 mod page_table;
+mod metadata;
 
 pub mod format {
     /// Protobuf definitions
