@@ -19,14 +19,18 @@
 
 #include <memory>
 
+#include "lance/format/data_fragment.h"
+#include "lance/format/format.pb.h"
+
 namespace lance::format {
 
 class Schema;
 
 /// \brief Manifest.
 ///
-/// Organize the less-frequently updated metadata about the full dataset:
 ///  * Schema
+///  * Version
+///  * Fragments.
 ///
 class Manifest final {
  public:
@@ -40,6 +44,9 @@ class Manifest final {
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
 
+  /// Copy constructor.
+  Manifest(const Manifest& other) noexcept;
+
   ~Manifest() = default;
 
   /// Parse a Manifest from input file at the offset.
@@ -52,13 +59,31 @@ class Manifest final {
   /// \return The offset of the manifest.
   ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
 
+  /// Increase the version number and returns the new Manifest.
+  ///
+  std::shared_ptr<Manifest> BumpVersion(bool overwrite = false);
+
   /// Get schema of the dataset.
   const Schema& schema() const;
 
- private:
+  /// Returns the version number.
+  uint64_t version() const;
 
+  /// Get the fragments existed in this version of dataset.
+  const std::vector<std::shared_ptr<DataFragment>>& fragments() const;
+
+  /// Append more fragments to the dataset.
+  void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
+
+ private:
   /// Table schema.
   std::shared_ptr<Schema> schema_;
+
+  std::uint64_t version_ = 1;
+
+  std::vector<std::shared_ptr<DataFragment>> fragments_;
+
+  Manifest(const lance::format::pb::Manifest& pb);
 };
 
 }  // namespace lance::format

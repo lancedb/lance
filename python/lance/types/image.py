@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
@@ -69,6 +70,10 @@ class ImageUriType(ImageType):
     def __arrow_ext_scalar_class__(self):
         return ImageUriScalar
 
+    def to_pandas_dtype(self):
+        from lance.types.pandas.image import ImageUriDtype
+        return ImageUriDtype()
+
 
 class ImageBinaryType(ImageType):
     """
@@ -97,16 +102,19 @@ class Image(ABC):
     """
 
     @staticmethod
-    def create(data: Optional[Union[bytes, bytearray, str]]):
+    def create(data: Optional[Union[bytes, bytearray, str, Image]]):
         if pd.isna(data):
             return None
+        if isinstance(data, Image):
+            return data
+
         if isinstance(data, bytearray):
             data = bytes(data)
 
         if isinstance(data, bytes):
             img = ImageBinary(data)
-        elif isinstance(data, str):
-            img = ImageUri(data)
+        elif isinstance(data, (str, Path)):
+            img = ImageUri(str(data))
         else:
             raise TypeError(
                 f"Image can only handle bytes or str " f"but got {type(data)}"
@@ -256,10 +264,19 @@ class ImageUri(Image):
         return ImageUri(copy(self.uri, uri))
 
     def __eq__(self, other):
-        return isinstance(other, ImageUri) and other.uri == self.uri
+        return isinstance(other, ImageUri) and self.uri == other.uri
+
+    def __lt__(self, other): # for sorting
+        return isinstance(other, ImageUri) and self.uri < other.uri
+
+    def __hash__(self):
+        return hash(self.uri)
 
     def __repr__(self):
         return f"Image({self.uri})"
+
+    def __str__(self):
+        return self.uri
 
     def to_arrow_storage(self):
         return self.uri

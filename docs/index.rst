@@ -1,39 +1,17 @@
-Lance: A Columnar Data Format for Computer Vision
-=================================================
+Lance: Blazing fast exploration and analysis of machine learning visual data using SQL
+======================================================================================
 
-`Lance` is a cloud-native columnar data format designed for
-managing large-scale computer vision datasets in production environments.
-Lance delivers blazing fast performance for image and video data use cases from analytics
-to point queries to training scans.
+Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
+* Use arbitary ML functions in SQL for common use cases such as similarity search using embeddings, model inference and computing evaluation metrics like F1, IOU and more.
 
-What problems does Lance solve?
--------------------------------
+* [Coming soon] Visualize, slice and drill-into visual datasets to inspect embeddings, labels/annotations, metrics and more.
 
-Today, the data tooling stack for computer vision is insufficient to serve
-the needs of the ML engineering community.
+* [Coming soon] Version, compare and diff visual datasets easily.
 
-Working with vision data for ML is different from working with tabular data:
+Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for visual data use cases.
 
-* Training, analytics, and labeling uses different tools requiring different formats
-* Data annotations are almost always deeply nested
-* Images / videos are large blobs that are difficult to query by existing engines
-
-This results in some major pain-points:
-
-* Too much time spent on low level data munging
-* Multiple copies creates data quality issues, even for well-known datasets
-* Reproducibility and data versioning is extremely difficult to achieve
-
-Lance to the rescue
--------------------
-To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
-
-* Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
-* Rich ML data types and integrations to eliminate manual data conversions.
-* Support for vector and search indices, versioning, and schema evolution.
-
-
+Lance currently supports DuckDB.
 
 .. toctree::
    :maxdepth: 1

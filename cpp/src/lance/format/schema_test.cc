@@ -26,6 +26,7 @@
 #include "lance/testing/json.h"
 
 using lance::arrow::ToArray;
+using lance::format::Schema;
 using lance::testing::MakeDataset;
 using lance::testing::TableFromJSON;
 
@@ -217,4 +218,45 @@ TEST_CASE("Test schema metadata") {
   CHECK(dataset->schema()->metadata());
   CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
   CHECK(dataset->schema()->metadata()->Get("k1").ValueOrDie() == "v1");
+}
+
+TEST_CASE("Test merge two schemas") {
+  auto base_schema = Schema(::arrow::schema(
+      {::arrow::field("a", ::arrow::int32()), ::arrow::field("b", ::arrow::utf8())}));
+  auto merged =
+      base_schema.Merge(*::arrow::schema({::arrow::field("c", ::arrow::list(::arrow::utf8()))}))
+          .ValueOrDie();
+  CHECK(merged->GetField("a")->id() == 0);
+  CHECK(merged->GetField("b")->id() == 1);
+  CHECK(merged->GetField("c")->id() == 2);
+}
+
+TEST_CASE("Test merge two structs") {
+  auto base_schema = Schema(::arrow::schema(
+      {::arrow::field("a", ::arrow::struct_({::arrow::field("b", ::arrow::int32())}))}));
+  auto schema_c =
+      ::arrow::schema({::arrow::field("a",
+                                      ::arrow::struct_({::arrow::field("b", ::arrow::int32()),
+                                                        ::arrow::field("c", ::arrow::int64())}))});
+  auto merged = base_schema.Merge(*schema_c).ValueOrDie();
+  auto a = merged->GetField("a");
+  CHECK(a->id() == 0);
+  auto expected_struct = ::arrow::struct_(
+      {::arrow::field("b", ::arrow::int32()), ::arrow::field("c", ::arrow::int64())});
+  INFO("Expected type: " << expected_struct->ToString() << " Got: " << a->type()->ToString());
+  CHECK(a->type()->Equals(*expected_struct));
+  CHECK(merged->GetField("a.b")->id() == 1);
+  CHECK(merged->GetField("a.c")->id() == 2);
+}
+
+TEST_CASE("Test merge two list of structs") {
+  auto base_schema = Schema(::arrow::schema({::arrow::field(
+      "a", ::arrow::list(::arrow::struct_({::arrow::field("b1", ::arrow::int32())})))}));
+  auto addon_schema = ::arrow::schema({::arrow::field(
+      "a", ::arrow::list(::arrow::struct_({::arrow::field("b2", ::arrow::utf8())})))});
+  auto merged = base_schema.Merge(*addon_schema).ValueOrDie();
+  CHECK(merged->ToArrow()->Equals(::arrow::schema(
+      {::arrow::field("a",
+                      ::arrow::list(::arrow::struct_({::arrow::field("b1", ::arrow::int32()),
+                                                      ::arrow::field("b2", ::arrow::utf8())})))})));
 }

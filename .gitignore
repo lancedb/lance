@@ -70,6 +70,11 @@ docs/notebooks
 integration/duckdb/manylinux-build
 python/notebooks/lance.duckdb_extension
 
+wheelhouse
+
+# pandas testing
+.hypothesis
+
 # Rust
 Cargo.lock
 target

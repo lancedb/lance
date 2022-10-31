@@ -16,9 +16,37 @@
 
 #include <arrow/dataset/file_base.h>
 
+#include <vector>
+
+#include "lance/format/data_fragment.h"
 #include "lance/io/exec/counter.h"
 
 namespace lance::arrow {
+
+/// LanceFragment, a fragment of data.
+class LanceFragment : public ::arrow::dataset::Fragment {
+ public:
+  LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
+                std::string data_dir,
+                std::shared_ptr<lance::format::DataFragment> fragment,
+                const format::Schema& schema);
+
+  ~LanceFragment() override = default;
+
+  ::arrow::Result<::arrow::RecordBatchGenerator> ScanBatchesAsync(
+      const std::shared_ptr<::arrow::dataset::ScanOptions>& options) override;
+
+  std::string type_name() const override { return "lance"; }
+
+ protected:
+  ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
+
+ private:
+  std::shared_ptr<::arrow::fs::FileSystem> fs_;
+  std::string data_uri_;
+  std::shared_ptr<lance::format::DataFragment> fragment_;
+  const format::Schema& schema_;
+};
 
 /// Lance FragmentScanOptions.
 ///

@@ -54,6 +54,13 @@ FetchContent_Declare(fmt
         )
 list(APPEND available_contents fmt)
 
+set(UUID_BUILD_TESTS OFF)
+set(UUID_USING_CXX20_SPAN ON)
+FetchContent_Declare(uuid
+        URL https://github.com/mariusbancila/stduuid/archive/refs/tags/v1.2.2.zip
+        )
+list(APPEND available_contents uuid)
+
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     FetchContent_Declare(
             Catch2
@@ -74,7 +81,10 @@ endif ()
 
 FetchContent_MakeAvailable(${available_contents})
 
-include_directories(${fmt_SOURCE_DIR}/include)
+include_directories(
+        ${fmt_SOURCE_DIR}/include
+        ${uuid_SOURCE_DIR}/include
+)
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
 find_package(Protobuf REQUIRED)

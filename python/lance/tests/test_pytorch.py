@@ -47,8 +47,6 @@ def test_data_loader(tmp_path: Path):
     assert torch.equal(value_batch, torch.tensor([10, 11, 12, 13]))
 
 
-@pytest.mark.skipif(platform.system() != "Linux",
-                    reason="there's a bug on mac")
 def test_dataset_with_ext_types(tmp_path: Path):
     images = []
     labels = []
@@ -91,6 +89,7 @@ def test_data_loader_with_filter(tmp_path: Path):
         assert (value - 10) % 2 == 0
         assert torch.is_tensor(value)
 
+
 def test_data_loader_projection(tmp_path: Path):
     ids = pa.array(range(10))
     values = pa.array([f"num-{i}" for i in ids])
@@ -101,3 +100,14 @@ def test_data_loader_projection(tmp_path: Path):
     for elem, expected_id in zip(dataset, range(5, 10)):
         assert elem == f"num-{expected_id}"
 
+
+def test_filter_resulted_empty_return(tmp_path: Path):
+    ids = pa.array(range(10))
+    values = pa.array([i.as_py() > 5 for i in ids])
+    table = pa.Table.from_arrays([ids, values], names=["id", "bignum"])
+    lance.write_table(table, tmp_path / "lance")
+
+    dataset = LanceDataset(tmp_path / "lance", columns=["id"], filter=pc.field("bignum") == True, mode="batch",
+                           batch_size=2)
+    actual_ids = torch.stack(list(dataset))
+    assert torch.equal(actual_ids, torch.stack([torch.tensor([6, 7]), torch.tensor([8, 9])]))

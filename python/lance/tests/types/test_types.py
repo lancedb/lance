@@ -40,7 +40,12 @@ from lance.types import (
 def test_image(tmp_path):
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
-    _test_image(tmp_path, storage)
+    dtype, arr = _test_image(tmp_path, storage)
+    tbl = pa.Table.from_arrays([arr], names=['img'])
+    df = tbl.to_pandas()
+    assert df.img.dtype == dtype.to_pandas_dtype()
+    tbl_rt = pa.Table.from_pandas(df)
+    assert tbl_rt['img'].type == dtype
 
 
 def test_image_binary(tmp_path):
@@ -79,6 +84,7 @@ def _test_image(tmp_path, storage):
     assert isinstance(ext_arr, ImageArray)
     expected_arr = ImageArray.from_pandas(storage.to_pylist())
     assert ext_arr == expected_arr
+    return image_type, ext_arr
 
 
 def test_point(tmp_path):

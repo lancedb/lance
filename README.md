@@ -1,42 +1,26 @@
-# Lance: A Columnar Data Format for Computer Vision
+# Lance
 
-![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
-[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
+**Blazing fast exploration and analysis of machine learning visual data using SQL**
 
-[![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
-![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+```sql
+SELECT predict(‘resnet’, image) FROM dataset
+```
 
-[![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
+![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
 
-Lance is a cloud-native columnar data format designed for managing large-scale computer vision datasets in production
-environments. Lance delivers blazing fast performance for image and video data use cases from analytics to point
-queries to training scans.
+Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
-Lance core is written in C++ and comes with python bindings to start. With first class Apache Arrow integration, Lance is queryable by tools like DuckDB out of the box and can be converted from parquet with a single line of code.
+* Use arbitary ML functions in SQL for common use cases such as similarity search using embeddings, model inference and computing evaluation metrics like F1, IOU and more.
 
-## What problems does Lance solve?
+* [Coming soon] Visualize, slice and drill-into visual datasets to inspect embeddings, labels/annotations, metrics and more.
 
-Today, the data tooling stack for computer vision is insufficient to serve the needs of the ML engineering community.
+* [Coming soon] Version, compare and diff visual datasets easily.
 
-### Working with vision data for ML is different from working with tabular data:
-- Training, analytics, and labeling uses different tools requiring different formats
-- Data annotations are almost always deeply nested
-- Images / videos are large blobs that are difficult to query by existing engines
+Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for visual data use cases.
 
-### This results in some major pain-points:
-- Too much time spent on low level data munging
-- Multiple copies creates data quality issues, even for well-known datasets
-- Reproducibility and data versioning is extremely difficult to achieve
-
-### Lance to the rescue
-To solve these pain-points, we are building Lance, an open-source columnar data format optimized for computer vision with the following goals:
-- Blazing fast performance for analytical scans and random access to individual records (for visualization and annotation)
-- Rich ML data types and integrations to eliminate manual data conversions
-- Support for vector and search indices, versioning, and schema evolution
+Lance currently supports DuckDB.
 
 ## Quick Start
-
-We've provided Linux and MacOS wheels for Lance in PyPI. You can install Lance python bindings via:
 
 ```
 pip install pylance
@@ -55,6 +39,15 @@ import duckdb
 ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
+
+## Important directories
+
+| Directory                                  | Description                            |
+|--------------------------------------------|----------------------------------------|
+| [cpp](./cpp)                               | Core Lance Format |
+| [python](./python)                         | Python SDK (Pylance)                |
+| [notebooks](./python/notebooks)            | Jupyter Notebooks                      |
+| [duckdb extension](./integration/duckdb)   | Lance Duckdb extension                 |
 
 ## What makes Lance different
 

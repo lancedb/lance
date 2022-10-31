@@ -18,7 +18,9 @@
 #include <arrow/util/thread_pool.h>
 #include <fmt/format.h>
 
+#include <filesystem>
 #include <memory>
+#include <utility>
 
 #include "lance/arrow/file_lance_ext.h"
 #include "lance/format/manifest.h"
@@ -29,6 +31,8 @@
 #include "lance/io/writer.h"
 
 const char kLanceFormatTypeName[] = "lance";
+
+namespace fs = std::filesystem;
 
 namespace lance::arrow {
 
@@ -133,6 +137,37 @@ std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTyp
 
 bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso) {
   return fso.type_name() == kLanceFormatTypeName;
+}
+
+LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
+                             std::string data_dir,
+                             std::shared_ptr<lance::format::DataFragment> fragment,
+                             const format::Schema& schema)
+    : fs_(std::move(fs)),
+      data_uri_(std::move(data_dir)),
+      fragment_(std::move(fragment)),
+      schema_(schema) {}
+
+::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
+  // Only support one file for now.
+  assert(fragment_->data_files().size() == 1);
+
+  // There will be more than one file when schema evolution happens, will implement it later.
+  for (const auto& data_file : fragment_->data_files()) {
+    auto full_path = (fs::path(data_uri_) / data_file.path()).string();
+    ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path));
+    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
+    auto batch_reader = lance::io::RecordBatchReader(
+        std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
+    ARROW_RETURN_NOT_OK(batch_reader.Open());
+    return ::arrow::RecordBatchGenerator(std::move(batch_reader));
+  }
+  return ::arrow::Status::IOError("Lance Fragment has zero file");
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
+  return schema_.ToArrow();
 }
 
 }  // namespace lance::arrow
