@@ -62,10 +62,8 @@ std::unique_ptr<ModelEntry> PyTorchModelEntry::Make(const std::string& name,
   try {
     module = torch::jit::load(uri);
     if (device == "cuda") {
-      std::cerr << "Sending module to CUDA" << std::endl;
       module.to(at::kCUDA);
     } else if (device == "cpu") {
-      std::cerr << "Sending module to CPU" << std::endl;
       module.to(at::kCPU);
     }
   } catch (const c10::Error& e) {
@@ -98,16 +96,13 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
     auto input_tensor = ToTensor(fmat);
     input_tensor = normalize(input_tensor);
     if (device_ == "cuda") {
-      std::cerr << "Sending input to CUDA" << std::endl;
-      input_tensor.to(at::kCUDA);
+      input_tensor = input_tensor.to(at::kCUDA);
     } else if (device_ == "cpu") {
-      std::cerr << "Sending input to CPU" << std::endl;
-      input_tensor.to(at::kCPU);
+      input_tensor = input_tensor.to(at::kCPU);
     }
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
-    auto output = module_.forward(inputs).toTensor();
-    output.to(at::kCPU);
+    auto output = module_.forward(inputs).toTensor().to(at::kCPU);
 
     // OMG this copying is painfully slow.
     std::vector<::duckdb::Value> values;
