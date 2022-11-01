@@ -65,11 +65,11 @@ def dataset(
         File system instance to read.
     """
     if not filesystem:
-        filesystem, uri = pa.fs.FileSystem.from_uri(uri)
+        filesystem, path = pa.fs.FileSystem.from_uri(uri)
 
     if version is None:
         if (
-            filesystem.get_file_info(os.path.join(uri, "_latest.manifest")).type
+            filesystem.get_file_info(os.path.join(path, "_latest.manifest")).type
             == pa.fs.FileType.NotFound
         ):
             return _dataset_plain(uri, **kwargs)
