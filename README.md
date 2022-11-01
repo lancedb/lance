@@ -1,13 +1,10 @@
 <div align="center">
 <p align="center">
  
- <img width="257" alt="Lance_Logo_Dark_Light" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
+<img width="257" alt="Lance_Logo_Dark_Light" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
 **Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
 
-```sql
-SELECT predict(‘resnet’, image) FROM dataset
-```
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
 <a href="https://discord.gg/zMM32dvNtd">Discord</a> •
@@ -19,6 +16,8 @@ SELECT predict(‘resnet’, image) FROM dataset
 
 </p>
 </div>
+
+<hr />
 
 Lance makes machine learning workflows with computer vision data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
