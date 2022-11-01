@@ -1,10 +1,28 @@
 # distutils: language = c++
 
-from pyarrow._dataset import Dataset
+from typing import List, Dict
+
+from pyarrow._dataset cimport Dataset, CDataset
+from pyarrow._dataset import _forbid_instantiation
+from pyarrow.includes.common cimport CStatus
+from pyarrow.includes.libarrow_dataset cimport CScanner, CFileSystemDatasetWriteOptions
+from libcpp.memory cimport shared_ptr
+from pyarrow import Table
+
+from lance._lib import BuildScanner
 
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
-        pass
+
+        enum WriteMode "::lance::arrow::LanceDataset::WriteMode":
+            pass
+
+        @staticmethod
+        CStatus Write(
+                const CFileSystemDatasetWriteOptions& write_options,
+                shared_ptr[CScanner] scanner,
+                WriteMode mode)
+
 
 
 cdef class LanceDataset(Dataset):
@@ -35,5 +53,5 @@ cdef class LanceDataset(Dataset):
         pass
 
 def write_dataset():
-    """"""
+    """Write dataset"""
     pass
