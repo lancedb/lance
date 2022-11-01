@@ -59,6 +59,10 @@ def dataset(
         If specified, load a specific version of the dataset.
     filesystem: pa.fs.FileSystem
         File system instance to read.
+
+    Other Parameters
+    ----------------
+
     """
     if not filesystem:
         filesystem, uri = pa.fs.FileSystem.from_uri(uri)

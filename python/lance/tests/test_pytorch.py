@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import platform
 
 import pytest
 
@@ -25,7 +24,6 @@ import PIL
 import pyarrow as pa
 import pyarrow.compute as pc
 
-import lance
 from lance import LanceFileFormat
 from lance.pytorch.data import LanceDataset
 from lance.types import ImageArray, ImageBinary

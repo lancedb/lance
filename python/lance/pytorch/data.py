@@ -158,14 +158,18 @@ class LanceDataset(IterableDataset):
         Either returning a record or a batch is controlled by the "mode" parameter.
         """
         self._setup_dataset()
+        kwargs = {"batch_size": self.batch_size}
+        if len(self.columns) > 0:
+            kwargs["columns"] = self.columns
+        if self.filter is not None:
+            kwargs["filter"] = self.filter
+
         for file_uri in self._files:
             ds = lance.dataset(
                 file_uri,
                 filesystem=self._fs,
             )
-            scan = ds.scanner(
-                columns=self.columns, batch_size=self.batch_size, filter=self.filter
-            )
+            scan = ds.scanner(**kwargs)
             for batch in scan.to_reader():
                 if self.mode == "batch":
                     if batch.num_rows == 0:
