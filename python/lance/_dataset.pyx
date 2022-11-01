@@ -1,5 +1,7 @@
 # distutils: language = c++
 
+from pyarrow._dataset import Dataset
+
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         pass
@@ -31,7 +33,6 @@ cdef class LanceDataset(Dataset):
     def versions(self) -> List[Dict]:
         """Fetch all versions of this dataset."""
         pass
-
 
 def write_dataset():
     """"""
