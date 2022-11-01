@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Union, Optional
+from typing import Optional, Union
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -23,7 +23,7 @@ from . import version
 
 __version__ = version.__version__
 
-from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset, _lance_dataset_write
+from lance.lib import LanceFileFormat, WriteTable, _lance_dataset_write, _wrap_dataset
 from lance.types import register_extension_types
 
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
@@ -68,10 +68,12 @@ def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int 
 
 
 def write_dataset(
-        data: Union[pa.Table, pa.dataset.Dataset],
-        base_dir: Union[str, Path],
-        mode: str = "create",
-        filesystem: pa.fs.FileSystem = None, **kwargs):
+    data: Union[pa.Table, pa.dataset.Dataset],
+    base_dir: Union[str, Path],
+    mode: str = "create",
+    filesystem: pa.fs.FileSystem = None,
+    **kwargs
+):
     """Write a dataset.
 
     Parameters
@@ -86,6 +88,7 @@ def write_dataset(
         The filesystem to write the dataset
     """
     from pyarrow.fs import _resolve_filesystem_and_path
+
     if isinstance(data, pa.Table):
         data = pa.dataset.InMemoryDataset(data)
 
