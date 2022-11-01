@@ -39,3 +39,14 @@ def test_dictionary_type_query(tmp_path: Path):
     ds = lance.dataset(uri)
     print(duckdb.query("SELECT * FROM ds"))
     print(duckdb.query("SELECT count(class), class FROM ds GROUP BY 2").to_df())
+
+
+def test_versioned_dataset(tmp_path: Path):
+    df = pd.DataFrame({"idx": range(5), "grade": ["A", "B", "B", "A", "C"]})
+    uri = tmp_path / "lance"
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    lance.write_dataset(table, uri)
+
+    ds = lance.dataset(uri)
+    actual_df = duckdb.query("SELECT * FROM ds").to_df()
+    assert pd.testing.assert_frame_equal(df, actual_df)

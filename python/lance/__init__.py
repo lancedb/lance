@@ -26,7 +26,6 @@ __version__ = version.__version__
 
 from lance.lib import (
     LanceFileFormat,
-    WriteTable,
     _lance_dataset_write,
     _wrap_dataset,
     _lance_dataset_make,
@@ -65,14 +64,14 @@ def dataset(
         File system instance to read.
     """
     if not filesystem:
-        filesystem, path = pa.fs.FileSystem.from_uri(uri)
+        filesystem, uri = pa.fs.FileSystem.from_uri(uri)
 
     if version is None:
         if (
-            filesystem.get_file_info(os.path.join(path, "_latest.manifest")).type
+            filesystem.get_file_info(os.path.join(uri, "_latest.manifest")).type
             == pa.fs.FileType.NotFound
         ):
-            return _dataset_plain(path, filesystem=filesystem, **kwargs)
+            return _dataset_plain(uri, filesystem=filesystem, **kwargs)
 
     # Read the versioned dataset layout.
     has_version = True

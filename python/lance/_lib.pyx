@@ -81,13 +81,6 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
         int batch_size
 
 
-cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
-    CStatus CWriteTable "::lance::arrow::WriteTable"(
-            const CTable& table,
-            shared_ptr[COutputStream] sink,
-            CLanceFileWriteOptions options)
-
-
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
     cdef cppclass LScannerBuilder "::lance::arrow::ScannerBuilder":
         LScannerBuilder(shared_ptr[CDataset]) except +
@@ -150,18 +143,6 @@ cdef class LanceFileFormat(FileFormat):
 
     def make_write_options(self):
         return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
-
-def WriteTable(table: Table,
-               sink: Union[str, Path],
-               batch_size: int):
-    arrow_table = pyarrow_unwrap_table(table)
-    cdef shared_ptr[COutputStream] out
-    get_writer(sink, &out)
-
-    cdef CLanceFileWriteOptions options = CLanceFileWriteOptions()
-    options.batch_size = batch_size
-    with nogil:
-        check_status(CWriteTable(deref(arrow_table), out, options))
 
 cdef class FileSystemDataset(Dataset):
     """
