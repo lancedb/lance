@@ -9,7 +9,9 @@
 SELECT predict(‘resnet’, image) FROM dataset
 ```
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
-<a href="https://discord.gg/zMM32dvNtd">Community</a>
+<a href="https://blog.eto.ai/">Blog</a> •
+<a href="https://discord.gg/zMM32dvNtd">Discord</a> •
+<a href="https://twitter.com/etodotai">Twitter</a>
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
