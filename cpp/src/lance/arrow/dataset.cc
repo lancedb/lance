@@ -117,11 +117,11 @@ LanceDataset::LanceDataset(const LanceDataset& other)
 LanceDataset::~LanceDataset() {}
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
-                                    std::shared_ptr<::arrow::dataset::Dataset> dataset,
+                                    const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
                                     WriteMode mode) {
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset->NewScan());
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
-  return Write(options, scanner, mode);
+  return Write(options, std::move(scanner), mode);
 }
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
@@ -168,6 +168,7 @@ LanceDataset::~LanceDataset() {}
   auto lance_option = options;
   lance_option.base_dir = data_dir;
   lance_option.existing_data_behavior = ::arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
+  lance_option.create_dir = true;
   auto partitioning = std::move(lance_option.partitioning);
   // TODO: support partition via lance manifest.
   lance_option.partitioning =

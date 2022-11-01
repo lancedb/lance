@@ -77,7 +77,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// To accommodate Cython lacking of arrow Scanner interface, we directly write
   /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
-                               std::shared_ptr<::arrow::dataset::Dataset> dataset,
+                               const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
                                WriteMode mode = kCreate);
 
   /// Load dataset, with a specific version.

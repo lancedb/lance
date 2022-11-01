@@ -311,6 +311,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         enum WriteMode "WriteMode":
             CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
+            APPEND "::lance::arrow::LanceDataset::WriteMode::kAppend"
+            OVERWRITE "::lance::arrow::LanceDataset::WriteMode::kOverwrite"
 
         @staticmethod
         CStatus Write(
@@ -351,7 +353,7 @@ def _lance_dataset_write(
         Dataset data,
         object base_dir not None,
         FileSystem filesystem not None,
-        str mode not None,
+        str mode not None
 ):
     """Wraps 'LanceDataset::Write'.
 
@@ -364,14 +366,24 @@ def _lance_dataset_write(
         shared_ptr[CScanner] c_scanner
         shared_ptr[CDataset] c_dataset
         CLanceDataset.WriteMode c_mode
+        FileWriteOptions write_options
 
     c_dataset = data.unwrap()
 
+    fmt = LanceFileFormat()
+    write_options = fmt.make_write_options()
+
     c_options.base_dir = tobytes(_stringify_path(base_dir))
     c_options.filesystem = filesystem.unwrap()
+    c_options.file_write_options = write_options.unwrap()
     c_options.create_dir = True
 
     if mode == "create":
         c_mode = CLanceDataset.WriteMode.CREATE
+    elif mode == "append":
+        c_mode = CLanceDataset.WriteMode.APPEND
+    elif mode == "overwrite":
+        c_mode = CLanceDataset.WriteMode.OVERWRITE
+
     with nogil:
         check_status(CLanceDataset.Write(c_options, c_dataset, c_mode))
