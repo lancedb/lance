@@ -117,6 +117,14 @@ LanceDataset::LanceDataset(const LanceDataset& other)
 LanceDataset::~LanceDataset() {}
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
+                                    std::shared_ptr<::arrow::dataset::Dataset> dataset,
+                                    WriteMode mode) {
+  ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset->NewScan());
+  ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
+  return Write(options, scanner, mode);
+}
+
+::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner,
                                     WriteMode mode) {
   const auto& base_dir = options.base_dir;

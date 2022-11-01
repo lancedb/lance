@@ -312,11 +312,10 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         enum WriteMode "WriteMode":
             CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
 
-
-        @ staticmethod
+        @staticmethod
         CStatus Write(
                 const CFileSystemDatasetWriteOptions& write_options,
-                shared_ptr[CScanner] scanner,
+                shared_ptr[CDataset] dataset,
                 WriteMode mode)
 
 
@@ -363,10 +362,10 @@ def _lance_dataset_write(
     cdef:
         CFileSystemDatasetWriteOptions c_options
         shared_ptr[CScanner] c_scanner
+        shared_ptr[CDataset] c_dataset
         CLanceDataset.WriteMode c_mode
 
-    scanner = data.scanner()
-    # print(type(scanner))
+    c_dataset = data.unwrap()
 
     c_options.base_dir = tobytes(_stringify_path(base_dir))
     c_options.filesystem = filesystem.unwrap()
@@ -374,6 +373,5 @@ def _lance_dataset_write(
 
     if mode == "create":
         c_mode = CLanceDataset.WriteMode.CREATE
-    # c_scanner = scanner.unwrap()
-    # with nogil:
-    #     check_status(CLanceDataset.Write(c_options, c_scanner, c_mode))
+    with nogil:
+        check_status(CLanceDataset.Write(c_options, c_dataset, c_mode))
