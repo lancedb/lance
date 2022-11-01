@@ -72,7 +72,7 @@ def dataset(
             filesystem.get_file_info(os.path.join(path, "_latest.manifest")).type
             == pa.fs.FileType.NotFound
         ):
-            return _dataset_plain(uri, **kwargs)
+            return _dataset_plain(path, filesystem=filesystem, **kwargs)
 
     # Read the versioned dataset layout.
     has_version = True
