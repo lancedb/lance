@@ -33,7 +33,7 @@ from lance.lib import (
 )
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_table", "write_dataset", "LanceFileFormat", "__version__"]
+__all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__"]
 
 register_extension_types()
 
@@ -80,21 +80,6 @@ def dataset(
         has_version = False
         version = 0
     return _lance_dataset_make(filesystem, uri, has_version, version)
-
-
-def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
-    """Write an Arrow Table into the destination.
-
-    Parameters
-    ----------
-    table : pa.Table
-        Apache Arrow Table
-    destination : str or `Path`
-        The destination to write dataset to.
-    batch_size : int, optional
-        Set the batch size to write to disk.
-    """
-    WriteTable(table, destination, batch_size=batch_size)
 
 
 def write_dataset(
