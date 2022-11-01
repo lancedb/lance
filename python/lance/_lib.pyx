@@ -145,13 +145,13 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
             APPEND "::lance::arrow::LanceDataset::WriteMode::kAppend"
             OVERWRITE "::lance::arrow::LanceDataset::WriteMode::kOverwrite"
 
-        @ staticmethod
+        @staticmethod
         CStatus Write(
                 const CFileSystemDatasetWriteOptions& write_options,
                 shared_ptr[CDataset] dataset,
                 WriteMode mode)
 
-        @ staticmethod
+        @staticmethod
         CResult[shared_ptr[CLanceDataset]] Make(
                 const shared_ptr[CFileSystem]& fs,
                 const string& base_uri,
