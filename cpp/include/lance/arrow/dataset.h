@@ -58,7 +58,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   ~LanceDataset() override;
 
-  /// Write a in-memory Arrow dataset to disk.
+  /// Write Arrow dataset to disk.
   ///
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
@@ -66,6 +66,18 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner,
+                               WriteMode mode = kCreate);
+
+  /// Write Arrow dataset to disk.
+  ///
+  /// \param options Arrow Dataset Write Options.
+  /// \param scanner the source dataset to be written.
+  /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  ///
+  /// GH-62. To accommodate Cython lacking of arrow Scanner interface, we directly write
+  /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
+  static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
+                               const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
                                WriteMode mode = kCreate);
 
   /// Load dataset, with a specific version.
