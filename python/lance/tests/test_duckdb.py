@@ -49,4 +49,4 @@ def test_versioned_dataset(tmp_path: Path):
 
     ds = lance.dataset(uri)
     actual_df = duckdb.query("SELECT * FROM ds").to_df()
-    assert pd.testing.assert_frame_equal(df, actual_df)
+    pd.testing.assert_frame_equal(df, actual_df, check_like=True)

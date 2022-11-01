@@ -27,7 +27,6 @@ __version__ = version.__version__
 from lance.lib import (
     LanceFileFormat,
     _lance_dataset_write,
-    _wrap_dataset,
     _lance_dataset_make,
 )
 from lance.types import register_extension_types
@@ -38,9 +37,7 @@ register_extension_types()
 
 
 def _dataset_plain(uri: str, **kwargs) -> ds.FileSystemDataset:
-    fmt = LanceFileFormat()
-    data = ds.dataset(uri, format=fmt, **kwargs)
-    return _wrap_dataset(data)
+    return ds.dataset(uri, format=LanceFileFormat(), **kwargs)
 
 
 def dataset(

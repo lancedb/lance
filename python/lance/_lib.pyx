@@ -144,150 +144,6 @@ cdef class LanceFileFormat(FileFormat):
     def make_write_options(self):
         return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
 
-cdef class FileSystemDataset(Dataset):
-    """
-    A Dataset of Lance fragments.
-
-    A LanceDataset is composed of one or more FileFragment.
-
-    Parameters
-    ----------
-    fragments : list[Fragments]
-        List of fragments to consume.
-    schema : Schema
-        The top-level schema of the Dataset.
-    filesystem : FileSystem
-        FileSystem of the fragments.
-    root_partition : Expression, optional
-        The top-level partition of the DataDataset.
-    """
-
-    cdef:
-        CFileSystemDataset * filesystem_dataset
-
-    def __init__(self):
-        _forbid_instantiation(self.__class__)
-
-    @property
-    def filesystem(self):
-        return FileSystem.wrap(self.filesystem_dataset.filesystem())
-
-    @property
-    def partitioning(self):
-        """
-        The partitioning of the Dataset source, if discovered.
-
-        If the FileSystemDataset is created using the ``dataset()`` factory
-        function with a partitioning specified, this will return the
-        finalized Partitioning object from the dataset discovery. In all
-        other cases, this returns None.
-        """
-        c_partitioning = self.filesystem_dataset.partitioning()
-        if c_partitioning.get() == nullptr:
-            return None
-        try:
-            return Partitioning.wrap(c_partitioning)
-        except TypeError:
-            # e.g. type_name "default"
-            return None
-
-    cdef void init(self, const shared_ptr[CDataset]& sp):
-        Dataset.init(self, sp)
-        self.filesystem_dataset = <CFileSystemDataset *> sp.get()
-
-    @staticmethod
-    cdef wrap(const shared_ptr[CDataset]& sp):
-        cdef Dataset ds = FileSystemDataset.__new__(FileSystemDataset)
-        ds.init(sp)
-        return ds
-
-    def __reduce__(self):
-        return FileSystemDataset, (
-            list(self.get_fragments()),
-            self.schema,
-            self.format,
-            self.filesystem,
-            self.partition_expression
-        )
-
-    @classmethod
-    def from_paths(cls, paths, schema=None, format=None,
-                   filesystem=None, partitions=None, root_partition=None):
-        """A Dataset created from a list of paths on a particular filesystem.
-
-        Parameters
-        ----------
-        paths : list of str
-            List of file paths to create the fragments from.
-        schema : Schema
-            The top-level schema of the DataDataset.
-        format : FileFormat
-            File format to create fragments from, currently only
-            ParquetFileFormat, IpcFileFormat, and CsvFileFormat are supported.
-        filesystem : FileSystem
-            The filesystem which files are from.
-        partitions : list[Expression], optional
-            Attach additional partition information for the file paths.
-        root_partition : Expression, optional
-            The top-level partition of the DataDataset.
-        """
-        cdef:
-            FileFragment fragment
-
-        if root_partition is None:
-            root_partition = _true
-
-        for arg, class_, name in [
-            (schema, Schema, 'schema'),
-            (format, FileFormat, 'format'),
-            (filesystem, FileSystem, 'filesystem'),
-            (root_partition, Expression, 'root_partition')
-        ]:
-            if not isinstance(arg, class_):
-                raise TypeError(
-                    "Argument '{0}' has incorrect type (expected {1}, "
-                    "got {2})".format(name, class_.__name__, type(arg))
-                )
-
-        partitions = partitions or [_true] * len(paths)
-
-        if len(paths) != len(partitions):
-            raise ValueError(
-                'The number of files resulting from paths_or_selector '
-                'must be equal to the number of partitions.'
-            )
-
-        fragments = [
-            format.make_fragment(path, filesystem, partitions[i])
-            for i, path in enumerate(paths)
-        ]
-        return FileSystemDataset(fragments, schema, format,
-                                 filesystem, root_partition)
-
-    @property
-    def files(self):
-        """List of the files"""
-        cdef vector[c_string] files = self.filesystem_dataset.files()
-        return [frombytes(f) for f in files]
-
-    @property
-    def format(self):
-        """The FileFormat of this source."""
-        cdef FileFormat format = LanceFileFormat.__new__(LanceFileFormat)
-        format.init(self.filesystem_dataset.format())
-        return format
-
-    def head(self, n: int, offset: int = 0) -> Table:
-        scanner = self.scanner(limit=n, offset=offset)
-        return scanner.to_table()
-
-    def scanner(self, *args, **kwargs):
-        return BuildScanner(self, *args, **kwargs)
-
-def _wrap_dataset(Dataset dataset not None):
-    cdef shared_ptr[CDataset] copy = dataset.unwrap()
-    return FileSystemDataset.wrap(move(copy))
-
 
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
@@ -310,8 +166,7 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         )
 
 
-
-cdef class LanceDataset(Dataset):
+cdef class FileSystemDataset(Dataset):
     """Lance Dataset.
     """
     cdef:
@@ -326,12 +181,12 @@ cdef class LanceDataset(Dataset):
 
     @staticmethod
     cdef wrap(const shared_ptr[CDataset]& sp):
-        cdef LanceDataset ds = LanceDataset.__new__(LanceDataset)
+        cdef FileSystemDataset ds = FileSystemDataset.__new__(FileSystemDataset)
         ds.init(sp)
         return ds
 
-    def head(self, n: int, offset: int = 0) -> Table:
-        scanner = self.scanner(limit=n, offset=offset)
+    def head(self, n: int, offset: int = 0, **kwargs) -> Table:
+        scanner = self.scanner(limit=n, offset=offset, **kwargs)
         return scanner.to_table()
 
     def scanner(self, *args, **kwargs):
@@ -399,4 +254,4 @@ def _lance_dataset_make(
 
     c_dataset = GetResultValue(CLanceDataset.Make(c_filesystem, base_dir, c_version))
     c_base_dataset = static_pointer_cast[CDataset, CLanceDataset](c_dataset)
-    return LanceDataset.wrap(move(c_base_dataset))
+    return FileSystemDataset.wrap(move(c_base_dataset))
