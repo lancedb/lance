@@ -14,9 +14,10 @@
 
 from pathlib import Path
 from typing import Optional, Union
+import os
 
 import pyarrow as pa
-import pyarrow.compute as pc
+import pyarrow.fs
 import pyarrow.dataset as ds
 
 from . import version
@@ -26,14 +27,27 @@ __version__ = version.__version__
 from lance.lib import LanceFileFormat, WriteTable, _lance_dataset_write, _wrap_dataset
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
+__all__ = ["dataset", "write_table", "write_dataset", "LanceFileFormat", "__version__"]
 
 register_extension_types()
 
 
-def dataset(uri: str, version: Optional[int] = None, **kwargs) -> ds.FileSystemDataset:
+def _dataset_plain(uri: str, **kwargs) -> ds.FileSystemDataset:
+    fmt = LanceFileFormat()
+    data = ds.dataset(uri, format=fmt, **kwargs)
+    return _wrap_dataset(data)
+
+
+def dataset(
+    uri: Union[str, Path],
+    version: Optional[int] = None,
+    filesystem: Optional[pa.fs.FileSystem] = None,
+    **kwargs,
+) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
+
+    It supports to read both versioned dataset, and plain (legacy) dataset.
 
     Parameters
     ----------
@@ -41,15 +55,20 @@ def dataset(uri: str, version: Optional[int] = None, **kwargs) -> ds.FileSystemD
         The uri to the lance data
     version: optional, int
         If specified, load a specific version of the dataset.
+    filesystem: pa.fs.FileSystem
+        File system instance to read.
     """
-    # TODO: check the layout first.
-    if version:
-        pass
-    else:
-        # Backward compatible to lance format w/o versioning support.
-        fmt = LanceFileFormat()
-        dataset = ds.dataset(uri, format=fmt, **kwargs)
-        return _wrap_dataset(dataset)
+    if not filesystem:
+        filesystem, uri = pa.fs.FileSystem.from_uri(uri)
+
+    if version is None:
+        if (
+            filesystem.get_file_info(os.path.join(uri, "_latest.manifest")).type
+            == pa.fs.FileType.NotFound
+        ):
+            return _dataset_plain(uri, **kwargs)
+
+    # Read new one
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
@@ -72,7 +91,7 @@ def write_dataset(
     base_dir: Union[str, Path],
     mode: str = "create",
     filesystem: pa.fs.FileSystem = None,
-    **kwargs
+    **kwargs,
 ):
     """Write a dataset.
 
