@@ -1,13 +1,13 @@
 # distutils: language = c++
 
-from typing import Optional, Union, List, Dict
+from typing import Optional, List, Dict
 from pathlib import Path
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
-from libcpp.memory cimport const_pointer_cast, shared_ptr, static_pointer_cast
+from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
-from libc.stdint cimport uint64_t
+from libc.stdint cimport uint64_t, int64_t
 
 from pyarrow import Table
 from pyarrow._dataset cimport (
@@ -16,18 +16,14 @@ from pyarrow._dataset cimport (
     CScanner,
     Dataset,
     FileFormat,
-    FileFragment,
     FileWriteOptions,
-    Partitioning,
 )
 from pyarrow._dataset import Scanner, _forbid_instantiation
 from pyarrow._compute cimport Expression, _bind
 from pyarrow._fs cimport FileSystem
-from pyarrow.includes.common cimport *
-from pyarrow.includes.libarrow cimport COutputStream, CTable
+from pyarrow.includes.common cimport CStatus, CResult, vector, move
 from pyarrow.includes.libarrow_dataset cimport (
     CFileFormat,
-    CFileSystemDataset,
     CFileSystemDatasetWriteOptions,
 )
 from pyarrow.includes.libarrow_fs cimport CFileSystem
@@ -35,12 +31,9 @@ from pyarrow.lib cimport (
     CExpression,
     GetResultValue,
     RecordBatchReader,
-    Schema,
     check_status,
-    get_writer,
-    pyarrow_unwrap_table,
 )
-from pyarrow.lib import frombytes, tobytes
+from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
 
 cdef Expression _true = Expression._scalar(True)
