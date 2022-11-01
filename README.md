@@ -1,8 +1,8 @@
 <div align="center">
 <p align="center">
+ 
+ <img width="257" alt="Lance_Logo_Dark_Light" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-![lance_logo](https://user-images.githubusercontent.com/917119/198655673-2b46f2c5-8d76-4863-8816-bf28370157bf.svg)
-  
 **Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
 
 ```sql
@@ -15,10 +15,7 @@ SELECT predict(‘resnet’, image) FROM dataset
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
-[![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
-[![Discord](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
-[![Downloads](https://pepy.tech/badge/pylance/month)](https://pepy.tech/project/pylance)
 
 </p>
 </div>
