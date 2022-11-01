@@ -24,7 +24,13 @@ from . import version
 
 __version__ = version.__version__
 
-from lance.lib import LanceFileFormat, WriteTable, _lance_dataset_write, _wrap_dataset
+from lance.lib import (
+    LanceFileFormat,
+    WriteTable,
+    _lance_dataset_write,
+    _wrap_dataset,
+    _lance_dataset_make,
+)
 from lance.types import register_extension_types
 
 __all__ = ["dataset", "write_table", "write_dataset", "LanceFileFormat", "__version__"]
@@ -68,7 +74,12 @@ def dataset(
         ):
             return _dataset_plain(uri, **kwargs)
 
-    # Read new one
+    # Read the versioned dataset layout.
+    has_version = True
+    if version is None:
+        has_version = False
+        version = 0
+    return _lance_dataset_make(filesystem, uri, has_version, version)
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):

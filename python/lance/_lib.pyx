@@ -5,8 +5,9 @@ from pathlib import Path
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
-from libcpp.memory cimport const_pointer_cast, shared_ptr
+from libcpp.memory cimport const_pointer_cast, shared_ptr, static_pointer_cast
 from libcpp.string cimport string
+from libc.stdint cimport uint64_t
 
 from pyarrow import Table
 from pyarrow._dataset cimport (
@@ -29,6 +30,7 @@ from pyarrow.includes.libarrow_dataset cimport (
     CFileSystemDataset,
     CFileSystemDatasetWriteOptions,
 )
+from pyarrow.includes.libarrow_fs cimport CFileSystem
 from pyarrow.lib cimport (
     CExpression,
     GetResultValue,
@@ -40,7 +42,6 @@ from pyarrow.lib cimport (
 )
 from pyarrow.lib import frombytes, tobytes
 from pyarrow.util import _stringify_path
-
 
 cdef Expression _true = Expression._scalar(True)
 
@@ -82,9 +83,9 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
 
 cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
     CStatus CWriteTable "::lance::arrow::WriteTable"(
-        const CTable& table,
-        shared_ptr[COutputStream] sink,
-        CLanceFileWriteOptions options)
+            const CTable& table,
+            shared_ptr[COutputStream] sink,
+            CLanceFileWriteOptions options)
 
 
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
@@ -97,12 +98,12 @@ cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CScanner]] Finish()
 
 def BuildScanner(
-    dataset: Dataset,
-    columns: Optional[list[str]] = None,
-    filter: Optional[Expression] = None,
-    batch_size: Optional[int] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
+        dataset: Dataset,
+        columns: Optional[list[str]] = None,
+        filter: Optional[Expression] = None,
+        batch_size: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
 ):
     cdef shared_ptr[CDataset] cdataset = dataset.unwrap()
     cdef shared_ptr[LScannerBuilder] builder = shared_ptr[LScannerBuilder](
@@ -314,11 +315,18 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
             APPEND "::lance::arrow::LanceDataset::WriteMode::kAppend"
             OVERWRITE "::lance::arrow::LanceDataset::WriteMode::kOverwrite"
 
-        @staticmethod
+        @ staticmethod
         CStatus Write(
                 const CFileSystemDatasetWriteOptions& write_options,
                 shared_ptr[CDataset] dataset,
                 WriteMode mode)
+
+        @ staticmethod
+        CResult[shared_ptr[CLanceDataset]] Make(
+                const shared_ptr[CFileSystem]& fs,
+                const string& base_uri,
+                optional[uint64_t] version,
+        )
 
 
 
@@ -331,12 +339,15 @@ cdef class LanceDataset(Dataset):
     def __init__(self):
         _forbid_instantiation(self.__class__)
 
+    cdef void init(self, const shared_ptr[CDataset]& sp):
+        Dataset.init(self, sp)
+        self.lance_dataset = <CLanceDataset *> sp.get()
+
     @staticmethod
     cdef wrap(const shared_ptr[CDataset]& sp):
-        # cdef Dataset ds = FileSystemDataset.__new__(FileSystemDataset)
-        # ds.init(sp)
-        # return ds
-        return None
+        cdef LanceDataset ds = LanceDataset.__new__(LanceDataset)
+        ds.init(sp)
+        return ds
 
     def head(self, n: int, offset: int = 0) -> Table:
         scanner = self.scanner(limit=n, offset=offset)
@@ -387,3 +398,24 @@ def _lance_dataset_write(
 
     with nogil:
         check_status(CLanceDataset.Write(c_options, c_dataset, c_mode))
+
+def _lance_dataset_make(
+        FileSystem filesystem not None,
+        object base_uri not None,
+        bool has_version,
+        uint64_t version
+):
+    cdef:
+        shared_ptr[CLanceDataset] c_dataset
+        shared_ptr[CDataset] c_base_dataset
+        shared_ptr[CFileSystem] c_filesystem
+        optional[uint64_t] c_version
+
+    c_filesystem = filesystem.unwrap()
+    base_dir = tobytes(_stringify_path(base_uri))
+    if has_version:
+        c_version = optional[uint64_t](version)
+
+    c_dataset = GetResultValue(CLanceDataset.Make(c_filesystem, base_dir, c_version))
+    c_base_dataset = static_pointer_cast[CDataset, CLanceDataset](c_dataset)
+    return LanceDataset.wrap(move(c_base_dataset))
