@@ -21,8 +21,8 @@
 
 namespace lance::duckdb::ml {
 
-ModelEntry::ModelEntry(std::string name, std::string uri)
-    : name_(std::move(name)), uri_(std::move(uri)) {}
+ModelEntry::ModelEntry(std::string name, std::string uri, std::string device)
+    : name_(std::move(name)), uri_(std::move(uri)), device_(std::move(device)) {}
 
 std::unique_ptr<ModelCatalog> ModelCatalog::catalog_;
 std::mutex ModelCatalog::mutex_;
@@ -37,11 +37,12 @@ ModelCatalog* ModelCatalog::Get() {
   return catalog_.get();
 }
 
-bool ModelCatalog::Load(const std::string& name, const std::string& uri) {
-  if (models_.contains(name)) {
+bool ModelCatalog::Load(const std::string& name, const std::string& uri, const std::string& device) {
+  // nvcc doesn't support C++20 yet so can't use std::map::contains()
+  if (models_.find(name) != models_.end()) {
     return false;
   }
-  auto entry = PyTorchModelEntry::Make(name, uri);
+  auto entry = PyTorchModelEntry::Make(name, uri, device);
   models_.emplace(name, std::move(entry));
   return true;
 }

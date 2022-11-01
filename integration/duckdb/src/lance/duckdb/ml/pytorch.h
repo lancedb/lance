@@ -20,6 +20,7 @@
 #include <duckdb/parser/parsed_data/create_function_info.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 #include <memory>
+#include <opencv2/opencv.hpp>
 #include <vector>
 
 #include "lance/duckdb/ml/catalog.h"
@@ -29,7 +30,7 @@ namespace lance::duckdb::ml {
 /// PyTorch / TorchScript model entry
 class PyTorchModelEntry : ModelEntry {
  public:
-  static std::unique_ptr<ModelEntry> Make(const std::string &name, const std::string &uri);
+  static std::unique_ptr<ModelEntry> Make(const std::string &name, const std::string &uri, const std::string &device);
 
   std::string type() const override { return "torchscript"; }
 
@@ -38,10 +39,13 @@ class PyTorchModelEntry : ModelEntry {
                ::duckdb::Vector &result) override;
 
  private:
-  PyTorchModelEntry(std::string name, std::string uri, torch::jit::script::Module module)
-      : ModelEntry(name, uri), module_(std::move(module)) {
+  PyTorchModelEntry(std::string name, std::string uri, std::string device,
+                    torch::jit::script::Module module)
+      : ModelEntry(name, uri, device), module_(std::move(module)) {
     module_.eval();
   }
+
+  torch::Tensor MatToTensor(const cv::Mat& fmat);
 
   std::string name_;
   std::string uri_;

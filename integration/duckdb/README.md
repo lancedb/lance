@@ -1,6 +1,6 @@
 # Lance DuckDB Extension
 
-*Linux and macOS only for now*.
+*Linux and Mac only for now*. Windows support forthcoming
 
 Lance DuckDB extension allows user to run Machine Learning tasks via DuckDB + Lance.
 
@@ -20,8 +20,10 @@ Machine Learning functions
 | `predict(model, blob)`            | Run model inference over image |
 | `ml_models()`                     | Show all ML models             |
 
+Currently the Lance duckdb extension is compiled against pytorch 1.13
+
 ```sql
-CALL create_pytorch_model('resnet', './resnet.pth')
+CALL create_pytorch_model('resnet', './resnet.pth', 'cpu')
 SELECT * FROM ml_models();
 // Run inference
 SELECT predict('resnet', image) as pred FROM images
@@ -43,9 +45,17 @@ To build the extension, run:
 make release-linux
 ```
 
+If you want to use GPU-enabled models, run:
+
+```shell
+make release-cuda
+```
+
+
 Load extension in Python
+
 ```python
 import duckdb
-duckdb.install_extension("./path/to/lance.duckdb_extension")
+duckdb.install_extension("./path/to/lance.duckdb_extension", force_install=True)
 duckdb.load_extension("lance")
 ```
