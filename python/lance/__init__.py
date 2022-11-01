@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Union
+from typing import Union, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -31,7 +31,7 @@ __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"
 register_extension_types()
 
 
-def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
+def dataset(uri: str, version: Optional[int] = None, **kwargs) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
@@ -39,10 +39,17 @@ def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
     ----------
     uri: str
         The uri to the lance data
+    version: optional, int
+        If specified, load a specific version of the dataset.
     """
-    fmt = LanceFileFormat()
-    dataset = ds.dataset(uri, format=fmt, **kwargs)
-    return _wrap_dataset(dataset)
+    # TODO: check the layout first.
+    if version:
+        pass
+    else:
+        # Backward compatible to lance format w/o versioning support.
+        fmt = LanceFileFormat()
+        dataset = ds.dataset(uri, format=fmt, **kwargs)
+        return _wrap_dataset(dataset)
 
 
 def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
@@ -58,3 +65,10 @@ def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int 
         Set the batch size to write to disk.
     """
     WriteTable(table, destination, batch_size=batch_size)
+
+
+def write_dataset(data: Union[pa.Table, pa.dataset.Dataset], base: Union[str, Path], mode: str = "create", **kwargs):
+    """Write a dataset.
+    """
+
+    pass

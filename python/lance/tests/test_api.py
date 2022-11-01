@@ -16,6 +16,8 @@
 from pathlib import Path
 
 import pandas as pd
+
+import lance
 import pyarrow as pa
 import pyarrow.dataset as ds
 
@@ -97,4 +99,13 @@ def test_limit_cross_files(tmp_path: Path):
     actual = dataset(tmp_path / "test.lance")
     t = actual.scanner(columns=["a"], limit=10).to_table()
     assert (len(t) == 10)
+
+
+def test_write_versioned_dataset(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    lance.write_dataset(table, tmp_path)
+
+    assert (tmp_path / "data").exists()
+    assert (tmp_path / "_latest.manifest").exists()
+    assert (tmp_path / "_versions/1.manifest").exists()
 
