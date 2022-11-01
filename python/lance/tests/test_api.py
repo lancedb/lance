@@ -103,9 +103,10 @@ def test_limit_cross_files(tmp_path: Path):
 
 def test_write_versioned_dataset(tmp_path: Path):
     table = pa.Table.from_pylist([{"a": 1, "b": 2}])
-    lance.write_dataset(table, tmp_path)
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
 
-    assert (tmp_path / "data").exists()
-    assert (tmp_path / "_latest.manifest").exists()
-    assert (tmp_path / "_versions/1.manifest").exists()
+    assert (base_dir / "data").exists()
+    assert (base_dir / "_latest.manifest").exists()
+    assert (base_dir / "_versions/1.manifest").exists()
 

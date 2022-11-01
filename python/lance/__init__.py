@@ -23,7 +23,7 @@ from . import version
 
 __version__ = version.__version__
 
-from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset
+from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset, _lance_dataset_write
 from lance.types import register_extension_types
 
 __all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
@@ -67,8 +67,28 @@ def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int 
     WriteTable(table, destination, batch_size=batch_size)
 
 
-def write_dataset(data: Union[pa.Table, pa.dataset.Dataset], base: Union[str, Path], mode: str = "create", **kwargs):
+def write_dataset(
+        data: Union[pa.Table, pa.dataset.Dataset],
+        base_dir: Union[str, Path],
+        mode: str = "create",
+        filesystem: pa.fs.FileSystem = None, **kwargs):
     """Write a dataset.
-    """
 
-    pass
+    Parameters
+    ----------
+    data : pa.Table or pa.dataset.Dataset
+        The data to write.
+    base_dir : str or Path
+        The root directory to write dataset to.
+    mode : str, 'create' | 'append' | 'overwrite'
+        Write mode.
+    filesystem : pa.fs.FileSystem, optional
+        The filesystem to write the dataset
+    """
+    from pyarrow.fs import _resolve_filesystem_and_path
+    if isinstance(data, pa.Table):
+        data = pa.dataset.InMemoryDataset(data)
+
+    filesystem, base_dir = _resolve_filesystem_and_path(base_dir, filesystem)
+
+    _lance_dataset_write(data, base_dir, filesystem, mode)
