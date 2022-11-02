@@ -224,12 +224,26 @@ def _lance_dataset_write(
         Dataset data,
         object base_dir not None,
         FileSystem filesystem not None,
-        str mode not None
+        str mode not None,
+        int max_rows_per_file,
+        int min_rows_per_group,
+        int max_rows_per_group,
 ):
     """Wraps 'LanceDataset::Write'.
 
     Parameters
     ----------
+    data : pyarrow.dataset.Dataset
+        Dataset to write.
+    base_dir : str or Path
+        The directory to write dataset to.
+    filesystem : pyarrow.fs.FileSystem
+        Pyarrow File System instance to write dataset.
+    mode : str
+        Write mode, can be "create", "append" or "overwrite".
+    max_rows_per_file : int
+    min_rows_per_group : int
+    max_rows_per_group : int
     """
 
     cdef:
@@ -248,10 +262,15 @@ def _lance_dataset_write(
     c_options.filesystem = filesystem.unwrap()
     c_options.file_write_options = write_options.unwrap()
     c_options.create_dir = True
+    if max_rows_per_file > 0:
+        c_options.max_rows_per_file = max_rows_per_file
+    if min_rows_per_group > 0:
+        c_options.min_rows_per_group = min_rows_per_group
+    c_options.max_rows_per_group = max_rows_per_group
 
-    if mode == "create":
-        c_mode = CLanceDataset.WriteMode.CREATE
-    elif mode == "append":
+    # Default value
+    c_mode = CLanceDataset.WriteMode.CREATE
+    if mode == "append":
         c_mode = CLanceDataset.WriteMode.APPEND
     elif mode == "overwrite":
         c_mode = CLanceDataset.WriteMode.OVERWRITE
