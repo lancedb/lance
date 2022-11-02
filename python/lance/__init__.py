@@ -121,6 +121,11 @@ def write_dataset(
     """
     from pyarrow.fs import _resolve_filesystem_and_path
 
+    if 0 < max_rows_per_file < max_rows_per_group:
+        raise ValueError(
+            "Max rows per file must be larger or equal to max_rows_per_group"
+        )
+
     if isinstance(data, pa.Table):
         data = pa.dataset.InMemoryDataset(data)
 
