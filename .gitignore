@@ -44,7 +44,7 @@ cmake-build-*
 .vscode
 .DS_Store
 
-python/lance/_lib.cpp
+python/lance/_*.cpp
 
 
 *.parquet
@@ -65,6 +65,7 @@ docs/notebooks
 
 
 integration/duckdb/manylinux-build
+integration/duckdb/cuda-build
 python/notebooks/lance.duckdb_extension
 
 wheelhouse

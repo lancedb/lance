@@ -27,6 +27,17 @@
 
 namespace lance::arrow {
 
+/// Dataset Version
+///
+class DatasetVersion {
+ public:
+  explicit DatasetVersion(uint64_t version);
+
+  uint64_t version() const;
+
+ private:
+  uint64_t version_;
+};
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///
@@ -47,7 +58,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   ~LanceDataset() override;
 
-  /// Write a in-memory Arrow dataset to disk.
+  /// Write Arrow dataset to disk.
   ///
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
@@ -57,6 +68,18 @@ class LanceDataset : public ::arrow::dataset::Dataset {
                                std::shared_ptr<::arrow::dataset::Scanner> scanner,
                                WriteMode mode = kCreate);
 
+  /// Write Arrow dataset to disk.
+  ///
+  /// \param options Arrow Dataset Write Options.
+  /// \param scanner the source dataset to be written.
+  /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  ///
+  /// GH-62. To accommodate Cython lacking of arrow Scanner interface, we directly write
+  /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
+  static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
+                               const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
+                               WriteMode mode = kCreate);
+
   /// Load dataset, with a specific version.
   ///
   /// \param fs File system object
@@ -64,9 +87,15 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param version optional version to load. If not presented, load the latest version.
   /// \return A specific version of the dataset. Or return nullptr if the dataset does not exist.
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
-      std::shared_ptr<::arrow::fs::FileSystem> fs,
-      std::string base_uri,
+      const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+      const std::string& base_uri,
       std::optional<uint64_t> version = std::nullopt);
+
+  /// Get all the dataset version.
+  ::arrow::Result<std::vector<DatasetVersion>> versions() const;
+
+  /// Get the latest version of the dataset
+  ::arrow::Result<DatasetVersion> latest_version() const;
 
   std::string type_name() const override { return "lance"; }
 

@@ -21,6 +21,8 @@
 #include <memory>
 #include <opencv2/opencv.hpp>
 #include <string>
+#include <optional>
+
 
 namespace lance::duckdb::ml {
 
@@ -55,54 +57,76 @@ torch::Tensor ToTensor(const cv::Mat& image) {
 }
 
 std::unique_ptr<ModelEntry> PyTorchModelEntry::Make(const std::string& name,
-                                                    const std::string& uri) {
+                                                    const std::string& uri,
+                                                    const std::string& device) {
   // Let's just support local model for now
   torch::jit::script::Module module;
   try {
     module = torch::jit::load(uri);
+    if (device == "cuda") {
+      module.to(at::kCUDA);
+    } else if (device == "cpu") {
+      module.to(at::kCPU);
+    }
   } catch (const c10::Error& e) {
     throw ::duckdb::IOException("Error loading the model: " + e.msg());
   }
-  return std::unique_ptr<ModelEntry>(new PyTorchModelEntry{name, uri, module});
+  return std::unique_ptr<ModelEntry>(new PyTorchModelEntry{name, uri, device, module});
 }
 
+/// Create an opencv image matrix from the image bytes in the duckdb value (also do BGR=>RGB)
+std::optional<cv::Mat> ReadImageFromDuckDBValue(::duckdb::Value image_bytes) {
+  auto img_bytes = ::duckdb::StringValue::Get(image_bytes);
+  cv::Mat1b buf(img_bytes.size(), 1, (unsigned char*)(img_bytes.data()));
+  auto mat = cv::imdecode(buf, cv::IMREAD_UNCHANGED);
+  if (mat.data == nullptr) {
+    std::cerr << "Failed to parse image: image size=" << img_bytes.size()
+              << " buf=" << buf.size().width << "\n";
+    return std::nullopt;
+  }
+  cv::Mat rgb_mat;
+  cv::cvtColor(mat, rgb_mat, cv::COLOR_BGR2RGB);
+  // Convert to float matrix.
+  cv::Mat fmat;
+  rgb_mat.convertTo(fmat, cv::DataType<float>::type);
+  return fmat;
+}
+
+/// Convert the input image to torch::Tensor and run it through the model (on the model's target device)
+torch::Tensor PyTorchModelEntry::MatToTensor(const cv::Mat& fmat) {
+  auto input_tensor = ToTensor(fmat);
+  input_tensor = normalize(input_tensor);
+  if (device_ == "cuda") {
+    input_tensor = input_tensor.to(at::kCUDA);
+  } else if (device_ == "cpu") {
+    input_tensor = input_tensor.to(at::kCPU);
+  }
+  return input_tensor;
+}
+
+/// Read the images from input data, run model inference, and return probabilities
 void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
                                 ::duckdb::ExpressionState& state,
                                 ::duckdb::Vector& result) {
   result.SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
   for (int i = 0; i < args.size(); i++) {
-    auto img_bytes = ::duckdb::StringValue::Get(args.data[1].GetValue(i));
-    cv::Mat1b buf(img_bytes.size(), 1, (unsigned char*)(img_bytes.data()));
-    auto mat = cv::imdecode(buf, cv::IMREAD_UNCHANGED);
-    if (mat.data == nullptr) {
-      std::cerr << "Failed to parse image: image size=" << img_bytes.size()
-                << " buf=" << buf.size().width << "\n";
-      continue;
+    auto fmat = ReadImageFromDuckDBValue(args.data[1].GetValue(i));
+    if (fmat.has_value()) {
+      auto input_tensor = MatToTensor(fmat.value());
+      // TODO: support batch mode
+      auto output = module_.forward({ input_tensor }).toTensor();
+      // OMG this copying is painfully slow.
+      std::vector<::duckdb::Value> values;
+      auto softmax = output[0].softmax(0).to(at::kCPU);
+      for (int i = 0; i < softmax.size(0); i++) {
+        values.emplace_back(::duckdb::Value::FLOAT(*softmax[i].data_ptr<float>()));
+      }
+      result.SetValue(i, ::duckdb::Value::LIST(values));
     }
-    cv::Mat rgb_mat;
-    cv::cvtColor(mat, rgb_mat, cv::COLOR_BGR2RGB);
-    // Convert to float matrix.
-    cv::Mat fmat;
-    rgb_mat.convertTo(fmat, cv::DataType<float>::type);
-
-    // TODO: support batch mode
-    auto input_tensor = ToTensor(fmat);
-    input_tensor = normalize(input_tensor);
-
-    std::vector<torch::jit::IValue> inputs;
-    inputs.push_back(input_tensor);
-    auto output = module_.forward(inputs).toTensor();
-
-    // OMG this copying is painfully slow.
-    std::vector<::duckdb::Value> values;
-    auto softmax = output[0].softmax(0);
-    for (int i = 0; i < softmax.size(0); i++) {
-      values.emplace_back(::duckdb::Value::FLOAT(*softmax[i].data_ptr<float>()));
-    }
-    result.SetValue(i, ::duckdb::Value::LIST(values));
   }
 }
 
+/// The `predict('model', image_col)` function
 void Predict(::duckdb::DataChunk& args,
              ::duckdb::ExpressionState& state,
              ::duckdb::Vector& result) {

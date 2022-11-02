@@ -1,0 +1,11 @@
+# Docker-compose to bring up a test cluster.
+version: "3.9"
+services:
+  cuda:
+    build:
+      context: ..
+      dockerfile: cuda/Dockerfile
+      target: builder
+    working_dir: /code
+    volumes:
+      - ../:/code

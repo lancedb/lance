@@ -5,7 +5,6 @@ if(POLICY CMP0135)
 endif()
 
 project(lance_duckdb CXX)
-
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
 
 set(OS_ARCH "amd64")
@@ -66,17 +65,26 @@ if(LANCE_BUILD_PYTORCH)
       set(torch_SOURCE_DIR ${CMAKE_BINARY_DIR}/thirdparty/torch/)
     endif()
   else()
-    FetchContent_Declare(
-      Torch
-      URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.12.1%2Bcpu.zip
-    )
+    if(LANCE_BUILD_CUDA)
+      FetchContent_Declare(
+        Torch
+        URL https://download.pytorch.org/libtorch/cu117/libtorch-cxx11-abi-shared-with-deps-1.13.0%2Bcu117.zip
+      )
+      enable_language(CUDA)
+      find_package(CUDAToolkit)
+    else()
+      FetchContent_Declare(
+        Torch
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-cxx11-abi-shared-with-deps-1.13.0%2Bcpu.zip
+      )
+    endif()
     list(APPEND available_contents Torch)
   endif()
 endif()
 
 FetchContent_MakeAvailable(${available_contents})
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include_directories(${duckdb_SOURCE_DIR}/src/include)
@@ -97,18 +105,29 @@ if(LANCE_BUILD_PYTORCH)
 endif()
 
 include_directories(src)
-set(LANCE_EXT_SOURCES
+
+set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
     src/lance/duckdb/list_functions.h
     src/lance/duckdb/vector_functions.cc
-    src/lance/duckdb/vector_functions.h
+    src/lance/duckdb/vector_functions.h)
+
+set(LANCE_EXT_SOURCE_ML
     src/lance/duckdb/ml/catalog.cc
     src/lance/duckdb/ml/catalog.h
     src/lance/duckdb/ml/pytorch.cc
     src/lance/duckdb/ml/pytorch.h
     src/lance/duckdb/ml/functions.cc
     src/lance/duckdb/ml/functions.h)
+
+if(LANCE_BUILD_PYTORCH)
+  set(LANCE_EXT_SOURCES
+      ${LANCE_EXT_SOURCE_COMMON}
+      ${LANCE_EXT_SOURCE_ML})
+else()
+  set(LANCE_EXT_SOURCES ${LANCE_EXT_SOURCE_COMMON})
+endif()
 
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
 if(APPLE)
@@ -118,4 +137,8 @@ endif()
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
                         opencv_imgcodecs)
+  if(LANCE_BUILD_CUDA)
+    set_target_properties(lance_loadable_extension PROPERTIES CUDA_ARCHITECTURES native)
+  endif()
 endif()
+

@@ -13,48 +13,100 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
+import os
 
 import pyarrow as pa
-import pyarrow.compute as pc
+import pyarrow.fs
 import pyarrow.dataset as ds
 
 from . import version
 
 __version__ = version.__version__
 
-from lance.lib import LanceFileFormat, WriteTable, _wrap_dataset
+from lance.lib import (
+    LanceFileFormat,
+    _lance_dataset_write,
+    _lance_dataset_make,
+)
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_table", "scanner", "LanceFileFormat", "__version__"]
+__all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__"]
 
 register_extension_types()
 
 
-def dataset(uri: str, **kwargs) -> ds.FileSystemDataset:
+def _dataset_plain(uri: str, **kwargs) -> ds.FileSystemDataset:
+    return ds.dataset(uri, format=LanceFileFormat(), **kwargs)
+
+
+def dataset(
+    uri: Union[str, Path],
+    version: Optional[int] = None,
+    filesystem: Optional[pa.fs.FileSystem] = None,
+    **kwargs,
+) -> ds.FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
+
+    It supports to read both versioned dataset, and plain (legacy) dataset.
 
     Parameters
     ----------
     uri: str
         The uri to the lance data
+    version: optional, int
+        If specified, load a specific version of the dataset.
+    filesystem: pa.fs.FileSystem
+        File system instance to read.
+
+    Other Parameters
+    ----------------
+
     """
-    fmt = LanceFileFormat()
-    dataset = ds.dataset(uri, format=fmt, **kwargs)
-    return _wrap_dataset(dataset)
+    if not filesystem:
+        filesystem, uri = pa.fs.FileSystem.from_uri(uri)
+
+    if version is None:
+        if (
+            filesystem.get_file_info(os.path.join(uri, "_latest.manifest")).type
+            == pa.fs.FileType.NotFound
+        ):
+            return _dataset_plain(uri, filesystem=filesystem, **kwargs)
+
+    # Read the versioned dataset layout.
+    has_version = True
+    if version is None:
+        has_version = False
+        version = 0
+    return _lance_dataset_make(filesystem, uri, has_version, version)
 
 
-def write_table(table: pa.Table, destination: Union[str, Path], batch_size: int = 1024):
-    """Write an Arrow Table into the destination.
+def write_dataset(
+    data: Union[pa.Table, pa.dataset.Dataset],
+    base_dir: Union[str, Path],
+    mode: str = "create",
+    filesystem: pa.fs.FileSystem = None,
+    **kwargs,
+):
+    """Write a dataset.
 
     Parameters
     ----------
-    table : pa.Table
-        Apache Arrow Table
-    destination : str or `Path`
-        The destination to write dataset to.
-    batch_size : int, optional
-        Set the batch size to write to disk.
+    data : pa.Table or pa.dataset.Dataset
+        The data to write.
+    base_dir : str or Path
+        The root directory to write dataset to.
+    mode : str, 'create' | 'append' | 'overwrite'
+        Write mode.
+    filesystem : pa.fs.FileSystem, optional
+        The filesystem to write the dataset
     """
-    WriteTable(table, destination, batch_size=batch_size)
+    from pyarrow.fs import _resolve_filesystem_and_path
+
+    if isinstance(data, pa.Table):
+        data = pa.dataset.InMemoryDataset(data)
+
+    filesystem, base_dir = _resolve_filesystem_and_path(base_dir, filesystem)
+
+    _lance_dataset_write(data, base_dir, filesystem, mode)

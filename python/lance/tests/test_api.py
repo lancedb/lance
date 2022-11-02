@@ -16,17 +16,19 @@
 from pathlib import Path
 
 import pandas as pd
+
+import lance
 import pyarrow as pa
 import pyarrow.dataset as ds
 
-from lance import LanceFileFormat, dataset, write_table
+from lance import LanceFileFormat, dataset
 
 
 def test_simple_round_trips(tmp_path: Path):
     table = pa.Table.from_pandas(
         pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]})
     )
-    write_table(table, tmp_path / "test.lance")
+    pa.dataset.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
 
     assert (tmp_path / "test.lance").exists()
 
@@ -40,7 +42,7 @@ def test_head(tmp_path: Path):
     table = pa.Table.from_pandas(
         pd.DataFrame({"label": [123, 456, 789], "values": [22, 33, 2.24]})
     )
-    write_table(table, tmp_path / "test.lance")
+    pa.dataset.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
     ds = dataset(str(tmp_path / "test.lance"))
     actual = ds.head(2)
     assert table[:2] == actual
@@ -50,7 +52,7 @@ def test_write_categorical_values(tmp_path: Path):
     df = pd.DataFrame({"label": ["cat", "cat", "dog", "person"]})
     df["label"] = df["label"].astype("category")
     table = pa.Table.from_pandas(df)
-    write_table(table, tmp_path / "test.lance")
+    ds.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
 
     assert (tmp_path / "test.lance").exists()
 
@@ -80,7 +82,9 @@ def test_write_dataset(tmp_path: Path):
 
 
 def test_write_dataset_with_metadata(tmp_path: Path):
-    table = pa.Table.from_pylist([{"a": 1}, {"a": 2}], metadata={"k1": "v1", "k2": "v2"})
+    table = pa.Table.from_pylist(
+        [{"a": 1}, {"a": 2}], metadata={"k1": "v1", "k2": "v2"}
+    )
     ds.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
 
     actual = dataset(str(tmp_path / "test.lance")).to_table()
@@ -89,12 +93,22 @@ def test_write_dataset_with_metadata(tmp_path: Path):
     assert schema.metadata[b"k2"] == b"v2"
 
 
-def test_limit_cross_files(tmp_path: Path):
-    table = pa.Table.from_pylist([{"a": i, "b": i * 2} for i in range(2000)])
-    ds.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat(),
-                     max_rows_per_group=200, max_rows_per_file=500)
+def test_write_versioned_dataset(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
 
-    actual = dataset(tmp_path / "test.lance")
-    t = actual.scanner(columns=["a"], limit=10).to_table()
-    assert (len(t) == 10)
+    assert (base_dir / "data").exists()
+    assert (base_dir / "_latest.manifest").exists()
+    assert (base_dir / "_versions/1.manifest").exists()
 
+    table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
+    lance.write_dataset(table2, base_dir, mode="append")
+    assert (base_dir / "_versions/2.manifest").exists()
+
+    dataset = lance.dataset(base_dir, version=1)
+    assert table1 == dataset.to_table()
+
+    dataset = lance.dataset(base_dir)  # Latest
+    full_table = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 100, "b": 200}])
+    assert full_table == dataset.to_table()
