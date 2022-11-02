@@ -165,6 +165,13 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 
         CResult[CDatasetVersion] latest_version() const;
 
+        CResult[vector[CDatasetVersion]] versions() const;
+
+
+cdef _dataset_version_to_json(CDatasetVersion cdv):
+    return {
+        "version": cdv.version(),
+    }
 
 cdef class FileSystemDataset(Dataset):
     """Lance Dataset.
@@ -194,15 +201,24 @@ cdef class FileSystemDataset(Dataset):
 
     def versions(self) -> List[Dict]:
         """Fetch all versions of this dataset."""
-        pass
+        cdef:
+            vector[CDatasetVersion] c_versions
+        c_versions = GetResultValue(self.lance_dataset.versions())
 
+        return [_dataset_version_to_json(cv) for cv in c_versions]
+
+    @property
     def version(self) -> Dict:
         """Get the current version of the dataset."""
-        pass
+        cdef:
+            CDatasetVersion c_version
+        c_version = self.lance_dataset.version()
+        return _dataset_version_to_json(c_version)
 
     def latest_version(self) -> Dict:
         """Get the latest version of the dataset."""
-        pass
+        c_version = GetResultValue(self.lance_dataset.latest_version())
+        return _dataset_version_to_json(c_version)
 
 def _lance_dataset_write(
         Dataset data,
