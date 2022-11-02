@@ -139,6 +139,9 @@ cdef class LanceFileFormat(FileFormat):
 
 
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
+    cdef cppclass CDatasetVersion "::lance::arrow::DatasetVersion":
+        uint64_t version() const;
+
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         enum WriteMode "WriteMode":
             CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
@@ -157,6 +160,10 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
                 const string& base_uri,
                 optional[uint64_t] version,
         )
+
+        CDatasetVersion version() const;
+
+        CResult[CDatasetVersion] latest_version() const;
 
 
 cdef class FileSystemDataset(Dataset):
@@ -187,6 +194,14 @@ cdef class FileSystemDataset(Dataset):
 
     def versions(self) -> List[Dict]:
         """Fetch all versions of this dataset."""
+        pass
+
+    def version(self) -> Dict:
+        """Get the current version of the dataset."""
+        pass
+
+    def latest_version(self) -> Dict:
+        """Get the latest version of the dataset."""
         pass
 
 def _lance_dataset_write(

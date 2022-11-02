@@ -250,6 +250,10 @@ LanceDataset::~LanceDataset() {}
   return manifest->GetDatasetVersion();
 }
 
+DatasetVersion LanceDataset::version() const {
+  return impl_->manifest->GetDatasetVersion();
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
     [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {
   return std::make_shared<LanceDataset>(*this);
