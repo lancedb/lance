@@ -1,4 +1,4 @@
-name: Test datagen code
+name: Run benchmarks
 
 on:
   push:
