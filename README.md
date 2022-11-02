@@ -1,7 +1,7 @@
 <div align="center">
 <p align="center">
  
-<img width="257" alt="Lance_Logo_Dark_Light" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
+<img width="257" alt="Lance" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
 **Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
 
@@ -13,6 +13,10 @@
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+
+<br />
+
+![lance_splash](https://user-images.githubusercontent.com/917119/199364094-a7a23baa-6f6b-4f67-b66b-6bcebcd288de.png)
 
 </p>
 </div>
