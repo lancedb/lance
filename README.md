@@ -13,8 +13,6 @@
 ![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
 [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
-
-<br />
  
 <img width="600" alt="lance_splash_" src="https://user-images.githubusercontent.com/917119/199364478-b3f1e3cc-6462-4550-b55f-20a49158e82c.png">
 
