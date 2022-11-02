@@ -19,6 +19,7 @@ import numpy as np
 import pyarrow as pa
 
 import lance
+from lance import LanceFileFormat
 from lance.types import (
     Box2dArray,
     Box2dType,
@@ -41,11 +42,11 @@ def test_image(tmp_path):
     data = [f"s3://bucket/{x}.jpg" for x in ["a", "b", "c"]]
     storage = pa.StringArray.from_pandas(data)
     dtype, arr = _test_image(tmp_path, storage)
-    tbl = pa.Table.from_arrays([arr], names=['img'])
+    tbl = pa.Table.from_arrays([arr], names=["img"])
     df = tbl.to_pandas()
     assert df.img.dtype == dtype.to_pandas_dtype()
     tbl_rt = pa.Table.from_pandas(df)
-    assert tbl_rt['img'].type == dtype
+    assert tbl_rt["img"].type == dtype
 
 
 def test_image_binary(tmp_path):
@@ -198,7 +199,8 @@ def test_label(tmp_path):
 def _test_extension_rt(tmp_path, ext_type, storage_arr):
     arr = pa.ExtensionArray.from_storage(ext_type, storage_arr)
     table = pa.Table.from_arrays([arr], names=["ext"])
-    lance.write_table(table, str(tmp_path / "test.lance"))
+    pa.dataset.write_dataset(table, tmp_path / "test.lance", format=LanceFileFormat())
+
     table = lance.dataset(str(tmp_path / "test.lance")).to_table()
     assert table["ext"].type == ext_type
     assert table["ext"].to_pylist() == arr.to_pylist()

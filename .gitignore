@@ -44,7 +44,7 @@ cmake-build-*
 .vscode
 .DS_Store
 
-python/lance/_lib.cpp
+python/lance/_*.cpp
 
 
 *.parquet

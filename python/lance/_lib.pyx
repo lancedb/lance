@@ -1,52 +1,40 @@
 # distutils: language = c++
 
-from typing import Optional, Union
+from typing import Optional, List, Dict
+from pathlib import Path
 
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
-from libcpp.memory cimport const_pointer_cast, shared_ptr
+from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
-
-from pathlib import Path
+from libc.stdint cimport uint64_t, int64_t
 
 from pyarrow import Table
-
 from pyarrow._dataset cimport (
     CDataset,
     CFileWriteOptions,
     CScanner,
     Dataset,
     FileFormat,
-    FileFragment,
     FileWriteOptions,
-    Partitioning,
 )
-
 from pyarrow._dataset import Scanner, _forbid_instantiation
-
 from pyarrow._compute cimport Expression, _bind
 from pyarrow._fs cimport FileSystem
-from pyarrow.includes.common cimport *
-from pyarrow.includes.libarrow cimport COutputStream, CTable
+from pyarrow.includes.common cimport CStatus, CResult, vector, move
 from pyarrow.includes.libarrow_dataset cimport (
     CFileFormat,
-    CFileFragment,
-    CFileSystem,
-    CFileSystemDataset,
-    CFragment,
+    CFileSystemDatasetWriteOptions,
 )
+from pyarrow.includes.libarrow_fs cimport CFileSystem
 from pyarrow.lib cimport (
     CExpression,
     GetResultValue,
     RecordBatchReader,
-    Schema,
     check_status,
-    get_writer,
-    pyarrow_unwrap_table,
 )
-
-from pyarrow.lib import frombytes, tobytes
-
+from pyarrow.lib import tobytes
+from pyarrow.util import _stringify_path
 
 cdef Expression _true = Expression._scalar(True)
 
@@ -86,13 +74,6 @@ cdef extern from "lance/arrow/file_lance.h" namespace "lance" nogil:
         int batch_size
 
 
-cdef extern from "lance/arrow/writer.h" namespace "lance::arrow" nogil:
-    CStatus CWriteTable "::lance::arrow::WriteTable"(
-        const CTable& table,
-        shared_ptr[COutputStream] sink,
-        CLanceFileWriteOptions options)
-
-
 cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
     cdef cppclass LScannerBuilder "::lance::arrow::ScannerBuilder":
         LScannerBuilder(shared_ptr[CDataset]) except +
@@ -103,12 +84,12 @@ cdef extern from "lance/arrow/scanner.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CScanner]] Finish()
 
 def BuildScanner(
-    dataset: Dataset,
-    columns: Optional[list[str]] = None,
-    filter: Optional[Expression] = None,
-    batch_size: Optional[int] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
+        dataset: Dataset,
+        columns: Optional[list[str]] = None,
+        filter: Optional[Expression] = None,
+        batch_size: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
 ):
     cdef shared_ptr[CDataset] cdataset = dataset.unwrap()
     cdef shared_ptr[LScannerBuilder] builder = shared_ptr[LScannerBuilder](
@@ -156,158 +137,114 @@ cdef class LanceFileFormat(FileFormat):
     def make_write_options(self):
         return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
 
-def WriteTable(table: Table,
-               sink: Union[str, Path],
-               batch_size: int):
-    arrow_table = pyarrow_unwrap_table(table)
-    cdef shared_ptr[COutputStream] out
-    get_writer(sink, &out)
 
-    cdef CLanceFileWriteOptions options = CLanceFileWriteOptions()
-    options.batch_size = batch_size
-    with nogil:
-        check_status(CWriteTable(deref(arrow_table), out, options))
+cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
+    cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
+        enum WriteMode "WriteMode":
+            CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
+            APPEND "::lance::arrow::LanceDataset::WriteMode::kAppend"
+            OVERWRITE "::lance::arrow::LanceDataset::WriteMode::kOverwrite"
+
+        @staticmethod
+        CStatus Write(
+                const CFileSystemDatasetWriteOptions& write_options,
+                shared_ptr[CDataset] dataset,
+                WriteMode mode)
+
+        @staticmethod
+        CResult[shared_ptr[CLanceDataset]] Make(
+                const shared_ptr[CFileSystem]& fs,
+                const string& base_uri,
+                optional[uint64_t] version,
+        )
+
 
 cdef class FileSystemDataset(Dataset):
+    """Lance Dataset.
     """
-    A Dataset of Lance fragments.
-
-    A LanceDataset is composed of one or more FileFragment.
-
-    Parameters
-    ----------
-    fragments : list[Fragments]
-        List of fragments to consume.
-    schema : Schema
-        The top-level schema of the Dataset.
-    filesystem : FileSystem
-        FileSystem of the fragments.
-    root_partition : Expression, optional
-        The top-level partition of the DataDataset.
-    """
-
     cdef:
-        CFileSystemDataset * filesystem_dataset
+        CLanceDataset * lance_dataset
 
     def __init__(self):
         _forbid_instantiation(self.__class__)
 
-    @property
-    def filesystem(self):
-        return FileSystem.wrap(self.filesystem_dataset.filesystem())
-
-    @property
-    def partitioning(self):
-        """
-        The partitioning of the Dataset source, if discovered.
-
-        If the FileSystemDataset is created using the ``dataset()`` factory
-        function with a partitioning specified, this will return the
-        finalized Partitioning object from the dataset discovery. In all
-        other cases, this returns None.
-        """
-        c_partitioning = self.filesystem_dataset.partitioning()
-        if c_partitioning.get() == nullptr:
-            return None
-        try:
-            return Partitioning.wrap(c_partitioning)
-        except TypeError:
-            # e.g. type_name "default"
-            return None
-
     cdef void init(self, const shared_ptr[CDataset]& sp):
         Dataset.init(self, sp)
-        self.filesystem_dataset = <CFileSystemDataset *> sp.get()
+        self.lance_dataset = <CLanceDataset *> sp.get()
 
     @staticmethod
     cdef wrap(const shared_ptr[CDataset]& sp):
-        cdef Dataset ds = FileSystemDataset.__new__(FileSystemDataset)
+        cdef FileSystemDataset ds = FileSystemDataset.__new__(FileSystemDataset)
         ds.init(sp)
         return ds
 
-    def __reduce__(self):
-        return FileSystemDataset, (
-            list(self.get_fragments()),
-            self.schema,
-            self.format,
-            self.filesystem,
-            self.partition_expression
-        )
-
-    @classmethod
-    def from_paths(cls, paths, schema=None, format=None,
-                   filesystem=None, partitions=None, root_partition=None):
-        """A Dataset created from a list of paths on a particular filesystem.
-
-        Parameters
-        ----------
-        paths : list of str
-            List of file paths to create the fragments from.
-        schema : Schema
-            The top-level schema of the DataDataset.
-        format : FileFormat
-            File format to create fragments from, currently only
-            ParquetFileFormat, IpcFileFormat, and CsvFileFormat are supported.
-        filesystem : FileSystem
-            The filesystem which files are from.
-        partitions : list[Expression], optional
-            Attach additional partition information for the file paths.
-        root_partition : Expression, optional
-            The top-level partition of the DataDataset.
-        """
-        cdef:
-            FileFragment fragment
-
-        if root_partition is None:
-            root_partition = _true
-
-        for arg, class_, name in [
-            (schema, Schema, 'schema'),
-            (format, FileFormat, 'format'),
-            (filesystem, FileSystem, 'filesystem'),
-            (root_partition, Expression, 'root_partition')
-        ]:
-            if not isinstance(arg, class_):
-                raise TypeError(
-                    "Argument '{0}' has incorrect type (expected {1}, "
-                    "got {2})".format(name, class_.__name__, type(arg))
-                )
-
-        partitions = partitions or [_true] * len(paths)
-
-        if len(paths) != len(partitions):
-            raise ValueError(
-                'The number of files resulting from paths_or_selector '
-                'must be equal to the number of partitions.'
-            )
-
-        fragments = [
-            format.make_fragment(path, filesystem, partitions[i])
-            for i, path in enumerate(paths)
-        ]
-        return FileSystemDataset(fragments, schema, format,
-                                 filesystem, root_partition)
-
-    @property
-    def files(self):
-        """List of the files"""
-        cdef vector[c_string] files = self.filesystem_dataset.files()
-        return [frombytes(f) for f in files]
-
-    @property
-    def format(self):
-        """The FileFormat of this source."""
-        cdef FileFormat format = LanceFileFormat.__new__(LanceFileFormat)
-        format.init(self.filesystem_dataset.format())
-        return format
-
-    def head(self, n: int, offset: int = 0) -> Table:
-        scanner = self.scanner(limit=n, offset=offset)
+    def head(self, n: int, offset: int = 0, **kwargs) -> Table:
+        scanner = self.scanner(limit=n, offset=offset, **kwargs)
         return scanner.to_table()
 
     def scanner(self, *args, **kwargs):
         return BuildScanner(self, *args, **kwargs)
 
-def _wrap_dataset(Dataset dataset not None):
-    cdef shared_ptr[CDataset] copy = dataset.unwrap()
-    return FileSystemDataset.wrap(move(copy))
+    def versions(self) -> List[Dict]:
+        """Fetch all versions of this dataset."""
+        pass
+
+def _lance_dataset_write(
+        Dataset data,
+        object base_dir not None,
+        FileSystem filesystem not None,
+        str mode not None
+):
+    """Wraps 'LanceDataset::Write'.
+
+    Parameters
+    ----------
+    """
+
+    cdef:
+        CFileSystemDatasetWriteOptions c_options
+        shared_ptr[CScanner] c_scanner
+        shared_ptr[CDataset] c_dataset
+        CLanceDataset.WriteMode c_mode
+        FileWriteOptions write_options
+
+    c_dataset = data.unwrap()
+
+    fmt = LanceFileFormat()
+    write_options = fmt.make_write_options()
+
+    c_options.base_dir = tobytes(_stringify_path(base_dir))
+    c_options.filesystem = filesystem.unwrap()
+    c_options.file_write_options = write_options.unwrap()
+    c_options.create_dir = True
+
+    if mode == "create":
+        c_mode = CLanceDataset.WriteMode.CREATE
+    elif mode == "append":
+        c_mode = CLanceDataset.WriteMode.APPEND
+    elif mode == "overwrite":
+        c_mode = CLanceDataset.WriteMode.OVERWRITE
+
+    with nogil:
+        check_status(CLanceDataset.Write(c_options, c_dataset, c_mode))
+
+def _lance_dataset_make(
+        FileSystem filesystem not None,
+        object base_uri not None,
+        bool has_version,
+        uint64_t version
+):
+    cdef:
+        shared_ptr[CLanceDataset] c_dataset
+        shared_ptr[CDataset] c_base_dataset
+        shared_ptr[CFileSystem] c_filesystem
+        optional[uint64_t] c_version
+
+    c_filesystem = filesystem.unwrap()
+    base_dir = tobytes(_stringify_path(base_uri))
+    if has_version:
+        c_version = optional[uint64_t](version)
+
+    c_dataset = GetResultValue(CLanceDataset.Make(c_filesystem, base_dir, c_version))
+    c_base_dataset = static_pointer_cast[CDataset, CLanceDataset](c_dataset)
+    return FileSystemDataset.wrap(move(c_base_dataset))
