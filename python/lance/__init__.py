@@ -28,6 +28,7 @@ from lance.lib import (
     LanceFileFormat,
     _lance_dataset_write,
     _lance_dataset_make,
+    FileSystemDataset,
 )
 from lance.types import register_extension_types
 
@@ -45,7 +46,7 @@ def dataset(
     version: Optional[int] = None,
     filesystem: Optional[pa.fs.FileSystem] = None,
     **kwargs,
-) -> ds.FileSystemDataset:
+) -> FileSystemDataset:
     """
     Create an Arrow Dataset from the given lance uri.
 
