@@ -25,9 +25,9 @@ Lance makes machine learning workflows with computer vision data easy (images, v
 
 * Use SQL to greatly simplify common operations on computer vision data, such as similarity search for data discovery, model inference and computing evaluation metrics.
 
-* Visualize, slice and drill-into computer vision datasets to inspect embeddings, labels/annotations and metrics.
+* (Coming soon) visualize, slice and drill-into computer vision datasets to inspect embeddings, labels/annotations and metrics.
 
-* Version, compare and diff computer vision datasets easily.
+* (Coming soon) version, compare and diff computer vision datasets easily.
 
 Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for use cases using computer vision data.
 
