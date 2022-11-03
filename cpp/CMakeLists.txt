@@ -109,14 +109,16 @@ if (APPLE)
     execute_process(COMMAND brew --prefix openssl@1.1 OUTPUT_VARIABLE OPENSSL_PREFIX)
     string(STRIP ${OPENSSL_PREFIX} OPENSSL_ROOT_DIR)
     find_package(Zstd REQUIRED)
-    list(APPEND CMAKE_MODULE_PATH
-            /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
-            /usr/local/opt/apache-arrow/lib/cmake/arrow)
+    execute_process(COMMAND brew --prefix apache-arrow OUTPUT_VARIABLE ARROW_PREFIX)
+    string(STRIP ${ARROW_PREFIX} ARROW_ROOT_DIR)
+    list(APPEND CMAKE_MODULE_PATH ${ARROW_ROOT_DIR}/lib/cmake/arrow)
+    set(ArrowDataset_DIR ${ARROW_ROOT_DIR}/lib/cmake/arrow)
+    set(Parquet_DIR ${ArrowDataset_DIR})
 endif (APPLE)
 
 find_package(Arrow REQUIRED)
-
 find_package(ArrowDataset REQUIRED)
+
 include_directories(include)
 include_directories(src)
 include_directories(${CMAKE_BINARY_DIR}/src)  # for format.pb.{h/cc}
