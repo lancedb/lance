@@ -205,7 +205,7 @@ TEST_CASE("GH-285: Write fixed size list") {
     CHECK(builder.Append().ok());
     CHECK(int_builder
               ->AppendValues(ranges::views::iota(i * 10, i * 10 + list_size) |
-                             ranges::to<std::vector<int>>)
+                             ranges::to<std::vector>)
               .ok());
   }
   auto arr = builder.Finish().ValueOrDie();
