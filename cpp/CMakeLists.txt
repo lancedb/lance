@@ -113,7 +113,7 @@ if (APPLE)
     string(STRIP ${ARROW_PREFIX} ARROW_ROOT_DIR)
     list(APPEND CMAKE_MODULE_PATH ${ARROW_ROOT_DIR}/lib/cmake/arrow)
     set(ArrowDataset_DIR ${ARROW_ROOT_DIR}/lib/cmake/arrow)
-    set(Parquet_DIR ${ARROW_ROOT_DIR}/lib/cmake/arrow)
+    set(Parquet_DIR ${ArrowDataset_DIR})
 endif (APPLE)
 
 find_package(Arrow REQUIRED)
