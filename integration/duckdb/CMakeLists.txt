@@ -4,6 +4,8 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
+add_compile_options(-mf16c) # opencv
+
 project(lance_duckdb CXX)
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
 
@@ -11,17 +13,12 @@ set(OS_ARCH "amd64")
 string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
 if(IS_ARM)
   set(OS_ARCH "arm64")
+  set(CMAKE_CXX_COMPILER_ID Clang) # DuckDB CMakeLists.txt does not allow static linking for AppleClang
 endif()
 
 include(FetchContent)
 
-if(APPLE)
-  set(EXTENSION_STATIC_BUILD
-      0
-      CACHE INTERNAL "Do not build static duckdb extension")
-else()
-  set(EXTENSION_STATIC_BUILD 1)
-endif()
+set(EXTENSION_STATIC_BUILD 1)
 
 set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
@@ -49,7 +46,7 @@ if(LANCE_BUILD_PYTORCH)
     if(OS_ARCH STREQUAL "amd64")
       FetchContent_Declare(
         Torch
-        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip)
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.13.0.zip)
       list(APPEND available_contents Torch)
     else()
       # Apple Silicon
@@ -130,9 +127,6 @@ else()
 endif()
 
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
-if(APPLE)
-  target_link_libraries(lance_loadable_extension duckdb)
-endif()
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
