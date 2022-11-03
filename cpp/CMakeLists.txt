@@ -61,8 +61,8 @@ FetchContent_Declare(range
         )
 list(APPEND available_contents range)
 
-set(UUID_BUILD_TESTS OFF)
-set(UUID_USING_CXX20_SPAN ON)
+set(UUID_BUILD_TESTS OFF CACHE INTERNAL "Do not build UUID unit test")
+set(UUID_USING_CXX20_SPAN ON CACHE INTERNAL "Use CXX-20 feature")
 FetchContent_Declare(uuid
         URL https://github.com/mariusbancila/stduuid/archive/refs/tags/v1.2.2.zip
         )
