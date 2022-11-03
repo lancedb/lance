@@ -195,7 +195,7 @@ TEST_CASE("Write fixed size list") {
   TestWriteFixedSizeArray(arr);
 }
 
-TEST_CASE("GH-Write chunked array of fixed size list") {
+TEST_CASE("GH-285: Write fixed size list") {
   auto list_size = 4;
   auto dtype = ::arrow::fixed_size_list(::arrow::int32(), list_size);
   auto int_builder = std::make_shared<::arrow::Int32Builder>();
