@@ -114,8 +114,9 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     std::shared_ptr<::arrow::Schema> schema,
     std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
     ::arrow::fs::FileLocator destination_locator) const {
+  auto lance_schema = std::make_shared<lance::format::Schema>(schema);
   return std::shared_ptr<::arrow::dataset::FileWriter>(
-      new io::FileWriter(schema, options, destination, destination_locator));
+      new io::FileWriter(lance_schema, options, destination, destination_locator));
 }
 
 std::shared_ptr<::arrow::dataset::FileWriteOptions> LanceFileFormat::DefaultWriteOptions() {

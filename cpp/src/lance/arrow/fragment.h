@@ -82,6 +82,22 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const;
 
+  /// Add column to dataset
+  ::arrow::Status AddColumn(std::shared_ptr<::arrow::Field> field);
+
+  /// Add column to the dataset.
+  ///
+  /// \param full_schema the schema containing all the fields, including the newly created ones.
+  /// \param new_schema the projected schema of the newly created columns.
+  /// \param column the data of the column.
+  /// \param pool memory pool
+  /// \return A new `LanceFragment` with the new column data.
+  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(
+      const std::shared_ptr<format::Schema>& full_schema,
+      const std::shared_ptr<format::Schema>& new_schema,
+      const std::shared_ptr<::arrow::ChunkedArray>& column,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 

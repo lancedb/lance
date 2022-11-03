@@ -93,6 +93,10 @@ class LanceDataset : public ::arrow::dataset::Dataset {
       const std::string& base_uri,
       std::optional<uint64_t> version = std::nullopt);
 
+  /// Add column
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Update(const std::string& column,
+                                                        ::arrow::compute::Expression value);
+
   /// Get all the dataset versions.
   ::arrow::Result<std::vector<DatasetVersion>> versions() const;
 

@@ -29,6 +29,7 @@
 
 using lance::arrow::ToArray;
 using lance::testing::MakeFragment;
+namespace fs = std::filesystem;
 
 TEST_CASE("Read fragment with one file") {
   auto arr = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
@@ -45,3 +46,33 @@ TEST_CASE("Read fragment with one file") {
   CHECK(batch->schema()->Equals(*t->schema()));
   CHECK(arr->Equals(batch->GetColumnByName("int")));
 }
+
+TEST_CASE("Test add column with an array") {
+  auto arr = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto t = arrow::Table::Make(::arrow::schema({::arrow::field("int", arr->type())}), {arr});
+  auto fragment = MakeFragment(t).ValueOrDie();
+
+  auto new_arr = ToArray({"1", "2", "3", "4", "5"}).ValueOrDie();
+  auto new_chunked_arr = std::make_shared<::arrow::ChunkedArray>(new_arr);
+  auto full_schema = std::make_shared<lance::format::Schema>(t->schema());
+  auto new_field = std::make_shared<lance::format::Field>(::arrow::field("str", ::arrow::utf8()));
+  full_schema->AddField(new_field);
+  auto new_schema = full_schema->Project({"str"}).ValueOrDie();
+  auto new_fragment = fragment->AddColumn(full_schema, new_schema, new_chunked_arr).ValueOrDie();
+
+  auto expected_table = arrow::Table::Make(full_schema->ToArrow(), {arr, new_arr});
+  auto scan_options = std::make_shared<::arrow::dataset::ScanOptions>();
+  scan_options->dataset_schema = expected_table->schema();
+  scan_options->projected_schema = expected_table->schema();
+
+  auto generator = new_fragment->ScanBatchesAsync(scan_options).ValueOrDie();
+  auto batch = generator().result().ValueOrDie();
+  INFO("Batch schema: " << batch->schema()->ToString()
+                        << " != expected table schema: " << expected_table->schema()->ToString());
+  CHECK(batch->schema()->Equals(*expected_table->schema()));
+  //  CHECK(arr->Equals(batch->GetColumnByName("int")));
+}
+
+TEST_CASE("Test add column without data") {}
+
+TEST_CASE("Add one ") {}

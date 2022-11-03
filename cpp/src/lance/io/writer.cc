@@ -50,7 +50,7 @@ namespace {
  *  - 2 bytes minor version number
  *  - 4 bytes magic word.
  */
-::arrow::Status WriteFooter(std::shared_ptr<::arrow::io::OutputStream> sink,
+::arrow::Status WriteFooter(const std::shared_ptr<::arrow::io::OutputStream>& sink,
                             int64_t metadata_offset) {
   ARROW_RETURN_NOT_OK(WriteInt<int64_t>(sink, metadata_offset));
   ARROW_RETURN_NOT_OK(WriteInt<int16_t>(sink, kMajorVersion));
@@ -60,14 +60,14 @@ namespace {
 
 }  // namespace internal
 
-FileWriter::FileWriter(std::shared_ptr<::arrow::Schema> schema,
+FileWriter::FileWriter(std::shared_ptr<lance::format::Schema> schema,
                        std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
                        std::shared_ptr<::arrow::io::OutputStream> destination,
                        ::arrow::fs::FileLocator destination_locator)
-    : ::arrow::dataset::FileWriter(schema, options, destination, destination_locator),
-      lance_schema_(std::make_unique<lance::format::Schema>(schema)),
+    : ::arrow::dataset::FileWriter(schema->ToArrow(), options, destination, destination_locator),
+      lance_schema_(std::move(schema)),
       metadata_(std::make_unique<lance::format::Metadata>()) {
-  assert(schema->num_fields() > 0);
+  assert(lance_schema_->fields().size() > 0);
 }
 
 FileWriter::~FileWriter() {}

@@ -131,7 +131,8 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
 
   {
     auto write_options = lance::arrow::LanceFileFormat().DefaultWriteOptions();
-    auto writer = lance::io::FileWriter(table->schema(), write_options, output);
+    auto schema = std::make_shared<lance::format::Schema>(table->schema());
+    auto writer = lance::io::FileWriter(schema, write_options, output);
     auto batch_reader = ::arrow::TableBatchReader(table);
     std::shared_ptr<::arrow::RecordBatch> batch;
     while (true) {

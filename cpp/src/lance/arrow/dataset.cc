@@ -20,17 +20,16 @@
 #include <arrow/table.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <uuid.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
-#include <random>
 #include <range/v3/all.hpp>
 #include <utility>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
@@ -70,17 +69,7 @@ auto CreateFragments(const std::vector<std::string>& paths, const lance::format:
          to<std::vector<std::shared_ptr<lance::format::DataFragment>>>;
 }
 
-std::string GetBasenameTemplate() {
-  std::random_device rd;
-  auto seed_data = std::array<int, std::mt19937::state_size>{};
-  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
-  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
-  std::mt19937 generator(seq);
-  uuids::uuid_random_generator gen{generator};
-  auto uuid = gen();
-
-  return uuids::to_string(uuid) + "_{i}.lance";
-}
+std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 
 ::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
@@ -280,6 +269,27 @@ LanceDataset::~LanceDataset() {}
   ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(fs, manifest_path));
   auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Update(
+    const std::string& column, ::arrow::compute::Expression value) {
+  auto& schema = impl_->manifest->schema();
+  auto field = schema->GetField(column);
+  if (!field) {
+    return ::arrow::Status::Invalid("Field ", column, " does not exist");
+  }
+  ARROW_ASSIGN_OR_RAISE(auto fragment_iter, GetFragments());
+  ARROW_RETURN_NOT_OK(
+      fragment_iter.Visit([column, value](std::shared_ptr<::arrow::dataset::Fragment> fragment) {
+        if (fragment->type_name() != "lance") {
+          return ::arrow::Status::Invalid("Only support lance file fragment");
+        }
+        auto lf = std::dynamic_pointer_cast<LanceFragment>(fragment);
+        assert(lf != nullptr);
+        return ::arrow::Status::OK();
+      }));
+
+  return ::arrow::Status::NotImplemented("not implemented yet");
 }
 
 ::arrow::Result<std::vector<DatasetVersion>> LanceDataset::versions() const {
