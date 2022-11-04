@@ -43,6 +43,7 @@ jobs:
       - uses: actions/checkout@v2
       - name: Install dependencies
         run: |
+          brew update
           cd $(brew --repository)
           git checkout 3.6.8  # Arrow 10.0
           brew install apache-arrow protobuf
