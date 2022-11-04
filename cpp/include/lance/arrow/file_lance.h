@@ -17,6 +17,7 @@
 #include <arrow/dataset/file_base.h>
 
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace lance::arrow {
@@ -39,7 +40,7 @@ class LanceFileFormat : public ::arrow::dataset::FileFormat {
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> Inspect(
       const ::arrow::dataset::FileSource &source) const override;
 
-  ::arrow::Future<::arrow::util::optional<int64_t>> CountRows(
+  ::arrow::Future<std::optional<int64_t>> CountRows(
       const std::shared_ptr<::arrow::dataset::FileFragment> &file,
       ::arrow::compute::Expression predicate,
       const std::shared_ptr<::arrow::dataset::ScanOptions> &options) override;

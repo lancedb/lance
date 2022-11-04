@@ -6,13 +6,15 @@ import sys
 from auditwheel.main import main
 from auditwheel.policy import _POLICIES as POLICIES
 
+ARROW_VERSION = "1000"
+
 for p in POLICIES:
     p["lib_whitelist"].extend(
         [
-            "libarrow.so.900",
-            "libarrow_dataset.so.900",
-            "libarrow_python.so.900",
-            "libparquet.so.900",
+            f"libarrow.so.{ARROW_VERSION}",
+            f"libarrow_dataset.so.{ARROW_VERSION}",
+            f"libarrow_python.so.{ARROW_VERSION}",
+            f"libparquet.so.{ARROW_VERSION}",
         ]
     )
 

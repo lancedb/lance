@@ -70,7 +70,7 @@ setup(
     long_description_content_type="text/markdown",
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
-    install_requires=["numpy", "pillow", "pyarrow>=9,<10", "requests", "pandas"],
+    install_requires=["numpy", "pillow", "pyarrow>=10,<11", "requests", "pandas"],
     extras_require={"test": ["pytest>=6.0", "duckdb", "click", "requests_mock", "hypothesis"]},
     python_requires=">=3.8",
     packages=find_packages(),

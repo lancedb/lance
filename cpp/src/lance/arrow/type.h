@@ -23,6 +23,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 template <typename T>
@@ -101,8 +102,7 @@ inline bool is_fixed_length(const std::shared_ptr<::arrow::DataType>& data_type)
 /// Convert arrow DataType to a string representation.
 ::arrow::Result<std::string> ToLogicalType(std::shared_ptr<::arrow::DataType> dtype);
 
-::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(
-    ::arrow::util::string_view logical_type);
+::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(const std::string& logical_type);
 
 std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype);
 
