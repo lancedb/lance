@@ -17,13 +17,18 @@
 #include <arrow/array.h>
 #include <arrow/builder.h>
 #include <arrow/io/api.h>
+#include <arrow/table.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <range/v3/core.hpp>
+#include <range/v3/view.hpp>
 
 #include "lance/arrow/stl.h"
+#include "lance/testing/io.h"
 
 using arrow::Int32Builder;
 using lance::arrow::ToArray;
+using lance::testing::MakeDataset;
 
 TEST_CASE("Test Write Int32 array") {
   auto arr = lance::arrow::ToArray({1, 2, 3, 4, 5, 6, 7, 8}).ValueOrDie();
@@ -188,4 +193,29 @@ TEST_CASE("Write fixed size list") {
   auto arr = builder.Finish().ValueOrDie();
 
   TestWriteFixedSizeArray(arr);
+}
+
+TEST_CASE("GH-285: Write fixed size list") {
+  auto list_size = 4;
+  auto dtype = ::arrow::fixed_size_list(::arrow::int32(), list_size);
+  auto int_builder = std::make_shared<::arrow::Int32Builder>();
+  auto builder = ::arrow::FixedSizeListBuilder(::arrow::default_memory_pool(), int_builder, dtype);
+
+  for (int i = 0; i < 100; i++) {
+    CHECK(builder.Append().ok());
+    CHECK(int_builder
+              ->AppendValues(ranges::views::iota(i * 10, i * 10 + list_size) |
+                             ranges::to<std::vector>)
+              .ok());
+  }
+  auto arr = builder.Finish().ValueOrDie();
+
+  auto tab = ::arrow::Table::Make(::arrow::schema({::arrow::field("l", dtype)}), {arr});
+
+  // Write to disk
+  auto dataset = MakeDataset(tab, {}, 10).ValueOrDie();
+  auto actual_table =
+      dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  INFO("Expected table: " << tab->ToString() << "\nActual table: " << actual_table->ToString());
+  CHECK(tab->Equals(*actual_table));
 }

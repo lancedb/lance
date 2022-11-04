@@ -1,24 +1,35 @@
-# Lance
+<div align="center">
+<p align="center">
+ 
+<img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Blazing fast exploration and analysis of machine learning visual data using SQL**
+**Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
 
-```sql
-SELECT predict(‘resnet’, image) FROM dataset
-```
+<a href="https://eto-ai.github.io/lance/">Documentation</a> •
+<a href="https://blog.eto.ai/">Blog</a> •
+<a href="https://discord.gg/zMM32dvNtd">Discord</a> •
+<a href="https://twitter.com/etodotai">Twitter</a>
 
-![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg) [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/) [![PyPi](https://img.shields.io/pypi/v/pylance)](https://pypi.org/project/pylance/) ![Python versions](https://img.shields.io/pypi/pyversions/pylance) [![](https://dcbadge.vercel.app/api/server/zMM32dvNtd?style=flat)](https://discord.gg/zMM32dvNtd)
+![CI](https://github.com/eto-ai/lance/actions/workflows/cpp.yml/badge.svg)
+[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
+![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+ 
+<img width="600" alt="Lance Basic Query Visualizing Misclassifications" src="https://user-images.githubusercontent.com/917119/199368681-7985c183-5f5e-4327-9561-77f679767bfa.png">
 
-Lance makes machine learning workflows with visual data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
+</p>
+</div>
 
-* Use arbitary ML functions in SQL for common use cases such as similarity search using embeddings, model inference and computing evaluation metrics like F1, IOU and more.
+<hr />
 
-* [Coming soon] Visualize, slice and drill-into visual datasets to inspect embeddings, labels/annotations, metrics and more.
+Lance makes machine learning workflows with computer vision data easy (images, videos, point clouds, audio, and more), by allowing Developers, Analysts and Operations to:
 
-* [Coming soon] Version, compare and diff visual datasets easily.
+* Use SQL to greatly simplify common operations on computer vision data, such as similarity search for data discovery, model inference and computing evaluation metrics.
 
-Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for visual data use cases.
+* (Coming soon) visualize, slice and drill-into computer vision datasets to inspect embeddings, labels/annotations and metrics.
 
-Lance currently supports DuckDB.
+* (Coming soon) version, compare and diff computer vision datasets easily.
+
+Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for use cases using computer vision data.
 
 ## Quick Start
 

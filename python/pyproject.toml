@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel", "ninja", "numpy", "cython", "pyarrow>=9,<10", "bump2version"]
+requires = ["setuptools>=42", "wheel", "ninja", "numpy", "cython", "pyarrow>=10,<11", "bump2version"]
 build-backend = "setuptools.build_meta"
 
 [tool.isort]

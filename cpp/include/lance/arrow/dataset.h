@@ -31,6 +31,8 @@ namespace lance::arrow {
 ///
 class DatasetVersion {
  public:
+  DatasetVersion() = default;
+
   explicit DatasetVersion(uint64_t version);
 
   uint64_t version() const;
@@ -58,7 +60,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   ~LanceDataset() override;
 
-  /// Write a in-memory Arrow dataset to disk.
+  /// Write Arrow dataset to disk.
   ///
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
@@ -66,6 +68,18 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner,
+                               WriteMode mode = kCreate);
+
+  /// Write Arrow dataset to disk.
+  ///
+  /// \param options Arrow Dataset Write Options.
+  /// \param scanner the source dataset to be written.
+  /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  ///
+  /// GH-62. To accommodate Cython lacking of arrow Scanner interface, we directly write
+  /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
+  static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
+                               const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
                                WriteMode mode = kCreate);
 
   /// Load dataset, with a specific version.
@@ -79,11 +93,14 @@ class LanceDataset : public ::arrow::dataset::Dataset {
       const std::string& base_uri,
       std::optional<uint64_t> version = std::nullopt);
 
-  /// Get all the dataset version.
+  /// Get all the dataset versions.
   ::arrow::Result<std::vector<DatasetVersion>> versions() const;
 
   /// Get the latest version of the dataset
   ::arrow::Result<DatasetVersion> latest_version() const;
+
+  /// Returns the version of this dataset.
+  DatasetVersion version() const;
 
   std::string type_name() const override { return "lance"; }
 
