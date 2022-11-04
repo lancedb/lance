@@ -142,7 +142,7 @@ class LanceDataset(IterableDataset):
             return self._files
 
         self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
-        self._files = dataset(self.root).files
+        self._files = pyarrow.dataset.dataset(self.root, format=lance.LanceFileFormat()).files
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
             # Split the work using at the files level for now.
