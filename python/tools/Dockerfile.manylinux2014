@@ -11,7 +11,6 @@ RUN yum update -y \
   arrow-devel-${ARROW_VERSION} \
   arrow-glib-devel-${ARROW_VERSION} \
   arrow-dataset-devel-${ARROW_VERSION} \
-  arrow-python-devel-${ARROW_VERSION} \
   parquet-devel-${ARROW_VERSION} \
   wget \
   http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
