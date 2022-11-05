@@ -13,6 +13,9 @@ set(OS_ARCH "amd64")
 string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
 if(IS_ARM)
   set(OS_ARCH "arm64")
+endif()
+
+if (APPLE)
   set(CMAKE_CXX_COMPILER_ID Clang) # DuckDB CMakeLists.txt does not allow static linking for AppleClang
 endif()
 
