@@ -3,7 +3,7 @@
  
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Blazing fast exploration and analysis of computer vision data using SQL and DuckDB**
+**Blazing fast exploration and analysis of computer vision data using SQL and DuckDB, backed by an Apache-Arrow compatible data format**
 
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
