@@ -52,11 +52,11 @@ if(LANCE_BUILD_PYTORCH)
         URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.13.0.zip)
       list(APPEND available_contents Torch)
     else()
-      # Apple Silicon
-      # libtorch does not have apple silicon release yet. Temporary solution.
+		# Apple Silicon
+		# libtorch does not have apple silicon release yet.Temporary solution.
       file(
         DOWNLOAD
-        https://files.pythonhosted.org/packages/5a/e8/82c14c28360dafe02877b28c70218c8b6ca8a0f2fbb0515b2abd027ca251/torch-1.12.0-cp310-none-macosx_11_0_arm64.whl
+		https://files.pythonhosted.org/packages/79/b3/eaea3fc35d0466b9dae1e3f9db08467939347b3aaa53c0fd81953032db33/torch-1.13.0-cp310-none-macosx_11_0_arm64.whl
         ${CMAKE_BINARY_DIR}/torch.zip)
       file(ARCHIVE_EXTRACT INPUT ${CMAKE_BINARY_DIR}/torch.zip DESTINATION
            ${CMAKE_BINARY_DIR}/thirdparty)
@@ -138,4 +138,3 @@ if(LANCE_BUILD_PYTORCH)
     set_target_properties(lance_loadable_extension PROPERTIES CUDA_ARCHITECTURES native)
   endif()
 endif()
-
