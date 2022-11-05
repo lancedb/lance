@@ -4,6 +4,8 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
+add_compile_options(-mf16c) # opencv
+
 project(lance_duckdb CXX)
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
 
@@ -13,15 +15,13 @@ if(IS_ARM)
   set(OS_ARCH "arm64")
 endif()
 
+if (APPLE)
+  set(CMAKE_CXX_COMPILER_ID Clang) # DuckDB CMakeLists.txt does not allow static linking for AppleClang
+endif()
+
 include(FetchContent)
 
-if(APPLE)
-  set(EXTENSION_STATIC_BUILD
-      0
-      CACHE INTERNAL "Do not build static duckdb extension")
-else()
-  set(EXTENSION_STATIC_BUILD 1)
-endif()
+set(EXTENSION_STATIC_BUILD 1)
 
 set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
@@ -49,14 +49,14 @@ if(LANCE_BUILD_PYTORCH)
     if(OS_ARCH STREQUAL "amd64")
       FetchContent_Declare(
         Torch
-        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.12.1.zip)
+        URL https://download.pytorch.org/libtorch/cpu/libtorch-macos-1.13.0.zip)
       list(APPEND available_contents Torch)
     else()
-      # Apple Silicon
-      # libtorch does not have apple silicon release yet. Temporary solution.
+		# Apple Silicon
+		# libtorch does not have apple silicon release yet.Temporary solution.
       file(
         DOWNLOAD
-        https://files.pythonhosted.org/packages/5a/e8/82c14c28360dafe02877b28c70218c8b6ca8a0f2fbb0515b2abd027ca251/torch-1.12.0-cp310-none-macosx_11_0_arm64.whl
+		https://files.pythonhosted.org/packages/79/b3/eaea3fc35d0466b9dae1e3f9db08467939347b3aaa53c0fd81953032db33/torch-1.13.0-cp310-none-macosx_11_0_arm64.whl
         ${CMAKE_BINARY_DIR}/torch.zip)
       file(ARCHIVE_EXTRACT INPUT ${CMAKE_BINARY_DIR}/torch.zip DESTINATION
            ${CMAKE_BINARY_DIR}/thirdparty)
@@ -130,9 +130,6 @@ else()
 endif()
 
 build_loadable_extension(lance ${LANCE_EXT_SOURCES})
-if(APPLE)
-  target_link_libraries(lance_loadable_extension duckdb)
-endif()
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
@@ -141,4 +138,3 @@ if(LANCE_BUILD_PYTORCH)
     set_target_properties(lance_loadable_extension PROPERTIES CUDA_ARCHITECTURES native)
   endif()
 endif()
-

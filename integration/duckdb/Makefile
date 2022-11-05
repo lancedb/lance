@@ -6,3 +6,6 @@ release-linux:
 
 release-cuda:
 	cd cuda && docker compose run cuda /code/cuda/build_lance.sh && cd ..
+
+release-osx:
+	cmake -B osx-build && make -C osx-build -j
