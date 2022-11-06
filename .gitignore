@@ -65,6 +65,7 @@ docs/notebooks
 
 
 integration/duckdb/*-build
+integration/duckdb/lance.duckdb_extension.*.zip
 python/notebooks/lance.duckdb_extension
 
 wheelhouse
