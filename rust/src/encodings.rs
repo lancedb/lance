@@ -19,7 +19,7 @@ use std::io::Result;
 use std::sync::Arc;
 
 use arrow2::array::{Array, Int32Array};
-use arrow2::types::NativeType;
+use arrow2::scalar::Scalar;
 
 pub mod plain;
 
@@ -47,12 +47,12 @@ pub trait Encoder {
 }
 
 /// Decoder.
-pub trait Decoder<T: NativeType> {
-    type ArrowType;
+pub trait Decoder {
+    // type ArrowType;
 
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> ;
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>>;
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>>;
 
-    fn value(&self, i: usize) -> Result<T>;
+    fn value(&self, i: usize) -> Result<Box<dyn Scalar>>;
 }

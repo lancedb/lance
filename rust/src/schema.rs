@@ -23,6 +23,7 @@ use arrow2::types::NativeType;
 
 use crate::encodings::{Decoder, Encoding};
 use crate::format::pb;
+use crate::page_table::PageInfo;
 
 /// Lance Field.
 ///
@@ -66,7 +67,7 @@ impl Field {
         return &self.children;
     }
 
-    pub fn get_decoder<R: Read + Seek, T: NativeType>(&self, reader: &R) -> Box<dyn Decoder<T, ArrowType=T>> {
+    pub fn get_decoder<R: Read + Seek>(&self, reader: &R, page_info: PageInfo) -> Box<dyn Decoder> {
         //Field::GetDecoder
         todo!()
     }

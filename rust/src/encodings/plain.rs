@@ -16,35 +16,40 @@
 
 use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
+use std::marker::PhantomData;
 
 use arrow2::array::{Array, PrimitiveArray};
 use arrow2::array::Int32Array;
 use arrow2::array::new_empty_array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
+use arrow2::datatypes::PrimitiveType;
+use arrow2::scalar::Scalar;
 use arrow2::types::NativeType;
 
 use crate::encodings::Decoder;
 
 /// Plain Decoder
-pub struct PlainDecoder<'a, R: Read + Seek> {
+pub struct PlainDecoder<'a, R: Read + Seek, T: NativeType> {
     file: &'a mut R,
     position: u64,
     page_length: i64,
+    phantom: PhantomData<T>,
 }
 
-impl<'a, R: Read + Seek> PlainDecoder<'a, R> {
+impl<'a, R: Read + Seek, T: NativeType> PlainDecoder<'a, R, T> {
     pub fn new(file: &'a mut R, position: u64, page_length: i64) -> Self {
         PlainDecoder {
             file,
             position,
             page_length,
+            phantom: Default::default()
         }
     }
 }
 
-impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
-    type ArrowType = T;
+impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
+    // type ArrowType = T;
 
     fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
@@ -84,7 +89,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
 
         let start = indices.value(0);
         let length = indices.values().last().map(|i| i - start);
-        let values = <PlainDecoder<'a, R> as Decoder<T>>::decode(self, start, &length)?;
+        let values = <PlainDecoder<'a, R, T> as Decoder>::decode(self, start, &length)?;
         let reset_indices = sub_scalar(&indices, &start);
 
         let res = take(values.as_ref(), &reset_indices);
@@ -94,7 +99,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
         }
     }
 
-    fn value(&self, i: usize) -> Result<T> {
+    fn value(&self, i: usize) -> Result<Box<dyn Scalar>> {
         todo!()
     }
 }

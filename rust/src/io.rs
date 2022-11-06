@@ -193,14 +193,14 @@ impl<R: Read + Seek> FileReader<R> {
         //FileReader::GetListScalar
         // auto field_id = field->id();
         let field_id = field.id;
-
-        // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
-        // TODO generic or not generic?
-        // let decoder = field.get_decoder(&self.file);
-
+        let page_info = self.page_table.get_page_info(field_id as usize, batch_id as usize);
         // ARROW_ASSIGN_OR_RAISE(auto page, GetPageInfo(field_id, batch_id));
         // auto [pos, length] = page;
         // decoder->Reset(pos, length);
+        // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
+        let mut decoder = field.get_decoder(&self.file, page_info);
+
+        let val = decoder.decode(idx_in_batch, Option(2)).unwrap();
         // ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
         // auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
         // if (offsets->Value(0) == offsets->Value(1)) {
@@ -216,6 +216,12 @@ impl<R: Read + Seek> FileReader<R> {
     }
 
     fn get_primitive_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
-        todo!()
+        //FileReader::GetPrimitiveScalar
+        let data_type = field.data_type();
+        let field_id = field.id;
+        let page_info = self.page_table.get_page_info(field_id as usize, batch_id as usize);
+
+        let decoder = field.get_decoder(&self.file, page_info);
+        return decoder.value(idx_in_batch as usize).unwrap();
     }
 }
