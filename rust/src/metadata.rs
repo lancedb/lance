@@ -30,28 +30,22 @@ impl Metadata {
     }
 
     pub fn locate_batch(&self, row_index: i32) -> Result<(i32, i32), Error> {
+
         // Metadata::LocateBatch
         let len = self.length();
-        // int64_t len = length();
 
         if row_index < 0 || row_index >= len {
             return Err(Error::InvalidArgumentError(format!("Row index out of range: {} of {}", row_index, len)));
         }
-        // if (row_index < 0 || row_index >= len) {
-        //     return ::arrow::Status::IndexError(fmt::format("Row index out of range: {} of {}", row_index, len));
-        // }
 
-        // auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), row_index);
-        // if (it == pb_.batch_offsets().end()) {
-        //     return ::arrow::Status::IndexError("Row index out of range {} of {}", row_index, len);
-        // }
-        // int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it);
-        // assert(bound_idx >= 0);
-        // bound_idx = std::max(0, bound_idx - 1);
-        // // Offset within the batch.
-        // int32_t offset = row_index - pb_.batch_offsets(bound_idx);
-        // return std::tuple(bound_idx, offset);
+        let bound_idx = self.pb.batch_offsets.partition_point(|x| { x <= &row_index }) as i32 - 1;
 
-        todo!()
+        if bound_idx <= 0 {
+            return Err(Error::InvalidArgumentError(format!("metadata is not valid {:?}", self.pb.batch_offsets)));
+        }
+
+        let offset = row_index - self.pb.batch_offsets[bound_idx as usize];
+
+        Ok((bound_idx, offset))
     }
 }
