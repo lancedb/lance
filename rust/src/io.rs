@@ -12,9 +12,11 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+use std::any::Any;
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use arrow2::array::{Array, DictionaryKey};
 use arrow2::datatypes::DataType;
+use arrow2::scalar::{Scalar, StructScalar};
 use arrow2::types::Index;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -112,15 +114,15 @@ impl<R: Read + Seek> FileReader<R> {
     }
 
     pub fn get(&self, idx: u32) -> Box<dyn Array> {
+        // TODO usize for idiomatic ? or i32 for protobuf compatibility?
         // FileReader::Get
         let schema = self.schema();
-        // ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(idx));
-        // auto [batch_id, idx_in_batch] = batch;
+        let (batch_id, idx_in_batch) = self.metadata.locate_batch(idx as i32).unwrap();
         for field in &schema.fields {
             let num_batches = self.metadata.num_batches();
-            for batch_id in 0..num_batches {
-                let value: Box<dyn Array> = Self::get_array(&field, batch_id, ArrayParams { offset: 0, len: None });
-            }
+            let v = self.get_scalar(field, batch_id, idx_in_batch);
+            // auto f = std::async(&FileReader::GetScalar, this, field, batch_id, idx_in_batch);
+            // futures.emplace_back(std::move(f));
         }
         todo!()
     }
@@ -159,6 +161,37 @@ impl<R: Read + Seek> FileReader<R> {
         let field_id = field.id.to_usize();
         let page_info = self.page_table.get_page_info(field_id, batch_id);
         // field.get_decoder(&self.file);
+        todo!()
+    }
+
+    fn get_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn arrow2::scalar::Scalar> {
+        //FileReader::GetScalar
+        match field.data_type() {
+            DataType::Struct(_) => {
+                self.get_struct_scalar(field, batch_id, idx_in_batch)
+            }
+            DataType::List(_) => {
+                self.get_array_scalar(field, batch_id, idx_in_batch)
+            }
+            _ => {
+                self.get_primitive_scalar(field, batch_id, idx_in_batch)
+            }
+        }
+    }
+
+    fn get_struct_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+        //FileReader::GetStructScalar
+        let mut values = Vec::new();
+        for child in field.fields() {
+            let scalar = self.get_scalar(child, batch_id, idx_in_batch);
+            values.push(scalar)
+        }
+        return Box::new(StructScalar::new(field.data_type(), values.into()));
+    }
+    fn get_array_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+        todo!()
+    }
+    fn get_primitive_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
         todo!()
     }
 }

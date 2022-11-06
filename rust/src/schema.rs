@@ -30,8 +30,8 @@ pub struct Field {
     pub id: i32,
     pub parent_id: i32,
     pub name: String,
-    logical_type: String,
-    extension_name: String,
+    pub logical_type: String,
+    pub extension_name: String,
     pub encoding: Option<Encoding>,
     node_type: i32,
 
@@ -58,6 +58,10 @@ impl Field {
             children: vec![],
         }
         // TODO Add subfields.
+    }
+
+    pub fn fields(&self) -> &Vec<Field> {
+        return &self.children;
     }
 
     /// Build Field from protobuf.
