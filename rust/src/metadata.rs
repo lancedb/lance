@@ -29,6 +29,13 @@ impl Metadata {
         }
     }
 
+    pub fn add_batch_length(&mut self, length: i32) {
+        if self.pb.batch_offsets.len() == 0 {
+            self.pb.batch_offsets.push(0)
+        }
+        self.pb.batch_offsets.push(self.length() + length)
+    }
+
     pub fn locate_batch(&self, row_index: i32) -> Result<(i32, i32), Error> {
 
         // Metadata::LocateBatch
@@ -40,7 +47,7 @@ impl Metadata {
 
         let bound_idx = self.pb.batch_offsets.partition_point(|x| { x <= &row_index }) as i32 - 1;
 
-        if bound_idx <= 0 {
+        if bound_idx < 0 {
             return Err(Error::InvalidArgumentError(format!("metadata is not valid {:?}", self.pb.batch_offsets)));
         }
 
