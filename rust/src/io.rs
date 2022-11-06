@@ -113,18 +113,18 @@ impl<R: Read + Seek> FileReader<R> {
         self.metadata.num_chunks()
     }
 
-    pub fn get(&self, idx: u32) -> Box<dyn Array> {
+    pub fn get(&self, idx: u32) -> Vec<Box<dyn Scalar>> {
         // TODO usize for idiomatic ? or i32 for protobuf compatibility?
         // FileReader::Get
         let schema = self.schema();
         let (batch_id, idx_in_batch) = self.metadata.locate_batch(idx as i32).unwrap();
+        let mut res = Vec::new();
         for field in &schema.fields {
             let num_batches = self.metadata.num_batches();
             let v = self.get_scalar(field, batch_id, idx_in_batch);
-            // auto f = std::async(&FileReader::GetScalar, this, field, batch_id, idx_in_batch);
-            // futures.emplace_back(std::move(f));
+            res.push(v)
         }
-        todo!()
+        return res;
     }
 
 
