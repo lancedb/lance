@@ -39,16 +39,16 @@ aws s3 cp "${ZIP_NAME}" "${REMOTE_URI}"
 # verify the upload was successful
 aws s3 ls "${REMOTE_URI}"
 
+# cleanup
+rm "${ZIP_NAME}"
+
+
 # update latest
 LATEST_POINTER="${ARTIFACT_ROOT}/artifacts/lance/lance_duckdb/latest"
-CMD="aws s3 cp ${LATEST_POINTER} -"
-LATEST_VER="$(CMD)" || echo "0.0.0"
+LATEST_VER=$(aws s3 cp "${LATEST_POINTER}" - || echo "0.0.0")
 
 if [[ "${VER}" > "${LATEST_VER}" ]]; then
   echo "${VER}" >> ./latest
   aws s3 cp latest "${LATEST_POINTER}"
+  rm latest # cleanup
 fi
-
-# cleanup
-rm "${ZIP_NAME}"
-rm latest
