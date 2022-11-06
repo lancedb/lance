@@ -188,9 +188,33 @@ impl<R: Read + Seek> FileReader<R> {
         }
         return Box::new(StructScalar::new(field.data_type(), values.into()));
     }
+
     fn get_array_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+        //FileReader::GetListScalar
+        // auto field_id = field->id();
+        let field_id = field.id;
+
+        // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
+        // TODO generic or not generic?
+        // let decoder = field.get_decoder(&self.file);
+
+        // ARROW_ASSIGN_OR_RAISE(auto page, GetPageInfo(field_id, batch_id));
+        // auto [pos, length] = page;
+        // decoder->Reset(pos, length);
+        // ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
+        // auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
+        // if (offsets->Value(0) == offsets->Value(1)) {
+        //     return std::make_shared<::arrow::NullScalar>();
+        // }
+        // ARROW_ASSIGN_OR_RAISE(
+        //     auto values,
+        //     GetArray(field->fields()[0],
+        //              batch_id,
+        //              ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
+        // return std::make_shared<::arrow::ListScalar>(values);
         todo!()
     }
+
     fn get_primitive_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
         todo!()
     }

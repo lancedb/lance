@@ -16,10 +16,12 @@
 
 use std::fmt;
 use std::fmt::Debug;
+use std::io::{Read, Seek};
 
 use arrow2::datatypes::{DataType, TimeUnit};
+use arrow2::types::NativeType;
 
-use crate::encodings::Encoding;
+use crate::encodings::{Decoder, Encoding};
 use crate::format::pb;
 
 /// Lance Field.
@@ -62,6 +64,11 @@ impl Field {
 
     pub fn fields(&self) -> &Vec<Field> {
         return &self.children;
+    }
+
+    pub fn get_decoder<R: Read + Seek, T: NativeType>(&self, reader: &R) -> Box<dyn Decoder<T, ArrowType=T>> {
+        //Field::GetDecoder
+        todo!()
     }
 
     /// Build Field from protobuf.
