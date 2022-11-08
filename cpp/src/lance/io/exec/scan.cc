@@ -51,6 +51,7 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
 
   auto& first_reader = std::get<0>(readers_[0]);
   {
+    // Make the plan to how much data to read next.
     std::lock_guard guard(lock_);
     batch_id = current_batch_id_;
     offset = current_offset_;
@@ -67,11 +68,32 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
     // Reach EOF
     return ScanBatch::Null();
   }
+  
+  auto executor = ::arrow::internal::GetCpuThreadPool();
+  std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
+  for (auto& [reader, schema] : readers_) {
+    ARROW_ASSIGN_OR_RAISE(
+        auto fut,
+        executor->Submit(
+            [](auto& r, auto& s, auto batch_id, auto offset, auto batch_size)
+                -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {
+              ARROW_ASSIGN_OR_RAISE(auto batch,
+                                    r->ReadBatch(*s, batch_id, offset, batch_size));
+              return batch;
+            },
+            reader,
+            schema,
+            batch_id,
+            offset,
+            batch_size_));
+    futs.emplace_back(std::move(fut));
+  }
 
   std::vector<std::shared_ptr<::arrow::RecordBatch>> batches;
-  for (auto& [reader, schema] : readers_) {
-    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadBatch(*schema, batch_id, offset, batch_size_));
-    batches.emplace_back(std::move(batch));
+  for (auto& fut : futs) {
+    fut.Wait();
+    ARROW_ASSIGN_OR_RAISE(auto b, fut.MoveResult());
+    batches.emplace_back(b);
   }
 
   ARROW_ASSIGN_OR_RAISE(auto batch, lance::arrow::MergeRecordBatches(batches));
