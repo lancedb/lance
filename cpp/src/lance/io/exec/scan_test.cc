@@ -30,6 +30,8 @@ using lance::io::exec::Scan;
 using lance::testing::MakeReader;
 
 TEST_CASE("Test Scan::Next") {
+  CHECK(::arrow::SetCpuThreadPoolCapacity(8).ok());
+
   std::vector<int32_t> ints(20);
   std::iota(ints.begin(), ints.end(), 0);
   auto schema = ::arrow::schema({
@@ -73,6 +75,8 @@ TEST_CASE("Test Scan::Next") {
 }
 
 TEST_CASE("Scan move to the next batch") {
+  CHECK(::arrow::SetCpuThreadPoolCapacity(8).ok());
+  
   const auto kNumBatches = 3;
   const auto kPageLength = 20;
   ::arrow::ArrayVector arrs;
