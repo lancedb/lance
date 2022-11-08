@@ -76,16 +76,16 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
               ARROW_ASSIGN_OR_RAISE(auto batch, r->ReadBatch(*s, batch_id, offset, batch_size));
               return batch;
             },
-            std::move(reader),
-            std::move(schema),
+            reader,
+            schema,
             batch_size_));
     futs.emplace_back(std::move(fut));
   }
 
   std::vector<std::shared_ptr<::arrow::RecordBatch>> batches;
-  for (auto& fut : futs) {
-    ARROW_ASSIGN_OR_RAISE(auto b, fut.MoveResult());
-    batches.emplace_back(b);
+  for (auto fut : futs) {
+    ARROW_ASSIGN_OR_RAISE(auto b, fut.result());
+    batches.emplace_back(std::move(b));
   }
 
   ARROW_ASSIGN_OR_RAISE(auto batch, lance::arrow::MergeRecordBatches(batches));
