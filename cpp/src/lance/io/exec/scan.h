@@ -48,18 +48,23 @@ class Scan : public ExecNode {
 
   /// Factory method.
   ///
+  /// \param readers a vector of the tuples of `[reader, schema]`, including opened file reader
+  ///                and projection schema.
+  /// \param batch_size batch size.
+  /// \return a Scan node if succeed.
   static ::arrow::Result<std::unique_ptr<Scan>> Make(
       const std::vector<FileReaderWithSchema>& readers, int64_t batch_size);
 
   Scan() = delete;
 
-  virtual ~Scan() = default;
+  ~Scan() override = default;
 
   constexpr Type type() const override { return Type::kScan; }
 
   /// Returns the next available batch in the file. Or returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
+  /// Debug String
   std::string ToString() const override;
 
   /// Seek to a particular row.
