@@ -112,9 +112,10 @@ namespace lance::arrow {
     arrays.emplace_back(left_arr);
   }
 
-  for (auto name : rhs->struct_type()->fields() | views::filter([&lhs](auto& f) {
-                     return !lhs->GetFieldByName(f->name());
-                   }) | views::transform([](auto& f) { return f->name(); })) {
+  for (auto name :
+       rhs->struct_type()->fields()                                                      //
+           | views::filter([&lhs](auto& f) { return !lhs->GetFieldByName(f->name()); })  //
+           | views::transform([](auto& f) { return f->name(); })) {
     names.emplace_back(name);
     arrays.emplace_back(rhs->GetFieldByName(name));
   }
@@ -141,12 +142,11 @@ template <HasFields T>
       fields.emplace_back(merged);
     }
   }
-  for (const auto& field : rhs.fields()) {
-    auto left_field = lhs.GetFieldByName(field->name());
-    if (!left_field) {
-      fields.emplace_back(field);
-    }
-  }
+  ranges::actions::insert(
+      fields,
+      std::end(fields),  //
+      rhs.fields()       //
+          | views::filter([&lhs](auto& f) { return !lhs.GetFieldByName(f->name()); }));
   return fields;
 };
 
