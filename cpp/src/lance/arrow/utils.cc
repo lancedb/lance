@@ -22,11 +22,14 @@
 #include <fmt/ranges.h>
 
 #include <concepts>
-#include <string>
+#include <range/v3/action.hpp>
+#include <range/v3/view.hpp>
 #include <vector>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
+
+namespace views = ranges::views;
 
 namespace lance::arrow {
 
@@ -38,6 +41,25 @@ namespace lance::arrow {
   ARROW_ASSIGN_OR_RAISE(auto right_struct, rhs->ToStructArray());
   ARROW_ASSIGN_OR_RAISE(auto struct_arr, MergeStructArrays(left_struct, right_struct, pool));
   return ::arrow::RecordBatch::FromStructArray(struct_arr);
+}
+
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
+    const std::vector<std::shared_ptr<::arrow::RecordBatch>>& batches, ::arrow::MemoryPool* pool) {
+  if (batches.empty()) {
+    return nullptr;
+  }
+  auto batch = batches[0];
+  for (auto& b : batches | views::drop(1)) {
+    if (b->num_rows() != batch->num_rows()) {
+      return ::arrow::Status::Invalid(
+          "MergeRecordBatches: attempt to merge batches with different length: ",
+          b->num_rows(),
+          " != ",
+          batch->num_rows());
+    }
+    ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, b, pool));
+  }
+  return batch;
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Array>> MergeListArrays(
@@ -97,18 +119,17 @@ namespace lance::arrow {
     arrays.emplace_back(left_arr);
   }
 
-  for (auto& field : rhs->struct_type()->fields()) {
-    auto& name = field->name();
-    if (lhs->GetFieldByName(name)) {
-      // We've seen each other before
-      continue;
-    }
+  for (auto name :
+       rhs->struct_type()->fields()                                                      //
+           | views::filter([&lhs](auto& f) { return !lhs->GetFieldByName(f->name()); })  //
+           | views::transform([](auto& f) { return f->name(); })) {
     names.emplace_back(name);
     arrays.emplace_back(rhs->GetFieldByName(name));
   }
   return ::arrow::StructArray::Make(arrays, names);
 }
 
+/// Concept of a class that has ".fields()" method.
 template <typename T>
 concept HasFields = (std::same_as<T, ::arrow::Schema> || std::same_as<T, ::arrow::StructType>);
 
@@ -129,12 +150,11 @@ template <HasFields T>
       fields.emplace_back(merged);
     }
   }
-  for (const auto& field : rhs.fields()) {
-    auto left_field = lhs.GetFieldByName(field->name());
-    if (!left_field) {
-      fields.emplace_back(field);
-    }
-  }
+  ranges::actions::insert(
+      fields,
+      std::end(fields),  //
+      rhs.fields()       //
+          | views::filter([&lhs](auto& f) { return !lhs.GetFieldByName(f->name()); }));
   return fields;
 };
 
