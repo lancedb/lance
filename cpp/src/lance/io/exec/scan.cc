@@ -68,7 +68,7 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
     // Reach EOF
     return ScanBatch::Null();
   }
-  
+
   auto executor = ::arrow::internal::GetCpuThreadPool();
   std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
   for (auto& [reader, schema] : readers_) {
