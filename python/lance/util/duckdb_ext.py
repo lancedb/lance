@@ -1,3 +1,16 @@
+#  Copyright 2022 Lance Developers
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
 import duckdb
 import os
 import pathlib
@@ -6,7 +19,7 @@ import urllib.request
 import zipfile
 
 
-def install_duckdb_extension(version='latest', unsigned=True):
+def install_duckdb_extension(version='latest'):
     """
     Install the lance duckdb extension
 
@@ -14,14 +27,12 @@ def install_duckdb_extension(version='latest', unsigned=True):
     ----------
     version: str, default 'latest'
         The version of the extension to install
-    unsigned: bool, default True
-        Whether to turn on allow_unsigned_extensions in duckdb
     """
     if version == 'latest':
         version = _get_latest_version('lance', 'lance_duckdb')
     uri = _get_uri(version)
     local_path = _download_and_unzip('lance', 'lance_duckdb', uri)
-    con = duckdb.connect(config={"allow_unsigned_extensions": unsigned})
+    con = duckdb.connect(config={"allow_unsigned_extensions": True})
     con.install_extension(local_path, force_install=True)
 
 
