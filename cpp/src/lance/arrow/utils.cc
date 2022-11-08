@@ -50,6 +50,13 @@ namespace lance::arrow {
   }
   auto batch = batches[0];
   for (auto& b : batches | views::drop(1)) {
+    if (b->num_rows() != batch->num_rows()) {
+      return ::arrow::Status::Invalid(
+          "MergeRecordBatches: attempt to merge batches with different length: ",
+          b->num_rows(),
+          " != ",
+          batch->num_rows());
+    }
     ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, b, pool));
   }
   return batch;
