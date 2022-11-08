@@ -28,12 +28,26 @@ def install_duckdb_extension(version='latest'):
     version: str, default 'latest'
         The version of the extension to install
     """
+    _check_duckdb_version()
     if version == 'latest':
         version = _get_latest_version('lance', 'lance_duckdb')
     uri = _get_uri(version)
     local_path = _download_and_unzip('lance', 'lance_duckdb', uri)
     con = duckdb.connect(config={"allow_unsigned_extensions": True})
     con.install_extension(local_path, force_install=True)
+
+
+def _check_duckdb_version():
+    """
+    Currently the extension is pre-built for v0.5.1 of duckdb and duckdb
+    does not support binary compatibility between patch versions
+    """
+    CURR_VER = "0.5.1"
+    if duckdb.__version__ != CURR_VER:
+        msg = (f"The lance extension is built against DuckDB version f{CURR_VER} but "
+               f"{duckdb.__version__} was found. Please `pip install --force-reinstall duckdb=={CURR_VER}` "
+               f"OR build the extension from source against your version of duckdb")
+        raise ImportError(msg)
 
 
 def _get_uri(version):

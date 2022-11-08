@@ -10,7 +10,7 @@ import torch
 from lance.util.duckdb_ext import install_duckdb_extension
 
 
-@pytest.mark.skipif(platform.system() == 'Darwin' and os.environ["GITHUB_ACTIONS"] == "true",
+@pytest.mark.skipif(platform.system() == 'Darwin' and os.environ.get("GITHUB_ACTIONS") == "true",
                     reason="virtualization issue")
 def test_ext(tmp_path: Path):
     install_duckdb_extension()
