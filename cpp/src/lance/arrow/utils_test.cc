@@ -235,6 +235,5 @@ TEST_CASE("Merge record batches") {
                                  {ToArray({1, 2, 3}).ValueOrDie(),
                                   ToArray({10, 20, 30}).ValueOrDie(),
                                   ToArray({"1", "2", "3"}).ValueOrDie()});
-  fmt::print("Merge : {}\n", merged->ToString());
   CHECK(merged->Equals(*expected));
 }
