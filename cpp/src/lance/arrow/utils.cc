@@ -122,6 +122,7 @@ namespace lance::arrow {
   return ::arrow::StructArray::Make(arrays, names);
 }
 
+/// Concept of a class that has ".fields()" method.
 template <typename T>
 concept HasFields = (std::same_as<T, ::arrow::Schema> || std::same_as<T, ::arrow::StructType>);
 
