@@ -42,11 +42,6 @@ class Scan : public ExecNode {
       std::tuple<std::shared_ptr<FileReader>, std::shared_ptr<lance::format::Schema>>;
 
   /// Factory method.
-  static ::arrow::Result<std::unique_ptr<Scan>> Make(std::shared_ptr<FileReader> reader,
-                                                     std::shared_ptr<lance::format::Schema> schema,
-                                                     int64_t batch_size);
-
-  /// Factory method.
   ///
   /// \param readers a vector of the tuples of `[reader, schema]`, including opened file reader
   ///                and projection schema.

@@ -45,7 +45,7 @@ TEST_CASE("Test Scan::Next") {
 
   const int32_t kBatchSize = 8;
   auto scan =
-      Scan::Make(reader, std::make_shared<Schema>(reader->schema()), kBatchSize).ValueOrDie();
+      Scan::Make({{reader, std::make_shared<Schema>(reader->schema())}}, kBatchSize).ValueOrDie();
   auto batch = scan->Next().ValueOrDie();
   CHECK(batch.batch_id == 0);
   CHECK(batch.batch->num_rows() == kBatchSize);
@@ -91,7 +91,7 @@ TEST_CASE("Scan move to the next batch") {
   // A batch size that is aligned with the page boundary.
   const int32_t kBatchSize = 4;
   auto scan =
-      Scan::Make(reader, std::make_shared<Schema>(reader->schema()), kBatchSize).ValueOrDie();
+      Scan::Make({{reader, std::make_shared<Schema>(reader->schema())}}, kBatchSize).ValueOrDie();
   auto num_batches = 0;
   while (true) {
     auto batch = scan->Next().ValueOrDie();

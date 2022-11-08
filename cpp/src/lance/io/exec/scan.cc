@@ -22,12 +22,6 @@
 
 namespace lance::io::exec {
 
-::arrow::Result<std::unique_ptr<Scan>> Scan::Make(std::shared_ptr<FileReader> reader,
-                                                  std::shared_ptr<lance::format::Schema> schema,
-                                                  int64_t batch_size) {
-  return Make({{reader, schema}}, batch_size);
-}
-
 ::arrow::Result<std::unique_ptr<Scan>> Scan::Make(const std::vector<FileReaderWithSchema>& readers,
                                                   int64_t batch_size) {
   if (readers.empty()) {
@@ -72,20 +66,19 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
   auto executor = ::arrow::internal::GetCpuThreadPool();
   std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
   for (auto& [reader, schema] : readers_) {
-    ARROW_ASSIGN_OR_RAISE(
-        auto fut,
-        executor->Submit(
-            [](auto& r, auto& s, auto batch_id, auto offset, auto batch_size)
-                -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {
-              ARROW_ASSIGN_OR_RAISE(auto batch,
-                                    r->ReadBatch(*s, batch_id, offset, batch_size));
-              return batch;
-            },
-            reader,
-            schema,
-            batch_id,
-            offset,
-            batch_size_));
+    ARROW_ASSIGN_OR_RAISE(auto fut,
+                          executor->Submit(
+                              [](auto& r, auto& s, auto batch_id, auto offset, auto batch_size)
+                                  -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {
+                                ARROW_ASSIGN_OR_RAISE(
+                                    auto batch, r->ReadBatch(*s, batch_id, offset, batch_size));
+                                return batch;
+                              },
+                              reader,
+                              schema,
+                              batch_id,
+                              offset,
+                              batch_size_));
     futs.emplace_back(std::move(fut));
   }
 
