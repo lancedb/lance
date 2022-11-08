@@ -112,10 +112,9 @@ namespace lance::arrow {
     arrays.emplace_back(left_arr);
   }
 
-  for (auto& field : rhs->struct_type()->fields() | views::filter([&lhs](auto& f) {
-                       return !lhs->GetFieldByName(f->name());
-                     })) {
-    auto& name = field->name();
+  for (auto name : rhs->struct_type()->fields() | views::filter([&lhs](auto& f) {
+                     return !lhs->GetFieldByName(f->name());
+                   }) | views::transform([](auto& f) { return f->name(); })) {
     names.emplace_back(name);
     arrays.emplace_back(rhs->GetFieldByName(name));
   }
