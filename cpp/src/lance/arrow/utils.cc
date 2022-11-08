@@ -49,7 +49,7 @@ namespace lance::arrow {
     return nullptr;
   }
   auto batch = batches[0];
-  for (auto& b : batches | ranges::views::drop(1)) {
+  for (auto& b : batches | views::drop(1)) {
     ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, b, pool));
   }
   return batch;
