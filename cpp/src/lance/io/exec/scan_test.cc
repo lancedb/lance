@@ -118,10 +118,8 @@ TEST_CASE("Scan with multiple readers") {
   auto strs_reader = MakeReader(strs_table).ValueOrDie();
   auto strs_schema = std::make_shared<lance::format::Schema>(strs_table->schema());
 
-  auto scan = Scan::Make({{std::move(ints_reader), std::move(ints_schema)},
-                          {std::move(strs_reader), std::move(strs_schema)}},
-                         100)
-                  .ValueOrDie();
+  auto scan =
+      Scan::Make({{ints_reader, ints_schema}, {strs_reader, strs_schema}}, 100).ValueOrDie();
   auto expected = arrow::RecordBatch::Make(
       arrow::schema({arrow::field("ints", arrow::int32()), arrow::field("strs", arrow::utf8())}),
       5,
