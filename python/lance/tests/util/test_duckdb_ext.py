@@ -4,7 +4,7 @@ from pathlib import Path
 import duckdb
 import torch
 
-from lance.util.duckdb import install_duckdb_extension
+from lance.util.duckdb_ext import install_duckdb_extension
 
 
 def test_ext(tmp_path: Path):

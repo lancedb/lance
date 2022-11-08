@@ -2,7 +2,6 @@ import duckdb
 import os
 import pathlib
 import platform
-import torch
 import urllib.request
 import zipfile
 
@@ -30,6 +29,7 @@ def _get_uri(version):
     uname = platform.uname()
     arch = uname.machine  # arm64, x86_64
     system = uname.system
+    system = "osx" if system.lower() == "darwin" else system
     device = _get_device()
     zip_name = f'lance.duckdb_extension.{system}.{arch}.{device}.zip'
     uri_root = 'https://eto-public.s3.us-west-2.amazonaws.com/'
