@@ -20,6 +20,8 @@
 
 #include <memory>
 #include <mutex>
+#include <tuple>
+#include <vector>
 
 #include "lance/io/exec/base.h"
 
@@ -36,21 +38,28 @@ namespace lance::io::exec {
 /// Leaf scan node.
 class Scan : public ExecNode {
  public:
+  using FileReaderWithSchema =
+      std::tuple<std::shared_ptr<FileReader>, std::shared_ptr<lance::format::Schema>>;
+
   /// Factory method.
-  static ::arrow::Result<std::unique_ptr<Scan>> Make(std::shared_ptr<FileReader> reader,
-                                                     std::shared_ptr<lance::format::Schema> schema,
-                                                     int64_t batch_size);
+  ///
+  /// \param readers a vector of the tuples of `[reader, schema]`, including opened file reader
+  ///                and projection schema.
+  /// \param batch_size batch size.
+  /// \return a Scan node if succeed.
+  static ::arrow::Result<std::unique_ptr<Scan>> Make(
+      const std::vector<FileReaderWithSchema>& readers, int64_t batch_size);
 
   Scan() = delete;
 
-  virtual ~Scan() = default;
+  ~Scan() override = default;
 
   constexpr Type type() const override { return Type::kScan; }
+
   /// Returns the next available batch in the file. Or returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
-  const lance::format::Schema& schema();
-
+  /// Debug String
   std::string ToString() const override;
 
   /// Seek to a particular row.
@@ -63,15 +72,12 @@ class Scan : public ExecNode {
  private:
   /// Constructor
   ///
-  /// \param reader An opened file reader.
-  /// \param schema The scan schema, used to select column to scan.
+  /// \param readers A vector of opened readers with the projected schema.
   /// \param batch_size scan batch size.
-  Scan(std::shared_ptr<FileReader> reader,
-       std::shared_ptr<lance::format::Schema> schema,
+  Scan(const std::vector<FileReaderWithSchema>& readers,
        int64_t batch_size);
 
-  const std::shared_ptr<FileReader> reader_;
-  const std::shared_ptr<lance::format::Schema> schema_;
+  std::vector<FileReaderWithSchema> readers_;
   const int64_t batch_size_;
 
   /// Keep track of the progress.

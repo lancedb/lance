@@ -49,8 +49,9 @@ TEST_CASE("Read limit multiple times") {
   auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<lance::io::FileReader>(infile);
   CHECK(reader->Open().ok());
-  auto scan = lance::io::exec::Scan::Make(reader, std::make_shared<Schema>(reader->schema()), 100)
-                  .ValueOrDie();
+  auto scan =
+      lance::io::exec::Scan::Make({{reader, std::make_shared<Schema>(reader->schema())}}, 100)
+          .ValueOrDie();
   auto counter = std::make_shared<Counter>(5, 10);
   auto limit = Limit(counter, std::move(scan));
   auto batch = limit.Next().ValueOrDie();

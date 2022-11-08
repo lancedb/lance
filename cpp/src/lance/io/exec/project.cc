@@ -55,7 +55,7 @@ Project::Project(std::unique_ptr<ExecNode> child,
     /// Take -> (optionally) Limit -> Filter -> Scan
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_schema, schema.Project(scan_options->filter));
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_node,
-                          Scan::Make(reader, filter_scan_schema, scan_options->batch_size));
+                          Scan::Make({{reader, filter_scan_schema}}, scan_options->batch_size));
     ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(filter_scan_node)));
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
@@ -64,7 +64,8 @@ Project::Project(std::unique_ptr<ExecNode> child,
     ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
   } else {
     /// (*optionally) Limit -> Scan
-    ARROW_ASSIGN_OR_RAISE(child, Scan::Make(reader, projected_schema, scan_options->batch_size));
+    ARROW_ASSIGN_OR_RAISE(
+        child, Scan::Make({{std::move(reader), projected_schema}}, scan_options->batch_size));
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
