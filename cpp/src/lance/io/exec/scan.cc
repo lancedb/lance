@@ -22,6 +22,8 @@
 
 namespace lance::io::exec {
 
+constexpr int kMinimalIOThreads = 4;
+
 ::arrow::Result<std::unique_ptr<Scan>> Scan::Make(const std::vector<FileReaderWithSchema>& readers,
                                                   int64_t batch_size) {
   if (readers.empty()) {
@@ -66,6 +68,11 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
   }
 
   auto executor = ::arrow::internal::GetCpuThreadPool();
+  if (::arrow::GetCpuThreadPoolCapacity() < kMinimalIOThreads) {
+    // Keep a minimal number of threads, preventing live lock on low CPU count (<=2) machines,
+    // i.e., Github Action runners.
+    ARROW_RETURN_NOT_OK(::arrow::SetCpuThreadPoolCapacity(kMinimalIOThreads));
+  }
   std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
   for (auto [reader, schema] : readers_) {
     ARROW_ASSIGN_OR_RAISE(
