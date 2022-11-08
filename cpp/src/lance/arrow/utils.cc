@@ -22,11 +22,14 @@
 #include <fmt/ranges.h>
 
 #include <concepts>
-#include <string>
+#include <range/v3/action.hpp>
+#include <range/v3/view.hpp>
 #include <vector>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
+
+namespace views = ranges::views;
 
 namespace lance::arrow {
 
@@ -46,8 +49,8 @@ namespace lance::arrow {
     return nullptr;
   }
   auto batch = batches[0];
-  for (std::size_t i = 1; i < batches.size(); ++i) {
-    ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, batches[i], pool));
+  for (auto& b : batches | ranges::views::drop(1)) {
+    ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, b, pool));
   }
   return batch;
 }
@@ -109,12 +112,10 @@ namespace lance::arrow {
     arrays.emplace_back(left_arr);
   }
 
-  for (auto& field : rhs->struct_type()->fields()) {
+  for (auto& field : rhs->struct_type()->fields() | views::filter([&lhs](auto& f) {
+                       return !lhs->GetFieldByName(f->name());
+                     })) {
     auto& name = field->name();
-    if (lhs->GetFieldByName(name)) {
-      // We've seen each other before
-      continue;
-    }
     names.emplace_back(name);
     arrays.emplace_back(rhs->GetFieldByName(name));
   }

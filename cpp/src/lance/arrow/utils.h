@@ -33,6 +33,10 @@ namespace lance::arrow {
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
 /// Merge a list of record batches into one.
+///
+/// \param batches A list of record batches.
+/// \param pool memory pool.
+/// \return the merged record batch. Or nullptr if batches is empty.
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
     const std::vector<std::shared_ptr<::arrow::RecordBatch>>& batches,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
