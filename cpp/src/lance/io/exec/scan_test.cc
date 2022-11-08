@@ -25,6 +25,7 @@
 #include "lance/io/exec/base.h"
 #include "lance/testing/io.h"
 
+using lance::arrow::ToArray;
 using lance::format::Schema;
 using lance::io::exec::Scan;
 using lance::testing::MakeReader;
@@ -102,4 +103,30 @@ TEST_CASE("Scan move to the next batch") {
     CHECK(batch.batch->num_rows() == kBatchSize);
   }
   CHECK(num_batches == kPageLength / kBatchSize * kNumBatches);
+}
+
+TEST_CASE("Scan with multiple readers") {
+  auto ints = lance::arrow::ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto strs = ToArray({"1", "2", "3", "4", "5"}).ValueOrDie();
+  auto int_table =
+      arrow::Table::Make(arrow::schema({arrow::field("ints", arrow::int32())}), {ints});
+  auto strs_table =
+      arrow::Table::Make(arrow::schema({arrow::field("strs", arrow::utf8())}), {strs});
+
+  auto ints_reader = MakeReader(int_table).ValueOrDie();
+  auto ints_schema = std::make_shared<lance::format::Schema>(int_table->schema());
+  auto strs_reader = MakeReader(strs_table).ValueOrDie();
+  auto strs_schema = std::make_shared<lance::format::Schema>(strs_table->schema());
+
+  auto scan = Scan::Make({{std::move(ints_reader), std::move(ints_schema)},
+                          {std::move(strs_reader), std::move(strs_schema)}},
+                         100)
+                  .ValueOrDie();
+  auto expected = arrow::RecordBatch::Make(
+      arrow::schema({arrow::field("ints", arrow::int32()), arrow::field("strs", arrow::utf8())}),
+      5,
+      {ints, strs});
+  auto batch = scan->Next().ValueOrDie();
+
+  CHECK(batch.batch->Equals(*expected));
 }
