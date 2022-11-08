@@ -83,7 +83,7 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
   }
 
   std::vector<std::shared_ptr<::arrow::RecordBatch>> batches;
-  for (auto fut : futs) {
+  for (auto& fut : futs) {
     ARROW_ASSIGN_OR_RAISE(auto b, fut.result());
     batches.emplace_back(std::move(b));
   }
