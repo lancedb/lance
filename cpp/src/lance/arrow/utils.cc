@@ -40,6 +40,18 @@ namespace lance::arrow {
   return ::arrow::RecordBatch::FromStructArray(struct_arr);
 }
 
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
+    const std::vector<std::shared_ptr<::arrow::RecordBatch>>& batches, ::arrow::MemoryPool* pool) {
+  if (batches.empty()) {
+    return nullptr;
+  }
+  auto batch = batches[0];
+  for (std::size_t i = 1; i < batches.size(); ++i) {
+    ARROW_ASSIGN_OR_RAISE(batch, MergeRecordBatches(batch, batches[i], pool));
+  }
+  return batch;
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::Array>> MergeListArrays(
     const std::shared_ptr<::arrow::Array>& lhs,
     const std::shared_ptr<::arrow::Array>& rhs,

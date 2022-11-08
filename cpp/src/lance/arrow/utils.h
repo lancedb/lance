@@ -20,6 +20,7 @@
 #include <arrow/result.h>
 
 #include <memory>
+#include <vector>
 
 #include "lance/format/schema.h"
 
@@ -29,6 +30,11 @@ namespace lance::arrow {
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
     const std::shared_ptr<::arrow::RecordBatch>& lhs,
     const std::shared_ptr<::arrow::RecordBatch>& rhs,
+    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
+/// Merge a list of record batches into one.
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
+    const std::vector<std::shared_ptr<::arrow::RecordBatch>>& batches,
     ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
 ::arrow::Result<std::shared_ptr<::arrow::StructArray>> MergeStructArrays(
