@@ -57,7 +57,9 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
         current_batch_page_length_ = first_reader->metadata().GetBatchLength(current_batch_id_);
       }
     }
+    // Lock released after scope.
   }
+  
   if (batch_id >= first_reader->metadata().num_batches()) {
     // Reach EOF
     return ScanBatch::Null();
@@ -83,10 +85,10 @@ Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
   }
 
   std::vector<std::shared_ptr<::arrow::RecordBatch>> batches;
-  for (auto& fut : futs) {
-    ARROW_ASSIGN_OR_RAISE(auto& b, fut.result());
-    batches.emplace_back(std::move(b));
-  }
+//  for (auto& fut : futs) {
+//    ARROW_ASSIGN_OR_RAISE(auto& b, fut.result());
+//    batches.emplace_back(std::move(b));
+//  }
 
   ARROW_ASSIGN_OR_RAISE(auto batch, lance::arrow::MergeRecordBatches(batches));
   return ScanBatch{
