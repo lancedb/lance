@@ -16,12 +16,16 @@
 import os
 import pathlib
 import sys
+from io import BytesIO
 from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+
+import lance.io
+
 try:
     import xmltodict
 except ImportError:
@@ -153,7 +157,8 @@ class OxfordPetConverter(DatasetConverter):
     def _get_index(self, name: str) -> pd.DataFrame:
         """Read the index file with the given name"""
         list_txt = os.path.join(self.uri_root, f"annotations/{name}.txt")
-        df = pd.read_csv(list_txt, delimiter=" ", comment="#", header=None)
+        data = BytesIO(lance.io.read_file(list_txt))
+        df = pd.read_csv(data, delimiter=" ", comment="#", header=None)
         df.columns = ["filename", "class", "species", "breed"]
         return df
 
