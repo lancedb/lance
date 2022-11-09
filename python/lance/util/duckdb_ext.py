@@ -10,6 +10,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+from io import BytesIO
 
 import duckdb
 import os
@@ -74,20 +75,19 @@ def _get_device():
 def _get_latest_version(org='lance', ext='lance_duckdb'):
     uri_root = 'https://eto-public.s3.us-west-2.amazonaws.com/'
     uri = os.path.join(uri_root, 'artifacts', org, ext, 'latest')
-    filehandle, _ = urllib.request.urlretrieve(uri)
-    with open(filehandle, 'r') as fh:
-        return fh.read().strip()
+    with urllib.request.urlopen(uri) as fh:
+        return fh.read().decode().strip()
 
 
 def _download_and_unzip(org, ext, uri):
-    filehandle, _ = urllib.request.urlretrieve(uri)
-    zip_file_object = zipfile.ZipFile(filehandle, 'r')
-    first_file = zip_file_object.namelist()[0]
-    ext_path = f'/tmp/{org}/{ext}'
-    os.makedirs(ext_path, exist_ok=True)
-    output_path = f'{ext_path}/{pathlib.Path(first_file).name}'
-    with zip_file_object.open(first_file) as in_:
-        content = in_.read()
-        with open(output_path, 'wb') as out_:
-            out_.write(content)
-    return output_path
+    with urllib.request.urlopen(uri) as fh:
+        zip_file_object = zipfile.ZipFile(BytesIO(fh.read()), 'r')
+        first_file = zip_file_object.namelist()[0]
+        ext_path = f'/tmp/{org}/{ext}'
+        os.makedirs(ext_path, exist_ok=True)
+        output_path = f'{ext_path}/{pathlib.Path(first_file).name}'
+        with zip_file_object.open(first_file) as in_:
+            content = in_.read()
+            with open(output_path, 'wb') as out_:
+                out_.write(content)
+        return output_path
