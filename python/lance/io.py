@@ -145,6 +145,5 @@ def download_uris(uris, num_workers=mp.cpu_count() - 1, func=read_file):
     func: str -> bytes, default read_file
         Can be overridden to provide custom behavior or pre/post-processing
     """
-    pool = mp.Pool(num_workers)
-    data = pool.map(func, uris)
-    return data
+    with mp.Pool(num_workers) as pool:
+        return pool.map(func, uris)
