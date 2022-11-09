@@ -25,6 +25,7 @@
 #include <memory>
 #include <range/v3/view.hpp>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -656,6 +657,36 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return merged;
 }
 
+// Forward declaration
+::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs);
+
+namespace {
+
+::arrow::Result<std::vector<std::shared_ptr<Field>>> GetIntersection(
+    const std::vector<std::shared_ptr<Field>>& lhs,
+    const std::vector<std::shared_ptr<Field>>& rhs) {
+  std::vector<std::shared_ptr<Field>> results;
+
+  std::unordered_map<std::string, std::shared_ptr<Field>> rhs_map;
+  for (auto& field : rhs) {
+    rhs_map[field->name()] = field;
+  }
+  for (auto& field : lhs) {
+    auto it = rhs_map.find(field->name());
+    if (it == rhs_map.end()) {
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto intersection, Intersection(*field, *it->second));
+    if (intersection) {
+      results.emplace_back(intersection);
+    }
+  }
+  return results;
+}
+
+};  // namespace
+
+// Not in anonymous namespace because it is friend method of Field.
 ::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs) {
   if (lhs.name() != rhs.name()) {
     return ::arrow::Status::Invalid(
@@ -670,6 +701,12 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
                                     rhs_type->ToString());
   }
   if (lance::arrow::is_struct(lhs_type)) {
+    ARROW_ASSIGN_OR_RAISE(auto children, GetIntersection(lhs.children_, rhs.children_));
+    if (!children.empty()) {
+      auto intersection = lhs.Copy(false);
+      intersection->children_ = std::move(children);
+      return intersection;
+    }
   } else if (lance::arrow::is_list(lhs_type)) {
     ARROW_ASSIGN_OR_RAISE(auto child, Intersection(*lhs.field(0), *rhs.field(0)));
     if (child) {
@@ -686,19 +723,8 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Intersection(const Schema& other) const {
   auto intersection = std::make_shared<Schema>();
 
-  std::unordered_set<std::string> other_names;
-  for (auto& other_field : other.fields_) {
-    other_names.emplace(other_field->name());
-  }
-  for (auto& field : fields_) {
-    if (other_names.contains(field->name())) {
-      ARROW_ASSIGN_OR_RAISE(auto intersect,
-                            format::Intersection(*field, *other.GetField(field->name())));
-      if (intersect) {
-        intersection->AddField(intersect);
-      }
-    }
-  }
+  ARROW_ASSIGN_OR_RAISE(auto fields, GetIntersection(fields_, other.fields_));
+  intersection->fields_ = std::move(fields);
   return intersection;
 }
 

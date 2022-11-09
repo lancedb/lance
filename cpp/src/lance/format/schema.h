@@ -171,8 +171,10 @@ class Field final {
 
   std::shared_ptr<Field> Get(int32_t id);
 
+  /// Convert to Apache Arrow Field.
   std::shared_ptr<::arrow::Field> ToArrow() const;
 
+  /// Serialize to Protobuf.
   std::vector<lance::format::pb::Field> ToProto() const;
 
   /// Returns Field ID.
