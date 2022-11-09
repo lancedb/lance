@@ -17,8 +17,10 @@
 #include <arrow/type.h>
 #include <arrow/util/key_value_metadata.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <range/v3/all.hpp>
 
 #include "lance/arrow/stl.h"
 #include "lance/testing/extension_types.h"
@@ -29,6 +31,7 @@ using lance::arrow::ToArray;
 using lance::format::Schema;
 using lance::testing::MakeDataset;
 using lance::testing::TableFromJSON;
+using namespace ranges;
 
 const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
@@ -91,7 +94,7 @@ TEST_CASE("Project nested fields") {
 
 TEST_CASE("Get schema view") {
   auto original = lance::format::Schema(arrow_schema);
-  auto view = original.Project({"split", "annotations.box.xmin"});
+  auto view = original.Project(std::vector<std::string>({"split", "annotations.box.xmin"}));
   INFO("Create view status: " << view.status());
   CHECK(view.ok());
   CHECK((*view)->GetField("split"));
@@ -119,9 +122,20 @@ TEST_CASE("Get projection via arrow schema") {
   CHECK(expect_schema.Equals(projection, false));
 }
 
+TEST_CASE("Project using field ids") {
+  auto schema = lance::format::Schema(arrow_schema);
+  fmt::print("Schema ids: {}\n", schema.GetFieldIds());
+}
+
+TEST_CASE("Test GetFieldIds") {
+  auto schema = lance::format::Schema(arrow_schema);
+  CHECK(schema.GetFieldIds() == (views::iota(0, 10) | to<std::vector<int32_t>>));
+}
+
 TEST_CASE("Exclude schema") {
   auto original = lance::format::Schema(arrow_schema);
-  auto projected = original.Project({"split", "annotations.box"}).ValueOrDie();
+  auto projected =
+      original.Project(std::vector<std::string>{"split", "annotations.box"}).ValueOrDie();
   INFO("Projected schema: " << projected->ToString());
   auto excluded = original.Exclude(*projected).ValueOrDie();
 

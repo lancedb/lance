@@ -23,7 +23,9 @@
 
 #include <algorithm>
 #include <memory>
+#include <range/v3/view.hpp>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "lance/arrow/type.h"
@@ -36,6 +38,7 @@
 using std::make_shared;
 using std::string;
 using std::vector;
+using namespace ranges;
 
 namespace lance::format {
 
@@ -577,6 +580,23 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
     columns.emplace_back(column_name);
   }
   return Project(columns);
+}
+
+::arrow::Result<std::shared_ptr<Schema>> Schema::Project(
+    const std::vector<FieldIdType>& field_ids) const {
+  assert(!field_ids.empty());
+  std::unordered_set<FieldIdType> field_id_set(std::begin(field_ids), std::end(field_ids));
+  if (field_id_set.size() != field_ids.size()) {
+    return ::arrow::Status::Invalid("Schema::Project: duplicated field id found");
+  }
+  google::protobuf::RepeatedPtrField<pb::Field> protos;
+  for (auto& pb : ToProto()) {
+    if (field_id_set.contains(pb.id())) {
+      *protos.Add() = pb;
+    }
+  }
+  auto projected = std::make_shared<Schema>(protos);
+  return projected;
 }
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(const Schema& other) const {
