@@ -93,6 +93,12 @@ class Schema final {
   /// \return A newly merged schema.
   ::arrow::Result<std::shared_ptr<Schema>> Merge(const ::arrow::Schema& arrow_schema) const;
 
+  /// Intersection between two Schemas
+  ///
+  /// \param other the other schema to run intersection with.
+  /// \return the intersection of two schemas.
+  ::arrow::Result<std::shared_ptr<Schema>> Intersection(const Schema& other) const;
+
   /// Add a new parent field.
   void AddField(std::shared_ptr<Field> f);
 

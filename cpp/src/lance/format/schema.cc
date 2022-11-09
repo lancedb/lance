@@ -656,6 +656,37 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return merged;
 }
 
+namespace {
+
+::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs) {
+  if (lhs.name() != rhs.name()) {
+    return ::arrow::Status::Invalid(
+        "Intersection over two different fields: ", lhs.name(), " != ", rhs.name());
+  }
+  return ::arrow::Status::NotImplemented("not implemented");
+}
+
+}  // namespace
+
+::arrow::Result<std::shared_ptr<Schema>> Schema::Intersection(const Schema& other) const {
+  auto intersection = std::make_shared<Schema>();
+
+  std::unordered_set<std::string> other_names;
+  for (auto& other_field : other.fields_) {
+    other_names.emplace(other_field->name());
+  }
+  for (auto& field : fields_) {
+    if (other_names.contains(field->name())) {
+      ARROW_ASSIGN_OR_RAISE(auto intersect,
+                            format::Intersection(*field, *other.GetField(field->name())));
+      if (intersect) {
+        intersection->AddField(intersect);
+      }
+    }
+  }
+  return std::move(intersection);
+}
+
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
 
 std::shared_ptr<Field> Schema::GetField(int32_t id) const {
