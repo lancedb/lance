@@ -697,11 +697,9 @@ int32_t Schema::GetFieldsCount() const {
 
 std::vector<int32_t> Schema::GetFieldIds() const {
   auto protos = ToProto();
-  std::vector<int32_t> ids;
-  for (auto& p : protos) {
-    ids.emplace_back(p.id());
-  }
-  return ids;
+  return protos                                              //
+         | views::transform([](auto& f) { return f.id(); })  //
+         | to<std::vector<int32_t>>;
 }
 
 std::vector<lance::format::pb::Field> Schema::ToProto() const {
@@ -720,6 +718,7 @@ std::shared_ptr<Schema> Schema::Copy() const {
   for (auto& field : fields_) {
     copy->fields_.emplace_back(field->Copy(true));
   };
+  copy->metadata_ = metadata_;
   return copy;
 }
 
