@@ -109,7 +109,7 @@ impl Field {
             "double" => DataType::Float64,
             "binary" => DataType::Binary,
             "string" => DataType::Utf8,
-            _ => panic!(),
+            x => DataType::Extension("not_supported_yet".to_string(), Box::new(DataType::Binary), Some(x.to_string())),
         }
     }
 

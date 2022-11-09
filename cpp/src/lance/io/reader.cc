@@ -164,6 +164,9 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
   return std::static_pointer_cast<::arrow::Int32Array>(datum.make_array());
 }
 
+//GetListScalar -> one row have a field, the field is a list, get that list
+//GetArray -> get rows of a field, the field can be any type
+//GetListArray -> get rows of a field, the field should be in type list
 ::arrow::Result<::std::shared_ptr<::arrow::Scalar>> FileReader::GetListScalar(
     const std::shared_ptr<lance::format::Field>& field, int32_t batch_id, int32_t idx) const {
   auto field_id = field->id();

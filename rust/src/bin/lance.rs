@@ -56,10 +56,10 @@ fn main() {
         Commands::Show { path } => {
             let f = File::open(path).unwrap();
             let reader = FileReader::new(f).unwrap();
-            // println!("Number of RecordBatch: {}", reader.num_chunks());
-            // println!("Schema: {}\n", reader.schema());
-            let chunk = reader.get(0);
-            println!("chunk sample: {:?}", chunk)
+            reader.get(0).iter().enumerate().for_each(|(idx, x)| {
+                println!("field: {:?}", reader.schema().fields[idx].name);
+                println!("example value: {:?}", x)
+            });
         }
     }
 }

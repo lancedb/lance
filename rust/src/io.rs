@@ -13,10 +13,12 @@
 //  limitations under the License.
 
 use std::any::Any;
+use std::fmt::{Debug, Formatter};
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use arrow2::array::{Array, DictionaryKey};
 use arrow2::datatypes::DataType;
-use arrow2::scalar::{Scalar, StructScalar};
+use arrow2::scalar::{Scalar, StructScalar, Utf8Scalar};
+use arrow2::types::Offset;
 use arrow2::types::Index;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -168,13 +170,16 @@ impl<R: Read + Seek> FileReader<R> {
         //FileReader::GetScalar
         match field.data_type() {
             DataType::Struct(_) => {
-                self.get_struct_scalar(field, batch_id, idx_in_batch)
+                Box::new(Utf8Scalar::<i32>::new(Some("struct not support yet")))
             }
             DataType::List(_) => {
-                self.get_array_scalar(field, batch_id, idx_in_batch)
+                Box::new(Utf8Scalar::<i32>::new(Some("list not support yet")))
             }
-            _ => {
-                self.get_primitive_scalar(field, batch_id, idx_in_batch)
+            DataType::Extension(t, _, Some(x)) if t == "not_supported_yet" => {
+                Box::new(Utf8Scalar::<i32>::new(Some(format!("data_type {:} not supported yet", x))))
+            }
+            x => {
+                Box::new(Utf8Scalar::<i32>::new(Some(format!("field in type{:?}", x))))
             }
         }
     }
@@ -189,7 +194,7 @@ impl<R: Read + Seek> FileReader<R> {
         return Box::new(StructScalar::new(field.data_type(), values.into()));
     }
 
-    fn get_array_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+    fn get_list_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
         //FileReader::GetListScalar
         // auto field_id = field->id();
         let field_id = field.id;
@@ -200,7 +205,7 @@ impl<R: Read + Seek> FileReader<R> {
         // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
         let mut decoder = field.get_decoder(&self.file, page_info);
 
-        let val = decoder.decode(idx_in_batch, Option(2)).unwrap();
+        let val = decoder.decode(idx_in_batch, &Some(2)).unwrap();
         // ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
         // auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
         // if (offsets->Value(0) == offsets->Value(1)) {
