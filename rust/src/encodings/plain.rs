@@ -25,7 +25,7 @@ use arrow2::array::new_empty_array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
 use arrow2::datatypes::PrimitiveType;
-use arrow2::scalar::Scalar;
+use arrow2::scalar::{PrimitiveScalar, Scalar};
 use arrow2::types::NativeType;
 
 use crate::encodings::Decoder;
@@ -78,12 +78,6 @@ impl<'a, R: Read + Seek, T: NativeType> PlainDecoder<'a, R, T> {
             Ok(Box::new(arr))
         }
     }
-
-    fn _value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
-        let arr = self._decode(i as i32, &Some(1 as i32)).unwrap();
-        arr.value(0);
-        todo!()
-    }
 }
 
 impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
@@ -115,6 +109,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
     }
 
     fn value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
-        self._value(i)
+        let arr = self._decode(i as i32, &Some(1 as i32)).unwrap();
+        Ok(Box::new(PrimitiveScalar::from(Some(arr.value(0)))))
     }
 }
