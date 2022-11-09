@@ -697,7 +697,7 @@ int32_t Schema::GetFieldsCount() const {
 
 std::vector<int32_t> Schema::GetFieldIds() const {
   auto protos = ToProto();
-  std::vector<int32_t> ids(protos.size());
+  std::vector<int32_t> ids;
   for (auto& p : protos) {
     ids.emplace_back(p.id());
   }

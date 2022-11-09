@@ -124,7 +124,23 @@ TEST_CASE("Get projection via arrow schema") {
 
 TEST_CASE("Project using field ids") {
   auto schema = lance::format::Schema(arrow_schema);
-  fmt::print("Schema ids: {}\n", schema.GetFieldIds());
+  for (const auto& name : arrow_schema->field_names()) {
+    auto fields = schema.Project({name}).ValueOrDie()->GetFieldIds();
+    auto project = schema.Project(fields).ValueOrDie();
+    CHECK(project->ToArrow()->Equals(::arrow::schema({arrow_schema->GetFieldByName(name)})));
+  }
+
+  auto fields = schema.Project({"annotations.box"}).ValueOrDie()->GetFieldIds();
+  auto project = schema.Project(fields).ValueOrDie();
+  CHECK(project->ToArrow()->Equals(::arrow::schema({::arrow::field(
+      "annotations",
+      ::arrow::list(::arrow::struct_({::arrow::field("box",
+                                                     ::arrow::struct_({
+                                                         ::arrow::field("xmin", ::arrow::float32()),
+                                                         ::arrow::field("ymin", ::arrow::float32()),
+                                                         ::arrow::field("xmax", ::arrow::float32()),
+                                                         ::arrow::field("ymax", ::arrow::float32()),
+                                                     }))})))})));
 }
 
 TEST_CASE("Test GetFieldIds") {
