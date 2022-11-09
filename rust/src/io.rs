@@ -12,14 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::any::Any;
-use std::fmt::{Debug, Formatter};
-use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use arrow2::array::{Array, DictionaryKey};
 use arrow2::datatypes::DataType;
 use arrow2::scalar::{Scalar, StructScalar, Utf8Scalar};
-use arrow2::types::Offset;
 use arrow2::types::Index;
+use arrow2::types::Offset;
+use std::any::Any;
+use std::fmt::{Debug, Formatter};
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -97,7 +97,12 @@ impl<R: Read + Seek> FileReader<R> {
             ProtoParser::read(&mut f, pb_meta.manifest_position as i64)?;
         let num_columns = manifest.fields.len();
         let num_batches = pb_meta.batch_offsets.len() - 1;
-        let page_table = PageTable::make(&mut f, pb_meta.page_table_position, num_columns, num_batches);
+        let page_table = PageTable::make(
+            &mut f,
+            pb_meta.page_table_position,
+            num_columns,
+            num_batches,
+        );
         let metadata = Metadata::make(pb_meta);
         Ok(FileReader {
             file: f,
@@ -115,7 +120,7 @@ impl<R: Read + Seek> FileReader<R> {
         self.metadata.num_chunks()
     }
 
-    pub fn get(&self, idx: u32) -> Vec<Box<dyn Scalar>> {
+    pub fn get(&mut self, idx: u32) -> Vec<Box<dyn Scalar>> {
         // TODO usize for idiomatic ? or i32 for protobuf compatibility?
         // FileReader::Get
         let schema = self.schema();
@@ -128,7 +133,6 @@ impl<R: Read + Seek> FileReader<R> {
         }
         return res;
     }
-
 
     fn get_array(field: &Field, batch_id: usize, array_params: ArrayParams) -> Box<dyn Array> {
         // TODO
@@ -147,44 +151,65 @@ impl<R: Read + Seek> FileReader<R> {
         todo!()
     }
 
-    fn get_list_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+    fn get_list_array(
+        field: &Field,
+        batch_id: usize,
+        array_params: &ArrayParams,
+    ) -> Box<dyn Array> {
         todo!()
     }
 
-    fn get_struct_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+    fn get_struct_array(
+        field: &Field,
+        batch_id: usize,
+        array_params: &ArrayParams,
+    ) -> Box<dyn Array> {
         todo!()
     }
 
-    fn get_dictionary_array(field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+    fn get_dictionary_array(
+        field: &Field,
+        batch_id: usize,
+        array_params: &ArrayParams,
+    ) -> Box<dyn Array> {
         todo!()
     }
 
-    fn get_primitive_array(&self, field: &Field, batch_id: usize, array_params: &ArrayParams) -> Box<dyn Array> {
+    fn get_primitive_array(
+        &self,
+        field: &Field,
+        batch_id: usize,
+        array_params: &ArrayParams,
+    ) -> Box<dyn Array> {
         let field_id = field.id.to_usize();
         let page_info = self.page_table.get_page_info(field_id, batch_id);
         // field.get_decoder(&self.file);
         todo!()
     }
 
-    fn get_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn arrow2::scalar::Scalar> {
+    fn get_scalar(
+        &mut self,
+        field: &Field,
+        batch_id: i32,
+        idx_in_batch: i32,
+    ) -> Box<dyn arrow2::scalar::Scalar> {
         //FileReader::GetScalar
         match field.data_type() {
-            DataType::Struct(_) => {
-                Box::new(Utf8Scalar::<i32>::new(Some("struct not support yet")))
-            }
-            DataType::List(_) => {
-                Box::new(Utf8Scalar::<i32>::new(Some("list not support yet")))
-            }
-            DataType::Extension(t, _, Some(x)) if t == "not_supported_yet" => {
-                Box::new(Utf8Scalar::<i32>::new(Some(format!("data_type {:} not supported yet", x))))
-            }
-            x => {
-                self.get_primitive_scalar(field, batch_id, idx_in_batch)
-            }
+            DataType::Struct(_) => Box::new(Utf8Scalar::<i32>::new(Some("struct not support yet"))),
+            DataType::List(_) => Box::new(Utf8Scalar::<i32>::new(Some("list not support yet"))),
+            DataType::Extension(t, _, Some(x)) if t == "not_supported_yet" => Box::new(
+                Utf8Scalar::<i32>::new(Some(format!("data_type {:} not supported yet", x))),
+            ),
+            x => self.get_primitive_scalar(field, batch_id, idx_in_batch),
         }
     }
 
-    fn get_struct_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+    fn get_struct_scalar(
+        &mut self,
+        field: &Field,
+        batch_id: i32,
+        idx_in_batch: i32,
+    ) -> Box<dyn Scalar> {
         //FileReader::GetStructScalar
         let mut values = Vec::new();
         for child in field.fields() {
@@ -194,16 +219,23 @@ impl<R: Read + Seek> FileReader<R> {
         return Box::new(StructScalar::new(field.data_type(), values.into()));
     }
 
-    fn get_list_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+    fn get_list_scalar(
+        &mut self,
+        field: &Field,
+        batch_id: i32,
+        idx_in_batch: i32,
+    ) -> Box<dyn Scalar> {
         //FileReader::GetListScalar
         // auto field_id = field->id();
         let field_id = field.id;
-        let page_info = self.page_table.get_page_info(field_id as usize, batch_id as usize);
+        let page_info = self
+            .page_table
+            .get_page_info(field_id as usize, batch_id as usize);
         // ARROW_ASSIGN_OR_RAISE(auto page, GetPageInfo(field_id, batch_id));
         // auto [pos, length] = page;
         // decoder->Reset(pos, length);
         // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
-        let mut decoder = field.get_decoder(&self.file, page_info);
+        let mut decoder = field.get_decoder(&mut self.file, page_info);
 
         let val = decoder.decode(idx_in_batch, &Some(2)).unwrap();
         // ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
@@ -220,13 +252,20 @@ impl<R: Read + Seek> FileReader<R> {
         todo!()
     }
 
-    fn get_primitive_scalar(&self, field: &Field, batch_id: i32, idx_in_batch: i32) -> Box<dyn Scalar> {
+    fn get_primitive_scalar(
+        &mut self,
+        field: &Field,
+        batch_id: i32,
+        idx_in_batch: i32,
+    ) -> Box<dyn Scalar> {
         //FileReader::GetPrimitiveScalar
         let data_type = field.data_type();
         let field_id = field.id;
-        let page_info = self.page_table.get_page_info(field_id as usize, batch_id as usize);
+        let page_info = self
+            .page_table
+            .get_page_info(field_id as usize, batch_id as usize);
 
-        let mut decoder = field.get_decoder(&self.file, page_info);
+        let mut decoder = field.get_decoder(&mut self.file, page_info);
         return decoder.value(idx_in_batch as usize).unwrap();
     }
 }

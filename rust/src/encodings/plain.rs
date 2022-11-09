@@ -19,9 +19,9 @@ use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use arrow2::array::{Array, PrimitiveArray};
-use arrow2::array::Int32Array;
 use arrow2::array::new_empty_array;
+use arrow2::array::Int32Array;
+use arrow2::array::{Array, PrimitiveArray};
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
 use arrow2::datatypes::PrimitiveType;
@@ -104,7 +104,10 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
         let res = take(values.as_ref(), &reset_indices);
         match res {
             Ok(arr) => Ok(arr),
-            Err(e) => Err(Error::new(ErrorKind::InvalidData, format!("Error take indices: {}", e)))
+            Err(e) => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Error take indices: {}", e),
+            )),
         }
     }
 

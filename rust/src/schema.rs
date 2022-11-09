@@ -18,9 +18,11 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io::{Read, Seek};
 
-use arrow2::datatypes::{DataType, TimeUnit};
-use arrow2::types::NativeType;
+use arrow2::datatypes::PhysicalType::Primitive;
+use arrow2::datatypes::{DataType, PhysicalType, PrimitiveType, TimeUnit};
+use arrow2::types::{days_ms, f16, i256, months_days_ns, NativeType};
 
+use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoding};
 use crate::format::pb;
 use crate::page_table::PageInfo;
@@ -67,8 +69,125 @@ impl Field {
         return &self.children;
     }
 
-    pub fn get_decoder<R: Read + Seek>(&self, reader: &R, page_info: PageInfo) -> Box<dyn Decoder> {
+    pub fn get_decoder<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        page_info: PageInfo,
+    ) -> Box<dyn Decoder> {
         //Field::GetDecoder
+
+        match self.data_type().to_physical_type() {
+            Primitive(t) => match t {
+                PrimitiveType::Int8 => {
+                    return Box::new(PlainDecoder::<R, i8>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Int16 => {
+                    return Box::new(PlainDecoder::<R, i16>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Int32 => {
+                    return Box::new(PlainDecoder::<R,i32>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Int64 => {
+                    return Box::new(PlainDecoder::<R, i64>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Int128 => {
+                    return Box::new(PlainDecoder::<R, i128>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Int256 => {
+                    return Box::new(PlainDecoder::<R, i256>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::UInt8 => {
+                    return Box::new(PlainDecoder::<R, u8>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::UInt16 => {
+                    return Box::new(PlainDecoder::<R, u16>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::UInt32 => {
+                    return Box::new(PlainDecoder::<R, u32>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::UInt64 => {
+                    return Box::new(PlainDecoder::<R, u64>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Float16 => {
+                    return Box::new(PlainDecoder::<R, f16>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Float32 => {
+                    return Box::new(PlainDecoder::<R, f32>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::Float64 => {
+                    return Box::new(PlainDecoder::<R, f64>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::DaysMs => {
+                    return Box::new(PlainDecoder::<R, days_ms>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                PrimitiveType::MonthDayNano => {
+                    return Box::new(PlainDecoder::<R, months_days_ns>::new(
+                        reader,
+                        page_info.position as u64,
+                        page_info.length,
+                    ));
+                }
+                _ => todo!(),
+            },
+            _ => todo!(),
+        }
+
         todo!()
     }
 
@@ -109,7 +228,11 @@ impl Field {
             "double" => DataType::Float64,
             "binary" => DataType::Binary,
             "string" => DataType::Utf8,
-            x => DataType::Extension("not_supported_yet".to_string(), Box::new(DataType::Binary), Some(x.to_string())),
+            x => DataType::Extension(
+                "not_supported_yet".to_string(),
+                Box::new(DataType::Binary),
+                Some(x.to_string()),
+            ),
         }
     }
 
@@ -138,7 +261,9 @@ impl Field {
             DataType::LargeBinary => "largebinary".to_string(),
             DataType::LargeUtf8 => "largestring".to_string(),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", len),
-            DataType::FixedSizeList(v, len) => format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len),
+            DataType::FixedSizeList(v, len) => {
+                format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len)
+            }
             _ => panic!(),
         }
     }
@@ -147,16 +272,7 @@ impl Field {
         use DataType::*;
         matches!(
             t,
-            UInt8
-                | UInt16
-                | UInt32
-                | UInt64
-                | Int8
-                | Int16
-                | Int32
-                | Int64
-                | Float32
-                | Float64
+            UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64 | Float32 | Float64
         )
     }
 
@@ -180,10 +296,10 @@ impl Field {
 
 fn to_str(unit: &TimeUnit) -> &'static str {
     match unit {
-        TimeUnit::Second => { "s" }
-        TimeUnit::Millisecond => { "ms" }
-        TimeUnit::Microsecond => { "us" }
-        TimeUnit::Nanosecond => { "ns" }
+        TimeUnit::Second => "s",
+        TimeUnit::Millisecond => "ms",
+        TimeUnit::Microsecond => "us",
+        TimeUnit::Nanosecond => "ns",
     }
 }
 
@@ -218,11 +334,7 @@ impl Schema {
     /// Create a Schema from arrow schema.
     pub fn new(schema: &arrow2::datatypes::Schema) -> Schema {
         Schema {
-            fields: schema
-                .fields
-                .iter()
-                .map(Field::new)
-                .collect(),
+            fields: schema.fields.iter().map(Field::new).collect(),
         }
     }
     /// Create a new schema from protobuf.

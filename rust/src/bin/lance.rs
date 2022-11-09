@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use std::fs::{File, read};
+use std::fs::{read, File};
 
 use clap::{Parser, Subcommand};
 
@@ -50,7 +50,8 @@ fn main() {
             println!("Number of RecordBatch: {}", reader.num_chunks());
             println!("Schema: {}\n", reader.schema());
             use std::any::TypeId;
-            let is_little_endian = TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>();
+            let is_little_endian =
+                TypeId::of::<byteorder::NativeEndian>() == TypeId::of::<byteorder::LittleEndian>();
             println!("Is little endian {:?}", is_little_endian)
         }
         Commands::Show { path } => {

@@ -2,7 +2,6 @@ use std::fs::Metadata;
 
 #[test]
 fn test_locate_batch() {
-
     use lance::metadata::Metadata;
     let mut metadata = Metadata::make(lance::format::pb::Metadata::default());
     metadata.add_batch_length(10);
