@@ -47,7 +47,6 @@ pub trait Encoder {
 
 /// Decoder.
 pub trait Decoder {
-    // type ArrowType;
 
     fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>>;
 
