@@ -596,6 +596,10 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
     }
   }
   auto projected = std::make_shared<Schema>(protos);
+  if (static_cast<size_t>(projected->GetFieldsCount()) != field_ids.size()) {
+    return ::arrow::Status::Invalid(fmt::format(
+        "Schema::Project(field_ids): field ids can not build a schema tree, ids={}", field_ids));
+  }
   return projected;
 }
 
