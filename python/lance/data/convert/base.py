@@ -106,9 +106,11 @@ class DatasetConverter(ABC):
         """pyarrow is unable to convert ExtensionTypes properly in pa.Table.from_pandas"""
         if isinstance(typ, pa.ExtensionType):
             storage = pa.array(col, type=typ.storage_type)
-            arr = pa.ExtensionArray.from_storage(typ, storage)
+            return pa.ExtensionArray.from_storage(typ, storage)
         elif pa.types.is_list(typ):
             native_arr = pa.array(col)
+            if isinstance(native_arr, pa.NullArray):
+                return pa.nulls(len(native_arr), typ)
             offsets = native_arr.offsets
             values = native_arr.values.to_numpy(zero_copy_only=False)
             return pa.ListArray.from_arrays(
@@ -116,6 +118,8 @@ class DatasetConverter(ABC):
             )
         elif pa.types.is_struct(typ):
             native_arr = pa.array(col)
+            if isinstance(native_arr, pa.NullArray):
+                return pa.nulls(len(native_arr), typ)
             arrays = []
             for subfield in typ:
                 sub_arr = native_arr.field(subfield.name)
@@ -127,8 +131,7 @@ class DatasetConverter(ABC):
                 arrays.append(converted)
             return pa.StructArray.from_arrays(arrays, fields=typ)
         else:
-            arr = pa.array(col, type=typ)
-        return arr
+            return pa.array(col, type=typ)
 
     def make_embedded_dataset(
         self,
