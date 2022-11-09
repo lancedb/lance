@@ -30,7 +30,7 @@ use crate::page_table::PageInfo;
 /// Lance Field.
 ///
 /// Metadata of a column.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct Field {
     pub id: i32,
     pub parent_id: i32,
@@ -325,7 +325,7 @@ impl fmt::Display for Field {
 }
 
 /// Lance file Schema.
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct Schema {
     pub fields: Vec<Field>,
 }

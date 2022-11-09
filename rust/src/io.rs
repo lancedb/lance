@@ -12,15 +12,13 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use arrow2::array::{Array, DictionaryKey};
+use std::fmt::Debug;
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
+
+use arrow2::array::Array;
 use arrow2::datatypes::DataType;
 use arrow2::scalar::{Scalar, StructScalar, Utf8Scalar};
 use arrow2::types::Index;
-use arrow2::types::Offset;
-use std::any::Any;
-use std::fmt::{Debug, Formatter};
-use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
-
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::metadata::Metadata;
@@ -123,12 +121,12 @@ impl<R: Read + Seek> FileReader<R> {
     pub fn get(&mut self, idx: u32) -> Vec<Box<dyn Scalar>> {
         // TODO usize for idiomatic ? or i32 for protobuf compatibility?
         // FileReader::Get
-        let schema = self.schema();
+        let schema = (*self.schema()).clone();
         let (batch_id, idx_in_batch) = self.metadata.locate_batch(idx as i32).unwrap();
         let mut res = Vec::new();
         for field in &schema.fields {
             let num_batches = self.metadata.num_batches();
-            let v = self.get_scalar(field, batch_id, idx_in_batch);
+            let v = self.get_scalar(&field, batch_id, idx_in_batch);
             res.push(v)
         }
         return res;

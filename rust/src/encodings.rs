@@ -23,7 +23,7 @@ use arrow2::scalar::Scalar;
 
 pub mod plain;
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub enum Encoding {
     Plain,
     VarBinary,
