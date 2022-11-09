@@ -54,5 +54,5 @@ pub trait Decoder {
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>>;
 
-    fn value(&self, i: usize) -> Result<Box<dyn Scalar>>;
+    fn value(&mut self, i: usize) -> Result<Box<dyn Scalar>>;
 }

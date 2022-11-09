@@ -17,6 +17,7 @@
 use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::marker::PhantomData;
+use std::ops::Deref;
 
 use arrow2::array::{Array, PrimitiveArray};
 use arrow2::array::Int32Array;
@@ -43,15 +44,11 @@ impl<'a, R: Read + Seek, T: NativeType> PlainDecoder<'a, R, T> {
             file,
             position,
             page_length,
-            phantom: Default::default()
+            phantom: Default::default(),
         }
     }
-}
 
-impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
-    // type ArrowType = T;
-
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> {
+    fn _decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<PrimitiveArray<T>>> {
         let read_len = length.unwrap_or((self.page_length - (offset as i64)) as i32) as usize;
         (*self.file).seek(SeekFrom::Start(self.position + offset as u64))?;
         let mut buffer = vec![T::default(); read_len];
@@ -82,6 +79,24 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
         }
     }
 
+    fn _value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
+        let arr = self._decode(i as i32, &Some(1 as i32)).unwrap();
+        arr.value(0);
+        todo!()
+    }
+}
+
+impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
+    // type ArrowType = T;
+
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> {
+        self._decode(offset, length).map(|x| {
+            // TODO no idea why we need this to compile
+            let new_box: Box<dyn Array> = Box::new(*x);
+            new_box
+        })
+    }
+
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>> {
         if indices.len() == 0 {
             return Ok(new_empty_array(T::PRIMITIVE.into()));
@@ -99,7 +114,7 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
         }
     }
 
-    fn value(&self, i: usize) -> Result<Box<dyn Scalar>> {
-        todo!()
+    fn value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
+        self._value(i)
     }
 }

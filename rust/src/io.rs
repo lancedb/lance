@@ -179,7 +179,7 @@ impl<R: Read + Seek> FileReader<R> {
                 Box::new(Utf8Scalar::<i32>::new(Some(format!("data_type {:} not supported yet", x))))
             }
             x => {
-                Box::new(Utf8Scalar::<i32>::new(Some(format!("field in type{:?}", x))))
+                self.get_primitive_scalar(field, batch_id, idx_in_batch)
             }
         }
     }
@@ -226,7 +226,7 @@ impl<R: Read + Seek> FileReader<R> {
         let field_id = field.id;
         let page_info = self.page_table.get_page_info(field_id as usize, batch_id as usize);
 
-        let decoder = field.get_decoder(&self.file, page_info);
+        let mut decoder = field.get_decoder(&self.file, page_info);
         return decoder.value(idx_in_batch as usize).unwrap();
     }
 }
