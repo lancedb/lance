@@ -285,6 +285,7 @@ class Field final {
                                    std::vector<std::string> components,
                                    std::size_t comp_idx);
   friend void Print(const Field& field, const std::string& path, int indent);
+  friend ::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs);
 
   std::vector<std::shared_ptr<Field>> children_;
 };

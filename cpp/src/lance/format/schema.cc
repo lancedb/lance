@@ -656,17 +656,32 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return merged;
 }
 
-namespace {
-
 ::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs) {
   if (lhs.name() != rhs.name()) {
     return ::arrow::Status::Invalid(
         "Intersection over two different fields: ", lhs.name(), " != ", rhs.name());
   }
-  return ::arrow::Status::NotImplemented("not implemented");
+  auto lhs_type = lhs.type();
+  auto rhs_type = rhs.type();
+  if (lhs_type->id() != rhs_type->id()) {
+    return ::arrow::Status::Invalid("Intersection: two fields are not compatible: ",
+                                    lhs_type->ToString(),
+                                    " != ",
+                                    rhs_type->ToString());
+  }
+  if (lance::arrow::is_struct(lhs_type)) {
+  } else if (lance::arrow::is_list(lhs_type)) {
+    ARROW_ASSIGN_OR_RAISE(auto child, Intersection(*lhs.field(0), *rhs.field(0)));
+    if (child) {
+      auto intersection = lhs.Copy(false);
+      intersection->AddChild(child);
+      return intersection;
+    }
+  } else {
+    return lhs.Copy(true);
+  }
+  return nullptr;
 }
-
-}  // namespace
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Intersection(const Schema& other) const {
   auto intersection = std::make_shared<Schema>();
@@ -684,7 +699,7 @@ namespace {
       }
     }
   }
-  return std::move(intersection);
+  return intersection;
 }
 
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
