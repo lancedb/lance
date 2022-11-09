@@ -56,7 +56,7 @@ fn main() {
         }
         Commands::Show { path } => {
             let f = File::open(path).unwrap();
-            let reader = FileReader::new(f).unwrap();
+            let mut reader = FileReader::new(f).unwrap();
             reader.get(0).iter().enumerate().for_each(|(idx, x)| {
                 println!("field: {:?}", reader.schema().fields[idx].name);
                 println!("example value: {:?}", x)

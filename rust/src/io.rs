@@ -18,7 +18,6 @@ use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use arrow2::array::Array;
 use arrow2::datatypes::DataType;
 use arrow2::scalar::{Scalar, StructScalar, Utf8Scalar};
-use arrow2::types::Index;
 use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::metadata::Metadata;
@@ -133,19 +132,6 @@ impl<R: Read + Seek> FileReader<R> {
     }
 
     fn get_array(field: &Field, batch_id: usize, array_params: ArrayParams) -> Box<dyn Array> {
-        // TODO
-        // let d_type = field.data_type();
-        // let storage_type = field.storage_type();
-        // let storage_array: Box<dyn Array> = match storage_type {
-        //     DataType::List(_) => { get_list_array(field, batch_id, &array_params) }
-        //     DataType::Struct(_) => { get_struct_array(field, batch_id, &array_params) }
-        //     DataType::Dictionary(_, _, _) => { get_dictionary_array(field, batch_id, &array_params) }
-        //     _ => {
-        //         get_primitive_array(field, batch_id, &array_params)
-        //     }
-        // };
-        //
-        // storage_array
         todo!()
     }
 
@@ -179,9 +165,6 @@ impl<R: Read + Seek> FileReader<R> {
         batch_id: usize,
         array_params: &ArrayParams,
     ) -> Box<dyn Array> {
-        let field_id = field.id.to_usize();
-        let page_info = self.page_table.get_page_info(field_id, batch_id);
-        // field.get_decoder(&self.file);
         todo!()
     }
 
@@ -225,28 +208,6 @@ impl<R: Read + Seek> FileReader<R> {
     ) -> Box<dyn Scalar> {
         //FileReader::GetListScalar
         // auto field_id = field->id();
-        let field_id = field.id;
-        let page_info = self
-            .page_table
-            .get_page_info(field_id as usize, batch_id as usize);
-        // ARROW_ASSIGN_OR_RAISE(auto page, GetPageInfo(field_id, batch_id));
-        // auto [pos, length] = page;
-        // decoder->Reset(pos, length);
-        // ARROW_ASSIGN_OR_RAISE(auto decoder, field->GetDecoder(file_));
-        let mut decoder = field.get_decoder(&mut self.file, page_info);
-
-        let val = decoder.decode(idx_in_batch, &Some(2)).unwrap();
-        // ARROW_ASSIGN_OR_RAISE(auto offsets_arr, decoder->ToArray(idx, 2));
-        // auto offsets = std::static_pointer_cast<::arrow::Int32Array>(offsets_arr);
-        // if (offsets->Value(0) == offsets->Value(1)) {
-        //     return std::make_shared<::arrow::NullScalar>();
-        // }
-        // ARROW_ASSIGN_OR_RAISE(
-        //     auto values,
-        //     GetArray(field->fields()[0],
-        //              batch_id,
-        //              ArrayReadParams(offsets->Value(0), offsets->Value(1) - offsets->Value(0))));
-        // return std::make_shared<::arrow::ListScalar>(values);
         todo!()
     }
 
@@ -257,7 +218,6 @@ impl<R: Read + Seek> FileReader<R> {
         idx_in_batch: i32,
     ) -> Box<dyn Scalar> {
         //FileReader::GetPrimitiveScalar
-        let data_type = field.data_type();
         let field_id = field.id;
         let page_info = self
             .page_table

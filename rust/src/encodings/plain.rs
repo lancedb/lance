@@ -17,14 +17,12 @@
 use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::marker::PhantomData;
-use std::ops::Deref;
 
-use arrow2::array::new_empty_array;
-use arrow2::array::Int32Array;
 use arrow2::array::{Array, PrimitiveArray};
+use arrow2::array::Int32Array;
+use arrow2::array::new_empty_array;
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
-use arrow2::datatypes::PrimitiveType;
 use arrow2::scalar::{PrimitiveScalar, Scalar};
 use arrow2::types::NativeType;
 

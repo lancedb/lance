@@ -18,19 +18,19 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io::{Read, Seek};
 
+use arrow2::datatypes::{DataType, PrimitiveType, TimeUnit};
 use arrow2::datatypes::PhysicalType::Primitive;
-use arrow2::datatypes::{DataType, PhysicalType, PrimitiveType, TimeUnit};
-use arrow2::types::{days_ms, f16, i256, months_days_ns, NativeType};
+use arrow2::types::{days_ms, f16, i256, months_days_ns};
 
-use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoding};
+use crate::encodings::plain::PlainDecoder;
 use crate::format::pb;
 use crate::page_table::PageInfo;
 
 /// Lance Field.
 ///
 /// Metadata of a column.
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct Field {
     pub id: i32,
     pub parent_id: i32,
@@ -69,11 +69,11 @@ impl Field {
         return &self.children;
     }
 
-    pub fn get_decoder<R: Read + Seek>(
-        &self,
-        reader: &mut R,
+    pub fn get_decoder<'a, R: Read + Seek>(
+        &'a self,
+        reader: &'a mut R,
         page_info: PageInfo,
-    ) -> Box<dyn Decoder> {
+    ) -> Box<dyn Decoder + '_> {
         //Field::GetDecoder
 
         match self.data_type().to_physical_type() {
@@ -93,7 +93,7 @@ impl Field {
                     ));
                 }
                 PrimitiveType::Int32 => {
-                    return Box::new(PlainDecoder::<R,i32>::new(
+                    return Box::new(PlainDecoder::<R, i32>::new(
                         reader,
                         page_info.position as u64,
                         page_info.length,
@@ -325,7 +325,7 @@ impl fmt::Display for Field {
 }
 
 /// Lance file Schema.
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct Schema {
     pub fields: Vec<Field>,
 }

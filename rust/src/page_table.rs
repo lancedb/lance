@@ -1,10 +1,7 @@
+use std::io::{Read, Seek, SeekFrom};
+
 use arrow2::datatypes::DataType;
 use byteorder::{LittleEndian, ReadBytesExt};
-use prost::bytes::{Buf, BufMut};
-use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Seek, SeekFrom};
-use std::iter::Map;
-use std::mem::size_of;
 
 #[derive(Debug, Clone)]
 pub struct PageInfo {
@@ -35,7 +32,7 @@ impl PageTable {
 
         let mut vec = vec![0i64; num_columns * num_batches * 2];
         file.read_i64_into::<LittleEndian>(&mut vec).unwrap(); //TODO is it right?
-        let mut buffer = arrow2::buffer::Buffer::from(vec);
+        let buffer = arrow2::buffer::Buffer::from(vec);
         let arr = arrow2::array::Int64Array::new(DataType::Int64, buffer, None);
         let mut lt = PageTable {
             page_info_map: Vec::new(),
