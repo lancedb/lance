@@ -16,7 +16,7 @@ use std::fmt::Debug;
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
 use arrow2::array::Array;
-use arrow2::datatypes::DataType;
+use arrow2::datatypes::{DataType, PhysicalType};
 use arrow2::scalar::{Scalar, StructScalar, Utf8Scalar};
 use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -175,13 +175,13 @@ impl<R: Read + Seek> FileReader<R> {
         idx_in_batch: i32,
     ) -> Box<dyn arrow2::scalar::Scalar> {
         //FileReader::GetScalar
-        match field.data_type() {
-            DataType::Struct(_) => Box::new(Utf8Scalar::<i32>::new(Some("struct not support yet"))),
-            DataType::List(_) => Box::new(Utf8Scalar::<i32>::new(Some("list not support yet"))),
-            DataType::Extension(t, _, Some(x)) if t == "not_supported_yet" => Box::new(
-                Utf8Scalar::<i32>::new(Some(format!("data_type {:} not supported yet", x))),
-            ),
-            x => self.get_primitive_scalar(field, batch_id, idx_in_batch),
+        match field.data_type().to_physical_type() {
+            PhysicalType::Primitive(p) => {
+                self.get_primitive_scalar(field, batch_id, idx_in_batch)
+            }
+            x => {
+                Box::new(Utf8Scalar::<i32>::new(Some(format!("show data_type {:?} not supported yet", x))))
+            }
         }
     }
 
