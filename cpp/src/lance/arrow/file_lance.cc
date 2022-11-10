@@ -63,7 +63,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFileFormat::Inspect(
     const ::arrow::dataset::FileSource& source) const {
   if (impl_->manifest) {
-    return impl_->manifest->schema().ToArrow();
+    return impl_->manifest->schema()->ToArrow();
   }
 
   ARROW_ASSIGN_OR_RAISE(auto infile, source.Open());
@@ -71,7 +71,7 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
   ARROW_RETURN_NOT_OK(reader->Open());
   /// TODO: load dictionary here.
   impl_->manifest = reader->manifest();
-  return impl_->manifest->schema().ToArrow();
+  return impl_->manifest->schema()->ToArrow();
 }
 
 ::arrow::Future<std::optional<int64_t>> LanceFileFormat::CountRows(
@@ -137,37 +137,6 @@ std::string LanceFragmentScanOptions::type_name() const { return kLanceFormatTyp
 
 bool IsLanceFragmentScanOptions(const ::arrow::dataset::FragmentScanOptions& fso) {
   return fso.type_name() == kLanceFormatTypeName;
-}
-
-LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
-                             std::string data_dir,
-                             std::shared_ptr<lance::format::DataFragment> fragment,
-                             const format::Schema& schema)
-    : fs_(std::move(fs)),
-      data_uri_(std::move(data_dir)),
-      fragment_(std::move(fragment)),
-      schema_(schema) {}
-
-::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
-    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
-  // Only support one file for now.
-  assert(fragment_->data_files().size() == 1);
-
-  // There will be more than one file when schema evolution happens, will implement it later.
-  for (const auto& data_file : fragment_->data_files()) {
-    auto full_path = (fs::path(data_uri_) / data_file.path()).string();
-    ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path));
-    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
-    auto batch_reader = lance::io::RecordBatchReader(
-        std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
-    ARROW_RETURN_NOT_OK(batch_reader.Open());
-    return ::arrow::RecordBatchGenerator(std::move(batch_reader));
-  }
-  return ::arrow::Status::IOError("Lance Fragment has zero file");
-}
-
-::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
-  return schema_.ToArrow();
 }
 
 }  // namespace lance::arrow

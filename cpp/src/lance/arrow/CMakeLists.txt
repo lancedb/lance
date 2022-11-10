@@ -21,6 +21,8 @@ add_library(
         dataset.cc
         file_lance.cc
         file_lance_ext.h
+        fragment.cc
+        fragment.h
         scanner.cc
         stl.h
         type.cc
@@ -34,6 +36,7 @@ target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 add_lance_test(api_test)
 add_lance_test(arrow_dataset_test)
 add_lance_test(dataset_test)
+add_lance_test(fragment_test)
 add_lance_test(scanner_test)
 add_lance_test(type_test)
 add_lance_test(utils_test)

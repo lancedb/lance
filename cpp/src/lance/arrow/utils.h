@@ -55,4 +55,7 @@ namespace lance::arrow {
 ::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
     const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning = nullptr);
 
+/// Get UUID string.
+std::string GetUUIDString();
+
 }  // namespace lance::arrow

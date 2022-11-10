@@ -98,21 +98,21 @@ Status FileReader::Open() {
     ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
     // We need read the dictionary from the same file.
     auto visitor = format::ReadDictionaryVisitor(file_);
-    ARROW_RETURN_NOT_OK(visitor.VisitSchema(manifest_->schema()));
+    ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest_->schema()));
   }
 
   // TODO: Let's assume that page position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
   auto num_batches = metadata_->num_batches();
-  auto num_columns = manifest_->schema().GetFieldsCount();
+  auto num_columns = manifest_->schema()->GetFieldsCount();
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
   return Status::OK();
 }
 
-const lance::format::Schema& FileReader::schema() const { return manifest_->schema(); }
+const lance::format::Schema& FileReader::schema() const { return *manifest_->schema(); }
 
 const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { return manifest_; }
 
@@ -204,24 +204,22 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
     int32_t idx, const std::vector<std::string>& columns) {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
+  ARROW_ASSIGN_OR_RAISE(auto projection, manifest_->schema()->Project(columns));
   return Get(idx, *projection);
 }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(int32_t idx) {
-  return Get(idx, manifest_->schema());
+  return Get(idx, *manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable() {
   std::vector<std::shared_ptr<::arrow::ChunkedArray>> columns;
-  return ReadTable(manifest_->schema());
+  return ReadTable(*manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
     const std::vector<std::string>& columns) {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
+  ARROW_ASSIGN_OR_RAISE(auto projection, manifest_->schema()->Project(columns));
   return ReadTable(*projection);
 }
 
