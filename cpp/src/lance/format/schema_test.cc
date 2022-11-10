@@ -143,6 +143,18 @@ TEST_CASE("Project using field ids") {
                                                      }))})))})));
 }
 
+TEST_CASE("Intersection of two schemas") {
+  auto schema = lance::format::Schema(arrow_schema);
+  auto pk_schema = schema.Project({"pk"}).ValueOrDie();
+  auto split_schema = schema.Project({"split"}).ValueOrDie();
+  CHECK(pk_schema->Intersection(*split_schema).ValueOrDie()->GetFieldsCount() == 0);
+
+  auto pk_and_split = schema.Project(std::vector<std::string>{"pk", "split"}).ValueOrDie();
+  auto split_and_annos =
+      schema.Project(std::vector<std::string>{"split", "annotations"}).ValueOrDie();
+  CHECK(pk_and_split->Intersection(*split_and_annos).ValueOrDie()->Equals(split_schema));
+}
+
 TEST_CASE("Test GetFieldIds") {
   auto schema = lance::format::Schema(arrow_schema);
   CHECK(schema.GetFieldIds() == (views::iota(0, 10) | to<std::vector<int32_t>>));
