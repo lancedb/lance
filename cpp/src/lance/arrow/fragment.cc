@@ -43,8 +43,6 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
-  fmt::print("Fragment data files: {}\n", fragment_->data_files().size());
-
   for (std::size_t i = 0; i < fragment_->data_files().size(); ++i) {
     ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(i));
     auto batch_reader = lance::io::RecordBatchReader(

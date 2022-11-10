@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "lance/format/data_fragment.h"
 #include "lance/format/schema.h"
@@ -62,6 +63,10 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Access data fragment.
   const std::shared_ptr<lance::format::DataFragment>& data_fragment() const { return fragment_; }
 
+  /// Data files.
+  const std::vector<lance::format::DataFile>& data_files() const { return fragment_->data_files(); }
+
+  /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const { return schema_; }
 
  protected:

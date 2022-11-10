@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/fragment.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/scan.h"
@@ -71,6 +72,22 @@ Project::Project(std::unique_ptr<ExecNode> child,
     }
   }
   return std::unique_ptr<Project>(new Project(std::move(child), std::move(projected_schema)));
+}
+
+::arrow::Result<std::unique_ptr<Project>> Project::Make(
+    const lance::arrow::LanceFragment& fragment,
+    std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
+  auto& schema = fragment.schema();
+  ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema->Project(*scan_options->projected_schema));
+  if (Filter::HasFilter(scan_options->filter)) {
+
+  } else {
+    std::vector<Scan::FileReaderWithSchema> readers;
+    for (auto& data_file : fragment.data_files()) {
+      fmt::print("Data file: {}\n", data_file.path());
+    }
+  }
+  return ::arrow::Status::NotImplemented("not implemented");
 }
 
 std::string Project::ToString() const { return "Project"; }

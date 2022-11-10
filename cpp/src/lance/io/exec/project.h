@@ -28,6 +28,10 @@ namespace lance::io {
 class FileReader;
 }
 
+namespace lance::arrow {
+class LanceFragment;
+}
+
 namespace lance::io::exec {
 
 /// \brief Projection over dataset.
@@ -47,6 +51,11 @@ class Project : ExecNode {
       std::shared_ptr<FileReader> reader,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
 
+  static ::arrow::Result<std::unique_ptr<Project>> Make(
+      const lance::arrow::LanceFragment& fragment,
+      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
+
+  /// Read the next batch. Returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
   constexpr Type type() const override { return kProject; }
