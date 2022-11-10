@@ -43,13 +43,8 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
-  for (std::size_t i = 0; i < fragment_->data_files().size(); ++i) {
-    ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(i));
-    ARROW_ASSIGN_OR_RAISE(auto batch_reader,
-                          lance::io::RecordBatchReader::Make(std::move(reader), options));
-    return ::arrow::RecordBatchGenerator(std::move(batch_reader));
-  }
-  return ::arrow::Status::IOError("Lance Fragment has zero file");
+  ARROW_ASSIGN_OR_RAISE(auto batch_reader, lance::io::RecordBatchReader::Make(*this, options));
+  return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
