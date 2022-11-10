@@ -104,9 +104,8 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
   ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
   ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
-  auto batch_reader = lance::io::RecordBatchReader(
-      std::move(reader), options, ::arrow::internal::GetCpuThreadPool());
-  ARROW_RETURN_NOT_OK(batch_reader.Open());
+  ARROW_ASSIGN_OR_RAISE(auto batch_reader,
+                        lance::io::RecordBatchReader::Make(std::move(reader), options));
   return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 

@@ -62,6 +62,8 @@ class Project : ExecNode {
 
   std::string ToString() const override;
 
+  const std::shared_ptr<lance::format::Schema>& schema() const { return projected_schema_; }
+
  private:
   Project(std::unique_ptr<ExecNode> child, std::shared_ptr<lance::format::Schema> projected_schema);
 
