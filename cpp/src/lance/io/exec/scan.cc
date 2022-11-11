@@ -107,6 +107,33 @@ Scan::Scan(const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>&
   };
 }
 
+::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Scan::Take(
+    int32_t batch_id, const std::shared_ptr<::arrow::Int32Array>& indices) {
+  auto executor = ::arrow::internal::GetCpuThreadPool();
+  std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
+  for (auto [reader, schema] : readers_) {
+    ARROW_ASSIGN_OR_RAISE(auto fut,
+                          executor->Submit(
+                              [batch_id, &indices](std::shared_ptr<lance::io::FileReader> r,
+                                                   std::shared_ptr<lance::format::Schema> s)
+                                  -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {
+                                ARROW_ASSIGN_OR_RAISE(auto batch,
+                                                      r->ReadBatch(*s, batch_id, indices));
+                                return batch;
+                              },
+                              reader,
+                              schema));
+    futs.emplace_back(std::move(fut));
+  }
+
+  std::vector<std::shared_ptr<::arrow::RecordBatch>> batches;
+  for (auto& fut : futs) {
+    ARROW_ASSIGN_OR_RAISE(auto& b, fut.result());
+    batches.emplace_back(b);
+  }
+  return lance::arrow::MergeRecordBatches(batches);
+}
+
 ::arrow::Status Scan::Seek(int32_t offset) {
   assert(!readers_.empty());
   auto& reader = std::get<0>(readers_[0]);

@@ -58,6 +58,9 @@ class Scan : public ExecNode {
   /// Returns the next available batch in the file. Or returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
+  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Take(
+      int32_t batch_id, const std::shared_ptr<::arrow::Int32Array>& indices);
+
   /// Debug String
   std::string ToString() const override;
 

@@ -62,7 +62,11 @@ Project::Project(std::unique_ptr<ExecNode> child,
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
     ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
-    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
+    std::unique_ptr<Scan> take_scan_node;
+    if (!take_schema->fields().empty()) {
+      ARROW_ASSIGN_OR_RAISE(take_scan_node, Scan::Make({{std::move(reader), take_schema}}, 1));
+    }
+    child = std::make_unique<Take>(std::move(child), std::move(take_scan_node));
   } else {
     /// (*optionally) Limit -> Scan
     ARROW_ASSIGN_OR_RAISE(
@@ -78,6 +82,10 @@ Project::Project(std::unique_ptr<ExecNode> child,
     const lance::arrow::LanceFragment& fragment,
     std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
   auto& schema = fragment.schema();
+  auto projected_arrow_schema = scan_options->projected_schema;
+  if (projected_arrow_schema->num_fields() == 0) {
+    projected_arrow_schema = scan_options->dataset_schema;
+  }
   ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema->Project(*scan_options->projected_schema));
 
   std::shared_ptr<Counter> counter;
@@ -98,8 +106,13 @@ Project::Project(std::unique_ptr<ExecNode> child,
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
-    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
-    //    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)))
+    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema))
+    ARROW_ASSIGN_OR_RAISE(auto take_readers, fragment.Open(*take_schema));
+    std::unique_ptr<Scan> take_scan_node;
+    if (!take_schema->fields().empty() && !take_readers.empty()) {
+      ARROW_ASSIGN_OR_RAISE(take_scan_node, Scan::Make(take_readers, 1));
+    };
+    child = std::make_unique<Take>(std::move(child), std::move(take_scan_node));
   } else {
     ARROW_ASSIGN_OR_RAISE(auto readers, fragment.Open(*projected_schema));
     ARROW_ASSIGN_OR_RAISE(child, Scan::Make(readers, scan_options->batch_size))
