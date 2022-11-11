@@ -74,13 +74,10 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  auto result = executor_->Submit([&]() {
+  ARROW_ASSIGN_OR_RAISE(auto fut, executor_->Submit([&]() {
     return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(this->ReadBatch());
-  });
-  if (!result.ok()) {
-    return result.status();
-  }
-  return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>(result.ValueOrDie());
+  }));
+  return fut;
 }
 
 }  // namespace lance::io

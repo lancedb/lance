@@ -54,9 +54,6 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 ::arrow::Result<std::vector<LanceFragment::FileReaderWithSchema>> LanceFragment::Open(
     const format::Schema& schema, ::arrow::internal::Executor* executor) const {
   assert(executor);
-  fmt::print("Filter by schema; {}\n", schema);
-  std::vector<LanceFragment::FileReaderWithSchema> readers;
-  // TODO: it is very slow to open s3 files, open files in parallell.
 
   std::vector<::arrow::Future<FileReaderWithSchema>> futs;
   for (std::size_t i = 0; i < fragment_->data_files().size(); i++) {
@@ -78,6 +75,8 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
             i));
     futs.emplace_back(std::move(future));
   }
+
+  std::vector<LanceFragment::FileReaderWithSchema> readers;
   for (auto& future : futs) {
     ARROW_ASSIGN_OR_RAISE(auto& reader, future.result());
     if (std::get<0>(reader) != nullptr) {
@@ -85,7 +84,7 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
     }
   }
 
-  return std::move(readers);
+  return readers;
 }
 
 ::arrow::Result<int64_t> LanceFragment::FastCountRow() const {
