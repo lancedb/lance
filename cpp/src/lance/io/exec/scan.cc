@@ -26,20 +26,23 @@ constexpr int kMinimalIOThreads = 4;
 
 ::arrow::Result<std::unique_ptr<Scan>> Scan::Make(
     const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>& readers,
-    int64_t batch_size) {
+    int64_t batch_size,
+    ::arrow::internal::Executor* executor) {
   if (readers.empty()) {
     return ::arrow::Status::Invalid("Scan::Make: can not accept zero readers");
   }
   if (std::get<0>(readers[0])->metadata().num_batches() == 0) {
     return ::arrow::Status::IOError("Can not open Scan on empty file");
   }
-  return std::unique_ptr<Scan>(new Scan(readers, batch_size));
+  return std::unique_ptr<Scan>(new Scan(readers, batch_size, executor));
 }
 
 Scan::Scan(const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>& readers,
-           int64_t batch_size)
+           int64_t batch_size,
+           ::arrow::internal::Executor* executor)
     : readers_(std::begin(readers), std::end(readers)),
       batch_size_(batch_size),
+      executor_(executor),
       current_batch_page_length_(std::get<0>(readers_[0])->metadata().GetBatchLength(0)) {}
 
 ::arrow::Result<ScanBatch> Scan::Next() {
@@ -74,12 +77,11 @@ Scan::Scan(const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>&
     // i.e., Github Action runners.
     ARROW_RETURN_NOT_OK(::arrow::SetCpuThreadPoolCapacity(kMinimalIOThreads));
   }
-  auto executor = ::arrow::internal::GetCpuThreadPool();
   std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
   for (auto [reader, schema] : readers_) {
     ARROW_ASSIGN_OR_RAISE(
         auto fut,
-        executor->Submit(
+        executor_->Submit(
             [batch_id, offset](
                 std::shared_ptr<lance::io::FileReader> r,
                 std::shared_ptr<lance::format::Schema> s,
@@ -109,11 +111,10 @@ Scan::Scan(const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>&
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Scan::Take(
     int32_t batch_id, const std::shared_ptr<::arrow::Int32Array>& indices) {
-  auto executor = ::arrow::internal::GetCpuThreadPool();
   std::vector<::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>> futs;
   for (auto [reader, schema] : readers_) {
     ARROW_ASSIGN_OR_RAISE(auto fut,
-                          executor->Submit(
+                          executor_->Submit(
                               [batch_id, &indices](std::shared_ptr<lance::io::FileReader> r,
                                                    std::shared_ptr<lance::format::Schema> s)
                                   -> ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> {

@@ -121,7 +121,7 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
   };
 }
 
-/// Make one lance format from the table.
+/// Make one lance fragment from the table.
 ::arrow::Result<std::shared_ptr<lance::arrow::LanceFragment>> MakeFragment(
     const std::shared_ptr<::arrow::Table>& table) {
   auto data_dir = lance::testing::MakeTemporaryDir().ValueOrDie();
