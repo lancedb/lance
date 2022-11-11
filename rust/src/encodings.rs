@@ -50,7 +50,7 @@ pub trait Encoder {
 pub trait Decoder<T: NativeType> {
     type ArrowType;
 
-    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>> ;
+    fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>>;
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>>;
 

@@ -17,9 +17,9 @@
 use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 
-use arrow2::array::{Array, MutableArray, MutablePrimitiveArray, PrimitiveArray};
 use arrow2::array::new_empty_array;
 use arrow2::array::Int32Array;
+use arrow2::array::{Array, MutableArray, MutablePrimitiveArray, PrimitiveArray};
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
 use arrow2::types::NativeType;
@@ -90,7 +90,10 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder<T> for PlainDecoder<'a, R> {
         let res = take(values.as_ref(), &reset_indices);
         match res {
             Ok(arr) => Ok(arr),
-            Err(e) => Err(Error::new(ErrorKind::InvalidData, format!("Error take indices: {}", e)))
+            Err(e) => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Error take indices: {}", e),
+            )),
         }
     }
 

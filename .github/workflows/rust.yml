@@ -1,0 +1,39 @@
+name: Rust
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - protos/**
+      - rust/**
+jobs:
+  linux:
+    timeout-minutes: 30
+    runs-on: "ubuntu-22.04"
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Run cargo fmt
+      run: cargo fmt --check
+    - name: Run lint
+      run: cargo clippy
+    - name: Run tests
+      run: cargo test
+  mac:
+    timeout-minutes: 30
+    runs-on: "macos-12"
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Run cargo fmt
+      run: cargo fmt --check
+    - name: Run lint
+      run: cargo clippy
+    - name: Run tests
+      run: cargo test
