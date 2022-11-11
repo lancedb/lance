@@ -51,6 +51,20 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
   return schema_->ToArrow();
 }
 
+::arrow::Result<std::vector<LanceFragment::FileReaderWithSchema>> LanceFragment::Open(
+    const format::Schema& schema) const {
+  fmt::print("Filter by schema; {}\n", schema);
+  std::vector<LanceFragment::FileReaderWithSchema> readers;
+  for (auto& data_file : fragment_->data_files()) {
+//    auto data_file_schema = schema_->Project(data_file.fields());
+    auto full_path = (fs::path(data_uri_) / data_file.path()).string();
+    ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
+    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
+    readers.emplace_back(std::make_tuple(std::move(reader), schema_));
+  }
+  return std::move(readers);
+}
+
 ::arrow::Result<int64_t> LanceFragment::FastCountRow() const {
   assert(!fragment_->data_files().empty());
   ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(0));

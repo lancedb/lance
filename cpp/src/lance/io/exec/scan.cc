@@ -24,8 +24,9 @@ namespace lance::io::exec {
 
 constexpr int kMinimalIOThreads = 4;
 
-::arrow::Result<std::unique_ptr<Scan>> Scan::Make(const std::vector<FileReaderWithSchema>& readers,
-                                                  int64_t batch_size) {
+::arrow::Result<std::unique_ptr<Scan>> Scan::Make(
+    const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>& readers,
+    int64_t batch_size) {
   if (readers.empty()) {
     return ::arrow::Status::Invalid("Scan::Make: can not accept zero readers");
   }
@@ -35,7 +36,8 @@ constexpr int kMinimalIOThreads = 4;
   return std::unique_ptr<Scan>(new Scan(readers, batch_size));
 }
 
-Scan::Scan(const std::vector<FileReaderWithSchema>& readers, int64_t batch_size)
+Scan::Scan(const std::vector<lance::arrow::LanceFragment::FileReaderWithSchema>& readers,
+           int64_t batch_size)
     : readers_(std::begin(readers), std::end(readers)),
       batch_size_(batch_size),
       current_batch_page_length_(std::get<0>(readers_[0])->metadata().GetBatchLength(0)) {}

@@ -67,7 +67,7 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   /// Move constructor.
   RecordBatchReader(RecordBatchReader&& other) noexcept;
 
-  ~RecordBatchReader() = default;
+  ~RecordBatchReader() override = default;
 
   std::shared_ptr<::arrow::Schema> schema() const override;
 

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "lance/format/data_fragment.h"
@@ -37,6 +38,9 @@ namespace lance::arrow {
 ///
 class LanceFragment : public ::arrow::dataset::Fragment {
  public:
+  using FileReaderWithSchema =
+      std::tuple<std::shared_ptr<lance::io::FileReader>, std::shared_ptr<format::Schema>>;
+
   /// Constructor
   ///
   /// \param fs a file system instance to conduct IOs.
@@ -62,6 +66,8 @@ class LanceFragment : public ::arrow::dataset::Fragment {
 
   /// Access data fragment.
   const std::shared_ptr<lance::format::DataFragment>& data_fragment() const { return fragment_; }
+
+  ::arrow::Result<std::vector<FileReaderWithSchema>> Open(const format::Schema& schema) const;
 
   /// Data files.
   const std::vector<lance::format::DataFile>& data_files() const { return fragment_->data_files(); }

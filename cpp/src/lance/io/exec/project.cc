@@ -91,10 +91,7 @@ Project::Project(std::unique_ptr<ExecNode> child,
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_schema, schema->Project(scan_options->filter));
-    std::vector<Scan::FileReaderWithSchema> filter_readers;
-    for (auto& data_file : fragment.data_files()) {
-      fmt::print("Data file: {}\n", data_file.path());
-    }
+    ARROW_ASSIGN_OR_RAISE(auto filter_readers, fragment.Open(*filter_scan_schema));
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_node,
                           Scan::Make(filter_readers, scan_options->batch_size));
     ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(filter_scan_node)));
@@ -102,12 +99,9 @@ Project::Project(std::unique_ptr<ExecNode> child,
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
     ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
-//    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)))
+    //    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)))
   } else {
-    std::vector<Scan::FileReaderWithSchema> readers;
-    for (auto& data_file : fragment.data_files()) {
-      fmt::print("Data file: {}\n", data_file.path());
-    }
+    ARROW_ASSIGN_OR_RAISE(auto readers, fragment.Open(*projected_schema));
     ARROW_ASSIGN_OR_RAISE(child, Scan::Make(readers, scan_options->batch_size))
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
