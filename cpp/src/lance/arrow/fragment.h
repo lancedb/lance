@@ -41,6 +41,15 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   using FileReaderWithSchema =
       std::tuple<std::shared_ptr<lance::io::FileReader>, std::shared_ptr<format::Schema>>;
 
+  /// Factory method & Adaptor to plain dataset.
+  ///
+  /// It creates a LanceFragment from `arrow.dataset.FileFragment`.
+  /// \param file_fragment plain dataset file fragment
+  /// \param schema the schema of dataset.
+  /// \return LanceFragment
+  static ::arrow::Result<std::shared_ptr<LanceFragment>> Make(
+      const ::arrow::dataset::FileFragment& file_fragment, std::shared_ptr<format::Schema> schema);
+
   /// Constructor
   ///
   /// \param fs a file system instance to conduct IOs.
@@ -64,15 +73,10 @@ class LanceFragment : public ::arrow::dataset::Fragment {
 
   std::string type_name() const override { return "lance"; }
 
-  /// Access data fragment.
-  const std::shared_ptr<lance::format::DataFragment>& data_fragment() const { return fragment_; }
-
+  /// Open Data files that contains the columns in the schema.
   ::arrow::Result<std::vector<FileReaderWithSchema>> Open(
       const format::Schema& schema,
       ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) const;
-
-  /// Data files.
-  const std::vector<lance::format::DataFile>& data_files() const { return fragment_->data_files(); }
 
   /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const { return schema_; }

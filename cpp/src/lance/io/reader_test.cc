@@ -123,6 +123,8 @@ TEST_CASE("Filter over dictionary base") {
                                              ::arrow::compute::literal("bike")))
             .ok());
   auto scanner = scan_builder->Finish().ValueOrDie();
-  auto actual = scanner->ToTable().ValueOrDie();
+  auto result = scanner->ToTable();
+
+  auto actual = result.ValueOrDie();
   CHECK(actual->num_rows() == 0);
 }

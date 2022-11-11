@@ -32,6 +32,15 @@ namespace fs = std::filesystem;
 
 namespace lance::arrow {
 
+::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::Make(
+    const ::arrow::dataset::FileFragment& file_fragment, std::shared_ptr<format::Schema> schema) {
+  auto field_ids = schema->GetFieldIds();
+  auto data_fragment = std::make_shared<format::DataFragment>(
+      format::DataFile(file_fragment.source().path(), field_ids));
+  return std::make_shared<LanceFragment>(
+      file_fragment.source().filesystem(), "", data_fragment, schema);
+}
+
 LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                              std::string data_dir,
                              std::shared_ptr<lance::format::DataFragment> fragment,
@@ -70,7 +79,7 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
               auto full_path = (fs::path(data_uri_) / data_file.path()).string();
               ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
               ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
-              return std::make_tuple(std::move(reader), schema_);
+              return std::make_tuple(std::move(reader), intersection);
             },
             i));
     futs.emplace_back(std::move(future));

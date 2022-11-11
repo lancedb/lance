@@ -40,14 +40,6 @@ namespace lance::io {
   return RecordBatchReader(std::move(project), executor);
 };
 
-::arrow::Result<RecordBatchReader> RecordBatchReader::Make(
-    std::shared_ptr<FileReader> reader,
-    std::shared_ptr<::arrow::dataset::ScanOptions> options,
-    ::arrow::internal::Executor* executor) noexcept {
-  ARROW_ASSIGN_OR_RAISE(auto project, exec::Project::Make(std::move(reader), std::move(options)));
-  return RecordBatchReader(std::move(project), executor);
-}
-
 RecordBatchReader::RecordBatchReader(std::shared_ptr<exec::Project> project,
                                      ::arrow::internal::Executor* executor)
     : project_(std::move(project)), executor_(executor) {}

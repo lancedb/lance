@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/fragment.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/exec/project.h"
@@ -102,10 +103,9 @@ bool LanceFileFormat::Equals(const FileFormat& other) const {
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFileFormat::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
     const std::shared_ptr<::arrow::dataset::FileFragment>& file) const {
-  ARROW_ASSIGN_OR_RAISE(auto infile, file->source().Open());
-  ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, impl_->manifest));
+  ARROW_ASSIGN_OR_RAISE(auto fragment, LanceFragment::Make(*file, impl_->manifest->schema()));
   ARROW_ASSIGN_OR_RAISE(auto batch_reader,
-                        lance::io::RecordBatchReader::Make(std::move(reader), options));
+                        lance::io::RecordBatchReader::Make(*fragment, options));
   return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 

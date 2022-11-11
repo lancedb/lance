@@ -40,17 +40,6 @@ class Project : ExecNode {
  public:
   Project() = delete;
 
-  /// Make a Project from the full dataset schema and scan options.
-  ///
-  /// \param reader file reader.
-  /// \param schema dataset schema.
-  /// \param scan_options Arrow scan options.
-  /// \return Project if success. Returns the error status otherwise.
-  ///
-  static ::arrow::Result<std::unique_ptr<Project>> Make(
-      std::shared_ptr<FileReader> reader,
-      std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
-
   /// Make a Project from the fragment and scan options.
   ///
   /// \param fragment Lance fragment

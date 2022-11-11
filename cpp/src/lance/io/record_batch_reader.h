@@ -54,11 +54,6 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
       std::shared_ptr<::arrow::dataset::ScanOptions> options,
       ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) noexcept;
 
-  static ::arrow::Result<RecordBatchReader> Make(
-      std::shared_ptr<FileReader> reader,
-      std::shared_ptr<::arrow::dataset::ScanOptions> options,
-      ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) noexcept;
-
   RecordBatchReader() = delete;
 
   /// Copy constructor.

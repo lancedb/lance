@@ -18,6 +18,7 @@
 
 #include <memory>
 
+#include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/exec/scan.h"
 
