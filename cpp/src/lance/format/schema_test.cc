@@ -125,8 +125,8 @@ TEST_CASE("Get projection via arrow schema") {
 TEST_CASE("Project using field ids") {
   auto schema = lance::format::Schema(arrow_schema);
   for (const auto& name : arrow_schema->field_names()) {
-    auto fields = schema.Project({name}).ValueOrDie()->GetFieldIds();
-    auto project = schema.Project(fields).ValueOrDie();
+    auto field_ids = schema.Project({name}).ValueOrDie()->GetFieldIds();
+    auto project = schema.Project(field_ids).ValueOrDie();
     CHECK(project->ToArrow()->Equals(::arrow::schema({arrow_schema->GetFieldByName(name)})));
   }
 

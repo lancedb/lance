@@ -784,7 +784,8 @@ std::vector<lance::format::pb::Field> Schema::ToProto() const {
   return pb_fields;
 }
 
-/// Make a full deep copy of the schema.
+/// Make a full deep copy of the schema, which makes a copy of each node
+/// in the schema tree.
 std::shared_ptr<Schema> Schema::Copy() const {
   auto copy = std::make_shared<Schema>();
   for (auto& field : fields_) {
