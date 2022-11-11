@@ -55,8 +55,11 @@ TEST_CASE("Test add column with an array") {
   auto new_arr = ToArray({"1", "2", "3", "4", "5"}).ValueOrDie();
   auto new_chunked_arr = std::make_shared<::arrow::ChunkedArray>(new_arr);
   auto full_schema = std::make_shared<lance::format::Schema>(t->schema());
-  auto new_field = std::make_shared<lance::format::Field>(::arrow::field("str", ::arrow::utf8()));
-  full_schema->AddField(new_field);
+
+  full_schema =
+      full_schema->Merge(*::arrow::schema({::arrow::field("str", ::arrow::utf8())})).ValueOrDie();
+  fmt::print("Full schema: {}\n", full_schema->ToString());
+
   auto new_schema = full_schema->Project({"str"}).ValueOrDie();
   auto new_fragment = fragment->AddColumn(full_schema, new_schema, new_chunked_arr).ValueOrDie();
 
@@ -70,7 +73,7 @@ TEST_CASE("Test add column with an array") {
   INFO("Batch schema: " << batch->schema()->ToString()
                         << " != expected table schema: " << expected_table->schema()->ToString());
   CHECK(batch->schema()->Equals(*expected_table->schema()));
-  //  CHECK(arr->Equals(batch->GetColumnByName("int")));
+  CHECK(arr->Equals(batch->GetColumnByName("int")));
 }
 
 TEST_CASE("Test add column without data") {}

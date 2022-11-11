@@ -17,6 +17,8 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/chunked_array.h>
 #include <arrow/table.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <filesystem>
 
@@ -117,11 +119,10 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
 }
 
 ::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::AddColumn(
-    const std::shared_ptr<format::Schema>& full_schema,
-    const std::shared_ptr<format::Schema>& new_schema,
+    const std::shared_ptr<format::Schema>& dataset_schema,
+    const std::shared_ptr<format::Schema>& column_schema,
     const std::shared_ptr<::arrow::ChunkedArray>& column,
     ::arrow::MemoryPool* pool) {
-  // Sanity checks are done at Dataset level.
   ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(0));
   if (reader->length() != column->length()) {
     return ::arrow::Status::Invalid(
@@ -131,16 +132,16 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
   }
 
   // Step 2. loop over chunk size, and slice the column
-  auto arrow_schema = new_schema->ToArrow();
+  auto arrow_schema = column_schema->ToArrow();
   auto new_table = ::arrow::Table::Make(arrow_schema, {column});
 
-  auto field_ids = new_schema->GetFieldIds();
+  auto field_ids = column_schema->GetFieldIds();
   std::string file_path = fs::path(data_uri_) / fmt::format("{}.lance", GetUUIDString());
 
   {
     ARROW_ASSIGN_OR_RAISE(auto output, fs_->OpenOutputStream(file_path));
     auto write_options = LanceFileFormat().DefaultWriteOptions();
-    io::FileWriter writer(std::move(new_schema), std::move(write_options), std::move(output));
+    io::FileWriter writer(column_schema, std::move(write_options), std::move(output));
 
     for (int64_t batch = 0, start = 0; batch < reader->num_batches(); batch++) {
       auto length = reader->metadata().GetBatchLength(batch);
@@ -149,15 +150,15 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
       ARROW_RETURN_NOT_OK(writer.Write(record_batch));
       start += length;
     }
+    writer.Finish().Wait();
     // Writer is closed because out of scope.
   }
 
   /// Append the file to the data fragment and create new LangeFragment.
   auto new_data_fragment = std::make_shared<format::DataFragment>(*fragment_);
   new_data_fragment->data_files().emplace_back(::lance::format::DataFile({file_path, field_ids}));
-  fmt::print("New data fragment data_files: {}\n", new_data_fragment->data_files().size());
 
-  return std::make_shared<LanceFragment>(fs_, data_uri_, new_data_fragment, full_schema);
+  return std::make_shared<LanceFragment>(fs_, data_uri_, new_data_fragment, dataset_schema);
 }
 
 }  // namespace lance::arrow
