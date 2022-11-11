@@ -10,6 +10,8 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import numpy as np
+import pyarrow as pa
 
 from lance.data.convert.oxford_pet import OxfordPetConverter
 
@@ -23,3 +25,24 @@ def test_basic(tmp_path):
     df = c.read_metadata(num_rows)
     c.make_embedded_dataset(df, fmt="lance", output_path=str(tmp_path / "oxford_pet.lance"))
     c.make_embedded_dataset(df, fmt="parquet", output_path=str(tmp_path / "oxford_pet.parquet"))
+
+
+# when writing iteratively sometimes we get all NAs in a column
+def test_na(tmp_path):
+    c = OxfordPetConverter(
+        uri_root="s3://eto-public/datasets/oxford_pet",
+        images_root="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet/"
+    )
+    name = "null_struct"
+    typ = pa.struct([pa.field("name", pa.string())])
+    col = np.array([None, None])
+    arr = c._convert_field(name, typ, col)
+    assert arr.type == typ
+    assert arr.is_null().to_numpy(False).all()
+
+    name = "null_list"
+    typ = pa.list_(pa.string())
+    col = np.array([None, None])
+    arr = c._convert_field(name, typ, col)
+    assert arr.type == typ
+    assert arr.is_null().to_numpy(False).all()
