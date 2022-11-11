@@ -60,26 +60,31 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 
   std::vector<::arrow::Future<FileReaderWithSchema>> futs;
   for (std::size_t i = 0; i < fragment_->data_files().size(); i++) {
-    ARROW_ASSIGN_OR_RAISE(auto future,
-                          executor->Submit(
-                              [this](auto idx) -> ::arrow::Result<FileReaderWithSchema> {
-                                auto& data_file = this->fragment_->data_files()[idx];
-                                auto full_path = (fs::path(data_uri_) / data_file.path()).string();
-                                ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
-                                ARROW_ASSIGN_OR_RAISE(auto reader,
-                                                      lance::io::FileReader::Make(infile));
-                                return std::make_tuple(std::move(reader), schema_);
-                              },
-                              i));
+    ARROW_ASSIGN_OR_RAISE(
+        auto future,
+        executor->Submit(
+            [this, &schema](auto idx) -> ::arrow::Result<FileReaderWithSchema> {
+              auto& data_file = this->fragment_->data_files()[idx];
+              ARROW_ASSIGN_OR_RAISE(auto data_file_schema, schema_->Project(data_file.fields()));
+              ARROW_ASSIGN_OR_RAISE(auto intersection, schema.Intersection(*data_file_schema));
+              if (intersection->fields().empty()) {
+                return std::make_tuple(nullptr, nullptr);
+              }
+              auto full_path = (fs::path(data_uri_) / data_file.path()).string();
+              ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
+              ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
+              return std::make_tuple(std::move(reader), schema_);
+            },
+            i));
     futs.emplace_back(std::move(future));
   }
-//  for (auto& data_file : fragment_->data_files()) {
-//    //    auto data_file_schema = schema_->Project(data_file.fields());
-//    auto full_path = (fs::path(data_uri_) / data_file.path()).string();
-//    ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
-//    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
-//    readers.emplace_back(std::make_tuple(std::move(reader), schema_));
-//  }
+  for (auto& future : futs) {
+    ARROW_ASSIGN_OR_RAISE(auto& reader, future.result());
+    if (std::get<0>(reader) != nullptr) {
+      readers.emplace_back(std::move(reader));
+    }
+  }
+
   return std::move(readers);
 }
 
