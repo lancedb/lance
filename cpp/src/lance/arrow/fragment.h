@@ -67,7 +67,9 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Access data fragment.
   const std::shared_ptr<lance::format::DataFragment>& data_fragment() const { return fragment_; }
 
-  ::arrow::Result<std::vector<FileReaderWithSchema>> Open(const format::Schema& schema) const;
+  ::arrow::Result<std::vector<FileReaderWithSchema>> Open(
+      const format::Schema& schema,
+      ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) const;
 
   /// Data files.
   const std::vector<lance::format::DataFile>& data_files() const { return fragment_->data_files(); }
