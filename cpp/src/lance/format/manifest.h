@@ -65,7 +65,7 @@ class Manifest final {
   std::shared_ptr<Manifest> BumpVersion(bool overwrite = false);
 
   /// Get schema of the dataset.
-  const Schema& schema() const;
+  const std::shared_ptr<Schema>& schema() const;
 
   /// Returns the version number.
   uint64_t version() const;

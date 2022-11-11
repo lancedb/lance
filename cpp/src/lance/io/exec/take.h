@@ -25,6 +25,8 @@
 
 namespace lance::io::exec {
 
+class Scan;
+
 /// \brief Take Node
 ///
 /// Take node takes the filtered results from child node, and uses the indices to
@@ -39,15 +41,12 @@ namespace lance::io::exec {
 ///  Take.child -> Limit.child -> Filter.child -> Scan
 class Take : public ExecNode {
  public:
-  /// Factory method.
+  /// Constructor.
   ///
-  /// \param reader An opened lance file reader.
-  /// \param schema Schema for the takers.
   /// \param child the child filter node.
-  /// \return a take node if success.
-  static ::arrow::Result<std::unique_ptr<Take>> Make(std::shared_ptr<FileReader> reader,
-                                                     std::shared_ptr<lance::format::Schema> schema,
-                                                     std::unique_ptr<ExecNode> child);
+  /// \param scan the scan node to execute point query. If scan is nullptr, Take node can read all
+  ///             columns from child already.
+  Take(std::unique_ptr<ExecNode> child, std::unique_ptr<Scan> scan);
 
   /// Returns the next batch.
   ///
@@ -60,21 +59,12 @@ class Take : public ExecNode {
 
   constexpr Type type() const override { return kTake; }
 
+  /// Debug string
   std::string ToString() const override;
 
  private:
-  /// Constructor.
-  ///
-  /// \param reader An opened lance file reader.
-  /// \param schema Schema for the takers.
-  /// \param child the child filter node.
-  Take(std::shared_ptr<FileReader> reader,
-       std::shared_ptr<lance::format::Schema> schema,
-       std::unique_ptr<ExecNode> child);
-
-  std::shared_ptr<FileReader> reader_;
-  std::shared_ptr<lance::format::Schema> schema_;
   std::unique_ptr<ExecNode> child_;
+  std::unique_ptr<Scan> scan_;
 };
 
 }  // namespace lance::io::exec

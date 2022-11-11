@@ -39,7 +39,7 @@ class FileWriter final : public ::arrow::dataset::FileWriter {
   FileWriter(std::shared_ptr<::arrow::Schema> schema,
              std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
              std::shared_ptr<::arrow::io::OutputStream> destination,
-             ::arrow::fs::FileLocator destination_locator);
+             ::arrow::fs::FileLocator destination_locator = {});
 
   ~FileWriter();
 

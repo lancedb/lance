@@ -32,32 +32,26 @@
 
 namespace lance::io {
 
-RecordBatchReader::RecordBatchReader(std::shared_ptr<FileReader> reader,
-                                     std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                                     ::arrow::internal::ThreadPool* thread_pool) noexcept
-    : reader_(reader), options_(options), thread_pool_(thread_pool) {
-  assert(thread_pool_);
-}
+::arrow::Result<RecordBatchReader> RecordBatchReader::Make(
+    const lance::arrow::LanceFragment& fragment,
+    std::shared_ptr<::arrow::dataset::ScanOptions> options,
+    ::arrow::internal::Executor* executor) noexcept {
+  ARROW_ASSIGN_OR_RAISE(auto project, exec::Project::Make(fragment, std::move(options)));
+  return RecordBatchReader(std::move(project), executor);
+};
+
+RecordBatchReader::RecordBatchReader(std::shared_ptr<exec::Project> project,
+                                     ::arrow::internal::Executor* executor)
+    : project_(std::move(project)), executor_(executor) {}
 
 RecordBatchReader::RecordBatchReader(const RecordBatchReader& other) noexcept
-    : reader_(other.reader_),
-      options_(other.options_),
-      project_(other.project_),
-      thread_pool_(other.thread_pool_) {}
+    : project_(other.project_), executor_(other.executor_) {}
 
 RecordBatchReader::RecordBatchReader(RecordBatchReader&& other) noexcept
-    : reader_(std::move(other.reader_)),
-      options_(std::move(other.options_)),
-      project_(std::move(other.project_)),
-      thread_pool_(std::move(other.thread_pool_)) {}
-
-::arrow::Status RecordBatchReader::Open() {
-  ARROW_ASSIGN_OR_RAISE(project_, exec::Project::Make(reader_, options_));
-  return ::arrow::Status::OK();
-}
+    : project_(std::move(other.project_)), executor_(std::move(other.executor_)) {}
 
 std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
-  return options_->projected_schema;
+  return project_->schema()->ToArrow();
 }
 
 ::arrow::Status RecordBatchReader::ReadNext(std::shared_ptr<::arrow::RecordBatch>* batch) {
@@ -72,13 +66,10 @@ std::shared_ptr<::arrow::Schema> RecordBatchReader::schema() const {
 }
 
 ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> RecordBatchReader::operator()() {
-  auto result = thread_pool_->Submit([&]() {
+  ARROW_ASSIGN_OR_RAISE(auto fut, executor_->Submit([&]() {
     return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>::MakeFinished(this->ReadBatch());
-  });
-  if (!result.ok()) {
-    return result.status();
-  }
-  return ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>>(result.ValueOrDie());
+  }));
+  return fut;
 }
 
 }  // namespace lance::io

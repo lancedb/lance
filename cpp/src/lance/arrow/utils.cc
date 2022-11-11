@@ -20,10 +20,14 @@
 #include <arrow/type_traits.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <uuid.h>
 
+#include <algorithm>
 #include <concepts>
+#include <random>
 #include <range/v3/action.hpp>
 #include <range/v3/view.hpp>
+#include <string>
 #include <vector>
 
 #include "lance/arrow/file_lance.h"
@@ -267,5 +271,34 @@ template <VarLenListType L>
   ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
   return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
 }
+
+namespace {
+
+class UuidGenerator {
+ public:
+  UuidGenerator() {
+    std::generate(std::begin(seed_), std::end(seed_), std::ref(rd_));
+    std::seed_seq seq(std::begin(seed_), std::end(seed_));
+    random_gen_ = std::make_unique<std::mt19937>(seq);
+    generator_ = std::make_unique<uuids::uuid_random_generator>(*random_gen_);
+  }
+
+  std::string operator()() const {
+    auto uuid = (*generator_)();
+    return uuids::to_string(uuid);
+  }
+
+ private:
+  std::random_device rd_;
+  std::array<int, std::mt19937::state_size> seed_;
+  std::unique_ptr<std::mt19937> random_gen_;
+  std::unique_ptr<uuids::uuid_random_generator> generator_;
+};
+
+const UuidGenerator uuid_generator_;
+
+}  // namespace
+
+std::string GetUUIDString() { return uuid_generator_(); }
 
 }  // namespace lance::arrow

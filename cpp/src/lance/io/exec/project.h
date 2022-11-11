@@ -28,6 +28,10 @@ namespace lance::io {
 class FileReader;
 }
 
+namespace lance::arrow {
+class LanceFragment;
+}
+
 namespace lance::io::exec {
 
 /// \brief Projection over dataset.
@@ -36,28 +40,31 @@ class Project : ExecNode {
  public:
   Project() = delete;
 
-  /// Make a Project from the full dataset schema and scan options.
+  /// Make a Project from the fragment and scan options.
   ///
-  /// \param reader file reader.
-  /// \param schema dataset schema.
+  /// \param fragment Lance fragment
   /// \param scan_options Arrow scan options.
   /// \return Project if success. Returns the error status otherwise.
-  ///
   static ::arrow::Result<std::unique_ptr<Project>> Make(
-      std::shared_ptr<FileReader> reader,
+      const lance::arrow::LanceFragment& fragment,
       std::shared_ptr<::arrow::dataset::ScanOptions> scan_options);
 
+  /// Read the next batch. Returns nullptr if EOF.
   ::arrow::Result<ScanBatch> Next() override;
 
+  /// ExecNode type.
   constexpr Type type() const override { return kProject; }
 
+  /// Debug String.
   std::string ToString() const override;
+
+  /// Returns the projected schema.
+  const std::shared_ptr<lance::format::Schema>& schema() const { return projected_schema_; }
 
  private:
   Project(std::unique_ptr<ExecNode> child, std::shared_ptr<lance::format::Schema> projected_schema);
 
   std::unique_ptr<ExecNode> child_;
-
   std::shared_ptr<lance::format::Schema> projected_schema_;
 };
 
