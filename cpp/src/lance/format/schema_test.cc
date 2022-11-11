@@ -17,8 +17,10 @@
 #include <arrow/type.h>
 #include <arrow/util/key_value_metadata.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <range/v3/all.hpp>
 
 #include "lance/arrow/stl.h"
 #include "lance/testing/extension_types.h"
@@ -29,6 +31,7 @@ using lance::arrow::ToArray;
 using lance::format::Schema;
 using lance::testing::MakeDataset;
 using lance::testing::TableFromJSON;
+using namespace ranges;
 
 const auto arrow_schema = ::arrow::schema(
     {::arrow::field("pk", ::arrow::utf8()),
@@ -91,7 +94,7 @@ TEST_CASE("Project nested fields") {
 
 TEST_CASE("Get schema view") {
   auto original = lance::format::Schema(arrow_schema);
-  auto view = original.Project({"split", "annotations.box.xmin"});
+  auto view = original.Project(std::vector<std::string>({"split", "annotations.box.xmin"}));
   INFO("Create view status: " << view.status());
   CHECK(view.ok());
   CHECK((*view)->GetField("split"));
@@ -119,9 +122,48 @@ TEST_CASE("Get projection via arrow schema") {
   CHECK(expect_schema.Equals(projection, false));
 }
 
+TEST_CASE("Project using field ids") {
+  auto schema = lance::format::Schema(arrow_schema);
+  for (const auto& name : arrow_schema->field_names()) {
+    auto field_ids = schema.Project({name}).ValueOrDie()->GetFieldIds();
+    auto project = schema.Project(field_ids).ValueOrDie();
+    CHECK(project->ToArrow()->Equals(::arrow::schema({arrow_schema->GetFieldByName(name)})));
+  }
+
+  auto fields = schema.Project({"annotations.box"}).ValueOrDie()->GetFieldIds();
+  auto project = schema.Project(fields).ValueOrDie();
+  CHECK(project->ToArrow()->Equals(::arrow::schema({::arrow::field(
+      "annotations",
+      ::arrow::list(::arrow::struct_({::arrow::field("box",
+                                                     ::arrow::struct_({
+                                                         ::arrow::field("xmin", ::arrow::float32()),
+                                                         ::arrow::field("ymin", ::arrow::float32()),
+                                                         ::arrow::field("xmax", ::arrow::float32()),
+                                                         ::arrow::field("ymax", ::arrow::float32()),
+                                                     }))})))})));
+}
+
+TEST_CASE("Intersection of two schemas") {
+  auto schema = lance::format::Schema(arrow_schema);
+  auto pk_schema = schema.Project({"pk"}).ValueOrDie();
+  auto split_schema = schema.Project({"split"}).ValueOrDie();
+  CHECK(pk_schema->Intersection(*split_schema).ValueOrDie()->GetFieldsCount() == 0);
+
+  auto pk_and_split = schema.Project(std::vector<std::string>{"pk", "split"}).ValueOrDie();
+  auto split_and_annos =
+      schema.Project(std::vector<std::string>{"split", "annotations"}).ValueOrDie();
+  CHECK(pk_and_split->Intersection(*split_and_annos).ValueOrDie()->Equals(split_schema));
+}
+
+TEST_CASE("Test GetFieldIds") {
+  auto schema = lance::format::Schema(arrow_schema);
+  CHECK(schema.GetFieldIds() == (views::iota(0, 10) | to<std::vector<int32_t>>));
+}
+
 TEST_CASE("Exclude schema") {
   auto original = lance::format::Schema(arrow_schema);
-  auto projected = original.Project({"split", "annotations.box"}).ValueOrDie();
+  auto projected =
+      original.Project(std::vector<std::string>{"split", "annotations.box"}).ValueOrDie();
   INFO("Projected schema: " << projected->ToString());
   auto excluded = original.Exclude(*projected).ValueOrDie();
 

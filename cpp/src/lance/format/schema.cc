@@ -23,7 +23,10 @@
 
 #include <algorithm>
 #include <memory>
+#include <range/v3/view.hpp>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "lance/arrow/type.h"
@@ -36,6 +39,7 @@
 using std::make_shared;
 using std::string;
 using std::vector;
+using namespace ranges;
 
 namespace lance::format {
 
@@ -579,6 +583,27 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return Project(columns);
 }
 
+::arrow::Result<std::shared_ptr<Schema>> Schema::Project(
+    const std::vector<FieldIdType>& field_ids) const {
+  assert(!field_ids.empty());
+  std::unordered_set<FieldIdType> field_id_set(std::begin(field_ids), std::end(field_ids));
+  if (field_id_set.size() != field_ids.size()) {
+    return ::arrow::Status::Invalid("Schema::Project: duplicated field id found");
+  }
+  google::protobuf::RepeatedPtrField<pb::Field> protos;
+  for (auto& pb : ToProto()) {
+    if (field_id_set.contains(pb.id())) {
+      *protos.Add() = pb;
+    }
+  }
+  auto projected = std::make_shared<Schema>(protos);
+  if (static_cast<size_t>(projected->GetFieldsCount()) != field_ids.size()) {
+    return ::arrow::Status::Invalid(fmt::format(
+        "Schema::Project(field_ids): field ids can not build a schema tree, ids={}", field_ids));
+  }
+  return projected;
+}
+
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Exclude(const Schema& other) const {
   /// An visitor to remove fields in place.
   class SchemaExcludeVisitor : public FieldVisitor {
@@ -632,6 +657,77 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
   return merged;
 }
 
+// Forward declaration
+::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs);
+
+namespace {
+
+::arrow::Result<std::vector<std::shared_ptr<Field>>> GetIntersection(
+    const std::vector<std::shared_ptr<Field>>& lhs,
+    const std::vector<std::shared_ptr<Field>>& rhs) {
+  std::vector<std::shared_ptr<Field>> results;
+
+  std::unordered_map<std::string, std::shared_ptr<Field>> rhs_map;
+  for (auto& field : rhs) {
+    rhs_map[field->name()] = field;
+  }
+  for (auto& field : lhs) {
+    auto it = rhs_map.find(field->name());
+    if (it == rhs_map.end()) {
+      continue;
+    }
+    ARROW_ASSIGN_OR_RAISE(auto intersection, Intersection(*field, *it->second));
+    if (intersection) {
+      results.emplace_back(intersection);
+    }
+  }
+  return results;
+}
+
+};  // namespace
+
+// Not in anonymous namespace because it is friend method of Field.
+::arrow::Result<std::shared_ptr<Field>> Intersection(const Field& lhs, const Field& rhs) {
+  if (lhs.name() != rhs.name()) {
+    return ::arrow::Status::Invalid(
+        "Intersection over two different fields: ", lhs.name(), " != ", rhs.name());
+  }
+  auto lhs_type = lhs.type();
+  auto rhs_type = rhs.type();
+  if (lhs_type->id() != rhs_type->id()) {
+    return ::arrow::Status::Invalid("Intersection: two fields are not compatible: ",
+                                    lhs_type->ToString(),
+                                    " != ",
+                                    rhs_type->ToString());
+  }
+  if (lance::arrow::is_struct(lhs_type)) {
+    ARROW_ASSIGN_OR_RAISE(auto children, GetIntersection(lhs.children_, rhs.children_));
+    if (!children.empty()) {
+      auto intersection = lhs.Copy(false);
+      intersection->children_ = std::move(children);
+      return intersection;
+    }
+  } else if (lance::arrow::is_list(lhs_type)) {
+    ARROW_ASSIGN_OR_RAISE(auto child, Intersection(*lhs.field(0), *rhs.field(0)));
+    if (child) {
+      auto intersection = lhs.Copy(false);
+      intersection->AddChild(child);
+      return intersection;
+    }
+  } else {
+    return lhs.Copy(true);
+  }
+  return nullptr;
+}
+
+::arrow::Result<std::shared_ptr<Schema>> Schema::Intersection(const Schema& other) const {
+  auto intersection = std::make_shared<Schema>();
+
+  ARROW_ASSIGN_OR_RAISE(auto fields, GetIntersection(fields_, other.fields_));
+  intersection->fields_ = std::move(fields);
+  return intersection;
+}
+
 void Schema::AddField(std::shared_ptr<Field> f) { fields_.emplace_back(f); }
 
 std::shared_ptr<Field> Schema::GetField(int32_t id) const {
@@ -673,11 +769,9 @@ int32_t Schema::GetFieldsCount() const {
 
 std::vector<int32_t> Schema::GetFieldIds() const {
   auto protos = ToProto();
-  std::vector<int32_t> ids(protos.size());
-  for (auto& p : protos) {
-    ids.emplace_back(p.id());
-  }
-  return ids;
+  return protos                                              //
+         | views::transform([](auto& f) { return f.id(); })  //
+         | to<std::vector<int32_t>>;
 }
 
 std::vector<lance::format::pb::Field> Schema::ToProto() const {
@@ -690,12 +784,14 @@ std::vector<lance::format::pb::Field> Schema::ToProto() const {
   return pb_fields;
 }
 
-/// Make a full copy of the schema.
+/// Make a full deep copy of the schema, which makes a copy of each node
+/// in the schema tree.
 std::shared_ptr<Schema> Schema::Copy() const {
   auto copy = std::make_shared<Schema>();
   for (auto& field : fields_) {
     copy->fields_.emplace_back(field->Copy(true));
   };
+  copy->metadata_ = metadata_;
   return copy;
 }
 
