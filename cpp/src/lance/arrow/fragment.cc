@@ -118,6 +118,9 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
   return lance::io::FileReader::Make(infile);
 }
 
+::arrow::Status LanceFragment::AddColumn(std::shared_ptr<::arrow::Field> field) {
+
+}
 ::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::AddColumn(
     const std::shared_ptr<format::Schema>& dataset_schema,
     const std::shared_ptr<format::Schema>& column_schema,

@@ -82,8 +82,8 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const;
 
-  /// Add column to dataset
-  ::arrow::Status AddColumn(std::shared_ptr<::arrow::Field> field);
+  /// Add column to dataset.
+  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(std::shared_ptr<::arrow::Field> field);
 
   /// Add column to the dataset.
   ///
