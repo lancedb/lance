@@ -14,6 +14,7 @@ runs:
       uses: pypa/cibuildwheel@v2.8.1
       env:
         CIBW_BUILD: cp3${{ inputs.python-minor-version }}*
+        CIBW_TEST_SKIP: "*"
       with:
         package-dir: python
         output-dir: python/wheels

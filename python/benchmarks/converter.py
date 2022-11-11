@@ -51,10 +51,9 @@ class DatasetConverter(ABC):
         if fmt == "parquet":
             pq.write_table(table, output_path, **kwargs)
         elif fmt == "lance":
-            pa.dataset.write_dataset(
+            lance.write_dataset(
                 table,
                 output_path,
-                format=lance.LanceFileFormat(),
                 **kwargs,
             )
         return table
@@ -118,8 +117,8 @@ class DatasetConverter(ABC):
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":
-            pa.dataset.write_dataset(
-                embedded, output_path, format=lance.LanceFileFormat(), **kwargs
+            lance.write_dataset(
+                embedded, output_path, **kwargs
             )
         return embedded
 

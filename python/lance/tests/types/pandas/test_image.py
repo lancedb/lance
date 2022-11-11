@@ -216,10 +216,6 @@ class TestMethods(base.BaseMethodsTests):
         expected = pd.Series(other).value_counts(dropna=dropna).sort_index()
         self.assert_series_equal(result, expected)
 
-    @pytest.mark.filterwarnings("ignore:Falling back:pandas.errors.PerformanceWarning")
-    def test_value_counts_with_normalize(self, data):
-        super().test_value_counts_with_normalize(data)
-
     def test_combine_add(self, data_repeated):
         with pytest.raises(TypeError):
             super().test_combine_add(data_repeated)

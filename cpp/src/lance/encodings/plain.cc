@@ -49,7 +49,8 @@ PlainEncoder::PlainEncoder(std::shared_ptr<::arrow::io::OutputStream> out) : Enc
 ::arrow::Result<int64_t> PlainEncoder::WriteFixedSizeListArray(
     const std::shared_ptr<::arrow::FixedSizeListArray>& arr) {
   assert(::arrow::is_primitive(arr->values()->type_id()));
-  return Write(arr->values());
+
+  return Write(arr->values()->Slice(arr->value_offset(0), arr->length() * arr->value_length()));
 }
 
 template <ArrowType T>

@@ -207,3 +207,33 @@ TEST_CASE("Test merge extension types") {
                             *::arrow::schema({::arrow::field("ann", lance::testing::image())}));
   CHECK(result.status().IsInvalid());
 }
+
+TEST_CASE("Merge record batches") {
+  const int kNumRows = 3;
+  auto batch1 =
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("col1", ::arrow::int32())}),
+                                 kNumRows,
+                                 {ToArray({1, 2, 3}).ValueOrDie()});
+  auto batch2 =
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("col2", ::arrow::uint32())}),
+                                 kNumRows,
+                                 {ToArray({10, 20, 30}).ValueOrDie()});
+  auto batch3 =
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("col3", ::arrow::utf8())}),
+                                 kNumRows,
+                                 {ToArray({"1", "2", "3"}).ValueOrDie()});
+  std::vector<std::shared_ptr<::arrow::RecordBatch>> batches({batch1, batch2, batch3});
+
+  auto merged = lance::arrow::MergeRecordBatches(batches).ValueOrDie();
+  CHECK(merged->num_rows() == kNumRows);
+
+  auto expected =
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("col1", ::arrow::int32()),
+                                                  ::arrow::field("col2", ::arrow::uint32()),
+                                                  ::arrow::field("col3", ::arrow::utf8())}),
+                                 kNumRows,
+                                 {ToArray({1, 2, 3}).ValueOrDie(),
+                                  ToArray({10, 20, 30}).ValueOrDie(),
+                                  ToArray({"1", "2", "3"}).ValueOrDie()});
+  CHECK(merged->Equals(*expected));
+}

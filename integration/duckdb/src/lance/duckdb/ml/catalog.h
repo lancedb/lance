@@ -31,6 +31,9 @@ class ModelEntry {
   /// Model URL
   const std::string& uri() const { return uri_; }
 
+  /// Target model device
+  const std::string& device() const { return device_; }
+
   /// Returns the type of the model.
   virtual std::string type() const = 0;
 
@@ -41,10 +44,11 @@ class ModelEntry {
 
  protected:
   /// Construct model entry
-  ModelEntry(std::string name, std::string uri);
+  ModelEntry(std::string name, std::string uri, std::string device);
 
   std::string name_;
   std::string uri_;
+  std::string device_;
 };
 
 /// Machine Learning Model Catalog.
@@ -56,7 +60,7 @@ class ModelCatalog {
   static ModelCatalog* Get();
 
   /// Load a Model from URI.
-  bool Load(const std::string& name, const std::string& uri);
+  bool Load(const std::string& name, const std::string& uri, const std::string& device);
 
   /// Get the model by name. Return `nullptr` if not found.
   [[nodiscard]] ModelEntry* Get(const std::string& name) const;

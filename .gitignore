@@ -44,7 +44,7 @@ cmake-build-*
 .vscode
 .DS_Store
 
-python/lance/_lib.cpp
+python/lance/_*.cpp
 
 
 *.parquet
@@ -67,7 +67,13 @@ docs/api/python
 **/.ipynb_checkpoints/
 docs/notebooks
 
+<<<<<<< HEAD
+
+integration/duckdb/*-build
+integration/duckdb/lance.duckdb_extension.*.zip
+=======
 integration/duckdb/manylinux-build
+>>>>>>> c359ac9 (Data Inspection CLI (#119))
 python/notebooks/lance.duckdb_extension
 
 wheelhouse

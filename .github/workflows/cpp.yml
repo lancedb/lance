@@ -9,12 +9,12 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      ArrowVersion: 9.0.0-1
+      ArrowVersion: 10.0.0-1
     defaults:
       run:
         working-directory: ./cpp
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
       - name: Run lint
@@ -40,11 +40,12 @@ jobs:
       run:
         working-directory: ./cpp
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
+          brew update
           cd $(brew --repository)
-          git checkout 3.6.6  # Arrow 9.0
+          git checkout 3.6.8  # Arrow 10.0
           brew install apache-arrow protobuf
       - name: Cmake
         run: cmake -B build

@@ -64,3 +64,14 @@ TEST_CASE("Test locate batch") {
     CHECK(!metadata.LocateBatch(65).ok());
   }
 }
+
+TEST_CASE("Test locate batch on empty metadata") {
+  auto metadata = lance::format::Metadata();
+
+  {
+    CHECK(!metadata.LocateBatch(-1).ok());
+    CHECK(!metadata.LocateBatch(0).ok());
+    CHECK(!metadata.LocateBatch(60).ok());
+    CHECK(!metadata.LocateBatch(65).ok());
+  }
+}

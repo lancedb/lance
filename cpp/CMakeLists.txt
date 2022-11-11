@@ -54,8 +54,15 @@ FetchContent_Declare(fmt
         )
 list(APPEND available_contents fmt)
 
-set(UUID_BUILD_TESTS OFF)
-set(UUID_USING_CXX20_SPAN ON)
+# TODO: Replace with std::range when it is available
+FetchContent_Declare(range
+        GIT_REPOSITORY https://github.com/ericniebler/range-v3.git
+        GIT_TAG 0.12.0
+        )
+list(APPEND available_contents range)
+
+set(UUID_BUILD_TESTS OFF CACHE INTERNAL "Do not build UUID unit test")
+set(UUID_USING_CXX20_SPAN ON CACHE INTERNAL "Use CXX-20 feature")
 FetchContent_Declare(uuid
         URL https://github.com/mariusbancila/stduuid/archive/refs/tags/v1.2.2.zip
         )
@@ -84,6 +91,7 @@ FetchContent_MakeAvailable(${available_contents})
 include_directories(
         ${fmt_SOURCE_DIR}/include
         ${uuid_SOURCE_DIR}/include
+        ${range_SOURCE_DIR}/include
 )
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
@@ -101,14 +109,16 @@ if (APPLE)
     execute_process(COMMAND brew --prefix openssl@1.1 OUTPUT_VARIABLE OPENSSL_PREFIX)
     string(STRIP ${OPENSSL_PREFIX} OPENSSL_ROOT_DIR)
     find_package(Zstd REQUIRED)
-    list(APPEND CMAKE_MODULE_PATH
-            /opt/homebrew/opt/apache-arrow/lib/cmake/arrow
-            /usr/local/opt/apache-arrow/lib/cmake/arrow)
+    execute_process(COMMAND brew --prefix apache-arrow OUTPUT_VARIABLE ARROW_PREFIX)
+    string(STRIP ${ARROW_PREFIX} ARROW_ROOT_DIR)
+    list(APPEND CMAKE_MODULE_PATH ${ARROW_ROOT_DIR}/lib/cmake/arrow)
+    set(ArrowDataset_DIR ${ARROW_ROOT_DIR}/lib/cmake/arrow)
+    set(Parquet_DIR ${ArrowDataset_DIR})
 endif (APPLE)
 
 find_package(Arrow REQUIRED)
-
 find_package(ArrowDataset REQUIRED)
+
 include_directories(include)
 include_directories(src)
 include_directories(${CMAKE_BINARY_DIR}/src)  # for format.pb.{h/cc}

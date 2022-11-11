@@ -16,19 +16,26 @@
 import os
 import pathlib
 import sys
+from io import BytesIO
 from typing import List
 from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import xmltodict
+
+import lance.io
+
+try:
+    import xmltodict
+except ImportError:
+    msg = "please install xmltodict to use Oxford Pet converter"
+    print(msg)
+    raise ImportError(msg)
 
 from lance.io import download_uris
 from lance.types import ImageUriType
-
-sys.path.append("..")
-from converter import DatasetConverter, PUBLIC_URI_ROOT
+from lance.data.convert.base import DatasetConverter
 
 
 # Oxford PET has dataset quality issues:
@@ -45,11 +52,34 @@ from converter import DatasetConverter, PUBLIC_URI_ROOT
 
 
 class OxfordPetConverter(DatasetConverter):
-    def __init__(self, uri_root):
-        super(OxfordPetConverter, self).__init__("oxford_pet", uri_root)
+    # TODO include trimaps
+
+    def __init__(self, uri_root, images_root):
+        super(OxfordPetConverter, self).__init__("oxford_pet", uri_root, images_root)
         self._data_quality_issues = {}
 
     def read_metadata(self, num_rows: int = 0, check_quality=False) -> pd.DataFrame:
+        """
+        For Oxford Pet we read the data dictionary in the list.txt
+        and trainval.txt. There's no explicit split indication so we
+        find the index where the labels start over again as the split
+        point.
+
+        """
+        index_df = self._read_all_indices(num_rows)
+        with_xmls = self._read_annotations(index_df)
+
+        if check_quality:
+            self._check_data_quality(with_xmls)
+
+        output = self._post_processing(with_xmls)
+        return output
+
+    def _read_all_indices(self, num_rows: int):
+        """
+        Read the total index (list.txt) and the trainval index (trainval.txt)
+        and the test.txt index. Add a split column to indicate train, val, test
+        """
         df = self._get_index("list")
         self._to_category(df)
         trainval = self._get_index("trainval")
@@ -67,29 +97,24 @@ class OxfordPetConverter(DatasetConverter):
             sizes = by_split.size()
             rows = np.round(sizes / sizes.sum() * num_rows).astype(int).to_dict()
             with_split = pd.concat([f.sample(rows[s]) for s, f in by_split])
+        return with_split
 
+    def _read_annotations(self, df):
+        """Parse the Pascal VOC annotations"""
         xml_files = (
             os.path.join(self.uri_root, "annotations", "xmls/")
-            + with_split.filename
+            + df.filename
             + ".xml"
         )
-        ann_df = pd.DataFrame(download_uris(xml_files, func=_get_xml))
+        ann_df = pd.DataFrame(download_uris(xml_files, func=_xml_to_dict))
         with_xmls = pd.concat(
-            [with_split.reset_index(drop=True), ann_df.drop(columns=["filename"])],
+            [df.reset_index(drop=True), ann_df.drop(columns=["filename"])],
             axis=1,
         )
+        return with_xmls
 
-        if check_quality:
-            trainval = df[df.split.isin(["train", "val"])]
-            self._data_quality_issues["missing_xml"] = trainval[
-                trainval.folder.isna()
-            ].filename.values.tolist()
-
-            p = pathlib.Path(self.uri_root) / "annotations" / "xmls"
-            names = pd.Series([p.name[:-4] for p in p.iterdir()])
-            no_index = pd.Index(names.values).difference(df.filename)
-            self._data_quality_issues["missing_index"] = no_index
-
+    def _post_processing(self, with_xmls):
+        """Convert dtypes, add primary key, fill NAs if needed, etc"""
         with_xmls["segmented"] = with_xmls.segmented.apply(
             lambda x: pd.NA if pd.isnull(x) else bool(x)
         ).astype(pd.BooleanDtype())
@@ -108,32 +133,55 @@ class OxfordPetConverter(DatasetConverter):
 
         with_xmls["object"] = with_xmls["object"].apply(_convert)
         with_xmls["external_image"] = with_xmls["filename"].apply(
-            lambda x: os.path.join(PUBLIC_URI_ROOT,
-                                   'oxford_pet',
-                                   f"images/{x}.jpg")
+            lambda x: os.path.join(self.images_root, f"images/{x}.jpg")
         )
         with_xmls = with_xmls.reset_index(drop=True).reset_index(names=["_pk"])
         return with_xmls
 
+    def _check_data_quality(self, df):
+        """
+        Check for train/val index entries with no xml labels and
+        xml annotations that are not in the index
+        """
+        trainval = df[df.split.isin(["train", "val"])]
+        self._data_quality_issues["missing_xml"] = trainval[
+            trainval.folder.isna()
+        ].filename.values.tolist()
+
+        p = pathlib.Path(self.uri_root) / "annotations" / "xmls"
+        names = pd.Series([p.name[:-4] for p in p.iterdir()])
+        no_index = pd.Index(names.values).difference(df.filename)
+        self._data_quality_issues["missing_index"] = no_index
+        print(self._data_quality_issues)
+
     def _get_index(self, name: str) -> pd.DataFrame:
+        """Read the index file with the given name"""
         list_txt = os.path.join(self.uri_root, f"annotations/{name}.txt")
-        df = pd.read_csv(list_txt, delimiter=" ", comment="#", header=None)
+        data = BytesIO(lance.io.read_file(list_txt))
+        df = pd.read_csv(data, delimiter=" ", comment="#", header=None)
         df.columns = ["filename", "class", "species", "breed"]
         return df
 
     @staticmethod
     def _find_split_index(trainval_df):
-        classnames = trainval_df.filename.str.rsplit("_", 1).str[0].str.lower()
+        """
+        find where the labels start over alphabetically again for the
+        trainval split point
+        """
+        classnames = trainval_df.filename.str.rsplit("_", n=1).str[0].str.lower()
         return np.argmax(classnames < classnames.shift(1))
 
     @staticmethod
-    def _to_category(metadata_df: pd.DataFrame):
+    def _to_category(metadata_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Convert class, breeds, and species to pandas category types
+        """
         species_dtype = pd.CategoricalDtype(["Unknown", "Cat", "Dog"])
         metadata_df["species"] = pd.Categorical.from_codes(
             metadata_df.species, dtype=species_dtype
         )
 
-        breeds = metadata_df.filename.str.rsplit("_", 1).str[0].unique()
+        breeds = metadata_df.filename.str.rsplit("_", n=1).str[0].unique()
         assert len(breeds) == 37
 
         breeds = np.concatenate([["Unknown"], breeds])
@@ -143,17 +191,13 @@ class OxfordPetConverter(DatasetConverter):
         )
         return metadata_df
 
-    def default_dataset_path(self, fmt, flavor=None):
-        suffix = f"_{flavor}" if flavor else ""
-        return os.path.join(self.uri_root, f"{self.name}{suffix}.{fmt}")
-
     def image_uris(self, table) -> List[str]:
-        prefix = os.path.join(PUBLIC_URI_ROOT, 'oxford_pet/')
-        uris = [os.path.join(self.uri_root, image_uri[len(prefix):])
+        uris = [os.path.join(self.uri_root, image_uri[len(self.images_root):])
                 for image_uri in table["external_image"].to_numpy()]
         return uris
 
-    def get_schema(self):
+    def get_schema(self) -> pa.Schema:
+        """Return the Arrow schema"""
         source_schema = pa.struct(
             [
                 pa.field("database", pa.string()),
@@ -212,7 +256,8 @@ class OxfordPetConverter(DatasetConverter):
         )
 
 
-def _get_xml(uri: str):
+def _xml_to_dict(uri: str):
+    """Read the Pascal VOC XML annotation and return a dictionary"""
     if not urlparse(uri).scheme:
         uri = pathlib.Path(uri)
 

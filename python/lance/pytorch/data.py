@@ -142,7 +142,7 @@ class LanceDataset(IterableDataset):
             return self._files
 
         self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
-        self._files = dataset(self.root).files
+        self._files = pyarrow.dataset.dataset(self.root, format=lance.LanceFileFormat()).files
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
             # Split the work using at the files level for now.
@@ -158,14 +158,20 @@ class LanceDataset(IterableDataset):
         Either returning a record or a batch is controlled by the "mode" parameter.
         """
         self._setup_dataset()
+        kwargs = {}
+        if len(self.columns) > 0:
+            kwargs["columns"] = self.columns
+        if self.filter is not None:
+            kwargs["filter"] = self.filter
+        if self.batch_size is not None:
+            kwargs["batch_size"] = self.batch_size
+
         for file_uri in self._files:
             ds = lance.dataset(
                 file_uri,
                 filesystem=self._fs,
             )
-            scan = ds.scanner(
-                columns=self.columns, batch_size=self.batch_size, filter=self.filter
-            )
+            scan = ds.scanner(**kwargs)
             for batch in scan.to_reader():
                 if self.mode == "batch":
                     if batch.num_rows == 0:
