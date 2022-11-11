@@ -51,8 +51,6 @@ class Scan : public ExecNode {
       int64_t batch_size,
       ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool());
 
-  static ::arrow::Result<std::shared_ptr<Scan>> Make();
-
   Scan() = delete;
 
   ~Scan() override = default;

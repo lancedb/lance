@@ -18,7 +18,6 @@
 
 #include "lance/arrow/utils.h"
 #include "lance/format/metadata.h"
-#include "lance/format/schema.h"
 #include "lance/io/reader.h"
 
 namespace lance::io::exec {
