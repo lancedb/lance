@@ -28,9 +28,13 @@
 #include <string>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
 #include "lance/arrow/writer.h"
 #include "lance/io/reader.h"
+#include "lance/io/writer.h"
+
+namespace fs = std::filesystem;
 
 namespace lance::testing {
 
@@ -116,5 +120,35 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
       0,
   };
 }
+
+/// Make one lance fragment from the table.
+::arrow::Result<std::shared_ptr<lance::arrow::LanceFragment>> MakeFragment(
+    const std::shared_ptr<::arrow::Table>& table) {
+  auto data_dir = lance::testing::MakeTemporaryDir().ValueOrDie();
+  auto local_fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  std::string filename(fs::path(data_dir) / "12345-67890.lance");
+  auto output = local_fs->OpenOutputStream(filename).ValueOrDie();
+
+  {
+    auto write_options = lance::arrow::LanceFileFormat().DefaultWriteOptions();
+    auto writer = lance::io::FileWriter(table->schema(), write_options, output);
+    auto batch_reader = ::arrow::TableBatchReader(table);
+    std::shared_ptr<::arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader.ReadNext(&batch));
+      if (batch == nullptr) {
+        break;
+      }
+      ARROW_RETURN_NOT_OK(writer.Write(batch));
+    }
+    writer.Finish().Wait();
+  }
+
+  auto schema = std::make_shared<lance::format::Schema>(table->schema());
+  auto data_file = lance::format::DataFile(filename, schema->GetFieldIds());
+  auto fragment = std::make_shared<lance::format::DataFragment>(data_file);
+  return std::make_shared<lance::arrow::LanceFragment>(
+      local_fs, data_dir, std::move(fragment), std::move(schema));
+};
 
 }  // namespace lance::testing

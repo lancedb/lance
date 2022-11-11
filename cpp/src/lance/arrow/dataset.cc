@@ -27,7 +27,8 @@
 #include <range/v3/all.hpp>
 #include <utility>
 
-#include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/file_lance.h"
+#include "lance/arrow/fragment.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/writer.h"
@@ -109,7 +110,7 @@ class LanceDataset::Impl {
 };
 
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
-    : ::arrow::dataset::Dataset(impl->manifest->schema().ToArrow()), impl_(std::move(impl)) {}
+    : ::arrow::dataset::Dataset(impl->manifest->schema()->ToArrow()), impl_(std::move(impl)) {}
 
 LanceDataset::LanceDataset(const LanceDataset& other)
     : LanceDataset(std::make_unique<Impl>(*other.impl_)) {}
@@ -145,7 +146,7 @@ LanceDataset::~LanceDataset() {}
       }
     } else {
       auto existing_manifest = cur_dataset->impl_->manifest;
-      auto existing_arrow_schema = existing_manifest->schema().ToArrow();
+      auto existing_arrow_schema = existing_manifest->schema()->ToArrow();
 
       if (!scanner->dataset()->schema()->Equals(existing_arrow_schema)) {
         return ::arrow::Status::IOError("Write dataset with different schema: ",
@@ -196,7 +197,7 @@ LanceDataset::~LanceDataset() {}
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
-  manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
+  manifest->AppendFragments(CreateFragments(paths, *manifest->schema()));
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
@@ -250,9 +251,7 @@ LanceDataset::~LanceDataset() {}
   return manifest->GetDatasetVersion();
 }
 
-DatasetVersion LanceDataset::version() const {
-  return impl_->manifest->GetDatasetVersion();
-}
+DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
     [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {

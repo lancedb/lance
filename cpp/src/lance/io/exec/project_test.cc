@@ -32,6 +32,7 @@
 #include "lance/testing/io.h"
 
 using lance::io::exec::Project;
+using lance::testing::MakeFragment;
 
 TEST_CASE("Project schema") {
   auto schema =
@@ -46,8 +47,8 @@ TEST_CASE("Project schema") {
   auto tbl =
       arrow::Table::FromRecordBatches({arrow::RecordBatch::FromStructArray(arr).ValueOrDie()})
           .ValueOrDie();
+  auto fragment = MakeFragment(tbl).ValueOrDie();
   auto dataset = std::make_shared<arrow::dataset::InMemoryDataset>(tbl);
-
   auto scan_builder = lance::arrow::ScannerBuilder(dataset);
   CHECK(scan_builder.Project({"v"}).ok());
   CHECK(scan_builder
@@ -56,8 +57,7 @@ TEST_CASE("Project schema") {
             .ok());
   auto scanner = scan_builder.Finish().ValueOrDie();
 
-  auto reader = lance::testing::MakeReader(tbl).ValueOrDie();
-  auto project = lance::io::exec::Project::Make(reader, scanner->options()).ValueOrDie();
+  auto project = lance::io::exec::Project::Make(*fragment, scanner->options()).ValueOrDie();
 
   auto result = project->Next();
   auto& batch = result.ValueOrDie();

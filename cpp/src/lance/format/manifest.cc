@@ -75,7 +75,7 @@ std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
   return new_manifest;
 }
 
-const Schema& Manifest::schema() const { return *schema_; }
+const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }
 
 uint64_t Manifest::version() const { return version_; }
 
