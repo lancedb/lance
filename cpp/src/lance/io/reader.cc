@@ -95,6 +95,7 @@ Status FileReader::Open() {
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
   if (!manifest_) {
+    /// Multiple files can share the manifest.
     ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
     // We need read the dictionary from the same file.
     auto visitor = format::ReadDictionaryVisitor(file_);
@@ -106,6 +107,7 @@ Status FileReader::Open() {
 
   auto num_batches = metadata_->num_batches();
   auto num_columns = manifest_->schema()->GetFieldsCount();
+  fmt::print("num_columns: {}\n", num_columns);
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
