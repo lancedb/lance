@@ -81,7 +81,7 @@ class DatasetConverter(ABC):
         **kwargs: keyword arguments to be passed to `write_dataset`
         """
         if isinstance(dataset, pd.DataFrame):
-            dataset = self._convert_metadata_df(dataset)
+            dataset = self.to_table(dataset)
         fmt = fmt.lower()
         if fmt == "parquet":
             ds.write_dataset(dataset, output_path, format=fmt, **kwargs)
@@ -91,7 +91,7 @@ class DatasetConverter(ABC):
             raise ValueError(f"Unsupported format {fmt}")
         return dataset
 
-    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+    def to_table(self, df: pd.DataFrame) -> pa.Table:
         """Convert each metdata column to pyarrow with lance types"""
         schema = self.get_schema()
         arrays = []
@@ -153,7 +153,7 @@ class DatasetConverter(ABC):
             {uri_root}/{name}.{fmt}
         """
         if isinstance(metadata, pd.DataFrame):
-            metadata = self._convert_metadata_df(metadata)
+            metadata = self.to_table(metadata)
         output_path = output_path or self.default_dataset_path(fmt)
         uris = self.image_uris(metadata)
         images = download_uris(pd.Series(uris))
