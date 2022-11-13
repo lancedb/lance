@@ -91,7 +91,7 @@ class DatasetConverter(ABC):
             raise ValueError(f"Unsupported format {fmt}")
         return dataset
 
-    def to_table(self, df: pd.DataFrame, to_image: bool = False) -> pa.Table:
+    def to_table(self, df: pd.DataFrame, to_image: bool = True) -> pa.Table:
         """Convert each metdata column to pyarrow with lance types"""
         schema = self.get_schema()
         arrays = []
