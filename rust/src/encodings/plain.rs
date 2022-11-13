@@ -110,7 +110,13 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
     }
 
     fn value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
-        let arr = self._decode(i as i32, &Some(1 as i32)).unwrap();
-        Ok(Box::new(PrimitiveScalar::from(Some(arr.value(0)))))
+        match self._decode(i as i32, &Some(1 as i32)) {
+            Ok(arr) => {
+                Ok(Box::new(PrimitiveScalar::from(Some(arr.value(0)))))
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
     }
 }
