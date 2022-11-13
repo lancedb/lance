@@ -15,7 +15,7 @@ pub struct PageTable {
 }
 
 impl PageTable {
-    pub fn make<R: Read + Seek>(
+    pub fn new<R: Read + Seek>(
         file: &mut R,
         page_table_position: u64,
         num_columns: usize,

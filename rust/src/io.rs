@@ -94,13 +94,13 @@ impl<R: Read + Seek> FileReader<R> {
             ProtoParser::read(&mut f, pb_meta.manifest_position as i64)?;
         let num_columns = manifest.fields.len();
         let num_batches = pb_meta.batch_offsets.len() - 1;
-        let page_table = PageTable::make(
+        let page_table = PageTable::new(
             &mut f,
             pb_meta.page_table_position,
             num_columns,
             num_batches,
         );
-        let metadata = Metadata::make(pb_meta);
+        let metadata = Metadata::new(pb_meta);
         Ok(FileReader {
             file: f,
             schema: Schema::from_proto(&manifest.fields),

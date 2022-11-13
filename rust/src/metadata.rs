@@ -6,7 +6,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn make(pb: pb::Metadata) -> Self {
+    pub fn new(pb: pb::Metadata) -> Self {
         Self { pb }
     }
 
