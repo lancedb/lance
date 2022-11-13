@@ -21,6 +21,7 @@ use std::io::{Read, Seek};
 use arrow2::datatypes::{DataType, PrimitiveType, TimeUnit};
 use arrow2::datatypes::PhysicalType::Primitive;
 use arrow2::types::{days_ms, f16, i256, months_days_ns};
+use std::string::ToString;
 
 use crate::encodings::{Decoder, Encoding};
 use crate::encodings::plain::PlainDecoder;
@@ -264,7 +265,7 @@ impl Field {
             DataType::FixedSizeList(v, len) => {
                 format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len)
             }
-            _ => panic!(),
+            x => format!("not supported format: {:?}", x),
         }
     }
 

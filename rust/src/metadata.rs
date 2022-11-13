@@ -14,7 +14,7 @@ impl Metadata {
         self.pb.batch_offsets.len() - 1
     }
 
-    pub fn length(&self) -> i32 {
+    pub fn length(&self) -> usize {
         // Metadata::length
         // TODO need a link to the design doc
         match self.pb.batch_offsets.last() {
@@ -27,14 +27,14 @@ impl Metadata {
         if self.pb.batch_offsets.len() == 0 {
             self.pb.batch_offsets.push(0)
         }
-        self.pb.batch_offsets.push(self.length() + length)
+        self.pb.batch_offsets.push(self.length() as i32 + length)
     }
 
     pub fn locate_batch(&self, row_index: i32) -> Result<(i32, i32), Error> {
         // Metadata::LocateBatch
         let len = self.length();
 
-        if row_index < 0 || row_index >= len {
+        if row_index < 0 || row_index >= len as i32 {
             return Err(Error::InvalidArgumentError(format!(
                 "Row index out of range: {} of {}",
                 row_index, len
