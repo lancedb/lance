@@ -10,10 +10,6 @@ impl Metadata {
         Self { pb }
     }
 
-    pub fn num_chunks(&self) -> usize {
-        self.pb.batch_offsets.len() - 1
-    }
-
     pub fn num_batches(&self) -> usize {
         self.pb.batch_offsets.len() - 1
     }

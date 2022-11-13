@@ -114,7 +114,7 @@ impl<R: Read + Seek> FileReader<R> {
     }
 
     pub fn num_chunks(&self) -> usize {
-        self.metadata.num_chunks()
+        self.metadata.num_batches()
     }
 
     pub fn get(&mut self, idx: u32) -> Vec<Box<dyn Scalar>> {
