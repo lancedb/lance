@@ -97,6 +97,10 @@ namespace {
   ARROW_ASSIGN_OR_RAISE(auto manifest_pos, ReadFooter(buf));
   ARROW_ASSIGN_OR_RAISE(auto manifest,
                         lance::format::Manifest::Parse(SliceBuffer(buf, manifest_pos)));
+
+  /// TODO: optimize ReadDictionaryVisitor to read from buffer.
+  auto visitor = format::ReadDictionaryVisitor(in);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest->schema()));
   return manifest;
 }
 

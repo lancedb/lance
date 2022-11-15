@@ -165,6 +165,9 @@ std::string Field::ToString() const {
   if (is_extension_type()) {
     str = fmt::format("{}, extension_name={}", str, extension_name_);
   }
+  if (dictionary_) {
+    str = fmt::format("{}, dict={}", str, dictionary_->ToString());
+  }
   return str;
 }
 
@@ -300,6 +303,8 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_type(GetNodeType());
 
   pb_fields.emplace_back(field);
+
+  fmt::print("Field::ToProto: name={} {} {}\n", name_, dictionary_offset_, dictionary_page_length_);
 
   for (auto& child : children_) {
     auto protos = child->ToProto();
