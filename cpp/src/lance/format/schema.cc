@@ -64,12 +64,12 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
   if (::lance::arrow::is_struct(dtype)) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
-      children_.push_back(std::shared_ptr<Field>(new Field(arrow_field)));
+      children_.push_back(std::make_shared<Field>(arrow_field));
     }
   } else if (::lance::arrow::is_list(dtype)) {
     auto list_type = std::static_pointer_cast<::arrow::ListType>(dtype);
     children_.emplace_back(
-        std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
+        std::make_shared<Field>(::arrow::field("item", list_type->value_type())));
     encoding_ = encodings::PLAIN;
   } else if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = encodings::VAR_BINARY;
@@ -195,6 +195,10 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 
   auto decoder =
       lance::encodings::VarBinaryDecoder<::arrow::StringType>(std::move(infile), ::arrow::utf8());
+  fmt::print("Load dictionary: name={} offset={} length={}\n",
+             name_,
+             dictionary_offset_,
+             dictionary_page_length_);
   decoder.Reset(dictionary_offset_, dictionary_page_length_);
 
   ARROW_ASSIGN_OR_RAISE(auto dict_arr, decoder.ToArray());

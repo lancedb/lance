@@ -20,6 +20,7 @@
 #include <arrow/status.h>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 using arrow::Result;
@@ -30,7 +31,7 @@ using std::vector;
 namespace lance::encodings {
 
 VarBinaryEncoder::VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out) noexcept
-    : Encoder(out) {}
+    : Encoder(std::move(out)) {}
 
 Result<int64_t> VarBinaryEncoder::Write(const std::shared_ptr<::arrow::Array>& data) {
   ARROW_ASSIGN_OR_RAISE(auto values_position, out_->Tell());

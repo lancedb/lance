@@ -31,6 +31,7 @@
 #include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
 #include "lance/arrow/writer.h"
+#include "lance/format/manifest.h"
 #include "lance/io/reader.h"
 #include "lance/io/writer.h"
 
@@ -145,10 +146,11 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
   }
 
   auto schema = std::make_shared<lance::format::Schema>(table->schema());
+  auto manifest = std::make_shared<lance::format::Manifest>(schema);
   auto data_file = lance::format::DataFile(filename, schema->GetFieldIds());
   auto fragment = std::make_shared<lance::format::DataFragment>(data_file);
   return std::make_shared<lance::arrow::LanceFragment>(
-      local_fs, data_dir, std::move(fragment), std::move(schema));
+      local_fs, data_dir, std::move(fragment), std::move(manifest));
 };
 
 }  // namespace lance::testing

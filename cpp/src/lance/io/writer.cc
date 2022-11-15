@@ -34,7 +34,7 @@ namespace lance::io {
 static constexpr int16_t kMajorVersion = 0;
 static constexpr int16_t kMinorVersion = 1;
 
-namespace internal {
+namespace {
 
 /**
  * Write the 16 bytes footer to the end of a file.
@@ -79,6 +79,16 @@ FileWriter::~FileWriter() {}
   }
   batch_id_++;
   return ::arrow::Status::OK();
+}
+
+::arrow::Status FileWriter::WriteManifest(const std::shared_ptr<::arrow::io::OutputStream>& destination,
+                                          const lance::format::Manifest& manifest) {
+  // Write dictionary values first.
+  auto visitor = format::WriteDictionaryVisitor(destination);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest.schema()));
+
+  ARROW_ASSIGN_OR_RAISE(auto offset, manifest.Write(destination));
+  return ::lance::io::WriteFooter(destination, offset);
 }
 
 ::arrow::Status FileWriter::WriteArray(const std::shared_ptr<format::Field>& field,
@@ -198,7 +208,7 @@ FileWriter::~FileWriter() {}
   metadata_->SetManifestPosition(pos);
 
   ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
-  return internal::WriteFooter(destination_, pos);
+  return ::lance::io::WriteFooter(destination_, pos);
 }
 
 ::arrow::Future<> FileWriter::FinishInternal() {

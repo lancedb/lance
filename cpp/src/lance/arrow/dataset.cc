@@ -205,7 +205,7 @@ LanceDataset::~LanceDataset() {}
   auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(manifest->Write(out));
+    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
   }
   auto latest_manifest_path = GetManifestPath(base_dir, std::nullopt);
   return fs->CopyFile(manifest_path, latest_manifest_path);
@@ -263,7 +263,7 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments =
       impl_->manifest->fragments() | views::transform([this](auto& data_fragment) {
         return std::make_shared<LanceFragment>(
-            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema());
+            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest);
       }) |
       ranges::to<decltype(fragments)>;
 

@@ -23,6 +23,7 @@
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/utils.h"
 #include "lance/format/data_fragment.h"
+#include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
 #include "lance/io/record_batch_reader.h"
@@ -33,22 +34,23 @@ namespace fs = std::filesystem;
 namespace lance::arrow {
 
 ::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::Make(
-    const ::arrow::dataset::FileFragment& file_fragment, std::shared_ptr<format::Schema> schema) {
-  auto field_ids = schema->GetFieldIds();
+    const ::arrow::dataset::FileFragment& file_fragment,
+    std::shared_ptr<format::Manifest> manifest) {
+  auto field_ids = manifest->schema()->GetFieldIds();
   auto data_fragment = std::make_shared<format::DataFragment>(
       format::DataFile(file_fragment.source().path(), field_ids));
   return std::make_shared<LanceFragment>(
-      file_fragment.source().filesystem(), "", data_fragment, schema);
+      file_fragment.source().filesystem(), "", std::move(data_fragment), std::move(manifest));
 }
 
 LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                              std::string data_dir,
                              std::shared_ptr<lance::format::DataFragment> fragment,
-                             std::shared_ptr<format::Schema> schema)
+                             std::shared_ptr<lance::format::Manifest> manifest)
     : fs_(std::move(fs)),
       data_uri_(std::move(data_dir)),
       fragment_(std::move(fragment)),
-      schema_(std::move(schema)) {}
+      manifest_(std::move(manifest)) {}
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
@@ -57,7 +59,7 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
-  return schema_->ToArrow();
+  return schema()->ToArrow();
 }
 
 ::arrow::Result<std::vector<LanceFragment::FileReaderWithSchema>> LanceFragment::Open(
@@ -71,14 +73,15 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
         executor->Submit(
             [this, &schema](auto idx) -> ::arrow::Result<FileReaderWithSchema> {
               auto& data_file = this->fragment_->data_files()[idx];
-              ARROW_ASSIGN_OR_RAISE(auto data_file_schema, schema_->Project(data_file.fields()));
+              ARROW_ASSIGN_OR_RAISE(auto data_file_schema,
+                                    this->schema()->Project(data_file.fields()));
               ARROW_ASSIGN_OR_RAISE(auto intersection, schema.Intersection(*data_file_schema));
               if (intersection->fields().empty()) {
                 return std::make_tuple(nullptr, nullptr);
               }
               auto full_path = (fs::path(data_uri_) / data_file.path()).string();
               ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
-              ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
+              ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, this->manifest_));
               return std::make_tuple(std::move(reader), intersection);
             },
             i));
@@ -95,6 +98,8 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 
   return readers;
 }
+
+const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return manifest_->schema(); }
 
 ::arrow::Result<int64_t> LanceFragment::FastCountRow() const {
   assert(!fragment_->data_files().empty());
