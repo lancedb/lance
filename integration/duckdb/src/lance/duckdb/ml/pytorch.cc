@@ -100,6 +100,7 @@ std::optional<cv::Mat> ReadImageFromFrame(::duckdb::Value frame_data,
   auto cols = ::duckdb::IntegerValue::Get(frame_cols);
   auto channels = ::duckdb::IntegerValue::Get(frame_channels);
   auto mat_str = ::duckdb::StringValue::Get(frame_data);
+  D_ASSERT(mat_str.size() == rows * cols * channels);
   auto data = (unsigned char*)mat_str.data();
 
   // TODO check number of channels

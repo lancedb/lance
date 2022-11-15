@@ -21,6 +21,7 @@
 #include "lance/duckdb/list_functions.h"
 #include "lance/duckdb/vector_functions.h"
 #include "lance/duckdb/video_functions.h"
+#include "lance/duckdb/ml/functions.h"
 
 namespace duckdb {
 
@@ -51,6 +52,9 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
   }
 
   con.Commit();
+
+  auto &config = DBConfig::GetConfig(*db.instance);
+  config.replacement_scans.emplace_back(lance::duckdb::VideoScanReplacement);
 }
 
 std::string LanceExtension::Name() { return {"lance"}; }
