@@ -14,12 +14,10 @@
 
 #include "lance/testing/io.h"
 
-#include <arrow/dataset/api.h>
 #include <arrow/filesystem/api.h>
 #include <arrow/io/api.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
-#include <fmt/format.h>
 
 #include <cerrno>
 #include <cstdlib>
@@ -75,6 +73,7 @@ namespace lance::testing {
   auto tmp_dir = "file://" + MakeTemporaryDir().ValueOrDie();
   std::string path;
   std::vector<std::shared_ptr<::arrow::Field>> partition_fields;
+  partition_fields.reserve(partitions.size());
   for (auto& part_col : partitions) {
     partition_fields.emplace_back(table->schema()->GetFieldByName(part_col));
   }
