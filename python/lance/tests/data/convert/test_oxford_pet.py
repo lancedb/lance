@@ -20,18 +20,19 @@ def test_basic(tmp_path):
     num_rows = 2
     c = OxfordPetConverter(
         uri_root="s3://eto-public/datasets/oxford_pet",
-        images_root="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet/"
+        images_root="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet"
     )
     df = c.read_metadata(num_rows)
-    c.make_embedded_dataset(df, fmt="lance", output_path=str(tmp_path / "oxford_pet.lance"))
-    c.make_embedded_dataset(df, fmt="parquet", output_path=str(tmp_path / "oxford_pet.parquet"))
+    table = c.to_table(df, to_image=True)
+    c.write_dataset(table, fmt="lance", output_path=str(tmp_path / "oxford_pet.lance"))
+    c.write_dataset(table, fmt="parquet", output_path=str(tmp_path / "oxford_pet.parquet"))
 
 
 # when writing iteratively sometimes we get all NAs in a column
 def test_na(tmp_path):
     c = OxfordPetConverter(
         uri_root="s3://eto-public/datasets/oxford_pet",
-        images_root="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet/"
+        images_root="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet"
     )
     name = "null_struct"
     typ = pa.struct([pa.field("name", pa.string())])

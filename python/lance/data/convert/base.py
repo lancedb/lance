@@ -81,7 +81,7 @@ class DatasetConverter(ABC):
         **kwargs: keyword arguments to be passed to `write_dataset`
         """
         if isinstance(dataset, pd.DataFrame):
-            dataset = self._convert_metadata_df(dataset)
+            dataset = self.to_table(dataset)
         fmt = fmt.lower()
         if fmt == "parquet":
             ds.write_dataset(dataset, output_path, format=fmt, **kwargs)
@@ -91,7 +91,7 @@ class DatasetConverter(ABC):
             raise ValueError(f"Unsupported format {fmt}")
         return dataset
 
-    def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
+    def to_table(self, df: pd.DataFrame, to_image: bool = True) -> pa.Table:
         """Convert each metdata column to pyarrow with lance types"""
         schema = self.get_schema()
         arrays = []
@@ -99,7 +99,10 @@ class DatasetConverter(ABC):
             field = schema.field(name)
             arr = self._convert_field(field.name, field.type, col)
             arrays.append(arr)
-        table = pa.Table.from_arrays(arrays, schema=schema).unify_dictionaries()
+        table = (pa.Table.from_arrays(arrays=arrays, schema=schema)
+                 .unify_dictionaries())
+        if to_image:
+            table = self._load_images(table)
         return table
 
     def _convert_field(self, name, typ, col):
@@ -133,33 +136,11 @@ class DatasetConverter(ABC):
         else:
             return pa.array(col, type=typ)
 
-    def make_embedded_dataset(
-        self,
-        metadata: Union[pa.Table, pd.DataFrame],
-        fmt="lance",
-        output_path=None,
-        **kwargs,
-    ):
-        """
-        Create and write a dataset with the images stored as a binary column named 'image'
-
-        Parameters
-        ----------
-        metadata: pa.Table or pd.DataFrame
-            The metadata frame/table for this dataset
-        fmt: str, "lance" or "parquet"
-        output_path: str, default None
-            If not specified, then it's the `default_dataset_path` which is
-            {uri_root}/{name}.{fmt}
-        """
-        if isinstance(metadata, pd.DataFrame):
-            metadata = self._convert_metadata_df(metadata)
-        output_path = output_path or self.default_dataset_path(fmt)
-        uris = self.image_uris(metadata)
+    def _load_images(self, table: pa.Table, image_col: str = 'image'):
+        uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         image_arr = ImageArray.from_pandas(images)
-        embedded = metadata.append_column(pa.field("image", ImageBinaryType()), image_arr)
-        self.write_dataset(embedded, output_path, fmt=fmt, **kwargs)
+        embedded = table.append_column(pa.field(image_col, ImageBinaryType()), image_arr)
         return embedded
 
     @classmethod
@@ -238,9 +219,9 @@ class DatasetConverter(ABC):
                     kwargs = {
                         'row_group_size': group_size,
                     }
-                if embedded:
-                    converter.make_embedded_dataset(df, f, output_path, **kwargs)
                 else:
-                    return converter.write_dataset(df, f, output_path, **kwargs)
+                    raise TypeError(f"Format {f} not supported")
+                table = converter.to_table(df, to_image=embedded)
+                return converter.write_dataset(table, f, output_path, **kwargs)
 
         return main
