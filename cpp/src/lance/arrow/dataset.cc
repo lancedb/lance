@@ -98,13 +98,19 @@ std::string GetBasenameTemplate() {
     return field->set_dictionary(dict_arr->dictionary());
   }
 
-  if (::arrow::is_list_like(data_type->id())) {
+  if (is_list(data_type)) {
     auto list_arr = std::dynamic_pointer_cast<::arrow::ListArray>(arr);
     ARROW_RETURN_NOT_OK(CollectDictionary(field->field(0), list_arr->values()));
   } else if (is_struct(data_type)) {
     auto struct_arr = std::dynamic_pointer_cast<::arrow::StructArray>(arr);
     for (auto& child : field->fields()) {
       auto child_arr = struct_arr->GetFieldByName(child->name());
+      if (child_arr == nullptr) {
+        return ::arrow::Status::Invalid("CollectDictionary: schema mismatch: field ",
+                                        child->name(),
+                                        "does not exist in the table: ",
+                                        struct_arr->type());
+      }
       ARROW_RETURN_NOT_OK(CollectDictionary(child, child_arr));
     }
   }
@@ -211,7 +217,6 @@ LanceDataset::~LanceDataset() {}
     manifest = std::make_shared<lance::format::Manifest>(schema);
   }
   ARROW_RETURN_NOT_OK(CollectDictionary(manifest->schema(), scanner));
-  fmt::print("Schema: {}\n", manifest->schema());
 
   // Write manifest file
   auto lance_option = options;
@@ -250,7 +255,6 @@ LanceDataset::~LanceDataset() {}
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
-  fmt::print("Manifest schema ptr: {}\n", fmt::ptr(manifest->schema().get()));
   auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));

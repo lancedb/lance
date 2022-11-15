@@ -198,10 +198,6 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 
   auto decoder =
       lance::encodings::VarBinaryDecoder<::arrow::StringType>(std::move(infile), ::arrow::utf8());
-  fmt::print("Load dictionary: name={} offset={} length={}\n",
-             name_,
-             dictionary_offset_,
-             dictionary_page_length_);
   decoder.Reset(dictionary_offset_, dictionary_page_length_);
 
   ARROW_ASSIGN_OR_RAISE(auto dict_arr, decoder.ToArray());
@@ -303,8 +299,6 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_type(GetNodeType());
 
   pb_fields.emplace_back(field);
-
-  fmt::print("Field::ToProto: name={} {} {}\n", name_, dictionary_offset_, dictionary_page_length_);
 
   for (auto& child : children_) {
     auto protos = child->ToProto();

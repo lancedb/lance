@@ -233,4 +233,5 @@ TEST_CASE("Dataset write dictionary array") {
   fmt::print("Base URI: {}\n", base_uri);
 
   auto actual = ReadTable(base_uri, 1);
+  CHECK(actual->Equals(*table));
 }
