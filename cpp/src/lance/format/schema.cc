@@ -87,9 +87,12 @@ Field::Field(const pb::Field& pb)
       name_(pb.name()),
       logical_type_(pb.logical_type()),
       extension_name_(pb.extension_name()),
-      encoding_(lance::encodings::FromProto(pb.encoding())),
-      dictionary_offset_(pb.dictionary_offset()),
-      dictionary_page_length_(pb.dictionary_page_length()) {}
+      encoding_(lance::encodings::FromProto(pb.encoding())) {
+  if (pb.has_dictionary()) {
+    dictionary_offset_ = pb.dictionary().offset();
+    dictionary_page_length_ = pb.dictionary().length();
+  }
+}
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
@@ -294,8 +297,12 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_logical_type(logical_type_);
   field.set_extension_name(extension_name_);
   field.set_encoding(::lance::encodings::ToProto(encoding_));
-  field.set_dictionary_offset(dictionary_offset_);
-  field.set_dictionary_page_length(dictionary_page_length_);
+
+  if (dictionary_offset_ >= 0) {
+    field.mutable_dictionary()->set_offset(dictionary_offset_);
+    field.mutable_dictionary()->set_length(dictionary_page_length_);
+  }
+
   field.set_type(GetNodeType());
 
   pb_fields.emplace_back(field);
