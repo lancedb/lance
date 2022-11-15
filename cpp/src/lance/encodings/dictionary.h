@@ -30,14 +30,14 @@ class DictionaryEncoder : public Encoder {
  public:
   DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out);
 
-  ~DictionaryEncoder() override = default;
+  virtual ~DictionaryEncoder() = default;
 
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
 
   /// Write value array.
   ///
   /// It should be only called once per dataset / file.
-  ::arrow::Result<int64_t> WriteValueArray(const std::shared_ptr<::arrow::Array>& arr);
+  ::arrow::Result<int64_t> WriteValueArray(std::shared_ptr<::arrow::Array> arr);
 
   std::string ToString() const override;
 

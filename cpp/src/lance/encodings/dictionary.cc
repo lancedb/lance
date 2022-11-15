@@ -37,8 +37,7 @@ DictionaryEncoder::DictionaryEncoder(std::shared_ptr<::arrow::io::OutputStream> 
   return plain_encoder_->Write(dict_arr->indices());
 }
 
-::arrow::Result<int64_t> DictionaryEncoder::WriteValueArray(
-    const std::shared_ptr<::arrow::Array>& arr) {
+::arrow::Result<int64_t> DictionaryEncoder::WriteValueArray(std::shared_ptr<::arrow::Array> arr) {
   if (::arrow::is_primitive(arr->type_id())) {
     return PlainEncoder(out_).Write(arr);
   } else if (arr->type_id() == ::arrow::Type::STRING) {
@@ -59,7 +58,9 @@ DictionaryDecoder::DictionaryDecoder(std::shared_ptr<::arrow::io::RandomAccessFi
   assert(dict);
 }
 
-::arrow::Status DictionaryDecoder::Init() { return plain_decoder_->Init(); }
+::arrow::Status DictionaryDecoder::Init() {
+  return plain_decoder_->Init();
+}
 
 void DictionaryDecoder::Reset(int64_t position, int32_t length) {
   Decoder::Reset(position, length);

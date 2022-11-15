@@ -49,7 +49,7 @@ class VarBinaryEncoder : public Encoder {
 
   explicit VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out) noexcept;
 
-  ~VarBinaryEncoder() override = default;
+  virtual ~VarBinaryEncoder() = default;
 
   /// Write an Array, and returns the offsets to the index block.
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
@@ -68,7 +68,7 @@ class VarBinaryDecoder : public Decoder {
  public:
   using Decoder::Decoder;
 
-  ~VarBinaryDecoder() override = default;
+  virtual ~VarBinaryDecoder() = default;
 
   /** Get a Value without scanning the full row group. */
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;

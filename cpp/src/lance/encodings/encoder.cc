@@ -76,7 +76,6 @@ Decoder::Decoder(std::shared_ptr<::arrow::io::RandomAccessFile> infile,
 ::arrow::Status Decoder::Init() { return ::arrow::Status::OK(); }
 
 void Decoder::Reset(int64_t position, int32_t length) {
-  fmt::print("Reset to position={}, length={}\n", position, length);
   position_ = position;
   length_ = length;
 }
