@@ -27,7 +27,7 @@ set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-  GIT_TAG v0.5.1)
+  GIT_TAG v0.6.0)
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
