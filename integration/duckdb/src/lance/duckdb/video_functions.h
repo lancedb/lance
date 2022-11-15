@@ -1,8 +1,0 @@
-//
-// Created by Chang She on 11/12/22.
-//
-
-#ifndef LANCE_DUCKDB_VIDEO_FUNCTIONS_H
-#define LANCE_DUCKDB_VIDEO_FUNCTIONS_H
-
-#endif //LANCE_DUCKDB_VIDEO_FUNCTIONS_H
