@@ -142,7 +142,6 @@ Status FileReader::Open() {
 
   auto num_batches = metadata_->num_batches();
   auto num_columns = manifest_->schema()->GetFieldsCount();
-  fmt::print("num_columns: {}\n", num_columns);
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
