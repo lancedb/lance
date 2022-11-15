@@ -31,6 +31,7 @@
 #include "lance/arrow/fragment.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
+#include "lance/io/reader.h"
 #include "lance/io/writer.h"
 
 namespace fs = std::filesystem;
@@ -82,7 +83,7 @@ std::string GetBasenameTemplate() {
 ::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
   ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(path));
-  return lance::format::Manifest::Parse(in, 0);
+  return lance::io::FileReader::OpenManifest(in);
 }
 
 }  // namespace
@@ -202,6 +203,7 @@ LanceDataset::~LanceDataset() {}
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
+  fmt::print("Manifest schema ptr: {}\n", fmt::ptr(manifest->schema().get()));
   auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));

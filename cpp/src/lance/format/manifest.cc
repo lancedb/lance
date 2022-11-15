@@ -49,6 +49,12 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   return std::shared_ptr<Manifest>(new Manifest(pb));
 }
 
+::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
+    const std::shared_ptr<::arrow::Buffer>& buffer) {
+  ARROW_ASSIGN_OR_RAISE(auto pb, io::ParseProto<pb::Manifest>(buffer));
+  return std::shared_ptr<Manifest>(new Manifest(pb));
+}
+
 ::arrow::Result<int64_t> Manifest::Write(std::shared_ptr<::arrow::io::OutputStream> out) const {
   lance::format::pb::Manifest pb;
   for (auto field : schema_->ToProto()) {

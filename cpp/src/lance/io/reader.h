@@ -41,6 +41,10 @@ class FileReader {
       std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
+  /// Open Manifest file
+  static ::arrow::Result<std::shared_ptr<::lance::format::Manifest>> OpenManifest(
+      const std::shared_ptr<::arrow::io::RandomAccessFile>& in);
+
   explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
                       std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
                       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
