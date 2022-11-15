@@ -41,6 +41,8 @@ if(LANCE_BUILD_PYTORCH)
   endif()
 
   set(BUILD_LIST
+      highgui
+      videoio
       imgcodecs
       CACHE INTERNAL "Do not build static duckdb extension")
   set(BUILD_SHARED_LIBS OFF)
@@ -100,6 +102,8 @@ if(LANCE_BUILD_PYTORCH)
 
   include_directories(
     ${OpenCV_SOURCE_DIR}/include ${OpenCV_SOURCE_DIR}/modules/core/include
+    ${OpenCV_SOURCE_DIR}/modules/highgui/include
+    ${OpenCV_SOURCE_DIR}/modules/videoio/include
     ${OpenCV_SOURCE_DIR}/modules/imgcodecs/include
     ${OpenCV_SOURCE_DIR}/modules/imgproc/include ${CMAKE_CURRENT_BINARY_DIR})
 
@@ -114,7 +118,9 @@ include_directories(src)
 set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
-    src/lance/duckdb/vector_functions.cc)
+    src/lance/duckdb/vector_functions.cc
+    src/lance/duckdb/video_functions.cc
+)
 
 set(LANCE_EXT_SOURCE_ML
     src/lance/duckdb/ml/catalog.cc
@@ -135,6 +141,8 @@ build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
+                        opencv_highgui
+                        opencv_videoio
                         opencv_imgcodecs)
   if(LANCE_BUILD_CUDA)
     set_target_properties(lance_loadable_extension PROPERTIES CUDA_ARCHITECTURES native)

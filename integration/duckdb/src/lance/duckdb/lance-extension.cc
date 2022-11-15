@@ -20,7 +20,7 @@
 
 #include "lance/duckdb/list_functions.h"
 #include "lance/duckdb/vector_functions.h"
-#include "lance/duckdb/ml/functions.h"
+#include "lance/duckdb/video_functions.h"
 
 namespace duckdb {
 
@@ -36,6 +36,10 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
 
   for (auto &func : lance::duckdb::GetVectorFunctions()) {
     catalog.CreateFunction(context, func.get());
+  }
+
+  for (auto &func : lance::duckdb::GetVideoTableFunctions()) {
+    catalog.CreateTableFunction(context, func.get());
   }
 
   for (auto &func : lance::duckdb::ml::GetMLFunctions()) {

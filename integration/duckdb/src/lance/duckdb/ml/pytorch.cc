@@ -92,6 +92,28 @@ std::optional<cv::Mat> ReadImageFromDuckDBValue(::duckdb::Value image_bytes) {
   return fmat;
 }
 
+std::optional<cv::Mat> ReadImageFromFrame(::duckdb::Value frame_data,
+                                          ::duckdb::Value frame_rows,
+                                          ::duckdb::Value frame_cols,
+                                          ::duckdb::Value frame_channels) {
+  auto rows = ::duckdb::IntegerValue::Get(frame_rows);
+  auto cols = ::duckdb::IntegerValue::Get(frame_cols);
+  auto channels = ::duckdb::IntegerValue::Get(frame_channels);
+  auto mat_str = ::duckdb::StringValue::Get(frame_data);
+  auto data = (unsigned char*)mat_str.data();
+
+  // TODO check number of channels
+  cv::Mat img = cv::Mat(rows, cols, CV_8UC3, data);
+  if (img.data == nullptr) {
+    std::cerr << "Failed to parse image: image size=" << mat_str.size() << std::endl;
+    return std::nullopt;
+  }
+  // Convert to float matrix.
+  cv::Mat fmat;
+  img.convertTo(fmat, cv::DataType<float>::type);
+  return fmat;
+}
+
 /// Convert the input image to torch::Tensor and run it through the model (on the model's target device)
 torch::Tensor PyTorchModelEntry::MatToTensor(const cv::Mat& fmat) {
   auto input_tensor = ToTensor(fmat);
@@ -109,8 +131,15 @@ void PyTorchModelEntry::Execute(::duckdb::DataChunk& args,
                                 ::duckdb::ExpressionState& state,
                                 ::duckdb::Vector& result) {
   result.SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
+  auto type = args.data[1].GetType();
   for (int i = 0; i < args.size(); i++) {
-    auto fmat = ReadImageFromDuckDBValue(args.data[1].GetValue(i));
+    ::std::optional<::cv::Mat> fmat;
+    if (type.id() == ::duckdb::LogicalTypeId::STRUCT) {
+      auto values = ::duckdb::StructValue::GetChildren(args.data[1].GetValue(i));
+      fmat = ReadImageFromFrame(values[0], values[1], values[2], values[3]);
+    } else {
+      fmat = ReadImageFromDuckDBValue(args.data[1].GetValue(i));
+    }
     if (fmat.has_value()) {
       auto input_tensor = MatToTensor(fmat.value());
       // TODO: support batch mode
@@ -152,8 +181,21 @@ std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetPyTorchFunctions()
   std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> functions;
   // Predict
   ::duckdb::ScalarFunctionSet predict("predict");
+  // From raw image bytes
   predict.AddFunction(
       ::duckdb::ScalarFunction({::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::BLOB},
+                               ::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
+                               Predict));
+  // From frames
+  auto frame = {
+      ::std::pair<::std::string, ::duckdb::LogicalType>("data", ::duckdb::LogicalType::BLOB),
+      ::std::pair<::std::string, ::duckdb::LogicalType>("width", ::duckdb::LogicalType::INTEGER),
+      ::std::pair<::std::string, ::duckdb::LogicalType>("height", ::duckdb::LogicalType::INTEGER),
+      ::std::pair<::std::string, ::duckdb::LogicalType>("channels", ::duckdb::LogicalType::INTEGER)
+  };
+  predict.AddFunction(
+      ::duckdb::ScalarFunction({::duckdb::LogicalType::VARCHAR,
+                                ::duckdb::LogicalType::STRUCT(frame)},
                                ::duckdb::LogicalType::LIST(::duckdb::LogicalType::FLOAT),
                                Predict));
   functions.emplace_back(std::make_unique<::duckdb::CreateScalarFunctionInfo>(predict));
