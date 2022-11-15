@@ -186,11 +186,8 @@ std::string Field::name() const {
 const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
 
 ::arrow::Status Field::set_dictionary(std::shared_ptr<::arrow::Array> dict_arr) {
-  if (!dictionary_) {
-    dictionary_ = dict_arr;
-    return ::arrow::Status::OK();
-  }
-  return ::arrow::Status::Invalid("Field::dictionary has already been set");
+  dictionary_ = std::move(dict_arr);
+  return ::arrow::Status::OK();
 }
 
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
