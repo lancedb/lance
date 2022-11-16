@@ -50,7 +50,8 @@ class DataFile : public ConvertToProto<pb::DataFile> {
   std::vector<int32_t> fields_;
 };
 
-/// POD of DataFragment
+/// POD of a DataFragment
+///
 ///
 class DataFragment : public ConvertToProto<pb::DataFragment> {
  public:

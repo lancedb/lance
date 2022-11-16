@@ -63,7 +63,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                 std::string data_dir,
                 std::shared_ptr<lance::format::DataFragment> fragment,
-                std::shared_ptr<lance::format::Manifest> manifest);
+                std::shared_ptr<lance::format::Manifest> manifest = nullptr);
 
   /// Destructor.
   ~LanceFragment() override = default;
@@ -86,23 +86,10 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   const std::shared_ptr<format::Schema>& schema() const;
 
   /// Add column to dataset.
-  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(
+  ::arrow::Result<std::shared_ptr<lance::format::DataFragment>> AddColumn(
       const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
       const std::shared_ptr<format::Schema>& column_schema,
       Updater updater);
-
-  /// Add column to the dataset.
-  ///
-  /// \param dataset_schema the schema containing all the fields, including the newly created ones.
-  /// \param column_schema the projected schema of the newly created columns.
-  /// \param data the data of the column.
-  /// \param pool memory pool
-  /// \return A new `LanceFragment` with the new column data.
-  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(
-      const std::shared_ptr<format::Schema>& dataset_schema,
-      const std::shared_ptr<format::Schema>& column_schema,
-      const std::shared_ptr<::arrow::ChunkedArray>& data,
-      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
@@ -122,6 +109,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   std::string data_uri_;
   std::shared_ptr<lance::format::DataFragment> fragment_;
   std::shared_ptr<format::Manifest> manifest_;
+  std::shared_ptr<format::Schema> schema_;
 };
 
 }  // namespace lance::arrow
