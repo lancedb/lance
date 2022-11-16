@@ -12,6 +12,9 @@ jobs:
       run:
         working-directory: ./rust
     steps:
+      - name: Install package
+        run: |
+          sudo apt-get -y install protobuf-compiler
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
         with:
