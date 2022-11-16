@@ -1,3 +1,9 @@
+name: rust
+on:
+  push:
+    branches:
+      - main
+  pull_request:
 jobs:
   build_and_test:
     name: Rust project
