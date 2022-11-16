@@ -19,7 +19,7 @@ impl Metadata {
         // TODO need a link to the design doc
         match self.pb.batch_offsets.last() {
             None => 0,
-            Some(v) => *v,
+            Some(v) => *v as usize,
         }
     }
 
