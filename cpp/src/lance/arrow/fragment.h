@@ -15,13 +15,16 @@
 #pragma once
 
 #include <arrow/dataset/api.h>
+#include <arrow/record_batch.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "lance/arrow/dataset.h"
 #include "lance/format/data_fragment.h"
 #include "lance/format/schema.h"
 
@@ -83,19 +86,22 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   const std::shared_ptr<format::Schema>& schema() const;
 
   /// Add column to dataset.
-  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(std::shared_ptr<::arrow::Field> field);
+  ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(
+      const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
+      const std::shared_ptr<format::Schema>& column_schema,
+      Updater updater);
 
   /// Add column to the dataset.
   ///
   /// \param dataset_schema the schema containing all the fields, including the newly created ones.
   /// \param column_schema the projected schema of the newly created columns.
-  /// \param column the data of the column.
+  /// \param data the data of the column.
   /// \param pool memory pool
   /// \return A new `LanceFragment` with the new column data.
   ::arrow::Result<std::shared_ptr<LanceFragment>> AddColumn(
       const std::shared_ptr<format::Schema>& dataset_schema,
       const std::shared_ptr<format::Schema>& column_schema,
-      const std::shared_ptr<::arrow::ChunkedArray>& column,
+      const std::shared_ptr<::arrow::ChunkedArray>& data,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
  protected:

@@ -16,10 +16,12 @@
 
 #include <arrow/dataset/api.h>
 #include <arrow/filesystem/api.h>
+#include <arrow/record_batch.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,6 +42,9 @@ class DatasetVersion {
  private:
   uint64_t version_;
 };
+
+using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(
+    const std::shared_ptr<::arrow::RecordBatch>& batch)>;
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///

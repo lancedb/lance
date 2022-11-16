@@ -83,7 +83,8 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
               }
               auto full_path = (fs::path(data_uri_) / data_file.path()).string();
               ARROW_ASSIGN_OR_RAISE(auto infile, fs_->OpenInputFile(full_path))
-              ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile, this->manifest_));
+              ARROW_ASSIGN_OR_RAISE(auto reader,
+                                    lance::io::FileReader::Make(infile, this->manifest_));
               return std::make_tuple(std::move(reader), intersection);
             },
             i));
@@ -118,9 +119,37 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
   return lance::io::FileReader::Make(infile);
 }
 
-::arrow::Status LanceFragment::AddColumn(std::shared_ptr<::arrow::Field> field) {
+::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::AddColumn(
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options,
+    const std::shared_ptr<format::Schema>& column_schema,
+    Updater updater) {
+  std::string file_path = fs::path(data_uri_) / fmt::format("{}.lance", GetUUIDString());
+  ARROW_ASSIGN_OR_RAISE(auto output, fs_->OpenOutputStream(file_path));
+  auto write_options = LanceFileFormat().DefaultWriteOptions();
+  io::FileWriter writer(column_schema, std::move(write_options), std::move(output));
 
+  ARROW_ASSIGN_OR_RAISE(auto generator, ScanBatchesAsync(options));
+  auto arrow_schema = column_schema->ToArrow();
+  while (true) {
+    auto fut = generator();
+    ARROW_ASSIGN_OR_RAISE(auto record_batch, fut.result());
+    ARROW_ASSIGN_OR_RAISE(auto arr, updater(record_batch));
+    if (arr->length() != record_batch->num_rows()) {
+      return ::arrow::Status::IOError(
+          "LanceFragment::AddColumn: updater must return the same size of output (",
+          arr->length(),
+          ") as input (",
+          record_batch->num_rows(),
+          ")");
+    }
+    auto result = ::arrow::RecordBatch::Make(arrow_schema, arr->length(), {arr});
+    ARROW_RETURN_NOT_OK(writer.Write(result));
+  }
+
+  auto field_ids = column_schema->GetFieldIds();
+  auto data_file = ::lance::format::DataFile({file_path, field_ids});
 }
+
 ::arrow::Result<std::shared_ptr<LanceFragment>> LanceFragment::AddColumn(
     const std::shared_ptr<format::Schema>& dataset_schema,
     const std::shared_ptr<format::Schema>& column_schema,
@@ -161,7 +190,7 @@ const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return ma
   auto new_data_fragment = std::make_shared<format::DataFragment>(*fragment_);
   new_data_fragment->data_files().emplace_back(::lance::format::DataFile({file_path, field_ids}));
 
-  return std::make_shared<LanceFragment>(fs_, data_uri_, new_data_fragment, dataset_schema);
+  //  return std::make_shared<LanceFragment>(fs_, data_uri_, new_data_fragment, dataset_schema);
 }
 
 }  // namespace lance::arrow
