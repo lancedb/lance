@@ -22,7 +22,7 @@ use arrow2::scalar::Scalar;
 
 pub mod plain;
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub enum Encoding {
     Plain,
     VarBinary,
@@ -47,7 +47,6 @@ pub trait Encoder {
 
 /// Decoder.
 pub trait Decoder {
-
     fn decode(&mut self, offset: i32, length: &Option<i32>) -> Result<Box<dyn Array>>;
 
     fn take(&mut self, indices: &Int32Array) -> Result<Box<dyn Array>>;

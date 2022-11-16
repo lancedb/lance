@@ -18,13 +18,13 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io::{Read, Seek};
 
-use arrow2::datatypes::{DataType, PrimitiveType, TimeUnit};
 use arrow2::datatypes::PhysicalType::Primitive;
+use arrow2::datatypes::{DataType, PrimitiveType, TimeUnit};
 use arrow2::types::{days_ms, f16, i256, months_days_ns};
 use std::string::ToString;
 
-use crate::encodings::{Decoder, Encoding};
 use crate::encodings::plain::PlainDecoder;
+use crate::encodings::{Decoder, Encoding};
 use crate::format::pb;
 use crate::page_table::PageInfo;
 

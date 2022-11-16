@@ -176,12 +176,11 @@ impl<R: Read + Seek> FileReader<R> {
     ) -> Box<dyn arrow2::scalar::Scalar> {
         //FileReader::GetScalar
         match field.data_type().to_physical_type() {
-            PhysicalType::Primitive(p) => {
-                self.get_primitive_scalar(field, batch_id, idx_in_batch)
-            }
-            x => {
-                Box::new(Utf8Scalar::<i32>::new(Some(format!("show data_type {:?} not supported yet", x))))
-            }
+            PhysicalType::Primitive(p) => self.get_primitive_scalar(field, batch_id, idx_in_batch),
+            x => Box::new(Utf8Scalar::<i32>::new(Some(format!(
+                "show data_type {:?} not supported yet",
+                x
+            )))),
         }
     }
 

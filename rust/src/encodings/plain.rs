@@ -18,9 +18,9 @@ use std::any::TypeId;
 use std::io::{Error, ErrorKind, Read, Result, Seek, SeekFrom};
 use std::marker::PhantomData;
 
-use arrow2::array::{Array, PrimitiveArray};
-use arrow2::array::Int32Array;
 use arrow2::array::new_empty_array;
+use arrow2::array::Int32Array;
+use arrow2::array::{Array, PrimitiveArray};
 use arrow2::compute::arithmetics::basic::sub_scalar;
 use arrow2::compute::take::take;
 use arrow2::scalar::{PrimitiveScalar, Scalar};
@@ -111,12 +111,8 @@ impl<'a, R: Read + Seek, T: NativeType> Decoder for PlainDecoder<'a, R, T> {
 
     fn value(&mut self, i: usize) -> Result<Box<dyn Scalar>> {
         match self._decode(i as i32, &Some(1 as i32)) {
-            Ok(arr) => {
-                Ok(Box::new(PrimitiveScalar::from(Some(arr.value(0)))))
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(arr) => Ok(Box::new(PrimitiveScalar::from(Some(arr.value(0))))),
+            Err(e) => Err(e),
         }
     }
 }
