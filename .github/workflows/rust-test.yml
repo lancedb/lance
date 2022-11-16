@@ -18,9 +18,8 @@ jobs:
           toolchain: stable
       - name: cargo test
         run: |
-          cargo build --debug --all-features
+          cargo build --all-features
           cargo test
-          cargo fmt --check
 
       - name: cargo format check
         run: |
