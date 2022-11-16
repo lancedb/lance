@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./rust
+        working-directory: rust
     steps:
       - name: Install package
         run: |
