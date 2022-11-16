@@ -1,0 +1,18 @@
+jobs:
+  build_and_test:
+    name: Rust project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: cargo test
+        run: |
+          cargo build --debug --all-features
+          cargo test
+          cargo fmt --check
+
+      - name: cargo format check
+        run: |
+          cargo fmt --check
