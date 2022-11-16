@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <arrow/buffer.h>
 #include <arrow/io/api.h>
 #include <arrow/result.h>
 
@@ -54,6 +55,10 @@ class Manifest final {
   static ::arrow::Result<std::shared_ptr<Manifest>> Parse(
       std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset);
 
+  /// Parse a Manifest from a buffer.
+  static ::arrow::Result<std::shared_ptr<Manifest>> Parse(
+      const std::shared_ptr<::arrow::Buffer>& buffer);
+
   /// Write the Manifest to a file.
   ///
   /// \param out the output stream to write this Manifest to.
@@ -87,7 +92,7 @@ class Manifest final {
 
   std::vector<std::shared_ptr<DataFragment>> fragments_;
 
-  Manifest(const lance::format::pb::Manifest& pb);
+  explicit Manifest(const lance::format::pb::Manifest& pb);
 };
 
 }  // namespace lance::format

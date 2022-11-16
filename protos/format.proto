@@ -52,7 +52,7 @@ message Manifest {
 
   // Snapshot version
   uint64 version = 4;
-  
+
   // Fragments of the dataset.
   repeated DataFragment fragments = 6;
 }
@@ -64,7 +64,7 @@ message Manifest {
 message DataFragment {
   // Unique ID of each DataFragment
   uint64 id = 1;
-  
+
   repeated DataFile files = 2;
 }
 
@@ -106,6 +106,18 @@ enum Encoding {
   DICTIONARY = 3;
 }
 
+/// Dictionary field metadata
+message Dictionary {
+  /// The file offset for storing the dictionary value.
+  /// It is only valid if encoding is DICTIONARY.
+  ///
+  /// The logic type presents the value type of the column, i.e., string value.
+  int64 offset = 1;
+
+  /// The length of dictionary values.
+  int64 length = 2;
+}
+
 /**
  * Field metadata for a column.
  */
@@ -135,9 +147,8 @@ message Field {
   /// It is only valid if encoding is DICTIONARY.
   ///
   /// The logic type presents the value type of the column, i.e., string value.
-  int64 dictionary_offset = 8;
-  int64 dictionary_page_length = 9;
+  Dictionary dictionary = 8;
 
   // optional extension type name
-  string extension_name = 10;
+  string extension_name = 9;
 }

@@ -19,8 +19,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <memory>
-#include <string>
 #include <range/v3/view.hpp>
+#include <string>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/stl.h"
@@ -29,13 +29,30 @@
 using lance::arrow::ToArray;
 using namespace ranges::views;
 
-
 std::shared_ptr<::arrow::Table> ReadTable(const std::string& uri, std::optional<int32_t> version) {
   std::string path;
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
   auto actual_dataset = lance::arrow::LanceDataset::Make(fs, uri, version).ValueOrDie();
   CHECK(actual_dataset != nullptr);
   return actual_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+}
+
+// Write table as dataset.
+std::string WriteTable(const std::shared_ptr<::arrow::Table>& table) {
+  auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
+  auto format = lance::arrow::LanceFileFormat::Make();
+  ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(base_uri, &path).ValueOrDie();
+  write_options.filesystem = fs;
+  write_options.base_dir = path;
+  write_options.file_write_options = format->DefaultWriteOptions();
+
+  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  CHECK(lance::arrow::LanceDataset::Write(write_options,
+                                          dataset->NewScan().ValueOrDie()->Finish().ValueOrDie())
+            .ok());
+  return base_uri;
 }
 
 TEST_CASE("Create new dataset") {
@@ -199,4 +216,22 @@ TEST_CASE("Dataset overwrite error cases") {
                                         lance::arrow::LanceDataset::kOverwrite);
   INFO("Status: " << status.message() << " is ok: " << status.ok());
   CHECK(status.IsIOError());
+}
+
+TEST_CASE("Dataset write dictionary array") {
+  auto dict_values = ToArray({"a", "b", "c"}).ValueOrDie();
+  auto dict_indices = ToArray({0, 1, 1, 2, 2, 0}).ValueOrDie();
+  auto data_type = ::arrow::dictionary(::arrow::int32(), ::arrow::utf8());
+  auto dict_arr =
+      ::arrow::DictionaryArray::FromArrays(
+          data_type, dict_indices, dict_values)
+          .ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("dict", data_type)}), {dict_arr});
+
+  auto base_uri = WriteTable(table);
+  fmt::print("Base URI: {}\n", base_uri);
+
+  auto actual = ReadTable(base_uri, 1);
+  CHECK(actual->Equals(*table));
 }

@@ -45,21 +45,22 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   ///
   /// It creates a LanceFragment from `arrow.dataset.FileFragment`.
   /// \param file_fragment plain dataset file fragment
-  /// \param schema the schema of dataset.
+  /// \param manifest dataset manifest.
   /// \return LanceFragment
   static ::arrow::Result<std::shared_ptr<LanceFragment>> Make(
-      const ::arrow::dataset::FileFragment& file_fragment, std::shared_ptr<format::Schema> schema);
+      const ::arrow::dataset::FileFragment& file_fragment,
+      std::shared_ptr<format::Manifest> manifest);
 
   /// Constructor
   ///
   /// \param fs a file system instance to conduct IOs.
   /// \param data_dir the base directory to store data.
   /// \param fragment data fragment, the metadata of the fragment.
-  /// \param schema the schema of the Fragment.
+  /// \param manifest dataset manifest.
   LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                 std::string data_dir,
                 std::shared_ptr<lance::format::DataFragment> fragment,
-                std::shared_ptr<format::Schema> schema);
+                std::shared_ptr<lance::format::Manifest> manifest);
 
   /// Destructor.
   ~LanceFragment() override = default;
@@ -79,7 +80,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
       ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) const;
 
   /// Dataset schema.
-  const std::shared_ptr<format::Schema>& schema() const { return schema_; }
+  const std::shared_ptr<format::Schema>& schema() const;
 
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
@@ -98,7 +99,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   std::shared_ptr<::arrow::fs::FileSystem> fs_;
   std::string data_uri_;
   std::shared_ptr<lance::format::DataFragment> fragment_;
-  std::shared_ptr<format::Schema> schema_;
+  std::shared_ptr<format::Manifest> manifest_;
 };
 
 }  // namespace lance::arrow

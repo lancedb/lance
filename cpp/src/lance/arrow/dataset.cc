@@ -14,8 +14,10 @@
 
 #include "lance/arrow/dataset.h"
 
+#include <arrow/array.h>
 #include <arrow/dataset/api.h>
 #include <arrow/status.h>
+#include <arrow/table.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <uuid.h>
@@ -31,6 +33,7 @@
 #include "lance/arrow/fragment.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
+#include "lance/io/reader.h"
 #include "lance/io/writer.h"
 
 namespace fs = std::filesystem;
@@ -82,7 +85,56 @@ std::string GetBasenameTemplate() {
 ::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
   ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(path));
-  return lance::format::Manifest::Parse(in, 0);
+  return lance::io::FileReader::OpenManifest(in);
+}
+
+::arrow::Status CollectDictionary(const std::shared_ptr<lance::format::Field>& field,
+                                  const std::shared_ptr<::arrow::Array>& arr) {
+  assert(field && arr);
+  assert(field->type()->Equals(arr->type()));
+  auto data_type = field->type();
+  if (::arrow::is_dictionary(data_type->id())) {
+    auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
+    return field->set_dictionary(dict_arr->dictionary());
+  }
+
+  if (is_list(data_type)) {
+    auto list_arr = std::dynamic_pointer_cast<::arrow::ListArray>(arr);
+    ARROW_RETURN_NOT_OK(CollectDictionary(field->field(0), list_arr->values()));
+  } else if (is_struct(data_type)) {
+    auto struct_arr = std::dynamic_pointer_cast<::arrow::StructArray>(arr);
+    for (auto& child : field->fields()) {
+      auto child_arr = struct_arr->GetFieldByName(child->name());
+      if (child_arr == nullptr) {
+        return ::arrow::Status::Invalid("CollectDictionary: schema mismatch: field ",
+                                        child->name(),
+                                        "does not exist in the table: ",
+                                        struct_arr->type());
+      }
+      ARROW_RETURN_NOT_OK(CollectDictionary(child, child_arr));
+    }
+  }
+  return ::arrow::Status::OK();
+}
+
+::arrow::Status CollectDictionary(const std::shared_ptr<lance::format::Schema>& schema,
+                                  const std::shared_ptr<::arrow::dataset::Scanner>& scanner) {
+  ARROW_ASSIGN_OR_RAISE(auto example, scanner->Head(1));
+  if (example->num_rows() == 0) {
+    return ::arrow::Status::Invalid("CollectDictionary: empty dataset");
+  }
+  for (auto& field : schema->fields()) {
+    auto chunked_arr = example->GetColumnByName(field->name());
+    if (chunked_arr == nullptr) {
+      return ::arrow::Status::Invalid("CollectDictionary: schema mismatch: field ",
+                                      field->name(),
+                                      "does not exist in the table: ",
+                                      example->schema());
+    }
+    assert(chunked_arr->num_chunks() > 0);
+    ARROW_RETURN_NOT_OK(CollectDictionary(field, chunked_arr->chunk(0)));
+  }
+  return ::arrow::Status::OK();
 }
 
 }  // namespace
@@ -164,6 +216,7 @@ LanceDataset::~LanceDataset() {}
     auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
     manifest = std::make_shared<lance::format::Manifest>(schema);
   }
+  ARROW_RETURN_NOT_OK(CollectDictionary(manifest->schema(), scanner));
 
   // Write manifest file
   auto lance_option = options;
@@ -205,7 +258,7 @@ LanceDataset::~LanceDataset() {}
   auto manifest_path = GetManifestPath(base_dir, manifest->version());
   {
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(manifest->Write(out));
+    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
   }
   auto latest_manifest_path = GetManifestPath(base_dir, std::nullopt);
   return fs->CopyFile(manifest_path, latest_manifest_path);
@@ -263,7 +316,7 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments =
       impl_->manifest->fragments() | views::transform([this](auto& data_fragment) {
         return std::make_shared<LanceFragment>(
-            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema());
+            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest);
       }) |
       ranges::to<decltype(fragments)>;
 

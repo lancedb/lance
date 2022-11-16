@@ -48,7 +48,7 @@ std::shared_ptr<::arrow::Schema> ToArrowVisitor::Finish() { return ::arrow::sche
 }
 
 WriteDictionaryVisitor::WriteDictionaryVisitor(std::shared_ptr<::arrow::io::OutputStream> out)
-    : out_(out) {}
+    : out_(std::move(out)) {}
 
 ::arrow::Status WriteDictionaryVisitor::Visit(std::shared_ptr<Field> root) {
   if (::arrow::is_dictionary(root->storage_type()->id())) {

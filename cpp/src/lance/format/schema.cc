@@ -64,12 +64,12 @@ void Field::Init(std::shared_ptr<::arrow::DataType> dtype) {
   if (::lance::arrow::is_struct(dtype)) {
     auto struct_type = std::static_pointer_cast<::arrow::StructType>(dtype);
     for (auto& arrow_field : struct_type->fields()) {
-      children_.push_back(std::shared_ptr<Field>(new Field(arrow_field)));
+      children_.push_back(std::make_shared<Field>(arrow_field));
     }
   } else if (::lance::arrow::is_list(dtype)) {
     auto list_type = std::static_pointer_cast<::arrow::ListType>(dtype);
     children_.emplace_back(
-        std::shared_ptr<Field>(new Field(::arrow::field("item", list_type->value_type()))));
+        std::make_shared<Field>(::arrow::field("item", list_type->value_type())));
     encoding_ = encodings::PLAIN;
   } else if (::arrow::is_binary_like(type_id) || ::arrow::is_large_binary_like(type_id)) {
     encoding_ = encodings::VAR_BINARY;
@@ -87,9 +87,12 @@ Field::Field(const pb::Field& pb)
       name_(pb.name()),
       logical_type_(pb.logical_type()),
       extension_name_(pb.extension_name()),
-      encoding_(lance::encodings::FromProto(pb.encoding())),
-      dictionary_offset_(pb.dictionary_offset()),
-      dictionary_page_length_(pb.dictionary_page_length()) {}
+      encoding_(lance::encodings::FromProto(pb.encoding())) {
+  if (pb.has_dictionary()) {
+    dictionary_offset_ = pb.dictionary().offset();
+    dictionary_page_length_ = pb.dictionary().length();
+  }
+}
 
 void Field::AddChild(std::shared_ptr<Field> child) { children_.emplace_back(child); }
 
@@ -165,6 +168,9 @@ std::string Field::ToString() const {
   if (is_extension_type()) {
     str = fmt::format("{}, extension_name={}", str, extension_name_);
   }
+  if (dictionary_) {
+    str = fmt::format("{}, dict={}", str, dictionary_->ToString());
+  }
   return str;
 }
 
@@ -180,11 +186,8 @@ std::string Field::name() const {
 const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictionary_; }
 
 ::arrow::Status Field::set_dictionary(std::shared_ptr<::arrow::Array> dict_arr) {
-  if (!dictionary_) {
-    dictionary_ = dict_arr;
-    return ::arrow::Status::OK();
-  }
-  return ::arrow::Status::Invalid("Field::dictionary has already been set");
+  dictionary_ = std::move(dict_arr);
+  return ::arrow::Status::OK();
 }
 
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
@@ -291,8 +294,12 @@ std::vector<lance::format::pb::Field> Field::ToProto() const {
   field.set_logical_type(logical_type_);
   field.set_extension_name(extension_name_);
   field.set_encoding(::lance::encodings::ToProto(encoding_));
-  field.set_dictionary_offset(dictionary_offset_);
-  field.set_dictionary_page_length(dictionary_page_length_);
+
+  if (dictionary_offset_ >= 0) {
+    field.mutable_dictionary()->set_offset(dictionary_offset_);
+    field.mutable_dictionary()->set_length(dictionary_page_length_);
+  }
+
   field.set_type(GetNodeType());
 
   pb_fields.emplace_back(field);

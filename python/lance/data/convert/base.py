@@ -30,9 +30,11 @@ from lance.types import ImageArray, ImageBinaryType
 class DatasetConverter(ABC):
     """Base class for converting raw => pandas => Arrow => Lance"""
 
-    def __init__(self, name, uri_root, images_root=None):
+    def __init__(self, name, uri_root, images_root: str=None):
         self.name = name
         self.uri_root = uri_root
+        if images_root is None:
+            images_root = os.path.join(uri_root, "images")
         self.images_root = images_root
 
     @abstractmethod

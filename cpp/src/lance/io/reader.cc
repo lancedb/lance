@@ -49,6 +49,8 @@ typedef ::arrow::Result<std::shared_ptr<::arrow::Scalar>> ScalarResult;
 
 namespace lance::io {
 
+namespace {
+
 ::arrow::Result<int64_t> ReadFooter(const std::shared_ptr<::arrow::Buffer>& buf) {
   assert(buf->size() >= 16);
   if (auto magic_buf = ::arrow::SliceBuffer(buf, buf->size() - 4);
@@ -56,17 +58,50 @@ namespace lance::io {
     return Status::IOError(
         fmt::format("Invalidate file format: MAGIC NUM is not {}", lance::format::kMagic));
   }
-  // Metadata Offset
   return ReadInt<int64_t>(buf->data() + buf->size() - 16);
 }
+
+}  // namespace
 
 ::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
     std::shared_ptr<::arrow::io::RandomAccessFile> in,
     std::shared_ptr<::lance::format::Manifest> manifest,
     ::arrow::MemoryPool* pool) {
-  auto reader = std::make_unique<FileReader>(in, manifest, pool);
+  auto reader = std::make_unique<FileReader>(std::move(in), std::move(manifest), pool);
   ARROW_RETURN_NOT_OK(reader->Open());
   return reader;
+}
+
+::arrow::Result<std::shared_ptr<::lance::format::Manifest>> FileReader::OpenManifest(
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in) {
+  constexpr auto kBufReadBytes = 8 * 1024 * 1024;  // Read 8 MB;
+  ::arrow::BufferVector buffers;
+  int64_t pos = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto buf, in->ReadAt(pos, kBufReadBytes));
+    auto read_nbytes = buf->size();
+    if (read_nbytes > 0) {
+      buffers.emplace_back(std::move(buf));
+    }
+    if (read_nbytes < kBufReadBytes) {
+      break;
+    }
+    pos += read_nbytes;
+  }
+  assert(!buffers.empty());
+  auto buf = buffers[0];
+  if (buffers.size() > 1) {
+    // Unlikely to get here
+    ARROW_ASSIGN_OR_RAISE(buf, ::arrow::ConcatenateBuffers(buffers));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto manifest_pos, ReadFooter(buf));
+  ARROW_ASSIGN_OR_RAISE(auto manifest,
+                        lance::format::Manifest::Parse(SliceBuffer(buf, manifest_pos)));
+
+  /// TODO: optimize ReadDictionaryVisitor to read from buffer.
+  auto visitor = format::ReadDictionaryVisitor(in);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest->schema()));
+  return manifest;
 }
 
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
@@ -95,6 +130,7 @@ Status FileReader::Open() {
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
   if (!manifest_) {
+    /// Multiple files can share the manifest.
     ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
     // We need read the dictionary from the same file.
     auto visitor = format::ReadDictionaryVisitor(file_);
