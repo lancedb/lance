@@ -57,6 +57,8 @@ class Updater::Impl {
 
   ::arrow::Status Update(const std::shared_ptr<::arrow::Array>& arr);
 
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
+
  private:
   auto data_dir() const { return dataset_->impl_->data_dir(); }
 
@@ -150,6 +152,10 @@ class Updater::Impl {
   return writer_->Write(batch);
 }
 
+::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Impl::Finish() {
+  return ::arrow::Status::NotImplemented("Not implemented yet");
+}
+
 ::arrow::Result<Updater> Updater::Make(std::shared_ptr<LanceDataset> dataset,
                                        const std::shared_ptr<::arrow::Field>& field) {
   auto arrow_schema = ::arrow::schema({field});
@@ -172,8 +178,6 @@ class Updater::Impl {
 
 Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
-::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Finish() {
-  return ::arrow::Status::NotImplemented("not implemented");
-}
+::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Finish() { return impl_->Finish(); }
 
 }  // namespace lance::arrow
