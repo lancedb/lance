@@ -52,8 +52,13 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
     : fs_(std::move(fs)),
       data_uri_(std::move(data_dir)),
       fragment_(std::move(fragment)),
-      manifest_(std::move(manifest)) {
-}
+      manifest_(std::move(manifest)) {}
+
+LanceFragment::LanceFragment(const LanceFragment& other)
+    : fs_(other.fs_),
+      data_uri_(other.data_uri_),
+      fragment_(other.fragment_),
+      manifest_(other.manifest_) {}
 
 ::arrow::Result<::arrow::RecordBatchGenerator> LanceFragment::ScanBatchesAsync(
     const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
@@ -104,6 +109,10 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
 }
 
 const std::shared_ptr<format::Schema>& LanceFragment::schema() const { return manifest_->schema(); }
+
+const std::shared_ptr<lance::format::DataFragment>& LanceFragment::data_fragment() const {
+  return fragment_;
+}
 
 ::arrow::Result<int64_t> LanceFragment::FastCountRow() const {
   assert(!fragment_->data_files().empty());

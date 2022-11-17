@@ -65,6 +65,9 @@ class LanceFragment : public ::arrow::dataset::Fragment {
                 std::shared_ptr<lance::format::DataFragment> fragment,
                 std::shared_ptr<lance::format::Manifest> manifest = nullptr);
 
+  /// Copy constructor.
+  LanceFragment(const LanceFragment& other);
+
   /// Destructor.
   ~LanceFragment() override = default;
 
@@ -85,6 +88,8 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const;
 
+  const std::shared_ptr<lance::format::DataFragment>& data_fragment() const;
+  
 //  /// Add column to dataset.
 //  /// Experimental API.
 //  ::arrow::Result<std::shared_ptr<lance::format::DataFragment>> AddColumn(

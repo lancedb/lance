@@ -28,6 +28,7 @@
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
+#include "lance/format/data_fragment.h"
 #include "lance/format/schema.h"
 #include "lance/io/writer.h"
 
@@ -69,7 +70,7 @@ class Updater::Impl {
   ::arrow::dataset::FragmentVector fragments_;
 
   // Used to store the updated fragments.
-  ::arrow::dataset::FragmentVector updated_fragments_;
+  std::vector<std::shared_ptr<format::DataFragment>> data_fragments_;
 
   // Track runtime information.
   ::arrow::dataset::FragmentVector::iterator fragment_it_;
@@ -95,6 +96,12 @@ class Updater::Impl {
   ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
   ARROW_ASSIGN_OR_RAISE(batch_generator_, (*fragment_it_)->ScanBatchesAsync(scanner->options()));
+
+  // Track the new data files
+  std::vector<format::DataFile> data_files(lance_fragment->data_fragment()->data_files());
+  data_files.emplace_back(::lance::format::DataFile({file_path, column_schema_->GetFieldIds()}));
+  auto new_fragment = std::make_shared<format::DataFragment>(data_files);
+  data_fragments_.emplace_back(std::move(new_fragment));
 
   return ::arrow::Status::OK();
 }

@@ -64,6 +64,7 @@ class DataFragment : public ConvertToProto<pb::DataFragment> {
   /// Construct with single DataFile.
   explicit DataFragment(const DataFile& data_file);
 
+  /// Construct with multiple data files.
   explicit DataFragment(std::vector<DataFile> data_files);
 
   const std::vector<DataFile>& data_files() const;
