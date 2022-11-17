@@ -27,6 +27,7 @@
 #include <range/v3/all.hpp>
 #include <utility>
 
+#include "lance/arrow/dataset_ext.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
@@ -132,23 +133,13 @@ DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
-class LanceDataset::Impl {
- public:
-  Impl() = delete;
+//-------------------------
+// LanceDataset::Impl
+//-------------------------
 
-  Impl(std::shared_ptr<::arrow::fs::FileSystem> filesystem,
-       std::string uri,
-       std::shared_ptr<lance::format::Manifest> m)
-      : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
+std::string LanceDataset::Impl::data_dir() const { return fs::path(base_uri) / kDataDir; }
 
-  std::string data_dir() const { return fs::path(base_uri) / kDataDir; }
-
-  std::string versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
-
-  std::shared_ptr<::arrow::fs::FileSystem> fs;
-  std::string base_uri;
-  std::shared_ptr<lance::format::Manifest> manifest;
-};
+std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
 
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
     : ::arrow::dataset::Dataset(impl->manifest->schema()->ToArrow()), impl_(std::move(impl)) {}

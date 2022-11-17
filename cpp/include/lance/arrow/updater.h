@@ -27,25 +27,36 @@ namespace lance::arrow {
 
 /// \brief Streaming Updater
 ///
-/// Experimental API
+/// \warning This API is experimental.
+///
+/// This class is not thread-safe.
 class Updater {
  public:
-  static ::arrow::Result<Updater> Make(std::shared_ptr<LanceDataset> dataset);
+  static ::arrow::Result<Updater> Make(std::shared_ptr<LanceDataset> dataset,
+                                       const std::shared_ptr<::arrow::Field>& field);
 
-  /// Returns the next batch as updater inputs. Return `nullptr` for the end of dataset.
+  /// Return the next batch as inputs. Or return `nullptr` for the end of dataset.
+  ///
+  /// The user must consume the returned results, by calling `Update`, before calling `Next()`
+  /// again.
+  ///
+  /// \return RecordBatch on success.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next();
 
-  /// Update a new column
+  /// Update the values to new values, presented in the array.
+  /// The array must has the same length as the batch returned previously via `Next()`.
   ::arrow::Status Update(const std::shared_ptr<::arrow::Array>& arr);
 
   /// Finish the update and returns a new version of dataset.
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
  private:
+  /// PIMPL: https://en.cppreference.com/w/cpp/language/pimpl
   class Impl;
   std::unique_ptr<Impl> impl_;
 
-  Updater(std::unique_ptr<Impl> impl);
+  /// Constructor
+  explicit Updater(std::unique_ptr<Impl> impl);
 };
 
 }  // namespace lance::arrow

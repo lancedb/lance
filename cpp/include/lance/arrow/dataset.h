@@ -125,6 +125,8 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   std::unique_ptr<Impl> impl_;
 
   explicit LanceDataset(std::unique_ptr<Impl> impl);
+
+  friend class Updater;
 };
 
 }  // namespace lance::arrow

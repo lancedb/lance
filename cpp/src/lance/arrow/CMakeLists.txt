@@ -19,6 +19,7 @@ add_library(
         arrow
         OBJECT
         dataset.cc
+        dataset_ext.h
         file_lance.cc
         file_lance_ext.h
         fragment.cc
@@ -40,5 +41,6 @@ add_lance_test(dataset_test)
 add_lance_test(fragment_test)
 add_lance_test(scanner_test)
 add_lance_test(type_test)
+add_lance_test(updater_test)
 add_lance_test(utils_test)
 add_lance_test(writer_test)
