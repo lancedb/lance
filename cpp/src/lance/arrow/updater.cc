@@ -75,7 +75,12 @@ class Updater::Impl {
     assert(fragment->type_name() == "lance");
     auto lance_fragment = std::dynamic_pointer_cast<LanceFragment>(fragment);
     assert(lance_fragment);
+    // TODO: open new writer for each fragment
   }
+
+  // TODO: read the next batch
+  // TODO: if reaches to the end of a fragment, close the writer, and reopen another writer.
+  // TODO: return RecordBatch
 
   return ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>();
 }
