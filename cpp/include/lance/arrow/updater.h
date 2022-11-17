@@ -25,13 +25,21 @@
 
 namespace lance::arrow {
 
-/// \brief Streaming Updater
+/// \brief Streaming Record Updater.
 ///
 /// \warning This API is experimental.
+///
+/// It scans over the dataset, and updates the batch according.
 ///
 /// This class is not thread-safe.
 class Updater {
  public:
+
+  /// Make a new Updater
+  ///
+  /// \param dataset The dataset to be updated.
+  /// \param field the (new) column to update.
+  /// \return an Updater if success.
   static ::arrow::Result<Updater> Make(std::shared_ptr<LanceDataset> dataset,
                                        const std::shared_ptr<::arrow::Field>& field);
 
@@ -51,7 +59,7 @@ class Updater {
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
  private:
-  /// PIMPL: https://en.cppreference.com/w/cpp/language/pimpl
+  /// PIMPL
   class Impl;
   std::unique_ptr<Impl> impl_;
 

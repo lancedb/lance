@@ -19,11 +19,15 @@
 #include <fmt/format.h>
 
 #include <filesystem>
+#include <limits>
+#include <memory>
 #include <vector>
 
 #include "lance/arrow/dataset.h"
 #include "lance/arrow/dataset_ext.h"
+#include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/schema.h"
 #include "lance/io/writer.h"
 
@@ -39,10 +43,10 @@ class Updater::Impl {
       : dataset_(std::move(dataset)),
         column_schema_(std::move(column_schema)),
         fragments_(std::move(fragments)),
-        fragment_it_(fragments.begin()) {}
+        fragment_it_(fragments_.begin()) {}
 
   /// Copy constructor
-  explicit Impl(const Impl& other)
+  Impl(const Impl& other)
       : dataset_(other.dataset_),
         column_schema_(other.column_schema_),
         fragments_(other.fragments_.begin(), other.fragments_.end()),
@@ -53,15 +57,47 @@ class Updater::Impl {
   ::arrow::Status Update(const std::shared_ptr<::arrow::Array>& arr);
 
  private:
+  auto data_dir() const { return dataset_->impl_->data_dir(); }
+
+  const auto& fs() const { return dataset_->impl_->fs; }
+
+  /// Prepare to read the next fragment.
+  ::arrow::Status NextFragment();
+
   std::shared_ptr<LanceDataset> dataset_;
   std::shared_ptr<lance::format::Schema> column_schema_;
   ::arrow::dataset::FragmentVector fragments_;
-  ::arrow::dataset::FragmentVector::iterator fragment_it_;
+
   // Used to store the updated fragments.
   ::arrow::dataset::FragmentVector updated_fragments_;
+
+  // Track runtime information.
+  ::arrow::dataset::FragmentVector::iterator fragment_it_;
   std::shared_ptr<::arrow::RecordBatch> last_batch_;
   std::unique_ptr<lance::io::FileWriter> writer_;
+  ::arrow::RecordBatchGenerator batch_generator_;
 };
+
+::arrow::Status Updater::Impl::NextFragment() {
+  assert(!writer_);
+  auto& fragment = *fragment_it_;
+  assert(fragment->type_name() == "lance");
+  auto lance_fragment = std::dynamic_pointer_cast<LanceFragment>(fragment);
+  assert(lance_fragment);
+
+  std::string file_path = fs::path(data_dir()) / fmt::format("{}.lance", GetUUIDString());
+  ARROW_ASSIGN_OR_RAISE(auto output, fs()->OpenOutputStream(file_path));
+  auto write_options = LanceFileFormat().DefaultWriteOptions();
+  writer_ =
+      std::make_unique<io::FileWriter>(column_schema_, std::move(write_options), std::move(output));
+
+  ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset_->NewScan());
+  ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
+  ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
+  ARROW_ASSIGN_OR_RAISE(batch_generator_, (*fragment_it_)->ScanBatchesAsync(scanner->options()));
+
+  return ::arrow::Status::OK();
+}
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Updater::Impl::Next() {
   if (fragment_it_ == fragments_.end()) {
@@ -71,18 +107,17 @@ class Updater::Impl {
     return ::arrow::Status::IOError("Have not consumed/committed last batch");
   }
   if (!writer_) {
-    auto& fragment = *fragment_it_;
-    assert(fragment->type_name() == "lance");
-    auto lance_fragment = std::dynamic_pointer_cast<LanceFragment>(fragment);
-    assert(lance_fragment);
-    // TODO: open new writer for each fragment
+    ARROW_RETURN_NOT_OK(NextFragment());
   }
 
-  // TODO: read the next batch
-  // TODO: if reaches to the end of a fragment, close the writer, and reopen another writer.
-  // TODO: return RecordBatch
-
-  return ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>();
+  auto fut = batch_generator_();
+  ARROW_ASSIGN_OR_RAISE(auto batch, fut.result());
+  if (!batch) {
+    // EOL
+    writer_.reset();
+    batch_generator_ = nullptr;
+  }
+  return batch;
 }
 
 ::arrow::Status Updater::Impl::Update(const std::shared_ptr<::arrow::Array>& arr) {
@@ -102,8 +137,10 @@ class Updater::Impl {
                     arr->length()));
   }
 
+  assert(writer_);
   last_batch_.reset();
-  return ::arrow::Status::NotImplemented("not implemented");
+  auto batch = ::arrow::RecordBatch::Make(column_schema_->ToArrow(), arr->length(), {arr});
+  return writer_->Write(batch);
 }
 
 ::arrow::Result<Updater> Updater::Make(std::shared_ptr<LanceDataset> dataset,
