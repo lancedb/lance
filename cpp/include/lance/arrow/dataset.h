@@ -43,8 +43,8 @@ class DatasetVersion {
   uint64_t version_;
 };
 
-using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(
-    const std::shared_ptr<::arrow::RecordBatch>& batch)>;
+//using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(
+//    const std::shared_ptr<::arrow::RecordBatch>& batch)>;
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///

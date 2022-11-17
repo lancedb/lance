@@ -27,6 +27,7 @@ add_library(
         stl.h
         type.cc
         type.h
+        updater.cc
         utils.cc
         utils.h
         writer.cc
