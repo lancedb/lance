@@ -21,7 +21,6 @@
 #include <memory>
 #include <optional>
 
-#include "lance/arrow/fragment.h"
 #include "lance/format/schema.h"
 #include "lance/io/exec/base.h"
 
