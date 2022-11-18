@@ -167,14 +167,6 @@ cdef class Updater:
         self.sp_updater = move(up)
         return self
 
-    def next(self) -> Optional[pyarrow.Table]:
-        cdef shared_ptr[CRecordBatch] c_batch
-        c_batch = GetResultValue(self.sp_updater.get().Next())
-        if c_batch.get() == NULL:
-            return None
-        batch = pyarrow_wrap_batch(c_batch)
-        return pyarrow.Table.from_batches([batch])
-
     def update_batch(self, data: pyarrow.Array):
         cdef shared_ptr[CArray] arr = pyarrow_unwrap_array(data)
         with nogil:
@@ -190,10 +182,12 @@ cdef class Updater:
         return self
 
     def __next__(self) -> pyarrow.Table:
-        next_val = self.next()
-        if next_val is None:
+        cdef shared_ptr[CRecordBatch] c_batch
+        c_batch = GetResultValue(self.sp_updater.get().Next())
+        if c_batch.get() == NULL:
             raise StopIteration
-        return next_val
+        batch = pyarrow_wrap_batch(c_batch)
+        return pyarrow.Table.from_batches([batch])
 
 
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
@@ -287,7 +281,8 @@ cdef class FileSystemDataset(Dataset):
         field : pyarrow.Field
             The name and schema of the newly added column.
         func : Callback[[pyarrow.Table], pyarrow.Array]
-            A function / callback that takes in an pyarrow Table and produces an Array.
+            A function / callback that takes in a Batch and produces an Array. The generated array must
+            have the same length as the input batch.
         """
         cdef:
             shared_ptr[CUpdater] c_updater
