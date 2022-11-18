@@ -20,17 +20,18 @@
 #include <arrow/table.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <uuid.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
-#include <random>
 #include <range/v3/all.hpp>
 #include <utility>
 
+#include "lance/arrow/dataset_ext.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/updater.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
@@ -70,17 +71,7 @@ auto CreateFragments(const std::vector<std::string>& paths, const lance::format:
          to<std::vector<std::shared_ptr<lance::format::DataFragment>>>;
 }
 
-std::string GetBasenameTemplate() {
-  std::random_device rd;
-  auto seed_data = std::array<int, std::mt19937::state_size>{};
-  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
-  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
-  std::mt19937 generator(seq);
-  uuids::uuid_random_generator gen{generator};
-  auto uuid = gen();
-
-  return uuids::to_string(uuid) + "_{i}.lance";
-}
+std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 
 ::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
@@ -143,24 +134,37 @@ DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
-class LanceDataset::Impl {
- public:
-  Impl() = delete;
+DatasetVersion& DatasetVersion::operator++() {
+  version_++;
+  return *this;
+}
 
-  Impl(std::shared_ptr<::arrow::fs::FileSystem> filesystem,
-       std::string uri,
-       std::shared_ptr<lance::format::Manifest> m)
-      : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
+const DatasetVersion DatasetVersion::operator++(int) {
+  version_++;
+  return *this;
+}
 
-  std::string data_dir() const { return fs::path(base_uri) / kDataDir; }
+//-------------------------
+// LanceDataset::Impl
+//-------------------------
 
-  std::string versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
+std::string LanceDataset::Impl::data_dir() const { return fs::path(base_uri) / kDataDir; }
 
-  std::shared_ptr<::arrow::fs::FileSystem> fs;
-  std::string base_uri;
-  std::shared_ptr<lance::format::Manifest> manifest;
-};
+std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
 
+::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
+    std::shared_ptr<lance::format::Manifest> new_manifest) const {
+  auto manifest_path = GetManifestPath(base_uri, manifest->version());
+  {
+    ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
+    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
+  }
+  auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
+  ARROW_RETURN_NOT_OK(fs->CopyFile(manifest_path, latest_manifest_path));
+  return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
+}
+
+//---------------------------
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
     : ::arrow::dataset::Dataset(impl->manifest->schema()->ToArrow()), impl_(std::move(impl)) {}
 
@@ -305,6 +309,11 @@ LanceDataset::~LanceDataset() {}
 }
 
 DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
+
+::arrow::Result<UpdaterBuilder> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Field>& new_field) const {
+  return UpdaterBuilder{std::make_shared<LanceDataset>(*this), std::move(new_field)};
+}
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
     [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {

@@ -30,8 +30,8 @@ class Schema;
 
 /// \brief Manifest.
 ///
-///  * Schema
-///  * Version
+///  * Schema.
+///  * Version.
 ///  * Fragments.
 ///
 class Manifest final {
@@ -42,6 +42,15 @@ class Manifest final {
   ///
   /// \param schema the dataset schema.
   Manifest(std::shared_ptr<Schema> schema);
+
+  /// Construct a Manifest with specific version.
+  ///
+  /// \param schema full dataset schema.
+  /// \param version a specific `DatasetVersion`.
+  /// \param fragments a list of fragments containing data files.
+  Manifest(std::shared_ptr<Schema> schema,
+           lance::arrow::DatasetVersion version,
+           std::vector<std::shared_ptr<DataFragment>> fragments);
 
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
@@ -82,13 +91,13 @@ class Manifest final {
   void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
 
   /// Get the dataset version.
-  arrow::DatasetVersion GetDatasetVersion() const;
+  const arrow::DatasetVersion& GetDatasetVersion() const;
 
  private:
   /// Table schema.
   std::shared_ptr<Schema> schema_;
 
-  std::uint64_t version_ = 1;
+  ::lance::arrow::DatasetVersion version_;
 
   std::vector<std::shared_ptr<DataFragment>> fragments_;
 

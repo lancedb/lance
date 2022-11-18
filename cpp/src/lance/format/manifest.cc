@@ -28,6 +28,11 @@ namespace lance::format {
 
 Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)), version_(1) {}
 
+Manifest::Manifest(std::shared_ptr<Schema> schema,
+                   lance::arrow::DatasetVersion version,
+                   std::vector<std::shared_ptr<DataFragment>> fragments)
+    : schema_(std::move(schema)), version_(std::move(version)), fragments_(std::move(fragments)) {}
+
 Manifest::Manifest(Manifest&& other) noexcept
     : schema_(std::move(other.schema_)),
       version_(other.version_),
@@ -64,7 +69,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   for (const auto& [key, value] : schema_->metadata()) {
     (*pb.mutable_metadata())[key] = value;
   }
-  pb.set_version(version_);
+  pb.set_version(version_.version());
   for (const auto& fragment : fragments_) {
     auto pb_fragment = pb.add_fragments();
     *pb_fragment = fragment->ToProto();
@@ -83,7 +88,7 @@ std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
 
 const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }
 
-uint64_t Manifest::version() const { return version_; }
+uint64_t Manifest::version() const { return version_.version(); }
 
 const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
@@ -91,8 +96,6 @@ void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>&
   fragments_.insert(std::end(fragments_), std::begin(fragments), std::end(fragments));
 }
 
-arrow::DatasetVersion Manifest::GetDatasetVersion() const {
-  return arrow::DatasetVersion{version_};
-}
+const arrow::DatasetVersion& Manifest::GetDatasetVersion() const { return version_; }
 
 }  // namespace lance::format

@@ -49,7 +49,12 @@ DataFragment::DataFragment(const DataFile& data_file)
 
 DataFragment::DataFragment(std::vector<DataFile> data_files) : files_(std::move(data_files)) {}
 
+DataFragment::DataFragment(const DataFragment& other)
+    : files_(other.files_.begin(), other.files_.end()) {}
+
 const std::vector<DataFile>& DataFragment::data_files() const { return files_; }
+
+std::vector<DataFile>& DataFragment::data_files() { return files_; }
 
 pb::DataFragment DataFragment::ToProto() const {
   auto proto = pb::DataFragment();

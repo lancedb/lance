@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <range/v3/algorithm/max.hpp>
 
 #include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
@@ -141,7 +142,7 @@ Status FileReader::Open() {
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
   auto num_batches = metadata_->num_batches();
-  auto num_columns = manifest_->schema()->GetFieldsCount();
+  auto num_columns = ranges::max(manifest_->schema()->GetFieldIds()) + 1;
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));

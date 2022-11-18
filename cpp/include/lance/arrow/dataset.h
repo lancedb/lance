@@ -16,10 +16,12 @@
 
 #include <arrow/dataset/api.h>
 #include <arrow/filesystem/api.h>
+#include <arrow/record_batch.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,19 +29,35 @@
 
 namespace lance::arrow {
 
+// Forward Declaration
+class UpdaterBuilder;
+
 /// Dataset Version
 ///
 class DatasetVersion {
  public:
+  using VersionNumberType = uint64_t;
+
   DatasetVersion() = default;
 
-  explicit DatasetVersion(uint64_t version);
+  /// Construct a Dataset version from version number.
+  explicit DatasetVersion(VersionNumberType version);
 
-  uint64_t version() const;
+  /// Get version number.
+  VersionNumberType version() const;
+
+  /// Increase version number
+  DatasetVersion& operator++();
+
+  /// Increase version number
+  const DatasetVersion operator++(int);
 
  private:
-  uint64_t version_;
+  VersionNumberType version_ = 0;
 };
+
+// using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(
+//     const std::shared_ptr<::arrow::RecordBatch>& batch)>;
 
 /// Lance Dataset, supports versioning and schema evolution.
 ///
@@ -104,7 +122,13 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   std::string type_name() const override { return "lance"; }
 
-  ::arrow::Result<std::shared_ptr<Dataset>> ReplaceSchema(
+  /// Begin to build a column updater against to this dataset.
+  ///
+  /// \param new_field the new field / column to be updated.
+  /// \return a builder for `Updater`.
+  ::arrow::Result<UpdaterBuilder> NewUpdate(const std::shared_ptr<::arrow::Field>& new_field) const;
+
+  ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
 
  protected:
@@ -116,6 +140,8 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   std::unique_ptr<Impl> impl_;
 
   explicit LanceDataset(std::unique_ptr<Impl> impl);
+
+  friend class Updater;
 };
 
 }  // namespace lance::arrow

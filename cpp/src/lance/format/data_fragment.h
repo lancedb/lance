@@ -30,8 +30,10 @@ namespace lance::format {
 /// - The ids of the columns stored in the file.
 class DataFile : public ConvertToProto<pb::DataFile> {
  public:
+  /// Construct DataFile from protobuf.
   explicit DataFile(const format::pb::DataFile& pb);
 
+  /// Construct DataFile with the file path and field IDs.
   DataFile(std::string path, const std::vector<int32_t>& fields);
 
   /// Get the relative path of the data
@@ -48,17 +50,26 @@ class DataFile : public ConvertToProto<pb::DataFile> {
   std::vector<int32_t> fields_;
 };
 
-/// POD of DataFragment
+/// POD of a DataFragment
+///
 ///
 class DataFragment : public ConvertToProto<pb::DataFragment> {
  public:
+  /// Construct DataFragment from protobuf.
   explicit DataFragment(const format::pb::DataFragment& pb);
 
+  /// Copy constructor.
+  DataFragment(const DataFragment& other);
+
+  /// Construct with single DataFile.
   explicit DataFragment(const DataFile& data_file);
 
-  DataFragment(std::vector<DataFile> data_files);
+  /// Construct with multiple data files.
+  explicit DataFragment(std::vector<DataFile> data_files);
 
   const std::vector<DataFile>& data_files() const;
+
+  std::vector<DataFile>& data_files();
 
   pb::DataFragment ToProto() const override;
 
