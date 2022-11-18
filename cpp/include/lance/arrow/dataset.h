@@ -122,6 +122,10 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   std::string type_name() const override { return "lance"; }
 
+  /// Begin to build a column updater against to this dataset.
+  ///
+  /// \param new_field the new field / column to be updated.
+  /// \return a builder for `Updater`.
   ::arrow::Result<UpdaterBuilder> NewUpdate(const std::shared_ptr<::arrow::Field>& new_field) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
