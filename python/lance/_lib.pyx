@@ -1,8 +1,9 @@
 # distutils: language = c++
 
-from typing import Optional, List, Dict
+from typing import Callable, Optional, List, Dict
 from pathlib import Path
 
+import pyarrow
 from cython.operator cimport dereference as deref
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr, static_pointer_cast
@@ -28,10 +29,17 @@ from pyarrow.includes.libarrow_dataset cimport (
 )
 from pyarrow.includes.libarrow_fs cimport CFileSystem
 from pyarrow.lib cimport (
+    CArray,
     CExpression,
+    CField,
+    CRecordBatch,
+    Field,
     GetResultValue,
     RecordBatchReader,
     check_status,
+    pyarrow_wrap_batch,
+    pyarrow_unwrap_field,
+    pyarrow_unwrap_array,
 )
 from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
@@ -138,6 +146,55 @@ cdef class LanceFileFormat(FileFormat):
         return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
 
 
+cdef extern from "lance/arrow/updater.h" namespace "lance::arrow" nogil:
+    cdef cppclass CUpdater "::lance::arrow::Updater":
+        CResult[shared_ptr[CRecordBatch]] Next();
+
+        CStatus UpdateBatch(const shared_ptr[CArray] arr);
+
+        CResult[shared_ptr[CLanceDataset]] Finish();
+
+    cdef cppclass CUpdaterBuilder "::lance::arrow::UpdaterBuilder":
+        CResult[shared_ptr[CUpdater]] Finish();
+
+
+cdef class Updater:
+    cdef shared_ptr[CUpdater] sp_updater
+
+    @staticmethod
+    cdef wrap(const shared_ptr[CUpdater]& up):
+        cdef Updater self = Updater.__new__(Updater)
+        self.sp_updater = move(up)
+        return self
+    def next(self) -> Optional[pyarrow.Table]:
+        cdef shared_ptr[CRecordBatch] c_batch
+        c_batch = GetResultValue(self.sp_updater.get().Next())
+        if c_batch.get() == NULL:
+            return None
+        batch = pyarrow_wrap_batch(c_batch)
+        return pyarrow.Table.from_batches([batch])
+
+    def update_batch(self, data: pyarrow.Array):
+        cdef shared_ptr[CArray] arr = pyarrow_unwrap_array(data)
+        with nogil:
+            check_status(self.sp_updater.get().UpdateBatch(arr))
+
+    def finish(self):
+        cdef shared_ptr[CLanceDataset] new_dataset = GetResultValue(
+            self.sp_updater.get().Finish()
+        )
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](new_dataset))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> pyarrow.Table:
+        next_val = self.next()
+        if next_val is None:
+            raise StopIteration
+        return next_val
+
+
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CDatasetVersion "::lance::arrow::DatasetVersion":
         uint64_t version() const;
@@ -148,13 +205,13 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
             APPEND "::lance::arrow::LanceDataset::WriteMode::kAppend"
             OVERWRITE "::lance::arrow::LanceDataset::WriteMode::kOverwrite"
 
-        @staticmethod
+        @ staticmethod
         CStatus Write(
                 const CFileSystemDatasetWriteOptions& write_options,
                 shared_ptr[CDataset] dataset,
                 WriteMode mode)
 
-        @staticmethod
+        @ staticmethod
         CResult[shared_ptr[CLanceDataset]] Make(
                 const shared_ptr[CFileSystem]& fs,
                 const string& base_uri,
@@ -167,6 +224,7 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 
         CResult[vector[CDatasetVersion]] versions() const;
 
+        CResult[shared_ptr[CUpdaterBuilder]] NewUpdate(const shared_ptr[CField]& field) const;
 
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
@@ -219,6 +277,19 @@ cdef class FileSystemDataset(Dataset):
         """Get the latest version of the dataset."""
         c_version = GetResultValue(self.lance_dataset.latest_version())
         return _dataset_version_to_json(c_version)
+
+    def append_column(self, field: Field, func: Callable[[pyarrow.Table], pyarrow.Array]) -> FileSystemDataset:
+        cdef:
+            shared_ptr[CUpdater] c_updater
+            shared_ptr[CField] c_field
+
+        c_field = pyarrow_unwrap_field(field)
+        c_updater = move(GetResultValue(GetResultValue(move(self.lance_dataset.NewUpdate(c_field))).get().Finish()))
+        updater = Updater.wrap(c_updater)
+        for table in updater:
+            arr = func(table)
+            updater.update_batch(arr)
+        return updater.finish()
 
 def _lance_dataset_write(
         Dataset data,
