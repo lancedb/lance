@@ -55,7 +55,8 @@ LanceFragment::LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
       manifest_(std::move(manifest)) {}
 
 LanceFragment::LanceFragment(const LanceFragment& other)
-    : fs_(other.fs_),
+    : ::arrow::dataset::Fragment(),
+      fs_(other.fs_),
       data_uri_(other.data_uri_),
       fragment_(other.fragment_),
       manifest_(other.manifest_) {}
