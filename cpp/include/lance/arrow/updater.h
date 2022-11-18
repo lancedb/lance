@@ -29,20 +29,25 @@ namespace lance::arrow {
 ///
 /// \warning This API is experimental.
 ///
-/// It scans over the dataset, and updates the batch according.
+/// It scans over the dataset, and updates a (new) column.
 ///
 /// This class is not thread-safe.
+///
+///  ```cpp
+///  // Example usage
+///  auto builder = dataset->NewUpdate(arrow::Field("new_col", data_type)).ValueOrDie();
+///  auto updater = builder->Finish().ValueOrDie();
+///  while (true) {
+///    auto batch = updater->Next().ValueOrDie();
+///    if (!batch) {
+///       // EOF break
+///    }
+///    auto arr = MyUpdateFunction(batch);
+///    assert(updater->Update(arr).ok());
+///  }
+///  ```
 class Updater {
  public:
-  /// Make a new Updater
-  ///
-  /// \param dataset The dataset to be updated.
-  /// \param field the (new) column to update.
-  ///
-  /// \return an Updater if success.
-  static ::arrow::Result<std::unique_ptr<Updater>> Make(
-      std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
-
   /// Destructor.
   ///
   /// Explicitly defined to make PIMPL work.
@@ -53,7 +58,7 @@ class Updater {
   /// The user must consume the returned results, by calling `Update`, before calling `Next()`
   /// again.
   ///
-  /// \return RecordBatch on success.
+  /// \return `::arrow::RecordBatch` if success.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next();
 
   /// Update the values to new values, presented in the array.
@@ -64,6 +69,15 @@ class Updater {
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
  private:
+  /// Make a new Updater
+  ///
+  /// \param dataset The dataset to be updated.
+  /// \param field the (new) column to update.
+  ///
+  /// \return an Updater if success.
+  static ::arrow::Result<std::unique_ptr<Updater>> Make(
+      std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
+
   /// PIMPL
   class Impl;
   std::unique_ptr<Impl> impl_;
@@ -74,6 +88,10 @@ class Updater {
   friend class UpdaterBuilder;
 };
 
+/// Updater Builder
+///
+/// This is similar to `::arrow::dataset::ScanBuilder`, use builder to pass
+/// parameters to build a Updater.
 class UpdaterBuilder {
  public:
   UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Field> field);
