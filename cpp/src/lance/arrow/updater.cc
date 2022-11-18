@@ -103,7 +103,7 @@ class Updater::Impl {
       std::make_unique<io::FileWriter>(column_schema_, std::move(write_options), std::move(output));
 
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset_->NewScan());
-  ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
+  //  ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
   ARROW_ASSIGN_OR_RAISE(batch_generator_, (*fragment_it_)->ScanBatchesAsync(scanner->options()));
 
@@ -123,26 +123,26 @@ class Updater::Impl {
   if (last_batch_) {
     return ::arrow::Status::IOError("Have not consumed/committed last batch");
   }
-  if (!writer_) {
-    ARROW_RETURN_NOT_OK(NextFragment());
+  while (!last_batch_ && fragment_it_ != fragments_.end()) {
+    if (!writer_) {
+      ARROW_RETURN_NOT_OK(NextFragment());
+    }
+
+    auto fut = batch_generator_();
+    ARROW_ASSIGN_OR_RAISE(last_batch_, fut.result());
+    if (!last_batch_) {
+      ARROW_RETURN_NOT_OK(writer_->Finish().result());
+      // EOF
+      writer_.reset();
+      ++fragment_it_;
+    }
   }
 
-  auto fut = batch_generator_();
-  ARROW_ASSIGN_OR_RAISE(auto batch, fut.result());
-  if (!batch) {
-    // EOL
-    writer_.reset();
-    batch_generator_ = nullptr;
-  }
-  return batch;
+  return last_batch_;
 }
 
 ::arrow::Status Updater::Impl::Update(const std::shared_ptr<::arrow::Array>& arr) {
   // Sanity checks.
-  if (arr->num_fields() != 1) {
-    return ::arrow::Status::IOError(
-        "Update only supports 1 column at a time, but got ", arr->num_fields(), " columns.");
-  }
   if (!last_batch_) {
     return ::arrow::Status::IOError(
         "Did not read batch before update, did you call Updater::Next() before?");
@@ -168,8 +168,8 @@ class Updater::Impl {
   ++latest_version;
   auto new_manifest =
       std::make_shared<lance::format::Manifest>(full_schema_, latest_version, data_fragments_);
-
-  return ::arrow::Status::NotImplemented("Not implemented yet");
+  ARROW_ASSIGN_OR_RAISE(auto dataset_impl, dataset_->impl_->WriteNewVersion(new_manifest));
+  return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(dataset_impl)));
 }
 
 Updater::~Updater() {}

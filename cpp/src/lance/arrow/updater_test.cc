@@ -14,6 +14,7 @@
 
 #include "lance/arrow/updater.h"
 
+#include <arrow/compute/api.h>
 #include <arrow/dataset/dataset.h>
 #include <arrow/filesystem/localfs.h>
 #include <arrow/table.h>
@@ -61,12 +62,30 @@ TEST_CASE("Use updater to update one column") {
                      .ValueOrDie()
                      .Finish()
                      .ValueOrDie();
-  int count = 0;
+  int cnt = 0;
   while (true) {
     auto batch = updater->Next().ValueOrDie();
     if (!batch) {
       break;
     }
-    count++;
+    cnt++;
+    CHECK(batch->schema()->Equals(*table->schema()));
+    auto input_arr = batch->GetColumnByName("ints");
+    auto datum = ::arrow::compute::Cast(input_arr, ::arrow::utf8()).ValueOrDie();
+    auto output_arr = datum.make_array();
+    auto status = updater->Update(output_arr);
+    CHECK(status.ok());
   }
+  CHECK(cnt == 10);
+
+  auto new_dataset = updater->Finish().ValueOrDie();
+  auto actual = new_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  auto expected_strs_arr =
+      ToArray(views::iota(0, 100) | views::transform([](auto i) { return fmt::format("{}", i); }) |
+              to<std::vector<std::string>>)
+          .ValueOrDie();
+  auto expected = arrow::Table::Make(
+      ::arrow::schema({arrow::field("ints", arrow::int32()), arrow::field("strs", arrow::utf8())}),
+      {ints_arr, expected_strs_arr});
+  CHECK(expected->Equals(*actual));
 }

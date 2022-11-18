@@ -129,10 +129,13 @@ class PlainDecoderImpl : public Decoder {
     auto len = GetReadLength(start, length);
     if (len < 0) {
       return ::arrow::Status::IndexError(
-          fmt::format("{}::ToArray: out of range: start={}, length={}, page_length={}\n",
+          fmt::format("{}::ToArray: out of range: read_length={}, start={}, length={}, "
+                      "position={}, page_length={}\n",
                       ToString(),
+                      len,
                       start,
                       length.value_or(-1),
+                      position_,
                       length_));
     }
 

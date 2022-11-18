@@ -152,6 +152,19 @@ std::string LanceDataset::Impl::data_dir() const { return fs::path(base_uri) / k
 
 std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
 
+::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
+    std::shared_ptr<lance::format::Manifest> new_manifest) const {
+  auto manifest_path = GetManifestPath(base_uri, manifest->version());
+  {
+    ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
+    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
+  }
+  auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
+  ARROW_RETURN_NOT_OK(fs->CopyFile(manifest_path, latest_manifest_path));
+  return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
+}
+
+//---------------------------
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
     : ::arrow::dataset::Dataset(impl->manifest->schema()->ToArrow()), impl_(std::move(impl)) {}
 
@@ -271,27 +284,6 @@ LanceDataset::~LanceDataset() {}
   ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(fs, manifest_path));
   auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
-}
-
-::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Update(
-    const std::string& column, ::arrow::compute::Expression value) {
-  auto& schema = impl_->manifest->schema();
-  auto field = schema->GetField(column);
-  if (!field) {
-    return ::arrow::Status::Invalid("Field ", column, " does not exist");
-  }
-  ARROW_ASSIGN_OR_RAISE(auto fragment_iter, GetFragments());
-  ARROW_RETURN_NOT_OK(
-      fragment_iter.Visit([column, value](std::shared_ptr<::arrow::dataset::Fragment> fragment) {
-        if (fragment->type_name() != "lance") {
-          return ::arrow::Status::Invalid("Only support lance file fragment");
-        }
-        auto lf = std::dynamic_pointer_cast<LanceFragment>(fragment);
-        assert(lf != nullptr);
-        return ::arrow::Status::OK();
-      }));
-
-  return ::arrow::Status::NotImplemented("not implemented yet");
 }
 
 ::arrow::Result<std::vector<DatasetVersion>> LanceDataset::versions() const {

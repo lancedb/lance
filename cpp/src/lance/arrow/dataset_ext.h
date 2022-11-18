@@ -18,13 +18,14 @@
 
 #include <arrow/filesystem/api.h>
 
+#include <memory>
+
 #include "lance/arrow/dataset.h"
 #include "lance/format/manifest.h"
 
 namespace lance::arrow {
 
 /// LanceDataset Implementation.
-
 class LanceDataset::Impl {
  public:
   Impl() = delete;
@@ -37,6 +38,11 @@ class LanceDataset::Impl {
   std::string data_dir() const;
 
   std::string versions_dir() const;
+
+  // Write the manifest version file.
+  // It only supports single writer at the moment.
+  ::arrow::Result<std::unique_ptr<Impl>> WriteNewVersion(
+      std::shared_ptr<lance::format::Manifest> new_manifest) const;
 
   std::shared_ptr<::arrow::fs::FileSystem> fs;
   std::string base_uri;
