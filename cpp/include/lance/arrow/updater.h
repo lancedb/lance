@@ -75,7 +75,7 @@ class Updater {
   /// \param field the (new) column to update.
   ///
   /// \return an Updater if success.
-  static ::arrow::Result<std::unique_ptr<Updater>> Make(
+  static ::arrow::Result<std::shared_ptr<Updater>> Make(
       std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
 
   /// PIMPL
@@ -96,7 +96,7 @@ class UpdaterBuilder {
  public:
   UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Field> field);
 
-  ::arrow::Result<std::unique_ptr<Updater>> Finish();
+  ::arrow::Result<std::shared_ptr<Updater>> Finish();
 
  private:
   std::shared_ptr<LanceDataset> dataset_;
