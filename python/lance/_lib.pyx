@@ -166,6 +166,7 @@ cdef class Updater:
         cdef Updater self = Updater.__new__(Updater)
         self.sp_updater = move(up)
         return self
+
     def next(self) -> Optional[pyarrow.Table]:
         cdef shared_ptr[CRecordBatch] c_batch
         c_batch = GetResultValue(self.sp_updater.get().Next())
@@ -279,6 +280,15 @@ cdef class FileSystemDataset(Dataset):
         return _dataset_version_to_json(c_version)
 
     def append_column(self, field: Field, func: Callable[[pyarrow.Table], pyarrow.Array]) -> FileSystemDataset:
+        """Append a new column.
+
+        Parameters
+        ----------
+        field : pyarrow.Field
+            The name and schema of the newly added column.
+        func : Callback[[pyarrow.Table], pyarrow.Array]
+            A function / callback that takes in an pyarrow Table and produces an Array.
+        """
         cdef:
             shared_ptr[CUpdater] c_updater
             shared_ptr[CField] c_field
