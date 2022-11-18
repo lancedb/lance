@@ -172,8 +172,10 @@ class Updater::Impl {
   return ::arrow::Status::NotImplemented("Not implemented yet");
 }
 
-::arrow::Result<Updater> Updater::Make(std::shared_ptr<LanceDataset> dataset,
-                                       const std::shared_ptr<::arrow::Field>& field) {
+Updater::~Updater() {}
+
+::arrow::Result<std::unique_ptr<Updater>> Updater::Make(
+    std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field) {
   auto arrow_schema = ::arrow::schema({field});
   ARROW_ASSIGN_OR_RAISE(auto full_schema, dataset->impl_->manifest->schema()->Merge(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto column_schema, full_schema->Project(*arrow_schema));
@@ -183,7 +185,7 @@ class Updater::Impl {
   ARROW_ASSIGN_OR_RAISE(auto fragments, fragment_iter.ToVector());
   auto impl = std::make_unique<Impl>(
       std::move(dataset), std::move(fragments), std::move(full_schema), std::move(column_schema));
-  return Updater(std::move(impl));
+  return std::unique_ptr<Updater>(new Updater(std::move(impl)));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Updater::Next() { return impl_->Next(); }
@@ -198,10 +200,10 @@ Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 UpdaterBuilder::UpdaterBuilder(std::shared_ptr<LanceDataset> source,
                                std::shared_ptr<::arrow::Field> field)
-    : source_dataset_(std::move(source)), field_(std::move(field)) {}
+    : dataset_(std::move(source)), field_(std::move(field)) {}
 
-::arrow::Result<Updater> UpdaterBuilder::Finish() {
-  return Updater::Make(source_dataset_, field_);
+::arrow::Result<std::unique_ptr<Updater>> UpdaterBuilder::Finish() {
+  return Updater::Make(dataset_, field_);
 }
 
 }  // namespace lance::arrow

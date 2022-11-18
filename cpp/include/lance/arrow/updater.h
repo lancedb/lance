@@ -40,8 +40,13 @@ class Updater {
   /// \param field the (new) column to update.
   ///
   /// \return an Updater if success.
-  static ::arrow::Result<Updater> Make(std::shared_ptr<LanceDataset> dataset,
-                                       const std::shared_ptr<::arrow::Field>& field);
+  static ::arrow::Result<std::unique_ptr<Updater>> Make(
+      std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
+
+  /// Destructor.
+  ///
+  /// Explicitly defined to make PIMPL work.
+  ~Updater();
 
   /// Return the next batch as inputs. Or return `nullptr` for the end of dataset.
   ///
@@ -71,12 +76,12 @@ class Updater {
 
 class UpdaterBuilder {
  public:
-  UpdaterBuilder(std::shared_ptr<LanceDataset> source, std::shared_ptr<::arrow::Field> field);
+  UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Field> field);
 
-  ::arrow::Result<Updater> Finish();
+  ::arrow::Result<std::unique_ptr<Updater>> Finish();
 
  private:
-  std::shared_ptr<LanceDataset> source_dataset_;
+  std::shared_ptr<LanceDataset> dataset_;
 
   std::shared_ptr<::arrow::Field> field_;
 };
