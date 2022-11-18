@@ -58,7 +58,7 @@ class Updater::Impl {
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next();
 
-  ::arrow::Status Update(const std::shared_ptr<::arrow::Array>& arr);
+  ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::Array>& arr);
 
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
@@ -141,7 +141,7 @@ class Updater::Impl {
   return last_batch_;
 }
 
-::arrow::Status Updater::Impl::Update(const std::shared_ptr<::arrow::Array>& arr) {
+::arrow::Status Updater::Impl::UpdateBatch(const std::shared_ptr<::arrow::Array>& arr) {
   // Sanity checks.
   if (!last_batch_) {
     return ::arrow::Status::IOError(
@@ -190,8 +190,8 @@ Updater::~Updater() {}
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Updater::Next() { return impl_->Next(); }
 
-::arrow::Status Updater::Update(const std::shared_ptr<::arrow::Array>& arr) {
-  return impl_->Update(arr);
+::arrow::Status Updater::UpdateBatch(const std::shared_ptr<::arrow::Array>& arr) {
+  return impl_->UpdateBatch(arr);
 }
 
 Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

@@ -63,7 +63,7 @@ class Updater {
 
   /// Update the values to new values, presented in the array.
   /// The array must has the same length as the batch returned previously via `Next()`.
-  ::arrow::Status Update(const std::shared_ptr<::arrow::Array>& arr);
+  ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::Array>& arr);
 
   /// Finish the update and returns a new version of dataset.
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();

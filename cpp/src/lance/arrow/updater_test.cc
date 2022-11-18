@@ -73,7 +73,7 @@ TEST_CASE("Use updater to update one column") {
     auto input_arr = batch->GetColumnByName("ints");
     auto datum = ::arrow::compute::Cast(input_arr, ::arrow::utf8()).ValueOrDie();
     auto output_arr = datum.make_array();
-    auto status = updater->Update(output_arr);
+    auto status = updater->UpdateBatch(output_arr);
     CHECK(status.ok());
   }
   CHECK(cnt == 10);
