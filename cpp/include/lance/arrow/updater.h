@@ -34,11 +34,11 @@ namespace lance::arrow {
 /// This class is not thread-safe.
 class Updater {
  public:
-
   /// Make a new Updater
   ///
   /// \param dataset The dataset to be updated.
   /// \param field the (new) column to update.
+  ///
   /// \return an Updater if success.
   static ::arrow::Result<Updater> Make(std::shared_ptr<LanceDataset> dataset,
                                        const std::shared_ptr<::arrow::Field>& field);
@@ -65,6 +65,20 @@ class Updater {
 
   /// Constructor
   explicit Updater(std::unique_ptr<Impl> impl);
+
+  friend class UpdaterBuilder;
+};
+
+class UpdaterBuilder {
+ public:
+  UpdaterBuilder(std::shared_ptr<LanceDataset> source, std::shared_ptr<::arrow::Field> field);
+
+  ::arrow::Result<Updater> Finish();
+
+ private:
+  std::shared_ptr<LanceDataset> source_dataset_;
+
+  std::shared_ptr<::arrow::Field> field_;
 };
 
 }  // namespace lance::arrow

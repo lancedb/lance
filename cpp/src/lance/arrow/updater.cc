@@ -40,8 +40,10 @@ class Updater::Impl {
  public:
   Impl(std::shared_ptr<LanceDataset> dataset,
        ::arrow::dataset::FragmentVector fragments,
+       std::shared_ptr<lance::format::Schema> full_schema,
        std::shared_ptr<lance::format::Schema> column_schema)
       : dataset_(std::move(dataset)),
+        full_schema_(std::move(full_schema)),
         column_schema_(std::move(column_schema)),
         fragments_(std::move(fragments)),
         fragment_it_(fragments_.begin()) {}
@@ -49,6 +51,7 @@ class Updater::Impl {
   /// Copy constructor
   Impl(const Impl& other)
       : dataset_(other.dataset_),
+        full_schema_(other.full_schema_),
         column_schema_(other.column_schema_),
         fragments_(other.fragments_.begin(), other.fragments_.end()),
         fragment_it_(fragments_.begin()) {}
@@ -68,13 +71,18 @@ class Updater::Impl {
   ::arrow::Status NextFragment();
 
   std::shared_ptr<LanceDataset> dataset_;
+  /// The schema of the newly generated dataset.
+  std::shared_ptr<lance::format::Schema> full_schema_;
+  /// The schema of the column to updated/added
   std::shared_ptr<lance::format::Schema> column_schema_;
+  /// A copy of fragments.
   ::arrow::dataset::FragmentVector fragments_;
 
   // Used to store the updated fragments.
   std::vector<std::shared_ptr<format::DataFragment>> data_fragments_;
 
   // Track runtime information.
+
   ::arrow::dataset::FragmentVector::iterator fragment_it_;
   std::shared_ptr<::arrow::RecordBatch> last_batch_;
   std::unique_ptr<lance::io::FileWriter> writer_;
@@ -153,6 +161,14 @@ class Updater::Impl {
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Impl::Finish() {
+  if (fragment_it_ != fragments_.end()) {
+    return ::arrow::Status::Invalid("Updater::Finish: there are remaining data to consume.");
+  }
+  ARROW_ASSIGN_OR_RAISE(auto latest_version, dataset_->latest_version());
+  ++latest_version;
+  auto new_manifest =
+      std::make_shared<lance::format::Manifest>(full_schema_, latest_version, data_fragments_);
+
   return ::arrow::Status::NotImplemented("Not implemented yet");
 }
 
@@ -165,8 +181,8 @@ class Updater::Impl {
   // Use vector to make implementation easier.
   // We can later to use FragmentIterator for datasets with a lot of Fragments.
   ARROW_ASSIGN_OR_RAISE(auto fragments, fragment_iter.ToVector());
-  auto impl =
-      std::make_unique<Impl>(std::move(dataset), std::move(fragments), std::move(column_schema));
+  auto impl = std::make_unique<Impl>(
+      std::move(dataset), std::move(fragments), std::move(full_schema), std::move(column_schema));
   return Updater(std::move(impl));
 }
 
@@ -179,5 +195,13 @@ class Updater::Impl {
 Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Finish() { return impl_->Finish(); }
+
+UpdaterBuilder::UpdaterBuilder(std::shared_ptr<LanceDataset> source,
+                               std::shared_ptr<::arrow::Field> field)
+    : source_dataset_(std::move(source)), field_(std::move(field)) {}
+
+::arrow::Result<Updater> UpdaterBuilder::Finish() {
+  return Updater::Make(source_dataset_, field_);
+}
 
 }  // namespace lance::arrow

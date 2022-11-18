@@ -12,6 +12,26 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include <catch2/catch_test_macros.hpp>
+#include <arrow/table.h>
 
-TEST_CASE("") {}
+#include <catch2/catch_test_macros.hpp>
+#include <range/v3/all.hpp>
+#include <ranges>
+#include <vector>
+
+#include "lance/arrow/stl.h"
+#include "lance/testing/io.h"
+
+using namespace ranges;
+using lance::arrow::ToArray;
+using lance::testing::MakeDataset;
+
+TEST_CASE("Use updater to update one column") {
+  auto ints = views::iota(0, 100) | to<std::vector<int>>();
+  auto ints_arr = ToArray(ints).ValueOrDie();
+  auto schema = arrow::schema({arrow::field("ints", arrow::int32())});
+  auto table = arrow::Table::Make(schema, {ints_arr});
+
+  const int kMaxRowsPerGroup = 10;
+  auto dataset = MakeDataset(table, {}, kMaxRowsPerGroup).ValueOrDie();
+}

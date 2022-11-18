@@ -30,6 +30,7 @@
 #include "lance/arrow/dataset_ext.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/updater.h"
 #include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
@@ -132,6 +133,16 @@ std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
+
+DatasetVersion& DatasetVersion::operator++() {
+  version_++;
+  return *this;
+}
+
+const DatasetVersion DatasetVersion::operator++(int) {
+  version_++;
+  return *this;
+}
 
 //-------------------------
 // LanceDataset::Impl
@@ -306,6 +317,11 @@ LanceDataset::~LanceDataset() {}
 }
 
 DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
+
+::arrow::Result<UpdaterBuilder> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Field>& new_field) const {
+  return UpdaterBuilder{std::make_shared<LanceDataset>(*this), std::move(new_field)};
+}
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
     [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {
