@@ -126,7 +126,8 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///
   /// \param new_field the new field / column to be updated.
   /// \return a builder for `Updater`.
-  ::arrow::Result<UpdaterBuilder> NewUpdate(const std::shared_ptr<::arrow::Field>& new_field) const;
+  ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
+      const std::shared_ptr<::arrow::Field>& new_field) const;
 
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;

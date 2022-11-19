@@ -60,7 +60,7 @@ TEST_CASE("Use updater to update one column") {
 
   auto updater = lance_dataset->NewUpdate(::arrow::field("strs", arrow::utf8()))
                      .ValueOrDie()
-                     .Finish()
+                     ->Finish()
                      .ValueOrDie();
   int cnt = 0;
   while (true) {

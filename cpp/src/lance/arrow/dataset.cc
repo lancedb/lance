@@ -310,9 +310,10 @@ LanceDataset::~LanceDataset() {}
 
 DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
 
-::arrow::Result<UpdaterBuilder> LanceDataset::NewUpdate(
+::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
     const std::shared_ptr<::arrow::Field>& new_field) const {
-  return UpdaterBuilder{std::make_shared<LanceDataset>(*this), std::move(new_field)};
+  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this),
+                                          std::move(new_field));
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
