@@ -17,7 +17,6 @@
 #include <arrow/dataset/type_fwd.h>
 #include <arrow/result.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <filesystem>
 #include <limits>
@@ -111,7 +110,6 @@ class Updater::Impl {
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset_->NewScan());
   if (!projected_columns_.empty()) {
     ARROW_RETURN_NOT_OK(scan_builder->Project(projected_columns_));
-    fmt::print("Scan builder project: {}\n", projected_columns_);
   }
   //  ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
