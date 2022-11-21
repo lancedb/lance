@@ -129,7 +129,7 @@ else()
   set(LANCE_EXT_SOURCES ${LANCE_EXT_SOURCE_COMMON})
 endif()
 
-add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
+# add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
 
