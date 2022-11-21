@@ -14,6 +14,7 @@
 
 #include "lance/arrow/updater.h"
 
+#include <arrow/chunked_array.h>
 #include <arrow/compute/api.h>
 #include <arrow/dataset/dataset.h>
 #include <arrow/filesystem/localfs.h>
@@ -34,16 +35,20 @@ using lance::arrow::LanceDataset;
 using lance::arrow::ToArray;
 namespace fs = std::filesystem;
 
-TEST_CASE("Use updater to update one column") {
+std::shared_ptr<LanceDataset> TestDataset() {
   auto ints = views::iota(0, 100) | to<std::vector<int>>();
   auto ints_arr = ToArray(ints).ValueOrDie();
-  auto schema = arrow::schema({arrow::field("ints", arrow::int32())});
-  auto table = arrow::Table::Make(schema, {ints_arr});
+  auto strs = ints | views::transform([](auto v) { return fmt::format("{}", v); }) |
+              to<std::vector<std::string>>;
+  auto strs_arr = ToArray(strs).ValueOrDie();
+  auto schema =
+      arrow::schema({arrow::field("ints", arrow::int32()), ::arrow::field("strs", arrow::utf8())});
+  auto table = arrow::Table::Make(schema, {ints_arr, strs_arr});
 
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
-  auto dataset_uri = fs::path(lance::testing::MakeTemporaryDir().ValueOrDie()) / "update";
+  auto dataset_uri = fs::path(lance::testing::MakeTemporaryDir().ValueOrDie()) / "data";
 
   auto format = lance::arrow::LanceFileFormat::Make();
   ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
@@ -53,12 +58,15 @@ TEST_CASE("Use updater to update one column") {
   write_options.file_write_options = format->DefaultWriteOptions();
   CHECK(LanceDataset::Write(write_options, dataset->NewScan().ValueOrDie()->Finish().ValueOrDie())
             .ok());
-  fmt::print("Dataset URI: {}\n", dataset_uri.string());
+  return LanceDataset::Make(fs, dataset_uri).ValueOrDie();
+}
 
-  auto lance_dataset = LanceDataset::Make(fs, dataset_uri).ValueOrDie();
+TEST_CASE("Use updater to update one column") {
+  auto lance_dataset = TestDataset();
   CHECK(lance_dataset->version().version() == 1);
+  auto table = lance_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
 
-  auto updater = lance_dataset->NewUpdate(::arrow::field("strs", arrow::utf8()))
+  auto updater = lance_dataset->NewUpdate(::arrow::field("values", arrow::utf8()))
                      .ValueOrDie()
                      ->Finish()
                      .ValueOrDie();
@@ -69,7 +77,7 @@ TEST_CASE("Use updater to update one column") {
       break;
     }
     cnt++;
-    CHECK(batch->schema()->Equals(*table->schema()));
+    CHECK(batch->schema()->Equals(*lance_dataset->schema()));
     auto input_arr = batch->GetColumnByName("ints");
     auto datum = ::arrow::compute::Cast(input_arr, ::arrow::utf8()).ValueOrDie();
     auto output_arr = datum.make_array();
@@ -84,8 +92,42 @@ TEST_CASE("Use updater to update one column") {
       ToArray(views::iota(0, 100) | views::transform([](auto i) { return fmt::format("{}", i); }) |
               to<std::vector<std::string>>)
           .ValueOrDie();
-  auto expected = arrow::Table::Make(
-      ::arrow::schema({arrow::field("ints", arrow::int32()), arrow::field("strs", arrow::utf8())}),
-      {ints_arr, expected_strs_arr});
+  auto expected =
+      arrow::Table::Make(::arrow::schema({arrow::field("ints", arrow::int32()),
+                                          arrow::field("strs", arrow::utf8()),
+                                          arrow::field("values", arrow::utf8())}),
+                         {table->GetColumnByName("ints"),
+                          table->GetColumnByName("strs"),
+                          std::make_shared<::arrow::ChunkedArray>(expected_strs_arr)});
   CHECK(expected->Equals(*actual));
+}
+
+TEST_CASE("Batch must be consumed before the next iteration") {
+  auto dataset = TestDataset();
+  auto updater = dataset->NewUpdate(::arrow::field("new_col", arrow::boolean()))
+                     .ValueOrDie()
+                     ->Finish()
+                     .ValueOrDie();
+  auto batch = updater->Next().ValueOrDie();
+  CHECK(batch);
+  auto result = updater->Next();
+  CHECK(!result.ok());
+}
+
+TEST_CASE("Test update with projection") {
+  auto dataset = TestDataset();
+  auto builder = dataset->NewUpdate(::arrow::field("new_col", arrow::utf8())).ValueOrDie();
+  builder->Project({"ints"});
+  auto updater = builder->Finish().ValueOrDie();
+  while (true) {
+    auto batch = updater->Next().ValueOrDie();
+    if (!batch) {
+      break;
+    }
+    CHECK(batch->schema()->Equals(*::arrow::schema({::arrow::field("ints", arrow::int32())})));
+    auto input_arr = batch->GetColumnByName("ints");
+    auto datum = ::arrow::compute::Cast(input_arr, ::arrow::utf8()).ValueOrDie();
+    auto output_arr = datum.make_array();
+    CHECK(updater->UpdateBatch(output_arr).ok());
+  }
 }

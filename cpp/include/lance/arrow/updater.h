@@ -20,6 +20,8 @@
 #include <arrow/status.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "lance/arrow/dataset.h"
 
@@ -73,10 +75,13 @@ class Updater {
   ///
   /// \param dataset The dataset to be updated.
   /// \param field the (new) column to update.
+  /// \param projection_columns the columns to read from source dataset.
   ///
   /// \return an Updater if success.
   static ::arrow::Result<std::shared_ptr<Updater>> Make(
-      std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
+      std::shared_ptr<LanceDataset> dataset,
+      const std::shared_ptr<::arrow::Field>& field,
+      const std::vector<std::string>& projection_columns);
 
   /// PIMPL
   class Impl;
@@ -96,12 +101,17 @@ class UpdaterBuilder {
  public:
   UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Field> field);
 
+  /// Set the projection columns from the source dataset.
+  void Project(std::vector<std::string> columns);
+
   ::arrow::Result<std::shared_ptr<Updater>> Finish();
 
  private:
   std::shared_ptr<LanceDataset> dataset_;
 
   std::shared_ptr<::arrow::Field> field_;
+
+  std::vector<std::string> projection_columns_;
 };
 
 }  // namespace lance::arrow

@@ -48,7 +48,7 @@ std::string WriteTable(const std::shared_ptr<::arrow::Table>& table) {
   write_options.base_dir = path;
   write_options.file_write_options = format->DefaultWriteOptions();
 
-  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   CHECK(lance::arrow::LanceDataset::Write(write_options,
                                           dataset->NewScan().ValueOrDie()->Finish().ValueOrDie())
             .ok());
@@ -62,7 +62,7 @@ TEST_CASE("Create new dataset") {
                                                       ::arrow::field("value", ::arrow::utf8())}),
                                      {ids, values});
 
-  auto dataset = lance::testing::MakeDataset(table1).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table1);
 
   auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
   auto format = lance::arrow::LanceFileFormat::Make();
@@ -84,14 +84,14 @@ TEST_CASE("Create new dataset") {
                                      {ids, values});
 
   // Version 2 is appending.
-  dataset = lance::testing::MakeDataset(table2).ValueOrDie();
+  dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table2);
   CHECK(lance::arrow::LanceDataset::Write(write_options,
                                           dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
                                           lance::arrow::LanceDataset::kAppend)
             .ok());
 
   // Version 3 is overwriting.
-  dataset = lance::testing::MakeDataset(table2).ValueOrDie();
+  dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table2);
   CHECK(lance::arrow::LanceDataset::Write(write_options,
                                           dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
                                           lance::arrow::LanceDataset::kOverwrite)
@@ -125,7 +125,7 @@ TEST_CASE("Create new dataset over existing dataset") {
   auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
   auto table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
-  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
 
   auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
   auto format = lance::arrow::LanceFileFormat::Make();
@@ -150,7 +150,7 @@ TEST_CASE("Dataset append error cases") {
   auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
   auto table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
-  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
 
   auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
   auto format = lance::arrow::LanceFileFormat::Make();
@@ -177,7 +177,7 @@ TEST_CASE("Dataset append error cases") {
     auto values = ToArray({"one", "two", "three", "four", "five"}).ValueOrDie();
     table = ::arrow::Table::Make(::arrow::schema({::arrow::field("values", ::arrow::utf8())}),
                                  {values});
-    dataset = lance::testing::MakeDataset(table).ValueOrDie();
+    auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
     auto status =
         lance::arrow::LanceDataset::Write(write_options,
                                           dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
@@ -190,7 +190,7 @@ TEST_CASE("Dataset overwrite error cases") {
   auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
   auto table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
-  auto dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
 
   auto base_uri = lance::testing::MakeTemporaryDir().ValueOrDie() + "/testdata";
   auto format = lance::arrow::LanceFileFormat::Make();
@@ -209,7 +209,7 @@ TEST_CASE("Dataset overwrite error cases") {
   auto values = ToArray({"one", "two", "three", "four", "five"}).ValueOrDie();
   table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("values", ::arrow::utf8())}), {values});
-  dataset = lance::testing::MakeDataset(table).ValueOrDie();
+  dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
   auto status =
       lance::arrow::LanceDataset::Write(write_options,
                                         dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
@@ -223,9 +223,7 @@ TEST_CASE("Dataset write dictionary array") {
   auto dict_indices = ToArray({0, 1, 1, 2, 2, 0}).ValueOrDie();
   auto data_type = ::arrow::dictionary(::arrow::int32(), ::arrow::utf8());
   auto dict_arr =
-      ::arrow::DictionaryArray::FromArrays(
-          data_type, dict_indices, dict_values)
-          .ValueOrDie();
+      ::arrow::DictionaryArray::FromArrays(data_type, dict_indices, dict_values).ValueOrDie();
   auto table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("dict", data_type)}), {dict_arr});
 
@@ -234,4 +232,55 @@ TEST_CASE("Dataset write dictionary array") {
 
   auto actual = ReadTable(base_uri, 1);
   CHECK(actual->Equals(*table));
+}
+
+TEST_CASE("Dataset add column with a constant value") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
+  auto base_uri = WriteTable(table);
+  auto actual = ReadTable(base_uri, 1);
+
+  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+
+  auto dataset2 =
+      dataset
+          ->AddColumn(::arrow::field("doubles", ::arrow::float64()), ::arrow::compute::literal(0.5))
+          .ValueOrDie();
+  CHECK(dataset2->version().version() == 2);
+  auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  auto doubles = ToArray<double>({0.5, 0.5, 0.5, 0.5, 0.5}).ValueOrDie();
+  auto expected_table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                            ::arrow::field("doubles", ::arrow::float64())}),
+                           {ids, doubles});
+  CHECK(table2->Equals(*expected_table));
+}
+
+TEST_CASE("Dataset add column with a function call") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
+  auto base_uri = WriteTable(table);
+  auto actual = ReadTable(base_uri, 1);
+
+  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+
+  auto dataset2 =
+      dataset
+          ->AddColumn(
+              ::arrow::field("doubles", ::arrow::float64()),
+              ::arrow::compute::call(
+                  "add", {::arrow::compute::field_ref("id"), ::arrow::compute::literal(0.5)}))
+          .ValueOrDie();
+  CHECK(dataset2->version().version() == 2);
+  auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  auto doubles = ToArray<double>({1.5, 2.5, 3.5, 4.5, 5.5}).ValueOrDie();
+  auto expected_table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                            ::arrow::field("doubles", ::arrow::float64())}),
+                           {ids, doubles});
+  CHECK(table2->Equals(*expected_table));
 }

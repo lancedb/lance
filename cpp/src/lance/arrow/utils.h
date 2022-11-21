@@ -55,6 +55,17 @@ namespace lance::arrow {
 ::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
     const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning = nullptr);
 
+/// Create an array from a scalar value.
+///
+/// \param scalar the value of each element in the array
+/// \param length array length.
+/// \param pool memory pool
+/// \return
+::arrow::Result<std::shared_ptr<::arrow::Array>> CreateArray(
+    const std::shared_ptr<::arrow::Scalar>& scalar,
+    int64_t length,
+    ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
 /// Get UUID string.
 std::string GetUUIDString();
 

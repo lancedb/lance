@@ -41,11 +41,13 @@ class Updater::Impl {
   Impl(std::shared_ptr<LanceDataset> dataset,
        ::arrow::dataset::FragmentVector fragments,
        std::shared_ptr<lance::format::Schema> full_schema,
-       std::shared_ptr<lance::format::Schema> column_schema)
+       std::shared_ptr<lance::format::Schema> column_schema,
+       std::vector<std::string> projection_columns)
       : dataset_(std::move(dataset)),
         full_schema_(std::move(full_schema)),
         column_schema_(std::move(column_schema)),
         fragments_(std::move(fragments)),
+        projected_columns_(std::move(projection_columns)),
         fragment_it_(fragments_.begin()) {}
 
   /// Copy constructor
@@ -54,6 +56,7 @@ class Updater::Impl {
         full_schema_(other.full_schema_),
         column_schema_(other.column_schema_),
         fragments_(other.fragments_.begin(), other.fragments_.end()),
+        projected_columns_(other.projected_columns_.begin(), other.projected_columns_.end()),
         fragment_it_(fragments_.begin()) {}
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next();
@@ -77,6 +80,8 @@ class Updater::Impl {
   std::shared_ptr<lance::format::Schema> column_schema_;
   /// A copy of fragments.
   ::arrow::dataset::FragmentVector fragments_;
+
+  std::vector<std::string> projected_columns_;
 
   // Used to store the updated fragments.
   std::vector<std::shared_ptr<format::DataFragment>> data_fragments_;
@@ -103,6 +108,9 @@ class Updater::Impl {
       std::make_unique<io::FileWriter>(column_schema_, std::move(write_options), std::move(output));
 
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset_->NewScan());
+  if (!projected_columns_.empty()) {
+    ARROW_RETURN_NOT_OK(scan_builder->Project(projected_columns_));
+  }
   //  ARROW_RETURN_NOT_OK(scan_builder->BatchSize(std::numeric_limits<int64_t>::max()));
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
   ARROW_ASSIGN_OR_RAISE(batch_generator_, (*fragment_it_)->ScanBatchesAsync(scanner->options()));
@@ -175,7 +183,9 @@ class Updater::Impl {
 Updater::~Updater() {}
 
 ::arrow::Result<std::shared_ptr<Updater>> Updater::Make(
-    std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field) {
+    std::shared_ptr<LanceDataset> dataset,
+    const std::shared_ptr<::arrow::Field>& field,
+    const std::vector<std::string>& projection_columns) {
   auto arrow_schema = ::arrow::schema({field});
   ARROW_ASSIGN_OR_RAISE(auto full_schema, dataset->impl_->manifest->schema()->Merge(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto column_schema, full_schema->Project(*arrow_schema));
@@ -183,8 +193,11 @@ Updater::~Updater() {}
   // Use vector to make implementation easier.
   // We can later to use FragmentIterator for datasets with a lot of Fragments.
   ARROW_ASSIGN_OR_RAISE(auto fragments, fragment_iter.ToVector());
-  auto impl = std::make_unique<Impl>(
-      std::move(dataset), std::move(fragments), std::move(full_schema), std::move(column_schema));
+  auto impl = std::make_unique<Impl>(std::move(dataset),
+                                     std::move(fragments),
+                                     std::move(full_schema),
+                                     std::move(column_schema),
+                                     projection_columns);
   return std::shared_ptr<Updater>(new Updater(std::move(impl)));
 }
 
@@ -202,8 +215,12 @@ UpdaterBuilder::UpdaterBuilder(std::shared_ptr<LanceDataset> source,
                                std::shared_ptr<::arrow::Field> field)
     : dataset_(std::move(source)), field_(std::move(field)) {}
 
+void UpdaterBuilder::Project(std::vector<std::string> columns) {
+  projection_columns_ = std::move(columns);
+}
+
 ::arrow::Result<std::shared_ptr<Updater>> UpdaterBuilder::Finish() {
-  return Updater::Make(dataset_, field_);
+  return Updater::Make(dataset_, field_, projection_columns_);
 }
 
 }  // namespace lance::arrow

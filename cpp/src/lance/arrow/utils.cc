@@ -14,6 +14,7 @@
 
 #include "lance/arrow/utils.h"
 
+#include <arrow/builder.h>
 #include <arrow/dataset/discovery.h>
 #include <arrow/filesystem/api.h>
 #include <arrow/result.h>
@@ -270,6 +271,68 @@ template <VarLenListType L>
       ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, options));
   ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
   return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
+}
+
+template <typename ArrayType>
+::arrow::Result<std::shared_ptr<::arrow::Array>> CreateArrayImpl(
+    const std::shared_ptr<::arrow::Scalar>& scalar, int64_t length, ::arrow::MemoryPool* pool) {
+  auto concrete_scalar =
+      std::dynamic_pointer_cast<typename ::arrow::TypeTraits<ArrayType>::ScalarType>(scalar);
+  auto builder =
+      std::make_shared<typename ::arrow::TypeTraits<ArrayType>::BuilderType>(scalar->type, pool);
+  ARROW_RETURN_NOT_OK(builder->Reserve(length));
+  for (int64_t i = 0; i < length; i++) {
+    ARROW_RETURN_NOT_OK(builder->Append(concrete_scalar->value));
+  }
+  return builder->Finish();
+}
+
+template <>
+::arrow::Result<std::shared_ptr<::arrow::Array>> CreateArrayImpl<::arrow::StringType>(
+    const std::shared_ptr<::arrow::Scalar>& scalar, int64_t length, ::arrow::MemoryPool* pool) {
+  auto concrete_scalar = std::dynamic_pointer_cast<::arrow::StringScalar>(scalar);
+  auto builder = ::arrow::StringBuilder(pool);
+  ARROW_RETURN_NOT_OK(builder.Reserve(length));
+  for (int64_t i = 0; i < length; i++) {
+    ARROW_RETURN_NOT_OK(builder.Append(concrete_scalar->view()));
+  }
+  return builder.Finish();
+}
+
+::arrow::Result<std::shared_ptr<::arrow::Array>> CreateArray(
+    const std::shared_ptr<::arrow::Scalar>& scalar, int64_t length, ::arrow::MemoryPool* pool) {
+  ARROW_ASSIGN_OR_RAISE(auto builder, GetArrayBuilder(scalar->type, pool));
+  switch (scalar->type->id()) {
+    case ::arrow::Type::BOOL:
+      return CreateArrayImpl<::arrow::BooleanType>(scalar, length, pool);
+    case ::arrow::Type::UINT8:
+      return CreateArrayImpl<::arrow::UInt8Type>(scalar, length, pool);
+    case ::arrow::Type::INT8:
+      return CreateArrayImpl<::arrow::Int8Type>(scalar, length, pool);
+    case ::arrow::Type::UINT16:
+      return CreateArrayImpl<::arrow::UInt16Type>(scalar, length, pool);
+    case ::arrow::Type::INT16:
+      return CreateArrayImpl<::arrow::Int16Type>(scalar, length, pool);
+    case ::arrow::Type::UINT32:
+      return CreateArrayImpl<::arrow::UInt32Type>(scalar, length, pool);
+    case ::arrow::Type::INT32:
+      return CreateArrayImpl<::arrow::Int32Type>(scalar, length, pool);
+    case ::arrow::Type::UINT64:
+      return CreateArrayImpl<::arrow::UInt64Type>(scalar, length, pool);
+    case ::arrow::Type::INT64:
+      return CreateArrayImpl<::arrow::Int64Type>(scalar, length, pool);
+    case ::arrow::Type::HALF_FLOAT:
+      return CreateArrayImpl<::arrow::HalfFloatType>(scalar, length, pool);
+    case ::arrow::Type::FLOAT:
+      return CreateArrayImpl<::arrow::FloatType>(scalar, length, pool);
+    case ::arrow::Type::DOUBLE:
+      return CreateArrayImpl<::arrow::DoubleType>(scalar, length, pool);
+    case ::arrow::Type::STRING:
+      return CreateArrayImpl<::arrow::StringType>(scalar, length, pool);
+    default:
+      return ::arrow::Status::Invalid(
+          fmt::format("CreateArray: unsupported type: {}", scalar->type->ToString()));
+  }
 }
 
 namespace {
