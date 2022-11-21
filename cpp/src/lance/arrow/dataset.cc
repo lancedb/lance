@@ -316,6 +316,29 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
                                           std::move(new_field));
 }
 
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
+    const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+  auto refs = ::arrow::compute::FieldsInExpression(expression);
+  auto columns = refs | views::transform([](auto& ref) { return ref.ToString(); }) |
+                 to<std::vector<std::string>>;
+  ARROW_ASSIGN_OR_RAISE(auto builder, NewUpdate(field));
+  // Add column
+  // builder->Project(columns);
+  ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
+
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
+    if (!batch) {
+      break;
+    }
+    if (expression.IsScalarExpression()) {
+      auto scalar = expression.literal();
+      scalar->scalar();
+    }
+  }
+  return updater->Finish();
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
     [[maybe_unused]] std::shared_ptr<::arrow::Schema> schema) const {
   return std::make_shared<LanceDataset>(*this);

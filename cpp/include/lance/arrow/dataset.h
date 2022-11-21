@@ -132,6 +132,16 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
 
+  /// Add column via a compute expression.
+  ///
+  /// \param field the new field.
+  /// \param expression the expression to compute the column.
+  /// \return a new version of the dataset.
+  ///
+  /// See `Updater` for details.
+  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumn(
+      const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression);
+
  protected:
   ::arrow::Result<::arrow::dataset::FragmentIterator> GetFragmentsImpl(
       ::arrow::compute::Expression predicate) override;
