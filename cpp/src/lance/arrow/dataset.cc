@@ -319,6 +319,10 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
     const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+  if (!expression.IsScalarExpression()) {
+    return ::arrow::Status::Invalid(
+        "LanceDataset::AddColumn: expression is not a scalar expression.");
+  }
   ARROW_ASSIGN_OR_RAISE(expression, expression.Bind(*schema()));
   ARROW_ASSIGN_OR_RAISE(auto builder, NewUpdate(field));
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
