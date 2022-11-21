@@ -257,3 +257,30 @@ TEST_CASE("Dataset add column with a constant value") {
                            {ids, doubles});
   CHECK(table2->Equals(*expected_table));
 }
+
+TEST_CASE("Dataset add column with a function call") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32())}), {ids});
+  auto base_uri = WriteTable(table);
+  auto actual = ReadTable(base_uri, 1);
+
+  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+
+  auto dataset2 =
+      dataset
+          ->AddColumn(
+              ::arrow::field("doubles", ::arrow::float64()),
+              ::arrow::compute::call(
+                  "add", {::arrow::compute::field_ref("id"), ::arrow::compute::literal(0.5)}))
+          .ValueOrDie();
+  CHECK(dataset2->version().version() == 2);
+  auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  auto doubles = ToArray<double>({1.5, 2.5, 3.5, 4.5, 5.5}).ValueOrDie();
+  auto expected_table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                            ::arrow::field("doubles", ::arrow::float64())}),
+                           {ids, doubles});
+  CHECK(table2->Equals(*expected_table));
+}
