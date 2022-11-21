@@ -318,6 +318,8 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
     const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+  assert(!expression.IsBound());
+  ARROW_ASSIGN_OR_RAISE(expression, expression.Bind(*schema()));
   auto refs = ::arrow::compute::FieldsInExpression(expression);
   auto columns = refs | views::transform([](auto& ref) { return ref.ToString(); }) |
                  to<std::vector<std::string>>;
@@ -332,8 +334,15 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
       break;
     }
     if (expression.IsScalarExpression()) {
-      auto scalar = expression.literal();
-      scalar->scalar();
+      auto datum = expression.literal();
+      assert(datum->kind() == ::arrow::Datum::Kind::SCALAR);
+      ARROW_ASSIGN_OR_RAISE(auto arr, CreateArray(datum->scalar(), batch->num_rows()));
+      ARROW_RETURN_NOT_OK(updater->UpdateBatch(arr));
+    } else {
+      ARROW_ASSIGN_OR_RAISE(
+          auto datum, ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
+      assert(datum.is_arraylike());
+      ARROW_RETURN_NOT_OK(updater->UpdateBatch(datum.make_array()));
     }
   }
   return updater->Finish();
