@@ -18,11 +18,11 @@
 #include <memory>
 #include <vector>
 
-#include "duckdb.hpp"
-#include "duckdb/parser/parsed_data/create_function_info.hpp"
+#include <duckdb.hpp>
+#include <duckdb/parser/parsed_data/create_function_info.hpp>
 
 namespace lance::duckdb {
 
-std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetListFunctions();
+std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetVectorFunctions();
 
 }

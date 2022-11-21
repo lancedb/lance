@@ -12,12 +12,12 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "ml/catalog.h"
+#include "lance/duckdb/ml/catalog.h"
 
 #include <mutex>
 #include <utility>
 
-#include "ml/pytorch.h"
+#include "lance/duckdb/ml/pytorch.h"
 
 namespace lance::duckdb::ml {
 

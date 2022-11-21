@@ -109,7 +109,7 @@ if(LANCE_BUILD_PYTORCH)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
-include_directories(include)
+include_directories(src)
 
 set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/lance-extension.cc

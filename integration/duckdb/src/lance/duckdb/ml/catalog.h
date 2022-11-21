@@ -19,7 +19,7 @@
 #include <memory>
 #include <mutex>
 
-#include "duckdb.hpp"
+#include <duckdb.hpp>
 
 namespace lance::duckdb::ml {
 

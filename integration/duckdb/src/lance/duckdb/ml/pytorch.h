@@ -24,7 +24,7 @@
 #include <opencv2/opencv.hpp>
 #include <vector>
 
-#include "catalog.h"
+#include "lance/duckdb/ml/catalog.h"
 
 namespace lance::duckdb::ml {
 

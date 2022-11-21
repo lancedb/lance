@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "list_functions.h"
+#include "lance/duckdb/list_functions.h"
 
 #include <cstdint>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>

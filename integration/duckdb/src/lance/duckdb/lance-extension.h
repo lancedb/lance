@@ -15,14 +15,15 @@
 
 #pragma once
 
-#include <memory>
-#include <vector>
+#include <duckdb.hpp>
+#include <duckdb/main/client_context.hpp>
 
-#include "duckdb.hpp"
-#include "duckdb/parser/parsed_data/create_function_info.hpp"
+namespace duckdb {
 
-namespace lance::duckdb {
+class LanceExtension : public Extension {
+ public:
+  void Load(DuckDB &db) override;
+  std::string Name() override;
+};
 
-std::vector<std::unique_ptr<::duckdb::CreateFunctionInfo>> GetVectorFunctions();
-
-}
+} // namespace duckdb

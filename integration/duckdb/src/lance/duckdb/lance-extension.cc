@@ -18,9 +18,9 @@
 
 #include <duckdb.hpp>
 
-#include "list_functions.h"
-#include "vector_functions.h"
-#include "ml/functions.h"
+#include "lance/duckdb/list_functions.h"
+#include "lance/duckdb/vector_functions.h"
+#include "lance/duckdb/ml/functions.h"
 
 namespace duckdb {
 
