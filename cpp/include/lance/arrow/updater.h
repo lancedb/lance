@@ -75,10 +75,13 @@ class Updater {
   ///
   /// \param dataset The dataset to be updated.
   /// \param field the (new) column to update.
+  /// \param projection_columns the columns to read from source dataset.
   ///
   /// \return an Updater if success.
   static ::arrow::Result<std::shared_ptr<Updater>> Make(
-      std::shared_ptr<LanceDataset> dataset, const std::shared_ptr<::arrow::Field>& field);
+      std::shared_ptr<LanceDataset> dataset,
+      const std::shared_ptr<::arrow::Field>& field,
+      const std::vector<std::string>& projection_columns);
 
   /// PIMPL
   class Impl;
