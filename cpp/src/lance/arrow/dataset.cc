@@ -337,7 +337,6 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
 
     ARROW_ASSIGN_OR_RAISE(auto datum,
                           ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
-    fmt::print("Datum: {}\n", datum.ToString());
     std::shared_ptr<::arrow::Array> arr;
     if (datum.is_scalar()) {
       ARROW_ASSIGN_OR_RAISE(arr, CreateArray(datum.scalar(), batch->num_rows()));
