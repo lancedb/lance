@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/duckdb/vector_functions.h"
+#include "vector_functions.h"
 
 #include <cmath>
 #include <cstdint>

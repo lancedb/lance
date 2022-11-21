@@ -12,14 +12,14 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/duckdb/ml/functions.h"
+#include "ml/functions.h"
 
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <iostream>
 #include <memory>
 #include <vector>
 
-#include "lance/duckdb/ml/pytorch.h"
+#include "ml/pytorch.h"
 
 namespace lance::duckdb::ml {
 

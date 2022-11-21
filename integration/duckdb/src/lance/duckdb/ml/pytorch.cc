@@ -12,7 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/duckdb/ml/pytorch.h"
+#include "ml/pytorch.h"
 
 #include <torch/script.h>
 
