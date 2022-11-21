@@ -15,13 +15,16 @@
 #pragma once
 
 #include <arrow/dataset/api.h>
+#include <arrow/record_batch.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "lance/arrow/dataset.h"
 #include "lance/format/data_fragment.h"
 #include "lance/format/schema.h"
 
@@ -60,7 +63,10 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   LanceFragment(std::shared_ptr<::arrow::fs::FileSystem> fs,
                 std::string data_dir,
                 std::shared_ptr<lance::format::DataFragment> fragment,
-                std::shared_ptr<lance::format::Manifest> manifest);
+                std::shared_ptr<lance::format::Manifest> manifest = nullptr);
+
+  /// Copy constructor.
+  LanceFragment(const LanceFragment& other);
 
   /// Destructor.
   ~LanceFragment() override = default;
@@ -82,6 +88,9 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Dataset schema.
   const std::shared_ptr<format::Schema>& schema() const;
 
+  /// Access the data fragment (POD).
+  const std::shared_ptr<lance::format::DataFragment>& data_fragment() const;
+
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
@@ -100,6 +109,7 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   std::string data_uri_;
   std::shared_ptr<lance::format::DataFragment> fragment_;
   std::shared_ptr<format::Manifest> manifest_;
+  std::shared_ptr<format::Schema> schema_;
 };
 
 }  // namespace lance::arrow

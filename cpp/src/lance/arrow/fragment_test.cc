@@ -29,6 +29,7 @@
 
 using lance::arrow::ToArray;
 using lance::testing::MakeFragment;
+namespace fs = std::filesystem;
 
 TEST_CASE("Read fragment with one file") {
   auto arr = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
@@ -45,3 +46,7 @@ TEST_CASE("Read fragment with one file") {
   CHECK(batch->schema()->Equals(*t->schema()));
   CHECK(arr->Equals(batch->GetColumnByName("int")));
 }
+
+TEST_CASE("Test add column without data") {}
+
+TEST_CASE("Add one field with updater") {}

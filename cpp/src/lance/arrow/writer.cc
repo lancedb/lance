@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/format/schema.h"
 #include "lance/io/writer.h"
 
 using arrow::Status;
@@ -39,7 +40,8 @@ namespace lance::arrow {
                            FileWriteOptions options) {
   ARROW_RETURN_NOT_OK(options.Validate());
   auto opts = std::make_shared<lance::arrow::FileWriteOptions>(options);
-  lance::io::FileWriter writer(table.schema(), opts, sink, {});
+  auto schema = std::make_shared<lance::format::Schema>(table.schema());
+  lance::io::FileWriter writer(schema, opts, sink, {});
 
   std::shared_ptr<::arrow::RecordBatch> batch;
   ::arrow::TableBatchReader batch_reader(table);
