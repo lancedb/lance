@@ -202,6 +202,10 @@ UpdaterBuilder::UpdaterBuilder(std::shared_ptr<LanceDataset> source,
                                std::shared_ptr<::arrow::Field> field)
     : dataset_(std::move(source)), field_(std::move(field)) {}
 
+void UpdaterBuilder::Project(std::vector<std::string> columns) {
+  projection_columns_ = std::move(columns);
+}
+
 ::arrow::Result<std::shared_ptr<Updater>> UpdaterBuilder::Finish() {
   return Updater::Make(dataset_, field_);
 }
