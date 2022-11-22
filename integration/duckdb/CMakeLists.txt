@@ -16,6 +16,10 @@ if(IS_ARM)
 endif()
 
 if (APPLE)
+  # POLICY CMP0042
+  set(CMAKE_MACOSX_RPATH 1)
+
+  set(CMAKE_ENABLE_EXPORTS 1)
   set(CMAKE_CXX_COMPILER_ID Clang) # DuckDB CMakeLists.txt does not allow static linking for AppleClang
 endif()
 
@@ -27,7 +31,7 @@ set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-  GIT_TAG v0.5.1)
+  GIT_TAG v0.6.0)
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
@@ -93,7 +97,6 @@ if(LANCE_BUILD_PYTORCH)
   set(Torch_DIR "${torch_SOURCE_DIR}/share/cmake/Torch")
 
   set(OpenCV_DIR ${CMAKE_CURRENT_BINARY_DIR})
-  include_directories(${OpenCV_INCLUDE_DIRS})
 
   include_directories(
     ${OpenCV_SOURCE_DIR}/include ${OpenCV_SOURCE_DIR}/modules/core/include
@@ -101,6 +104,8 @@ if(LANCE_BUILD_PYTORCH)
     ${OpenCV_SOURCE_DIR}/modules/imgproc/include ${CMAKE_CURRENT_BINARY_DIR})
 
   find_package(Torch REQUIRED)
+
+  include_directories(${TORCH_INCLUDE_DIRS})
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
@@ -109,17 +114,12 @@ include_directories(src)
 set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
-    src/lance/duckdb/list_functions.h
-    src/lance/duckdb/vector_functions.cc
-    src/lance/duckdb/vector_functions.h)
+    src/lance/duckdb/vector_functions.cc)
 
 set(LANCE_EXT_SOURCE_ML
     src/lance/duckdb/ml/catalog.cc
-    src/lance/duckdb/ml/catalog.h
     src/lance/duckdb/ml/pytorch.cc
-    src/lance/duckdb/ml/pytorch.h
-    src/lance/duckdb/ml/functions.cc
-    src/lance/duckdb/ml/functions.h)
+    src/lance/duckdb/ml/functions.cc)
 
 if(LANCE_BUILD_PYTORCH)
   set(LANCE_EXT_SOURCES
@@ -129,7 +129,9 @@ else()
   set(LANCE_EXT_SOURCES ${LANCE_EXT_SOURCE_COMMON})
 endif()
 
-build_loadable_extension(lance ${LANCE_EXT_SOURCES})
+# add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
+set(PARAMETERS "-warnings")
+build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
@@ -138,3 +140,4 @@ if(LANCE_BUILD_PYTORCH)
     set_target_properties(lance_loadable_extension PROPERTIES CUDA_ARCHITECTURES native)
   endif()
 endif()
+

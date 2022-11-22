@@ -14,47 +14,49 @@
 
 #define DUCKDB_EXTENSION_MAIN
 
+#include "lance-extension.h"
+
 #include <duckdb.hpp>
 
 #include "lance/duckdb/list_functions.h"
-#include "lance/duckdb/ml/functions.h"
 #include "lance/duckdb/vector_functions.h"
+#include "lance/duckdb/ml/functions.h"
 
-class LanceExtension : public ::duckdb::Extension {
- public:
-  void Load(::duckdb::DuckDB &db) override {
-    duckdb::Connection con(db);
-    con.BeginTransaction();
-    auto &context = *con.context;
-    auto &catalog = ::duckdb::Catalog::GetCatalog(context);
+namespace duckdb {
 
-    for (auto &func : lance::duckdb::GetListFunctions()) {
-      catalog.CreateFunction(context, func.get());
-    }
+void LanceExtension::Load(::duckdb::DuckDB &db) {
+  duckdb::Connection con(db);
+  con.BeginTransaction();
+  auto &context = *con.context;
+  auto &catalog = ::duckdb::Catalog::GetCatalog(context);
 
-    for (auto &func : lance::duckdb::GetVectorFunctions()) {
-      catalog.CreateFunction(context, func.get());
-    }
-
-    for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
-      catalog.CreateFunction(context, func.get());
-    }
-
-    for (auto &func : lance::duckdb::ml::GetMLTableFunctions()) {
-      catalog.CreateTableFunction(context, func.get());
-    }
-
-    con.Commit();
+  for (auto &func : lance::duckdb::GetListFunctions()) {
+    catalog.CreateFunction(context, func.get());
   }
 
-  std::string Name() override { return std::string("lance"); }
+  for (auto &func : lance::duckdb::GetVectorFunctions()) {
+    catalog.CreateFunction(context, func.get());
+  }
+
+  for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
+    catalog.CreateFunction(context, func.get());
+  }
+
+  for (auto &func : lance::duckdb::ml::GetMLTableFunctions()) {
+    catalog.CreateTableFunction(context, func.get());
+  }
+
+  con.Commit();
+}
+
+std::string LanceExtension::Name() { return {"lance"}; }
 };
 
 extern "C" {
 
 DUCKDB_EXTENSION_API void lance_init(duckdb::DatabaseInstance &db) {
   duckdb::DuckDB db_wrapper(db);
-  db_wrapper.LoadExtension<LanceExtension>();
+  db_wrapper.LoadExtension<duckdb::LanceExtension>();
 }
 
 DUCKDB_EXTENSION_API const char *lance_version() { return duckdb::DuckDB::LibraryVersion(); }
