@@ -325,6 +325,13 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   }
   ARROW_ASSIGN_OR_RAISE(expression, expression.Bind(*schema()));
   ARROW_ASSIGN_OR_RAISE(auto builder, NewUpdate(field));
+  if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+    std::vector<std::string> columns;
+    for (const auto& ref : ::arrow::compute::FieldsInExpression(expression)) {
+      columns.emplace_back(arrow::ToColumnName(ref));
+    }
+    builder->Project(columns);
+  }
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
 
   // TODO: add projection via FieldRef.
