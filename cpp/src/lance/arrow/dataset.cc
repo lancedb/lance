@@ -16,11 +16,9 @@
 
 #include <arrow/array.h>
 #include <arrow/array/concatenate.h>
-#include <arrow/dataset/api.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -339,10 +337,15 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
     if (!batch) {
       break;
     }
+
+#ifndef NDEBUG
     // Due to lack of injection point to test schema in the unit tests, let's do assert here.
     // Assert will be disabled in the release build.
-    assert(batch->schema()->Equals(
-        impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
+    if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+      assert(batch->schema()->Equals(
+          impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
+    }
+#endif
 
     ARROW_ASSIGN_OR_RAISE(auto datum,
                           ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
