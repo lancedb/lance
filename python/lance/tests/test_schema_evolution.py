@@ -34,6 +34,25 @@ def test_write_versioned_dataset(tmp_path: Path):
     pd.testing.assert_frame_equal(expected_df, actual_df)
 
 
+def test_column_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    def value_func(x: pa.Table):
+        assert x.num_columns == 1
+        assert x.column_names == ["a"]
+        return pa.array([str(i) for i in x.column("a")])
+
+    new_dataset = dataset.append_column(pa.field("c", pa.utf8()), value_func, columns=["a"])
+
+    actual_df = new_dataset.to_table().to_pandas()
+    expected_df = pd.DataFrame({"a": [1, 10], "b": [2, 20], "c": ["1", "10"]})
+    pd.testing.assert_frame_equal(expected_df, actual_df)
+
+
 def test_add_column_with_literal(tmp_path: Path):
     table = pa.Table.from_pylist([{"a": i} for i in range(10)])
 

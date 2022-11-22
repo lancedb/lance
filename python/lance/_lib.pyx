@@ -155,6 +155,8 @@ cdef extern from "lance/arrow/updater.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CLanceDataset]] Finish();
 
     cdef cppclass CUpdaterBuilder "::lance::arrow::UpdaterBuilder":
+        void Project(vector[string] columns);
+
         CResult[shared_ptr[CUpdater]] Finish();
 
 
@@ -283,9 +285,10 @@ cdef class FileSystemDataset(Dataset):
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
     def append_column(
-            self,
-            field: Field,
-            value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+        self,
+        field: Field,
+        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+        columns: Optional[List[str]] = None,
     ) -> FileSystemDataset:
         """Append a new column.
 
@@ -296,16 +299,22 @@ cdef class FileSystemDataset(Dataset):
         value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
             A function / callback that takes in a Batch and produces an Array. The generated array must
             have the same length as the input batch.
+        columns : list of strs, optional.
+            The list of columns to read from the source dataset.
         """
         cdef:
             shared_ptr[CUpdater] c_updater
             shared_ptr[CField] c_field
+            shared_ptr[CUpdaterBuilder] c_update_builder
 
         if isinstance(value, Expression):
             return self._append_column_expr(field, value)
         elif isinstance(value, Callable):
             c_field = pyarrow_unwrap_field(field)
-            c_updater = move(GetResultValue(GetResultValue(move(self.lance_dataset.NewUpdate(c_field))).get().Finish()))
+            c_update_builder = GetResultValue(self.lance_dataset.NewUpdate(c_field))
+            if columns is not None and len(columns) > 0:
+                c_update_builder.get().Project([tobytes(col) for col in columns])
+            c_updater = GetResultValue(c_update_builder.get().Finish())
             updater = Updater.wrap(c_updater)
             for table in updater:
                 arr = value(table)
