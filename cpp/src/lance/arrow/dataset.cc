@@ -334,12 +334,15 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   }
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
 
-  // TODO: add projection via FieldRef.
   while (true) {
     ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
     if (!batch) {
       break;
     }
+    // Due to lack of ingestion point to test schema in unit test, let's do assert here.
+    // Assert will be disabled in the release build.
+    assert(batch->schema()->Equals(
+        impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
 
     ARROW_ASSIGN_OR_RAISE(auto datum,
                           ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
