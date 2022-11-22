@@ -92,6 +92,7 @@ class LanceDataset(IterableDataset):
     def __init__(
         self,
         root: Union[str, Path],
+        version: Optional[int] = None,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         batch_size: Optional[int] = None,
         filter: Optional[pc.Expression] = None,
@@ -104,6 +105,8 @@ class LanceDataset(IterableDataset):
         ----------
         root : str or Path
             The root URI
+        version: optional, int
+            If specified, load a specific version of the dataset.
         columns : list of str, optional
             List of the column names.
         batch_size : int, optional
@@ -124,6 +127,7 @@ class LanceDataset(IterableDataset):
         self.filter = filter
         self.batch_size = batch_size
         self.transform = transform
+        self.version = version
 
         if mode not in ["batch", "record"]:
             raise ValueError(f"Mode must be either 'batch' or 'record', got '{mode}'")
@@ -142,7 +146,7 @@ class LanceDataset(IterableDataset):
             return self._fragments
 
         self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
-        self._fragments = lance.dataset(self.root).get_fragments()
+        self._fragments = lance.dataset(self.root, self.version).get_fragments()
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
             # Split the fragments into each worker.
