@@ -1,6 +1,6 @@
 # distutils: language = c++
 
-from typing import Callable, Optional, List, Dict
+from typing import Callable, Optional, List, Dict, Union
 from pathlib import Path
 
 import pyarrow
@@ -221,6 +221,9 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 
         CResult[shared_ptr[CUpdaterBuilder]] NewUpdate(const shared_ptr[CField]& field) const;
 
+        CResult[shared_ptr[CLanceDataset]] AddColumn(
+                const shared_ptr[CField]& field, CExpression expression);
+
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
@@ -273,14 +276,24 @@ cdef class FileSystemDataset(Dataset):
         c_version = GetResultValue(self.lance_dataset.latest_version())
         return _dataset_version_to_json(c_version)
 
-    def append_column(self, field: Field, func: Callable[[pyarrow.Table], pyarrow.Array]) -> FileSystemDataset:
+    def _append_column_expr(self, field: Field, expression: Expression) -> FileSystemDataset:
+        cdef CExpression c_expression = expression.unwrap()
+        cdef shared_ptr[CField] c_field = pyarrow_unwrap_field(field)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumn(c_field, c_expression))
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
+
+    def append_column(
+            self,
+            field: Field,
+            value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+    ) -> FileSystemDataset:
         """Append a new column.
 
         Parameters
         ----------
         field : pyarrow.Field
             The name and schema of the newly added column.
-        func : Callback[[pyarrow.Table], pyarrow.Array]
+        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
             A function / callback that takes in a Batch and produces an Array. The generated array must
             have the same length as the input batch.
         """
@@ -288,13 +301,18 @@ cdef class FileSystemDataset(Dataset):
             shared_ptr[CUpdater] c_updater
             shared_ptr[CField] c_field
 
-        c_field = pyarrow_unwrap_field(field)
-        c_updater = move(GetResultValue(GetResultValue(move(self.lance_dataset.NewUpdate(c_field))).get().Finish()))
-        updater = Updater.wrap(c_updater)
-        for table in updater:
-            arr = func(table)
-            updater.update_batch(arr)
-        return updater.finish()
+        if isinstance(value, Expression):
+            return self._append_column_expr(field, value)
+        elif isinstance(value, Callable):
+            c_field = pyarrow_unwrap_field(field)
+            c_updater = move(GetResultValue(GetResultValue(move(self.lance_dataset.NewUpdate(c_field))).get().Finish()))
+            updater = Updater.wrap(c_updater)
+            for table in updater:
+                arr = value(table)
+                updater.update_batch(arr)
+            return updater.finish()
+        else:
+            raise ValueError(f"Value does not accept type: {type(value)}")
 
 def _lance_dataset_write(
         Dataset data,
