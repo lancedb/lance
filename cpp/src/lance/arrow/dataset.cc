@@ -339,7 +339,7 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
     if (!batch) {
       break;
     }
-    // Due to lack of ingestion point to test schema in unit test, let's do assert here.
+    // Due to lack of injection point to test schema in the unit tests, let's do assert here.
     // Assert will be disabled in the release build.
     assert(batch->schema()->Equals(
         impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
