@@ -118,3 +118,31 @@ def test_filter_resulted_empty_return(tmp_path: Path):
     assert torch.equal(
         actual_ids, torch.stack([torch.tensor([6, 7]), torch.tensor([8, 9])])
     )
+
+
+def test_multiversioned_data_loader(tmp_path: Path):
+    ids = pa.array(range(10))
+    values = pa.array([f"first-{i}" for i in ids])
+    table = pa.Table.from_arrays([ids, values], names=["id", "value"])
+
+    data_uri = tmp_path / "lance"
+    lance.write_dataset(table, data_uri)
+
+    ids = pa.array(range(10, 20))
+    values = pa.array([f"second-{i}" for i in ids])
+    table = pa.Table.from_arrays([ids, values], names=["id", "value"])
+    lance.write_dataset(table, data_uri, mode="append")
+
+    dataset = LanceDataset(
+        data_uri,
+        columns=["id"],
+        version=1,
+    )
+    assert len(list(iter(dataset))) == 10
+
+    dataset = LanceDataset(
+        data_uri,
+        columns=["id"],
+        version=2,
+    )
+    assert len(list(iter(dataset))) == 20
