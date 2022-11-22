@@ -14,6 +14,7 @@
 
 #include "lance/duckdb/vector_functions.h"
 
+#include <cmath>
 #include <cstdint>
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <iostream>
