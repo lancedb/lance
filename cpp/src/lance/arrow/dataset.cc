@@ -16,11 +16,9 @@
 
 #include <arrow/array.h>
 #include <arrow/array/concatenate.h>
-#include <arrow/dataset/api.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -325,14 +323,29 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   }
   ARROW_ASSIGN_OR_RAISE(expression, expression.Bind(*schema()));
   ARROW_ASSIGN_OR_RAISE(auto builder, NewUpdate(field));
+  if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+    std::vector<std::string> columns;
+    for (const auto& ref : ::arrow::compute::FieldsInExpression(expression)) {
+      columns.emplace_back(arrow::ToColumnName(ref));
+    }
+    builder->Project(columns);
+  }
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
 
-  // TODO: add projection via FieldRef.
   while (true) {
     ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
     if (!batch) {
       break;
     }
+
+#ifndef NDEBUG
+    // Due to lack of injection point to test schema in the unit tests, let's do assert here.
+    // Assert will be disabled in the release build.
+    if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+      assert(batch->schema()->Equals(
+          impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
+    }
+#endif
 
     ARROW_ASSIGN_OR_RAISE(auto datum,
                           ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
