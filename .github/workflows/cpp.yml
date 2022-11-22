@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     env:
-      ArrowVersion: 10.0.0-1
+      ArrowVersion: 10.0.1-1
     defaults:
       run:
         working-directory: ./cpp
