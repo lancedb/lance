@@ -4,7 +4,7 @@ breathe
 cython
 pandas
 piccolo-theme
-duckdb>=0.5.1,<0.6
+duckdb>=0.6,<0.7
 jupyterlab
 fastai
 --extra-index-url https://download.pytorch.org/whl/cpu
