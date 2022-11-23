@@ -20,6 +20,7 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -50,10 +51,13 @@ class DatasetVersion {
   DatasetVersion& operator++();
 
   /// Increase version number
-  const DatasetVersion operator++(int);
+  DatasetVersion operator++(int);
 
  private:
   VersionNumberType version_ = 0;
+
+  /// Dataset creation time, in UTC timezone.
+  std::chrono::time_point<std::chrono::system_clock> created_time_;
 };
 
 // using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(

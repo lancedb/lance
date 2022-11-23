@@ -20,6 +20,8 @@ syntax = "proto3";
 
 package lance.format.pb;
 
+import "google/protobuf/timestamp.proto";
+
 /*
 
 Format:
@@ -55,6 +57,9 @@ message Manifest {
 
   // Fragments of the dataset.
   repeated DataFragment fragments = 6;
+
+  // Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 7;
 }
 
 // Data fragment. A fragment is a set of files which represent the
