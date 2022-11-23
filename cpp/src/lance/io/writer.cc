@@ -210,7 +210,8 @@ FileWriter::~FileWriter() {}
   ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, pb));
   metadata_->SetManifestPosition(pos);
 
-  ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
+  auto metadata_pb = metadata_->ToProto();
+  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, metadata_pb));
   return ::lance::io::WriteFooter(destination_, pos);
 }
 

@@ -23,9 +23,13 @@
 #include <tuple>
 #include <vector>
 
-#include "lance/format/format.pb.h"
+
 
 namespace lance::format {
+
+namespace pb {
+class Metadata;
+}
 
 class Manifest;
 
@@ -34,17 +38,17 @@ class Metadata final {
  public:
   Metadata() = default;
 
+  Metadata(std::vector<int32_t> batch_offsets,
+           int64_t page_length_position,
+           int64_t manifest_position = -1);
+
   ~Metadata() = default;
 
   /// Parse a Metadata from an arrow buffer.
   static ::arrow::Result<std::shared_ptr<Metadata>> Make(
       const std::shared_ptr<::arrow::Buffer>& buffer);
 
-  /// Write Metadata to an open output stream.
-  ///
-  /// \param out the output file
-  /// \return file position if success.
-  ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::io::OutputStream>& out);
+  pb::Metadata ToProto() const;
 
   /// Get the number of batches in this file.
   int32_t num_batches() const;
@@ -79,7 +83,6 @@ class Metadata final {
   std::vector<int32_t> batch_offsets_;
   int64_t page_table_position_ = -1;
   int64_t manifest_position_ = -1;
-  pb::Metadata pb_;
 };
 
 }  // namespace lance::format

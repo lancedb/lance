@@ -21,6 +21,7 @@
 #include <memory>
 #include <tuple>
 
+#include "lance/format/format.pb.h"
 #include "lance/format/manifest.h"
 #include "lance/io/pb.h"
 
@@ -30,18 +31,28 @@ using std::shared_ptr;
 
 namespace lance::format {
 
+Metadata::Metadata(std::vector<int32_t> batch_offsets,
+                   int64_t page_length_position,
+                   int64_t manifest_position)
+    : batch_offsets_(std::move(batch_offsets)),
+      page_table_position_(page_length_position),
+      manifest_position_(manifest_position) {}
+
 Result<shared_ptr<Metadata>> Metadata::Make(const shared_ptr<::arrow::Buffer>& buffer) {
   auto meta = std::make_unique<Metadata>();
-  auto msg = io::ParseProto<pb::Metadata>(buffer);
-  if (!msg.ok()) {
-    return msg.status();
-  }
-  meta->pb_ = std::move(*msg);
-  return meta;
+  ARROW_ASSIGN_OR_RAISE(auto msg, io::ParseProto<pb::Metadata>(buffer));
+  std::vector<int32_t> offsets(msg.batch_offsets().begin(), msg.batch_offsets().end());
+  return std::make_unique<Metadata>(offsets, msg.page_table_position(), msg.manifest_position());
 }
 
-::arrow::Result<int64_t> Metadata::Write(const std::shared_ptr<::arrow::io::OutputStream>& out) {
-  return io::WriteProto(out, pb_);
+pb::Metadata Metadata::ToProto() const {
+  lance::format::pb::Metadata proto;
+  proto.set_page_table_position(page_table_position_);
+  proto.set_manifest_position(manifest_position_);
+  for (auto offset : batch_offsets_) {
+    proto.add_batch_offsets(offset);
+  }
+  return proto;
 }
 
 int32_t Metadata::num_batches() const { return batch_offsets_.size() - 1; }
