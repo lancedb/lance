@@ -76,6 +76,9 @@ class Metadata final {
   void SetManifestPosition(int64_t position);
 
  private:
+  std::vector<int32_t> batch_offsets_;
+  int64_t page_table_position_ = -1;
+  int64_t manifest_position_ = -1;
   pb::Metadata pb_;
 };
 

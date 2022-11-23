@@ -22,9 +22,12 @@
 
 #include "lance/arrow/dataset.h"
 #include "lance/format/data_fragment.h"
-#include "lance/format/format.pb.h"
 
 namespace lance::format {
+
+namespace pb {
+class Manifest;
+}
 
 class Schema;
 

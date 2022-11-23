@@ -21,7 +21,6 @@
 #include <memory>
 #include <tuple>
 
-#include "lance/format/format.h"
 #include "lance/format/manifest.h"
 #include "lance/io/pb.h"
 
@@ -45,25 +44,26 @@ Result<shared_ptr<Metadata>> Metadata::Make(const shared_ptr<::arrow::Buffer>& b
   return io::WriteProto(out, pb_);
 }
 
-int32_t Metadata::num_batches() const { return pb_.batch_offsets_size() - 1; }
+int32_t Metadata::num_batches() const { return batch_offsets_.size() - 1; }
 
 int64_t Metadata::length() const {
-  if (pb_.batch_offsets_size() == 0) {
+  if (batch_offsets_.empty()) {
     return 0;
   }
-  return pb_.batch_offsets(pb_.batch_offsets_size() - 1);
+  return *batch_offsets_.rbegin();
 }
 
 void Metadata::AddBatchLength(int32_t batch_length) {
-  if (pb_.batch_offsets_size() == 0) {
-    pb_.add_batch_offsets(0);
+  assert(batch_length > 0);
+  if (batch_offsets_.empty()) {
+    batch_offsets_.emplace_back(0);
   }
-  pb_.add_batch_offsets(length() + batch_length);
+  batch_offsets_.emplace_back(length() + batch_length);
 }
 
 int32_t Metadata::GetBatchLength(int32_t batch_id) const {
-  assert(batch_id <= pb_.batch_offsets_size());
-  return pb_.batch_offsets(batch_id + 1) - pb_.batch_offsets(batch_id);
+  assert(static_cast<std::size_t>(batch_id) < batch_offsets_.size() - 1);
+  return batch_offsets_[batch_id + 1] - batch_offsets_[batch_id];
 }
 
 ::arrow::Result<std::tuple<int32_t, int32_t>> Metadata::LocateBatch(int32_t row_index) const {
@@ -76,22 +76,22 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
     return ::arrow::Status::IndexError(
         fmt::format("Row index out of range: {} of {}", row_index, len - 1));
   }
-  auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), row_index);
-  if (it == pb_.batch_offsets().end()) {
+  auto it = std::upper_bound(batch_offsets_.begin(), batch_offsets_.end(), row_index);
+  if (it == batch_offsets_.end()) {
     return ::arrow::Status::IndexError("Row index out of range {} of {}", row_index, len);
   }
-  int32_t bound_idx = std::distance(pb_.batch_offsets().begin(), it) - 1;
+  int32_t bound_idx = std::distance(batch_offsets_.begin(), it) - 1;
   // Offset within the batch.
-  int32_t offset = row_index - pb_.batch_offsets(bound_idx);
+  int32_t offset = row_index - batch_offsets_[bound_idx];
   return std::tuple(bound_idx, offset);
 }
 
-void Metadata::SetManifestPosition(int64_t position) { pb_.set_manifest_position(position); }
+void Metadata::SetManifestPosition(int64_t position) { manifest_position_ = position; }
 
-int64_t Metadata::page_table_position() const { return pb_.page_table_position(); }
+int64_t Metadata::page_table_position() const { return page_table_position_; }
 
-void Metadata::SetPageTablePosition(int64_t position) { pb_.set_page_table_position(position); }
+void Metadata::SetPageTablePosition(int64_t position) { page_table_position_ = position; }
 
-int64_t Metadata::manifest_position() const { return pb_.manifest_position(); }
+int64_t Metadata::manifest_position() const { return manifest_position_; }
 
 }  // namespace lance::format
