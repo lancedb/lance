@@ -2,7 +2,7 @@ FROM quay.io/pypa/manylinux2014_x86_64
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
-ENV ARROW_VERSION=10.0.0-1.el7
+ENV ARROW_VERSION=10.0.1-1.el7
 
 RUN yum update -y \
   && yum install -y epel-release || yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(cut -d: -f5 /etc/system-release-cpe | cut -d. -f1).noarch.rpm \

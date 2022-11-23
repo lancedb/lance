@@ -24,7 +24,7 @@ import PIL
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from lance import LanceFileFormat
+import lance
 from lance.pytorch.data import LanceDataset
 from lance.types import ImageArray, ImageBinary
 
@@ -35,8 +35,7 @@ def test_data_loader(tmp_path: Path):
     values = pa.array(range(10, 20))
     tab = pa.Table.from_arrays([ids, values], names=["id", "value"])
 
-    pa.dataset.write_dataset(tab, tmp_path / "lance", format=LanceFileFormat())
-
+    lance.write_dataset(tab, tmp_path / "lance")
     dataset = LanceDataset(tmp_path / "lance", batch_size=4, mode="batch")
     id_batch, value_batch = next(iter(dataset))
     assert id_batch.shape == torch.Size([4])
@@ -61,7 +60,7 @@ def test_dataset_with_ext_types(tmp_path: Path):
     labels_arr = pa.DictionaryArray.from_pandas(pd.Series(labels, dtype="category"))
 
     tab = pa.Table.from_arrays([image_arr, labels_arr], names=["image", "label"])
-    pa.dataset.write_dataset(tab, tmp_path / "lance", format=LanceFileFormat())
+    lance.write_dataset(tab, tmp_path / "lance")
 
     dataset = LanceDataset(tmp_path / "lance", batch_size=4, mode="batch")
     batch = next(iter(dataset))
@@ -78,7 +77,7 @@ def test_data_loader_with_filter(tmp_path: Path):
     split = pa.array(["train", "val"] * 5)
     tab = pa.Table.from_arrays([ids, values, split], names=["id", "value", "split"])
 
-    pa.dataset.write_dataset(tab, tmp_path / "lance", format=LanceFileFormat())
+    lance.write_dataset(tab, tmp_path / "lance")
 
     dataset = LanceDataset(tmp_path / "lance", filter=pc.field("split") == "train")
     for id, value, split in dataset:
@@ -93,7 +92,7 @@ def test_data_loader_projection(tmp_path: Path):
     ids = pa.array(range(10))
     values = pa.array([f"num-{i}" for i in ids])
     tab = pa.Table.from_arrays([ids, values], names=["id", "value"])
-    pa.dataset.write_dataset(tab, tmp_path / "lance", format=LanceFileFormat())
+    lance.write_dataset(tab, tmp_path / "lance")
 
     dataset = LanceDataset(
         tmp_path / "lance", columns=["value"], filter=pc.field("id") >= 5
@@ -106,7 +105,7 @@ def test_filter_resulted_empty_return(tmp_path: Path):
     ids = pa.array(range(10))
     values = pa.array([i.as_py() > 5 for i in ids])
     table = pa.Table.from_arrays([ids, values], names=["id", "bignum"])
-    pa.dataset.write_dataset(table, tmp_path / "lance", format=LanceFileFormat())
+    lance.write_dataset(table, tmp_path / "lance")
 
     dataset = LanceDataset(
         tmp_path / "lance",
@@ -119,3 +118,31 @@ def test_filter_resulted_empty_return(tmp_path: Path):
     assert torch.equal(
         actual_ids, torch.stack([torch.tensor([6, 7]), torch.tensor([8, 9])])
     )
+
+
+def test_multiversioned_data_loader(tmp_path: Path):
+    ids = pa.array(range(10))
+    values = pa.array([f"first-{i}" for i in ids])
+    table = pa.Table.from_arrays([ids, values], names=["id", "value"])
+
+    data_uri = tmp_path / "lance"
+    lance.write_dataset(table, data_uri)
+
+    ids = pa.array(range(10, 20))
+    values = pa.array([f"second-{i}" for i in ids])
+    table = pa.Table.from_arrays([ids, values], names=["id", "value"])
+    lance.write_dataset(table, data_uri, mode="append")
+
+    dataset = LanceDataset(
+        data_uri,
+        columns=["id"],
+        version=1,
+    )
+    assert len(list(iter(dataset))) == 10
+
+    dataset = LanceDataset(
+        data_uri,
+        columns=["id"],
+        version=2,
+    )
+    assert len(list(iter(dataset))) == 20
