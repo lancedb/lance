@@ -135,11 +135,13 @@ uint64_t DatasetVersion::version() const { return version_; }
 
 DatasetVersion& DatasetVersion::operator++() {
   version_++;
+  created_time_ = std::chrono::system_clock::now();
   return *this;
 }
 
-const DatasetVersion DatasetVersion::operator++(int) {
+DatasetVersion DatasetVersion::operator++(int) {
   version_++;
+  created_time_ = std::chrono::system_clock::now();
   return *this;
 }
 
