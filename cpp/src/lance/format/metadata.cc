@@ -73,7 +73,8 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   }
 
   if (row_index < 0 || row_index >= len) {
-    return ::arrow::Status::IndexError(fmt::format("Row index out of range: {} of {}", row_index, len - 1));
+    return ::arrow::Status::IndexError(
+        fmt::format("Row index out of range: {} of {}", row_index, len - 1));
   }
   auto it = std::upper_bound(pb_.batch_offsets().begin(), pb_.batch_offsets().end(), row_index);
   if (it == pb_.batch_offsets().end()) {
@@ -85,19 +86,12 @@ int32_t Metadata::GetBatchLength(int32_t batch_id) const {
   return std::tuple(bound_idx, offset);
 }
 
-::arrow::Result<std::shared_ptr<Manifest>> Metadata::GetManifest(
-    std::shared_ptr<::arrow::io::RandomAccessFile> in) {
-  // TODO: change to read buffer instead of read file again.
-  if (pb_.manifest_position() == 0) {
-    return Status::IOError("Can not find manifest within the file");
-  }
-  return Manifest::Parse(in, pb_.manifest_position());
-}
-
 void Metadata::SetManifestPosition(int64_t position) { pb_.set_manifest_position(position); }
 
 int64_t Metadata::page_table_position() const { return pb_.page_table_position(); }
 
 void Metadata::SetPageTablePosition(int64_t position) { pb_.set_page_table_position(position); }
+
+int64_t Metadata::manifest_position() const { return pb_.manifest_position(); }
 
 }  // namespace lance::format

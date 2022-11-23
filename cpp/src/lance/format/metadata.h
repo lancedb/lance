@@ -67,13 +67,13 @@ class Metadata final {
   /// Get the file position to the page table.
   int64_t page_table_position() const;
 
+  /// Get the file position of the manifest.
+  int64_t manifest_position() const;
+
   /// Set the position of the page table.
   void SetPageTablePosition(int64_t position);
 
   void SetManifestPosition(int64_t position);
-
-  ::arrow::Result<std::shared_ptr<Manifest>> GetManifest(
-      std::shared_ptr<::arrow::io::RandomAccessFile> in);
 
  private:
   pb::Metadata pb_;
