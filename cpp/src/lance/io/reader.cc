@@ -132,7 +132,8 @@ Status FileReader::Open() {
 
   if (!manifest_) {
     /// Multiple files can share the manifest.
-    ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+    ARROW_ASSIGN_OR_RAISE(manifest_,
+                          format::Manifest::Parse(file_, metadata_->manifest_position()));
     // We need read the dictionary from the same file.
     auto visitor = format::ReadDictionaryVisitor(file_);
     ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest_->schema()));

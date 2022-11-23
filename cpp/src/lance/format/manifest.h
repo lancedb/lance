@@ -22,9 +22,12 @@
 
 #include "lance/arrow/dataset.h"
 #include "lance/format/data_fragment.h"
-#include "lance/format/format.pb.h"
 
 namespace lance::format {
+
+namespace pb {
+class Manifest;
+}
 
 class Schema;
 
@@ -41,7 +44,7 @@ class Manifest final {
   /// Construct a Manifest with the schema.
   ///
   /// \param schema the dataset schema.
-  Manifest(std::shared_ptr<Schema> schema);
+  explicit Manifest(std::shared_ptr<Schema> schema);
 
   /// Construct a Manifest with specific version.
   ///
@@ -62,17 +65,14 @@ class Manifest final {
 
   /// Parse a Manifest from input file at the offset.
   static ::arrow::Result<std::shared_ptr<Manifest>> Parse(
-      std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset);
+      const std::shared_ptr<::arrow::io::RandomAccessFile>& in, int64_t offset);
 
   /// Parse a Manifest from a buffer.
   static ::arrow::Result<std::shared_ptr<Manifest>> Parse(
       const std::shared_ptr<::arrow::Buffer>& buffer);
 
-  /// Write the Manifest to a file.
-  ///
-  /// \param out the output stream to write this Manifest to.
-  /// \return The offset of the manifest.
-  ::arrow::Result<int64_t> Write(std::shared_ptr<::arrow::io::OutputStream> out) const;
+  /// Convert to protobuf.
+  pb::Manifest ToProto() const;
 
   /// Increase the version number and returns the new Manifest.
   ///

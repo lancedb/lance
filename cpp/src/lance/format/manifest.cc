@@ -49,7 +49,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
 }
 
 ::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
-    std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset) {
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in, int64_t offset) {
   ARROW_ASSIGN_OR_RAISE(auto pb, io::ParseProto<pb::Manifest>(in, offset));
   return std::shared_ptr<Manifest>(new Manifest(pb));
 }
@@ -60,7 +60,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   return std::shared_ptr<Manifest>(new Manifest(pb));
 }
 
-::arrow::Result<int64_t> Manifest::Write(std::shared_ptr<::arrow::io::OutputStream> out) const {
+pb::Manifest Manifest::ToProto() const {
   lance::format::pb::Manifest pb;
   for (auto field : schema_->ToProto()) {
     auto pb_field = pb.add_fields();
@@ -74,7 +74,7 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
     auto pb_fragment = pb.add_fragments();
     *pb_fragment = fragment->ToProto();
   }
-  return io::WriteProto(out, pb);
+  return pb;
 }
 
 std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {

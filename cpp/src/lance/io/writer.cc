@@ -58,7 +58,7 @@ namespace {
   return sink->Write(lance::format::kMagic, 4);
 }
 
-}  // namespace internal
+}  // namespace
 
 FileWriter::FileWriter(std::shared_ptr<lance::format::Schema> schema,
                        std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
@@ -81,13 +81,15 @@ FileWriter::~FileWriter() {}
   return ::arrow::Status::OK();
 }
 
-::arrow::Status FileWriter::WriteManifest(const std::shared_ptr<::arrow::io::OutputStream>& destination,
-                                          const lance::format::Manifest& manifest) {
+::arrow::Status FileWriter::WriteManifest(
+    const std::shared_ptr<::arrow::io::OutputStream>& destination,
+    const lance::format::Manifest& manifest) {
   // Write dictionary values first.
   auto visitor = format::WriteDictionaryVisitor(destination);
   ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest.schema()));
 
-  ARROW_ASSIGN_OR_RAISE(auto offset, manifest.Write(destination));
+  auto pb = manifest.ToProto();
+  ARROW_ASSIGN_OR_RAISE(auto offset, WriteProto(destination, pb));
   return ::lance::io::WriteFooter(destination, offset);
 }
 
@@ -204,10 +206,12 @@ FileWriter::~FileWriter() {}
     auto opts = std::dynamic_pointer_cast<lance::arrow::FileWriteOptions>(options_);
   }
   format::Manifest manifest(lance_schema_);
-  ARROW_ASSIGN_OR_RAISE(pos, manifest.Write(destination_));
+  auto pb = manifest.ToProto();
+  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, pb));
   metadata_->SetManifestPosition(pos);
 
-  ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
+  auto metadata_pb = metadata_->ToProto();
+  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, metadata_pb));
   return ::lance::io::WriteFooter(destination_, pos);
 }
 
