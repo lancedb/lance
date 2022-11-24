@@ -90,6 +90,16 @@ ScannerBuilder::ScannerBuilder(std::shared_ptr<::arrow::dataset::Dataset> datase
                               top_names, *scanner->options()->dataset_schema));
     scanner->options()->projection = project_desc.expression;
   }
+
+  if (scanner->options()->fragment_scan_options) {
+    auto fso = std::dynamic_pointer_cast<LanceFragmentScanOptions>(
+        scanner->options()->fragment_scan_options);
+    if (fso->counter && !::arrow::compute::ExpressionHasFieldRefs(scanner->options()->filter)) {
+      /// We need to limit the parallelism for Project to calculate LIMIT / Offset
+      scanner->options()->batch_size = fso->counter->limit();
+      scanner->options()->batch_readahead = 1;
+    }
+  }
   return scanner;
 }
 
