@@ -55,7 +55,7 @@ target_link_libraries(
         oxford_pet
         lance
         lance_benchmark
-        Catch2::Catch2
+        argparse
 )
 target_include_directories(point_query SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
 

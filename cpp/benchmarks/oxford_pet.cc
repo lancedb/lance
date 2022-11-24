@@ -13,49 +13,54 @@
 //  limitations under the License.
 
 #include <arrow/compute/api.h>
-#include <arrow/filesystem/api.h>
+#include <fmt/chrono.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
-#include <catch2/benchmark/catch_benchmark.hpp>
-#include <catch2/catch_session.hpp>
-#include <catch2/catch_test_macros.hpp>
+#include <argparse/argparse.hpp>
+#include <chrono>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "bench_utils.h"
 #include "lance/arrow/dataset.h"
 #include "lance/arrow/scanner.h"
 
-std::string uri;
-
-TEST_CASE("SELECT image, class FROM ds WHERE class='pug' LIMIT 50 OFFSET 20") {
-  CHECK(!uri.empty());
-  auto fs = std::make_shared<arrow::fs::LocalFileSystem>();
-
-  auto result = lance::arrow::LanceDataset::Make(fs, uri);
-  INFO(result.status().message());
+// we don't use catch2 Benchmark, as it adds heavy noise during profiling.
+void BenchmarkFilterWithLimit(const std::string& uri, int samples = 5) {
   auto dataset = OpenDataset(uri);
-  BENCHMARK("Run query") {
+  std::vector<std::chrono::milliseconds> durations;
+
+  for (int i = 0; i < samples; i++) {
+    auto start = std::chrono::system_clock::now();
     auto builder = lance::arrow::ScannerBuilder(dataset);
-    CHECK(builder.Project({"image", "class"}).ok());
-    CHECK(builder
-              .Filter(::arrow::compute::equal(::arrow::compute::field_ref("class"),
-                                              ::arrow::compute::literal("pug")))
-              .ok());
-    CHECK(builder.Limit(20, 50).ok());
+    assert(builder.Project({"image", "class"}).ok());
+    assert(builder
+               .Filter(::arrow::compute::equal(::arrow::compute::field_ref("class"),
+                                               ::arrow::compute::literal("pug")))
+               .ok());
+    assert(builder.Limit(20, 50).ok());
     auto scanner = builder.Finish().ValueOrDie();
     auto table = scanner->ToTable().ValueOrDie();
-  };
+    durations.emplace_back(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start));
+  }
+  fmt::print("Times: {}\n", durations);
 }
 
 int main(int argc, char** argv) {
-  Catch::Session session;
-  using namespace Catch::Clara;
+  argparse::ArgumentParser parser(argv[0]);
+  parser.add_argument("uri").help("Dataset URI");
 
-  auto cli = session.cli() | Opt(uri, "uri")["--uri"]("Input file URI");
-  session.cli(cli);
-
-  int ret = session.applyCommandLine(argc, argv);
-  if (ret != 0) {
-    return ret;
+  try {
+    parser.parse_args(argc, argv);
+  } catch (const std::runtime_error& err) {
+    std::cerr << err.what() << std::endl;
+    std::cerr << parser;
+    std::exit(1);
   }
-  return session.run();
+
+  BenchmarkFilterWithLimit(parser.get("uri"));
+  return 0;
 }
