@@ -84,9 +84,6 @@ TEST_CASE("Build Scanner with nested struct") {
   INFO("Actual schema: " << scanner->options()->projected_schema->ToString());
   CHECK(expected_proj_schema->Equals(scanner->options()->projected_schema));
 
-  CHECK(scanner->options()->batch_size == 10);
-  CHECK(scanner->options()->batch_readahead == 1);
-
   fmt::print("Scanner Options: {}\n", scanner->options()->filter.ToString());
 }
 
