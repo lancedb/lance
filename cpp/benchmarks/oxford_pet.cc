@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include <algorithm>
 #include <argparse/argparse.hpp>
 #include <chrono>
 #include <memory>
@@ -45,7 +46,8 @@ void BenchmarkFilterWithLimit(const std::string& uri, const std::string& cls, in
     durations.emplace_back(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now() - start));
   }
-  fmt::print("Times: {}\n", durations);
+  fmt::print("Avg time: {}\n", std::reduce(durations.begin(), durations.end()) / durations.size());
+//  fmt::print("Times: {}\n", durations);
 }
 
 int main(int argc, char** argv) {
@@ -65,7 +67,6 @@ int main(int argc, char** argv) {
     std::exit(1);
   }
 
-  BenchmarkFilterWithLimit(parser.get("uri"), parser.get("class"),
-                           parser.get<int>("iteration"));
+  BenchmarkFilterWithLimit(parser.get("uri"), parser.get("class"), parser.get<int>("iteration"));
   return 0;
 }

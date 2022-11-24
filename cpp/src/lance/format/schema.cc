@@ -191,7 +191,6 @@ const std::shared_ptr<::arrow::Array>& Field::dictionary() const { return dictio
 }
 
 ::arrow::Status Field::LoadDictionary(std::shared_ptr<::arrow::io::RandomAccessFile> infile) {
-  fmt::print("Load dictionary: field name={}\n", name_);
   auto data_type = storage_type();
   assert(::arrow::is_dictionary(data_type->storage_id()));
   auto dict_type = std::dynamic_pointer_cast<::arrow::DictionaryType>(data_type);
