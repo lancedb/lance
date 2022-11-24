@@ -30,12 +30,15 @@ namespace fs = std::filesystem;
 /// Convert a Parquet file to lance file.
 arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) {
   auto uri = in_uri;
+  std::string path;
+  auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
+
   auto dataset = OpenDataset(in_uri, "parquet");
   auto scan_builder = dataset->NewScan().ValueOrDie();
   auto scanner = scan_builder->Finish().ValueOrDie();
   auto table = scanner->ToTable().ValueOrDie();
 
-  auto outfile = dataset->filesystem()->OpenOutputStream(out).ValueOrDie();
+  auto outfile = fs->OpenOutputStream(out).ValueOrDie();
   return lance::arrow::WriteTable(*table, outfile);
 }
 

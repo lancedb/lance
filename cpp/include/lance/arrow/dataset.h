@@ -60,9 +60,6 @@ class DatasetVersion {
   std::chrono::time_point<std::chrono::system_clock> created_time_;
 };
 
-// using Updater = std::function<::arrow::Result<std::shared_ptr<::arrow::Array>>(
-//     const std::shared_ptr<::arrow::RecordBatch>& batch)>;
-
 /// Lance Dataset, supports versioning and schema evolution.
 ///
 class LanceDataset : public ::arrow::dataset::Dataset {

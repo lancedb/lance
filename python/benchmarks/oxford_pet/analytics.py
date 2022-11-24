@@ -15,7 +15,7 @@ from lance.io import download_uris
 sys.path.append("..")
 
 from suite import BenchmarkSuite, get_dataset, get_uri
-from datagen import OxfordPetConverter
+from lance.data.convert.oxford_pet import OxfordPetConverter
 
 import lance
 
