@@ -57,7 +57,7 @@ target_link_libraries(
         lance_benchmark
         argparse
 )
-target_include_directories(point_query SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
+target_include_directories(oxford_pet SYSTEM PRIVATE ${PARQUET_INCLUDE_DIR} ${ARROW_INCLUDE_DIR})
 
 add_executable(scan scan.cc)
 target_link_libraries(
