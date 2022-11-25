@@ -20,6 +20,7 @@
 #include <iostream>
 #include <string>
 
+#include "lance/arrow/dataset.h"
 #include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/reader.h"
@@ -28,18 +29,15 @@ using std::string;
 
 void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
 
-::arrow::Status PrintSchema(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
-  auto files = dataset->files();
-  auto infile = dataset->filesystem()->OpenInputFile(files[0]).ValueOrDie();
-  auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
-  auto schema = reader->schema();
+::arrow::Status PrintSchema(const std::shared_ptr<lance::arrow::LanceDataset>& dataset) {
   PrintLine();
-  fmt::print("Schema:\n", schema);
-  lance::format::Print(schema);
+  auto schema = dataset->schema();
+  fmt::print("Schema:\n");
+  lance::format::Print(*schema);
   return ::arrow::Status::OK();
 }
 
-::arrow::Status PrintSummary(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
+::arrow::Status PrintSummary(const std::shared_ptr<lance::arrow::LanceDataset>& dataset) {
   assert(dataset);
   PrintLine();
   fmt::print("Summary: \n");

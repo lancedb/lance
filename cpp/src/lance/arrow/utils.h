@@ -26,6 +26,8 @@
 
 namespace lance::arrow {
 
+class LanceDataset;
+
 /// Merge two same-length record batches into one.
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> MergeRecordBatches(
     const std::shared_ptr<::arrow::RecordBatch>& lhs,
@@ -52,8 +54,7 @@ namespace lance::arrow {
                                                               const ::arrow::Schema& rhs);
 
 /// Open Lance dataset from URI.
-::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
-    const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning = nullptr);
+::arrow::Result<std::shared_ptr<LanceDataset>> OpenDataset(const std::string& uri);
 
 /// Create an array from a scalar value.
 ///
