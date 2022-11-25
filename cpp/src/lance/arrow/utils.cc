@@ -31,7 +31,6 @@
 #include <string>
 #include <vector>
 
-#include "lance/arrow/dataset.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
 
@@ -253,10 +252,25 @@ template <VarLenListType L>
   return ::arrow::schema(merged_fields);
 }
 
-::arrow::Result<std::shared_ptr<LanceDataset>> OpenDataset(const std::string& uri) {
+::arrow::Result<std::shared_ptr<::arrow::dataset::FileSystemDataset>> OpenDataset(
+    const std::string& uri, std::shared_ptr<::arrow::dataset::Partitioning> partitioning) {
   std::string path;
   ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
-  return LanceDataset::Make(fs, path);
+  ::arrow::fs::FileSelector selector;
+  selector.base_dir = path;
+  selector.recursive = true;
+  selector.allow_not_found = true;
+  auto format = lance::arrow::LanceFileFormat::Make();
+
+  auto options = ::arrow::dataset::FileSystemFactoryOptions();
+  if (partitioning) {
+    options.partitioning = partitioning;
+  }
+  ARROW_ASSIGN_OR_RAISE(
+      auto factory,
+      ::arrow::dataset::FileSystemDatasetFactory::Make(fs, selector, format, options));
+  ARROW_ASSIGN_OR_RAISE(auto dataset, factory->Finish());
+  return std::dynamic_pointer_cast<::arrow::dataset::FileSystemDataset>(dataset);
 }
 
 template <typename ArrayType>
