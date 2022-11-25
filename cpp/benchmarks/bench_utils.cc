@@ -84,7 +84,7 @@ std::shared_ptr<::arrow::io::RandomAccessFile> OpenUri(const std::string& uri, b
 
 /// Open Dataset from the URI.
 std::shared_ptr<::arrow::dataset::Dataset> OpenDataset(const std::string& uri,
-                                                                 const std::string& format) {
+                                                       const std::string& format) {
   std::string path;
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
   std::shared_ptr<arrow::dataset::FileFormat> file_format;
