@@ -219,11 +219,11 @@ class DatasetConverter(ABC):
                     }
                 elif f == 'parquet':
                     kwargs = {
-                        'row_group_size': group_size,
+                        'max_rows_per_group': group_size,
                     }
                 else:
                     raise TypeError(f"Format {f} not supported")
                 table = converter.to_table(df, to_image=embedded)
-                return converter.write_dataset(table, f, output_path, **kwargs)
+                return converter.write_dataset(table, output_path, f, **kwargs)
 
         return main
