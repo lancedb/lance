@@ -39,7 +39,7 @@ def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
     uri = get_uri(base_uri, "oxford_pet", fmt, flavor)
     if fmt == "parquet":
         ds = get_dataset(uri)
-        query = "SELECT image, class FROM ds WHERE class='pug' " "LIMIT 50 OFFSET 20"
+        query = "SELECT image, class FROM ds WHERE class='pug' LIMIT 50 OFFSET 20"
         return duckdb.query(query).to_arrow_table()
     elif fmt == "lance":
         scanner = lance.dataset(uri).scanner(
