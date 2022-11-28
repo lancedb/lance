@@ -78,6 +78,10 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   ::arrow::Result<::arrow::RecordBatchGenerator> ScanBatchesAsync(
       const std::shared_ptr<::arrow::dataset::ScanOptions>& options) override;
 
+  ::arrow::Future<std::optional<int64_t>> CountRows(
+      ::arrow::compute::Expression predicate,
+      const std::shared_ptr<::arrow::dataset::ScanOptions>& options) override;
+
   std::string type_name() const override { return "lance"; }
 
   /// Open Data files that contains the columns in the schema.
@@ -91,12 +95,14 @@ class LanceFragment : public ::arrow::dataset::Fragment {
   /// Access the data fragment (POD).
   const std::shared_ptr<lance::format::DataFragment>& data_fragment() const;
 
+  ::arrow::Result<int32_t> num_batches() const;
+
  protected:
   ::arrow::Result<std::shared_ptr<::arrow::Schema>> ReadPhysicalSchemaImpl() override;
 
  private:
   /// Fast path `CountRow()`, it only reads the metadata of one data file.
-  ::arrow::Result<int64_t> FastCountRow() const;
+  ::arrow::Result<std::optional<int64_t>> FastCountRows() const;
 
   /// Open file reader on a data file.
   ///

@@ -13,13 +13,17 @@
 //  limitations under the License.
 
 #include <arrow/dataset/api.h>
+#include <arrow/status.h>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include <argparse/argparse.hpp>
 #include <iostream>
+#include <optional>
 #include <string>
 
+#include "lance/arrow/dataset.h"
+#include "lance/arrow/fragment.h"
 #include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
 #include "lance/io/reader.h"
@@ -28,29 +32,39 @@ using std::string;
 
 void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
 
-::arrow::Status PrintSchema(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
-  auto files = dataset->files();
-  auto infile = dataset->filesystem()->OpenInputFile(files[0]).ValueOrDie();
-  auto reader = lance::io::FileReader::Make(infile).ValueOrDie();
-  auto schema = reader->schema();
+::arrow::Status PrintSchema(const std::shared_ptr<lance::arrow::LanceDataset>& dataset) {
   PrintLine();
-  fmt::print("Schema:\n", schema);
-  lance::format::Print(schema);
+  ARROW_ASSIGN_OR_RAISE(auto fragments, dataset->GetFragments());
+  ARROW_ASSIGN_OR_RAISE(auto first, fragments.Next());
+  assert(first != nullptr);
+  auto fragment = std::dynamic_pointer_cast<lance::arrow::LanceFragment>(first);
+  auto schema = fragment->schema();
+  fmt::print("Schema:\n");
+  lance::format::Print(*schema);
   return ::arrow::Status::OK();
 }
 
-::arrow::Status PrintSummary(const std::shared_ptr<::arrow::dataset::FileSystemDataset>& dataset) {
+::arrow::Status PrintSummary(const std::shared_ptr<lance::arrow::LanceDataset>& dataset) {
   assert(dataset);
   PrintLine();
   fmt::print("Summary: \n");
   int num_batches = 0;
   int total = 0;
-  for (auto file : dataset->files()) {
-    ARROW_ASSIGN_OR_RAISE(auto infile, dataset->filesystem()->OpenInputFile(file));
-    ARROW_ASSIGN_OR_RAISE(auto reader, lance::io::FileReader::Make(infile));
-    num_batches += reader->num_batches();
-    total += reader->length();
+  auto scanner = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie();
+  ARROW_ASSIGN_OR_RAISE(auto fragment_iter, dataset->GetFragments());
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto fragment, fragment_iter.Next());
+    if (!fragment) {
+      break;
+    }
+    auto lfragment = std::dynamic_pointer_cast<lance::arrow::LanceFragment>(fragment);
+    ARROW_ASSIGN_OR_RAISE(int32_t batches, lfragment->num_batches());
+    num_batches += batches;
+    auto fut = lfragment->CountRows(::arrow::compute::literal(true), scanner->options());
+    ARROW_ASSIGN_OR_RAISE(auto cnt, fut.result());
+    total += cnt.value_or(0);
   }
+  fmt::print("  Number of versions: {}\n", dataset->versions().ValueOrDie().size());
   fmt::print("  Total records: {}\n", total);
   fmt::print("  Number of batches: {}\n", num_batches);
   fmt::print("  Mean batch size: {}\n", total / num_batches + 1);
@@ -59,8 +73,14 @@ void PrintLine(int width = 40) { fmt::print("{:-^{}}\n", "", width); }
 
 ::arrow::Status inspect(const argparse::ArgumentParser& args) {
   auto uri = args.get<string>("uri");
+  std::optional<uint64_t> version;
+  if (args.is_used("--dataset-version")) {
+    version = args.get<uint64_t>("--dataset-version");
+  }
+  std::string path;
+  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
   fmt::print("Inspecting dataset: {}\n", uri);
-  ARROW_ASSIGN_OR_RAISE(auto dataset, lance::arrow::OpenDataset(uri));
+  ARROW_ASSIGN_OR_RAISE(auto dataset, lance::arrow::LanceDataset::Make(fs, path, version));
   ARROW_RETURN_NOT_OK(PrintSummary(dataset));
   ARROW_RETURN_NOT_OK(PrintSchema(dataset));
 
@@ -74,6 +94,7 @@ int main(int argc, char** argv) {
   argparse::ArgumentParser inspect_parser("inspect");
   inspect_parser.add_description("Inspect dataset");
   inspect_parser.add_argument("uri").help("Dataset URI").required();
+  inspect_parser.add_argument("-V", "--dataset-version").help("specify the version");
   parser.add_subparser(inspect_parser);
 
   try {

@@ -67,6 +67,24 @@ LanceFragment::LanceFragment(const LanceFragment& other)
   return ::arrow::RecordBatchGenerator(std::move(batch_reader));
 }
 
+::arrow::Future<std::optional<int64_t>> LanceFragment::CountRows(
+    ::arrow::compute::Expression predicate,
+    const std::shared_ptr<::arrow::dataset::ScanOptions>& options) {
+  if (!::arrow::compute::ExpressionHasFieldRefs(predicate)) {
+    auto result = options->io_context.executor()->Submit(
+        [=](auto fragment) -> ::arrow::Result<std::optional<int64_t>> {
+          return fragment->FastCountRows();
+        },
+        this);
+    if (!result.ok()) {
+      return result.status();
+    }
+    return result.ValueOrDie();
+  }
+  // Fallback to default method
+  return ::arrow::dataset::Fragment::CountRows(predicate, options);
+}
+
 ::arrow::Result<std::shared_ptr<::arrow::Schema>> LanceFragment::ReadPhysicalSchemaImpl() {
   return schema()->ToArrow();
 }
@@ -115,7 +133,13 @@ const std::shared_ptr<lance::format::DataFragment>& LanceFragment::data_fragment
   return fragment_;
 }
 
-::arrow::Result<int64_t> LanceFragment::FastCountRow() const {
+::arrow::Result<int32_t> LanceFragment::num_batches() const {
+  assert(!fragment_->data_files().empty());
+  ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(0));
+  return reader->num_batches();
+}
+
+::arrow::Result<std::optional<int64_t>> LanceFragment::FastCountRows() const {
   assert(!fragment_->data_files().empty());
   ARROW_ASSIGN_OR_RAISE(auto reader, OpenReader(0));
   return reader->length();
