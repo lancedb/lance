@@ -167,7 +167,6 @@ def test_iterate_dataset_several_times(tmp_path: Path):
     dataset = LanceDataset(
         data_uri,
         columns=["image"],
-        version=1,
     )
     images_tensor = list(iter(dataset))
     assert(len(images_tensor) == 50)
