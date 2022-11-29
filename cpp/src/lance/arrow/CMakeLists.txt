@@ -24,6 +24,8 @@ add_library(
         file_lance_ext.h
         fragment.cc
         fragment.h
+        hash_merger.cc
+        hash_merger.h
         scanner.cc
         stl.h
         type.cc

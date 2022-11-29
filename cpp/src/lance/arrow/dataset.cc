@@ -33,6 +33,7 @@
 #include "lance/arrow/dataset_ext.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/hash_merger.h"
 #include "lance/arrow/updater.h"
 #include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
@@ -433,47 +434,26 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
   }
 
   // First phase, build hash table (in memory for simplicity)
-  ::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> map_build_result;
-
-#define BUILD_CHUNK_IDX(TypeId)                                                          \
-  case TypeId:                                                                           \
-    map_build_result =                                                                   \
-        BuildHashChunkIndex<typename ::arrow::TypeIdTraits<TypeId>::Type>(right_column); \
-    break;
-
-  switch (right_type->id()) {
-    BUILD_CHUNK_IDX(::arrow::Type::UINT8);
-    BUILD_CHUNK_IDX(::arrow::Type::INT8);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT16);
-    BUILD_CHUNK_IDX(::arrow::Type::INT16);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT32);
-    BUILD_CHUNK_IDX(::arrow::Type::INT32);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT64);
-    BUILD_CHUNK_IDX(::arrow::Type::INT64);
-    //    BUILD_CHUNK_IDX(::arrow::Type::HALF_FLOAT);
-    BUILD_CHUNK_IDX(::arrow::Type::FLOAT);
-    BUILD_CHUNK_IDX(::arrow::Type::DOUBLE);
-    case ::arrow::Type::STRING:
-      map_build_result = BuildHashChunkIndex<::arrow::StringType, std::string_view>(right_column);
-      break;
-    default:
-      return ::arrow::Status::Invalid("Only support primitive or string type, got: ",
-                                      right_type->ToString());
-  }
-
-#undef BUILD_CHUNK_IDX
-
-  if (!map_build_result.ok()) {
-    return map_build_result.status();
-  }
-  auto hash_map = map_build_result.ValueUnsafe();
+  auto merger = HashMerger();
+  ARROW_RETURN_NOT_OK(merger.Build(other, on));
 
   // Second phase
   auto table_schema = other.schema();
   ARROW_ASSIGN_OR_RAISE(auto merged_schema,
                         table_schema->RemoveField(table_schema->GetFieldIndex(on)));
   ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(merged_schema)));
+  update_builder->Project({on});
+  ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
 
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
+    if (!batch) {
+      break;
+    }
+    assert(batch->schema()->Equals(::arrow::schema({left_column})));
+    auto index_arr = batch->GetColumnByName(on);
+    ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
+  }
   return ::arrow::Result<std::shared_ptr<LanceDataset>>();
 }
 
