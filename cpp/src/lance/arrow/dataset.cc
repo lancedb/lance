@@ -18,12 +18,16 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
+#include <arrow/type_traits.h>
 #include <fmt/format.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
 #include <range/v3/all.hpp>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "lance/arrow/dataset_ext.h"
@@ -313,8 +317,12 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
 
 ::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
     const std::shared_ptr<::arrow::Field>& new_field) const {
-  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this),
-                                          std::move(new_field));
+  return NewUpdate(::arrow::schema({new_field}));
+}
+
+::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Schema>& new_columns) const {
+  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this), new_columns);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
@@ -382,8 +390,30 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   return ::arrow::MakeVectorIterator(fragments);
 }
 
+/// Build index map: key => {chunk_id, idx_in_chunk}.
+///
+template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<ArrowType>::CType>
+::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> BuildHashChunkIndex(
+    const std::shared_ptr<::arrow::ChunkedArray>& chunked_arr) {
+  std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>> key_to_chunk_index;
+  for (int64_t chk = 0; chk < chunked_arr->num_chunks(); chk++) {
+    auto arr = std::dynamic_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(
+        chunked_arr->chunk(chk));
+    for (int64_t idx = 0; idx < arr->length(); idx++) {
+      auto value = arr->Value(idx);
+      auto key = std::hash<CType>{}(value);
+      auto ret = key_to_chunk_index.emplace(key, std::make_tuple(chk, idx));
+      if (!ret.second) {
+        return ::arrow::Status::IndexError("Duplicated key found: ", value);
+      }
+    }
+  }
+  return std::move(key_to_chunk_index);
+}
+
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(const ::arrow::Table& other,
                                                                         const std::string& on) {
+  /// Sanity checks
   auto left_column = schema_->GetFieldByName(on);
   if (left_column == nullptr) {
     return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the dataset.", on));
@@ -392,12 +422,9 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   if (right_column == nullptr) {
     return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the table.", on));
   }
+
   auto& left_type = left_column->type();
   auto& right_type = right_column->type();
-  if (!::arrow::is_primitive(right_type->id()) && !::arrow::is_string(right_type->id())) {
-    return ::arrow::Status::Invalid("Only support primitive or string column type, got: ",
-                                    right_type->ToString());
-  }
   if (!left_type->Equals(right_type)) {
     return ::arrow::Status::Invalid("LanceDataset::AddColumns: types are not equal: ",
                                     left_type->ToString(),
@@ -405,7 +432,47 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
                                     right_type->ToString());
   }
 
-  // First step, hashing
+  // First phase, build hash table (in memory for simplicity)
+  ::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> map_build_result;
+
+#define BUILD_CHUNK_IDX(TypeId)                                                          \
+  case TypeId:                                                                           \
+    map_build_result =                                                                   \
+        BuildHashChunkIndex<typename ::arrow::TypeIdTraits<TypeId>::Type>(right_column); \
+    break;
+
+  switch (right_type->id()) {
+    BUILD_CHUNK_IDX(::arrow::Type::UINT8);
+    BUILD_CHUNK_IDX(::arrow::Type::INT8);
+    BUILD_CHUNK_IDX(::arrow::Type::UINT16);
+    BUILD_CHUNK_IDX(::arrow::Type::INT16);
+    BUILD_CHUNK_IDX(::arrow::Type::UINT32);
+    BUILD_CHUNK_IDX(::arrow::Type::INT32);
+    BUILD_CHUNK_IDX(::arrow::Type::UINT64);
+    BUILD_CHUNK_IDX(::arrow::Type::INT64);
+    //    BUILD_CHUNK_IDX(::arrow::Type::HALF_FLOAT);
+    BUILD_CHUNK_IDX(::arrow::Type::FLOAT);
+    BUILD_CHUNK_IDX(::arrow::Type::DOUBLE);
+    case ::arrow::Type::STRING:
+      map_build_result = BuildHashChunkIndex<::arrow::StringType, std::string_view>(right_column);
+      break;
+    default:
+      return ::arrow::Status::Invalid("Only support primitive or string type, got: ",
+                                      right_type->ToString());
+  }
+
+#undef BUILD_CHUNK_IDX
+
+  if (!map_build_result.ok()) {
+    return map_build_result.status();
+  }
+  auto hash_map = map_build_result.ValueUnsafe();
+
+  // Second phase
+  auto table_schema = other.schema();
+  ARROW_ASSIGN_OR_RAISE(auto merged_schema,
+                        table_schema->RemoveField(table_schema->GetFieldIndex(on)));
+  ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(merged_schema)));
 
   return ::arrow::Result<std::shared_ptr<LanceDataset>>();
 }

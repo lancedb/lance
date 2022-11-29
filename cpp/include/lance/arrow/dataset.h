@@ -130,6 +130,9 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
       const std::shared_ptr<::arrow::Field>& new_field) const;
 
+  ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
+      const std::shared_ptr<::arrow::Schema>& new_columns) const;
+
   /// Add all columns, except the "on" table, from an in-memory table.
   ///
   /// The algorithm follows the semantic of LEFT JOIN. The difference to LEFT JOIN

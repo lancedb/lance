@@ -27,6 +27,9 @@
 #include <vector>
 
 template <typename T>
+concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
+
+template <typename T>
 concept HasToString = requires(T t) {
                         { t.ToString() } -> std::same_as<std::string>;
                       };

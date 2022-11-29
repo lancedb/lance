@@ -184,9 +184,8 @@ Updater::~Updater() {}
 
 ::arrow::Result<std::shared_ptr<Updater>> Updater::Make(
     std::shared_ptr<LanceDataset> dataset,
-    const std::shared_ptr<::arrow::Field>& field,
+    const std::shared_ptr<::arrow::Schema>& arrow_schema,
     const std::vector<std::string>& projection_columns) {
-  auto arrow_schema = ::arrow::schema({field});
   ARROW_ASSIGN_OR_RAISE(auto full_schema, dataset->impl_->manifest->schema()->Merge(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto column_schema, full_schema->Project(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto fragment_iter, dataset->GetFragments());
@@ -212,15 +211,15 @@ Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ::arrow::Result<std::shared_ptr<LanceDataset>> Updater::Finish() { return impl_->Finish(); }
 
 UpdaterBuilder::UpdaterBuilder(std::shared_ptr<LanceDataset> source,
-                               std::shared_ptr<::arrow::Field> field)
-    : dataset_(std::move(source)), field_(std::move(field)) {}
+                               std::shared_ptr<::arrow::Schema> schema)
+    : dataset_(std::move(source)), schema_(std::move(schema)) {}
 
 void UpdaterBuilder::Project(std::vector<std::string> columns) {
   projection_columns_ = std::move(columns);
 }
 
 ::arrow::Result<std::shared_ptr<Updater>> UpdaterBuilder::Finish() {
-  return Updater::Make(dataset_, field_, projection_columns_);
+  return Updater::Make(dataset_, schema_, projection_columns_);
 }
 
 }  // namespace lance::arrow
