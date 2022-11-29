@@ -94,7 +94,7 @@ class LanceDataset(IterableDataset):
         root: Union[str, Path],
         version: Optional[int] = None,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        batch_size: Optional[int] = None,
+        batch_size: Optional[int] = 64,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
         mode: str = "record",
