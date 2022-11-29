@@ -130,6 +130,20 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
       const std::shared_ptr<::arrow::Field>& new_field) const;
 
+  /// Add all columns, except the "on" table, from an in-memory table.
+  ///
+  /// The algorithm follows the semantic of LEFT JOIN. The difference to LEFT JOIN
+  /// is that this function does not allow one row on the left ("this" dataset)
+  /// maps to two distinct rows on the right ("other").
+  /// However, if a matched row on the right side does not exist, it allows to fill NULL.
+  ///
+  /// \param other the table to merge with this dataset.
+  /// \param on the column to be compared to.
+  ///           This column must exist in both side and have the same data type..
+  /// \return `::arrow::Status::OK` if success.
+  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumns(const ::arrow::Table& other,
+                                                            const std::string& on);
+
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
 

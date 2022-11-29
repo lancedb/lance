@@ -382,4 +382,32 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   return ::arrow::MakeVectorIterator(fragments);
 }
 
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(const ::arrow::Table& other,
+                                                                        const std::string& on) {
+  auto left_column = schema_->GetFieldByName(on);
+  if (left_column == nullptr) {
+    return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the dataset.", on));
+  }
+  auto right_column = other.GetColumnByName(on);
+  if (right_column == nullptr) {
+    return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the table.", on));
+  }
+  auto& left_type = left_column->type();
+  auto& right_type = right_column->type();
+  if (!::arrow::is_primitive(right_type->id()) && !::arrow::is_string(right_type->id())) {
+    return ::arrow::Status::Invalid("Only support primitive or string column type, got: ",
+                                    right_type->ToString());
+  }
+  if (!left_type->Equals(right_type)) {
+    return ::arrow::Status::Invalid("LanceDataset::AddColumns: types are not equal: ",
+                                    left_type->ToString(),
+                                    " != ",
+                                    right_type->ToString());
+  }
+
+  // First step, hashing
+
+  return ::arrow::Result<std::shared_ptr<LanceDataset>>();
+}
+
 }  // namespace lance::arrow
