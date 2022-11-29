@@ -30,19 +30,27 @@
 
 namespace lance::arrow {
 
+/// A basic implementation of in-memory hash (join) merge.
 class HashMerger {
  public:
-  HashMerger() = default;
+  HashMerger() = delete;
 
-  /// Build a hash map on column specified by "col_name".
-  ::arrow::Status Build(const ::arrow::Table& table, const std::string& col_name);
+  explicit HashMerger(const ::arrow::Table& table,
+                      std::string index_column,
+                      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
+  /// Build a hash map on column specified by "column".
+  ::arrow::Status Build();
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Collect(
       const std::shared_ptr<::arrow::Array>& on_col);
 
  private:
+  const ::arrow::Table& table_;
+  std::string column_name_;
   std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>> index_map_;
   std::shared_ptr<::arrow::DataType> index_column_type_;
+  ::arrow::MemoryPool* pool_;
 };
 
 }  // namespace lance::arrow

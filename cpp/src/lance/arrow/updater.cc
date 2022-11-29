@@ -61,11 +61,13 @@ class Updater::Impl {
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Next();
 
-  ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::Array>& arr);
+  ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::RecordBatch>& batch);
 
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
  private:
+  friend class Updater;
+
   auto data_dir() const { return dataset_->impl_->data_dir(); }
 
   const auto& fs() const { return dataset_->impl_->fs; }
@@ -149,22 +151,21 @@ class Updater::Impl {
   return last_batch_;
 }
 
-::arrow::Status Updater::Impl::UpdateBatch(const std::shared_ptr<::arrow::Array>& arr) {
+::arrow::Status Updater::Impl::UpdateBatch(const std::shared_ptr<::arrow::RecordBatch>& batch) {
   // Sanity checks.
   if (!last_batch_) {
     return ::arrow::Status::IOError(
         "Did not read batch before update, did you call Updater::Next() before?");
   }
-  if (last_batch_->num_rows() != arr->length()) {
+  if (last_batch_->num_rows() != batch->num_rows()) {
     return ::arrow::Status::IOError(
         fmt::format("Updater::Update: input size({}) != output size({})",
                     last_batch_->num_rows(),
-                    arr->length()));
+                    batch->num_rows()));
   }
 
   assert(writer_);
   last_batch_.reset();
-  auto batch = ::arrow::RecordBatch::Make(column_schema_->ToArrow(), arr->length(), {arr});
   return writer_->Write(batch);
 }
 
@@ -203,7 +204,12 @@ Updater::~Updater() {}
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Updater::Next() { return impl_->Next(); }
 
 ::arrow::Status Updater::UpdateBatch(const std::shared_ptr<::arrow::Array>& arr) {
-  return impl_->UpdateBatch(arr);
+  auto batch = ::arrow::RecordBatch::Make(impl_->column_schema_->ToArrow(), arr->length(), {arr});
+  return UpdateBatch(batch);
+}
+
+::arrow::Status Updater::UpdateBatch(const std::shared_ptr<::arrow::RecordBatch>& batch) {
+  return impl_->UpdateBatch(batch);
 }
 
 Updater::Updater(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

@@ -18,6 +18,13 @@
 
 namespace lance::arrow {
 
+HashMerger::HashMerger(const ::arrow::Table& table,
+                       std::string index_column,
+                       ::arrow::MemoryPool* pool)
+    : table_(table), column_name_(std::move(index_column)), pool_(pool) {}
+
+namespace {
+
 /// Build index map: key => {chunk_id, idx_in_chunk}.
 ///
 template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<ArrowType>::CType>
@@ -39,8 +46,10 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
   return std::move(key_to_chunk_index);
 }
 
-::arrow::Status HashMerger::Build(const ::arrow::Table& table, const std::string& col_name) {
-  auto chunked_arr = table.GetColumnByName(col_name);
+}  // namespace
+
+::arrow::Status HashMerger::Build() {
+  auto chunked_arr = table_.GetColumnByName(column_name_);
   index_column_type_ = chunked_arr->type();
 
   ::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> result;
@@ -83,7 +92,13 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
     return ::arrow::Status::TypeError(
         "Index column match mismatch: ", on_col->type()->ToString(), " != ", index_column_type_);
   }
-  return ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>>();
+  for (int i = 0; i < table_.num_columns(); i++) {
+    auto field = table_.field(i);
+    if (field->name() == column_name_) {
+      continue;
+    }
+  }
+  return ::arrow::Status::NotImplemented("not impl");
 }
 
 }  // namespace lance::arrow

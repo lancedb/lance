@@ -144,8 +144,10 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param on the column to be compared to.
   ///           This column must exist in both side and have the same data type..
   /// \return `::arrow::Status::OK` if success.
-  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumns(const ::arrow::Table& other,
-                                                            const std::string& on);
+  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumns(
+      const ::arrow::Table& other,
+      const std::string& on,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;

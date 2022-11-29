@@ -413,7 +413,8 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(const ::arrow::Table& other,
-                                                                        const std::string& on) {
+                                                                        const std::string& on,
+                                                                        ::arrow::MemoryPool* pool) {
   /// Sanity checks
   auto left_column = schema_->GetFieldByName(on);
   if (left_column == nullptr) {
@@ -434,8 +435,8 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
   }
 
   // First phase, build hash table (in memory for simplicity)
-  auto merger = HashMerger();
-  ARROW_RETURN_NOT_OK(merger.Build(other, on));
+  auto merger = HashMerger(other, on, pool);
+  ARROW_RETURN_NOT_OK(merger.Build());
 
   // Second phase
   auto table_schema = other.schema();
@@ -453,6 +454,7 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
     assert(batch->schema()->Equals(::arrow::schema({left_column})));
     auto index_arr = batch->GetColumnByName(on);
     ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
+    ARROW_RETURN_NOT_OK(updater->UpdateBatch(right_batch));
   }
   return ::arrow::Result<std::shared_ptr<LanceDataset>>();
 }
