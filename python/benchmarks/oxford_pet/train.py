@@ -98,7 +98,7 @@ def train(
 
     print(f"Running benchmark: {benchmark}")
     if data_format == "lance":
-        dataset = lance.pytorch.data.LanceDataset(
+        dataset = lance.pytorch.Dataset(
             dataset,
             columns=["image", "class"],
             batch_size=batch_size,

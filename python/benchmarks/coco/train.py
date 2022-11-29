@@ -107,7 +107,7 @@ def train(
     benchmark: str,
 ):
     if data_format == "lance":
-        dataset = lance.pytorch.data.LanceDataset(
+        dataset = lance.pytorch.data.Dataset(
             uri,
             columns=["image", "annotations.category_id", "annotations.bbox"],
             batch_size=2,

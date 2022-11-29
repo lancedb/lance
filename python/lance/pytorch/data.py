@@ -35,7 +35,7 @@ import lance
 from lance import dataset
 from lance.types import Image, is_image_type
 
-__all__ = ["LanceDataset"]
+__all__ = ["Dataset"]
 
 
 def _data_to_tensor(data: Any) -> Union[torch.Tensor, PIL.Image.Image]:
@@ -82,7 +82,7 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
         return torch.from_numpy(np_arr)
 
 
-class LanceDataset(IterableDataset):
+class Dataset(IterableDataset):
     """An PyTorch IterableDataset.
 
     See:

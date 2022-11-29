@@ -48,7 +48,7 @@ def gen_embeddings(checkpoint, dataset, output, batch_size, num_workers, data_fo
     model = Classification.load_from_checkpoint(checkpoint)
 
     if data_format == "lance":
-        dataset = lance.pytorch.data.LanceDataset(
+        dataset = lance.pytorch.Dataset(
             dataset,
             columns=["image", "filename"],
             batch_size=batch_size,
