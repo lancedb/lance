@@ -140,6 +140,12 @@ class LanceDataset(IterableDataset):
     def __repr__(self):
         return f"LanceDataset(root={self.root})"
 
+    @property
+    def schema(self) -> pa.Schema:
+        """Dataset Schema"""
+        self._setup_dataset()
+        return self._dataset.schema
+
     def _setup_dataset(self):
         """Lazy loading dataset in different process."""
         if not self._dataset:
