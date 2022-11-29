@@ -146,3 +146,31 @@ def test_multiversioned_data_loader(tmp_path: Path):
         version=2,
     )
     assert len(list(iter(dataset))) == 20
+
+
+def test_iterate_dataset_several_times(tmp_path: Path):
+    images = []
+    labels = []
+    for i in range(50):
+        images.append(
+            ImageBinary.from_numpy(
+                np.random.randint(0, 256, size=(32, 32), dtype=np.uint8)
+            )
+        )
+        labels.append(["cat", "dog", "goat"][i % 3])
+    image_arr = ImageArray.from_images(images)
+    table = pa.Table.from_arrays([labels, image_arr], names=["label", "image"])
+
+    data_uri = tmp_path / "test"
+    lance.write_dataset(table, data_uri)
+
+    dataset = LanceDataset(
+        data_uri,
+        columns=["image"],
+        version=1,
+    )
+    images_tensor = list(iter(dataset))
+    assert(len(images_tensor) == 50)
+
+    images_tensor = list(iter(dataset))
+    assert(len(images_tensor) == 50)

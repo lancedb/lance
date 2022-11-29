@@ -142,18 +142,19 @@ class LanceDataset(IterableDataset):
 
     def _setup_dataset(self):
         """Lazy loading dataset in different process."""
-        if self._fragments:
-            return self._fragments
+        if not self._dataset:
+            self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
+            self._dataset = lance.dataset(self.root, self.version)
 
-        self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
-        self._fragments = lance.dataset(self.root, self.version).get_fragments()
+        self._fragments = self._dataset.get_fragments()
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
             # Split the fragments into each worker.
             rank = worker_info.id
             num_workers = worker_info.num_workers
             self._fragments = [
-                self._fragments[i] for i in range(rank, len(self._fragments), num_workers)
+                self._fragments[i]
+                for i in range(rank, len(self._fragments), num_workers)
             ]
 
     def __iter__(self):
