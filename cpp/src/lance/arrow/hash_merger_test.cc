@@ -61,7 +61,8 @@ void TestBuildHashMap() {
   CHECK(merger.Init().ok());
 
   auto pk_arr =
-      lance::arrow::ToArray<typename ::arrow::TypeTraits<T>::CType>({0, 3, 5, 10, 20}).ValueOrDie();
+      lance::arrow::ToArray<typename ::arrow::TypeTraits<T>::CType>({10, 20, 0, 5, 200, 32, 88})
+          .ValueOrDie();
   auto result_batch = merger.Collect(pk_arr).ValueOrDie();
   fmt::print("Result: {}\n", result_batch->ToString());
 }
