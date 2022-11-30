@@ -67,6 +67,8 @@ class Updater {
   /// The array must has the same length as the batch returned previously via `Next()`.
   ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::Array>& arr);
 
+  /// Update the values to new values, presented in a `RecordBatch`.
+  /// The batch must has the same length as the batch returned previously via `Next()`.
   ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::RecordBatch>& batch);
 
   /// Finish the update and returns a new version of dataset.

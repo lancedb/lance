@@ -140,10 +140,31 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// on the left ("this" dataset) maps to two distinct rows on the right ("other").
   /// However, if it can not find a matched row on the right side, a NULL value is provided.
   ///
+  /// For example,
+  ///
+  /// \code
+  /// dataset (left) = {
+  ///   "id": [1, 2, 3, 4],
+  ///   "vals": ["a", "b", "c", "d"],
+  /// }
+  /// table (right) = {
+  ///   "id": [5, 1, 10, 3, 8],
+  ///   "attrs": [5.0, 1.0, 10.0, 3.0, 8.0],
+  /// }
+  ///
+  /// dataset.AddColumn(table, on="id") =>
+  ///   {
+  ///     "id": [1, 2, 3, 4],
+  ///     "vals": ["a", "b", "c", "d"],
+  ///     "attrs": [1.0, Null, 3.0, Null],
+  ///   }
+  /// \endcode
+  ///
   /// \param other the table to merge with this dataset.
   /// \param on the column to be compared to.
   ///           This column must exist in both side and have the same data type..
   /// \return `::arrow::Status::OK` if success.
+  ///
   ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumns(
       const std::shared_ptr<::arrow::Table>& other,
       const std::string& on,

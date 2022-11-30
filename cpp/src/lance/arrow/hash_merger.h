@@ -30,6 +30,7 @@
 namespace lance::arrow {
 
 /// A basic implementation of in-memory hash (join) merge.
+///
 class HashMerger {
  public:
   HashMerger() = delete;
@@ -44,6 +45,7 @@ class HashMerger {
   /// Build a hash map on column specified by "column".
   ::arrow::Status Init();
 
+  /// Collect the batch records with the same keys in the column.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Collect(
       const std::shared_ptr<::arrow::Array>& on_col);
 

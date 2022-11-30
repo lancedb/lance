@@ -391,27 +391,6 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   return ::arrow::MakeVectorIterator(fragments);
 }
 
-/// Build index map: key => {chunk_id, idx_in_chunk}.
-///
-template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<ArrowType>::CType>
-::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> BuildHashChunkIndex(
-    const std::shared_ptr<::arrow::ChunkedArray>& chunked_arr) {
-  std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>> key_to_chunk_index;
-  for (int64_t chk = 0; chk < chunked_arr->num_chunks(); chk++) {
-    auto arr = std::dynamic_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(
-        chunked_arr->chunk(chk));
-    for (int64_t idx = 0; idx < arr->length(); idx++) {
-      auto value = arr->Value(idx);
-      auto key = std::hash<CType>{}(value);
-      auto ret = key_to_chunk_index.emplace(key, std::make_tuple(chk, idx));
-      if (!ret.second) {
-        return ::arrow::Status::IndexError("Duplicated key found: ", value);
-      }
-    }
-  }
-  return std::move(key_to_chunk_index);
-}
-
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(
     const std::shared_ptr<::arrow::Table>& other,
     const std::string& on,
