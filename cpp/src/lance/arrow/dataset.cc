@@ -457,7 +457,7 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
     ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
     ARROW_RETURN_NOT_OK(updater->UpdateBatch(right_batch));
   }
-  return ::arrow::Result<std::shared_ptr<LanceDataset>>();
+  return updater->Finish();
 }
 
 }  // namespace lance::arrow
