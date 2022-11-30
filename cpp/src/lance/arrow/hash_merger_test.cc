@@ -34,7 +34,6 @@ std::shared_ptr<::arrow::Table> MakeTable() {
   typename ::arrow::TypeTraits<T>::BuilderType keys_builder;
   typename ::arrow::StringBuilder value_builder;
   ::arrow::ArrayVector key_arrs, value_arrs;
-  ///
   for (int chunk = 0; chunk < 5; chunk++) {
     for (int i = 0; i < 10; i++) {
       typename ::arrow::TypeTraits<T>::CType value = chunk * 10 + i;
@@ -73,18 +72,11 @@ void TestMergeOnPrimitiveType() {
   CHECK(values_builder.AppendNull().ok());
   auto values_arr = values_builder.Finish().ValueOrDie();
 
-  CHECK(key_builder.AppendValues({10, 20, 0, 5}).ok());
-  CHECK(key_builder.AppendNull().ok());
-  CHECK(key_builder.Append(32).ok());
-  CHECK(key_builder.AppendNull().ok());
-  auto keys_arr = key_builder.Finish().ValueOrDie();
-
   auto result_batch = merger.Collect(pk_arr).ValueOrDie();
   auto expected =
-      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("keys", std::make_shared<T>()),
-                                                  ::arrow::field("values", ::arrow::utf8())}),
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("values", ::arrow::utf8())}),
                                  values_arr->length(),
-                                 {keys_arr, values_arr});
+                                 {values_arr});
   CHECK(result_batch->Equals(*expected));
 }
 
@@ -92,10 +84,35 @@ TEST_CASE("Hash merge with primitive keys") {
   TestMergeOnPrimitiveType<::arrow::UInt8Type>();
   TestMergeOnPrimitiveType<::arrow::Int8Type>();
   TestMergeOnPrimitiveType<::arrow::UInt16Type>();
+  TestMergeOnPrimitiveType<::arrow::Int16Type>();
   TestMergeOnPrimitiveType<::arrow::Int32Type>();
+  TestMergeOnPrimitiveType<::arrow::UInt32Type>();
   TestMergeOnPrimitiveType<::arrow::UInt64Type>();
+  TestMergeOnPrimitiveType<::arrow::Int64Type>();
   TestMergeOnPrimitiveType<::arrow::FloatType>();
   TestMergeOnPrimitiveType<::arrow::DoubleType>();
 }
 
-TEST_CASE("Hash merge with string keys") {}
+TEST_CASE("Hash merge with string keys") {
+  auto keys = lance::arrow::ToArray({"a", "b", "c", "d"}).ValueOrDie();
+  auto values = lance::arrow::ToArray({1, 2, 3, 4}).ValueOrDie();
+  auto schema = ::arrow::schema(
+      {::arrow::field("keys", ::arrow::utf8()), ::arrow::field("values", ::arrow::int32())});
+  auto table = ::arrow::Table::Make(schema, {keys, values});
+
+  HashMerger merger(table, "keys");
+  CHECK(merger.Init().ok());
+
+  auto pk_arr = lance::arrow::ToArray({"c", "d", "e", "f", "a"}).ValueOrDie();
+  auto batch = merger.Collect(pk_arr).ValueOrDie();
+  fmt::print("Batch is: {}\n", batch->ToString());
+  CHECK(batch->num_columns() == 1);
+  ::arrow::Int32Builder builder;
+  CHECK(builder.AppendValues({3, 4}).ok());
+  CHECK(builder.AppendNulls(2).ok());
+  CHECK(builder.Append(0).ok());
+  auto expected_values = builder.Finish().ValueOrDie();
+  auto expected = ::arrow::RecordBatch::Make(
+      ::arrow::schema({::arrow::field("values", ::arrow::int32())}), 5, {expected_values});
+  CHECK(batch->Equals(*expected));
+}

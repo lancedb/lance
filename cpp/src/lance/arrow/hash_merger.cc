@@ -151,7 +151,16 @@ HashMerger::~HashMerger() {}
   ARROW_ASSIGN_OR_RAISE(auto indices_arr, indices_builder.Finish());
   ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::Take(table_, indices_arr));
   assert(datum.table());
-  return datum.table()->CombineChunksToBatch(pool_);
+  auto table = datum.table();
+
+  // Drop the index column.
+  for (int i = 0; i < table->num_columns(); ++i) {
+    if (table->field(i)->name() == column_name_) {
+      ARROW_ASSIGN_OR_RAISE(table, table->RemoveColumn(i));
+      break;
+    }
+  }
+  return table->CombineChunksToBatch(pool_);
 }
 
 }  // namespace lance::arrow
