@@ -134,8 +134,6 @@ HashMerger::~HashMerger() {}
   }
   std::vector<std::optional<std::size_t>> hashes;
   impl_->ComputeHash(on_col, &hashes);
-  std::vector<int64_t> indices;
-  std::vector<bool> nulls;
   ::arrow::Int64Builder indices_builder;
   ARROW_RETURN_NOT_OK(indices_builder.Reserve(on_col->length()));
   for (const auto& hvalue : hashes) {
@@ -150,7 +148,7 @@ HashMerger::~HashMerger() {}
       ARROW_RETURN_NOT_OK(indices_builder.AppendNull());
     }
   }
-  ARROW_ASSIGN_OR_RAISE(auto indices_arr, lance::arrow::ToArray(indices));
+  ARROW_ASSIGN_OR_RAISE(auto indices_arr, indices_builder.Finish());
   ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::Take(table_, indices_arr));
   assert(datum.table());
   return datum.table()->CombineChunksToBatch(pool_);

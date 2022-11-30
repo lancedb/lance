@@ -54,25 +54,48 @@ std::shared_ptr<::arrow::Table> MakeTable() {
 }
 
 template <ArrowType T>
-void TestBuildHashMap() {
+void TestMergeOnPrimitiveType() {
   auto table = MakeTable<T>();
 
   HashMerger merger(table, "keys");
   CHECK(merger.Init().ok());
 
   auto pk_arr =
-      lance::arrow::ToArray<typename ::arrow::TypeTraits<T>::CType>({10, 20, 0, 5, 200, 32, 88})
+      lance::arrow::ToArray<typename ::arrow::TypeTraits<T>::CType>({10, 20, 0, 5, 120, 32, 88})
           .ValueOrDie();
+
+  ::arrow::StringBuilder values_builder;
+  typename ::arrow::TypeTraits<T>::BuilderType key_builder;
+
+  CHECK(values_builder.AppendValues({"10", "20", "0", "5"}).ok());
+  CHECK(values_builder.AppendNull().ok());
+  CHECK(values_builder.Append("32").ok());
+  CHECK(values_builder.AppendNull().ok());
+  auto values_arr = values_builder.Finish().ValueOrDie();
+
+  CHECK(key_builder.AppendValues({10, 20, 0, 5}).ok());
+  CHECK(key_builder.AppendNull().ok());
+  CHECK(key_builder.Append(32).ok());
+  CHECK(key_builder.AppendNull().ok());
+  auto keys_arr = key_builder.Finish().ValueOrDie();
+
   auto result_batch = merger.Collect(pk_arr).ValueOrDie();
-  fmt::print("Result: {}\n", result_batch->ToString());
+  auto expected =
+      ::arrow::RecordBatch::Make(::arrow::schema({::arrow::field("keys", std::make_shared<T>()),
+                                                  ::arrow::field("values", ::arrow::utf8())}),
+                                 values_arr->length(),
+                                 {keys_arr, values_arr});
+  CHECK(result_batch->Equals(*expected));
 }
 
 TEST_CASE("Hash merge with primitive keys") {
-  TestBuildHashMap<::arrow::UInt8Type>();
-  TestBuildHashMap<::arrow::Int32Type>();
-  TestBuildHashMap<::arrow::UInt64Type>();
-  TestBuildHashMap<::arrow::FloatType>();
-  TestBuildHashMap<::arrow::DoubleType>();
+  TestMergeOnPrimitiveType<::arrow::UInt8Type>();
+  TestMergeOnPrimitiveType<::arrow::Int8Type>();
+  TestMergeOnPrimitiveType<::arrow::UInt16Type>();
+  TestMergeOnPrimitiveType<::arrow::Int32Type>();
+  TestMergeOnPrimitiveType<::arrow::UInt64Type>();
+  TestMergeOnPrimitiveType<::arrow::FloatType>();
+  TestMergeOnPrimitiveType<::arrow::DoubleType>();
 }
 
 TEST_CASE("Hash merge with string keys") {}
