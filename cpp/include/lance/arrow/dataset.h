@@ -133,12 +133,12 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
       const std::shared_ptr<::arrow::Schema>& new_columns) const;
 
-  /// Add all columns, except the "on" table, from an in-memory table.
+  /// Add all columns from the table, except the "on" column.
   ///
-  /// The algorithm follows the semantic of LEFT JOIN. The difference to LEFT JOIN
-  /// is that this function does not allow one row on the left ("this" dataset)
-  /// maps to two distinct rows on the right ("other").
-  /// However, if a matched row on the right side does not exist, it allows to fill NULL.
+  /// The algorithm follows the semantic of `LEFT JOIN` in SQL.
+  /// The difference to LEFT JOIN is that this function does not allow one row
+  /// on the left ("this" dataset) maps to two distinct rows on the right ("other").
+  /// However, if it can not find a matched row on the right side, a NULL value is provided.
   ///
   /// \param other the table to merge with this dataset.
   /// \param on the column to be compared to.
