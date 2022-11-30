@@ -33,6 +33,7 @@ from pyarrow.lib cimport (
     CExpression,
     CField,
     CRecordBatch,
+    CTable,
     Field,
     GetResultValue,
     RecordBatchReader,
@@ -40,6 +41,7 @@ from pyarrow.lib cimport (
     pyarrow_wrap_batch,
     pyarrow_unwrap_field,
     pyarrow_unwrap_array,
+    pyarrow_unwrap_table,
 )
 from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
@@ -226,6 +228,10 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CLanceDataset]] AddColumn(
                 const shared_ptr[CField]& field, CExpression expression);
 
+        CResult[shared_ptr[CLanceDataset]] AddColumns(
+                const shared_ptr[CTable]& table, const string& on
+        )
+
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
@@ -284,23 +290,33 @@ cdef class FileSystemDataset(Dataset):
         cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumn(c_field, c_expression))
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
+    def _append_column_with_table(self, table: pyarrow.Table, on: str) -> FileSystemDataset:
+        cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(table)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumns(c_table, on))
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
+
     def append_column(
         self,
-        field: Field,
-        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression, pyarrow.Table],
+        field: Optional[Field] = None,
         columns: Optional[List[str]] = None,
+        on: Optional[str] = None,
     ) -> FileSystemDataset:
         """Append a new column.
 
         Parameters
         ----------
-        field : pyarrow.Field
-            The name and schema of the newly added column.
-        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
+        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression, pyarrow.Table
             A function / callback that takes in a Batch and produces an Array. The generated array must
             have the same length as the input batch.
+            If value is a table, it does a left-join to merge the table into this dataset
+            based on the JOIN key specified by "on".
+        field : pyarrow.Field, optional
+            The name and schema of the newly added column.
         columns : list of strs, optional.
             The list of columns to read from the source dataset.
+        on : str, optional
+            If the value is a table, this specifies the column as join key.
         """
         cdef:
             shared_ptr[CUpdater] c_updater
@@ -309,6 +325,10 @@ cdef class FileSystemDataset(Dataset):
 
         if isinstance(value, Expression):
             return self._append_column_expr(field, value)
+        elif isinstance(value, Table):
+            if on is None:
+                raise ValueError("Must specify the column of index to join on by specifying 'on' parameter")
+            return self._append_column_with_table(value, on)
         elif isinstance(value, Callable):
             c_field = pyarrow_unwrap_field(field)
             c_update_builder = GetResultValue(self.lance_dataset.NewUpdate(c_field))
