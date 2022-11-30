@@ -14,75 +14,115 @@
 
 #include "lance/arrow/hash_merger.h"
 
+#include <arrow/compute/api.h>
 #include <arrow/type_traits.h>
+
+#include <optional>
+
+#include "lance/arrow/stl.h"
+#include "lance/arrow/type.h"
 
 namespace lance::arrow {
 
-HashMerger::HashMerger(const ::arrow::Table& table,
-                       std::string index_column,
-                       ::arrow::MemoryPool* pool)
-    : table_(table), column_name_(std::move(index_column)), pool_(pool) {}
+class HashMerger::Impl {
+ public:
+  virtual ~Impl() = default;
 
-namespace {
+  virtual void ComputeHash(const std::shared_ptr<::arrow::Array>& arr,
+                           std::vector<std::optional<std::size_t>>* out) = 0;
 
-/// Build index map: key => {chunk_id, idx_in_chunk}.
-///
-template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<ArrowType>::CType>
-::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> BuildHashChunkIndex(
-    const std::shared_ptr<::arrow::ChunkedArray>& chunked_arr) {
-  std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>> key_to_chunk_index;
-  for (int64_t chk = 0; chk < chunked_arr->num_chunks(); chk++) {
-    auto arr = std::dynamic_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(
-        chunked_arr->chunk(chk));
-    for (int64_t idx = 0; idx < arr->length(); idx++) {
-      auto value = arr->Value(idx);
-      auto key = std::hash<CType>{}(value);
-      auto ret = key_to_chunk_index.emplace(key, std::make_tuple(chk, idx));
-      if (!ret.second) {
-        return ::arrow::Status::IndexError("Duplicated key found: ", value);
+  virtual ::arrow::Result<std::unordered_map<std::size_t, int64_t>> BuildHashChunkIndex(
+      const std::shared_ptr<::arrow::ChunkedArray>& chunked_arr) = 0;
+};
+
+template <ArrowType T, typename CType = typename ::arrow::TypeTraits<T>::CType>
+class TypedHashMerger : public HashMerger::Impl {
+ public:
+  void ComputeHash(const std::shared_ptr<::arrow::Array>& arr,
+                   std::vector<std::optional<std::size_t>>* out) override {
+    auto hash_func = std::hash<CType>{};
+    assert(out);
+    auto values = std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(arr);
+    assert(values);
+    out->reserve(values->length());
+    out->clear();
+    for (int i = 0; i < values->length(); ++i) {
+      if (values->IsNull(i)) {
+        out->emplace_back(std::nullopt);
+      } else {
+        auto value = values->Value(i);
+        out->emplace_back(hash_func(value));
       }
     }
   }
-  return std::move(key_to_chunk_index);
-}
 
-}  // namespace
+  ::arrow::Result<std::unordered_map<std::size_t, int64_t>> BuildHashChunkIndex(
+      const std::shared_ptr<::arrow::ChunkedArray>& chunked_arr) override {
+    std::unordered_map<std::size_t, int64_t> key_to_chunk_index;
+    int64_t index = 0;
+    std::vector<std::optional<std::size_t>> hashes;
+    for (const auto& chunk : chunked_arr->chunks()) {
+      ComputeHash(chunk, &hashes);
+      assert(chunk->length() == static_cast<int64_t>(hashes.size()));
+      for (std::size_t i = 0; i < hashes.size(); i++) {
+        const auto& key = hashes[i];
+        if (key.has_value()) {
+          auto ret = key_to_chunk_index.emplace(key.value(), index);
+          if (!ret.second) {
+            auto values =
+                std::dynamic_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(chunk);
+            return ::arrow::Status::IndexError("Duplicate key found: ", values->Value(i));
+          }
+        }
+        index++;
+      }
+    }
+    return std::move(key_to_chunk_index);
+  }
+};
 
-::arrow::Status HashMerger::Build() {
-  auto chunked_arr = table_.GetColumnByName(column_name_);
+HashMerger::HashMerger(std::shared_ptr<::arrow::Table> table,
+                       std::string index_column,
+                       ::arrow::MemoryPool* pool)
+    : table_(std::move(table)), column_name_(std::move(index_column)), pool_(pool) {}
+
+HashMerger::~HashMerger() {}
+
+::arrow::Status HashMerger::Init() {
+  auto chunked_arr = table_->GetColumnByName(column_name_);
+  if (chunked_arr == nullptr) {
+    return ::arrow::Status::Invalid("index column ", column_name_, " does not exist");
+  }
   index_column_type_ = chunked_arr->type();
 
-  ::arrow::Result<std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>>> result;
-
-#define BUILD_CHUNK_IDX(TypeId)                                                              \
-  case TypeId:                                                                               \
-    result = BuildHashChunkIndex<typename ::arrow::TypeIdTraits<TypeId>::Type>(chunked_arr); \
+#define BUILD_IMPL(TypeId)                                                    \
+  case TypeId:                                                                \
+    impl_ = std::unique_ptr<Impl>(                                            \
+        new TypedHashMerger<typename ::arrow::TypeIdTraits<TypeId>::Type>()); \
     break;
 
   switch (index_column_type_->id()) {
-    BUILD_CHUNK_IDX(::arrow::Type::UINT8);
-    BUILD_CHUNK_IDX(::arrow::Type::INT8);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT16);
-    BUILD_CHUNK_IDX(::arrow::Type::INT16);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT32);
-    BUILD_CHUNK_IDX(::arrow::Type::INT32);
-    BUILD_CHUNK_IDX(::arrow::Type::UINT64);
-    BUILD_CHUNK_IDX(::arrow::Type::INT64);
-    //    BUILD_CHUNK_IDX(::arrow::Type::HALF_FLOAT);
-    BUILD_CHUNK_IDX(::arrow::Type::FLOAT);
-    BUILD_CHUNK_IDX(::arrow::Type::DOUBLE);
+    BUILD_IMPL(::arrow::Type::UINT8);
+    BUILD_IMPL(::arrow::Type::INT8);
+    BUILD_IMPL(::arrow::Type::UINT16);
+    BUILD_IMPL(::arrow::Type::INT16);
+    BUILD_IMPL(::arrow::Type::UINT32);
+    BUILD_IMPL(::arrow::Type::INT32);
+    BUILD_IMPL(::arrow::Type::UINT64);
+    BUILD_IMPL(::arrow::Type::INT64);
+    //    BUILD_IMPL(::arrow::Type::HALF_FLOAT);
+    BUILD_IMPL(::arrow::Type::FLOAT);
+    BUILD_IMPL(::arrow::Type::DOUBLE);
     case ::arrow::Type::STRING:
-      result = BuildHashChunkIndex<::arrow::StringType, std::string_view>(chunked_arr);
+      impl_ = std::unique_ptr<Impl>(new TypedHashMerger<::arrow::StringType, std::string_view>());
       break;
     default:
       return ::arrow::Status::Invalid("Only support primitive or string type, got: ",
                                       index_column_type_->ToString());
   }
 
-  if (!result.ok()) {
-    return result.status();
-  }
-  index_map_ = std::move(result.ValueOrDie());
+  ARROW_ASSIGN_OR_RAISE(index_map_, impl_->BuildHashChunkIndex(chunked_arr));
+
   return ::arrow::Status::OK();
 }
 
@@ -92,14 +132,27 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
     return ::arrow::Status::TypeError(
         "Index column match mismatch: ", on_col->type()->ToString(), " != ", index_column_type_);
   }
-  for (int i = 0; i < table_.num_columns(); i++) {
-    auto field = table_.field(i);
-    if (field->name() == column_name_) {
-      continue;
+  std::vector<std::optional<std::size_t>> hashes;
+  impl_->ComputeHash(on_col, &hashes);
+  std::vector<int64_t> indices;
+  std::vector<bool> nulls;
+  for (const auto& hvalue : hashes) {
+    if (hvalue.has_value()) {
+      auto it = index_map_.find(hvalue.value());
+      if (it != index_map_.end()) {
+        indices.emplace_back(it->second);
+        nulls.emplace_back(false);
+      } else {
+        nulls.emplace_back(true);
+      }
+    } else {
+      nulls.emplace_back(true);
     }
   }
-  fmt::print("{}", fmt::ptr(pool_));
-  return ::arrow::Status::NotImplemented("not impl");
+  ARROW_ASSIGN_OR_RAISE(auto indices_arr, lance::arrow::ToArray(indices));
+  ARROW_ASSIGN_OR_RAISE(auto datum, ::arrow::compute::Take(table_, indices_arr));
+  assert(datum.table());
+  return datum.table()->CombineChunksToBatch(pool_);
 }
 
 }  // namespace lance::arrow

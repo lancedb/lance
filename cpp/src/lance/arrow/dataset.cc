@@ -412,15 +412,16 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
   return std::move(key_to_chunk_index);
 }
 
-::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(const ::arrow::Table& other,
-                                                                        const std::string& on,
-                                                                        ::arrow::MemoryPool* pool) {
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(
+    const std::shared_ptr<::arrow::Table>& other,
+    const std::string& on,
+    ::arrow::MemoryPool* pool) {
   /// Sanity checks
   auto left_column = schema_->GetFieldByName(on);
   if (left_column == nullptr) {
     return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the dataset.", on));
   }
-  auto right_column = other.GetColumnByName(on);
+  auto right_column = other->GetColumnByName(on);
   if (right_column == nullptr) {
     return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the table.", on));
   }
@@ -436,10 +437,10 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
 
   // First phase, build hash table (in memory for simplicity)
   auto merger = HashMerger(other, on, pool);
-  ARROW_RETURN_NOT_OK(merger.Build());
+  ARROW_RETURN_NOT_OK(merger.Init());
 
   // Second phase
-  auto table_schema = other.schema();
+  auto table_schema = other->schema();
   ARROW_ASSIGN_OR_RAISE(auto merged_schema,
                         table_schema->RemoveField(table_schema->GetFieldIndex(on)));
   ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(merged_schema)));

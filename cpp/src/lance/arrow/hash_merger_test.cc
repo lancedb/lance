@@ -23,6 +23,7 @@
 #include <memory>
 #include <vector>
 
+#include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
 
 using lance::arrow::HashMerger;
@@ -33,6 +34,7 @@ std::shared_ptr<::arrow::Table> MakeTable() {
   typename ::arrow::TypeTraits<T>::BuilderType keys_builder;
   typename ::arrow::StringBuilder value_builder;
   ::arrow::ArrayVector key_arrs, value_arrs;
+  ///
   for (int chunk = 0; chunk < 5; chunk++) {
     for (int i = 0; i < 10; i++) {
       typename ::arrow::TypeTraits<T>::CType value = chunk * 10 + i;
@@ -55,14 +57,21 @@ template <ArrowType T>
 void TestBuildHashMap() {
   auto table = MakeTable<T>();
 
-  HashMerger merger(*table, "keys");
-  CHECK(merger.Build().ok());
+  HashMerger merger(table, "keys");
+  CHECK(merger.Init().ok());
+
+  auto pk_arr =
+      lance::arrow::ToArray<typename ::arrow::TypeTraits<T>::CType>({0, 3, 5, 10, 20}).ValueOrDie();
+  auto result_batch = merger.Collect(pk_arr).ValueOrDie();
+  fmt::print("Result: {}\n", result_batch->ToString());
 }
 
-TEST_CASE("Build Hash") {
+TEST_CASE("Hash merge with primitive keys") {
   TestBuildHashMap<::arrow::UInt8Type>();
   TestBuildHashMap<::arrow::Int32Type>();
   TestBuildHashMap<::arrow::UInt64Type>();
   TestBuildHashMap<::arrow::FloatType>();
   TestBuildHashMap<::arrow::DoubleType>();
 }
+
+TEST_CASE("Hash merge with string keys") {}

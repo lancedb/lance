@@ -35,22 +35,32 @@ class HashMerger {
  public:
   HashMerger() = delete;
 
-  explicit HashMerger(const ::arrow::Table& table,
+  /// HashMerger constructor.
+  explicit HashMerger(std::shared_ptr<::arrow::Table> table,
                       std::string index_column,
                       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
+  ~HashMerger();
+
   /// Build a hash map on column specified by "column".
-  ::arrow::Status Build();
+  ::arrow::Status Init();
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Collect(
       const std::shared_ptr<::arrow::Array>& on_col);
 
  private:
-  const ::arrow::Table& table_;
+  std::shared_ptr<::arrow::Table> table_;
   std::string column_name_;
-  std::unordered_map<std::size_t, std::tuple<int64_t, int64_t>> index_map_;
+
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+  /// A map from `std::hash(key)` to the index (`int64_t`) in the table.
+  std::unordered_map<std::size_t, int64_t> index_map_;
   std::shared_ptr<::arrow::DataType> index_column_type_;
   ::arrow::MemoryPool* pool_;
+
+  template <ArrowType T, typename CType>
+  friend class TypedHashMerger;
 };
 
 }  // namespace lance::arrow
