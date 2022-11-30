@@ -136,17 +136,18 @@ HashMerger::~HashMerger() {}
   impl_->ComputeHash(on_col, &hashes);
   std::vector<int64_t> indices;
   std::vector<bool> nulls;
+  ::arrow::Int64Builder indices_builder;
+  ARROW_RETURN_NOT_OK(indices_builder.Reserve(on_col->length()));
   for (const auto& hvalue : hashes) {
     if (hvalue.has_value()) {
       auto it = index_map_.find(hvalue.value());
       if (it != index_map_.end()) {
-        indices.emplace_back(it->second);
-        nulls.emplace_back(false);
+        ARROW_RETURN_NOT_OK(indices_builder.Append(it->second));
       } else {
-        nulls.emplace_back(true);
+        ARROW_RETURN_NOT_OK(indices_builder.AppendNull());
       }
     } else {
-      nulls.emplace_back(true);
+      ARROW_RETURN_NOT_OK(indices_builder.AppendNull());
     }
   }
   ARROW_ASSIGN_OR_RAISE(auto indices_arr, lance::arrow::ToArray(indices));
