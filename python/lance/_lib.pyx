@@ -292,7 +292,7 @@ cdef class FileSystemDataset(Dataset):
 
     def _append_column_with_table(self, table: pyarrow.Table, on: str) -> FileSystemDataset:
         cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(table)
-        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumns(c_table, on))
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumns(c_table, tobytes(on)))
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
     def append_column(
