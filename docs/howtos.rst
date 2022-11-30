@@ -8,3 +8,5 @@ How-To Guides
     2 - Creating Lance Datasets <./notebooks/02_creating_lance_datasets>
     3 - Exploratory Data Analysis <./notebooks/03_exploratory_data_analysis>
     4 - Run Models in SQL <./notebooks/04_run_models_SQL>
+    5 - Data Versioning <./notebooks/05_data_versioning>
+
