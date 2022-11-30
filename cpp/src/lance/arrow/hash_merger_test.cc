@@ -105,12 +105,11 @@ TEST_CASE("Hash merge with string keys") {
 
   auto pk_arr = lance::arrow::ToArray({"c", "d", "e", "f", "a"}).ValueOrDie();
   auto batch = merger.Collect(pk_arr).ValueOrDie();
-  fmt::print("Batch is: {}\n", batch->ToString());
   CHECK(batch->num_columns() == 1);
   ::arrow::Int32Builder builder;
   CHECK(builder.AppendValues({3, 4}).ok());
   CHECK(builder.AppendNulls(2).ok());
-  CHECK(builder.Append(0).ok());
+  CHECK(builder.Append(1).ok());
   auto expected_values = builder.Finish().ValueOrDie();
   auto expected = ::arrow::RecordBatch::Make(
       ::arrow::schema({::arrow::field("values", ::arrow::int32())}), 5, {expected_values});
