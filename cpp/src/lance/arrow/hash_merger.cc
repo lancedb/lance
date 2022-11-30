@@ -77,7 +77,7 @@ class TypedHashMerger : public HashMerger::Impl {
         index++;
       }
     }
-    return std::move(key_to_chunk_index);
+    return key_to_chunk_index;
   }
 };
 
