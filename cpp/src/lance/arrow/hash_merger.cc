@@ -98,6 +98,7 @@ template <typename ArrowType, typename CType = typename ::arrow::TypeTraits<Arro
       continue;
     }
   }
+  fmt::print("{}", fmt::ptr(pool_));
   return ::arrow::Status::NotImplemented("not impl");
 }
 
