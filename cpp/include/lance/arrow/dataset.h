@@ -42,10 +42,14 @@ class DatasetVersion {
   DatasetVersion() = default;
 
   /// Construct a Dataset version from version number.
-  explicit DatasetVersion(VersionNumberType version);
+  explicit DatasetVersion(VersionNumberType version,
+                          std::chrono::time_point<std::chrono::system_clock> created);
 
   /// Get version number.
   VersionNumberType version() const;
+
+  /// Timestamp of dataset creation, in UTC.
+  const std::chrono::time_point<std::chrono::system_clock>& created_timestamp() const;
 
   /// Increase version number
   DatasetVersion& operator++();
@@ -57,7 +61,7 @@ class DatasetVersion {
   VersionNumberType version_ = 0;
 
   /// Dataset creation time, in UTC timezone.
-  std::chrono::time_point<std::chrono::system_clock> created_time_;
+  std::chrono::time_point<std::chrono::system_clock> created_timestamp_;
 };
 
 /// Lance Dataset, supports versioning and schema evolution.

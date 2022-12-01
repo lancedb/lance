@@ -134,19 +134,26 @@ std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 
 }  // namespace
 
-DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
+DatasetVersion::DatasetVersion(uint64_t version,
+                               std::chrono::time_point<std::chrono::system_clock> created)
+    : version_(version), created_timestamp_(created) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
+const std::chrono::time_point<std::chrono::system_clock>& DatasetVersion::created_timestamp()
+    const {
+  return created_timestamp_;
+}
+
 DatasetVersion& DatasetVersion::operator++() {
   version_++;
-  created_time_ = std::chrono::system_clock::now();
+  created_timestamp_ = std::chrono::system_clock::now();
   return *this;
 }
 
 DatasetVersion DatasetVersion::operator++(int) {
   version_++;
-  created_time_ = std::chrono::system_clock::now();
+  created_timestamp_ = std::chrono::system_clock::now();
   return *this;
 }
 
