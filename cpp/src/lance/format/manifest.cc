@@ -106,6 +106,10 @@ std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
   return new_manifest;
 }
 
+void Manifest::Touch() {
+  version_.Touch();
+}
+
 const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }
 
 uint64_t Manifest::version() const { return version_.version(); }
