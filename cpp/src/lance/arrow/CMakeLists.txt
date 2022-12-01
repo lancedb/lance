@@ -24,6 +24,8 @@ add_library(
         file_lance_ext.h
         fragment.cc
         fragment.h
+        hash_merger.cc
+        hash_merger.h
         scanner.cc
         stl.h
         type.cc
@@ -39,6 +41,7 @@ add_lance_test(api_test)
 add_lance_test(arrow_dataset_test)
 add_lance_test(dataset_test)
 add_lance_test(fragment_test)
+add_lance_test(hash_merger_test)
 add_lance_test(scanner_test)
 add_lance_test(type_test)
 add_lance_test(updater_test)

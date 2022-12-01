@@ -18,17 +18,22 @@
 #include <arrow/array/concatenate.h>
 #include <arrow/status.h>
 #include <arrow/table.h>
+#include <arrow/type_traits.h>
 #include <fmt/format.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
 #include <range/v3/all.hpp>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
 #include "lance/arrow/dataset_ext.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
+#include "lance/arrow/hash_merger.h"
 #include "lance/arrow/updater.h"
 #include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
@@ -313,8 +318,12 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
 
 ::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
     const std::shared_ptr<::arrow::Field>& new_field) const {
-  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this),
-                                          std::move(new_field));
+  return NewUpdate(::arrow::schema({new_field}));
+}
+
+::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Schema>& new_columns) const {
+  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this), new_columns);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
@@ -380,6 +389,64 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
       ranges::to<decltype(fragments)>;
 
   return ::arrow::MakeVectorIterator(fragments);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
+    const std::shared_ptr<::arrow::Table>& other,
+    const std::string& on,
+    ::arrow::MemoryPool* pool) {
+  return Merge(other, on, on, pool);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
+    const std::shared_ptr<::arrow::Table>& right,
+    const std::string& left_on,
+    const std::string& right_on,
+    ::arrow::MemoryPool* pool) {
+  /// Sanity checks
+  auto left_column = schema_->GetFieldByName(left_on);
+  if (left_column == nullptr) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the dataset.", left_on));
+  }
+  auto right_column = right->GetColumnByName(right_on);
+  if (right_column == nullptr) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the table.", right_on));
+  }
+
+  auto& left_type = left_column->type();
+  auto& right_type = right_column->type();
+  if (!left_type->Equals(right_type)) {
+    return ::arrow::Status::Invalid("LanceDataset::AddColumns: types are not equal: ",
+                                    left_type->ToString(),
+                                    " != ",
+                                    right_type->ToString());
+  }
+
+  // First phase, build hash table (in memory for simplicity)
+  auto merger = HashMerger(right, right_on, pool);
+  ARROW_RETURN_NOT_OK(merger.Init());
+
+  // Second phase
+  auto table_schema = right->schema();
+  ARROW_ASSIGN_OR_RAISE(auto incoming_schema,
+                        table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
+  ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
+  update_builder->Project({left_on});
+  ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
+
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
+    if (!batch) {
+      break;
+    }
+    assert(batch->schema()->Equals(::arrow::schema({left_column})));
+    auto index_arr = batch->GetColumnByName(left_on);
+    ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
+    ARROW_RETURN_NOT_OK(updater->UpdateBatch(right_batch));
+  }
+  return updater->Finish();
 }
 
 }  // namespace lance::arrow

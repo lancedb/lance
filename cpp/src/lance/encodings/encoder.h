@@ -33,9 +33,6 @@ class OutputStream;
 
 namespace lance::encodings {
 
-template <typename T>
-concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
-
 /// Encoding type Enum
 enum Encoding {
   NONE = 0,

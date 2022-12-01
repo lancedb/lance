@@ -130,6 +130,57 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
       const std::shared_ptr<::arrow::Field>& new_field) const;
 
+  ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
+      const std::shared_ptr<::arrow::Schema>& new_columns) const;
+
+  /// Merge an in-memory table, except the "right_on" column.
+  ///
+  /// The algorithm follows the semantic of `LEFT JOIN` in SQL.
+  /// The difference to LEFT JOIN is that this function does not allow one row
+  /// on the left ("this" dataset) maps to two distinct rows on the right ("other").
+  /// However, if it can not find a matched row on the right side, a NULL value is provided.
+  ///
+  /// For example,
+  ///
+  /// \code
+  /// dataset (left) = {
+  ///   "id": [1, 2, 3, 4],
+  ///   "vals": ["a", "b", "c", "d"],
+  /// }
+  /// table (right) = {
+  ///   "id": [5, 1, 10, 3, 8],
+  ///   "attrs": [5.0, 1.0, 10.0, 3.0, 8.0],
+  /// }
+  ///
+  /// dataset.AddColumn(table, on="id") =>
+  ///   {
+  ///     "id": [1, 2, 3, 4],
+  ///     "vals": ["a", "b", "c", "d"],
+  ///     "attrs": [1.0, Null, 3.0, Null],
+  ///   }
+  /// \endcode
+  ///
+  /// \param right the table to merge with this dataset.
+  /// \param left_on the column in this dataset be compared to.
+  /// \param right_on the column in the table to be compared to.
+  ///           This column must exist in both side and have the same data type.
+  /// \param pool memory pool
+  /// \return `::arrow::Status::OK` if success.
+  ///
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
+      const std::shared_ptr<::arrow::Table>& right,
+      const std::string& left_on,
+      const std::string& right_on,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
+  /// Merge an in-memory table, both sides must have the same column specified by the "on" name.
+  ///
+  /// See `Merge(right, left_on, right_on, pool)` for details.
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
+      const std::shared_ptr<::arrow::Table>& right,
+      const std::string& on,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
       std::shared_ptr<::arrow::Schema> schema) const override;
 

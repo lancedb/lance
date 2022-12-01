@@ -67,6 +67,10 @@ class Updater {
   /// The array must has the same length as the batch returned previously via `Next()`.
   ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::Array>& arr);
 
+  /// Update the values to new values, presented in a `RecordBatch`.
+  /// The batch must has the same length as the batch returned previously via `Next()`.
+  ::arrow::Status UpdateBatch(const std::shared_ptr<::arrow::RecordBatch>& batch);
+
   /// Finish the update and returns a new version of dataset.
   ::arrow::Result<std::shared_ptr<LanceDataset>> Finish();
 
@@ -74,13 +78,13 @@ class Updater {
   /// Make a new Updater
   ///
   /// \param dataset The dataset to be updated.
-  /// \param field the (new) column to update.
+  /// \param schema the (new) columns to update.
   /// \param projection_columns the columns to read from source dataset.
   ///
   /// \return an Updater if success.
   static ::arrow::Result<std::shared_ptr<Updater>> Make(
       std::shared_ptr<LanceDataset> dataset,
-      const std::shared_ptr<::arrow::Field>& field,
+      const std::shared_ptr<::arrow::Schema>& schema,
       const std::vector<std::string>& projection_columns);
 
   /// PIMPL
@@ -99,7 +103,7 @@ class Updater {
 /// parameters to build a Updater.
 class UpdaterBuilder {
  public:
-  UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Field> field);
+  UpdaterBuilder(std::shared_ptr<LanceDataset> dataset, std::shared_ptr<::arrow::Schema> schema);
 
   /// Set the projection columns from the source dataset.
   void Project(std::vector<std::string> columns);
@@ -109,7 +113,7 @@ class UpdaterBuilder {
  private:
   std::shared_ptr<LanceDataset> dataset_;
 
-  std::shared_ptr<::arrow::Field> field_;
+  std::shared_ptr<::arrow::Schema> schema_;
 
   std::vector<std::string> projection_columns_;
 };
