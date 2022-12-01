@@ -228,8 +228,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CLanceDataset]] AddColumn(
                 const shared_ptr[CField]& field, CExpression expression);
 
-        CResult[shared_ptr[CLanceDataset]] AddColumns(
-                const shared_ptr[CTable]& table, const string& on
+        CResult[shared_ptr[CLanceDataset]] Merge(
+                const shared_ptr[CTable]& table, const string& left_on, const string& right_on
         )
 
 cdef _dataset_version_to_json(CDatasetVersion cdv):
@@ -290,33 +290,23 @@ cdef class FileSystemDataset(Dataset):
         cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumn(c_field, c_expression))
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
-    def _append_column_with_table(self, table: pyarrow.Table, on: str) -> FileSystemDataset:
-        cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(table)
-        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumns(c_table, tobytes(on)))
-        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
-
     def append_column(
         self,
-        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression, pyarrow.Table],
+        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
         field: Optional[Field] = None,
         columns: Optional[List[str]] = None,
-        on: Optional[str] = None,
     ) -> FileSystemDataset:
         """Append a new column.
 
         Parameters
         ----------
-        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression, pyarrow.Table
+        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
             A function / callback that takes in a Batch and produces an Array. The generated array must
             have the same length as the input batch.
-            If value is a table, it does a left-join to merge the table into this dataset
-            based on the JOIN key specified by "on".
         field : pyarrow.Field, optional
             The name and schema of the newly added column.
         columns : list of strs, optional.
             The list of columns to read from the source dataset.
-        on : str, optional
-            If the value is a table, this specifies the column as join key.
         """
         cdef:
             shared_ptr[CUpdater] c_updater
@@ -325,10 +315,6 @@ cdef class FileSystemDataset(Dataset):
 
         if isinstance(value, Expression):
             return self._append_column_expr(field, value)
-        elif isinstance(value, Table):
-            if on is None:
-                raise ValueError("Must specify the column of index to join on by specifying 'on' parameter")
-            return self._append_column_with_table(value, on)
         elif isinstance(value, Callable):
             c_field = pyarrow_unwrap_field(field)
             c_update_builder = GetResultValue(self.lance_dataset.NewUpdate(c_field))
@@ -342,6 +328,23 @@ cdef class FileSystemDataset(Dataset):
             return updater.finish()
         else:
             raise ValueError(f"Value does not accept type: {type(value)}")
+
+    def merge(self, right: pyarrow.Table, left_on: str, right_on: str) -> FileSystemDataset:
+        """Merge another table using Left-join
+
+        Parameters:
+        right : pyarrow.Table
+            The table to merge into this dataset.
+        left_on : str
+            The name of the column in this dataset to be compared during merge.
+        right_on : str
+            The name of the column in the right table to be compared during merge.
+        """
+        cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(right)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(
+            self.lance_dataset.Merge(c_table, tobytes(left_on), tobytes(right_on))
+        )
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
 def _lance_dataset_write(
         Dataset data,

@@ -100,7 +100,7 @@ def test_add_column_with_table(tmp_path: Path):
     dataset = lance.dataset(base_dir)
 
     new_table = pa.Table.from_pylist([{"a": i, "c": i * 10} for i in range(10)])
-    new_dataset = dataset.append_column(new_table, on="a")
+    new_dataset = dataset.merge(new_table, left_on="a", right_on="a")
     assert new_dataset.version["version"] == 2
     actual_df = new_dataset.to_table().to_pandas()
     expected_df = table.to_pandas()
