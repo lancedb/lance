@@ -47,7 +47,7 @@ class HashMerger {
 
   /// Collect the batch records with the same keys in the column.
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> Collect(
-      const std::shared_ptr<::arrow::Array>& on_col);
+      const std::shared_ptr<::arrow::Array>& index_arr);
 
  private:
   std::shared_ptr<::arrow::Table> table_;

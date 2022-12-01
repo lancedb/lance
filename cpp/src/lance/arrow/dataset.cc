@@ -391,18 +391,28 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   return ::arrow::MakeVectorIterator(fragments);
 }
 
-::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumns(
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
     const std::shared_ptr<::arrow::Table>& other,
     const std::string& on,
     ::arrow::MemoryPool* pool) {
+  return Merge(other, on, on, pool);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
+    const std::shared_ptr<::arrow::Table>& right,
+    const std::string& left_on,
+    const std::string& right_on,
+    ::arrow::MemoryPool* pool) {
   /// Sanity checks
-  auto left_column = schema_->GetFieldByName(on);
+  auto left_column = schema_->GetFieldByName(left_on);
   if (left_column == nullptr) {
-    return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the dataset.", on));
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the dataset.", left_on));
   }
-  auto right_column = other->GetColumnByName(on);
+  auto right_column = right->GetColumnByName(right_on);
   if (right_column == nullptr) {
-    return ::arrow::Status::Invalid(fmt::format("Column {} does not exist in the table.", on));
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the table.", right_on));
   }
 
   auto& left_type = left_column->type();
@@ -415,15 +425,15 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
   }
 
   // First phase, build hash table (in memory for simplicity)
-  auto merger = HashMerger(other, on, pool);
+  auto merger = HashMerger(right, right_on, pool);
   ARROW_RETURN_NOT_OK(merger.Init());
 
   // Second phase
-  auto table_schema = other->schema();
-  ARROW_ASSIGN_OR_RAISE(auto merged_schema,
-                        table_schema->RemoveField(table_schema->GetFieldIndex(on)));
-  ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(merged_schema)));
-  update_builder->Project({on});
+  auto table_schema = right->schema();
+  ARROW_ASSIGN_OR_RAISE(auto incoming_schema,
+                        table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
+  ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
+  update_builder->Project({left_on});
   ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
 
   while (true) {
@@ -432,7 +442,7 @@ DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatase
       break;
     }
     assert(batch->schema()->Equals(::arrow::schema({left_column})));
-    auto index_arr = batch->GetColumnByName(on);
+    auto index_arr = batch->GetColumnByName(left_on);
     ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
     ARROW_RETURN_NOT_OK(updater->UpdateBatch(right_batch));
   }

@@ -128,15 +128,15 @@ HashMerger::~HashMerger() {}
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> HashMerger::Collect(
-    const std::shared_ptr<::arrow::Array>& on_col) {
-  if (!on_col->type()->Equals(index_column_type_)) {
+    const std::shared_ptr<::arrow::Array>& index_arr) {
+  if (!index_arr->type()->Equals(index_column_type_)) {
     return ::arrow::Status::TypeError(
-        "Index column match mismatch: ", on_col->type()->ToString(), " != ", index_column_type_);
+        "Index column match mismatch: ", index_arr->type()->ToString(), " != ", index_column_type_);
   }
   std::vector<std::optional<std::size_t>> hashes;
-  impl_->ComputeHash(on_col, &hashes);
+  impl_->ComputeHash(index_arr, &hashes);
   ::arrow::Int64Builder indices_builder;
-  ARROW_RETURN_NOT_OK(indices_builder.Reserve(on_col->length()));
+  ARROW_RETURN_NOT_OK(indices_builder.Reserve(index_arr->length()));
   for (const auto& hvalue : hashes) {
     if (hvalue.has_value()) {
       auto it = index_map_.find(hvalue.value());

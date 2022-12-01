@@ -133,7 +133,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<UpdaterBuilder>> NewUpdate(
       const std::shared_ptr<::arrow::Schema>& new_columns) const;
 
-  /// Add all columns from the table, except the "on" column.
+  /// Merge an in-memory table, except the "right_on" column.
   ///
   /// The algorithm follows the semantic of `LEFT JOIN` in SQL.
   /// The difference to LEFT JOIN is that this function does not allow one row
@@ -160,13 +160,24 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///   }
   /// \endcode
   ///
-  /// \param other the table to merge with this dataset.
-  /// \param on the column to be compared to.
-  ///           This column must exist in both side and have the same data type..
+  /// \param right the table to merge with this dataset.
+  /// \param left_on the column in this dataset be compared to.
+  /// \param right_on the column in the table to be compared to.
+  ///           This column must exist in both side and have the same data type.
+  /// \param pool memory pool
   /// \return `::arrow::Status::OK` if success.
   ///
-  ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumns(
-      const std::shared_ptr<::arrow::Table>& other,
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
+      const std::shared_ptr<::arrow::Table>& right,
+      const std::string& left_on,
+      const std::string& right_on,
+      ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
+
+  /// Merge an in-memory table, both sides must have the same column specified by the "on" name.
+  ///
+  /// See `Merge(right, left_on, right_on, pool)` for details.
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
+      const std::shared_ptr<::arrow::Table>& right,
       const std::string& on,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
