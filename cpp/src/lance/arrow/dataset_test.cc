@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <memory>
 #include <range/v3/view.hpp>
 #include <string>
@@ -28,6 +29,7 @@
 
 using lance::arrow::ToArray;
 using namespace ranges::views;
+using namespace std::chrono_literals;
 
 std::shared_ptr<::arrow::Table> ReadTable(const std::string& uri, std::optional<int32_t> version) {
   std::string path;
@@ -243,12 +245,15 @@ TEST_CASE("Dataset add column with a constant value") {
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(dataset->version().timestamp() > std::chrono::system_clock::now() - 30s);
 
   auto dataset2 =
       dataset
           ->AddColumn(::arrow::field("doubles", ::arrow::float64()), ::arrow::compute::literal(0.5))
           .ValueOrDie();
   CHECK(dataset2->version().version() == 2);
+  CHECK(dataset2->version().timestamp() > dataset->version().timestamp());
+
   auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   auto doubles = ToArray<double>({0.5, 0.5, 0.5, 0.5, 0.5}).ValueOrDie();
   auto expected_table =
@@ -267,6 +272,7 @@ TEST_CASE("Dataset add column with a function call") {
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(dataset->version().timestamp() > std::chrono::system_clock::now() - 30s);
 
   auto dataset2 =
       dataset
@@ -276,6 +282,7 @@ TEST_CASE("Dataset add column with a function call") {
                   "add", {::arrow::compute::field_ref("id"), ::arrow::compute::literal(0.5)}))
           .ValueOrDie();
   CHECK(dataset2->version().version() == 2);
+  CHECK(dataset2->version().timestamp() > dataset->version().timestamp());
   auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   auto doubles = ToArray<double>({1.5, 2.5, 3.5, 4.5, 5.5}).ValueOrDie();
   auto expected_table =
