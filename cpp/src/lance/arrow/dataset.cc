@@ -168,7 +168,9 @@ std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri)
 
 namespace {
 
-::arrow::Status WriteManifest(const auto& fs, const auto& base_uri, const auto& manifest) {
+::arrow::Status WriteManifest(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+                              const std::string& base_uri,
+                              const std::shared_ptr<format::Manifest>& manifest) {
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_uri) / kVersionsDir).string();
