@@ -14,3 +14,5 @@
 
 """PyTorch Integration
 """
+
+from lance.pytorch.data import Dataset

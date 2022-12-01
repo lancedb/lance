@@ -35,7 +35,7 @@ import lance
 from lance import dataset
 from lance.types import Image, is_image_type
 
-__all__ = ["LanceDataset"]
+__all__ = ["Dataset"]
 
 
 def _data_to_tensor(data: Any) -> Union[torch.Tensor, PIL.Image.Image]:
@@ -82,7 +82,7 @@ def to_tensor(arr: pa.Array) -> Union[torch.Tensor, PIL.Image.Image]:
         return torch.from_numpy(np_arr)
 
 
-class LanceDataset(IterableDataset):
+class Dataset(IterableDataset):
     """An PyTorch IterableDataset.
 
     See:
@@ -94,7 +94,7 @@ class LanceDataset(IterableDataset):
         root: Union[str, Path],
         version: Optional[int] = None,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        batch_size: Optional[int] = None,
+        batch_size: Optional[int] = 64,
         filter: Optional[pc.Expression] = None,
         transform: Optional[Callable] = None,
         mode: str = "record",
@@ -140,20 +140,27 @@ class LanceDataset(IterableDataset):
     def __repr__(self):
         return f"LanceDataset(root={self.root})"
 
+    @property
+    def schema(self) -> pa.Schema:
+        """Dataset Schema"""
+        self._setup_dataset()
+        return self._dataset.schema
+
     def _setup_dataset(self):
         """Lazy loading dataset in different process."""
-        if self._fragments:
-            return self._fragments
+        if not self._dataset:
+            self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
+            self._dataset = lance.dataset(self.root, self.version)
 
-        self._fs, _ = pyarrow.fs.FileSystem.from_uri(self.root)
-        self._fragments = lance.dataset(self.root, self.version).get_fragments()
+        self._fragments = self._dataset.get_fragments()
         worker_info = torch.utils.data.get_worker_info()
         if worker_info:
             # Split the fragments into each worker.
             rank = worker_info.id
             num_workers = worker_info.num_workers
             self._fragments = [
-                self._fragments[i] for i in range(rank, len(self._fragments), num_workers)
+                self._fragments[i]
+                for i in range(rank, len(self._fragments), num_workers)
             ]
 
     def __iter__(self):
