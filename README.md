@@ -25,9 +25,9 @@ Lance makes machine learning workflows with ML data easy (images, videos, point 
 
 * Use SQL to greatly simplify common operations on ML data, such as similarity search for data discovery, model inference and computing evaluation metrics.
 
-* (Coming soon) visualize, slice and drill-into datasets to inspect embeddings, labels/annotations and metrics.
+* Version, compare and diff ML datasets easily.
 
-* (Coming soon) version, compare and diff ML datasets easily.
+* (Coming soon) visualize, slice and drill-into datasets to inspect embeddings, labels/annotations and metrics.
 
 Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for ML data.
 
@@ -50,6 +50,22 @@ import duckdb
 ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
+
+You can easily import a DataFrame or a Parquet file to Lance using Apache Arrow-first APIs:
+
+```python
+import pyarrow as pa
+
+# Import a pandas DataFrame to Lance
+tbl = pa.Table.from_pandas(my_dataframe)
+lance.write_dataset(tbl, '/tmp/my_dataframe.lance')
+
+# Import a Parquet file to Lance
+parquet_dataset = ds.dataset('/tmp/hello.parquet')
+lance.write_dataset(parquet_dataset, '/tmp/hello.lance')
+```
+
+For more details, read our [documentation](https://eto-ai.github.io/lance/notebooks/02_creating_lance_datasets.html).
 
 ## Important directories
 
