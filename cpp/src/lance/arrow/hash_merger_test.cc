@@ -25,6 +25,7 @@
 
 #include "lance/arrow/stl.h"
 #include "lance/arrow/type.h"
+#include "lance/testing/json.h"
 
 using lance::arrow::HashMerger;
 
@@ -89,9 +90,22 @@ TEST_CASE("Hash merge with primitive keys") {
   TestMergeOnPrimitiveType<::arrow::UInt32Type>();
   TestMergeOnPrimitiveType<::arrow::UInt64Type>();
   TestMergeOnPrimitiveType<::arrow::Int64Type>();
-  TestMergeOnPrimitiveType<::arrow::FloatType>();
-  TestMergeOnPrimitiveType<::arrow::DoubleType>();
 }
+
+template <ArrowType T>
+void TestMergeOnFloatType() {
+  auto table =
+      lance::testing::TableFromJSON(::arrow::schema({::arrow::field("a", std::make_shared<T>())}),
+                                    R"([{"a": 1.0}, {"a": 2.0}])")
+          .ValueOrDie();
+  HashMerger merger(table, "a");
+  CHECK(!merger.Init().ok());
+}
+
+TEST_CASE("Float keys are not supported") {
+  TestMergeOnFloatType<::arrow::FloatType>();
+  TestMergeOnFloatType<::arrow::DoubleType>();
+};
 
 TEST_CASE("Hash merge with string keys") {
   auto keys = lance::arrow::ToArray({"a", "b", "c", "d"}).ValueOrDie();
