@@ -112,19 +112,19 @@ def test_write_versioned_dataset(tmp_path: Path):
 
     dataset = lance.dataset(base_dir, version=1)
     assert table1 == dataset.to_table()
-    assert dataset.version == {"version": 1}
-    assert dataset.latest_version() == {"version": 3}
+    assert dataset.version["version"] == 1
+    assert dataset.latest_version()["version"] == 3
 
     dataset = lance.dataset(base_dir, version=2)
     full_table = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 100, "b": 200}])
     assert full_table == dataset.to_table()
 
-    assert dataset.version == {"version": 2}
-    assert dataset.latest_version() == {"version": 3}
-    assert dataset.versions() == [{"version": 1}, {"version": 2}, {"version": 3}]
+    assert dataset.version["version"] == 2
+    assert dataset.latest_version()["version"] == 3
+    assert len(dataset.versions()) == 3
 
     dataset = lance.dataset(base_dir)
     assert dataset.to_table() == table3
-    assert dataset.version == {"version": 3}
-    assert dataset.latest_version() == {"version": 3}
-    assert dataset.versions() == [{"version": 1}, {"version": 2}, {"version": 3}]
+    assert dataset.version["version"] == 3
+    assert dataset.latest_version()["version"] == 3
+    assert len(dataset.versions()) == 3
