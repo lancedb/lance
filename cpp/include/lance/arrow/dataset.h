@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -50,6 +51,9 @@ class DatasetVersion {
 
   /// Timestamp of dataset creation, in UTC.
   const std::chrono::time_point<std::chrono::system_clock>& timestamp() const;
+
+  /// time_t representation of timestamp. Used for cython
+  std::time_t timet_timestamp() const;
 
   /// Increase version number
   DatasetVersion& operator++();

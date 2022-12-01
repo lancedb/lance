@@ -144,6 +144,10 @@ const std::chrono::time_point<std::chrono::system_clock>& DatasetVersion::timest
   return timestamp_;
 }
 
+std::time_t DatasetVersion::timet_timestamp() const {
+  return std::chrono::system_clock::to_time_t(timestamp_);
+}
+
 DatasetVersion& DatasetVersion::operator++() {
   version_++;
   Touch();
