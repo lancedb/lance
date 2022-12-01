@@ -49,7 +49,7 @@ class DatasetVersion {
   VersionNumberType version() const;
 
   /// Timestamp of dataset creation, in UTC.
-  const std::chrono::time_point<std::chrono::system_clock>& created_timestamp() const;
+  const std::chrono::time_point<std::chrono::system_clock>& timestamp() const;
 
   /// Increase version number
   DatasetVersion& operator++();
@@ -57,11 +57,14 @@ class DatasetVersion {
   /// Increase version number
   DatasetVersion operator++(int);
 
+  /// Change timestamp to `Now()`.
+  void Touch();
+
  private:
   VersionNumberType version_ = 0;
 
   /// Dataset creation time, in UTC timezone.
-  std::chrono::time_point<std::chrono::system_clock> created_timestamp_;
+  std::chrono::time_point<std::chrono::system_clock> timestamp_;
 };
 
 /// Lance Dataset, supports versioning and schema evolution.

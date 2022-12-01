@@ -88,7 +88,7 @@ pb::Manifest Manifest::ToProto() const {
     (*pb.mutable_metadata())[key] = value;
   }
   pb.set_version(version_.version());
-  *pb.mutable_timestamp() = format::ToProto(version_.created_timestamp());
+  *pb.mutable_timestamp() = format::ToProto(version_.timestamp());
 
   for (const auto& fragment : fragments_) {
     auto pb_fragment = pb.add_fragments();
