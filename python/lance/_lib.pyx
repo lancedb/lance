@@ -33,6 +33,7 @@ from pyarrow.lib cimport (
     CExpression,
     CField,
     CRecordBatch,
+    CTable,
     Field,
     GetResultValue,
     RecordBatchReader,
@@ -40,6 +41,7 @@ from pyarrow.lib cimport (
     pyarrow_wrap_batch,
     pyarrow_unwrap_field,
     pyarrow_unwrap_array,
+    pyarrow_unwrap_table,
 )
 from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
@@ -226,6 +228,10 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CLanceDataset]] AddColumn(
                 const shared_ptr[CField]& field, CExpression expression);
 
+        CResult[shared_ptr[CLanceDataset]] Merge(
+                const shared_ptr[CTable]& table, const string& left_on, const string& right_on
+        )
+
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
@@ -286,19 +292,19 @@ cdef class FileSystemDataset(Dataset):
 
     def append_column(
         self,
-        field: Field,
         value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+        field: Optional[Field] = None,
         columns: Optional[List[str]] = None,
     ) -> FileSystemDataset:
         """Append a new column.
 
         Parameters
         ----------
-        field : pyarrow.Field
-            The name and schema of the newly added column.
         value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
             A function / callback that takes in a Batch and produces an Array. The generated array must
             have the same length as the input batch.
+        field : pyarrow.Field, optional
+            The name and schema of the newly added column.
         columns : list of strs, optional.
             The list of columns to read from the source dataset.
         """
@@ -322,6 +328,23 @@ cdef class FileSystemDataset(Dataset):
             return updater.finish()
         else:
             raise ValueError(f"Value does not accept type: {type(value)}")
+
+    def merge(self, right: pyarrow.Table, left_on: str, right_on: str) -> FileSystemDataset:
+        """Merge another table using Left-join
+
+        Parameters:
+        right : pyarrow.Table
+            The table to merge into this dataset.
+        left_on : str
+            The name of the column in this dataset to be compared during merge.
+        right_on : str
+            The name of the column in the right table to be compared during merge.
+        """
+        cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(right)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(
+            self.lance_dataset.Merge(c_table, tobytes(left_on), tobytes(right_on))
+        )
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
 def _lance_dataset_write(
         Dataset data,

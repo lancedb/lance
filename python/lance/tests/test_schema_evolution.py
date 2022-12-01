@@ -15,10 +15,10 @@
 from pathlib import Path
 
 import pandas as pd
-
-import lance
 import pyarrow as pa
 import pyarrow.compute as pc
+
+import lance
 
 
 def test_write_versioned_dataset(tmp_path: Path):
@@ -27,7 +27,10 @@ def test_write_versioned_dataset(tmp_path: Path):
     lance.write_dataset(table1, base_dir)
 
     dataset = lance.dataset(base_dir)
-    new_dataset = dataset.append_column(pa.field("c", pa.utf8()), lambda x: pa.array([f"a{i}" for i in range(len(x))]))
+    new_dataset = dataset.append_column(
+        lambda x: pa.array([f"a{i}" for i in range(len(x))]),
+        field=pa.field("c", pa.utf8()),
+    )
 
     actual_df = new_dataset.to_table().to_pandas()
     expected_df = pd.DataFrame({"a": [1, 10], "b": [2, 20], "c": ["a0", "a1"]})
@@ -46,7 +49,9 @@ def test_column_projection(tmp_path: Path):
         assert x.column_names == ["a"]
         return pa.array([str(i) for i in x.column("a")])
 
-    new_dataset = dataset.append_column(pa.field("c", pa.utf8()), value_func, columns=["a"])
+    new_dataset = dataset.append_column(
+        value_func, field=pa.field("c", pa.utf8()), columns=["a"]
+    )
 
     actual_df = new_dataset.to_table().to_pandas()
     expected_df = pd.DataFrame({"a": [1, 10], "b": [2, 20], "c": ["1", "10"]})
@@ -59,7 +64,9 @@ def test_add_column_with_literal(tmp_path: Path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
     dataset = lance.dataset(base_dir)
-    new_dataset = dataset.append_column(pa.field("b", pa.float64()), pc.scalar(0.5))
+    new_dataset = dataset.append_column(
+        pc.scalar(0.5), field=pa.field("b", pa.float64())
+    )
 
     assert new_dataset.version["version"] == 2
     actual_df = new_dataset.to_table().to_pandas()
@@ -74,11 +81,28 @@ def test_add_column_with_compute(tmp_path: Path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
     dataset = lance.dataset(base_dir)
-    new_dataset = dataset.append_column(pa.field("b", pa.int64()),
-                                        pc.Expression._call("power", [pc.field("a"), pc.scalar(2)]))
+    new_dataset = dataset.append_column(
+        pc.Expression._call("power", [pc.field("a"), pc.scalar(2)]),
+        field=pa.field("b", pa.int64()),
+    )
 
     assert new_dataset.version["version"] == 2
     actual_df = new_dataset.to_table().to_pandas()
     expected_df = table.to_pandas()
     expected_df["b"] = expected_df["a"] * expected_df["a"]
+    pd.testing.assert_frame_equal(actual_df, expected_df)
+
+
+def test_add_column_with_table(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": i, "b": str(i)} for i in range(10)])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    new_table = pa.Table.from_pylist([{"a": i, "c": i * 10} for i in range(10)])
+    new_dataset = dataset.merge(new_table, left_on="a", right_on="a")
+    assert new_dataset.version["version"] == 2
+    actual_df = new_dataset.to_table().to_pandas()
+    expected_df = table.to_pandas()
+    expected_df["c"] = new_table.column("c").to_numpy()
     pd.testing.assert_frame_equal(actual_df, expected_df)
