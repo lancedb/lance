@@ -110,9 +110,10 @@ HashMerger::~HashMerger() {}
     BUILD_IMPL(::arrow::Type::INT32);
     BUILD_IMPL(::arrow::Type::UINT64);
     BUILD_IMPL(::arrow::Type::INT64);
-    //    BUILD_IMPL(::arrow::Type::HALF_FLOAT);
-    BUILD_IMPL(::arrow::Type::FLOAT);
-    BUILD_IMPL(::arrow::Type::DOUBLE);
+    case ::arrow::Type::HALF_FLOAT:
+    case ::arrow::Type::FLOAT:
+    case ::arrow::Type::DOUBLE:
+      return ::arrow::Status::Invalid("Do not support merge on floating points");
     case ::arrow::Type::STRING:
       impl_ = std::unique_ptr<Impl>(new TypedHashMerger<::arrow::StringType, std::string_view>());
       break;
