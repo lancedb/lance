@@ -17,7 +17,7 @@ template <typename T>
 concept ProtoMessage = std::is_base_of<google::protobuf::Message, T>::value;
 
 template <ProtoMessage P>
-::arrow::Result<P> ParseProto(std::shared_ptr<::arrow::Buffer> buf) {
+::arrow::Result<P> ParseProto(const std::shared_ptr<::arrow::Buffer>& buf) {
   auto pb_size = ReadInt<int32_t>(*buf);
   P proto;
   if (!proto.ParseFromArray(buf->data() + sizeof(pb_size), pb_size)) {
@@ -27,7 +27,7 @@ template <ProtoMessage P>
 }
 
 template <ProtoMessage P>
-::arrow::Result<P> ParseProto(std::shared_ptr<::arrow::io::RandomAccessFile> source,
+::arrow::Result<P> ParseProto(const std::shared_ptr<::arrow::io::RandomAccessFile>& source,
                               int64_t offset) {
   ARROW_ASSIGN_OR_RAISE(auto pb_size, ReadInt<int32_t>(source, offset));
   P proto;
@@ -38,7 +38,7 @@ template <ProtoMessage P>
   return proto;
 }
 
-::arrow::Result<int64_t> WriteProto(std::shared_ptr<::arrow::io::OutputStream> sink,
+::arrow::Result<int64_t> WriteProto(const std::shared_ptr<::arrow::io::OutputStream>& sink,
                                     const google::protobuf::Message& pb);
 
 }  // namespace lance::io
