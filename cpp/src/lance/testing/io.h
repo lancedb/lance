@@ -32,7 +32,9 @@ namespace lance::testing {
 
 /// Make lance::io::FileReader from an Arrow Table.
 ::arrow::Result<std::shared_ptr<lance::io::FileReader>> MakeReader(
-    const std::shared_ptr<::arrow::Table>& table);
+    const std::shared_ptr<::arrow::Table>& table,
+    uint64_t max_rows_per_group = 1024
+    );
 
 /// Make a FileSystem Dataset from the table.
 ///

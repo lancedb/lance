@@ -19,15 +19,16 @@
 #include <iostream>
 #include <map>
 
-#include "lance/arrow/writer.h"
 #include "bench_utils.h"
+#include "lance/arrow/dataset.h"
+#include "lance/arrow/file_lance.h"
 
 using std::map;
 using std::string;
 
 namespace fs = std::filesystem;
 
-/// Convert a Parquet file to lance file.
+/// Convert a Parquet file to lance dataset.
 arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) {
   auto uri = in_uri;
   std::string path;
@@ -36,10 +37,14 @@ arrow::Status ConvertParquet(const std::string& in_uri, const std::string& out) 
   auto dataset = OpenDataset(in_uri, "parquet");
   auto scan_builder = dataset->NewScan().ValueOrDie();
   auto scanner = scan_builder->Finish().ValueOrDie();
-  auto table = scanner->ToTable().ValueOrDie();
 
-  auto outfile = fs->OpenOutputStream(out).ValueOrDie();
-  return lance::arrow::WriteTable(*table, outfile);
+  ::arrow::dataset::FileSystemDatasetWriteOptions write_options;
+  std::string base_dir;
+  auto out_fs = ::arrow::fs::FileSystemFromUriOrPath(out, &base_dir).ValueOrDie();
+  write_options.filesystem = out_fs;
+  write_options.base_dir = base_dir;
+  write_options.file_write_options = lance::arrow::LanceFileFormat().DefaultWriteOptions();
+  return lance::arrow::LanceDataset::Write(write_options, scanner);
 }
 
 int main(int argc, char** argv) {
