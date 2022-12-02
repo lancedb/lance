@@ -22,7 +22,7 @@
 /// @brief Public Arrow API.
 namespace lance::arrow {
 
-/// Write an Arrow Table into the destination file..
+/// Write an Arrow Table into the destination file.
 ///
 /// \param table Apache Arrow table.
 /// \param sink the output stream to write the table to.

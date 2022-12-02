@@ -44,12 +44,12 @@ namespace lance::encodings {
  */
 class VarBinaryEncoder : public Encoder {
  public:
-  /// Can we make this int32 type>
+  /// Can we make this int32 type?
   using OffsetType = ::arrow::Int64Type;
 
   explicit VarBinaryEncoder(std::shared_ptr<::arrow::io::OutputStream> out) noexcept;
 
-  virtual ~VarBinaryEncoder() = default;
+  ~VarBinaryEncoder() override = default;
 
   /// Write an Array, and returns the offsets to the index block.
   ::arrow::Result<int64_t> Write(const std::shared_ptr<::arrow::Array>& arr) override;
@@ -68,7 +68,7 @@ class VarBinaryDecoder : public Decoder {
  public:
   using Decoder::Decoder;
 
-  virtual ~VarBinaryDecoder() = default;
+  ~VarBinaryDecoder() override = default;
 
   /** Get a Value without scanning the full row group. */
   ::arrow::Result<std::shared_ptr<::arrow::Scalar>> GetScalar(int64_t idx) const override;
