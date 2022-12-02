@@ -19,6 +19,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import pytest
 
 import lance
 
@@ -68,13 +69,13 @@ def test_add_column_with_literal(tmp_path: Path):
     dataset = lance.dataset(base_dir)
     assert dataset.version["version"] == 1
     # Created within 10 seconds, in UDT
-    assert dataset.version[
-        "timestamp"
-    ] > datetime.datetime.utcnow() - datetime.timedelta(0, 10)
-    # Let Python auto convert timezones
-    assert dataset.version[
-               "timestamp"
-           ] > datetime.datetime.now() - datetime.timedelta(0, 10)
+    ts = dataset.version["timestamp"]
+    with pytest.raises(TypeError):
+        # can't compare offset-naive and offset-aware datetimes
+        assert ts > datetime.datetime.utcnow() - datetime.timedelta(0, 10)
+        
+    assert ts > datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(0, 10)
+    assert ts > datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
 
     time.sleep(1)
     new_dataset = dataset.append_column(
