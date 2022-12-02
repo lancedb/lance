@@ -1,6 +1,6 @@
 # distutils: language = c++
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Optional, List, Dict, Union
 from pathlib import Path
 
@@ -239,7 +239,7 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
-        "timestamp": datetime.utcfromtimestamp(cdv.timet_timestamp()),
+        "timestamp": datetime.fromtimestamp(cdv.timet_timestamp(), tz=timezone.utc),
     }
 
 cdef class FileSystemDataset(Dataset):
