@@ -21,7 +21,7 @@
 
 #include "bench_utils.h"
 #include "lance/arrow/dataset.h"
-#include "lance/arrow/writer.h"
+#include "lance/arrow/file_lance.h"
 
 using std::map;
 using std::string;

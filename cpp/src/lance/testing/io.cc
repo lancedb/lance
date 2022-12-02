@@ -23,12 +23,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
-#include "lance/arrow/writer.h"
 #include "lance/format/manifest.h"
 #include "lance/io/reader.h"
 #include "lance/io/writer.h"
@@ -47,9 +47,26 @@ namespace lance::testing {
 }
 
 ::arrow::Result<std::shared_ptr<io::FileReader>> MakeReader(
-    const std::shared_ptr<::arrow::Table>& table) {
+    const std::shared_ptr<::arrow::Table>& table,
+    uint64_t max_rows_per_group) {
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
-  ARROW_RETURN_NOT_OK(lance::arrow::WriteTable(*table, sink));
+
+  auto options = std::make_shared<lance::arrow::FileWriteOptions>();
+  options->batch_size = max_rows_per_group;
+  auto schema = std::make_shared<lance::format::Schema>(table->schema());
+  lance::io::FileWriter writer(schema, options, sink, {});
+
+  std::shared_ptr<::arrow::RecordBatch> batch;
+  ::arrow::TableBatchReader batch_reader(table);
+  batch_reader.set_chunksize(options->batch_size);
+  while (true) {
+    ARROW_RETURN_NOT_OK(batch_reader.ReadNext(&batch));
+    if (!batch) {
+      break;
+    }
+    ARROW_RETURN_NOT_OK(writer.Write(batch));
+  }
+  writer.Finish().Wait();
   auto infile = make_shared<::arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
