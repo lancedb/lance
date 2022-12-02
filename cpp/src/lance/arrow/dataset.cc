@@ -134,21 +134,33 @@ std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 
 }  // namespace
 
-DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
+DatasetVersion::DatasetVersion(uint64_t version,
+                               std::chrono::time_point<std::chrono::system_clock> created)
+    : version_(version), timestamp_(created) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
+const std::chrono::time_point<std::chrono::system_clock>& DatasetVersion::timestamp() const {
+  return timestamp_;
+}
+
+std::time_t DatasetVersion::timet_timestamp() const {
+  return std::chrono::system_clock::to_time_t(timestamp_);
+}
+
 DatasetVersion& DatasetVersion::operator++() {
   version_++;
-  created_time_ = std::chrono::system_clock::now();
+  Touch();
   return *this;
 }
 
 DatasetVersion DatasetVersion::operator++(int) {
   version_++;
-  created_time_ = std::chrono::system_clock::now();
+  Touch();
   return *this;
 }
+
+void DatasetVersion::Touch() { timestamp_ = std::chrono::system_clock::now(); }
 
 //-------------------------
 // LanceDataset::Impl
@@ -158,15 +170,31 @@ std::string LanceDataset::Impl::data_dir() const { return fs::path(base_uri) / k
 
 std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
 
-::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
-    std::shared_ptr<lance::format::Manifest> new_manifest) const {
+namespace {
+
+::arrow::Status WriteManifest(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+                              const std::string& base_uri,
+                              const std::shared_ptr<format::Manifest>& manifest) {
+  // Write the manifest version file.
+  // It only supports single writer at the moment.
+  auto version_dir = (fs::path(base_uri) / kVersionsDir).string();
+  ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
   auto manifest_path = GetManifestPath(base_uri, manifest->version());
   {
+    // Keep the serialized time, which is when this particular version of dataset is visible.
+    manifest->Touch();
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
     ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
   }
   auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
-  ARROW_RETURN_NOT_OK(fs->CopyFile(manifest_path, latest_manifest_path));
+  return fs->CopyFile(manifest_path, latest_manifest_path);
+}
+
+}  // namespace
+
+::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
+    std::shared_ptr<lance::format::Manifest> new_manifest) const {
+  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest));
   return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
 }
 
@@ -261,17 +289,8 @@ LanceDataset::~LanceDataset() {}
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
   manifest->AppendFragments(CreateFragments(paths, *manifest->schema()));
-  // Write the manifest version file.
-  // It only supports single writer at the moment.
-  auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
-  ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
-  auto manifest_path = GetManifestPath(base_dir, manifest->version());
-  {
-    ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
-  }
-  auto latest_manifest_path = GetManifestPath(base_dir, std::nullopt);
-  return fs->CopyFile(manifest_path, latest_manifest_path);
+
+  return WriteManifest(fs, base_dir, manifest);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(

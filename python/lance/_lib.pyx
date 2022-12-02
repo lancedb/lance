@@ -1,10 +1,12 @@
 # distutils: language = c++
 
+from datetime import datetime
 from typing import Callable, Optional, List, Dict, Union
 from pathlib import Path
 
 import pyarrow
 from cython.operator cimport dereference as deref
+from libc.time cimport time_t
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
@@ -198,6 +200,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CDatasetVersion "::lance::arrow::DatasetVersion":
         uint64_t version() const;
 
+        time_t timet_timestamp() const;
+
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         enum WriteMode "WriteMode":
             CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
@@ -235,6 +239,7 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
+        "timestamp": datetime.utcfromtimestamp(cdv.timet_timestamp()),
     }
 
 cdef class FileSystemDataset(Dataset):

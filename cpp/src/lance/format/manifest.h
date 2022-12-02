@@ -78,6 +78,9 @@ class Manifest final {
   ///
   std::shared_ptr<Manifest> BumpVersion(bool overwrite = false);
 
+  /// Update timestamps.
+  void Touch();
+
   /// Get schema of the dataset.
   const std::shared_ptr<Schema>& schema() const;
 
@@ -97,8 +100,10 @@ class Manifest final {
   /// Table schema.
   std::shared_ptr<Schema> schema_;
 
+  /// Dataset version.
   ::lance::arrow::DatasetVersion version_;
 
+  /// Data fragments in this dataset.
   std::vector<std::shared_ptr<DataFragment>> fragments_;
 
   explicit Manifest(const lance::format::pb::Manifest& pb);

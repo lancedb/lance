@@ -12,6 +12,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import datetime
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -64,11 +66,23 @@ def test_add_column_with_literal(tmp_path: Path):
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
     dataset = lance.dataset(base_dir)
+    assert dataset.version["version"] == 1
+    # Created within 10 seconds, in UDT
+    assert dataset.version[
+        "timestamp"
+    ] > datetime.datetime.utcnow() - datetime.timedelta(0, 10)
+    # Let Python auto convert timezones
+    assert dataset.version[
+               "timestamp"
+           ] > datetime.datetime.now() - datetime.timedelta(0, 10)
+
+    time.sleep(1)
     new_dataset = dataset.append_column(
         pc.scalar(0.5), field=pa.field("b", pa.float64())
     )
 
     assert new_dataset.version["version"] == 2
+    assert new_dataset.version["timestamp"] > dataset.version["timestamp"]
     actual_df = new_dataset.to_table().to_pandas()
     expected_df = table.to_pandas()
     expected_df["b"] = 0.5
