@@ -22,7 +22,6 @@
 
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/stl.h"
-#include "lance/arrow/writer.h"
 #include "lance/testing/io.h"
 #include "lance/testing/json.h"
 
@@ -41,11 +40,7 @@ TEST_CASE("FileSystemFactory Test") {
   auto table =
       TableFromJSON(schema, R"([{"key": "one"}, {"key": "two"}, {"key": "three"}])").ValueOrDie();
   auto fs = arrow::fs::FileSystemFromUriOrPath(path).ValueOrDie();
-
-  {
-    auto sink = fs->OpenOutputStream(path).ValueOrDie();
-    CHECK(lance::arrow::WriteTable(*table, sink).ok());
-  }
+  CHECK(MakeDataset(table).ok());
 
   auto factory =
       arrow::dataset::FileSystemDatasetFactory::Make(
