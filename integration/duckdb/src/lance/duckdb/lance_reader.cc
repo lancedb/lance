@@ -15,12 +15,15 @@
 
 #include "lance/duckdb/lance_reader.h"
 
+#include <arrow/filesystem/api.h>
 #include <lance/arrow/dataset.h>
 
 #include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "lance/duckdb/lance.h"
 
 namespace lance::duckdb {
 
@@ -42,12 +45,18 @@ std::unique_ptr<::duckdb::FunctionData> LanceScanBind(
     std::vector<std::string> &names) {
   auto dataset_uri = input.inputs[0].GetValue<std::string>();
   printf("Dataset uri is: %s\n", dataset_uri.c_str());
-//  auto result =
-  names.emplace_back("abc");
-  return_types.emplace_back(::duckdb::LogicalType::INTEGER);
 
+  std::string path;
+  auto fs = GetResult(::arrow::fs::FileSystemFromUriOrPath(dataset_uri, &path));
+  auto dataset = GetResult(lance::arrow::LanceDataset::Make(std::move(fs), path));
+  auto schema = dataset->schema();
   auto bind_data = std::make_unique<ScanBindData>();
-  bind_data->column_ids.emplace_back(0);
+  for (int i = 0; i < schema->fields().size(); ++i) {
+    const auto& field = schema->field(i);
+    names.emplace_back(field->name());
+    return_types.emplace_back(ToLogicalType(*field->type()));
+    bind_data->column_ids.emplace_back(i);
+  }
   return std::move(bind_data);
 }
 
