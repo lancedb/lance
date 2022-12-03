@@ -18,6 +18,7 @@
 /// \brief Lance Core Adaptors and utilities
 
 #include <arrow/result.h>
+#include <arrow/status.h>
 #include <arrow/type_fwd.h>
 
 #include <duckdb/common/exception.hpp>
@@ -33,6 +34,14 @@ T GetResult(::arrow::Result<T>&& result) {
   throw E(result.status().message());
 }
 
+template <typename E = ::duckdb::IOException>
+void CheckStatus(const ::arrow::Status& status) {
+  if (!status.ok()) {
+    throw E(status.message());
+  }
+}
+
+/// Convert Arrow and Lance types into DuckDB logical type
 ::duckdb::LogicalType ToLogicalType(const ::arrow::DataType& arrow_type);
 
 }  // namespace lance::duckdb

@@ -21,7 +21,7 @@ namespace lance::duckdb {
 
 /// Get lance reader:
 ///
-/// SELECT * from lance_scan("s3://path/to");
+/// SELECT * from lance_scan("s3://path/to/dataset");
 ::duckdb::TableFunctionSet GetLanceReaderFunction();
 
 }

@@ -144,7 +144,7 @@ endif()
 # add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
-target_link_libraries(lance_loadable_extension lance ArrowDataset::arrow_dataset_shared)
+target_link_libraries(lance_loadable_extension lance ArrowDataset::arrow_dataset_shared fmt::fmt)
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
