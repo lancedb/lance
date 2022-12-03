@@ -109,10 +109,11 @@ if(LANCE_BUILD_PYTORCH)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
-# Add lance
-include_directories(${CMAKE_BINARY_DIR}/lance/src)
+# Add lance core as dependency
+find_package(Arrow REQUIRED)
+find_package(ArrowDataset REQUIRED)
+include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include)
 add_subdirectory(../../cpp lance)
-
 
 include_directories(src)
 
@@ -141,6 +142,7 @@ endif()
 # add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
+target_link_libraries(lance_loadable_extension lance ArrowDataset::arrow_dataset_shared)
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"

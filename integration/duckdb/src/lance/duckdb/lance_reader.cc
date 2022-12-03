@@ -15,15 +15,41 @@
 
 #include "lance/duckdb/lance_reader.h"
 
+#include <lance/arrow/dataset.h>
+
+#include <cstdio>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace lance::duckdb {
 
-struct GlobalLanceReaderFunctionState : public ::duckdb::GlobalTableFunctionState {};
-
-struct LocalLanceReaderFunctionState : public ::duckdb::LocalTableFunctionState {
-
+struct GlobalScanState : public ::duckdb::GlobalTableFunctionState {
+  std::shared_ptr<lance::arrow::LanceDataset> dataset;
 };
+
+struct LocalScanState : public ::duckdb::LocalTableFunctionState {};
+
+/// BindData for Lance Scan
+struct ScanBindData : public ::duckdb::TableFunctionData {
+  std::shared_ptr<lance::arrow::LanceDataset> dataset;
+};
+
+std::unique_ptr<::duckdb::FunctionData> LanceScanBind(
+    ::duckdb::ClientContext &context,
+    ::duckdb::TableFunctionBindInput &input,
+    std::vector<::duckdb::LogicalType> &return_types,
+    std::vector<std::string> &names) {
+  auto dataset_uri = input.inputs[0].GetValue<std::string>();
+  printf("Dataset uri is: %s\n", dataset_uri.c_str());
+//  auto result =
+  names.emplace_back("abc");
+  return_types.emplace_back(::duckdb::LogicalType::INTEGER);
+
+  auto bind_data = std::make_unique<ScanBindData>();
+  bind_data->column_ids.emplace_back(0);
+  return std::move(bind_data);
+}
 
 void LanceScan(::duckdb::ClientContext &context,
                ::duckdb::TableFunctionInput &input,
@@ -32,7 +58,8 @@ void LanceScan(::duckdb::ClientContext &context,
 ::duckdb::TableFunctionSet GetLanceReaderFunction() {
   ::duckdb::TableFunctionSet func_set("lance_scan");
 
-  ::duckdb::TableFunction table_function({::duckdb::LogicalType::VARCHAR}, LanceScan);
+  ::duckdb::TableFunction table_function(
+      {::duckdb::LogicalType::VARCHAR}, LanceScan, LanceScanBind);
   table_function.projection_pushdown = true;
   table_function.filter_pushdown = true;
   table_function.filter_prune = true;

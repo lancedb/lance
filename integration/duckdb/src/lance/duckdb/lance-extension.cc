@@ -18,9 +18,10 @@
 
 #include <duckdb.hpp>
 
+#include "lance/duckdb/lance_reader.h"
 #include "lance/duckdb/list_functions.h"
-#include "lance/duckdb/vector_functions.h"
 #include "lance/duckdb/ml/functions.h"
+#include "lance/duckdb/vector_functions.h"
 
 namespace duckdb {
 
@@ -46,11 +47,15 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
     catalog.CreateTableFunction(context, func.get());
   }
 
+  auto scan_func = lance::duckdb::GetLanceReaderFunction();
+  ::duckdb::CreateTableFunctionInfo scan(scan_func);
+  catalog.CreateTableFunction(context, &scan);
+
   con.Commit();
 }
 
 std::string LanceExtension::Name() { return {"lance"}; }
-};
+};  // namespace duckdb
 
 extern "C" {
 
