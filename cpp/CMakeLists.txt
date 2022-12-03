@@ -160,7 +160,7 @@ endif ()
 add_library(lance SHARED ${lance_objects})
 target_link_libraries(lance PUBLIC
         ${Protobuf_LIBRARIES}
-        ${ARROW_SHARED_LIB}
-        ${ARROW_DATASET_SHARED_LIB}
+        Arrow::arrow_shared
+        ArrowDataset::arrow_dataset_shared
         fmt::fmt
         )
