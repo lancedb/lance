@@ -15,17 +15,13 @@
 
 #pragma once
 
-#include <duckdb.hpp>
-#include <duckdb/main/client_context.hpp>
+#include <duckdb/function/function_set.hpp>
 
-namespace duckdb {
+namespace lance::duckdb {
 
-class LanceExtension : public Extension {
- public:
+/// Get lance reader:
+///
+/// SELECT * from lance_scan("s3://path/to");
+::duckdb::TableFunctionSet GetLanceReaderFunction();
 
-  void Load(DuckDB &db) override;
-
-  std::string Name() override;
-};
-
-} // namespace duckdb
+}

@@ -109,12 +109,21 @@ if(LANCE_BUILD_PYTORCH)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
+# Add lance
+include_directories(${CMAKE_BINARY_DIR}/lance/src)
+add_subdirectory(../../cpp lance)
+
+
 include_directories(src)
 
 set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/lance-extension.cc
     src/lance/duckdb/list_functions.cc
-    src/lance/duckdb/vector_functions.cc)
+    src/lance/duckdb/list_functions.h
+    src/lance/duckdb/vector_functions.cc
+    src/lance/duckdb/lance_reader.h
+    src/lance/duckdb/lance_reader.cc
+)
 
 set(LANCE_EXT_SOURCE_ML
     src/lance/duckdb/ml/catalog.cc

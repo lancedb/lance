@@ -16,7 +16,7 @@
 protobuf_generate_cpp(
         PROTO_SRCS
         PROTO_HDRS
-        ${CMAKE_SOURCE_DIR}/../protos/format.proto
+        ${PROJECT_SOURCE_DIR}/../protos/format.proto
 )
 
 add_library(
