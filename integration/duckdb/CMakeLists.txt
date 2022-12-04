@@ -112,7 +112,7 @@ endif()
 # Add lance core as dependency
 find_package(Arrow REQUIRED)
 find_package(ArrowDataset REQUIRED)
-include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include)
+include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include ../../cpp/src)
 add_subdirectory(../../cpp lance)
 
 include_directories(src)

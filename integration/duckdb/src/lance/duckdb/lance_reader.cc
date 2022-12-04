@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "lance/arrow/type.h"
 #include "lance/duckdb/lance.h"
 
 namespace lance::duckdb {
@@ -93,10 +94,10 @@ std::unique_ptr<::duckdb::GlobalTableFunctionState> InitGlobal(
 }
 
 /// Convert numeric array to duckdb vector.
-template <typename ArrowType>
+template <ArrowType T>
 void ToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
   // TODO: dynamic_pointer_cast does not work here, IDK why.
-  auto array = std::static_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(arr);
+  auto array = std::static_pointer_cast<typename ::arrow::TypeTraits<T>::ArrayType>(arr);
   assert(array != nullptr);
   // TODO: How to use zero copy to move data from arrow to duckdb.
   for (int i = 0; i < array->length(); ++i) {
