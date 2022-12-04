@@ -46,6 +46,7 @@ inline ::duckdb::LogicalType ArrowListTypeToLogicalType(const ::arrow::DataType&
 }
 
 }  // namespace
+
 ::duckdb::LogicalType ToLogicalType(const ::arrow::DataType& arrow_type) {
   switch (arrow_type.id()) {
     case ::arrow::Type::BOOL:
