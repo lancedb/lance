@@ -92,7 +92,7 @@ std::unique_ptr<::duckdb::GlobalTableFunctionState> InitGlobal(
 
 /// Convert numeric array to duckdb vector.
 template <typename ArrowType>
-void NumericArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
+void ToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
   // TODO: dynamic_pointer_cast does not work here, IDK why.
   auto array = std::static_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(arr);
   assert(array != nullptr);
@@ -103,38 +103,54 @@ void NumericArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
 }
 
+template <>
+void ToVector<::arrow::StringType>(const std::shared_ptr<::arrow::Array> &arr,
+                                   ::duckdb::Vector *out) {
+  auto array =
+      std::static_pointer_cast<typename ::arrow::TypeTraits<::arrow::StringType>::ArrayType>(arr);
+  assert(array != nullptr);
+  // TODO: How to use zero copy to move data from arrow to duckdb.
+  for (int i = 0; i < array->length(); ++i) {
+    out->SetValue(i, std::string(array->Value(i)));
+  }
+  out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
+}
+
 /// Convert a `arrow::Array` to `duckdb::Vector`.
 void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
   switch (arr->type_id()) {
     case ::arrow::Type::UINT8:
-      NumericArrayToVector<::arrow::UInt8Type>(arr, out);
+      ToVector<::arrow::UInt8Type>(arr, out);
       break;
     case ::arrow::Type::INT8:
-      NumericArrayToVector<::arrow::Int8Type>(arr, out);
+      ToVector<::arrow::Int8Type>(arr, out);
       break;
     case ::arrow::Type::UINT16:
-      NumericArrayToVector<::arrow::UInt16Type>(arr, out);
+      ToVector<::arrow::UInt16Type>(arr, out);
       break;
     case ::arrow::Type::INT16:
-      NumericArrayToVector<::arrow::Int16Type>(arr, out);
+      ToVector<::arrow::Int16Type>(arr, out);
       break;
     case ::arrow::Type::UINT32:
-      NumericArrayToVector<::arrow::UInt32Type>(arr, out);
+      ToVector<::arrow::UInt32Type>(arr, out);
       break;
     case ::arrow::Type::INT32:
-      NumericArrayToVector<::arrow::Int32Type>(arr, out);
+      ToVector<::arrow::Int32Type>(arr, out);
       break;
     case ::arrow::Type::UINT64:
-      NumericArrayToVector<::arrow::UInt64Type>(arr, out);
+      ToVector<::arrow::UInt64Type>(arr, out);
       break;
     case ::arrow::Type::INT64:
-      NumericArrayToVector<::arrow::Int64Type>(arr, out);
+      ToVector<::arrow::Int64Type>(arr, out);
       break;
     case ::arrow::Type::FLOAT:
-      NumericArrayToVector<::arrow::FloatType>(arr, out);
+      ToVector<::arrow::FloatType>(arr, out);
       break;
     case ::arrow::Type::DOUBLE:
-      NumericArrayToVector<::arrow::FloatType>(arr, out);
+      ToVector<::arrow::FloatType>(arr, out);
+      break;
+    case ::arrow::Type::STRING:
+      ToVector<::arrow::StringType>(arr, out);
       break;
     default:
       throw ::duckdb::IOException("Unsupported type: " + arr->type()->ToString());
