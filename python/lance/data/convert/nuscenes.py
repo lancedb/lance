@@ -13,8 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-# Nuscenes consists of multiple datasets
-# nuimages (images only) and nuscenes (point clouds and images)
 import json
 import os
 import sys
@@ -26,22 +24,36 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+from lance.types import Box2dType
+
 sys.path.append("..")
 
 SUPPORTED_DATASET_VERSIONS = ["v1.0-mini", "v1.0"]
-INSTANCE_DATA_TABLES = ["sample", "sample_data", "object_ann", "surface_ann", "category"]
+INSTANCE_DATA_TABLES = [
+    "sample",
+    "sample_data",
+    "object_ann",
+    "surface_ann",
+    "category",
+    "ego_pose",
+    "calibrated_sensor",
+    "sensor",
+    "log"
+]
 
 class NuscenesConverter():
     def __init__(self, uri_root: str, dataset_verson: str):
-        # We either support Nuimages (just images and sweeps using camera modality)
-        # or Nuscenes (includes radar, camera and lidar).
-        # Both datasets come with a mini version that contains no splits
-        # and a full size version with splits.
+        """
+        We either support Nuimages (just images and sweeps using camera modality)
+        or Nuscenes (includes radar, camera and lidar).
+        Both datasets come with a mini version that contains no splits
+        and a full size version with splits.
+        """
         assert dataset_verson in SUPPORTED_DATASET_VERSIONS, f"Nuscenes converter does not support the dataset version {dataset_verson}."
         self.dataset_version = dataset_verson
         self.has_split = True
-        
         self.uri_root = uri_root
+        self.instance_data = self._load_instance_data()
 
         if "mini" in self.dataset_version:
             self.has_split = False 
@@ -59,6 +71,9 @@ class NuscenesConverter():
             return json.load(fobj)
     
     def _load_instance_data(self):
+        """
+        Loads the json data.
+        """
         instance_data = {}
 
         for table in INSTANCE_DATA_TABLES:
@@ -66,45 +81,187 @@ class NuscenesConverter():
 
         return instance_data
 
+    def _clone_and_rename(self, object, table_name):
+        """
+        Renames the object, as when we merge to flatten
+        objects we can face name collisions. To keep semantic
+        consistency with the data model, we apply a suffix of
+        the table name.
+        """
+        object_joined = {}
+        for key in object:
+            object_joined[f"{table_name}_{key}_"] = object[key]
+        return object_joined
+
+    def _merge_dict(self, obj1, obj2, table_name):
+        """
+        Merges two dictionaries to flatten the object.
+        """
+        rename_and_cloned_obj2 = self._clone_and_rename(obj2, table_name)
+        return {**obj1, **rename_and_cloned_obj2}
+
+    def _find_foreign_object(self, token, foreign_key, table_name):
+        """
+        Find and returns a foreign object with a given foreign key
+        and token value.
+        """
+        for object in self.instance_data[table_name]:
+            if token == object[foreign_key]:
+                return object
+        return None
+
+    def _find_annotations(self, token, foreign_key, table_name):
+        """
+        Collects the annotation for the given sample.
+        """
+        objects = []
+        for object in self.instance_data[table_name]:
+            if token == object[foreign_key]:
+                category = self._find_foreign_object(object["category_token"], "token", "category")
+                object_joined = self._merge_dict(object, category, "category")
+                objects.append(object_joined)
+        return objects
+
     def instances_to_df(self):
+        """
+        Converts the dataset to a dataframe that is flattened.
+        To do so, we need to get all the samples and
+        join various entities to the sample.
+        """
         instances_df = []
-    
-        instance_data = self._load_instance_data()
-       
-        for sample in instance_data["sample"]:            
-            object_annotations = []
-            object_labels = []
-            
-            obj_t = sample["key_camera_token"]
-            
-            # Collect all the objects in the sample
-            for o in instance_data["object_ann"]:
-                if o["sample_data_token"] == obj_t:
-                    
-                    # Collect the category label for the object
-                    obj_cat_t = o["category_token"]
+           
+        for sample in self.instance_data["sample"]:
+            # Find all related entities to the sample
+            log_data = self._find_foreign_object(sample["log_token"], "token", "log")
+            sample_data = self._find_foreign_object(sample["token"], "sample_token", "sample_data")
+            ego_pose = self._find_foreign_object(sample_data["ego_pose_token"], "token", "ego_pose")
+            calibrated_sensor = self._find_foreign_object(sample_data["calibrated_sensor_token"], "token", "calibrated_sensor")
+            sensor = self._find_foreign_object(calibrated_sensor["sensor_token"], "token", "sensor")
 
-                    for c in instance_data["category"]:                        
-                        if obj_cat_t == c["token"]:
-                            object_annotations.append(o)
-                            object_labels.append(c)
+            # Create the flatten sample
+            sample_joined = copy.deepcopy(sample)
+            sample_joined = self._merge_dict(sample_joined, log_data, "log")
+            sample_joined = self._merge_dict(sample_joined, sample_data, "sample_data")
+            sample_joined = self._merge_dict(sample_joined, ego_pose, "ego_pose")
+            sample_joined = self._merge_dict(sample_joined, calibrated_sensor, "calibrated_sensor")
+            sample_joined = self._merge_dict(sample_joined, sensor, "sensor")
 
-            # Get the filename for the sample
-            for o in instance_data["sample_data"]:
-                if sample["token"] == o["sample_token"]:
-                    sample_data = copy.deepcopy(o)
+            # Find the annotations for the sample
+            object_anns = self._find_annotations(sample_data["token"], "sample_data_token", "object_ann")
+            surface_ann = self._find_annotations(sample_data["token"] , "sample_data_token", "surface_ann")
+            sample_joined["object_ann"] = object_anns
+            sample_joined["surface_ann"] = surface_ann
             
-            # Create a tuple with all of our joined objects
-            instances_df.append({
-                "sample": sample,
-                "sample_data": sample_data,
-                "object_annotations": object_annotations,
-                "object_labels": object_labels
-            })
+            instances_df.append(sample_joined)
         
         return pd.DataFrame(instances_df)
-            
-
-                    
-
-
+    
+    def get_schema(self) -> pa.Schema:
+        """
+        Returns the Arrow schema which is flattened.
+        """
+        log_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("logfile", pa.string()),
+                pa.field("vehicle", pa.string()),
+                pa.field("date_captured", pa.string()),
+                pa.field("location", pa.string())
+            ]
+        )
+        calibrated_sensor_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("sensor_token", pa.string()),
+                pa.field("translation", pa.list_(pa.float32(), 3)),
+                pa.field("rotation", pa.list_(pa.float32(), 4)),
+                pa.field("camera_intrinsic", pa.list_(pa.list_(pa.float32(), 3))),
+                pa.field("camera_distortion", pa.list_(pa.float32(), 6)), # can be 5 or 6 length
+            ]
+        )
+        sensor_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("channel", pa.string()),
+                pa.field("modality", pa.string())
+            ]
+        )
+        sample_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("timestamp", pa.int32()),
+                pa.field("log_token", pa.string()),
+                pa.field("key_camera_token", pa.string())
+            ]
+        )
+        sample_data_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("sample_token", pa.string()),
+                pa.field("ego_pose_token", pa.string()),
+                pa.field("calibrated_sensor_token", pa.string()),
+                pa.field("filename", pa.string()),
+                pa.field("fileformat", pa.string()),
+                pa.field("width", pa.int32()),
+                pa.field("height", pa.int32()),
+                pa.field("timestamp", pa.int32()),
+                pa.field("is_key_frame", pa.bool_()),
+                pa.field("next", pa.string()),
+                pa.field("prev", pa.string())
+            ]
+        )
+        ego_pose_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("translation", pa.list_(pa.float32(), 3)),
+                pa.field("rotation", pa.list_(pa.float32(), 4)),
+                pa.field("timestamp", pa.int32()),
+                pa.field("rotation_rate", pa.list_(pa.float32(), 3)),
+                pa.field("acceleration", pa.list_(pa.float32(), 3)),
+                pa.field("speed", pa.float32()),
+            ]
+        )  
+        surface_ann_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("sample_data_token", pa.string()),
+                pa.field("category_token", pa.string()),
+                pa.field("mask", pa.string()) # TODO: change to RLE once type is created
+            ]
+        )
+        object_ann_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("sample_data_token", pa.string()),
+                pa.field("category_token", pa.string()),
+                pa.field("attribute_tokens", pa.list_(pa.string())),
+                pa.field("bbox", Box2dType),
+                pa.field("mask", pa.string()) # TODO: change to RLE once type is created
+            ]
+        )
+        category_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("description", pa.string())
+            ]
+        )
+        attribute_schema = pa.struct(
+            [
+                pa.field("token", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("description", pa.string())
+            ]
+        )
+        return pa.schema(
+            pa.field("log", log_schema),
+            pa.field("calibrated_sensor", calibrated_sensor_schema),
+            pa.field("sensor", sensor_schema),
+            pa.field("sample", sample_schema),
+            pa.field("sample_data", sample_data_schema),
+            pa.field("ego_pose", ego_pose_schema),
+            pa.field("surface_ann", surface_ann_schema),
+            pa.field("object_ann", object_ann_schema),
+            pa.field("category", category_schema),
+            pa.field("attribute", attribute_schema)
+        )
