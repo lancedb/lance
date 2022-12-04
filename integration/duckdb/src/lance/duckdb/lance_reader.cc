@@ -35,6 +35,9 @@ namespace lance::duckdb {
 
 namespace {
 
+// Forward declaration
+void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out);
+
 struct GlobalScanState : public ::duckdb::GlobalTableFunctionState {
   std::shared_ptr<lance::arrow::LanceDataset> dataset;
   ::arrow::dataset::TaggedRecordBatchGenerator batch_generator;
@@ -120,16 +123,36 @@ template <>
 void ToVector<::arrow::DictionaryType>(const std::shared_ptr<::arrow::Array> &arr,
                                        ::duckdb::Vector *out) {
   auto array = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  fmt::print("arr type->{}\n", arr->type()->ToString());
   // TODO: zero copy
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
   auto dict_arr = std::dynamic_pointer_cast<::arrow::StringArray>(array->dictionary());
   out->Print();
   fmt::print("Logical type: {}\n", out->GetType().ToString());
-  auto indices_arr = std::dynamic_pointer_cast<::arrow::Int16Array>(array->indices());
+  auto indices_arr = std::static_pointer_cast<::arrow::Int8Array>(array->indices());
   fmt::print("Index arr: {}\n", fmt::ptr(indices_arr));
   for (int i = 0; i < indices_arr->length(); ++i) {
     auto idx = indices_arr->Value(i);
     out->SetValue(i, std::string(dict_arr->Value(idx)));
+  }
+}
+
+template <>
+void ToVector<::arrow::StructType>(const std::shared_ptr<::arrow::Array> &arr,
+                                   ::duckdb::Vector *out) {
+  assert(arr->type_id() == ::arrow::Type::STRUCT);
+  auto struct_arr = std::static_pointer_cast<::arrow::StructArray>(arr);
+  auto &vector_children = ::duckdb::StructVector::GetEntries(*out);
+
+  // Sanity checks
+  if (struct_arr->num_fields() != vector_children.size()) {
+    throw ::duckdb::InvalidInputException("Struct fields are not expected: %lu != %lu",
+                                          struct_arr->num_fields(),
+                                          vector_children.size());
+  }
+
+  for (int i = 0; i < struct_arr->num_fields(); i++) {
+    ArrowArrayToVector(struct_arr->field(i), vector_children[i].get());
   }
 }
 
@@ -171,6 +194,9 @@ void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Ve
       break;
     case ::arrow::Type::DICTIONARY:
       ToVector<::arrow::DictionaryType>(arr, out);
+      break;
+    case ::arrow::Type::STRUCT:
+      ToVector<::arrow::StructType>(arr, out);
       break;
     default:
       throw ::duckdb::IOException("Unsupported Arrow Type: " + arr->type()->ToString());
