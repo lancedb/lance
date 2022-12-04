@@ -19,7 +19,7 @@
 namespace lance::io {
 
 /// Write the protobuf message and returns the offset the message was written at.
-::arrow::Result<int64_t> WriteProto(std::shared_ptr<::arrow::io::OutputStream> sink,
+::arrow::Result<int64_t> WriteProto(const std::shared_ptr<::arrow::io::OutputStream>& sink,
                                     const google::protobuf::Message& pb) {
   ARROW_ASSIGN_OR_RAISE(auto offset, sink->Tell());
   int32_t pb_length = pb.ByteSizeLong();

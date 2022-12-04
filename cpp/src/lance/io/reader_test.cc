@@ -24,7 +24,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/arrow/stl.h"
-#include "lance/arrow/writer.h"
 #include "lance/testing/io.h"
 
 TEST_CASE("Test List Array With Nulls") {
@@ -42,12 +41,7 @@ TEST_CASE("Test List Array With Nulls") {
   auto table = ::arrow::Table::Make(schema, {values});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
-
-  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  auto reader_result = lance::io::FileReader::Make(infile);
-  INFO("Open file: " << reader_result.status());
-  auto reader = std::move(reader_result.ValueOrDie());
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
   auto table_result = reader->ReadTable();
   INFO("Table read result: " << table_result.status());
   CHECK(table_result.ok());
@@ -79,10 +73,7 @@ TEST_CASE("Get List Array With Indices") {
   auto table = ::arrow::Table::Make(schema, {arr});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
-  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  auto reader = lance::io::FileReader(infile);
-  CHECK(reader.Open().ok());
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
   for (auto& indices : std::vector<std::vector<int>>({{0, 1, 3}, {2, 3, 4}, {0, 5, 9}})) {
     list_builder.Reset();
@@ -95,7 +86,7 @@ TEST_CASE("Get List Array With Indices") {
         std::static_pointer_cast<::arrow::ListArray>(list_builder.Finish().ValueOrDie());
     auto expected_table = ::arrow::Table::Make(schema, {expected_arr});
 
-    auto batch = reader.ReadBatch(reader.schema(), 0, lance::arrow::ToArray(indices).ValueOrDie())
+    auto batch = reader->ReadBatch(reader->schema(), 0, lance::arrow::ToArray(indices).ValueOrDie())
                      .ValueOrDie();
     CHECK(batch->Equals(*expected_table->CombineChunksToBatch().ValueOrDie()));
   }

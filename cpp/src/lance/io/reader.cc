@@ -256,12 +256,6 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
-    const std::vector<std::string>& columns) {
-  ARROW_ASSIGN_OR_RAISE(auto projection, manifest_->schema()->Project(columns));
-  return ReadTable(*projection);
-}
-
-::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
     const lance::format::Schema& schema) const {
   std::vector<std::shared_ptr<::arrow::ChunkedArray>> columns;
   for (auto& field : schema.fields()) {
@@ -273,39 +267,6 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
     columns.emplace_back(std::make_shared<::arrow::ChunkedArray>(chunks));
   }
   return ::arrow::Table::Make(schema.ToArrow(), columns);
-}
-
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
-    const lance::format::Schema& schema, int32_t offset, int32_t length) const {
-  ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(offset));
-  auto [batch_id, idx_in_batch] = batch;
-  std::vector<std::shared_ptr<::arrow::Array>> arrs;
-  for (auto& field : schema.fields()) {
-    auto len =
-        static_cast<int32_t>(std::min(static_cast<int64_t>(length), metadata_->length() - offset));
-    ::arrow::ArrayVector chunks;
-    // Make a local copy?
-    auto ckid = batch_id;
-    auto ck_index = idx_in_batch;
-    while (len > 0 && ckid < metadata_->num_batches()) {
-      auto page_length = metadata_->GetBatchLength(batch_id);
-      auto length_in_page = std::min(len, page_length - ck_index);
-      ARROW_ASSIGN_OR_RAISE(auto arr,
-                            GetArray(field, ckid, ArrayReadParams(ck_index, length_in_page)));
-      len -= length_in_page;
-      ckid++;
-      ck_index = 0;
-      chunks.emplace_back(arr);
-    }
-    assert(!chunks.empty());
-    if (chunks.size() > 1) {
-      ARROW_ASSIGN_OR_RAISE(auto arr, ::arrow::Concatenate(chunks, pool_));
-      arrs.emplace_back(arr);
-    } else {
-      arrs.emplace_back(chunks[0]);
-    }
-  }
-  return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(

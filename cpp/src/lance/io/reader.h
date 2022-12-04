@@ -57,14 +57,6 @@ class FileReader {
 
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable();
 
-  ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
-      const std::vector<std::string>& columns);
-
-  /// Read a RecordBatch at the file offset.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadAt(const lance::format::Schema& schema,
-                                                                int32_t offset,
-                                                                int32_t length) const;
-
   /// Read a Batch
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(
       const lance::format::Schema& schema,

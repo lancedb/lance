@@ -12,20 +12,18 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-#include "lance/arrow/writer.h"
-
 #include <arrow/builder.h>
 #include <arrow/io/api.h>
 #include <arrow/table.h>
 #include <arrow/type.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <map>
 #include <string>
 #include <vector>
 
+#include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
 #include "lance/format/schema.h"
 #include "lance/io/reader.h"
@@ -136,15 +134,7 @@ std::shared_ptr<::arrow::Table> ReadTable(std::shared_ptr<arrow::io::BufferOutpu
 
 TEST_CASE("Write COCO Dataset") {
   auto coco = CocoDataset();
-  auto sink = arrow::io::BufferOutputStream::Create();
-  auto status = lance::arrow::WriteTable(*coco, sink.ValueOrDie());
-  INFO("Write file: " << status);
-  CHECK(status.ok());
-  auto buf = sink.ValueOrDie()->Finish().ValueOrDie();
-
-  auto infile = make_shared<arrow::io::BufferReader>(buf);
-  INFO(FileReader::Make(infile).status());
-  auto reader = FileReader::Make(infile).ValueOrDie();
+  auto reader = lance::testing::MakeReader(coco).ValueOrDie();
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
@@ -178,12 +168,7 @@ TEST_CASE("Write dictionary type") {
   auto schema = arrow::schema({arrow::field("label", label_type)});
   auto table = arrow::Table::Make(schema, {arr});
 
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
-
-  auto infile = make_shared<arrow::io::BufferReader>(sink->Finish().ValueOrDie());
-  INFO(FileReader::Make(infile).status());
-  auto reader = FileReader::Make(infile).ValueOrDie();
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
   CHECK(reader->num_batches() == 1);
   CHECK(reader->length() == 4);
 
@@ -203,9 +188,7 @@ TEST_CASE("Large binary field") {
   auto table = ::arrow::Table::Make(std::move(schema), {arr});
 
   auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  auto result = lance::arrow::WriteTable(*table, sink);
-  INFO("Write table: " << result.message());
-  CHECK(result.ok());
+  lance::testing::MakeReader(table).ValueOrDie();
 }
 
 TEST_CASE("Binary field") {
@@ -219,8 +202,7 @@ TEST_CASE("Binary field") {
   auto arr = builder.Finish().ValueOrDie();
   auto table = ::arrow::Table::Make(std::move(schema), {arr});
 
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+  CHECK(lance::testing::MakeReader(table).ok());
 }
 
 TEST_CASE("Write timestamp") {
@@ -240,12 +222,9 @@ TEST_CASE("Write timestamp") {
     auto arr = builder.Finish().ValueOrDie();
     auto table = ::arrow::Table::Make(std::move(schema), {arr});
 
-    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-    auto result = lance::arrow::WriteTable(*table, sink);
-    INFO("Write " << type->ToString() << ": " << result.message());
-    CHECK(result.ok());
+    auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
-    auto actual_table = ReadTable(sink);
+    auto actual_table = reader->ReadTable().ValueOrDie();
     INFO("Actual table: " << actual_table->ToString());
     INFO("Expected table: " << table->ToString());
     CHECK(table->Equals(*actual_table));
@@ -262,16 +241,14 @@ TEST_CASE("Write with batch size") {
   auto arr = int_builder.Finish().ValueOrDie();
   auto table =
       ::arrow::Table::Make(::arrow::schema({::arrow::field("v", ::arrow::int32())}), {arr});
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  auto result = lance::arrow::WriteTable(*table, sink, options);
-  CHECK(result.ok());
+  auto reader = lance::testing::MakeReader(table, 5).ValueOrDie();
 
-  auto actual_table = ReadTable(sink);
-  auto reader = ::arrow::TableBatchReader(actual_table);
+  auto actual_table = reader->ReadTable().ValueOrDie();
+  auto batch_reader = ::arrow::TableBatchReader(actual_table);
   std::shared_ptr<::arrow::RecordBatch> batch;
   int batch_count = 0;
   while (true) {
-    CHECK(reader.ReadNext(&batch).ok());
+    CHECK(batch_reader.ReadNext(&batch).ok());
     if (!batch) {
       break;
     }
@@ -384,12 +361,10 @@ TEST_CASE("Write extension but read storage if not registered") {
   auto arr = std::static_pointer_cast<::arrow::ExtensionArray>(
                  table->GetColumnByName("image_ext")->chunk(0))
                  ->storage();
-
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
 
   // We can read it back without the extension
-  auto actual_table = ReadTable(sink);
+  auto actual_table = reader->ReadTable().ValueOrDie();
   CHECK(arr->Equals(actual_table->GetColumnByName("image_ext")->chunk(0)));
   auto lance_schema = Schema(actual_table->schema());
   auto image_field = lance_schema.GetField("image_ext");
@@ -405,11 +380,11 @@ TEST_CASE("Extension type round-trip") {
   auto box_type = std::make_shared<::lance::testing::Box2dType>();
   CHECK(arrow::RegisterExtensionType(box_type).ok());
   auto table = MakeTable();
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
 
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
   // We can read it back without the extension
-  auto actual_table = ReadTable(sink);
+  auto actual_table = reader->ReadTable().ValueOrDie();
+
   INFO("Actual table: " << actual_table->ToString() << "\nExpected table: " << table->ToString());
   CHECK(table->Equals(*actual_table));
 
@@ -442,8 +417,7 @@ TEST_CASE("Write empty arrays") {
   auto schema = ::arrow::schema({::arrow::field("values", ::arrow::list(struct_field))});
   auto table = ::arrow::Table::Make(schema, {arr});
 
-  auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-  CHECK(lance::arrow::WriteTable(*table, sink).ok());
-  auto actual_table = ReadTable(sink);
+  auto reader = lance::testing::MakeReader(table).ValueOrDie();
+  auto actual_table = reader->ReadTable().ValueOrDie();
   CHECK(table->Equals(*actual_table));
 }

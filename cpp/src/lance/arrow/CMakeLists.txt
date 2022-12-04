@@ -33,7 +33,6 @@ add_library(
         updater.cc
         utils.cc
         utils.h
-        writer.cc
 )
 target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
