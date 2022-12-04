@@ -2,6 +2,7 @@ BasedOnStyle: Google
 ColumnLimit: 100
 BinPackArguments: false
 BinPackParameters: false
+ReferenceAlignment: Left
 ---
 Language: Proto
 BasedOnStyle: Google

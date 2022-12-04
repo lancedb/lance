@@ -89,7 +89,6 @@ std::unique_ptr<::duckdb::GlobalTableFunctionState> InitGlobal(
   CheckStatus(builder->Project(columns));
   auto scanner = GetResult(builder->Finish());
   state->batch_generator = GetResult(scanner->ScanBatchesAsync());
-  fmt::print("Columns ids: {}\n", input.column_ids);
   return state;
 }
 
@@ -119,24 +118,35 @@ void ToVector<::arrow::StringType>(const std::shared_ptr<::arrow::Array> &arr,
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
 }
 
+/// Convert a String array into duckdb vector.
+template <>
+void ToVector<::arrow::BinaryType>(const std::shared_ptr<::arrow::Array> &arr,
+                                   ::duckdb::Vector *out) {
+  auto array = std::static_pointer_cast<::arrow::BinaryArray>(arr);
+  assert(array != nullptr);
+  // TODO: How to use zero copy to move data from arrow to duckdb.
+  for (int i = 0; i < array->length(); ++i) {
+    auto val = array->Value(i);
+    out->SetValue(i, ::duckdb::Value::BLOB((::duckdb::data_ptr_t)val.data(), val.size()));
+  }
+  out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
+}
+
 template <>
 void ToVector<::arrow::DictionaryType>(const std::shared_ptr<::arrow::Array> &arr,
                                        ::duckdb::Vector *out) {
   auto array = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
-  fmt::print("arr type->{}\n", arr->type()->ToString());
   // TODO: zero copy
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
   auto dict_arr = std::dynamic_pointer_cast<::arrow::StringArray>(array->dictionary());
-  out->Print();
-  fmt::print("Logical type: {}\n", out->GetType().ToString());
   auto indices_arr = std::static_pointer_cast<::arrow::Int8Array>(array->indices());
-  fmt::print("Index arr: {}\n", fmt::ptr(indices_arr));
   for (int i = 0; i < indices_arr->length(); ++i) {
     auto idx = indices_arr->Value(i);
     out->SetValue(i, std::string(dict_arr->Value(idx)));
   }
 }
 
+/// Convert `arrow::Array` to duckdb Struct Vector.
 template <>
 void ToVector<::arrow::StructType>(const std::shared_ptr<::arrow::Array> &arr,
                                    ::duckdb::Vector *out) {
@@ -156,9 +166,40 @@ void ToVector<::arrow::StructType>(const std::shared_ptr<::arrow::Array> &arr,
   }
 }
 
+template <>
+void ToVector<::arrow::ListType>(const std::shared_ptr<::arrow::Array> &arr,
+                                 ::duckdb::Vector *out) {
+  /// TODO: zero copy vector construction.
+  assert(arr->type_id() == ::arrow::Type::LIST);
+  auto list_arr = std::static_pointer_cast<::arrow::ListArray>(arr);
+  for (int i = 0; i < list_arr->length(); ++i) {
+    auto scalar = GetResult(list_arr->GetScalar(i));
+    auto list_scalar = std::static_pointer_cast<::arrow::ListScalar>(scalar);
+    ::duckdb::Vector elem_vector(ToLogicalType(*list_scalar->value->type()));
+    ArrowArrayToVector(list_scalar->value, &elem_vector);
+  }
+}
+
+template <>
+void ToVector<::arrow::FixedSizeListType>(const std::shared_ptr<::arrow::Array> &arr,
+                                          ::duckdb::Vector *out) {
+  /// TODO: zero copy vector construction.
+  assert(arr->type_id() == ::arrow::Type::FIXED_SIZE_LIST);
+  auto list_arr = std::static_pointer_cast<::arrow::FixedSizeListArray>(arr);
+  for (int i = 0; i < list_arr->length(); ++i) {
+    auto scalar = GetResult(list_arr->GetScalar(i));
+    auto list_scalar = std::static_pointer_cast<::arrow::FixedSizeListScalar>(scalar);
+    ::duckdb::Vector elem_vector(ToLogicalType(*list_scalar->value->type()));
+    ArrowArrayToVector(list_scalar->value, &elem_vector);
+  }
+}
+
 /// Convert a `arrow::Array` to `duckdb::Vector`.
 void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
   switch (arr->type_id()) {
+    case ::arrow::Type::BOOL:
+      ToVector<::arrow::BooleanType>(arr, out);
+      break;
     case ::arrow::Type::UINT8:
       ToVector<::arrow::UInt8Type>(arr, out);
       break;
@@ -192,11 +233,20 @@ void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Ve
     case ::arrow::Type::STRING:
       ToVector<::arrow::StringType>(arr, out);
       break;
+    case ::arrow::Type::BINARY:
+      ToVector<::arrow::BinaryType>(arr, out);
+      break;
     case ::arrow::Type::DICTIONARY:
       ToVector<::arrow::DictionaryType>(arr, out);
       break;
     case ::arrow::Type::STRUCT:
       ToVector<::arrow::StructType>(arr, out);
+      break;
+    case ::arrow::Type::LIST:
+      ToVector<::arrow::ListType>(arr, out);
+      break;
+    case ::arrow::Type::FIXED_SIZE_LIST:
+      ToVector<::arrow::FixedSizeListType>(arr, out);
       break;
     default:
       throw ::duckdb::IOException("Unsupported Arrow Type: " + arr->type()->ToString());
