@@ -90,63 +90,55 @@ std::unique_ptr<::duckdb::GlobalTableFunctionState> InitGlobal(
   return state;
 }
 
+/// Convert numeric array to duckdb vector.
 template <typename ArrowType>
 void NumericArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
-  fmt::print("Numberic to vector, out={} arr->type={} template={} arr={}\n",
-             fmt::ptr(out),
-             arr->type()->ToString(),
-             ArrowType().ToString(),
-             fmt::ptr(arr));
-  auto array = std::dynamic_pointer_cast<const typename ::arrow::TypeTraits<ArrowType>::ArrayType>(arr);
+  // TODO: dynamic_pointer_cast does not work here, IDK why.
+  auto array = std::static_pointer_cast<typename ::arrow::TypeTraits<ArrowType>::ArrayType>(arr);
   assert(array != nullptr);
-  // TODO: Use zero copy
-  //  out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
-  fmt::print("Add data: out={} length={}\n", fmt::ptr(out), fmt::ptr(array));
+  // TODO: How to use zero copy to move data from arrow to duckdb.
   for (int i = 0; i < array->length(); ++i) {
     out->SetValue(i, ::duckdb::Value::CreateValue(array->Value(i)));
   }
+  out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
 }
 
 /// Convert a `arrow::Array` to `duckdb::Vector`.
-::duckdb::Vector ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr) {
-  // TODO: optimize it for zero copy
-  auto logical_type = ToLogicalType(*arr->type());
-  ::duckdb::Vector result(logical_type);
+void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out) {
   switch (arr->type_id()) {
     case ::arrow::Type::UINT8:
-      NumericArrayToVector<::arrow::UInt8Type>(arr, &result);
+      NumericArrayToVector<::arrow::UInt8Type>(arr, out);
       break;
     case ::arrow::Type::INT8:
-      NumericArrayToVector<::arrow::Int8Type>(arr, &result);
+      NumericArrayToVector<::arrow::Int8Type>(arr, out);
       break;
     case ::arrow::Type::UINT16:
-      NumericArrayToVector<::arrow::UInt16Type>(arr, &result);
+      NumericArrayToVector<::arrow::UInt16Type>(arr, out);
       break;
     case ::arrow::Type::INT16:
-      NumericArrayToVector<::arrow::Int16Type>(arr, &result);
+      NumericArrayToVector<::arrow::Int16Type>(arr, out);
       break;
     case ::arrow::Type::UINT32:
-      NumericArrayToVector<::arrow::UInt32Type>(arr, &result);
+      NumericArrayToVector<::arrow::UInt32Type>(arr, out);
       break;
     case ::arrow::Type::INT32:
-      NumericArrayToVector<::arrow::Int32Type>(arr, &result);
+      NumericArrayToVector<::arrow::Int32Type>(arr, out);
       break;
     case ::arrow::Type::UINT64:
-      NumericArrayToVector<::arrow::UInt64Type>(arr, &result);
+      NumericArrayToVector<::arrow::UInt64Type>(arr, out);
       break;
     case ::arrow::Type::INT64:
-      NumericArrayToVector<::arrow::Int64Type>(arr, &result);
+      NumericArrayToVector<::arrow::Int64Type>(arr, out);
       break;
     case ::arrow::Type::FLOAT:
-      NumericArrayToVector<::arrow::FloatType>(arr, &result);
+      NumericArrayToVector<::arrow::FloatType>(arr, out);
       break;
     case ::arrow::Type::DOUBLE:
-      NumericArrayToVector<::arrow::FloatType>(arr, &result);
+      NumericArrayToVector<::arrow::FloatType>(arr, out);
       break;
     default:
       throw ::duckdb::IOException("Unsupported type: " + arr->type()->ToString());
   }
-  return std::move(result);
 }
 
 void LanceScan(::duckdb::ClientContext &context,
@@ -158,13 +150,10 @@ void LanceScan(::duckdb::ClientContext &context,
   if (batch.record_batch == nullptr) {
     return;
   }
-  fmt::print("Batch: {}\n", batch.record_batch->ToString());
-  output.SetCapacity(batch.record_batch->num_rows());
-  for (auto &col : batch.record_batch->columns()) {
-    //    auto vec = ArrowArrayToVector(col);
-    fmt::print("Convert to array: {}\n", col->ToString());
-    output.data.emplace_back(ArrowArrayToVector(col));
-    fmt::print("After convert\n");
+  output.SetCardinality(batch.record_batch->num_rows());
+  for (int i = 0; i < output.data.size(); ++i) {
+    auto col = batch.record_batch->column(i);
+    ArrowArrayToVector(col, &output.data[i]);
   }
 }
 
