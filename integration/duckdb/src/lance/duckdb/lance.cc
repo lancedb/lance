@@ -74,6 +74,14 @@ inline ::duckdb::LogicalType ArrowListTypeToLogicalType(const ::arrow::DataType&
     case ::arrow::Type::BINARY:
     case ::arrow::Type::LARGE_BINARY:
       return ::duckdb::LogicalType::BLOB;
+    case ::arrow::Type::TIME32:
+    case ::arrow::Type::TIME64:
+      return ::duckdb::LogicalType::TIME;
+    case ::arrow::Type::TIMESTAMP:
+      return ::duckdb::LogicalType::TIMESTAMP;
+    case ::arrow::Type::DATE32:
+    case ::arrow::Type::DATE64:
+      return ::duckdb::LogicalType::DATE;
     case ::arrow::Type::DICTIONARY:
       return ArrowDictionaryTypeToLogicalType(arrow_type);
     case ::arrow::Type::STRUCT:
