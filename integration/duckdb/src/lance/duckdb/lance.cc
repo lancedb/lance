@@ -24,24 +24,23 @@ namespace lance::duckdb {
 
 namespace {
 
-inline ::duckdb::LogicalType ArrowDictionaryTypeToLogicalType(const ::arrow::DataType& dtype) {
-  auto& dict_type = dynamic_cast<const ::arrow::DictionaryType&>(dtype);
-  return ToLogicalType(*dict_type.value_type());
+inline ::duckdb::LogicalType ToLogicalType(const ::arrow::DictionaryType& dtype) {
+  return lance::duckdb::ToLogicalType(*dtype.value_type());
 }
 
-inline ::duckdb::LogicalType ArrowStructTypeToLogicalType(const ::arrow::DataType& dtype) {
-  auto& struct_type = dynamic_cast<const ::arrow::StructType&>(dtype);
+inline ::duckdb::LogicalType ToLogicalType(const ::arrow::StructType& struct_type) {
   ::duckdb::child_list_t<::duckdb::LogicalType> children;
   for (auto& child : struct_type.fields()) {
-    children.emplace_back(std::make_pair(child->name(), ToLogicalType(*child->type())));
+    children.emplace_back(
+        std::make_pair(child->name(), lance::duckdb::ToLogicalType(*child->type())));
   }
   return ::duckdb::LogicalType::STRUCT(children);
 }
 
 template <typename L>
-inline ::duckdb::LogicalType ArrowListTypeToLogicalType(const ::arrow::DataType& dtype) {
+inline ::duckdb::LogicalType ToLogicalType(const ::arrow::DataType& dtype) {
   auto& list_type = dynamic_cast<const L&>(dtype);
-  auto child_type = ToLogicalType(*list_type.value_type());
+  auto child_type = lance::duckdb::ToLogicalType(*list_type.value_type());
   return ::duckdb::LogicalType::LIST(child_type);
 }
 
@@ -83,13 +82,13 @@ inline ::duckdb::LogicalType ArrowListTypeToLogicalType(const ::arrow::DataType&
     case ::arrow::Type::DATE64:
       return ::duckdb::LogicalType::DATE;
     case ::arrow::Type::DICTIONARY:
-      return ArrowDictionaryTypeToLogicalType(arrow_type);
+      return ToLogicalType(dynamic_cast<const ::arrow::DictionaryType&>(arrow_type));
     case ::arrow::Type::STRUCT:
-      return ArrowStructTypeToLogicalType(arrow_type);
+      return ToLogicalType(dynamic_cast<const ::arrow::StructType&>(arrow_type));
     case ::arrow::Type::LIST:
-      return ArrowListTypeToLogicalType<::arrow::ListType>(arrow_type);
+      return ToLogicalType<::arrow::ListType>(arrow_type);
     case ::arrow::Type::FIXED_SIZE_LIST:
-      return ArrowListTypeToLogicalType<::arrow::FixedSizeListType>(arrow_type);
+      return ToLogicalType<::arrow::FixedSizeListType>(arrow_type);
     default:
       throw ::duckdb::InvalidInputException("Does not support type: %s",
                                             arrow_type.ToString().c_str());
