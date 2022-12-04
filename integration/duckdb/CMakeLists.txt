@@ -4,7 +4,7 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-add_compile_options(-mf16c) # opencv
+#add_compile_options(-mf16c) # opencv
 
 project(lance_duckdb CXX)
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)

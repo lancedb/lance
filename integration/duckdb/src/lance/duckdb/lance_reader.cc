@@ -103,17 +103,34 @@ void ToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Vector *out)
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
 }
 
+/// Convert a String array into duckdb vector.
 template <>
 void ToVector<::arrow::StringType>(const std::shared_ptr<::arrow::Array> &arr,
                                    ::duckdb::Vector *out) {
-  auto array =
-      std::static_pointer_cast<typename ::arrow::TypeTraits<::arrow::StringType>::ArrayType>(arr);
+  auto array = std::static_pointer_cast<::arrow::StringArray>(arr);
   assert(array != nullptr);
   // TODO: How to use zero copy to move data from arrow to duckdb.
   for (int i = 0; i < array->length(); ++i) {
     out->SetValue(i, std::string(array->Value(i)));
   }
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
+}
+
+template <>
+void ToVector<::arrow::DictionaryType>(const std::shared_ptr<::arrow::Array> &arr,
+                                       ::duckdb::Vector *out) {
+  auto array = std::static_pointer_cast<::arrow::DictionaryArray>(arr);
+  // TODO: zero copy
+  out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
+  auto dict_arr = std::dynamic_pointer_cast<::arrow::StringArray>(array->dictionary());
+  out->Print();
+  fmt::print("Logical type: {}\n", out->GetType().ToString());
+  auto indices_arr = std::dynamic_pointer_cast<::arrow::Int16Array>(array->indices());
+  fmt::print("Index arr: {}\n", fmt::ptr(indices_arr));
+  for (int i = 0; i < indices_arr->length(); ++i) {
+    auto idx = indices_arr->Value(i);
+    out->SetValue(i, std::string(dict_arr->Value(idx)));
+  }
 }
 
 /// Convert a `arrow::Array` to `duckdb::Vector`.
@@ -152,8 +169,11 @@ void ArrowArrayToVector(const std::shared_ptr<::arrow::Array> &arr, ::duckdb::Ve
     case ::arrow::Type::STRING:
       ToVector<::arrow::StringType>(arr, out);
       break;
+    case ::arrow::Type::DICTIONARY:
+      ToVector<::arrow::DictionaryType>(arr, out);
+      break;
     default:
-      throw ::duckdb::IOException("Unsupported type: " + arr->type()->ToString());
+      throw ::duckdb::IOException("Unsupported Arrow Type: " + arr->type()->ToString());
   }
 }
 
