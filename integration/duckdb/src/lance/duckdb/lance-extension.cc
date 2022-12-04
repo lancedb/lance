@@ -30,6 +30,7 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
   con.BeginTransaction();
   auto &context = *con.context;
   auto &catalog = ::duckdb::Catalog::GetCatalog(context);
+  auto &config = DBConfig::GetConfig(*db.instance);
 
   for (auto &func : lance::duckdb::GetListFunctions()) {
     catalog.CreateFunction(context, func.get());
@@ -50,6 +51,8 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
   auto scan_func = lance::duckdb::GetLanceReaderFunction();
   ::duckdb::CreateTableFunctionInfo scan(scan_func);
   catalog.CreateTableFunction(context, &scan);
+
+  config.replacement_scans.emplace_back(lance::duckdb::LanceScanReplacement);
 
   con.Commit();
 }

@@ -14,6 +14,8 @@ jobs:
     defaults:
       run:
         working-directory: ./integration/duckdb
+    env:
+      ArrowVersion: 10.0.1-1
     steps:
       - uses: actions/checkout@v2
       - name: ccache

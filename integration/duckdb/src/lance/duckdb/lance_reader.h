@@ -16,6 +16,9 @@
 #pragma once
 
 #include <duckdb/function/function_set.hpp>
+#include <duckdb/function/replacement_scan.hpp>
+#include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <memory>
 
 namespace lance::duckdb {
 
@@ -24,4 +27,9 @@ namespace lance::duckdb {
 /// SELECT * from lance_scan("s3://path/to/dataset");
 ::duckdb::TableFunctionSet GetLanceReaderFunction();
 
-}
+std::unique_ptr<::duckdb::TableFunctionRef> LanceScanReplacement(
+    ::duckdb::ClientContext &context,
+    const ::std::string &table_name,
+    ::duckdb::ReplacementScanData *data);
+
+}  // namespace lance::duckdb

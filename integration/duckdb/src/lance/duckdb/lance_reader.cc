@@ -25,6 +25,8 @@
 #include <lance/arrow/dataset.h>
 
 #include <cstdio>
+#include <duckdb/parser/expression/constant_expression.hpp>
+#include <duckdb/parser/expression/function_expression.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -283,6 +285,23 @@ void LanceScan(::duckdb::ClientContext &context,
 
   func_set.AddFunction(table_function);
   return func_set;
+}
+
+std::unique_ptr<::duckdb::TableFunctionRef> LanceScanReplacement(
+    ::duckdb::ClientContext &context,
+    const ::std::string &table_name,
+    ::duckdb::ReplacementScanData *data) {
+  auto lower_name = ::duckdb::StringUtil::Lower(table_name);
+  if (!::duckdb::StringUtil::EndsWith(lower_name, ".lance")) {
+    return nullptr;
+  }
+  auto table_function = ::duckdb::make_unique<::duckdb::TableFunctionRef>();
+  ::std::vector<::std::unique_ptr<::duckdb::ParsedExpression>> children;
+  children.emplace_back(
+      ::std::make_unique<::duckdb::ConstantExpression>(::duckdb::Value(table_name)));
+  table_function->function =
+      ::std::make_unique<::duckdb::FunctionExpression>("lance_scan", ::std::move(children));
+  return table_function;
 }
 
 }  // namespace lance::duckdb
