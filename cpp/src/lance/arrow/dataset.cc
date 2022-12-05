@@ -313,7 +313,16 @@ LanceDataset::~LanceDataset() {}
   if (finfo.type() == ::arrow::fs::FileType::NotFound) {
     return ::arrow::Status::IOError("Manifest not found: ", manifest_path);
   }
-  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(fs, manifest_path));
+  auto result = OpenManifest(fs, manifest_path);
+
+  if (result.status().IsIOError() && result.status().message().starts_with("Path does not exist")) {
+    if (!version) {
+      return ::arrow::Status::IOError("Can not find the latest version of the dataset");
+    }
+    return ::arrow::Status::IOError("Version ", version.value(), " does not exist");
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto manifest, result);
   auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
 }
