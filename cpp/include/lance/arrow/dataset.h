@@ -123,6 +123,14 @@ class LanceDataset : public ::arrow::dataset::Dataset {
       const std::string& base_uri,
       std::optional<uint64_t> version = std::nullopt);
 
+  /// Load dataset from URI, with a optional version.
+  ///
+  /// \param uri a fully qualified dataset URI
+  /// \param version optional version to load.
+  /// \return See `Make(fs, base_uri, version)`.
+  static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
+      const std::string& uri, std::optional<uint64_t> version = std::nullopt);
+
   /// Get all the dataset versions.
   ::arrow::Result<std::vector<DatasetVersion>> versions() const;
 

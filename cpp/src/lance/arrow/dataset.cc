@@ -293,6 +293,13 @@ LanceDataset::~LanceDataset() {}
   return WriteManifest(fs, base_dir, manifest);
 }
 
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(const std::string& uri,
+                                                                  std::optional<uint64_t> version) {
+  std::string path;
+  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
+  return Make(fs, path, version);
+}
+
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs,
     const std::string& base_uri,
