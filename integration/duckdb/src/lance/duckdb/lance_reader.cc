@@ -28,6 +28,7 @@
 #include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/function_expression.hpp>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,9 +60,13 @@ std::unique_ptr<::duckdb::FunctionData> LanceScanBind(
     std::vector<::duckdb::LogicalType> &return_types,
     std::vector<std::string> &names) {
   auto dataset_uri = input.inputs[0].GetValue<std::string>();
+  std::optional<uint64_t> version = std::nullopt;
+  if (input.inputs.size() > 1) {
+    version = input.inputs[1].GetValue<int>();
+  }
   std::string path;
   auto fs = GetResult(::arrow::fs::FileSystemFromUriOrPath(dataset_uri, &path));
-  auto dataset = GetResult(lance::arrow::LanceDataset::Make(std::move(fs), path));
+  auto dataset = GetResult(lance::arrow::LanceDataset::Make(std::move(fs), path, version));
   auto schema = dataset->schema();
   auto bind_data = std::make_unique<ScanBindData>();
   bind_data->dataset = std::move(dataset);
@@ -277,13 +282,16 @@ void LanceScan(::duckdb::ClientContext &context,
 ::duckdb::TableFunctionSet GetLanceReaderFunction() {
   ::duckdb::TableFunctionSet func_set("lance_scan");
 
-  ::duckdb::TableFunction table_function(
-      {::duckdb::LogicalType::VARCHAR}, LanceScan, LanceScanBind, InitGlobal);
-  table_function.projection_pushdown = true;
-  table_function.filter_pushdown = true;
-  table_function.filter_prune = true;
-
-  func_set.AddFunction(table_function);
+  for (auto &arguments : std::vector<std::vector<::duckdb::LogicalType>>(
+           {{::duckdb::LogicalType::VARCHAR},
+            {::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::INTEGER}})) {
+    ::duckdb::TableFunction table_function(
+        arguments, LanceScan, LanceScanBind, InitGlobal);
+    table_function.projection_pushdown = true;
+    table_function.filter_pushdown = true;
+    table_function.filter_prune = true;
+    func_set.AddFunction(table_function);
+  }
   return func_set;
 }
 
