@@ -282,22 +282,16 @@ void LanceScan(::duckdb::ClientContext &context,
 ::duckdb::TableFunctionSet GetLanceReaderFunction() {
   ::duckdb::TableFunctionSet func_set("lance_scan");
 
-  ::duckdb::TableFunction table_function(
-      {::duckdb::LogicalType::VARCHAR}, LanceScan, LanceScanBind, InitGlobal);
-  table_function.projection_pushdown = true;
-  table_function.filter_pushdown = true;
-  table_function.filter_prune = true;
-  func_set.AddFunction(table_function);
-
-  ::duckdb::TableFunction scan_with_version(
-      {::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::INTEGER},
-      LanceScan,
-      LanceScanBind,
-      InitGlobal);
-  scan_with_version.projection_pushdown = true;
-  scan_with_version.filter_pushdown = true;
-  scan_with_version.filter_prune = true;
-  func_set.AddFunction(scan_with_version);
+  for (auto &arguments : std::vector<std::vector<::duckdb::LogicalType>>(
+           {{::duckdb::LogicalType::VARCHAR},
+            {::duckdb::LogicalType::VARCHAR, ::duckdb::LogicalType::INTEGER}})) {
+    ::duckdb::TableFunction table_function(
+        arguments, LanceScan, LanceScanBind, InitGlobal);
+    table_function.projection_pushdown = true;
+    table_function.filter_pushdown = true;
+    table_function.filter_prune = true;
+    func_set.AddFunction(table_function);
+  }
   return func_set;
 }
 
