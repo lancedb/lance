@@ -14,10 +14,20 @@ jobs:
     defaults:
       run:
         working-directory: ./integration/duckdb
+    env:
+      ArrowVersion: 10.0.1-1
     steps:
       - uses: actions/checkout@v2
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y -V ca-certificates lsb-release wget
+          wget https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr 'A-Z' 'a-z')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb
+          sudo apt update
+          sudo apt install -y -V libarrow-dev=${ArrowVersion} libarrow-dataset-dev=${ArrowVersion} libparquet-dev=${ArrowVersion}
       - name: Cmake
         run: cmake -B build
       - name: Build
@@ -30,6 +40,12 @@ jobs:
         working-directory: ./integration/duckdb
     steps:
       - uses: actions/checkout@v2
+      - name: Install dependencies
+        run: |
+          brew update
+          cd $(brew --repository)
+          git checkout 3.6.8  # Arrow 10.0
+          brew install apache-arrow
       - name: Cmake
         run: cmake -B build
       - name: Build

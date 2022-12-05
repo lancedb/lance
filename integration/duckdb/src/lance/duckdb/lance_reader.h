@@ -15,17 +15,21 @@
 
 #pragma once
 
-#include <duckdb.hpp>
-#include <duckdb/main/client_context.hpp>
+#include <duckdb/function/function_set.hpp>
+#include <duckdb/function/replacement_scan.hpp>
+#include <duckdb/parser/tableref/table_function_ref.hpp>
+#include <memory>
 
-namespace duckdb {
+namespace lance::duckdb {
 
-class LanceExtension : public Extension {
- public:
+/// Get lance reader:
+///
+/// SELECT * from lance_scan("s3://path/to/dataset");
+::duckdb::TableFunctionSet GetLanceReaderFunction();
 
-  void Load(DuckDB &db) override;
+std::unique_ptr<::duckdb::TableFunctionRef> LanceScanReplacement(
+    ::duckdb::ClientContext &context,
+    const ::std::string &table_name,
+    ::duckdb::ReplacementScanData *data);
 
-  std::string Name() override;
-};
-
-} // namespace duckdb
+}  // namespace lance::duckdb

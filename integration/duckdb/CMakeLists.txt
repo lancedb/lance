@@ -4,7 +4,7 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-add_compile_options(-mf16c) # opencv
+#add_compile_options(-mf16c) # opencv
 
 project(lance_duckdb CXX)
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
@@ -88,7 +88,7 @@ endif()
 
 FetchContent_MakeAvailable(${available_contents})
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include_directories(${duckdb_SOURCE_DIR}/src/include)
@@ -109,12 +109,24 @@ if(LANCE_BUILD_PYTORCH)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
+# Add lance core as dependency
+find_package(Arrow REQUIRED)
+find_package(ArrowDataset REQUIRED)
+include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include ../../cpp/src)
+add_subdirectory(../../cpp lance)
+
 include_directories(src)
 
 set(LANCE_EXT_SOURCE_COMMON
+    src/lance/duckdb/lance_reader.cc
+    src/lance/duckdb/lance_reader.h
     src/lance/duckdb/lance-extension.cc
+    src/lance/duckdb/lance.cc
+    src/lance/duckdb/lance.h
     src/lance/duckdb/list_functions.cc
-    src/lance/duckdb/vector_functions.cc)
+    src/lance/duckdb/list_functions.h
+    src/lance/duckdb/vector_functions.cc
+)
 
 set(LANCE_EXT_SOURCE_ML
     src/lance/duckdb/ml/catalog.cc
@@ -132,6 +144,7 @@ endif()
 # add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
+target_link_libraries(lance_loadable_extension lance ArrowDataset::arrow_dataset_shared fmt::fmt)
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
