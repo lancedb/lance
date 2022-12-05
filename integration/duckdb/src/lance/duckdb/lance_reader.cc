@@ -121,7 +121,7 @@ void ToVector<::arrow::StringType>(const std::shared_ptr<::arrow::Array> &arr,
   out->SetVectorType(::duckdb::VectorType::FLAT_VECTOR);
 }
 
-/// Convert a String array into duckdb vector.
+/// Convert a Binary array into duckdb vector.
 template <>
 void ToVector<::arrow::BinaryType>(const std::shared_ptr<::arrow::Array> &arr,
                                    ::duckdb::Vector *out) {
