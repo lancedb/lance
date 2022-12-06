@@ -26,6 +26,32 @@ from lance.io import open_uri
 __all__ = ["load_detection"]
 
 
+def _convert_segmentation(s):
+    """Convert segmentation"""
+    if isinstance(s, list):
+        return {"polygon": s}
+    return s
+
+
+def _instance_anns_to_df(instances_json):
+    """Instance / Detection annotations and map to string category names
+
+    Returns
+    -------
+    ann_df: pd.DataFrame
+    """
+    df = pd.DataFrame(instances_json['annotations'])
+    cat_df = pd.DataFrame(instances_json['categories'])
+    df["segmentation"] = df.segmentation.apply(_convert_segmentation)
+    df["iscrowd"] = df.iscrowd.astype("bool")
+    # Convert coco dataset bounding box [x,y,width,height] to [x0,y0,x1,y1] format.
+    df["bbox"] = df.bbox.apply(
+        lambda arr: [arr[0], arr[1], arr[0] + arr[2], arr[1] + arr[3]]
+    )
+    category_df = cat_df.rename({"id": "category_id"}, axis=1)
+    return df.merge(category_df, on="category_id")
+
+
 def load_detection(root: [Path, str],
                    annotations_file: Optional[Union[Path, str]] = None,
                    split: str = "train") -> pa.Table:
