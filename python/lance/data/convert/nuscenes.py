@@ -158,110 +158,90 @@ class NuscenesConverter():
     
     def get_schema(self) -> pa.Schema:
         """
-        Returns the Arrow schema which is flattened.
-        """
-        log_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("logfile", pa.string()),
-                pa.field("vehicle", pa.string()),
-                pa.field("date_captured", pa.string()),
-                pa.field("location", pa.string())
-            ]
-        )
-        calibrated_sensor_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("sensor_token", pa.string()),
-                pa.field("translation", pa.list_(pa.float32(), 3)),
-                pa.field("rotation", pa.list_(pa.float32(), 4)),
-                pa.field("camera_intrinsic", pa.list_(pa.list_(pa.float32(), 3))),
-                pa.field("camera_distortion", pa.list_(pa.float32(), 6)), # can be 5 or 6 length
-            ]
-        )
-        sensor_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("channel", pa.string()),
-                pa.field("modality", pa.string())
-            ]
-        )
-        sample_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("timestamp", pa.int32()),
-                pa.field("log_token", pa.string()),
-                pa.field("key_camera_token", pa.string())
-            ]
-        )
-        sample_data_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("sample_token", pa.string()),
-                pa.field("ego_pose_token", pa.string()),
-                pa.field("calibrated_sensor_token", pa.string()),
-                pa.field("filename", pa.string()),
-                pa.field("fileformat", pa.string()),
-                pa.field("width", pa.int32()),
-                pa.field("height", pa.int32()),
-                pa.field("timestamp", pa.int32()),
-                pa.field("is_key_frame", pa.bool_()),
-                pa.field("next", pa.string()),
-                pa.field("prev", pa.string())
-            ]
-        )
-        ego_pose_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("translation", pa.list_(pa.float32(), 3)),
-                pa.field("rotation", pa.list_(pa.float32(), 4)),
-                pa.field("timestamp", pa.int32()),
-                pa.field("rotation_rate", pa.list_(pa.float32(), 3)),
-                pa.field("acceleration", pa.list_(pa.float32(), 3)),
-                pa.field("speed", pa.float32()),
-            ]
-        )  
-        surface_ann_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("sample_data_token", pa.string()),
-                pa.field("category_token", pa.string()),
-                pa.field("mask", pa.string()) # TODO: change to RLE once type is created
-            ]
-        )
-        object_ann_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("sample_data_token", pa.string()),
-                pa.field("category_token", pa.string()),
-                pa.field("attribute_tokens", pa.list_(pa.string())),
-                pa.field("bbox", Box2dType),
-                pa.field("mask", pa.string()) # TODO: change to RLE once type is created
-            ]
-        )
-        category_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("name", pa.string()),
-                pa.field("description", pa.string())
-            ]
-        )
-        attribute_schema = pa.struct(
-            [
-                pa.field("token", pa.string()),
-                pa.field("name", pa.string()),
-                pa.field("description", pa.string())
-            ]
-        )
-        return pa.schema(
-            pa.field("log", log_schema),
-            pa.field("calibrated_sensor", calibrated_sensor_schema),
-            pa.field("sensor", sensor_schema),
-            pa.field("sample", sample_schema),
-            pa.field("sample_data", sample_data_schema),
-            pa.field("ego_pose", ego_pose_schema),
+        Returns the Arrow schema.
+        This is flatten/denormalized for better ergonomics for
+        ML - i.e. filtering/slicing the dataset and reducing joins.
+        Column names are renamed accordingly to prevent collisions.
+        """        
+        # Surface Ann
+        surface_ann_schema = pa.struct([
+            pa.field("surface_ann_token_", pa.string()),
+            pa.field("surface_ann_sample_data_token_", pa.string()),
+            pa.field("surface_ann_category_token_", pa.string()),
+            pa.field("surface_ann_mask_", pa.string()), # TODO: change to RLE once type is created 
+
+            # Category
+            pa.field("category_token_", pa.string()),
+            pa.field("category_name_", pa.string()),
+            pa.field("category_description_", pa.string())
+        ])
+
+        # Object Ann
+        object_ann_schema = pa.struct([
+            pa.field("object_ann_token_", pa.string()),
+            pa.field("object_ann_sample_data_token_", pa.string()),
+            pa.field("object_ann_category_token_", pa.string()),
+            pa.field("object_ann_attribute_tokens_", pa.list_(pa.string())),
+            pa.field("object_ann_bbox_", Box2dType),
+            pa.field("object_ann_mask_", pa.string()), # TODO: change to RLE once type is created
+
+            # Category
+            pa.field("category_token_", pa.string()),
+            pa.field("category_name_", pa.string()),
+            pa.field("category_description_", pa.string())
+        ])
+
+        return pa.schema([
+            # Sample is our root table, we don't rename these fields
+            pa.field("token", pa.string()),
+            pa.field("timestamp", pa.int32()),
+            pa.field("log_token", pa.string()),
+            pa.field("key_camera_token", pa.string()),
+            
+            # Log
+            pa.field("log_token_", pa.string()),
+            pa.field("log_logfile_", pa.string()),
+            pa.field("log_vehicle_", pa.string()),
+            pa.field("log_date_captured_", pa.string()),
+            pa.field("log_location_", pa.string()),
+            
+            # Calibrated Sensor
+            pa.field("calibrated_sensor_token_", pa.string()),
+            pa.field("calibrated_sensor_sensor_token_", pa.string()),
+            pa.field("calibrated_sensor_translation_", pa.list_(pa.float32(), 3)),
+            pa.field("calibrated_sensor_rotation_", pa.list_(pa.float32(), 4)),
+            pa.field("calibrated_sensor_camera_intrinsic_", pa.list_(pa.list_(pa.float32(), 3))),
+            pa.field("calibrated_sensor_camera_distortion_", pa.list_(pa.float32(), 6)), # can be 5 or 6 length
+            
+            # Sensor
+            pa.field("sensor_token_", pa.string()),
+            pa.field("sensor_channel_", pa.string()),
+            pa.field("sensor_modality_", pa.string()),
+
+            # Sample Data
+            pa.field("sample_data_token_", pa.string()),
+            pa.field("sample_data_sample_token_", pa.string()),
+            pa.field("sample_data_ego_pose_token_", pa.string()),
+            pa.field("sample_data_calibrated_sensor_token_", pa.string()),
+            pa.field("sample_data_filename_", pa.string()),
+            pa.field("sample_data_fileformat_", pa.string()),
+            pa.field("sample_data_width_", pa.int32()),
+            pa.field("sample_data_height_", pa.int32()),
+            pa.field("sample_data_timestamp_", pa.int32()),
+            pa.field("sample_data_is_key_frame_", pa.bool_()),
+            pa.field("sample_data_next_", pa.string()),
+            pa.field("sample_data_prev_", pa.string()),
+
+            # Ego Pose
+            pa.field("ego_pose_token_", pa.string()),
+            pa.field("ego_pose_translation_", pa.list_(pa.float32(), 3)),
+            pa.field("ego_pose_rotation_", pa.list_(pa.float32(), 4)),
+            pa.field("ego_pose_timestamp_", pa.int32()),
+            pa.field("ego_pose_rotation_rate_", pa.list_(pa.float32(), 3)),
+            pa.field("ego_pose_acceleration_", pa.list_(pa.float32(), 3)),
+            pa.field("ego_pose_speed_", pa.float32()),
+
+            # Annotations
             pa.field("surface_ann", surface_ann_schema),
-            pa.field("object_ann", object_ann_schema),
-            pa.field("category", category_schema),
-            pa.field("attribute", attribute_schema)
-        )
+            pa.field("object_ann", object_ann_schema)
+        ])
