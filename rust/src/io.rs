@@ -223,6 +223,6 @@ impl<R: Read + Seek> FileReader<R> {
             .get_page_info(field_id as usize, batch_id as usize);
 
         let mut decoder = field.get_decoder(&mut self.file, page_info);
-        return decoder.value(idx_in_batch as usize).unwrap();
+        return decoder.value(idx_in_batch).unwrap();
     }
 }
