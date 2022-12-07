@@ -13,7 +13,7 @@
 #  limitations under the License.
 """Dataset conversion"""
 
-from abc import abstractmethod, ABC
+from abc import abstractmethod, ABC, abstractproperty
 import os
 from typing import Union
 
@@ -60,7 +60,7 @@ class DatasetConverter(ABC):
 
     def _convert_metadata_df(self, df: pd.DataFrame) -> pa.Table:
         """Convert each metdata column to pyarrow with lance types"""
-        schema = self.get_schema()
+        schema = self.schema
         arrays = []
         for name, col in df.items():
             field = schema.field(name)
@@ -122,83 +122,8 @@ class DatasetConverter(ABC):
             )
         return embedded
 
+    @property
     @abstractmethod
-    def get_schema(self):
+    def schema(self):
         pass
 
-    @classmethod
-    def create_main(cls):
-        FORMATS = click.Choice(["lance", "parquet"])
-
-        @click.command()
-        @click.argument("base_uri")
-        @click.option(
-            "-f",
-            "--fmt",
-            type=FORMATS,
-            default="lance",
-            help="Output format (parquet or lance)",
-        )
-        @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
-        @click.option(
-            "-g",
-            "--group-size",
-            type=int,
-            default=1024,
-            help="group size",
-            show_default=True,
-        )
-        @click.option(
-            "--max-rows-per-file",
-            type=int,
-            default=0,
-            help="max rows per file",
-            show_default=True,
-        )
-        @click.option(
-            "-o",
-            "--output-path",
-            type=str,
-            help="Output path. Default is under the base_uri",
-        )
-        @click.option(
-            "--num-rows",
-            type=int,
-            default=0,
-            help="Max rows in the dataset (0 means this is ignored)"
-        )
-        def main(
-            base_uri,
-            fmt,
-            embedded,
-            output_path,
-            group_size: int,
-            max_rows_per_file: int,
-            num_rows: int
-        ):
-            converter = cls(base_uri)
-            df = converter.read_metadata(num_rows=num_rows)
-            known_formats = ["lance", "parquet"]
-            if fmt is not None:
-                assert fmt in known_formats
-                fmt = [fmt]
-            else:
-                fmt = known_formats
-
-            for f in fmt:
-                if f == 'lance':
-                    kwargs = {
-                        "existing_data_behavior": "overwrite_or_ignore",
-                        "max_rows_per_group": group_size,
-                        "max_rows_per_file": max_rows_per_file,
-                    }
-                elif f == 'parquet':
-                    kwargs = {
-                        'row_group_size': group_size,
-                    }
-                if embedded:
-                    converter.make_embedded_dataset(df, f, output_path, **kwargs)
-                else:
-                    return converter.save_df(df, f, output_path, **kwargs)
-
-        return main

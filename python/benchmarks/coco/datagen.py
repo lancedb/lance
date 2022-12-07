@@ -13,10 +13,13 @@ import pandas as pd
 import pyarrow as pa
 
 from lance.types import ImageType
+import click
 
 sys.path.append("..")
 
 from converter import DatasetConverter, PUBLIC_URI_ROOT
+
+FORMATS = ["lance", "parquet"]
 
 
 class CocoConverter(DatasetConverter):
@@ -99,7 +102,9 @@ class CocoConverter(DatasetConverter):
         for split in self.splits:
             if split == "test":
                 test_images = self._get_test_images("test")
-                split_dfs.append(pd.DataFrame({"image_uri": test_images, "split": split}))
+                split_dfs.append(
+                    pd.DataFrame({"image_uri": test_images, "split": split})
+                )
             else:
                 split_dfs.append(read_split(split))
 
@@ -135,7 +140,8 @@ class CocoConverter(DatasetConverter):
         )
         return uris
 
-    def get_schema(self):
+    @property
+    def schema(self):
         names = [
             "license",
             "file_name",
@@ -213,6 +219,84 @@ def _aggregate_annotations(annotations):
     return ret
 
 
+@click.command()
+@click.argument("uri")
+@click.option(
+    "-f",
+    "--fmt",
+    type=click.Choice(FORMATS),
+    default="lance",
+    help="Output format (parquet or lance)",
+)
+@click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
+@click.option(
+    "-g",
+    "--group-size",
+    type=int,
+    default=1024,
+    help="group size",
+    show_default=True,
+)
+@click.option(
+    "--max-rows-per-file",
+    type=int,
+    default=0,
+    help="max rows per file",
+    show_default=True,
+)
+@click.option(
+    "-o",
+    "--output-path",
+    type=str,
+    help="Output path. Default is under the base_uri",
+)
+@click.option(
+    "--num-rows",
+    type=int,
+    default=0,
+    help="Max rows in the dataset (0 means this is ignored)",
+)
+@click.option(
+    "--split",
+    type=str,
+    help="comma separated split strings",
+    default="train,val,test",
+    show_default=True,
+)
+def main(
+    uri,
+    fmt,
+    embedded,
+    output_path,
+    group_size: int,
+    max_rows_per_file: int,
+    num_rows: int,
+    split: str,
+):
+    converter = CocoConverter(uri, splits=split.split(","))
+    df = converter.read_metadata(num_rows=num_rows)
+    if fmt is not None:
+        assert fmt in FORMATS
+        fmt = [fmt]
+    else:
+        fmt = FORMATS
+
+    for f in fmt:
+        if f == "lance":
+            kwargs = {
+                "existing_data_behavior": "overwrite_or_ignore",
+                "max_rows_per_group": group_size,
+                "max_rows_per_file": max_rows_per_file,
+            }
+        elif f == "parquet":
+            kwargs = {
+                "row_group_size": group_size,
+            }
+        if embedded:
+            converter.make_embedded_dataset(df, f, output_path, **kwargs)
+        else:
+            return converter.save_df(df, f, output_path, **kwargs)
+
+
 if __name__ == "__main__":
-    main = CocoConverter.create_main()
     main()

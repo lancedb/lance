@@ -15,6 +15,7 @@
 import os
 from pathlib import Path
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 import pandas
 import pyarrow as pa
@@ -67,6 +68,10 @@ def dataset(
 
     """
     if not filesystem:
+        parsed = urlparse(uri)
+        if not parsed.scheme:
+            uri = parsed._replace(scheme="file://").geturl()
+
         filesystem, uri = pa.fs.FileSystem.from_uri(uri)
 
     if version is None:
