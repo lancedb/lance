@@ -29,14 +29,24 @@ class Schema;
 
 class Partitioning {
  public:
-  Partitioning(const Schema& dataset_schema, const Partitioning& proto);
+  Partitioning() = delete;
 
+  static ::arrow::Result<Partitioning> Make(const Schema& dataset_schema,
+                                            const pb::Partitioning& proto);
+
+  /// Convert to an Arrow Partitioning.
   std::shared_ptr<::arrow::dataset::Partitioning> ToArrow();
+
+  pb::Partitioning ToProto() const;
 
   /// Partition schema.
   const std::shared_ptr<Schema>& schema() const;
 
  private:
+  Partitioning(std::shared_ptr<Schema> schema);
+
+  /// Partitioning schema
+  std::shared_ptr<Schema> schema_;
 };
 
 }  // namespace lance::format
