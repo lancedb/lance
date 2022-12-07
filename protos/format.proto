@@ -76,6 +76,9 @@ message DataFragment {
   uint64 id = 1;
 
   repeated DataFile files = 2;
+
+  // Optional partition path.
+  string partitioning_path = 3;
 }
 
 /// Lance Data File

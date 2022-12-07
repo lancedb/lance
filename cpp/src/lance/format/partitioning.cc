@@ -25,7 +25,16 @@ namespace lance::format {
 Partitioning::Partitioning(std::shared_ptr<Schema> schema) : schema_(std::move(schema)) {}
 
 ::arrow::Result<Partitioning> Partitioning::Make(std::shared_ptr<Schema> schema) {
-  //
+
+  for (auto& field : schema->fields()) {
+    auto data_type = field->type();
+    if (!(::arrow::is_primitive(*data_type) || ::arrow::is_string(*data_type) ||
+          ::arrow::is_dictionary(*data_type))) {
+      return ::arrow::Status::Invalid("Partitioning::Make: type ", data_type, " not supported");
+    }
+  }
+
+  return Partitioning(std::move(schema));
 }
 
 ::arrow::Result<Partitioning> Partitioning::Make(const Schema& dataset_schema,
@@ -35,7 +44,7 @@ Partitioning::Partitioning(std::shared_ptr<Schema> schema) : schema_(std::move(s
     field_ids.emplace_back(fid);
   }
   ARROW_ASSIGN_OR_RAISE(auto schema, dataset_schema.Project(field_ids));
-  return Partitioning(schema);
+  return Make(schema);
 }
 
 std::shared_ptr<::arrow::dataset::Partitioning> Partitioning::ToArrow() {
