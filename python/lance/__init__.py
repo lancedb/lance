@@ -68,11 +68,8 @@ def dataset(
 
     """
     if not filesystem:
-        parsed = urlparse(uri)
-        if not parsed.scheme:
-            uri = parsed._replace(scheme="file://").geturl()
-
-        filesystem, uri = pa.fs.FileSystem.from_uri(uri)
+        from pyarrow.fs import _resolve_filesystem_and_path
+        filesystem, uri = _resolve_filesystem_and_path(uri, filesystem)
 
     if version is None:
         if (
