@@ -16,6 +16,7 @@
 
 #include <arrow/type.h>
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
 
 #include "lance/format/schema.h"
@@ -43,4 +44,10 @@ TEST_CASE("Create partition from protobuf") {
   auto expr = arrow_part->Parse("a=12/split=eval/foo.lance").ValueOrDie();
   CHECK(expr.Equals(
       and_(equal(field_ref("a"), literal(12)), equal(field_ref("split"), literal("eval")))));
+
+  auto proto = partitioning.ToProto();
+
+  auto field_ids = partitioning.schema()->GetFieldIds();
+  std::equal(proto.field_ids().begin(), proto.field_ids().end(), field_ids.begin());
+  CHECK(proto.field_ids(0) == 0);
 }
