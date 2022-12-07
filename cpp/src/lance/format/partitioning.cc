@@ -24,6 +24,10 @@ namespace lance::format {
 
 Partitioning::Partitioning(std::shared_ptr<Schema> schema) : schema_(std::move(schema)) {}
 
+::arrow::Result<Partitioning> Partitioning::Make(std::shared_ptr<Schema> schema) {
+  //
+}
+
 ::arrow::Result<Partitioning> Partitioning::Make(const Schema& dataset_schema,
                                                  const pb::Partitioning& proto) {
   std::vector<Schema::FieldIdType> field_ids;
@@ -37,6 +41,14 @@ Partitioning::Partitioning(std::shared_ptr<Schema> schema) : schema_(std::move(s
 std::shared_ptr<::arrow::dataset::Partitioning> Partitioning::ToArrow() {
   // Hard code to hive partition for now
   return std::make_shared<::arrow::dataset::HivePartitioning>(schema_->ToArrow());
+}
+
+pb::Partitioning Partitioning::ToProto() const {
+  auto proto = pb::Partitioning();
+  for (auto& fid : schema_->GetFieldIds()) {
+    proto.add_field_ids(fid);
+  }
+  return proto;
 }
 
 const std::shared_ptr<Schema>& Partitioning::schema() const { return schema_; }

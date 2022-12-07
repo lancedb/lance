@@ -27,23 +27,42 @@ class Partitioning;
 
 class Schema;
 
+/// Partitioning.
+///
+/// Stored in each manifest, to describe the partitioning scheme of the dataset.
 class Partitioning {
  public:
   Partitioning() = delete;
 
+  /// Make a partitioning from partitioning schema.
+  ///
+  /// \param schema Partitioning schema.
+  /// \return Partitioning object on success. `::arrow::Status::Invalid` if schema is empty or
+  ///         any of the field is not primitive / string field.
+  static ::arrow::Result<Partitioning> Make(std::shared_ptr<Schema> schema);
+
+  /// Make partitioning from protobuf and dataset schema.
+  ///
+  /// \param dataset_schema the schema of the full dataset.
+  /// \param proto persisted the partitioning.
+  /// \return Partitioning object on success. `::arrow::Status::Invalid` if it can not construct
+  ///         partitioning object, i.e., the protobuf refers to a field that does not exist in the
+  ///         provided `dataset_schema`.
   static ::arrow::Result<Partitioning> Make(const Schema& dataset_schema,
                                             const pb::Partitioning& proto);
 
   /// Convert to an Arrow Partitioning.
   std::shared_ptr<::arrow::dataset::Partitioning> ToArrow();
 
+  /// Convert to protobuf.
   pb::Partitioning ToProto() const;
 
   /// Partition schema.
   const std::shared_ptr<Schema>& schema() const;
 
  private:
-  Partitioning(std::shared_ptr<Schema> schema);
+  /// Construct with partitioning schema.
+  explicit Partitioning(std::shared_ptr<Schema> schema);
 
   /// Partitioning schema
   std::shared_ptr<Schema> schema_;
