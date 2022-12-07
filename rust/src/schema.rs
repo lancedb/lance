@@ -50,10 +50,10 @@ impl Field {
             id: -1,
             parent_id: -1,
             name: field.name.clone(),
-            logical_type: Self::type_str(field.data_type().to_logical_type()),
+            logical_type: field.data_type().to_logical_type().type_str(),
             extension_name: String::new(),
             encoding: match field.data_type() {
-                t if Self::is_numeric(t) => Some(Encoding::Plain),
+                t if t.is_numeric() => Some(Encoding::Plain),
                 DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8 => {
                     Some(Encoding::VarBinary)
                 }
@@ -263,18 +263,10 @@ impl Field {
             DataType::LargeUtf8 => "largestring".to_string(),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", len),
             DataType::FixedSizeList(v, len) => {
-                format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len)
+                format!("fixed_size_list:{}:{}", v.data_type().type_str(), len)
             }
             x => format!("not supported format: {:?}", x),
         }
-    }
-
-    fn is_numeric(t: &DataType) -> bool {
-        use DataType::*;
-        matches!(
-            t,
-            UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64 | Float32 | Float64
-        )
     }
 
     fn insert(&mut self, child: Field) {
@@ -292,6 +284,55 @@ impl Field {
             }
         }
         None
+    }
+}
+
+trait ToLogicalType {
+    /// Return Arrow Data Type name.
+    fn type_str(&self) -> String;
+
+    fn is_numeric(&self) -> bool;
+}
+
+impl ToLogicalType for DataType {
+    /// Return Arrow Data Type name.
+    fn type_str(&self) -> String {
+        match self {
+            DataType::Boolean => "bool".to_string(),
+            DataType::UInt8 => "uint8".to_string(),
+            DataType::Int8 => "int8".to_string(),
+            DataType::UInt16 => "uint16".to_string(),
+            DataType::Int16 => "int16".to_string(),
+            DataType::UInt32 => "uint32".to_string(),
+            DataType::Int32 => "int32".to_string(),
+            DataType::UInt64 => "uint64".to_string(),
+            DataType::Int64 => "int64".to_string(),
+            DataType::Float16 => "halffloat".to_string(),
+            DataType::Float32 => "float".to_string(),
+            DataType::Float64 => "double".to_string(),
+            DataType::Date32 => "date32:day".to_string(),
+            DataType::Date64 => "date64:ms".to_string(),
+            DataType::Time32(unit) => format!("time32:{}", to_str(unit)),
+            DataType::Time64(unit) => format!("time64:{}", to_str(unit)),
+            DataType::Timestamp(unit, _) => format!("timestamp:{}", to_str(unit)),
+            DataType::Binary => "binary".to_string(),
+            DataType::Utf8 => "string".to_string(),
+            DataType::LargeBinary => "largebinary".to_string(),
+            DataType::LargeUtf8 => "largestring".to_string(),
+            DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", len),
+            DataType::FixedSizeList(v, len) => {
+                format!("fixed_size_list:{}:{}", Self::type_str(v.data_type()), len)
+            }
+            x => format!("not supported format: {:?}", x),
+        }
+    }
+
+    fn is_numeric(&self) -> bool {
+        use DataType::*;
+        matches!(
+            self,
+            UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64 | Float32 | Float64
+        )
     }
 }
 
