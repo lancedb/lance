@@ -33,6 +33,8 @@ add_library(
         metadata.h
         page_table.cc
         page_table.h
+        partitioning.cc
+        partitioning.h
         schema.cc
         schema.h
         visitors.cc

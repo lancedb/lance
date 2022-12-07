@@ -41,6 +41,11 @@ Format:
 
  */
 
+message Partitioning {
+  // Field IDs for the columns used in the partitioning schema.
+  repeated int32 field_ids = 1;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
