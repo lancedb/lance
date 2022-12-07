@@ -14,7 +14,7 @@
 
 pub mod encodings;
 pub mod io;
-pub mod metadata;
+mod metadata;
 mod page_table;
 pub mod schema;
 
