@@ -10,6 +10,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 from io import BytesIO
 
 import duckdb
@@ -43,7 +44,7 @@ def _check_duckdb_version():
     Currently the extension is pre-built for v0.6.0 of duckdb and duckdb
     does not support binary compatibility between patch versions
     """
-    CURR_VER = "0.6.0"
+    CURR_VER = "0.6.1"
     if duckdb.__version__ != CURR_VER:
         msg = (f"The lance extension is built against DuckDB version f{CURR_VER} but "
                f"{duckdb.__version__} was found. Please `pip install --force-reinstall duckdb=={CURR_VER}` "
