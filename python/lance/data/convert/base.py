@@ -27,10 +27,60 @@ from lance.io import download_uris
 from lance.types import ImageArray, ImageBinaryType
 
 
+def _convert_field(name: str, typ: pa.DataType, col: pd.Series) -> pa.Array:
+    """Pyarrow is unable to convert ExtensionTypes properly in pa.Table.from_pandas."""
+    if isinstance(typ, pa.ExtensionType):
+        storage = pa.array(col, type=typ.storage_type)
+        return pa.ExtensionArray.from_storage(typ, storage)
+    elif pa.types.is_list(typ):
+        native_arr = pa.array(col)
+        if isinstance(native_arr, pa.NullArray):
+            return pa.nulls(len(native_arr), typ)
+        offsets = native_arr.offsets
+        values = native_arr.values.to_numpy(zero_copy_only=False)
+        return pa.ListArray.from_arrays(
+            offsets, _convert_field(f"{name}.elements", typ.value_type, values)
+        )
+    elif pa.types.is_struct(typ):
+        native_arr = pa.array(col)
+        if isinstance(native_arr, pa.NullArray):
+            return pa.nulls(len(native_arr), typ)
+        arrays = []
+        for subfield in typ:
+            sub_arr = native_arr.field(subfield.name)
+            converted = _convert_field(
+                f"{name}.{subfield.name}",
+                subfield.type,
+                sub_arr.to_numpy(zero_copy_only=False),
+            )
+            arrays.append(converted)
+        return pa.StructArray.from_arrays(arrays, fields=typ)
+    else:
+        return pa.array(col, type=typ)
+
+
+def to_table(df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+    """Convert Pandas DataFrame to PyArrow with extension types, including Lance semantic types.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The Pandas DataFrame to convert.
+    schema : pa.Schema
+        Pyarrow Schema of the expected table.
+    """
+    arrays = []
+    for name, col in df.items():
+        field = schema.field(name)
+        arr = _convert_field(field.name, field.type, col)
+        arrays.append(arr)
+    return pa.Table.from_arrays(arrays=arrays, schema=schema).unify_dictionaries()
+
+
 class DatasetConverter(ABC):
     """Base class for converting raw => pandas => Arrow => Lance"""
 
-    def __init__(self, name, uri_root, images_root: str=None):
+    def __init__(self, name, uri_root, images_root: str = None):
         self.name = name
         self.uri_root = uri_root
         if images_root is None:
@@ -83,7 +133,7 @@ class DatasetConverter(ABC):
         **kwargs: keyword arguments to be passed to `write_dataset`
         """
         if isinstance(dataset, pd.DataFrame):
-            dataset = self.to_table(dataset)
+            dataset = to_table(dataset)
         fmt = fmt.lower()
         if fmt == "parquet":
             ds.write_dataset(dataset, output_path, format=fmt, **kwargs)
@@ -93,56 +143,13 @@ class DatasetConverter(ABC):
             raise ValueError(f"Unsupported format {fmt}")
         return dataset
 
-    def to_table(self, df: pd.DataFrame, to_image: bool = True) -> pa.Table:
-        """Convert each metdata column to pyarrow with lance types"""
-        schema = self.get_schema()
-        arrays = []
-        for name, col in df.items():
-            field = schema.field(name)
-            arr = self._convert_field(field.name, field.type, col)
-            arrays.append(arr)
-        table = (pa.Table.from_arrays(arrays=arrays, schema=schema)
-                 .unify_dictionaries())
-        if to_image:
-            table = self._load_images(table)
-        return table
-
-    def _convert_field(self, name, typ, col):
-        """pyarrow is unable to convert ExtensionTypes properly in pa.Table.from_pandas"""
-        if isinstance(typ, pa.ExtensionType):
-            storage = pa.array(col, type=typ.storage_type)
-            return pa.ExtensionArray.from_storage(typ, storage)
-        elif pa.types.is_list(typ):
-            native_arr = pa.array(col)
-            if isinstance(native_arr, pa.NullArray):
-                return pa.nulls(len(native_arr), typ)
-            offsets = native_arr.offsets
-            values = native_arr.values.to_numpy(zero_copy_only=False)
-            return pa.ListArray.from_arrays(
-                offsets, self._convert_field(f"{name}.elements", typ.value_type, values)
-            )
-        elif pa.types.is_struct(typ):
-            native_arr = pa.array(col)
-            if isinstance(native_arr, pa.NullArray):
-                return pa.nulls(len(native_arr), typ)
-            arrays = []
-            for subfield in typ:
-                sub_arr = native_arr.field(subfield.name)
-                converted = self._convert_field(
-                    f"{name}.{subfield.name}",
-                    subfield.type,
-                    sub_arr.to_numpy(zero_copy_only=False),
-                )
-                arrays.append(converted)
-            return pa.StructArray.from_arrays(arrays, fields=typ)
-        else:
-            return pa.array(col, type=typ)
-
-    def _load_images(self, table: pa.Table, image_col: str = 'image'):
+    def _load_images(self, table: pa.Table, image_col: str = "image"):
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         image_arr = ImageArray.from_pandas(images)
-        embedded = table.append_column(pa.field(image_col, ImageBinaryType()), image_arr)
+        embedded = table.append_column(
+            pa.field(image_col, ImageBinaryType()), image_arr
+        )
         return embedded
 
     @classmethod
@@ -161,7 +168,7 @@ class DatasetConverter(ABC):
         @click.option(
             "--images-root",
             type=str,
-            help="If provided, use this as the uri root for image uri's"
+            help="If provided, use this as the uri root for image uri's",
         )
         @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
         @click.option(
@@ -189,7 +196,7 @@ class DatasetConverter(ABC):
             "--num-rows",
             type=int,
             default=0,
-            help="Max rows in the dataset (0 means this is ignored)"
+            help="Max rows in the dataset (0 means this is ignored)",
         )
         def main(
             base_uri,
@@ -199,7 +206,7 @@ class DatasetConverter(ABC):
             output_path,
             group_size: int,
             max_rows_per_file: int,
-            num_rows: int
+            num_rows: int,
         ):
             converter = cls(base_uri, images_root)
             df = converter.read_metadata(num_rows=num_rows)
@@ -211,15 +218,15 @@ class DatasetConverter(ABC):
                 fmt = known_formats
 
             for f in fmt:
-                if f == 'lance':
+                if f == "lance":
                     kwargs = {
                         "existing_data_behavior": "overwrite_or_ignore",
                         "max_rows_per_group": group_size,
                         "max_rows_per_file": max_rows_per_file,
                     }
-                elif f == 'parquet':
+                elif f == "parquet":
                     kwargs = {
-                        'max_rows_per_group': group_size,
+                        "max_rows_per_group": group_size,
                     }
                 else:
                     raise TypeError(f"Format {f} not supported")
