@@ -47,7 +47,7 @@ Partitioning::Partitioning(std::shared_ptr<Schema> schema) : schema_(std::move(s
   return Make(schema);
 }
 
-std::shared_ptr<::arrow::dataset::Partitioning> Partitioning::ToArrow() {
+std::shared_ptr<::arrow::dataset::Partitioning> Partitioning::ToArrow() const {
   // Hard code to hive partition for now
   return std::make_shared<::arrow::dataset::HivePartitioning>(schema_->ToArrow());
 }

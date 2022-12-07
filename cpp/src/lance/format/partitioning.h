@@ -41,9 +41,9 @@ class Partitioning {
   ///         any of the field is not primitive / string field.
   static ::arrow::Result<Partitioning> Make(std::shared_ptr<Schema> schema);
 
-  /// Make partitioning from protobuf and dataset schema.
+  /// Make partitioning from protobuf and full dataset schema.
   ///
-  /// \param dataset_schema the schema of the full dataset.
+  /// \param dataset_schema the full schema of the dataset.
   /// \param proto persisted the partitioning.
   /// \return Partitioning object on success. `::arrow::Status::Invalid` if it can not construct
   ///         partitioning object, i.e., the protobuf refers to a field that does not exist in the
@@ -52,7 +52,7 @@ class Partitioning {
                                             const pb::Partitioning& proto);
 
   /// Convert to an Arrow Partitioning.
-  std::shared_ptr<::arrow::dataset::Partitioning> ToArrow();
+  std::shared_ptr<::arrow::dataset::Partitioning> ToArrow() const;
 
   /// Convert to protobuf.
   pb::Partitioning ToProto() const;

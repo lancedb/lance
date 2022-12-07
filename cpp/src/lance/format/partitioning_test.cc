@@ -12,8 +12,35 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
+#include "lance/format/partitioning.h"
+
+#include <arrow/type.h>
+
 #include <catch2/catch_test_macros.hpp>
 
-TEST_CASE("Create partition from protobuf") {
+#include "lance/format/schema.h"
 
+using namespace ::arrow::compute;
+
+TEST_CASE("Create partition from protobuf") {
+  auto arrow_schema = ::arrow::schema(
+      {::arrow::field("a", ::arrow::int32()), ::arrow::field("split", ::arrow::utf8())});
+  auto schema = std::make_shared<::lance::format::Schema>(arrow_schema);
+
+  auto partitioning = lance::format::Partitioning::Make(std::move(schema)).ValueOrDie();
+
+  auto arrow_part = partitioning.ToArrow();
+  CHECK(arrow_part->type_name() == "hive");
+  auto path = arrow_part
+                  ->Format(::arrow::compute::and_(
+                      ::arrow::compute::equal(::arrow::compute::field_ref("a"),
+                                              ::arrow::compute::literal(123)),
+                      ::arrow::compute::equal(::arrow::compute::field_ref("split"),
+                                              ::arrow::compute::literal("test"))))
+                  .ValueOrDie();
+  CHECK(path.directory == "a=123/split=test");
+
+  auto expr = arrow_part->Parse("a=12/split=eval/foo.lance").ValueOrDie();
+  CHECK(expr.Equals(
+      and_(equal(field_ref("a"), literal(12)), equal(field_ref("split"), literal("eval")))));
 }
