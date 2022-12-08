@@ -24,6 +24,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 option(LANCE_BUILD_CMD "Build lance command line tool" ON)
+option(LANCE_STATIC_BUILD "Build lance as static library" OFF)
 
 # Default to Debug build if not specified
 if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
@@ -95,6 +96,7 @@ include_directories(
 )
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
+set(Protobuf_USE_STATIC_LIBS ${LANCE_STATIC_BUILD})
 find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
@@ -158,10 +160,20 @@ if (LANCE_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif ()
 
-add_library(lance SHARED ${lance_objects})
-target_link_libraries(lance PUBLIC
+if (LANCE_STATIC_BUILD)
+    add_library(lance STATIC ${lance_objects})
+    target_link_libraries(lance PUBLIC
+        ${Protobuf_LIBRARIES}
+        Arrow::arrow_static
+        ArrowDataset::arrow_dataset_static
+        fmt::fmt-header-only
+        )
+else()
+    add_library(lance SHARED ${lance_objects})
+    target_link_libraries(lance PUBLIC
         ${Protobuf_LIBRARIES}
         Arrow::arrow_shared
         ArrowDataset::arrow_dataset_shared
         fmt::fmt
         )
+endif(LANCE_STATIC_BUILD)

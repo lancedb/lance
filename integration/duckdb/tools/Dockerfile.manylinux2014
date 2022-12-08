@@ -14,4 +14,5 @@ RUN yum update -y \
   wget \
   http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-devel-3.6.1-4.el7.x86_64.rpm \
   http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-compiler-3.6.1-4.el7.x86_64.rpm \
-  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm
+  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-3.6.1-4.el7.x86_64.rpm \
+  http://mirror.centos.org/centos-7/7.9.2009/cloud/x86_64/openstack-train/Packages/p/protobuf-static-3.6.1-4.el7.x86_64.rpm

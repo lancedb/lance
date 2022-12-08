@@ -31,7 +31,7 @@ set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
   GIT_REPOSITORY https://github.com/duckdb/duckdb.git
-  GIT_TAG v0.6.0)
+  GIT_TAG v0.6.1)
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
@@ -110,6 +110,7 @@ if(LANCE_BUILD_PYTORCH)
 endif()
 
 # Add lance core as dependency
+set(LANCE_STATIC_BUILD ON)
 find_package(Arrow REQUIRED)
 find_package(ArrowDataset REQUIRED)
 include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include ../../cpp/src)
@@ -144,7 +145,7 @@ endif()
 # add_library(lance_extension STATIC ${LANCE_EXT_SOURCES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
-target_link_libraries(lance_loadable_extension lance ArrowDataset::arrow_dataset_shared fmt::fmt)
+target_link_libraries(lance_loadable_extension lance fmt::fmt-header-only)
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"
