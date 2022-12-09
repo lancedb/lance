@@ -60,8 +60,12 @@ inline ::duckdb::LogicalType ToLogicalType(const ::arrow::DataType& dtype) {
       return ::duckdb::LogicalType::USMALLINT;
     case ::arrow::Type::INT32:
       return ::duckdb::LogicalType::INTEGER;
-    case ::arrow::Type::UINT64:
+    case ::arrow::Type::UINT32:
       return ::duckdb::LogicalType::UINTEGER;
+    case ::arrow::Type::INT64:
+      return ::duckdb::LogicalType::BIGINT;
+    case ::arrow::Type::UINT64:
+      return ::duckdb::LogicalType::UBIGINT;
     case ::arrow::Type::FLOAT:
     case ::arrow::Type::HALF_FLOAT:
       return ::duckdb::LogicalType::FLOAT;
