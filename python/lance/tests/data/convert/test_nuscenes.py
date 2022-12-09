@@ -17,8 +17,8 @@ import tarfile
 
 BASE_URI_FIXTURES = "https://eto-public.s3.us-west-2.amazonaws.com"
 URI_FIXTURES = "/tests/datasets/nuimages-v1.0-mini-test-fixtures.tgz"
-LOCAL_ZIP_PATH = "/Users/jsc/code/nuimages-v1.0-mini-test-fixtures.tgz"
-LOCAL_FIXTURES_PATH = "/Users/jsc/code"
+LOCAL_ZIP_PATH = "/tmp/nuimages-v1.0-mini-test-fixtures.tgz"
+LOCAL_FIXTURES_PATH = "/tmp"
 
 from lance.data.convert.nuscenes import NuscenesConverter
 
