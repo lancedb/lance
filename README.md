@@ -51,16 +51,16 @@ ds = lance.dataset("s3://eto-public/datasets/oxford_pet/oxford_pet.lance")
 duckdb.query('select class, count(1) from ds group by 1').to_arrow_table()
 ```
 
-You can easily import a DataFrame or a Parquet file to Lance using Apache Arrow-first APIs:
+You can easily import a DataFrame or a Parquet file to Lance:
 
 ```python
-import pyarrow as pa
 
 # Import a pandas DataFrame to Lance
-tbl = pa.Table.from_pandas(my_dataframe)
-lance.write_dataset(tbl, '/tmp/my_dataframe.lance')
+lance.write_dataset(my_dataframe, '/tmp/my_dataframe.lance')
 
 # Import a Parquet file to Lance
+import pyarrow as pa
+
 parquet_dataset = ds.dataset('/tmp/hello.parquet')
 lance.write_dataset(parquet_dataset, '/tmp/hello.lance')
 ```
