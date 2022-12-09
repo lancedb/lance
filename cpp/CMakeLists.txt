@@ -166,7 +166,7 @@ if (LANCE_STATIC_BUILD)
         ${Protobuf_LIBRARIES}
         Arrow::arrow_static
         ArrowDataset::arrow_dataset_static
-        fmt::fmt-header-only
+        fmt::fmt
         )
 else()
     add_library(lance SHARED ${lance_objects})
@@ -177,3 +177,4 @@ else()
         fmt::fmt
         )
 endif(LANCE_STATIC_BUILD)
+#set_target_properties(lance PROPERTIES POSITION_INDEPENDENT_CODE ON)

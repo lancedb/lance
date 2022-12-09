@@ -15,4 +15,5 @@
 
 add_executable(lq lance.cc)
 target_link_libraries(lq argparse lance fmt::fmt)
+target_compile_features(lq PUBLIC cxx_std_20)
 target_include_directories(lq SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})

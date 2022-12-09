@@ -10,7 +10,7 @@ release-linux:
 		-w /code/integration/duckdb \
 		--user ${UID}:${GID} \
 		duckdb_manylinux \
-		/bin/bash -c "cmake -B manylinux-build && cd manylinux-build && make -j $(JOBS) && cp lance/liblance.so ."
+		/bin/bash -c "cmake -DLANCE_BUILD_PYTORCH=FALSE -B manylinux-build && cd manylinux-build && make -j $(JOBS)"
 
 release-cuda:
 	cd cuda && docker compose run cuda /code/cuda/build_lance.sh && cd ..
