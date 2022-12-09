@@ -56,10 +56,10 @@ You can easily import a DataFrame or a Parquet file to Lance:
 ```python
 
 # Import a pandas DataFrame to Lance
-lance.write_dataset(my_dataframe, '/tmp/my_dataframe.lance')
+lance.write_dataset(my_dataframe, '/tmp/hello.lance')
 
 # Import a Parquet file to Lance
-import pyarrow as pa
+import pyarrow.dataset as ds
 
 parquet_dataset = ds.dataset('/tmp/hello.parquet')
 lance.write_dataset(parquet_dataset, '/tmp/hello.lance')
