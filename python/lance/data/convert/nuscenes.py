@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+import lance
 from lance.types import Box2dType
 
 sys.path.append("..")
@@ -245,3 +246,15 @@ class NuscenesConverter():
             pa.field("surface_ann", surface_ann_schema),
             pa.field("object_ann", object_ann_schema)
         ])
+    
+    def write_dataset(self, dataset, output_path, fmt="lance", **kwargs):
+        # Only accepts df/lance at this point TODO to convert to pyarrow typed dataset
+        if isinstance(dataset, pd.DataFrame):
+            fmt = fmt.lower()
+            if fmt == "lance":
+                lance.write_dataset(dataset, output_path, **kwargs)
+            else:
+                raise ValueError(f"Unsupported format {fmt}")
+            return dataset
+        else:
+            raise ValueError(f"Unsupported input format, only accepts DataFrames currently")

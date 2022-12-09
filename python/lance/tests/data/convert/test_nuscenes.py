@@ -12,12 +12,34 @@
 #  limitations under the License.
 import numpy as np
 import pyarrow as pa
+import requests
+import tarfile
+
+BASE_URI_FIXTURES = "https://eto-public.s3.us-west-2.amazonaws.com"
+URI_FIXTURES = "/tests/datasets/nuimages-v1.0-mini-test-fixtures.tgz"
+LOCAL_ZIP_PATH = "/Users/jsc/code/nuimages-v1.0-mini-test-fixtures.tgz"
+LOCAL_FIXTURES_PATH = "/Users/jsc/code"
 
 from lance.data.convert.nuscenes import NuscenesConverter
 
-def test_nuscenes_dataset_converter(uri_root, dataset_version):
+def prep_test_fixtures():
+    r = requests.get(f"{BASE_URI_FIXTURES}{URI_FIXTURES}", stream=True)
+    if r.status_code == 200:
+        with open(LOCAL_ZIP_PATH, 'wb') as f:
+            f.write(r.raw.read())
+
+def unpack_fixtures():
+    if tarfile.is_tarfile(LOCAL_ZIP_PATH):
+        with tarfile.open(LOCAL_ZIP_PATH) as f:
+            f.extractall(path=LOCAL_FIXTURES_PATH)
+
+def test_nuscenes_dataset_converter():
+    prep_test_fixtures()
+    unpack_fixtures()
     c = NuscenesConverter(
-        uri_root=uri_root,
-        dataset_verson=dataset_version
+        uri_root=f"{LOCAL_FIXTURES_PATH}/nuimages-v1.0-mini-test-fixtures",
+        dataset_verson="v1.0-mini"
     )
     nuscenes_df = c.instances_to_df()
+    assert nuscenes_df.shape[0] == 2
+    c.write_dataset(nuscenes_df, LOCAL_FIXTURES_PATH, "lance")
