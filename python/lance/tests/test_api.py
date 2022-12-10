@@ -16,12 +16,12 @@
 from pathlib import Path
 
 import pandas as pd
-
-import lance
 import pyarrow as pa
 import pyarrow.dataset as ds
 
+import lance
 from lance import LanceFileFormat, dataset
+from lance.util import cd
 
 
 def test_simple_round_trips(tmp_path: Path):
@@ -128,3 +128,20 @@ def test_write_versioned_dataset(tmp_path: Path):
     assert dataset.version["version"] == 3
     assert dataset.latest_version()["version"] == 3
     assert len(dataset.versions()) == 3
+
+
+def test_open_local_path(tmp_path: Path):
+    table = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    base_dir = tmp_path / "local_path"
+    lance.write_dataset(table, base_dir)
+
+    with cd(tmp_path):
+        ds = lance.dataset("./local_path")
+        assert ds.to_table() == table
+
+    with cd(tmp_path):
+        ds = lance.dataset("local_path")
+        assert ds.to_table() == table
+
+    ds = lance.dataset(base_dir.absolute())
+    assert ds.to_table() == table
