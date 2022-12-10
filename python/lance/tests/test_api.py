@@ -138,3 +138,6 @@ def test_open_local_path(tmp_path: Path):
     with cd(tmp_path):
         ds = lance.dataset("./local_path")
         assert ds.to_table() == table
+
+    ds = lance.dataset(base_dir.absolute())
+    assert ds.to_table() == table
