@@ -90,6 +90,8 @@ def convert_imagenet_1k(
         ]
     )
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
+    # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
+    # it allows to write larger-than-memory data.
     dataset = pa.dataset.dataset(list(_record_batch_gen(limit=limit)))
     lance.write_dataset(dataset, out, max_rows_per_group=group_size)
 
