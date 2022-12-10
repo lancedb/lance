@@ -18,13 +18,14 @@ import os
 import sys
 import copy
 from collections import defaultdict
-from typing import Iterable
+from typing import Iterable, List
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
 import lance
+from lance.data.convert.base import DatasetConverter
 from lance.types import Box2dType
 
 sys.path.append("..")
@@ -42,7 +43,7 @@ INSTANCE_DATA_TABLES = [
     "log"
 ]
 
-class NuscenesConverter():
+class NuscenesConverter(DatasetConverter):
     def __init__(self, uri_root: str, dataset_verson: str):
         """
         We either support Nuimages (just images and sweeps using camera modality)
@@ -50,10 +51,12 @@ class NuscenesConverter():
         Both datasets come with a mini version that contains no splits
         and a full size version with splits.
         """
+        super(NuscenesConverter, self).__init__(
+            "nuscenes", uri_root)
+
         assert dataset_verson in SUPPORTED_DATASET_VERSIONS, f"Nuscenes converter does not support the dataset version {dataset_verson}."
         self.dataset_version = dataset_verson
         self.has_split = True
-        self.uri_root = uri_root
         self.instance_data = self._load_instance_data()
 
         if "mini" in self.dataset_version:
@@ -123,37 +126,41 @@ class NuscenesConverter():
                 objects.append(object_joined)
         return objects
 
-    def instances_to_df(self):
+    def read_metadata(self, num_rows: int = 0):
         """
         Converts the dataset to a dataframe that is flattened.
         To do so, we need to get all the samples and
         join various entities to the sample.
         """
         instances_df = []
+        current_row = 0
            
         for sample in self.instance_data["sample"]:
-            # Find all related entities to the sample
-            log_data = self._find_foreign_object(sample["log_token"], "token", "log")
-            sample_data = self._find_foreign_object(sample["token"], "sample_token", "sample_data")
-            ego_pose = self._find_foreign_object(sample_data["ego_pose_token"], "token", "ego_pose")
-            calibrated_sensor = self._find_foreign_object(sample_data["calibrated_sensor_token"], "token", "calibrated_sensor")
-            sensor = self._find_foreign_object(calibrated_sensor["sensor_token"], "token", "sensor")
+            if num_rows > current_row or num_rows == 0:
+                current_row += 1
 
-            # Create the flatten sample
-            sample_joined = copy.deepcopy(sample)
-            sample_joined = self._merge_dict(sample_joined, log_data, "log")
-            sample_joined = self._merge_dict(sample_joined, sample_data, "sample_data")
-            sample_joined = self._merge_dict(sample_joined, ego_pose, "ego_pose")
-            sample_joined = self._merge_dict(sample_joined, calibrated_sensor, "calibrated_sensor")
-            sample_joined = self._merge_dict(sample_joined, sensor, "sensor")
+                # Find all related entities to the sample
+                log_data = self._find_foreign_object(sample["log_token"], "token", "log")
+                sample_data = self._find_foreign_object(sample["token"], "sample_token", "sample_data")
+                ego_pose = self._find_foreign_object(sample_data["ego_pose_token"], "token", "ego_pose")
+                calibrated_sensor = self._find_foreign_object(sample_data["calibrated_sensor_token"], "token", "calibrated_sensor")
+                sensor = self._find_foreign_object(calibrated_sensor["sensor_token"], "token", "sensor")
 
-            # Find the annotations for the sample
-            object_anns = self._find_annotations(sample_data["token"], "sample_data_token", "object_ann")
-            surface_ann = self._find_annotations(sample_data["token"] , "sample_data_token", "surface_ann")
-            sample_joined["object_ann"] = object_anns
-            sample_joined["surface_ann"] = surface_ann
-            
-            instances_df.append(sample_joined)
+                # Create the flatten sample
+                sample_joined = copy.deepcopy(sample)
+                sample_joined = self._merge_dict(sample_joined, log_data, "log")
+                sample_joined = self._merge_dict(sample_joined, sample_data, "sample_data")
+                sample_joined = self._merge_dict(sample_joined, ego_pose, "ego_pose")
+                sample_joined = self._merge_dict(sample_joined, calibrated_sensor, "calibrated_sensor")
+                sample_joined = self._merge_dict(sample_joined, sensor, "sensor")
+
+                # Find the annotations for the sample
+                object_anns = self._find_annotations(sample_data["token"], "sample_data_token", "object_ann")
+                surface_ann = self._find_annotations(sample_data["token"] , "sample_data_token", "surface_ann")
+                sample_joined["object_ann"] = object_anns
+                sample_joined["surface_ann"] = surface_ann
+                
+                instances_df.append(sample_joined)
         
         return pd.DataFrame(instances_df)
     
@@ -163,13 +170,19 @@ class NuscenesConverter():
         This is flatten/denormalized for better ergonomics for
         ML - i.e. filtering/slicing the dataset and reducing joins.
         Column names are renamed accordingly to prevent collisions.
-        """        
+        """
+        # Mask
+        mask_schema = pa.struct([
+            pa.field("size", pa.list_(pa.int32(), 2)),
+            pa.field("counts", pa.string())
+        ])
+
         # Surface Ann
         surface_ann_schema = pa.struct([
-            pa.field("surface_ann_token_", pa.string()),
-            pa.field("surface_ann_sample_data_token_", pa.string()),
-            pa.field("surface_ann_category_token_", pa.string()),
-            pa.field("surface_ann_mask_", pa.string()), # TODO: change to RLE once type is created 
+            pa.field("token", pa.string()),
+            pa.field("sample_data_token", pa.string()),
+            pa.field("category_token", pa.string()),
+            pa.field("mask", mask_schema), # TODO: change to RLE once type is created 
 
             # Category
             pa.field("category_token_", pa.string()),
@@ -179,12 +192,12 @@ class NuscenesConverter():
 
         # Object Ann
         object_ann_schema = pa.struct([
-            pa.field("object_ann_token_", pa.string()),
-            pa.field("object_ann_sample_data_token_", pa.string()),
-            pa.field("object_ann_category_token_", pa.string()),
-            pa.field("object_ann_attribute_tokens_", pa.list_(pa.string())),
-            pa.field("object_ann_bbox_", Box2dType),
-            pa.field("object_ann_mask_", pa.string()), # TODO: change to RLE once type is created
+            pa.field("token", pa.string()),
+            pa.field("sample_data_token", pa.string()),
+            pa.field("category_token", pa.string()),
+            pa.field("attribute_tokens", pa.list_(pa.string())),
+            pa.field("bbox", Box2dType()),
+            pa.field("mask", mask_schema), # TODO: change to RLE once type is created
 
             # Category
             pa.field("category_token_", pa.string()),
@@ -195,7 +208,7 @@ class NuscenesConverter():
         return pa.schema([
             # Sample is our root table, we don't rename these fields
             pa.field("token", pa.string()),
-            pa.field("timestamp", pa.int32()),
+            pa.field("timestamp", pa.int64()),
             pa.field("log_token", pa.string()),
             pa.field("key_camera_token", pa.string()),
             
@@ -212,7 +225,7 @@ class NuscenesConverter():
             pa.field("calibrated_sensor_translation_", pa.list_(pa.float32(), 3)),
             pa.field("calibrated_sensor_rotation_", pa.list_(pa.float32(), 4)),
             pa.field("calibrated_sensor_camera_intrinsic_", pa.list_(pa.list_(pa.float32(), 3))),
-            pa.field("calibrated_sensor_camera_distortion_", pa.list_(pa.float32(), 6)), # can be 5 or 6 length
+            pa.field("calibrated_sensor_camera_distortion_", pa.list_(pa.float32())), # can be 5 or 6 length
             
             # Sensor
             pa.field("sensor_token_", pa.string()),
@@ -228,7 +241,7 @@ class NuscenesConverter():
             pa.field("sample_data_fileformat_", pa.string()),
             pa.field("sample_data_width_", pa.int32()),
             pa.field("sample_data_height_", pa.int32()),
-            pa.field("sample_data_timestamp_", pa.int32()),
+            pa.field("sample_data_timestamp_", pa.int64()),
             pa.field("sample_data_is_key_frame_", pa.bool_()),
             pa.field("sample_data_next_", pa.string()),
             pa.field("sample_data_prev_", pa.string()),
@@ -237,24 +250,16 @@ class NuscenesConverter():
             pa.field("ego_pose_token_", pa.string()),
             pa.field("ego_pose_translation_", pa.list_(pa.float32(), 3)),
             pa.field("ego_pose_rotation_", pa.list_(pa.float32(), 4)),
-            pa.field("ego_pose_timestamp_", pa.int32()),
+            pa.field("ego_pose_timestamp_", pa.int64()),
             pa.field("ego_pose_rotation_rate_", pa.list_(pa.float32(), 3)),
             pa.field("ego_pose_acceleration_", pa.list_(pa.float32(), 3)),
             pa.field("ego_pose_speed_", pa.float32()),
 
             # Annotations
-            pa.field("surface_ann", surface_ann_schema),
-            pa.field("object_ann", object_ann_schema)
+            pa.field("surface_ann", pa.list_(surface_ann_schema)),
+            pa.field("object_ann", pa.list_(object_ann_schema))
         ])
     
-    def write_dataset(self, dataset, output_path, fmt="lance", **kwargs):
-        # Only accepts df/lance at this point TODO to convert to pyarrow typed dataset
-        if isinstance(dataset, pd.DataFrame):
-            fmt = fmt.lower()
-            if fmt == "lance":
-                lance.write_dataset(dataset, output_path, **kwargs)
-            else:
-                raise ValueError(f"Unsupported format {fmt}")
-            return dataset
-        else:
-            raise ValueError(f"Unsupported input format, only accepts DataFrames currently")
+    def image_uris(self, table) -> List[str]:
+        """Return image uris to read the binary column"""
+        pass

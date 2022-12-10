@@ -40,6 +40,6 @@ def test_nuscenes_dataset_converter():
         uri_root=f"{LOCAL_FIXTURES_PATH}/nuimages-v1.0-mini-test-fixtures",
         dataset_verson="v1.0-mini"
     )
-    nuscenes_df = c.instances_to_df()
+    nuscenes_df = c.read_metadata()
     assert nuscenes_df.shape[0] == 2
     c.write_dataset(nuscenes_df, LOCAL_FIXTURES_PATH, "lance")
