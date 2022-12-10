@@ -20,6 +20,8 @@ except ImportError as ie:
 
 import pyarrow as pa
 
+
 def features_to_schema(features) -> pa.Schema:
+    """Convert Hugging Face features to lance / arrow semantic types."""
     print(features)
     pass

@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 from __future__ import annotations
 
 import io
@@ -102,9 +103,15 @@ class Image(ABC):
     """
 
     @staticmethod
-    def create(data: Optional[Union[bytes, bytearray, str, Image]]):
+    def create(data: Optional[Union[bytes, bytearray, str, Image, PILImage]]) -> Image:
         if pd.isna(data):
             return None
+
+        if isinstance(data, PILImage.Image):
+            buf = io.BytesIO()
+            data.save(buf, format=data.format)
+            return Image.create(buf.getvalue())
+
         if isinstance(data, Image):
             return data
 

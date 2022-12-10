@@ -34,25 +34,34 @@ def _record_batch_gen(batch_size: int = 1024) -> Generator[pa.RecordBatch, None,
     for split in splits:
         hg_dataset = load_dataset("imagenet-1k", split=split, streaming=True)
         hg_features = hg_dataset.features
-        batch = {"image": [], "label": []}
-        for example in hg_dataset:
-            batch.append(
-                {
-                    "image": Image.create(example["image"]),
-                    "label": example["label"],
-                    "split": splits.index(split),
-                }
-            )
+        batch = {"image": [], "label": [], "split": []}
+        for example in itertools.islice(hg_dataset, 2000):
+            batch["image"].append(Image.create(example["image"]))
+            if split == "test":
+                batch["label"].append(None)
+            else:
+                batch["label"].append(example["label"])
+            batch["split"].append(splits.index(split))
 
-            if len(batch) >= batch_size:
+            if len(batch["image"]) >= batch_size:
                 image_arr = ImageArray.from_images(batch["image"])
-                label_arr = pyarrow.DictionaryArray(
-                    pa.array(batch["label"], hg_features["label"].names)
+                label_arr = pyarrow.DictionaryArray.from_arrays(
+                    pa.array(batch["label"], type=pa.int16()), hg_features["label"].names
                 )
-                split_arr = pyarrow.DictionaryArray(pa.array(batch["split"], splits))
-                yield pa.RecordBatch(
+                split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), splits)
+                yield pa.RecordBatch.from_arrays(
                     [image_arr, label_arr, split_arr], ["image", "label", "split"]
                 )
+                batch = {"image": [], "label": [], "split": []}
+
+        if batch["image"]:
+            image_arr = ImageArray.from_images(batch["image"])
+            label_arr = pyarrow.DictionaryArray.from_arrays(
+                pa.array(batch["label"], type=pa.int16()), hg_features["label"].names)
+            split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), splits)
+            yield pa.RecordBatch.from_arrays(
+                [image_arr, label_arr, split_arr], ["image", "label", "split"]
+            )
 
 
 def convert_imagenet_1k(out: str | Path) -> lance.FileSystemDataset:
@@ -74,13 +83,14 @@ def convert_imagenet_1k(out: str | Path) -> lance.FileSystemDataset:
             pa.field("split", pa.dictionary(pa.int8(), pa.utf8())),
         ]
     )
-    batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
-    dataset = pa.dataset.dataset(batch_reader)
+    # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
+    dataset = pa.dataset.dataset(list(_record_batch_gen()))
     lance.write_dataset(dataset, out)
 
 
 if __name__ == "__main__":
     import click
+
 
     @click.command()
     @click.argument("out")
@@ -94,5 +104,6 @@ if __name__ == "__main__":
     )
     def main(out, limit):
         convert_imagenet_1k(out)
+
 
     main()
