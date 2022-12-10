@@ -262,4 +262,6 @@ class NuscenesConverter(DatasetConverter):
     
     def image_uris(self, table) -> List[str]:
         """Return image uris to read the binary column"""
-        pass
+        uris = [os.path.join(self.uri_root, image_uri)
+            for image_uri in table["sample_data_filename_"].to_numpy()]
+        return uris
