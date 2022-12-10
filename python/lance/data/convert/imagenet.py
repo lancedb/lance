@@ -13,21 +13,38 @@
 #  limitations under the License.
 
 
+import itertools
 from pathlib import Path
+from typing import Dict, Generator, List, Optional
 
 import pyarrow
-
-import lance
-import itertools
-from typing import Generator
 import pyarrow as pa
 import pyarrow.dataset
+
+import lance
 from lance.types.image import Image, ImageArray, ImageBinaryType
-import pandas as pd
-import lance.data.huggingface as hf
+
+__all__ = ["convert_imagenet_1k"]
+
+_SPLITS = ["train", "validation", "test"]
 
 
-def _record_batch_gen(batch_size: int = 1024) -> Generator[pa.RecordBatch, None, None]:
+def _to_record_batch(batch: Dict, label_names: List[str]) -> pa.RecordBatch:
+    """Convert a batch to RecordBatch."""
+    image_arr = ImageArray.from_images(batch["image"])
+    label_arr = pyarrow.DictionaryArray.from_arrays(
+        pa.array(batch["label"], type=pa.int16()),
+        label_names,
+    )
+    split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), _SPLITS)
+    return pa.RecordBatch.from_arrays(
+        [image_arr, label_arr, split_arr], ["image", "label", "split"]
+    )
+
+
+def _record_batch_gen(
+    batch_size: int = 1024, limit: Optional[int] = None
+) -> Generator[pa.RecordBatch, None, None]:
     """Generator of RecordBatch."""
     from datasets import load_dataset
 
@@ -36,36 +53,24 @@ def _record_batch_gen(batch_size: int = 1024) -> Generator[pa.RecordBatch, None,
         hg_dataset = load_dataset("imagenet-1k", split=split, streaming=True)
         hg_features = hg_dataset.features
         batch = {"image": [], "label": [], "split": []}
-        for example in itertools.islice(hg_dataset, 2000):
+        if limit:
+            hg_dataset = itertools.islice(hg_dataset, limit)
+        for example in hg_dataset:
             batch["image"].append(Image.create(example["image"]))
-            if split == "test":
-                batch["label"].append(None)
-            else:
-                batch["label"].append(example["label"])
+            batch["label"].append(example["label"] if split != "test" else None)
             batch["split"].append(splits.index(split))
 
             if len(batch["image"]) >= batch_size:
-                image_arr = ImageArray.from_images(batch["image"])
-                label_arr = pyarrow.DictionaryArray.from_arrays(
-                    pa.array(batch["label"], type=pa.int16()), hg_features["label"].names
-                )
-                split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), splits)
-                yield pa.RecordBatch.from_arrays(
-                    [image_arr, label_arr, split_arr], ["image", "label", "split"]
-                )
+                yield _to_record_batch(batch, hg_features["label"].names)
                 batch = {"image": [], "label": [], "split": []}
 
         if batch["image"]:
-            image_arr = ImageArray.from_images(batch["image"])
-            label_arr = pyarrow.DictionaryArray.from_arrays(
-                pa.array(batch["label"], type=pa.int16()), hg_features["label"].names)
-            split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), splits)
-            yield pa.RecordBatch.from_arrays(
-                [image_arr, label_arr, split_arr], ["image", "label", "split"]
-            )
+            yield _to_record_batch(batch, hg_features["label"].names)
 
 
-def convert_imagenet_1k(out: str | Path) -> lance.FileSystemDataset:
+def convert_imagenet_1k(
+    out: str | Path, group_size: int, limit: Optional[int] = None
+) -> lance.FileSystemDataset:
     """Converting ImageNet 1K dataset to lance format
 
     Parameters
@@ -85,16 +90,23 @@ def convert_imagenet_1k(out: str | Path) -> lance.FileSystemDataset:
         ]
     )
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
-    dataset = pa.dataset.dataset(list(_record_batch_gen()))
-    lance.write_dataset(dataset, out)
+    dataset = pa.dataset.dataset(list(_record_batch_gen(limit=limit)))
+    lance.write_dataset(dataset, out, max_rows_per_group=group_size)
 
 
 if __name__ == "__main__":
     import click
 
-
     @click.command()
     @click.argument("out")
+    @click.option(
+        "-g",
+        "--group-size",
+        type=int,
+        default=2048,
+        help="group size",
+        show_default=True,
+    )
     @click.option(
         "--limit",
         type=int,
@@ -103,8 +115,7 @@ if __name__ == "__main__":
         metavar="N",
         show_default=True,
     )
-    def main(out, limit):
-        convert_imagenet_1k(out)
-
+    def main(out, group_size, limit):
+        convert_imagenet_1k(out, group_size)
 
     main()
