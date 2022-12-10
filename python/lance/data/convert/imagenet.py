@@ -23,6 +23,7 @@ from typing import Generator
 import pyarrow as pa
 import pyarrow.dataset
 from lance.types.image import Image, ImageArray, ImageBinaryType
+import pandas as pd
 import lance.data.huggingface as hf
 
 
