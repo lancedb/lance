@@ -118,6 +118,6 @@ if __name__ == "__main__":
         show_default=True,
     )
     def main(out, group_size, limit):
-        convert_imagenet_1k(out, group_size)
+        convert_imagenet_1k(out, group_size, limit=limit)
 
     main()
