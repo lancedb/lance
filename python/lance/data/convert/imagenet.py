@@ -82,13 +82,6 @@ def convert_imagenet_1k(
     -------
     An opened lance dataset.
     """
-    schema = pa.schema(
-        [
-            pa.field("image", ImageBinaryType()),
-            pa.field("label", pa.dictionary(pa.int16(), pa.utf8())),
-            pa.field("split", pa.dictionary(pa.int8(), pa.utf8())),
-        ]
-    )
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
     # it allows to write larger-than-memory data.
