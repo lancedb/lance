@@ -17,12 +17,11 @@ import itertools
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 
-import pyarrow
 import pyarrow as pa
 import pyarrow.dataset
 
 import lance
-from lance.types.image import Image, ImageArray, ImageBinaryType
+from lance.types.image import Image, ImageArray
 
 __all__ = ["convert_imagenet_1k"]
 
@@ -32,13 +31,14 @@ _SPLITS = ["train", "validation", "test"]
 def _to_record_batch(batch: Dict, label_names: List[str]) -> pa.RecordBatch:
     """Convert a batch to RecordBatch."""
     image_arr = ImageArray.from_images(batch["image"])
-    label_arr = pyarrow.DictionaryArray.from_arrays(
+    label_arr = pa.DictionaryArray.from_arrays(
         pa.array(batch["label"], type=pa.int16()),
         label_names,
     )
-    split_arr = pyarrow.DictionaryArray.from_arrays(pa.array(batch["split"]), _SPLITS)
+    split_arr = pa.DictionaryArray.from_arrays(pa.array(batch["split"]), _SPLITS)
+    id_arr = pa.array(batch["id"])
     return pa.RecordBatch.from_arrays(
-        [image_arr, label_arr, split_arr], ["image", "label", "split"]
+        [id_arr, image_arr, label_arr, split_arr], ["id", "image", "label", "split"]
     )
 
 
@@ -48,21 +48,24 @@ def _record_batch_gen(
     """Generator of RecordBatch."""
     from datasets import load_dataset
 
+    example_id = 1
     splits = ["train", "validation", "test"]
     for split in splits:
         hg_dataset = load_dataset("imagenet-1k", split=split, streaming=True)
         hg_features = hg_dataset.features
-        batch = {"image": [], "label": [], "split": []}
+        batch = {"image": [], "label": [], "split": [], "id": []}
         if limit:
             hg_dataset = itertools.islice(hg_dataset, limit)
         for example in hg_dataset:
             batch["image"].append(Image.create(example["image"]))
             batch["label"].append(example["label"] if split != "test" else None)
             batch["split"].append(splits.index(split))
+            batch["id"].append(example_id)
+            example_id += 1
 
             if len(batch["image"]) >= batch_size:
                 yield _to_record_batch(batch, hg_features["label"].names)
-                batch = {"image": [], "label": [], "split": []}
+                batch = {"image": [], "label": [], "split": [], "id": []}
 
         if batch["image"]:
             yield _to_record_batch(batch, hg_features["label"].names)
@@ -70,13 +73,17 @@ def _record_batch_gen(
 
 def convert_imagenet_1k(
     out: str | Path, group_size: int, limit: Optional[int] = None
-) -> lance.FileSystemDataset:
-    """Converting ImageNet 1K dataset to lance format
+) -> None:
+    """Convert ImageNet 1K dataset to lance format
 
     Parameters
     ----------
     out : str or Path
         Output URI
+    group_size : int
+        The size of each row group.
+    limit : int, optional
+        Limit number of records to generate, useful for testing.
 
     Returns
     -------
