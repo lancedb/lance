@@ -30,7 +30,7 @@ from lance.types import Box2dType
 
 sys.path.append("..")
 
-SUPPORTED_DATASET_VERSIONS = ["v1.0-mini", "v1.0"]
+SUPPORTED_DATASET_VERSIONS = ["v1.0-mini", "v1.0", "v1.0-test", "v1.0-train", "v1.0-val"]
 INSTANCE_DATA_TABLES = [
     "sample",
     "sample_data",
@@ -44,7 +44,7 @@ INSTANCE_DATA_TABLES = [
 ]
 
 class NuscenesConverter(DatasetConverter):
-    def __init__(self, uri_root: str, dataset_verson: str):
+    def __init__(self, uri_root: str, images_root: str, dataset_verson: str):
         """
         We either support Nuimages (just images and sweeps using camera modality)
         or Nuscenes (includes radar, camera and lidar).
@@ -52,17 +52,23 @@ class NuscenesConverter(DatasetConverter):
         and a full size version with splits.
         """
         super(NuscenesConverter, self).__init__(
-            "nuscenes", uri_root)
+            "nuscenes", uri_root, images_root)
 
         assert dataset_verson in SUPPORTED_DATASET_VERSIONS, f"Nuscenes converter does not support the dataset version {dataset_verson}."
         self.dataset_version = dataset_verson
         self.has_split = True
         self.instance_data = self._load_instance_data()
+        self.split = ""
 
         if "mini" in self.dataset_version:
-            self.has_split = False 
-   
-   
+            self.has_split = False
+        elif "test" in self.dataset_version:
+            self.split = "test"
+        elif "train" in self.dataset_version:
+            self.split = "train"
+        elif "val" in self.dataset_version:
+            self.split = "val"
+        
     def _get_json_data(self, entity: str):
         """
         Reads the json data for the appropriate entity.
@@ -148,6 +154,8 @@ class NuscenesConverter(DatasetConverter):
 
                 # Create the flatten sample
                 sample_joined = copy.deepcopy(sample)
+                sample_joined["split"] = self.split
+
                 sample_joined = self._merge_dict(sample_joined, log_data, "log")
                 sample_joined = self._merge_dict(sample_joined, sample_data, "sample_data")
                 sample_joined = self._merge_dict(sample_joined, ego_pose, "ego_pose")
@@ -206,6 +214,9 @@ class NuscenesConverter(DatasetConverter):
         ])
 
         return pa.schema([
+            # Split
+            pa.field("split", pa.string()),
+
             # Sample is our root table, we don't rename these fields
             pa.field("token", pa.string()),
             pa.field("timestamp", pa.int64()),
@@ -262,6 +273,6 @@ class NuscenesConverter(DatasetConverter):
     
     def image_uris(self, table) -> List[str]:
         """Return image uris to read the binary column"""
-        uris = [os.path.join(self.uri_root, image_uri)
+        uris = [os.path.join(self.images_root, image_uri)
             for image_uri in table["sample_data_filename_"].to_numpy()]
         return uris

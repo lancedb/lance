@@ -10,8 +10,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import numpy as np
-import pyarrow as pa
 import requests
 import tarfile
 
@@ -37,6 +35,7 @@ def test_nuscenes_dataset_converter(tmp_path):
     unpack_fixtures(tmp_path)
     c = NuscenesConverter(
         uri_root=f"{tmp_path}/nuimages-v1.0-mini-test-fixtures",
+        images_root=f"{tmp_path}/nuimages-v1.0-mini-test-fixtures",
         dataset_verson="v1.0-mini"
     )
     nuscenes_df = c.read_metadata()
