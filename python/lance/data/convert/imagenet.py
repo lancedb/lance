@@ -31,8 +31,9 @@ _SPLITS = ["train", "validation", "test"]
 def _to_record_batch(batch: Dict, label_names: List[str]) -> pa.RecordBatch:
     """Convert a batch to RecordBatch."""
     image_arr = ImageArray.from_images(batch["image"])
-    label_arr = pa.DictionaryArray.from_arrays(
-        pa.array(batch["label"], type=pa.int16()),
+    label_arr = pa.array(batch["label"], type=pa.int16())
+    names_arr = pa.DictionaryArray.from_arrays(
+        label_arr,
         label_names,
     )
     split_arr = pa.DictionaryArray.from_arrays(
@@ -40,7 +41,8 @@ def _to_record_batch(batch: Dict, label_names: List[str]) -> pa.RecordBatch:
     )
     id_arr = pa.array(batch["id"], pa.int32())
     return pa.RecordBatch.from_arrays(
-        [id_arr, image_arr, label_arr, split_arr], ["id", "image", "label", "split"]
+        [id_arr, image_arr, label_arr, names_arr, split_arr],
+        ["id", "image", "label", "name", "split"],
     )
 
 
