@@ -35,8 +35,10 @@ def _to_record_batch(batch: Dict, label_names: List[str]) -> pa.RecordBatch:
         pa.array(batch["label"], type=pa.int16()),
         label_names,
     )
-    split_arr = pa.DictionaryArray.from_arrays(pa.array(batch["split"]), _SPLITS)
-    id_arr = pa.array(batch["id"])
+    split_arr = pa.DictionaryArray.from_arrays(
+        pa.array(batch["split"], type=pa.int8()), _SPLITS
+    )
+    id_arr = pa.array(batch["id"], pa.int32())
     return pa.RecordBatch.from_arrays(
         [id_arr, image_arr, label_arr, split_arr], ["id", "image", "label", "split"]
     )
