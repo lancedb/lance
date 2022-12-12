@@ -351,6 +351,10 @@ LanceDataset::~LanceDataset() {}
 
 DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
 
+const std::string& LanceDataset::uri() const {
+  return impl_->base_uri;
+}
+
 ::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
     const std::shared_ptr<::arrow::Field>& new_field) const {
   return NewUpdate(::arrow::schema({new_field}));

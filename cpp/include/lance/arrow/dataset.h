@@ -142,6 +142,9 @@ class LanceDataset : public ::arrow::dataset::Dataset {
 
   std::string type_name() const override { return "lance"; }
 
+  /// Get dataset URI.
+  const std::string& uri() const;
+
   /// Begin to build a column updater against to this dataset.
   ///
   /// \param new_field the new field / column to be updated.
