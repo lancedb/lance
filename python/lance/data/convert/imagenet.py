@@ -50,7 +50,10 @@ def _record_batch_gen(
     batch_size: int = 1024, limit: Optional[int] = None
 ) -> Generator[pa.RecordBatch, None, None]:
     """Generator of RecordBatch."""
-    from datasets import load_dataset
+    try:
+        from datasets import load_dataset
+    except ImportError as ie:
+        raise ImportError("Please install huggingface dataset via 'pip install datasets'") from ie
 
     example_id = 1
     splits = ["train", "validation", "test"]
