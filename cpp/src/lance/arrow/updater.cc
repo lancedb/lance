@@ -119,7 +119,8 @@ class Updater::Impl {
 
   // Track the new data files
   std::vector<format::DataFile> data_files(lance_fragment->data_fragment()->data_files());
-  data_files.emplace_back(::lance::format::DataFile({file_path, column_schema_->GetFieldIds()}));
+  data_files.emplace_back(::lance::format::DataFile(
+      {fs::relative(file_path, data_dir()), column_schema_->GetFieldIds()}));
   auto new_fragment = std::make_shared<format::DataFragment>(data_files);
   data_fragments_.emplace_back(std::move(new_fragment));
 

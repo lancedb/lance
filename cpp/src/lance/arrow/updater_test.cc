@@ -92,13 +92,12 @@ TEST_CASE("Use updater to update one column") {
       ToArray(views::iota(0, 100) | views::transform([](auto i) { return fmt::format("{}", i); }) |
               to<std::vector<std::string>>)
           .ValueOrDie();
-  auto expected =
-      arrow::Table::Make(::arrow::schema({arrow::field("ints", arrow::int32()),
-                                          arrow::field("strs", arrow::utf8()),
-                                          arrow::field("values", arrow::utf8())}),
-                         {table->GetColumnByName("ints"),
-                          table->GetColumnByName("strs"),
-                          std::make_shared<::arrow::ChunkedArray>(expected_strs_arr)});
+  auto expected = arrow::Table::Make(::arrow::schema({arrow::field("ints", arrow::int32()),
+                                                      arrow::field("strs", arrow::utf8()),
+                                                      arrow::field("values", arrow::utf8())}),
+                                     {table->GetColumnByName("ints"),
+                                      table->GetColumnByName("strs"),
+                                      std::make_shared<::arrow::ChunkedArray>(expected_strs_arr)});
   CHECK(expected->Equals(*actual));
 }
 
@@ -129,5 +128,45 @@ TEST_CASE("Test update with projection") {
     auto datum = ::arrow::compute::Cast(input_arr, ::arrow::utf8()).ValueOrDie();
     auto output_arr = datum.make_array();
     CHECK(updater->UpdateBatch(output_arr).ok());
+  }
+}
+
+TEST_CASE("Test data file stores the relative path to the data dir") {
+  auto dataset = TestDataset();
+
+  // Re-open with relative path
+  auto local_fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto parent_path = fs::path(dataset->uri()).parent_path();
+  auto dataset_name = fs::path(dataset->uri()).filename().string();
+  fs::current_path(parent_path);
+  dataset = LanceDataset::Make(local_fs, dataset_name).ValueOrDie();
+
+  auto updater = dataset->NewUpdate(::arrow::field("col", ::arrow::int32()))
+                     .ValueOrDie()
+                     ->Finish()
+                     .ValueOrDie();
+  while (true) {
+    auto batch = updater->Next().ValueOrDie();
+    if (!batch) {
+      break;
+    }
+    auto output = ::arrow::compute::Add(batch->GetColumnByName("ints"), ::arrow::Datum(2))
+                      .ValueOrDie()
+                      .make_array();
+    CHECK(updater->UpdateBatch(output).ok());
+  }
+  updater->Finish().ValueOrDie();
+
+  dataset = LanceDataset::Make(local_fs, fs::path(dataset->uri()).filename().string()).ValueOrDie();
+  CHECK(dataset->version().version() == 2);
+  auto table = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
+  CHECK(table->schema()->num_fields() == 3);
+
+  for (auto fragment_result : dataset->GetFragments().ValueOrDie()) {
+    auto fragment = fragment_result.ValueOrDie();
+    auto lance_fragment = std::dynamic_pointer_cast<lance::arrow::LanceFragment>(fragment);
+    for (auto& data_file : lance_fragment->data_fragment()->data_files()) {
+      CHECK(data_file.path().find("/") == std::string::npos);
+    }
   }
 }
