@@ -20,7 +20,7 @@ TEST_CASE("Test Call Defer") {
   int i = 100;
 
   {
-    lance::util::Defer incr = [&]() { i += 200; };
+    lance::util::Defer incr([&i]() { i += 200; });
 
     CHECK(i == 100);
     i += 20;

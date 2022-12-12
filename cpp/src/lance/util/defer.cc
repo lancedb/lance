@@ -20,9 +20,10 @@ namespace lance::util {
 
 Defer::Defer(std::function<void()>&& cb) : callback_(std::move(cb)) {}
 
-Defer::Defer(Defer&& other)
-    : callback_(std::move(other.callback_)){
+Defer::Defer(Defer&& other) : callback_(std::move(other.callback_)){};
 
-      };
+Defer::~Defer() {
+  callback_();
+}
 
 }  // namespace lance::util

@@ -18,13 +18,19 @@
 
 namespace lance::util {
 
+/// Defer the execution of a lambda function until out of scope.
+///
+/// It offers RAII to general function calls. It is modeled after Golang's Defer statement.
 class Defer {
  public:
   Defer() = delete;
 
-  explicit Defer(std::function<void()>&& cb);
+  explicit Defer(std::function<void(void)>&& cb);
 
+  /// Move constructor.
   Defer(Defer&& other);
+
+  ~Defer();
 
  private:
   std::function<void()> callback_;
