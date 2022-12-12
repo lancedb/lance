@@ -16,6 +16,7 @@ add_subdirectory(arrow)
 add_subdirectory(encodings)
 add_subdirectory(format)
 add_subdirectory(io)
+add_subdirectory(util)
 
 if (CMAKE_BUILD_TYPE STREQUAL Debug)
     add_subdirectory(testing)
