@@ -21,6 +21,18 @@ namespace lance::util {
 /// Defer the execution of a lambda function until out of scope.
 ///
 /// It offers RAII to general function calls. It is modeled after Golang's Defer statement.
+///
+/// \example
+///
+/// void WriteData(const std::string& path) {
+///   auto fd = fopen(path.c_str());
+///   Defer closer([&file]() { fclose(fd); }
+///   for (int i = 0; i < 10; i++) {
+///       fprint(fd, "line: %d\n", i);
+///   }
+///   // fd is closed when out of scope.
+/// }
+///
 class Defer {
  public:
   Defer() = delete;
