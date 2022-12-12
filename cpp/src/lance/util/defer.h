@@ -26,7 +26,7 @@ namespace lance::util {
 ///
 /// void WriteData(const std::string& path) {
 ///   auto fd = fopen(path.c_str());
-///   Defer closer([&file]() { fclose(fd); }
+///   Defer auto_closer([&]() { fclose(fd); }
 ///   for (int i = 0; i < 10; i++) {
 ///       fprint(fd, "line: %d\n", i);
 ///   }
