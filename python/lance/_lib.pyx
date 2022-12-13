@@ -352,13 +352,13 @@ cdef class FileSystemDataset(Dataset):
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
 def _lance_dataset_write(
-        Dataset data,
-        object base_dir not None,
-        FileSystem filesystem not None,
-        str mode not None,
-        int max_rows_per_file,
-        int min_rows_per_group,
-        int max_rows_per_group,
+    Dataset data,
+    object base_dir not None,
+    FileSystem filesystem not None,
+    str mode not None,
+    int max_rows_per_file,
+    int min_rows_per_group,
+    int max_rows_per_group,
 ):
     """Wraps 'LanceDataset::Write'.
 
