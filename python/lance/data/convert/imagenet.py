@@ -55,7 +55,7 @@ def _record_batch_gen(
     except ImportError as ie:
         raise ImportError("Please install huggingface dataset via 'pip install datasets'") from ie
 
-    example_id = 1
+    sample_id = 1
     splits = ["train", "validation", "test"]
     for split in splits:
         hg_dataset = load_dataset("imagenet-1k", split=split, streaming=True)
@@ -63,12 +63,12 @@ def _record_batch_gen(
         batch = {"image": [], "label": [], "split": [], "id": []}
         if limit:
             hg_dataset = itertools.islice(hg_dataset, limit)
-        for example in hg_dataset:
-            batch["image"].append(Image.create(example["image"]))
-            batch["label"].append(example["label"] if split != "test" else None)
+        for sample in hg_dataset:
+            batch["image"].append(Image.create(sample["image"]))
+            batch["label"].append(sample["label"] if split != "test" else None)
             batch["split"].append(splits.index(split))
-            batch["id"].append(example_id)
-            example_id += 1
+            batch["id"].append(sample_id)
+            sample_id += 1
 
             if len(batch["image"]) >= batch_size:
                 yield _to_record_batch(batch, hg_features["label"].names)
@@ -91,10 +91,6 @@ def convert_imagenet_1k(
         The size of each row group.
     limit : int, optional
         Limit number of records to generate, useful for testing.
-
-    Returns
-    -------
-    An opened lance dataset.
     """
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that

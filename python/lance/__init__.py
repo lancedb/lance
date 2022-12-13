@@ -14,7 +14,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional, Union, Iterable
+from typing import Optional, Union
 
 import pandas
 import pyarrow as pa
