@@ -25,8 +25,7 @@ endif()
 
 include(FetchContent)
 
-#set(EXTENSION_STATIC_BUILD 1)
-
+set(EXTENSION_STATIC_BUILD 1)
 set(BUILD_UNITTESTS FALSE) # For duckdb
 FetchContent_Declare(
   DuckDB
@@ -111,6 +110,7 @@ endif()
 
 # Add lance core as dependency
 set(LANCE_STATIC_BUILD ON)
+set(ARROW_OPENSSL_USE_SHARED OFF)
 find_package(Arrow REQUIRED)
 find_package(ArrowDataset REQUIRED)
 include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include ../../cpp/src)
@@ -144,7 +144,7 @@ endif()
 
 set(PARAMETERS "-warnings")
 build_loadable_extension(lance ${PARAMETERS} ${LANCE_EXT_SOURCES})
-target_link_libraries(lance_loadable_extension lance fmt::fmt)
+target_link_libraries(lance_loadable_extension fmt::fmt lance)
 
 if(LANCE_BUILD_PYTORCH)
   target_link_libraries(lance_loadable_extension "${TORCH_LIBRARIES}"

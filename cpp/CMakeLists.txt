@@ -62,8 +62,8 @@ FetchContent_Declare(range
         )
 list(APPEND available_contents range)
 
-set(protobuf_USE_STATIC_LIBS ${LANCE_STATIC_BUILD})
-set(protobuf_BUILD_TESTS OFF)
+set(protobuf_USE_STATIC_LIBS ${LANCE_STATIC_BUILD} CACHE INTERNAL "Protobuf uses static lib")
+set(protobuf_BUILD_TESTS OFF CACHE INTERNAL "Protobuf does not build tests")
 FetchContent_Declare(protobuf
     GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
     GIT_TAG        v21.4
@@ -168,20 +168,14 @@ endif ()
 
 if (LANCE_STATIC_BUILD)
     add_library(lance STATIC ${lance_objects})
-    target_link_libraries(lance PRIVATE
-        #${Protobuf_LIBRARY_RELEASE}
-        Arrow::arrow_bundled_dependencies
-        Arrow::arrow_static
-        ArrowDataset::arrow_dataset_static
-        #fmt::fmt
-        )
 else()
     add_library(lance SHARED ${lance_objects})
-    target_link_libraries(lance PUBLIC
-        ${Protobuf_LIBRARIES}
-        Arrow::arrow_shared
-        ArrowDataset::arrow_dataset_shared
-        fmt::fmt
-        )
 endif(LANCE_STATIC_BUILD)
-#set_target_properties(lance PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_link_libraries(lance PRIVATE
+    libprotobuf
+    Arrow::arrow_shared
+    ArrowDataset::arrow_dataset_shared
+    fmt::fmt
+    )
+
