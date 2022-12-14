@@ -35,6 +35,7 @@ add_library(
         utils.h
 )
 target_include_directories(arrow SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
+add_dependencies(arrow format)
 
 add_lance_test(api_test)
 add_lance_test(arrow_dataset_test)

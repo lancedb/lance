@@ -12,32 +12,33 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-
-protobuf_generate_cpp(
-        PROTO_SRCS
-        PROTO_HDRS
-        ${PROJECT_SOURCE_DIR}/../protos/format.proto
-)
+add_custom_target(gen_protos
+    COMMAND protoc -I${PROJECT_SOURCE_DIR}/../protos
+    -I${protobuf_SOURCE_DIR}/src
+    --cpp_out=${PROJECT_BINARY_DIR}/src/lance/format
+    format.proto
+    DEPENDS libprotobuf)
 
 add_library(
-        format
-        OBJECT
-        ${PROTO_HDRS}
-        ${PROTO_SRCS}
-        data_fragment.cc
-        data_fragment.h
-        format.h
-        manifest.cc
-        manifest.h
-        metadata.cc
-        metadata.h
-        page_table.cc
-        page_table.h
-        schema.cc
-        schema.h
-        visitors.cc
-        visitors.h
+    format
+    OBJECT
+    ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.cc
+    ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.h
+    data_fragment.cc
+    data_fragment.h
+    format.h
+    manifest.cc
+    manifest.h
+    metadata.cc
+    metadata.h
+    page_table.cc
+    page_table.h
+    schema.cc
+    schema.h
+    visitors.cc
+    visitors.h
 )
+add_dependencies(format gen_protos)
 target_include_directories(format SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
 
 add_lance_test(metadata_test)

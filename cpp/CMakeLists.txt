@@ -62,6 +62,15 @@ FetchContent_Declare(range
         )
 list(APPEND available_contents range)
 
+set(protobuf_USE_STATIC_LIBS ${LANCE_STATIC_BUILD})
+set(protobuf_BUILD_TESTS OFF)
+FetchContent_Declare(protobuf
+    GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
+    GIT_TAG        v21.4
+    FIND_PACKAGE_ARGS NAMES protobuf
+    )
+list(APPEND available_contents protobuf)
+
 set(UUID_BUILD_TESTS OFF CACHE INTERNAL "Do not build UUID unit test")
 set(UUID_USING_CXX20_SPAN ON CACHE INTERNAL "Use CXX-20 feature")
 FetchContent_Declare(uuid
@@ -96,9 +105,7 @@ include_directories(
 )
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
-set(Protobuf_USE_STATIC_LIBS ${LANCE_STATIC_BUILD})
-find_package(Protobuf REQUIRED)
-include_directories(${Protobuf_INCLUDE_DIRS})
+include_directories(${protobuf_SOURCE_DIR}/src)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND CMAKE_MODULE_PATH
@@ -163,7 +170,7 @@ endif ()
 if (LANCE_STATIC_BUILD)
     add_library(lance STATIC ${lance_objects})
     target_link_libraries(lance PUBLIC
-        ${Protobuf_LIBRARIES}
+        ${Protobuf_LIBRARY_RELEASE}
         Arrow::arrow_static
         ArrowDataset::arrow_dataset_static
         fmt::fmt
