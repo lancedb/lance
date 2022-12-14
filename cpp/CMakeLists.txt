@@ -17,6 +17,7 @@ cmake_minimum_required(VERSION 3.22)
 if (${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.24")
     cmake_policy(SET CMP0135 NEW)
 endif ()
+cmake_policy(SET CMP0077 NEW)
 
 project(lance CXX)
 
@@ -25,6 +26,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 option(LANCE_BUILD_CMD "Build lance command line tool" ON)
 option(LANCE_STATIC_BUILD "Build lance as static library" OFF)
+set(ARROW_BUILD_STATIC TRUE)
 
 # Default to Debug build if not specified
 if (NOT DEFINED CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
@@ -120,19 +122,6 @@ if (APPLE)
     set(Parquet_DIR ${ArrowDataset_DIR})
 endif (APPLE)
 
-set(OPENSSL_USE_STATIC_LIBS ON "blabla")
-
-if (LANCE_STATIC_BUILD)
-    message(STATUS "Attemp to find static ssl")
-    set(OPENSSL_USE_STATIC_LIBS TRUE CACHE INTERNAL "blabla")
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-#    set(ARROW_OPENSSL_USE_SHARED OFF "Use static ssl")
-    find_package(OpenSSL REQUIRED)
-
-    set(OPENSSL_USE_STATIC_LIBS TRUE)
-    message(STATUS "ssl lib: ${OPENSSL_SSL_LIBRARY}")
-endif()
-
 find_package(Arrow REQUIRED)
 find_package(ArrowDataset REQUIRED)
 
@@ -181,10 +170,8 @@ if (LANCE_STATIC_BUILD)
     add_library(lance STATIC ${lance_objects})
     target_link_libraries(lance PUBLIC
             libprotobuf
-            Arrow::arrow_static
-            ArrowDataset::arrow_dataset_static
-            Arrow::arrow_bundled_dependencies
-            libssl.a
+            Arrow::arrow_shared
+            ArrowDataset::arrow_dataset_shared
             fmt::fmt
             )
 else()

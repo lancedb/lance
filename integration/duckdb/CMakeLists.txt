@@ -4,9 +4,10 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
-#add_compile_options(-mf16c) # opencv
+cmake_policy(SET CMP0077 NEW)
 
 project(lance_duckdb CXX)
+
 option(LANCE_BUILD_PYTORCH "Build with PyTorch" OFF)
 
 set(OS_ARCH "amd64")
@@ -22,6 +23,9 @@ if (APPLE)
   set(CMAKE_ENABLE_EXPORTS 1)
   set(CMAKE_CXX_COMPILER_ID Clang) # DuckDB CMakeLists.txt does not allow static linking for AppleClang
 endif()
+
+set(OPENSSL_USE_STATIC_LIBS TRUE)
+set(ARROW_OPENSSL_USE_SHARED OFF)
 
 include(FetchContent)
 
@@ -108,11 +112,7 @@ if(LANCE_BUILD_PYTORCH)
   include_directories(${OpenCV_INCLUDE_DIRS})
 endif()
 
-# Add lance core as dependency
 set(LANCE_STATIC_BUILD ON)
-set(ARROW_OPENSSL_USE_SHARED OFF)
-find_package(Arrow REQUIRED)
-find_package(ArrowDataset REQUIRED)
 include_directories(${CMAKE_BINARY_DIR}/lance/src ../../cpp/include ../../cpp/src)
 
 add_subdirectory(../../cpp lance)
