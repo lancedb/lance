@@ -15,15 +15,25 @@
 
 set -e
 
-PUBLIC_URI_ROOT="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet/"
+PUBLIC_URI_ROOT="https://eto-public.s3.us-west-2.amazonaws.com/datasets/oxford_pet"
 
 DATASET_ROOT=$1  # this is the root dir of the raw dataset
 OUTPUT_PATH=$2  # this is the root dir of the lance/parquet dataset
 
+rm -rf ${OUTPUT_PATH}
+rm -rf ${OUTPUT_PATH}.tar.gz
 
 python lance/data/convert/oxford_pet.py \
   $DATASET_ROOT --output-path $OUTPUT_PATH \
   --fmt lance --images-root $PUBLIC_URI_ROOT
 
+
+pushd ${OUTPUT_PATH}/../
+tar -cvf oxford_pet.lance.tar.gz oxford_pet.lance/
+popd
+
 aws s3 rm --recursive s3://eto-public/datasets/oxford_pet/oxford_pet.lance
 aws s3 cp --recursive $OUTPUT_PATH s3://eto-public/datasets/oxford_pet/oxford_pet.lance
+
+aws s3 rm s3://eto-public/datasets/oxford_pet/oxford_pet.lance.tar.gz
+aws s3 cp ${OUTPUT_PATH}.tar.gz s3://eto-public/datasets/oxford_pet/oxford_pet.lance.tar.gz
