@@ -11,14 +11,8 @@ RUN yum update -y \
   && yum install -y --enablerepo=epel \
   wget \
   devtoolset-11-gcc-c++ devtoolset-11-make \
+  openssl-static \
   arrow-devel-${ARROW_VERSION} \
   arrow-dataset-devel-${ARROW_VERSION} \
   parquet-devel-${ARROW_VERSION}
 
-RUN wget https://github.com/openssl/openssl/archive/refs/tags/OpenSSL_1_1_1s.tar.gz \
-    && tar -xzvf OpenSSL_1_1_1s.tar.gz \
-    && mv openssl-OpenSSL_1_1_1s openssl-1.1.1s \
-    && cd openssl-1.1.1s \
-    && ./config --prefix=/usr --openssldir=/etc/ssl --libdir=lib no-shared zlib-dynamic \
-    && make -j \
-    && make install

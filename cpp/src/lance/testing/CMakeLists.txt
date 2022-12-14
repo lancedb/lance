@@ -18,5 +18,8 @@ add_library(
         extension_types.h
         io.cc
         io.h
-        json.h json.cc)
+        json.h
+        json.cc
+)
 target_include_directories(lance_testing SYSTEM PRIVATE ${Protobuf_INCLUDE_DIR})
+add_dependencies(lance_testing format)

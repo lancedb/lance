@@ -41,11 +41,6 @@ endif (CCACHE_FOUND)
 add_compile_options(-Wall -Wextra -fPIC)
 add_link_options(-o linker-signed)
 
-if (CMAKE_BUILD_TYPE STREQUAL Debug)
-    SET(LANCE_BUILD_BENCHMARKS ON)
-    add_compile_options(-Werror)
-endif ()
-
 Include(FetchContent)
 
 # TODO: We can remove this package once std::format is available.
@@ -110,6 +105,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND CMAKE_MODULE_PATH
             /usr/lib/x86_64-linux-gnu/cmake/arrow
             /usr/lib64/cmake/arrow
+            /usr/lib64/cmake/Arrow
             )
 endif ()
 
@@ -123,6 +119,19 @@ if (APPLE)
     set(ArrowDataset_DIR ${ARROW_ROOT_DIR}/lib/cmake/arrow)
     set(Parquet_DIR ${ArrowDataset_DIR})
 endif (APPLE)
+
+set(OPENSSL_USE_STATIC_LIBS ON "blabla")
+
+if (LANCE_STATIC_BUILD)
+    message(STATUS "Attemp to find static ssl")
+    set(OPENSSL_USE_STATIC_LIBS TRUE CACHE INTERNAL "blabla")
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+#    set(ARROW_OPENSSL_USE_SHARED OFF "Use static ssl")
+    find_package(OpenSSL REQUIRED)
+
+    set(OPENSSL_USE_STATIC_LIBS TRUE)
+    message(STATUS "ssl lib: ${OPENSSL_SSL_LIBRARY}")
+endif()
 
 find_package(Arrow REQUIRED)
 find_package(ArrowDataset REQUIRED)
@@ -150,6 +159,8 @@ if (CMAKE_BUILD_TYPE STREQUAL Debug)
     include(Catch)
     set(test_libs Catch2::Catch2WithMain $<TARGET_OBJECTS:lance_testing>)
     enable_testing()
+
+    SET(LANCE_BUILD_BENCHMARKS ON)
 endif ()
 
 set(lance_objects
@@ -168,14 +179,21 @@ endif ()
 
 if (LANCE_STATIC_BUILD)
     add_library(lance STATIC ${lance_objects})
+    target_link_libraries(lance PUBLIC
+            libprotobuf
+            Arrow::arrow_static
+            ArrowDataset::arrow_dataset_static
+            Arrow::arrow_bundled_dependencies
+            libssl.a
+            fmt::fmt
+            )
 else()
     add_library(lance SHARED ${lance_objects})
+    target_link_libraries(lance PUBLIC
+            libprotobuf
+            Arrow::arrow_shared
+            ArrowDataset::arrow_dataset_shared
+            fmt::fmt
+            )
 endif(LANCE_STATIC_BUILD)
-
-target_link_libraries(lance PRIVATE
-    libprotobuf
-    Arrow::arrow_shared
-    ArrowDataset::arrow_dataset_shared
-    fmt::fmt
-    )
 
