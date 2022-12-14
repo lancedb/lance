@@ -67,7 +67,6 @@ set(protobuf_BUILD_TESTS OFF)
 FetchContent_Declare(protobuf
     GIT_REPOSITORY https://github.com/protocolbuffers/protobuf.git
     GIT_TAG        v21.4
-    FIND_PACKAGE_ARGS NAMES protobuf
     )
 list(APPEND available_contents protobuf)
 
@@ -169,11 +168,12 @@ endif ()
 
 if (LANCE_STATIC_BUILD)
     add_library(lance STATIC ${lance_objects})
-    target_link_libraries(lance PUBLIC
-        ${Protobuf_LIBRARY_RELEASE}
+    target_link_libraries(lance PRIVATE
+        #${Protobuf_LIBRARY_RELEASE}
+        Arrow::arrow_bundled_dependencies
         Arrow::arrow_static
         ArrowDataset::arrow_dataset_static
-        fmt::fmt
+        #fmt::fmt
         )
 else()
     add_library(lance SHARED ${lance_objects})

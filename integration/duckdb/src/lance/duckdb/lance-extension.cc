@@ -40,6 +40,7 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
     catalog.CreateFunction(context, func.get());
   }
 
+#if defined(WITH_ML)
   for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
     catalog.CreateFunction(context, func.get());
   }
@@ -47,6 +48,7 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
   for (auto &func : lance::duckdb::ml::GetMLTableFunctions()) {
     catalog.CreateTableFunction(context, func.get());
   }
+#endif
 
   auto scan_func = lance::duckdb::GetLanceReaderFunction();
   ::duckdb::CreateTableFunctionInfo scan(scan_func);

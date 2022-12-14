@@ -12,12 +12,19 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-add_custom_target(gen_protos
-    COMMAND protoc -I${PROJECT_SOURCE_DIR}/../protos
+add_custom_command(
+    OUTPUT ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.cc
+    ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.h
+  COMMAND protoc -I${PROJECT_SOURCE_DIR}/../protos
     -I${protobuf_SOURCE_DIR}/src
     --cpp_out=${PROJECT_BINARY_DIR}/src/lance/format
     format.proto
-    DEPENDS libprotobuf)
+)
+add_custom_target(gen_protos
+    COMMAND echo "Generating protobuf files"
+    DEPENDS
+      ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.cc
+      ${PROJECT_BINARY_DIR}/src/lance/format/format.pb.h)
 
 add_library(
     format
