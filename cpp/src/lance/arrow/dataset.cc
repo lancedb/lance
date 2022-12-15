@@ -364,7 +364,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
-    const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+    const std::shared_ptr<::arrow::Field>& field,
+    ::arrow::compute::Expression expression,
+    const std::unordered_map<std::string, std::string>& metadata) {
   if (!expression.IsScalarExpression()) {
     return ::arrow::Status::Invalid(
         "LanceDataset::AddColumn: expression is not a scalar expression.");
@@ -377,6 +379,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
       columns.emplace_back(arrow::ToColumnName(ref));
     }
     builder->Project(columns);
+  }
+  if (!metadata.empty()) {
+    builder->Metadata(metadata);
   }
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
 
@@ -484,7 +489,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
                         table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
   ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
   update_builder->Project({left_on});
-  update_builder->Metadata(metadata);
+  if (!metadata.empty()) {
+    update_builder->Metadata(metadata);
+  }
   ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
 
   while (true) {

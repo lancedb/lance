@@ -215,11 +215,14 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///
   /// \param field the new field.
   /// \param expression the expression to compute the column.
+  /// \param metadata additional metadata attached to the new version of data.
   /// \return a new version of the dataset.
   ///
   /// See `Updater` for details.
   ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumn(
-      const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression);
+      const std::shared_ptr<::arrow::Field>& field,
+      ::arrow::compute::Expression expression,
+      const std::unordered_map<std::string, std::string>& metadata = {});
 
  protected:
   ::arrow::Result<::arrow::dataset::FragmentIterator> GetFragmentsImpl(

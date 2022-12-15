@@ -15,6 +15,7 @@
 #include "lance/arrow/dataset.h"
 
 #include <arrow/table.h>
+#include <arrow/util/key_value_metadata.h>
 #include <fmt/format.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -310,8 +311,12 @@ TEST_CASE("Dataset add columns with a table") {
       ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
                                             ::arrow::field("new_value", ::arrow::int32())}),
                            {added_ids, added_values});
-  auto new_dataset = dataset->Merge(added_table, "id").ValueOrDie();
+  std::unordered_map<std::string, std::string> new_metadata{{"k", "v"}};
+  auto new_dataset = dataset->Merge(added_table, "id", new_metadata).ValueOrDie();
   CHECK(new_dataset->version().version() == 2);
+  CHECK(new_dataset->schema()->metadata()->keys() == std::vector<std::string>({"k"}));
+  CHECK(new_dataset->schema()->metadata()->values() == std::vector<std::string>({"v"}));
+
   auto new_table =
       new_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
 
