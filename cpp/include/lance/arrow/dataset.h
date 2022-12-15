@@ -60,12 +60,6 @@ class DatasetVersion {
   /// time_t representation of timestamp. Used for cython
   std::time_t timet_timestamp() const;
 
-  /// Increase version number
-  DatasetVersion& operator++();
-
-  /// Increase version number
-  DatasetVersion operator++(int);
-
  private:
   void Touch();
 

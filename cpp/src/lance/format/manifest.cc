@@ -46,11 +46,12 @@ Manifest::Manifest(std::shared_ptr<Schema> schema)
     : schema_(std::move(schema)), version_(1), timestamp_(std::chrono::system_clock::now()) {}
 
 Manifest::Manifest(std::shared_ptr<Schema> schema,
-                   lance::arrow::DatasetVersion version,
-                   std::vector<std::shared_ptr<DataFragment>> fragments)
+                   std::vector<std::shared_ptr<DataFragment>> fragments,
+                   uint64_t version,
+                   std::chrono::time_point<std::chrono::system_clock> timestamp)
     : schema_(std::move(schema)),
-      version_(version.version()),
-      timestamp_(version.timestamp()),
+      version_(version),
+      timestamp_(timestamp),
       fragments_(std::move(fragments)) {}
 
 Manifest::Manifest(Manifest&& other) noexcept

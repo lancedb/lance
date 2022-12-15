@@ -153,20 +153,6 @@ const std::unordered_map<std::string, std::string>& DatasetVersion::metadata() c
   return metadata_;
 }
 
-DatasetVersion& DatasetVersion::operator++() {
-  version_++;
-  Touch();
-  return *this;
-}
-
-DatasetVersion DatasetVersion::operator++(int) {
-  version_++;
-  Touch();
-  return *this;
-}
-
-void DatasetVersion::Touch() { timestamp_ = std::chrono::system_clock::now(); }
-
 //-------------------------
 // LanceDataset::Impl
 //-------------------------

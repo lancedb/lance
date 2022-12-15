@@ -91,7 +91,8 @@ TEST_CASE("Create new dataset") {
   dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table2);
   CHECK(lance::arrow::LanceDataset::Write(write_options,
                                           dataset->NewScan().ValueOrDie()->Finish().ValueOrDie(),
-                                          lance::arrow::LanceDataset::kAppend)
+                                          lance::arrow::LanceDataset::kAppend,
+                                          {{"reason", "more_records"}})
             .ok());
 
   // Version 3 is overwriting.

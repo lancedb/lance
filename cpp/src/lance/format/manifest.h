@@ -49,11 +49,12 @@ class Manifest final {
   /// Construct a Manifest with specific version.
   ///
   /// \param schema full dataset schema.
-  /// \param version a specific `DatasetVersion`.
   /// \param fragments a list of fragments containing data files.
+  /// \param version a specific version.
   Manifest(std::shared_ptr<Schema> schema,
-           lance::arrow::DatasetVersion version,
-           std::vector<std::shared_ptr<DataFragment>> fragments);
+           std::vector<std::shared_ptr<DataFragment>> fragments,
+           uint64_t version,
+           std::chrono::time_point<std::chrono::system_clock> timestamp);
 
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;

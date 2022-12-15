@@ -180,9 +180,8 @@ class Updater::Impl {
     return ::arrow::Status::Invalid("Updater::Finish: there are remaining data to consume.");
   }
   ARROW_ASSIGN_OR_RAISE(auto latest_version, dataset_->latest_version());
-  ++latest_version;
-  auto new_manifest =
-      std::make_shared<lance::format::Manifest>(full_schema_, latest_version, data_fragments_);
+  auto new_manifest = std::make_shared<lance::format::Manifest>(
+      full_schema_, data_fragments_, latest_version.version() + 1, latest_version.timestamp());
   ARROW_ASSIGN_OR_RAISE(auto dataset_impl, dataset_->impl_->WriteNewVersion(new_manifest));
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(dataset_impl)));
 }
