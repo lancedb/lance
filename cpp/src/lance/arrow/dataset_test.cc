@@ -324,3 +324,26 @@ TEST_CASE("Dataset add columns with a table") {
                            {ids, values, new_values});
   CHECK(new_table->Equals(*expected_table));
 }
+
+TEST_CASE("Test throw error when merging with the same column names") {
+  auto ids = ToArray({1, 2, 3, 4, 5}).ValueOrDie();
+  auto values = ToArray({"one", "two", "three", "four", "five"}).ValueOrDie();
+  auto schema = ::arrow::schema(
+      {::arrow::field("id", ::arrow::int32()), ::arrow::field("value", ::arrow::utf8())});
+  auto table = ::arrow::Table::Make(schema, {ids, values});
+  auto base_uri = WriteTable(table);
+  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(dataset->version().version() == 1);
+
+  auto added_ids = ToArray({5, 4, 3, 10, 12, 1}).ValueOrDie();
+  auto added_values = ToArray({50, 40, 30, 100, 120, 10}).ValueOrDie();
+  auto added_table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", ::arrow::int32()),
+                                            ::arrow::field("value", ::arrow::int32())}),
+                           {added_ids, added_values});
+  auto result = dataset->Merge(added_table, "id");
+  CHECK(result.status().IsInvalid());
+  CHECK(result.status().message() ==
+        "LanceDataset::Merge: column 'value' already exists in the dataset");
+}

@@ -351,9 +351,7 @@ LanceDataset::~LanceDataset() {}
 
 DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
 
-const std::string& LanceDataset::uri() const {
-  return impl_->base_uri;
-}
+const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 
 ::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
     const std::shared_ptr<::arrow::Field>& new_field) const {
@@ -457,10 +455,21 @@ const std::string& LanceDataset::uri() const {
   auto& left_type = left_column->type();
   auto& right_type = right_column->type();
   if (!left_type->Equals(right_type)) {
-    return ::arrow::Status::Invalid("LanceDataset::AddColumns: types are not equal: ",
+    return ::arrow::Status::Invalid("LanceDataset::Merge: types are not equal: ",
                                     left_type->ToString(),
                                     " != ",
                                     right_type->ToString());
+  }
+
+  for (const auto& field : right->fields()) {
+    auto& field_name = field->name();
+    if (field_name == right_on) {
+      continue;
+    }
+    if (schema_->GetFieldByName(field_name) != nullptr) {
+      return ::arrow::Status::Invalid(
+          "LanceDataset::Merge: column '", field_name, "' already exists in the dataset");
+    }
   }
 
   // First phase, build hash table (in memory for simplicity)
