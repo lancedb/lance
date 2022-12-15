@@ -185,10 +185,31 @@ TEST_CASE("Update schema with metadata") {
   CHECK(dataset->schema()->metadata()->keys() == std::vector<std::string>({"k1"}));
   CHECK(dataset->schema()->metadata()->values() == std::vector<std::string>({"v1"}));
 
+  // Do not change metadata
+  auto updater = dataset->NewUpdate(::arrow::field("col1", ::arrow::int32()))
+                     .ValueOrDie()
+                     ->Finish()
+                     .ValueOrDie();
+  while (true) {
+    auto batch = updater->Next().ValueOrDie();
+    if (!batch) {
+      break;
+    }
+    auto output = ::arrow::compute::Add(batch->GetColumnByName("ints"), ::arrow::Datum(2))
+                      .ValueOrDie()
+                      .make_array();
+    CHECK(updater->UpdateBatch(output).ok());
+  }
+  dataset = updater->Finish().ValueOrDie();
+  INFO("Expect the metadata is preserved if not overwrite");
+  CHECK(dataset->version().version() == 2);
+  CHECK(dataset->schema()->metadata()->keys() == std::vector<std::string>({"k1"}));
+  CHECK(dataset->schema()->metadata()->values() == std::vector<std::string>({"v1"}));
+
   auto updater_builder = dataset->NewUpdate(::arrow::field("col", ::arrow::int32())).ValueOrDie();
   std::unordered_map<std::string, std::string> new_metadata{{"k2", "v2"}, {"k3", "v3"}};
   updater_builder->Metadata(new_metadata);
-  auto updater = updater_builder->Finish().ValueOrDie();
+  updater = updater_builder->Finish().ValueOrDie();
 
   while (true) {
     auto batch = updater->Next().ValueOrDie();
@@ -202,7 +223,7 @@ TEST_CASE("Update schema with metadata") {
   }
   dataset = updater->Finish().ValueOrDie();
 
-  CHECK(dataset->version().version() == 2);
+  CHECK(dataset->version().version() == 3);
   CHECK(dataset->schema()->metadata() != nullptr);
   std::unordered_map<std::string, std::string> expected_metadata;
   dataset->schema()->metadata()->ToUnorderedMap(&expected_metadata);
