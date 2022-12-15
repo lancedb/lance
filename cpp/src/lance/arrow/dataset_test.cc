@@ -17,6 +17,7 @@
 #include <arrow/table.h>
 #include <arrow/util/key_value_metadata.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -314,6 +315,9 @@ TEST_CASE("Dataset add columns with a table") {
   std::unordered_map<std::string, std::string> new_metadata{{"k", "v"}};
   auto new_dataset = dataset->Merge(added_table, "id", new_metadata).ValueOrDie();
   CHECK(new_dataset->version().version() == 2);
+  INFO("New dataset version metadata: " << fmt::format(
+           "{} {}", new_dataset->version().metadata(), new_metadata));
+  CHECK(new_dataset->version().metadata() == new_metadata);
   CHECK(new_dataset->schema()->metadata()->keys() == std::vector<std::string>({"k"}));
   CHECK(new_dataset->schema()->metadata()->values() == std::vector<std::string>({"v"}));
 

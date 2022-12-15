@@ -45,13 +45,17 @@ class DatasetVersion {
 
   /// Construct a Dataset version from version number.
   explicit DatasetVersion(VersionNumberType version,
-                          std::chrono::time_point<std::chrono::system_clock> created);
+                          std::chrono::time_point<std::chrono::system_clock> created,
+                          const std::unordered_map<std::string, std::string>& metadata);
 
   /// Get version number.
   VersionNumberType version() const;
 
   /// Timestamp of dataset creation, in UTC.
   const std::chrono::time_point<std::chrono::system_clock>& timestamp() const;
+
+  /// Key-value metadata of this version.
+  const std::unordered_map<std::string, std::string>& metadata() const;
 
   /// time_t representation of timestamp. Used for cython
   std::time_t timet_timestamp() const;
@@ -62,14 +66,16 @@ class DatasetVersion {
   /// Increase version number
   DatasetVersion operator++(int);
 
-  /// Change timestamp to `Now()`.
+ private:
   void Touch();
 
- private:
   VersionNumberType version_ = 0;
 
   /// Dataset creation time, in UTC timezone.
   std::chrono::time_point<std::chrono::system_clock> timestamp_;
+
+  /// Key Value metadata.
+  std::unordered_map<std::string, std::string> metadata_;
 };
 
 /// Lance Dataset, supports versioning and schema evolution.
@@ -96,22 +102,26 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
   /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  /// \param metadata additional metadata attached to the new version of data.
   ///
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner,
-                               WriteMode mode = kCreate);
+                               WriteMode mode = kCreate,
+                               const std::unordered_map<std::string, std::string>& metadata = {});
 
   /// Write Arrow dataset to disk.
   ///
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
   /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  /// \param metadata additional metadata attached to the new version of data.
   ///
   /// GH-62. To accommodate Cython lacking of arrow Scanner interface, we directly write
   /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
-                               WriteMode mode = kCreate);
+                               WriteMode mode = kCreate,
+                               const std::unordered_map<std::string, std::string>& metadata = {});
 
   /// Load dataset, with a specific version.
   ///

@@ -135,8 +135,9 @@ std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 }  // namespace
 
 DatasetVersion::DatasetVersion(uint64_t version,
-                               std::chrono::time_point<std::chrono::system_clock> created)
-    : version_(version), timestamp_(created) {}
+                               std::chrono::time_point<std::chrono::system_clock> created,
+                               const std::unordered_map<std::string, std::string>& metadata)
+    : version_(version), timestamp_(created), metadata_(metadata.begin(), metadata.end()) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
@@ -146,6 +147,10 @@ const std::chrono::time_point<std::chrono::system_clock>& DatasetVersion::timest
 
 std::time_t DatasetVersion::timet_timestamp() const {
   return std::chrono::system_clock::to_time_t(timestamp_);
+}
+
+const std::unordered_map<std::string, std::string>& DatasetVersion::metadata() const {
+  return metadata_;
 }
 
 DatasetVersion& DatasetVersion::operator++() {
@@ -209,15 +214,17 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
-                                    WriteMode mode) {
+                                    WriteMode mode,
+                                    const std::unordered_map<std::string, std::string>& metadata) {
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset->NewScan());
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
-  return Write(options, std::move(scanner), mode);
+  return Write(options, std::move(scanner), mode, metadata);
 }
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner,
-                                    WriteMode mode) {
+                                    WriteMode mode,
+                                    const std::unordered_map<std::string, std::string>& metadata) {
   const auto& base_dir = options.base_dir;
   const auto data_dir = (fs::path(base_dir) / kDataDir).string();
   auto& fs = options.filesystem;
@@ -289,6 +296,9 @@ LanceDataset::~LanceDataset() {}
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
   manifest->AppendFragments(CreateFragments(paths, *manifest->schema()));
+  if (!metadata.empty()) {
+    manifest->schema()->SetMetadata(metadata);
+  }
 
   return WriteManifest(fs, base_dir, manifest);
 }

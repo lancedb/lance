@@ -94,14 +94,15 @@ class Manifest final {
   void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
 
   /// Get the dataset version.
-  const arrow::DatasetVersion& GetDatasetVersion() const;
+  arrow::DatasetVersion GetDatasetVersion() const;
 
  private:
   /// Table schema.
   std::shared_ptr<Schema> schema_;
 
-  /// Dataset version.
-  ::lance::arrow::DatasetVersion version_;
+  uint64_t version_;
+
+  std::chrono::time_point<std::chrono::system_clock> timestamp_;
 
   /// Data fragments in this dataset.
   std::vector<std::shared_ptr<DataFragment>> fragments_;
