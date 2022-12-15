@@ -431,14 +431,16 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
     const std::shared_ptr<::arrow::Table>& other,
     const std::string& on,
+    const std::unordered_map<std::string, std::string>& metadata,
     ::arrow::MemoryPool* pool) {
-  return Merge(other, on, on, pool);
+  return Merge(other, on, on, metadata, pool);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
     const std::shared_ptr<::arrow::Table>& right,
     const std::string& left_on,
     const std::string& right_on,
+    const std::unordered_map<std::string, std::string>& metadata,
     ::arrow::MemoryPool* pool) {
   /// Sanity checks
   auto left_column = schema_->GetFieldByName(left_on);
@@ -482,6 +484,7 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
                         table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
   ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
   update_builder->Project({left_on});
+  update_builder->Metadata(metadata);
   ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
 
   while (true) {

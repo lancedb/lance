@@ -629,6 +629,7 @@ Schema::Schema(const std::shared_ptr<::arrow::Schema>& schema) {
 
 ::arrow::Result<std::shared_ptr<Schema>> Schema::Merge(const ::arrow::Schema& arrow_schema) const {
   auto merged = std::make_shared<Schema>();
+  merged->metadata_ = metadata_;
   for (auto& field : fields_) {
     auto arrow_field = arrow_schema.GetFieldByName(field->name());
     if (arrow_field) {
@@ -867,6 +868,11 @@ std::shared_ptr<::arrow::Schema> Schema::ToArrow() const {
   }
 
   return ::arrow::schema(arrow_fields, arrow_metadata);
+}
+
+void Schema::SetMetadata(const std::unordered_map<std::string, std::string>& metadata) {
+  // Make a copy of metadata
+  metadata_ = metadata;
 }
 
 pb::Field::Type Field::GetNodeType() const {

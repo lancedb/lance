@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lance::arrow {
@@ -186,13 +187,16 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param left_on the column in this dataset be compared to.
   /// \param right_on the column in the table to be compared to.
   ///           This column must exist in both side and have the same data type.
+  /// \param metadata additional metadata attached to the new version of data.
   /// \param pool memory pool
+  ///
   /// \return `::arrow::Status::OK` if success.
   ///
   ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
       const std::shared_ptr<::arrow::Table>& right,
       const std::string& left_on,
       const std::string& right_on,
+      const std::unordered_map<std::string, std::string>& metadata = {},
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   /// Merge an in-memory table, both sides must have the same column specified by the "on" name.
@@ -201,6 +205,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
       const std::shared_ptr<::arrow::Table>& right,
       const std::string& on,
+      const std::unordered_map<std::string, std::string>& metadata = {},
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
