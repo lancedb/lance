@@ -38,6 +38,7 @@
 #include "lance/format/page_table.h"
 #include "lance/format/schema.h"
 #include "lance/io/endian.h"
+#include "lance/io/pb.h"
 
 using arrow::Result;
 using arrow::Status;
@@ -63,6 +64,19 @@ namespace {
 }
 
 }  // namespace
+
+::arrow::Result<lance::arrow::DatasetVersion> ReadDatasetVersion(
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in,
+    const lance::format::Manifest& manifest) {
+  ARROW_ASSIGN_OR_RAISE(
+      auto proto,
+      ParseProto<lance::format::pb::VersionAuxData>(in, manifest.version_aux_data_position()));
+
+  auto vers = lance::arrow::DatasetVersion(manifest.version(), FromProto(proto.timestamp()));
+  vers.SetTag(proto.tag());
+  vers.SetMetadata(proto.metadata().begin(), proto.metadata().end());
+  return vers;
+}
 
 ::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
     std::shared_ptr<::arrow::io::RandomAccessFile> in,

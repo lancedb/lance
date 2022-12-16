@@ -27,49 +27,23 @@ using arrow::Status;
 
 namespace lance::format {
 
-namespace {
-
-google::protobuf::Timestamp ToProto(const std::chrono::time_point<std::chrono::system_clock>& ts) {
-  return google::protobuf::util::TimeUtil::TimeTToTimestamp(
-      std::chrono::system_clock::to_time_t(ts));
-};
-
-std::chrono::time_point<std::chrono::system_clock> FromProto(
-    const google::protobuf::Timestamp& proto) {
-  return std::chrono::system_clock::from_time_t(
-      google::protobuf::util::TimeUtil::TimestampToTimeT(proto));
-}
-
-}  // namespace
-
-Manifest::Manifest(std::shared_ptr<Schema> schema)
-    : schema_(std::move(schema)), version_(1), timestamp_(std::chrono::system_clock::now()) {}
+Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)), version_(1) {}
 
 Manifest::Manifest(std::shared_ptr<Schema> schema,
                    std::vector<std::shared_ptr<DataFragment>> fragments,
-                   uint64_t version,
-                   std::chrono::time_point<std::chrono::system_clock> timestamp)
-    : schema_(std::move(schema)),
-      version_(version),
-      timestamp_(timestamp),
-      fragments_(std::move(fragments)) {}
+                   uint64_t version)
+    : schema_(std::move(schema)), version_(version), fragments_(std::move(fragments)) {}
 
 Manifest::Manifest(Manifest&& other) noexcept
     : schema_(std::move(other.schema_)),
       version_(other.version_),
-      timestamp_(other.timestamp_),
       fragments_(std::move(other.fragments_)) {}
 
 Manifest::Manifest(const Manifest& other) noexcept
-    : schema_(other.schema_),
-      version_(other.version_),
-      timestamp_(other.timestamp_),
-      fragments_(other.fragments()) {}
+    : schema_(other.schema_), version_(other.version_), fragments_(other.fragments()) {}
 
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
-    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())),
-      version_(pb.version()),
-      timestamp_(FromProto(pb.timestamp())) {
+    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
   for (auto& pb_fragment : pb.fragments()) {
     fragments_.emplace_back(std::make_shared<DataFragment>(pb_fragment));
   }
@@ -93,11 +67,7 @@ pb::Manifest Manifest::ToProto() const {
     auto pb_field = pb.add_fields();
     *pb_field = field;
   }
-  for (const auto& [key, value] : schema_->metadata()) {
-    (*pb.mutable_metadata())[key] = value;
-  }
   pb.set_version(version_);
-  *pb.mutable_timestamp() = format::ToProto(timestamp_);
 
   for (const auto& fragment : fragments_) {
     auto pb_fragment = pb.add_fragments();
@@ -115,20 +85,22 @@ std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
   return new_manifest;
 }
 
-void Manifest::Touch() { timestamp_ = std::chrono::system_clock::now(); }
-
 const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }
 
 uint64_t Manifest::version() const { return version_; }
+
+uint64_t Manifest::version_aux_data_position() const {
+  return version_aux_data_position_.value_or(0);
+}
+
+void Manifest::SetVersionAuxDataPosition(uint64_t pos) {
+  version_aux_data_position_ = pos;
+}
 
 const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
 void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments) {
   fragments_.insert(std::end(fragments_), std::begin(fragments), std::end(fragments));
-}
-
-arrow::DatasetVersion Manifest::GetDatasetVersion() const {
-  return lance::arrow::DatasetVersion(version_, timestamp_, schema_->metadata());
 }
 
 }  // namespace lance::format

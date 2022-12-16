@@ -135,9 +135,8 @@ std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 }  // namespace
 
 DatasetVersion::DatasetVersion(uint64_t version,
-                               std::chrono::time_point<std::chrono::system_clock> created,
-                               const std::unordered_map<std::string, std::string>& metadata)
-    : version_(version), timestamp_(created), metadata_(metadata.begin(), metadata.end()) {}
+                               std::chrono::time_point<std::chrono::system_clock> created)
+    : version_(version), timestamp_(created) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
@@ -152,6 +151,14 @@ std::time_t DatasetVersion::timet_timestamp() const {
 const std::unordered_map<std::string, std::string>& DatasetVersion::metadata() const {
   return metadata_;
 }
+
+void DatasetVersion::SetMetadata(const std::unordered_map<std::string, std::string>& metadata) {
+  SetMetadata(metadata.begin(), metadata.end());
+}
+
+const std::string& DatasetVersion::tag() const { return tag_; }
+
+void DatasetVersion::SetTag(std::string tag) { tag_ = tag; }
 
 //-------------------------
 // LanceDataset::Impl
@@ -175,7 +182,7 @@ namespace {
     // Keep the serialized time, which is when this particular version of dataset is visible.
     manifest->Touch();
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
+    ARROW_RETURN_NOT_OK(lance::io::WriteManifestWithVersion(out, *manifest));
   }
   auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
   return fs->CopyFile(manifest_path, latest_manifest_path);
@@ -323,6 +330,18 @@ LanceDataset::~LanceDataset() {}
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
 }
 
+namespace {
+
+/// Read version auxiliary data from a manifest file.
+::arrow::Result<DatasetVersion> GetVersion(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+                                           const std::string& manifest_file) {
+  ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(manifest_file));
+  ARROW_ASSIGN_OR_RAISE(auto manifest, lance::io::FileReader::OpenManifest(in));
+  return lance::io::GetDatasetVersion(in, *manifest);
+}
+
+}  // namespace
+
 ::arrow::Result<std::vector<DatasetVersion>> LanceDataset::versions() const {
   std::vector<DatasetVersion> versions;
   ::arrow::fs::FileSelector selector;
@@ -332,8 +351,8 @@ LanceDataset::~LanceDataset() {}
 
   ARROW_ASSIGN_OR_RAISE(auto file_infos, impl_->fs->GetFileInfo(selector));
   for (const auto& finfo : file_infos) {
-    ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, finfo.path()));
-    versions.emplace_back(manifest->GetDatasetVersion());
+    ARROW_ASSIGN_OR_RAISE(auto version, GetVersion(impl_->fs, finfo.path()));
+    versions.emplace_back(version);
   }
   versions |= actions::sort([](auto& v1, auto& v2) { return v1.version() < v2.version(); });
   return versions;
@@ -341,11 +360,13 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Result<DatasetVersion> LanceDataset::latest_version() const {
   auto latest_version_path = GetManifestPath(impl_->base_uri);
-  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, latest_version_path));
-  return manifest->GetDatasetVersion();
+  return GetVersion(impl_->fs, latest_version_path);
 }
 
-DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
+::arrow::Result<DatasetVersion> LanceDataset::version() const {
+  auto manifest_path = GetManifestPath(impl_->base_uri, impl_->manifest->version());
+  return GetVersion(impl_->fs, manifest_path);
+}
 
 const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 

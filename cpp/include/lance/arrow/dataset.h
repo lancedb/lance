@@ -37,16 +37,24 @@ class UpdaterBuilder;
 
 /// Dataset Version
 ///
+/// Includes:
+///   - version (number)
+///   - timestamp
+///   - key-value metadata, optional
 class DatasetVersion {
  public:
   using VersionNumberType = uint64_t;
+  using MetadataMap = std::unordered_map<std::string, std::string>;
 
   DatasetVersion() = default;
 
   /// Construct a Dataset version from version number.
-  explicit DatasetVersion(VersionNumberType version,
-                          std::chrono::time_point<std::chrono::system_clock> created,
-                          const std::unordered_map<std::string, std::string>& metadata);
+  ///
+  /// \param version version number
+  /// \param timestamp dataset version creation time.
+  DatasetVersion(VersionNumberType version,
+                 std::chrono::time_point<std::chrono::system_clock> timestamp =
+                     std::chrono::system_clock::now());
 
   /// Get version number.
   VersionNumberType version() const;
@@ -54,22 +62,38 @@ class DatasetVersion {
   /// Timestamp of dataset creation, in UTC.
   const std::chrono::time_point<std::chrono::system_clock>& timestamp() const;
 
-  /// Key-value metadata of this version.
-  const std::unordered_map<std::string, std::string>& metadata() const;
-
   /// time_t representation of timestamp. Used for cython
   std::time_t timet_timestamp() const;
 
- private:
-  void Touch();
+  /// Key-value metadata of this version.
+  const MetadataMap& metadata() const;
 
+  /// Set metadata of this version.
+  void SetMetadata(const MetadataMap& metadata);
+
+  template <typename Iter>
+  void SetMetadata(Iter begin, Iter end) {
+    metadata_.clear();
+    metadata_.insert(begin, end);
+  }
+
+  /// Get the tag of this version.
+  const std::string& tag() const;
+
+  /// Set a tag for this version.
+  void SetTag(std::string tag);
+
+ private:
   VersionNumberType version_ = 0;
 
   /// Dataset creation time, in UTC timezone.
   std::chrono::time_point<std::chrono::system_clock> timestamp_;
 
   /// Key Value metadata.
-  std::unordered_map<std::string, std::string> metadata_;
+  MetadataMap metadata_ = {};
+
+  /// Version tag
+  std::string tag_;
 };
 
 /// Lance Dataset, supports versioning and schema evolution.
@@ -143,7 +167,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<DatasetVersion> latest_version() const;
 
   /// Returns the version of this dataset.
-  DatasetVersion version() const;
+  ::arrow::Result<DatasetVersion> version() const;
 
   std::string type_name() const override { return "lance"; }
 

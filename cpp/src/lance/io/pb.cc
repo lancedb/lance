@@ -28,4 +28,15 @@ namespace lance::io {
   return offset;
 }
 
+std::chrono::time_point<std::chrono::system_clock> FromProto(
+    const google::protobuf::Timestamp& proto) {
+  return std::chrono::system_clock::from_time_t(
+      google::protobuf::util::TimeUtil::TimestampToTimeT(proto));
+}
+
+google::protobuf::Timestamp ToProto(const std::chrono::time_point<std::chrono::system_clock>& ts) {
+  return google::protobuf::util::TimeUtil::TimeTToTimestamp(
+      std::chrono::system_clock::to_time_t(ts));
+};
+
 }  // namespace lance::io
