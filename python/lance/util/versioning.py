@@ -23,7 +23,7 @@
 #  limitations under the License.
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Union
 
 import pandas as pd
 
