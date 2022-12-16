@@ -74,7 +74,12 @@ namespace {
 
   auto vers = lance::arrow::DatasetVersion(manifest.version(), FromProto(proto.timestamp()));
   vers.SetTag(proto.tag());
-  vers.SetMetadata(proto.metadata().begin(), proto.metadata().end());
+
+  if (!proto.metadata().empty()) {
+    std::unordered_map<std::string, std::string> metadata(proto.metadata().begin(),
+                                                          proto.metadata().end());
+    vers.SetMetadata(std::move(metadata));
+  }
   return vers;
 }
 

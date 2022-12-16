@@ -69,13 +69,7 @@ class DatasetVersion {
   const MetadataMap& metadata() const;
 
   /// Set metadata of this version.
-  void SetMetadata(const MetadataMap& metadata);
-
-  template <typename Iter>
-  void SetMetadata(Iter begin, Iter end) {
-    metadata_.clear();
-    metadata_.insert(begin, end);
-  }
+  void SetMetadata(MetadataMap metadata);
 
   /// Get the tag of this version.
   const std::string& tag() const;
