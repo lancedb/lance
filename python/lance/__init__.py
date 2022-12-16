@@ -80,22 +80,24 @@ def dataset(
         filesystem, uri = _resolve_filesystem_and_path(uri, filesystem)
 
     if version is None:
-        if not _is_versioned(filesystem, uri):
+        if _is_plain_dataset(filesystem, uri):
             return _dataset_plain(uri, filesystem=filesystem, **kwargs)
 
         if asof is not None:
-            ds = dataset(uri, version, filesystem=filesystem, **kwargs)
+            ds = _get_versioned_dataset(filesystem, uri, version)
             version = get_version_asof(ds, asof)
 
     return _get_versioned_dataset(filesystem, uri, version)
 
 
-def _is_versioned(filesystem, uri):
+def _is_plain_dataset(filesystem: pa.fs.FileSystem, uri: str):
     manifest = os.path.join(uri, "_latest.manifest")
-    return not (filesystem.get_file_info(manifest).type == pa.fs.FileType.NotFound)
+    return filesystem.get_file_info(manifest).type == pa.fs.FileType.NotFound
 
 
-def _get_versioned_dataset(filesystem, uri, version):
+def _get_versioned_dataset(filesystem: pa.fs.FileSystem,
+                           uri: str,
+                           version: Optional[int] = None):
     # Read the versioned dataset layout.
     has_version = True
     if version is None:
