@@ -73,8 +73,10 @@ def test_add_column_with_literal(tmp_path: Path):
     with pytest.raises(TypeError):
         # can't compare offset-naive and offset-aware datetimes
         assert ts > datetime.datetime.utcnow() - datetime.timedelta(0, 10)
-        
-    assert ts > datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(0, 10)
+
+    assert ts > datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(
+        0, 10
+    )
     assert ts > datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
 
     time.sleep(1)

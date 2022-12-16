@@ -16,7 +16,7 @@ from lance.types import ImageType
 
 sys.path.append("..")
 
-from converter import DatasetConverter, PUBLIC_URI_ROOT
+from converter import PUBLIC_URI_ROOT, DatasetConverter
 
 
 class CocoConverter(DatasetConverter):
@@ -57,10 +57,9 @@ class CocoConverter(DatasetConverter):
         )
         images_df["split"] = split
         images_df["image_uri"] = images_df["file_name"].apply(
-            lambda fname: os.path.join(PUBLIC_URI_ROOT,
-                                       "coco",
-                                       f"{split}{self.version}",
-                                       fname)
+            lambda fname: os.path.join(
+                PUBLIC_URI_ROOT, "coco", f"{split}{self.version}", fname
+            )
         )
         # TODO join images_df.license to instances_json['license']
         return images_df.merge(anno_df, on="image_id")
@@ -73,8 +72,8 @@ class CocoConverter(DatasetConverter):
         -------
         ann_df: pd.DataFrame
         """
-        df = pd.DataFrame(instances_json['annotations'])
-        cat_df = pd.DataFrame(instances_json['categories'])
+        df = pd.DataFrame(instances_json["annotations"])
+        cat_df = pd.DataFrame(instances_json["categories"])
         df["segmentation"] = df.segmentation.apply(_convert_segmentation)
         df["iscrowd"] = df.iscrowd.astype("bool")
         # Convert coco dataset bounding box [x,y,width,height] to [x0,y0,x1,y1] format.
@@ -96,9 +95,9 @@ class CocoConverter(DatasetConverter):
         df["date_captured"] = pd.to_datetime(df.date_captured)
         return df
 
-    def _concat_frames(self,
-                       frames: Iterable[pd.DataFrame],
-                       num_rows: int) -> pd.DataFrame:
+    def _concat_frames(
+        self, frames: Iterable[pd.DataFrame], num_rows: int
+    ) -> pd.DataFrame:
         if num_rows > 0:
             sizes = np.array([len(df) for df in frames])
             rows = np.round(sizes / sizes.sum() * num_rows).astype(int)
@@ -106,12 +105,9 @@ class CocoConverter(DatasetConverter):
         return pd.concat(frames)
 
     def _get_test_images(self, dirname: str = "test"):
-        uri = os.path.join(self.uri_root,
-                           f"{dirname}{self.version}")
+        uri = os.path.join(self.uri_root, f"{dirname}{self.version}")
         fs, path = pa.fs.FileSystem.from_uri(uri)
-        public_uri = os.path.join(PUBLIC_URI_ROOT,
-                                  "coco",
-                                  f"{dirname}{self.version}")
+        public_uri = os.path.join(PUBLIC_URI_ROOT, "coco", f"{dirname}{self.version}")
         return [
             os.path.join(public_uri, file.base_name)
             for file in fs.get_file_info(pa.fs.FileSelector(path, recursive=True))
@@ -119,10 +115,12 @@ class CocoConverter(DatasetConverter):
 
     def image_uris(self, table):
         prefix = os.path.join(PUBLIC_URI_ROOT, "coco/")
-        uris = np.array([
-            os.path.join(self.uri_root, image_uri[len(prefix):])
-            for image_uri in table["image_uri"].to_numpy()
-        ])
+        uris = np.array(
+            [
+                os.path.join(self.uri_root, image_uri[len(prefix) :])
+                for image_uri in table["image_uri"].to_numpy()
+            ]
+        )
         return uris
 
     def get_schema(self):
@@ -181,7 +179,7 @@ class CocoConverter(DatasetConverter):
             pa.int16(),
             pa.int64(),
             pa.string(),  # TODO https://github.com/duckdb/duckdb/issues/4812
-            pa.string()  # TODO https://github.com/duckdb/duckdb/issues/4812
+            pa.string(),  # TODO https://github.com/duckdb/duckdb/issues/4812
         ]
         schema = pa.struct(
             [pa.field(name, pa.list_(dtype)) for name, dtype in zip(names, types)]

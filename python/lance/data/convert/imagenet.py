@@ -53,7 +53,9 @@ def _record_batch_gen(
     try:
         from datasets import load_dataset
     except ImportError as ie:
-        raise ImportError("Please install huggingface dataset via 'pip install datasets'") from ie
+        raise ImportError(
+            "Please install huggingface dataset via 'pip install datasets'"
+        ) from ie
 
     sample_id = 1
     splits = ["train", "validation", "test"]

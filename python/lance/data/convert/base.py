@@ -13,9 +13,9 @@
 #  limitations under the License.
 """Dataset conversion"""
 
-from abc import abstractmethod, ABC
 import os
-from typing import Union, List
+from abc import ABC, abstractmethod
+from typing import List, Union
 
 import click
 import pandas as pd
@@ -30,7 +30,7 @@ from lance.types import ImageArray, ImageBinaryType
 class DatasetConverter(ABC):
     """Base class for converting raw => pandas => Arrow => Lance"""
 
-    def __init__(self, name, uri_root, images_root: str=None):
+    def __init__(self, name, uri_root, images_root: str = None):
         self.name = name
         self.uri_root = uri_root
         if images_root is None:
@@ -101,8 +101,7 @@ class DatasetConverter(ABC):
             field = schema.field(name)
             arr = self._convert_field(field.name, field.type, col)
             arrays.append(arr)
-        table = (pa.Table.from_arrays(arrays=arrays, schema=schema)
-                 .unify_dictionaries())
+        table = pa.Table.from_arrays(arrays=arrays, schema=schema).unify_dictionaries()
         if to_image:
             table = self._load_images(table)
         return table
@@ -138,11 +137,13 @@ class DatasetConverter(ABC):
         else:
             return pa.array(col, type=typ)
 
-    def _load_images(self, table: pa.Table, image_col: str = 'image'):
+    def _load_images(self, table: pa.Table, image_col: str = "image"):
         uris = self.image_uris(table)
         images = download_uris(pd.Series(uris))
         image_arr = ImageArray.from_pandas(images)
-        embedded = table.append_column(pa.field(image_col, ImageBinaryType()), image_arr)
+        embedded = table.append_column(
+            pa.field(image_col, ImageBinaryType()), image_arr
+        )
         return embedded
 
     @classmethod
@@ -161,7 +162,7 @@ class DatasetConverter(ABC):
         @click.option(
             "--images-root",
             type=str,
-            help="If provided, use this as the uri root for image uri's"
+            help="If provided, use this as the uri root for image uri's",
         )
         @click.option("-e", "--embedded", type=bool, default=True, help="Embed images")
         @click.option(
@@ -189,7 +190,7 @@ class DatasetConverter(ABC):
             "--num-rows",
             type=int,
             default=0,
-            help="Max rows in the dataset (0 means this is ignored)"
+            help="Max rows in the dataset (0 means this is ignored)",
         )
         def main(
             base_uri,
@@ -199,7 +200,7 @@ class DatasetConverter(ABC):
             output_path,
             group_size: int,
             max_rows_per_file: int,
-            num_rows: int
+            num_rows: int,
         ):
             converter = cls(base_uri, images_root)
             df = converter.read_metadata(num_rows=num_rows)
@@ -211,15 +212,15 @@ class DatasetConverter(ABC):
                 fmt = known_formats
 
             for f in fmt:
-                if f == 'lance':
+                if f == "lance":
                     kwargs = {
                         "existing_data_behavior": "overwrite_or_ignore",
                         "max_rows_per_group": group_size,
                         "max_rows_per_file": max_rows_per_file,
                     }
-                elif f == 'parquet':
+                elif f == "parquet":
                     kwargs = {
-                        'max_rows_per_group': group_size,
+                        "max_rows_per_group": group_size,
                     }
                 else:
                     raise TypeError(f"Format {f} not supported")

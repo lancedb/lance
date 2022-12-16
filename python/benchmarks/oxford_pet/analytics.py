@@ -15,9 +15,9 @@ from lance.io import download_uris
 sys.path.append("..")
 
 from suite import BenchmarkSuite, get_dataset, get_uri
-from lance.data.convert.oxford_pet import OxfordPetConverter
 
 import lance
+from lance.data.convert.oxford_pet import OxfordPetConverter
 
 oxford_pet_benchmarks = BenchmarkSuite("oxford_pet")
 
@@ -71,7 +71,7 @@ def get_pets_filtered_data(base_uri, klass="pug", offset=20, limit=50):
     c = OxfordPetConverter(base_uri)
     df = c.read_metadata()
     filtered = df.loc[df["class"] == klass, ["class", "filename"]]
-    limited: pd.DataFrame = filtered[offset: offset + limit]
+    limited: pd.DataFrame = filtered[offset : offset + limit]
     uris = [os.path.join(base_uri, f"images/{x}.jpg") for x in limited.filename.values]
     return limited.assign(images=download_uris(pd.Series(uris)))
 

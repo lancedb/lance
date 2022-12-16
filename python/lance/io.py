@@ -23,11 +23,11 @@ from typing import IO, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import requests
+from pyarrow import fs
 from requests.auth import AuthBase
 
 import lance
 from lance.logging import logger
-from pyarrow import fs
 
 USER_AGENT = f"User-Agent: Lance/{lance.__version__} (contact@eto.ai)"
 
