@@ -71,7 +71,7 @@ std::shared_ptr<LanceDataset> TestDataset(
 
 TEST_CASE("Use updater to update one column") {
   auto lance_dataset = TestDataset();
-  CHECK(lance_dataset->version().version() == 1);
+  CHECK(lance_dataset->version().ValueOrDie().version() == 1);
   auto table = lance_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
 
   auto updater = lance_dataset->NewUpdate(::arrow::field("values", arrow::utf8()))
@@ -166,7 +166,7 @@ TEST_CASE("Test data file stores the relative path to the data dir") {
   updater->Finish().ValueOrDie();
 
   dataset = LanceDataset::Make(local_fs, fs::path(dataset->uri()).filename().string()).ValueOrDie();
-  CHECK(dataset->version().version() == 2);
+  CHECK(dataset->version().ValueOrDie().version() == 2);
   auto table = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   CHECK(table->schema()->num_fields() == 3);
 
@@ -202,7 +202,7 @@ TEST_CASE("Update schema with metadata") {
   }
   dataset = updater->Finish().ValueOrDie();
   INFO("Expect the metadata is preserved if not overwrite");
-  CHECK(dataset->version().version() == 2);
+  CHECK(dataset->version().ValueOrDie().version() == 2);
   CHECK(dataset->schema()->metadata()->keys() == std::vector<std::string>({"k1"}));
   CHECK(dataset->schema()->metadata()->values() == std::vector<std::string>({"v1"}));
 
@@ -223,9 +223,6 @@ TEST_CASE("Update schema with metadata") {
   }
   dataset = updater->Finish().ValueOrDie();
 
-  CHECK(dataset->version().version() == 3);
-  CHECK(dataset->schema()->metadata() != nullptr);
-  std::unordered_map<std::string, std::string> expected_metadata;
-  dataset->schema()->metadata()->ToUnorderedMap(&expected_metadata);
-  CHECK(expected_metadata == new_metadata);
+  CHECK(dataset->version().ValueOrDie().version() == 3);
+  CHECK(dataset->version()->metadata() == new_metadata);
 }

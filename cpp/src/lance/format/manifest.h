@@ -74,10 +74,6 @@ class Manifest final {
   /// Convert to protobuf.
   pb::Manifest ToProto() const;
 
-  /// Increase the version number and returns the new Manifest.
-  ///
-  std::shared_ptr<Manifest> BumpVersion(bool overwrite = false);
-
   /// Get schema of the dataset.
   const std::shared_ptr<Schema>& schema() const;
 

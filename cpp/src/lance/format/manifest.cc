@@ -67,6 +67,7 @@ pb::Manifest Manifest::ToProto() const {
     auto pb_field = pb.add_fields();
     *pb_field = field;
   }
+  pb.mutable_metadata()->insert(schema_->metadata().begin(), schema_->metadata().end());
   pb.set_version(version_);
 
   for (const auto& fragment : fragments_) {
@@ -74,15 +75,6 @@ pb::Manifest Manifest::ToProto() const {
     *pb_fragment = fragment->ToProto();
   }
   return pb;
-}
-
-std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
-  auto new_manifest = std::make_shared<Manifest>(*this);
-  new_manifest->version_++;
-  if (overwrite) {
-    new_manifest->fragments_.clear();
-  }
-  return new_manifest;
 }
 
 const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }

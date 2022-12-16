@@ -248,14 +248,16 @@ TEST_CASE("Dataset add column with a constant value") {
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(dataset->version().timestamp() > std::chrono::system_clock::now() - 30s);
+  auto version = dataset->version().ValueOrDie();
+  CHECK(version.timestamp() > std::chrono::system_clock::now() - 30s);
 
   auto dataset2 =
       dataset
           ->AddColumn(::arrow::field("doubles", ::arrow::float64()), ::arrow::compute::literal(0.5))
           .ValueOrDie();
-  CHECK(dataset2->version().version() == 2);
-  CHECK(dataset2->version().timestamp() > dataset->version().timestamp());
+  auto version2 = dataset2->version().ValueOrDie();
+  CHECK(version2.version() == 2);
+  CHECK(version2.timestamp() >= version.timestamp());
 
   auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   auto doubles = ToArray<double>({0.5, 0.5, 0.5, 0.5, 0.5}).ValueOrDie();
@@ -275,7 +277,7 @@ TEST_CASE("Dataset add column with a function call") {
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(dataset->version().timestamp() > std::chrono::system_clock::now() - 30s);
+  CHECK(dataset->version().ValueOrDie().timestamp() > std::chrono::system_clock::now() - 30s);
 
   auto dataset2 =
       dataset
@@ -284,8 +286,8 @@ TEST_CASE("Dataset add column with a function call") {
               ::arrow::compute::call(
                   "add", {::arrow::compute::field_ref("id"), ::arrow::compute::literal(0.5)}))
           .ValueOrDie();
-  CHECK(dataset2->version().version() == 2);
-  CHECK(dataset2->version().timestamp() > dataset->version().timestamp());
+  CHECK(dataset2->version().ValueOrDie().version() == 2);
+  CHECK(dataset2->version().ValueOrDie().timestamp() > dataset->version().ValueOrDie().timestamp());
   auto table2 = dataset2->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   auto doubles = ToArray<double>({1.5, 2.5, 3.5, 4.5, 5.5}).ValueOrDie();
   auto expected_table =
@@ -305,7 +307,7 @@ TEST_CASE("Dataset add columns with a table") {
 
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(dataset->version().version() == 1);
+  CHECK(dataset->version().ValueOrDie().version() == 1);
 
   auto added_ids = ToArray({5, 4, 3, 10, 12, 1}).ValueOrDie();
   auto added_values = ToArray({50, 40, 30, 100, 120, 10}).ValueOrDie();
@@ -315,12 +317,10 @@ TEST_CASE("Dataset add columns with a table") {
                            {added_ids, added_values});
   std::unordered_map<std::string, std::string> new_metadata{{"k", "v"}};
   auto new_dataset = dataset->Merge(added_table, "id", new_metadata).ValueOrDie();
-  CHECK(new_dataset->version().version() == 2);
+  CHECK(new_dataset->version().ValueOrDie().version() == 2);
   INFO("New dataset version metadata: " << fmt::format(
-           "{} {}", new_dataset->version().metadata(), new_metadata));
-  CHECK(new_dataset->version().metadata() == new_metadata);
-  CHECK(new_dataset->schema()->metadata()->keys() == std::vector<std::string>({"k"}));
-  CHECK(new_dataset->schema()->metadata()->values() == std::vector<std::string>({"v"}));
+           "{} {}", new_dataset->version().ValueOrDie().metadata(), new_metadata));
+  CHECK(new_dataset->version().ValueOrDie().metadata() == new_metadata);
 
   auto new_table =
       new_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
@@ -344,7 +344,7 @@ TEST_CASE("Test throw error when merging with the same column names") {
   auto base_uri = WriteTable(table);
   auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
   auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
-  CHECK(dataset->version().version() == 1);
+  CHECK(dataset->version().ValueOrDie().version() == 1);
 
   auto added_ids = ToArray({5, 4, 3, 10, 12, 1}).ValueOrDie();
   auto added_values = ToArray({50, 40, 30, 100, 120, 10}).ValueOrDie();

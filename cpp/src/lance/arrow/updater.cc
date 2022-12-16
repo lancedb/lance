@@ -180,9 +180,15 @@ class Updater::Impl {
     return ::arrow::Status::Invalid("Updater::Finish: there are remaining data to consume.");
   }
   ARROW_ASSIGN_OR_RAISE(auto latest_version, dataset_->latest_version());
+
+  auto new_version = DatasetVersion(latest_version.version() + 1);
+  if (!metadata_.empty()) {
+    new_version.SetMetadata(metadata_);
+  }
   auto new_manifest = std::make_shared<lance::format::Manifest>(
-      full_schema_, data_fragments_, latest_version.version() + 1, latest_version.timestamp());
-  ARROW_ASSIGN_OR_RAISE(auto dataset_impl, dataset_->impl_->WriteNewVersion(new_manifest));
+      full_schema_, data_fragments_, new_version.version());
+  ARROW_ASSIGN_OR_RAISE(auto dataset_impl,
+                        dataset_->impl_->WriteNewVersion(new_manifest, new_version));
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(dataset_impl)));
 }
 
@@ -194,9 +200,6 @@ Updater::~Updater() {}
     const std::vector<std::string>& projection_columns,
     const std::unordered_map<std::string, std::string>& metadata) {
   ARROW_ASSIGN_OR_RAISE(auto full_schema, dataset->impl_->manifest->schema()->Merge(*arrow_schema));
-  if (!metadata.empty()) {
-    full_schema->SetMetadata(metadata);
-  }
   ARROW_ASSIGN_OR_RAISE(auto column_schema, full_schema->Project(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto fragment_iter, dataset->GetFragments());
   // Use vector to make implementation easier.

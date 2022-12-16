@@ -172,27 +172,31 @@ namespace {
 
 ::arrow::Status WriteManifest(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
                               const std::string& base_uri,
-                              const std::shared_ptr<format::Manifest>& manifest) {
+                              const std::shared_ptr<format::Manifest>& manifest,
+                              const DatasetVersion& version) {
+  if (manifest->version() != version.version()) {
+    return ::arrow::Status::Invalid(
+        "Manifest and version does not match: ", manifest->version(), " != ", version.version());
+  }
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_uri) / kVersionsDir).string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
   auto manifest_path = GetManifestPath(base_uri, manifest->version());
   {
-    // Keep the serialized time, which is when this particular version of dataset is visible.
-    manifest->Touch();
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(lance::io::WriteManifestWithVersion(out, *manifest));
+    ARROW_RETURN_NOT_OK(lance::io::WriteManifestWithVersion(out, *manifest, version));
+    // output stream is closed
   }
-  auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
+  auto latest_manifest_path = GetManifestPath(base_uri);
   return fs->CopyFile(manifest_path, latest_manifest_path);
 }
 
 }  // namespace
 
 ::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
-    std::shared_ptr<lance::format::Manifest> new_manifest) const {
-  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest));
+    std::shared_ptr<lance::format::Manifest> new_manifest, const DatasetVersion& version) const {
+  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest, version));
   return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
 }
 
@@ -223,6 +227,7 @@ LanceDataset::~LanceDataset() {}
   auto& fs = options.filesystem;
 
   std::shared_ptr<lance::format::Manifest> manifest;
+  std::unique_ptr<DatasetVersion> version;
   if (mode == kCreate) {
     if (fs->GetFileInfo(base_dir)->type() != ::arrow::fs::FileType::NotFound) {
       return ::arrow::Status::AlreadyExists("Dataset ", base_dir, " already exists");
@@ -246,17 +251,28 @@ LanceDataset::~LanceDataset() {}
       }
 
       // Bump the version
-      manifest = cur_dataset->impl_->manifest->BumpVersion(mode == kOverwrite);
+      ARROW_ASSIGN_OR_RAISE(auto latest, cur_dataset->latest_version());
+      auto new_version_num = latest.version() + 1;
+      version = std::make_unique<DatasetVersion>(new_version_num);
+      std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
+      if (mode == kAppend) {
+        fragments = existing_manifest->fragments();
+      }
+      manifest = std::make_shared<lance::format::Manifest>(
+          existing_manifest->schema(), fragments, new_version_num);
     }
   }
   if (!manifest) {
-    // This is a completely new dataset, create Manifest with version 1.
     auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
     manifest = std::make_shared<lance::format::Manifest>(schema);
+    version = std::make_unique<DatasetVersion>(1);
   }
+  if (!metadata.empty()) {
+    version->SetMetadata(metadata);
+  }
+
   ARROW_RETURN_NOT_OK(CollectDictionary(manifest->schema(), scanner));
 
-  // Write manifest file
   auto lance_option = options;
   lance_option.base_dir = data_dir;
   lance_option.existing_data_behavior = ::arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
@@ -293,7 +309,7 @@ LanceDataset::~LanceDataset() {}
     manifest->schema()->SetMetadata(metadata);
   }
 
-  return WriteManifest(fs, base_dir, manifest);
+  return WriteManifest(fs, base_dir, manifest, *version);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(const std::string& uri,
@@ -337,7 +353,7 @@ namespace {
                                            const std::string& manifest_file) {
   ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(manifest_file));
   ARROW_ASSIGN_OR_RAISE(auto manifest, lance::io::FileReader::OpenManifest(in));
-  return lance::io::GetDatasetVersion(in, *manifest);
+  return lance::io::ReadDatasetVersion(in, *manifest);
 }
 
 }  // namespace

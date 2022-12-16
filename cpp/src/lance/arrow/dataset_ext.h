@@ -35,14 +35,19 @@ class LanceDataset::Impl {
        std::shared_ptr<lance::format::Manifest> m)
       : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
 
+  /// Data directory.
   std::string data_dir() const;
 
+  /// The URI to store versioned metadata.
   std::string versions_dir() const;
 
-  // Write the manifest version file.
-  // It only supports single writer at the moment.
+  /// Write the manifest version file.
+  /// It only supports single writer at the moment.
+  ///
+  ///
   ::arrow::Result<std::unique_ptr<Impl>> WriteNewVersion(
-      std::shared_ptr<lance::format::Manifest> new_manifest) const;
+      std::shared_ptr<lance::format::Manifest> new_manifest,
+      const DatasetVersion& new_version) const;
 
   std::shared_ptr<::arrow::fs::FileSystem> fs;
   std::string base_uri;
