@@ -13,8 +13,8 @@
 #  limitations under the License.
 """Dataset conversion"""
 
-from abc import abstractmethod, ABC
 import os
+from abc import ABC, abstractmethod
 from typing import Union
 
 import click
@@ -25,7 +25,6 @@ import pyarrow.parquet as pq
 import lance
 from lance.io import download_uris
 from lance.types import ImageArray, ImageBinaryType
-
 
 PUBLIC_URI_ROOT = "https://eto-public.s3.us-west-2.amazonaws.com/datasets/"
 
@@ -117,9 +116,7 @@ class DatasetConverter(ABC):
         if fmt == "parquet":
             pq.write_table(embedded, output_path, **kwargs)
         elif fmt == "lance":
-            lance.write_dataset(
-                embedded, output_path, **kwargs
-            )
+            lance.write_dataset(embedded, output_path, **kwargs)
         return embedded
 
     @abstractmethod
@@ -165,7 +162,7 @@ class DatasetConverter(ABC):
             "--num-rows",
             type=int,
             default=0,
-            help="Max rows in the dataset (0 means this is ignored)"
+            help="Max rows in the dataset (0 means this is ignored)",
         )
         def main(
             base_uri,
@@ -174,7 +171,7 @@ class DatasetConverter(ABC):
             output_path,
             group_size: int,
             max_rows_per_file: int,
-            num_rows: int
+            num_rows: int,
         ):
             converter = cls(base_uri)
             df = converter.read_metadata(num_rows=num_rows)
@@ -186,15 +183,15 @@ class DatasetConverter(ABC):
                 fmt = known_formats
 
             for f in fmt:
-                if f == 'lance':
+                if f == "lance":
                     kwargs = {
                         "existing_data_behavior": "overwrite_or_ignore",
                         "max_rows_per_group": group_size,
                         "max_rows_per_file": max_rows_per_file,
                     }
-                elif f == 'parquet':
+                elif f == "parquet":
                     kwargs = {
-                        'row_group_size': group_size,
+                        "row_group_size": group_size,
                     }
                 if embedded:
                     converter.make_embedded_dataset(df, f, output_path, **kwargs)

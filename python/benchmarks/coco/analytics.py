@@ -12,8 +12,8 @@ from lance.io import download_uris
 
 sys.path.append("..")
 
-from suite import BenchmarkSuite, get_dataset, get_uri
 from datagen import CocoConverter
+from suite import BenchmarkSuite, get_dataset, get_uri
 
 import lance
 
@@ -68,7 +68,7 @@ def _filter_data_raw(base_uri: str, klass="cat", offset=20, limit=50):
 
     mask = ser.apply(has_klass)
     filtered = df.loc[mask, ["image_uri", "annotations"]]
-    limited = filtered[offset: offset + limit]
+    limited = filtered[offset : offset + limit]
     limited.assign(image=download_uris(limited.image_uri))
     return limited
 

@@ -46,7 +46,10 @@ extensions = [
         library_dirs=[lance_libs] + arrow_library_dirs,
         language="c++",
         extra_compile_args=["-Wall", "-std=c++20", "-O3"],
-        extra_link_args=["-Wl,-rpath", lance_libs]  # , "-Wl,-rpath", arrow_library_dirs[0]],
+        extra_link_args=[
+            "-Wl,-rpath",
+            lance_libs,
+        ],  # , "-Wl,-rpath", arrow_library_dirs[0]],
     )
 ]
 
@@ -71,7 +74,9 @@ setup(
     ext_modules=cythonize(extensions, language_level="3"),
     zip_safe=False,
     install_requires=["numpy", "pillow", "pyarrow>=10,<11", "requests", "pandas"],
-    extras_require={"test": ["pytest>=6.0", "duckdb==0.6.0", "click", "requests_mock", "hypothesis"]},
+    extras_require={
+        "test": ["pytest>=6.0", "duckdb==0.6.0", "click", "requests_mock", "hypothesis"]
+    },
     python_requires=">=3.8",
     packages=find_packages(),
     classifiers=[

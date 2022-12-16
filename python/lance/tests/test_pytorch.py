@@ -94,9 +94,7 @@ def test_data_loader_projection(tmp_path: Path):
     tab = pa.Table.from_arrays([ids, values], names=["id", "value"])
     lance.write_dataset(tab, tmp_path / "lance")
 
-    dataset = Dataset(
-        tmp_path / "lance", columns=["value"], filter=pc.field("id") >= 5
-    )
+    dataset = Dataset(tmp_path / "lance", columns=["value"], filter=pc.field("id") >= 5)
     for elem, expected_id in zip(dataset, range(5, 10)):
         assert elem == f"num-{expected_id}"
 
@@ -169,7 +167,7 @@ def test_iterate_dataset_several_times(tmp_path: Path):
         columns=["image"],
     )
     images_tensor = list(iter(dataset))
-    assert(len(images_tensor) == 50)
+    assert len(images_tensor) == 50
 
     images_tensor = list(iter(dataset))
-    assert(len(images_tensor) == 50)
+    assert len(images_tensor) == 50

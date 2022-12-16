@@ -3,11 +3,12 @@ import pandas as pd
 import pandas._testing as tm
 import pytest
 from pandas.compat import pa_version_under7p0
-from pandas.core.dtypes.common import is_string_dtype, is_object_dtype
+from pandas.conftest import *
+from pandas.core.dtypes.common import is_object_dtype, is_string_dtype
 from pandas.errors import PerformanceWarning
 from pandas.tests.extension import base
 from pandas.tests.extension.conftest import *
-from pandas.conftest import *
+
 from lance.types.pandas.image import ImageUriDtype
 
 
@@ -24,7 +25,7 @@ def data(dtype):
     * data[0] and data[1] should both be non missing
     * data[0] and data[1] should not be equal
     """
-    uris = [f'/path/to/image{i}.jpg' for i in range(100)]
+    uris = [f"/path/to/image{i}.jpg" for i in range(100)]
     return pd.array(uris, dtype=dtype)
 
 
@@ -63,7 +64,6 @@ def data_missing_for_sorting(dtype):
 
 
 class TestDtype(base.BaseDtypeTests):
-
     @pytest.mark.skip(reason="not a problem")
     def test_is_not_string_type(self, dtype):
         # super class didn't assert the value
@@ -204,7 +204,6 @@ class TestGroupBy(base.BaseGroupbyTests):
 
 
 class TestMethods(base.BaseMethodsTests):
-
     @pytest.mark.parametrize("dropna", [True, False])
     def test_value_counts(self, all_data, dropna, request):
         all_data = all_data[:10]

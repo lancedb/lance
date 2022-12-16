@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -128,6 +128,21 @@ def test_write_versioned_dataset(tmp_path: Path):
     assert dataset.version["version"] == 3
     assert dataset.latest_version()["version"] == 3
     assert len(dataset.versions()) == 3
+
+
+def test_asof(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    test_ts = datetime.now()
+    time.sleep(1)
+
+    table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
+    lance.write_dataset(table2, base_dir, mode="append")
+
+    dataset = lance.dataset(base_dir, asof=test_ts)
+    assert dataset.version["version"] == 1
 
 
 def test_open_local_path(tmp_path: Path):

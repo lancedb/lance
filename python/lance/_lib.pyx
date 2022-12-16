@@ -1,18 +1,20 @@
 # distutils: language = c++
 
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Dict, Union
 from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union
 
 import pyarrow
+
 from cython.operator cimport dereference as deref
+from libc.stdint cimport int64_t, uint64_t
 from libc.time cimport time_t
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
-from libc.stdint cimport uint64_t, int64_t
 
 from pyarrow import Table
+
 from pyarrow._dataset cimport (
     CDataset,
     CFileWriteOptions,
@@ -21,10 +23,12 @@ from pyarrow._dataset cimport (
     FileFormat,
     FileWriteOptions,
 )
+
 from pyarrow._dataset import Scanner, _forbid_instantiation
+
 from pyarrow._compute cimport Expression, _bind
 from pyarrow._fs cimport FileSystem
-from pyarrow.includes.common cimport CStatus, CResult, vector, move
+from pyarrow.includes.common cimport CResult, CStatus, move, vector
 from pyarrow.includes.libarrow_dataset cimport (
     CFileFormat,
     CFileSystemDatasetWriteOptions,
@@ -40,13 +44,15 @@ from pyarrow.lib cimport (
     GetResultValue,
     RecordBatchReader,
     check_status,
-    pyarrow_wrap_batch,
-    pyarrow_unwrap_field,
     pyarrow_unwrap_array,
+    pyarrow_unwrap_field,
     pyarrow_unwrap_table,
+    pyarrow_wrap_batch,
 )
+
 from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
+
 
 cdef Expression _true = Expression._scalar(True)
 
@@ -235,6 +241,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CLanceDataset]] Merge(
                 const shared_ptr[CTable]& table, const string& left_on, const string& right_on
         )
+
+        const string& uri() const;
 
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {

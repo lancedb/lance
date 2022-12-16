@@ -33,10 +33,9 @@ except ImportError:
     print(msg)
     raise ImportError(msg)
 
+from lance.data.convert.base import DatasetConverter
 from lance.io import download_uris
 from lance.types import ImageUriType
-from lance.data.convert.base import DatasetConverter
-
 
 # Oxford PET has dataset quality issues:
 #
@@ -56,7 +55,8 @@ class OxfordPetConverter(DatasetConverter):
 
     def __init__(self, uri_root, images_root=None):
         super(OxfordPetConverter, self).__init__(
-            "oxford_pet", uri_root, images_root or uri_root)
+            "oxford_pet", uri_root, images_root or uri_root
+        )
         self._data_quality_issues = {}
 
     def read_metadata(self, num_rows: int = 0, check_quality=False) -> pd.DataFrame:
@@ -103,9 +103,7 @@ class OxfordPetConverter(DatasetConverter):
     def _read_annotations(self, df):
         """Parse the Pascal VOC annotations"""
         xml_files = (
-            os.path.join(self.uri_root, "annotations", "xmls/")
-            + df.filename
-            + ".xml"
+            os.path.join(self.uri_root, "annotations", "xmls/") + df.filename + ".xml"
         )
         ann_df = pd.DataFrame(download_uris(xml_files, func=_xml_to_dict))
         with_xmls = pd.concat(
@@ -193,8 +191,10 @@ class OxfordPetConverter(DatasetConverter):
         return metadata_df
 
     def image_uris(self, table) -> List[str]:
-        uris = [os.path.join(self.uri_root, image_uri[len(self.images_root) + 1:])
-                for image_uri in table["external_image"].to_numpy()]
+        uris = [
+            os.path.join(self.uri_root, image_uri[len(self.images_root) + 1 :])
+            for image_uri in table["external_image"].to_numpy()
+        ]
         return uris
 
     def get_schema(self) -> pa.Schema:

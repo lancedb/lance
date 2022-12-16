@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
 import pandas
+import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs
@@ -35,6 +37,8 @@ from lance.types import register_extension_types
 
 __all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__"]
 
+from .util.versioning import get_version_asof
+
 register_extension_types()
 
 
@@ -45,6 +49,7 @@ def _dataset_plain(uri: str, **kwargs) -> ds.FileSystemDataset:
 def dataset(
     uri: Union[str, Path],
     version: Optional[int] = None,
+    asof: Optional[Union[datetime, pd.Timestamp, str]] = None,
     filesystem: Optional[pa.fs.FileSystem] = None,
     **kwargs,
 ) -> FileSystemDataset:
@@ -59,6 +64,9 @@ def dataset(
         The uri to the lance data
     version: optional, int
         If specified, load a specific version of the dataset.
+    asof: optional datetime/Timestamp/str
+        If specified find the latest version created on or earlier than
+        given argument value. If version is specified, this is ignored.
     filesystem: pyarrow.fs.FileSystem
         File system instance to read.
 
@@ -68,15 +76,28 @@ def dataset(
     """
     if not filesystem:
         from pyarrow.fs import _resolve_filesystem_and_path
+
         filesystem, uri = _resolve_filesystem_and_path(uri, filesystem)
 
     if version is None:
-        if (
-            filesystem.get_file_info(os.path.join(uri, "_latest.manifest")).type
-            == pa.fs.FileType.NotFound
-        ):
+        if _is_plain_dataset(filesystem, uri):
             return _dataset_plain(uri, filesystem=filesystem, **kwargs)
 
+        if asof is not None:
+            ds = _get_versioned_dataset(filesystem, uri, version)
+            version = get_version_asof(ds, asof)
+
+    return _get_versioned_dataset(filesystem, uri, version)
+
+
+def _is_plain_dataset(filesystem: pa.fs.FileSystem, uri: str):
+    manifest = os.path.join(uri, "_latest.manifest")
+    return filesystem.get_file_info(manifest).type == pa.fs.FileType.NotFound
+
+
+def _get_versioned_dataset(filesystem: pa.fs.FileSystem,
+                           uri: str,
+                           version: Optional[int] = None):
     # Read the versioned dataset layout.
     has_version = True
     if version is None:

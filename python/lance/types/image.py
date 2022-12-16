@@ -73,6 +73,7 @@ class ImageUriType(ImageType):
 
     def to_pandas_dtype(self):
         from lance.types.pandas.image import ImageUriDtype
+
         return ImageUriDtype()
 
 
@@ -273,7 +274,7 @@ class ImageUri(Image):
     def __eq__(self, other):
         return isinstance(other, ImageUri) and self.uri == other.uri
 
-    def __lt__(self, other): # for sorting
+    def __lt__(self, other):  # for sorting
         return isinstance(other, ImageUri) and self.uri < other.uri
 
     def __hash__(self):

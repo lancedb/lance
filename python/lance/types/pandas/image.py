@@ -31,9 +31,9 @@ from lance.types.image import ImageUri
 
 @pd.api.extensions.register_extension_dtype
 class ImageUriDtype(ExtensionDtype):
-    name = 'image[uri]'
+    name = "image[uri]"
     type = Image
-    kind = 'O'
+    kind = "O"
     na_value = pd.NA
 
     @classmethod
@@ -77,6 +77,7 @@ class ImageArray(PandasArray):
 
     def __arrow_array__(self, type=None):
         from lance.types.image import ImageArray as ArrowImageArray
+
         return ArrowImageArray.from_images(self)
 
     def __init__(self, values, copy=False):
@@ -96,21 +97,23 @@ class ImageArray(PandasArray):
         if isinstance(scalars, BaseMaskedArray):
             # avoid costly conversion to object dtype
             values = scalars._data
-            values = pd._libs.lib.ensure_string_array(values, copy=copy, convert_na_value=False)
+            values = pd._libs.lib.ensure_string_array(
+                values, copy=copy, convert_na_value=False
+            )
             values[scalars._mask] = pd.NA
         else:
             # convert non-na-likes to str, and nan-likes to StringDtype().na_value
             scalars = [_convert_value(x) for x in scalars]
-            values = pd._libs.lib.ensure_string_array(scalars, na_value=pd.NA, copy=copy)
+            values = pd._libs.lib.ensure_string_array(
+                scalars, na_value=pd.NA, copy=copy
+            )
 
         # Manually creating new array avoids the validation step in the __init__, so is
         # faster. Refactor need for validation?
         return cls(values, copy=copy)
 
     @classmethod
-    def _from_sequence_of_strings(
-        cls, strings, *, dtype=None, copy=False
-    ):
+    def _from_sequence_of_strings(cls, strings, *, dtype=None, copy=False):
         return cls._from_sequence(strings, dtype=dtype, copy=copy)
 
     def _putmask(self, mask, value) -> None:
@@ -166,8 +169,7 @@ class ImageArray(PandasArray):
 
     @staticmethod
     def _is_scalar_value(value):
-        return (pd.core.dtypes.api.is_scalar(value) or
-                isinstance(value, Image))
+        return pd.core.dtypes.api.is_scalar(value) or isinstance(value, Image)
 
     def __getitem__(self, key):
         if pd.core.dtypes.api.is_integer(key):
@@ -264,16 +266,14 @@ class ImageArray(PandasArray):
 
     _arith_method = _cmp_method
 
-    def take(self, indices, allow_fill=False,
-             fill_value=None, axis=0):
+    def take(self, indices, allow_fill=False, fill_value=None, axis=0):
         if allow_fill:
             fill_value = _convert_value(fill_value)
-        return super().take(indices, allow_fill=allow_fill,
-                            fill_value=fill_value, axis=axis)
+        return super().take(
+            indices, allow_fill=allow_fill, fill_value=fill_value, axis=axis
+        )
 
-    def _reduce(
-        self, name, *, skipna=True, axis=0, **kwargs
-    ):
+    def _reduce(self, name, *, skipna=True, axis=0, **kwargs):
         if name in ["min", "max"]:
             return getattr(self, name)(skipna=skipna, axis=axis)
 
