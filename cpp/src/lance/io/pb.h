@@ -43,11 +43,11 @@ template <ProtoMessage P>
 ::arrow::Result<int64_t> WriteProto(const std::shared_ptr<::arrow::io::OutputStream>& sink,
                                     const google::protobuf::Message& pb);
 
-/// Convert a Protobuf Timestamp to Chrono time point.
+/// Convert a Protobuf Timestamp to Chrono time point, in microseconds resolution.
 std::chrono::time_point<std::chrono::system_clock> FromProto(
     const google::protobuf::Timestamp& proto);
 
-/// Convert chrono time_point to protobuf Timestamp
+/// Convert chrono time_point to protobuf Timestamp, in microseconds resolution.
 google::protobuf::Timestamp ToProto(const std::chrono::time_point<std::chrono::system_clock>& ts);
 
 }  // namespace lance::io
