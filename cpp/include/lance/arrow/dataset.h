@@ -44,7 +44,7 @@ class UpdaterBuilder;
 class DatasetVersion {
  public:
   using VersionNumberType = uint64_t;
-  using MetadataMap = std::unordered_map<std::string, std::string>;
+  using KeyValueMap = std::unordered_map<std::string, std::string>;
 
   DatasetVersion() = default;
 
@@ -66,10 +66,10 @@ class DatasetVersion {
   std::time_t timet_timestamp() const;
 
   /// Key-value metadata of this version.
-  const MetadataMap& metadata() const;
+  const KeyValueMap& metadata() const;
 
   /// Set metadata of this version.
-  void SetMetadata(MetadataMap metadata);
+  void SetMetadata(KeyValueMap metadata);
 
   /// Get the tag of this version.
   const std::string& tag() const;
@@ -84,7 +84,7 @@ class DatasetVersion {
   std::chrono::time_point<std::chrono::system_clock> timestamp_;
 
   /// Key Value metadata.
-  MetadataMap metadata_ = {};
+  KeyValueMap metadata_ = {};
 
   /// Version tag
   std::string tag_;

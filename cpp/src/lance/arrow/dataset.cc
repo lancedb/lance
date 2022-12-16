@@ -148,9 +148,9 @@ std::time_t DatasetVersion::timet_timestamp() const {
   return std::chrono::system_clock::to_time_t(timestamp_);
 }
 
-const DatasetVersion::MetadataMap& DatasetVersion::metadata() const { return metadata_; }
+const DatasetVersion::KeyValueMap& DatasetVersion::metadata() const { return metadata_; }
 
-void DatasetVersion::SetMetadata(MetadataMap metadata) { metadata_ = std::move(metadata); }
+void DatasetVersion::SetMetadata(KeyValueMap metadata) { metadata_ = std::move(metadata); }
 
 const std::string& DatasetVersion::tag() const { return tag_; }
 
