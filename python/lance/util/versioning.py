@@ -22,6 +22,8 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
@@ -59,3 +61,23 @@ def get_version_asof(ds: FileSystemDataset, ts: [datetime, pd.Timestamp, str]) -
         if v["timestamp"] <= ts:
             return v["version"]
     raise ValueError(f"{ts} is earlier than the first version of this dataset")
+
+
+def compare(uri: [Path, str],
+            metric_func: Callable[[FileSystemDataset], pd.DataFrame],
+            versions: list = None) \
+        -> pd.DataFrame:
+    """
+    Compare metrics across versions of a dataset
+    """
+    import lance
+    if versions is None:
+        versions = lance.dataset(uri).versions()
+    results = []
+    for v in versions:
+        if isinstance(v, dict):
+            v = v["version"]
+        vdf = metric_func(lance.dataset(uri, version=v))
+        vdf["version"] = v
+        results.append(vdf)
+    return pd.concat(results)

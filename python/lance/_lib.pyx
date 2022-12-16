@@ -263,6 +263,10 @@ cdef class FileSystemDataset(Dataset):
         Dataset.init(self, sp)
         self.lance_dataset = <CLanceDataset *> sp.get()
 
+    @property
+    def uri(self) -> str:
+        return self.lance_dataset.uri().decode("UTF-8")
+
     @staticmethod
     cdef wrap(const shared_ptr[CDataset]& sp):
         cdef FileSystemDataset ds = FileSystemDataset.__new__(FileSystemDataset)
