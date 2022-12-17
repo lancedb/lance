@@ -227,7 +227,7 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
                 optional[uint64_t] version,
         )
 
-        CDatasetVersion version() const;
+        CResult[CDatasetVersion] version() const;
 
         CResult[CDatasetVersion] latest_version() const;
 
@@ -289,7 +289,7 @@ cdef class FileSystemDataset(Dataset):
         """Get the current version of the dataset."""
         cdef:
             CDatasetVersion c_version
-        c_version = self.lance_dataset.version()
+        c_version = GetResultValue(self.lance_dataset.version())
         return _dataset_version_to_json(c_version)
 
     def latest_version(self) -> Dict:
