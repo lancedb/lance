@@ -18,7 +18,14 @@ import pytest
 import pytz
 
 import lance
-from lance.util.versioning import get_version_asof, compute_metric
+from lance.util.versioning import (
+    ColumnDiff,
+    LanceDiff,
+    RowDiff,
+    compute_metric,
+    diff,
+    get_version_asof,
+)
 
 
 def test_get_version_asof(tmp_path):
@@ -57,13 +64,42 @@ def _get_test_timestamps(naive):
 
 
 def test_compute_metric(tmp_path):
-    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
     base_dir = tmp_path / "test"
-    lance.write_dataset(table1, base_dir)
-    table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
-    lance.write_dataset(table2, base_dir, mode="append")
+    _create_dataset(base_dir)
 
     def func(dataset):
         return dataset.to_table().to_pandas().max().to_frame().T
+
     metrics = compute_metric(base_dir, func)
     assert "version" in metrics
+
+
+def _create_dataset(base_dir):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    lance.write_dataset(table1, base_dir)
+    table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
+    lance.write_dataset(table2, base_dir, mode="append")
+    table3 = pa.Table.from_pylist([{"a": 100, "c": 100, "d": 200}])
+    lance.dataset(base_dir).merge(table3, left_on="a", right_on="a")
+
+
+def test_diff(tmp_path):
+    base_dir = tmp_path / "test"
+    _create_dataset(base_dir)
+
+    d = diff(base_dir, 1, 2)
+    assert isinstance(d, LanceDiff)
+
+    rows = d.rows_added(key="a")
+    assert isinstance(rows, RowDiff)
+    assert rows.count_rows == 1
+    tbl = rows.head()
+    assert isinstance(tbl, pa.Table)
+    assert len(tbl) == 1
+
+    cols = d.columns_added()
+    assert isinstance(cols, ColumnDiff)
+    assert len(cols.schema) == 2
+    tbl = cols.head()
+    assert isinstance(tbl, pa.Table)
+    assert len(tbl) == 2

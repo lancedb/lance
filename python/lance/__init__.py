@@ -95,9 +95,9 @@ def _is_plain_dataset(filesystem: pa.fs.FileSystem, uri: str):
     return filesystem.get_file_info(manifest).type == pa.fs.FileType.NotFound
 
 
-def _get_versioned_dataset(filesystem: pa.fs.FileSystem,
-                           uri: str,
-                           version: Optional[int] = None):
+def _get_versioned_dataset(
+    filesystem: pa.fs.FileSystem, uri: str, version: Optional[int] = None
+):
     # Read the versioned dataset layout.
     has_version = True
     if version is None:
