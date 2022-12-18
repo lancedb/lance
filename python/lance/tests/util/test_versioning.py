@@ -18,7 +18,7 @@ import pytest
 import pytz
 
 import lance
-from lance.util.versioning import get_version_asof
+from lance.util.versioning import get_version_asof, compute_metric
 
 
 def test_get_version_asof(tmp_path):
@@ -54,3 +54,16 @@ def _get_test_timestamps(naive):
         naive.astimezone(timezone.utc),
         naive.astimezone(pytz.timezone("America/Los_Angeles")),
     ]
+
+
+def test_compute_metric(tmp_path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+    table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
+    lance.write_dataset(table2, base_dir, mode="append")
+
+    def func(dataset):
+        return dataset.to_table().to_pandas().max().to_frame().T
+    metrics = compute_metric(base_dir, func)
+    assert "version" in metrics
