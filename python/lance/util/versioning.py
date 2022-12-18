@@ -128,7 +128,7 @@ class LanceDiff:
         """
         v2_fields = _flat_schema(self.v2.schema)
         v1_fields = set([f.name for f in _flat_schema(self.v1.schema)])
-        new_fields = [f for f in v2_fields if f not in v1_fields]
+        new_fields = [f for f in v2_fields if f.name not in v1_fields]
         return ColumnDiff(self.v2, new_fields)
 
 
