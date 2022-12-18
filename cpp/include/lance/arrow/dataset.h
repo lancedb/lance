@@ -131,6 +131,10 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   static ::arrow::Result<std::shared_ptr<LanceDataset>> Make(
       const std::string& uri, std::optional<uint64_t> version = std::nullopt);
 
+  /// Create a new LanceDataset at a given version
+  ::arrow::Result<std::shared_ptr<LanceDataset>> Checkout(
+      std::optional<uint64_t> version = std::nullopt) const;
+
   /// Get all the dataset versions.
   ::arrow::Result<std::vector<DatasetVersion>> versions() const;
 

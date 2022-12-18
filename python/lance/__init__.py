@@ -15,13 +15,14 @@
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Callable
 
 import pandas
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs
+from pyarrow._dataset import Dataset
 
 from . import version
 
@@ -35,9 +36,9 @@ from lance.lib import (
 )
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__"]
+__all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__", "diff", "compute_metric"]
 
-from .util.versioning import get_version_asof
+from .util.versioning import get_version_asof, LanceDiff, compute_metric
 
 register_extension_types()
 
@@ -88,6 +89,33 @@ def dataset(
             version = get_version_asof(ds, asof)
 
     return _get_versioned_dataset(filesystem, uri, version)
+
+
+def diff(dataset: FileSystemDataset, v1: int, v2: int = None) -> LanceDiff:
+    """
+    Get the difference from v1 to v2 of this dataset
+
+    Parameters
+    ----------
+    dataset: FileSystemDataset
+        The dataset we want to get the diff for
+    v1: int
+        Start version. If negative then it is assumed to be reverse from latest.
+        So -1 would mean the second to the latest version
+    v2: int, default None
+        End version. If not specified, use the current version in the given
+        dataset
+    """
+    if v1 < 0:
+        v1 = dataset.versions()[v1]["version"]
+    if v2 is None:
+        v2 = dataset.version["version"]
+    if v2 < 0:
+        v2 = dataset.versions()[v2]["version"]
+    if v1 > v2:
+        raise ValueError("v2 must not be less than v1")
+    return LanceDiff(dataset.checkout(v1),
+                     dataset if v2 is None else dataset.checkout(v2))
 
 
 def _is_plain_dataset(filesystem: pa.fs.FileSystem, uri: str):

@@ -327,6 +327,10 @@ LanceDataset::~LanceDataset() {}
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
 }
 
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Checkout(std::optional<uint64_t> version) const {
+  return LanceDataset::Make(impl_->fs, impl_->base_uri, version);
+}
+
 ::arrow::Result<std::vector<DatasetVersion>> LanceDataset::versions() const {
   std::vector<DatasetVersion> versions;
   ::arrow::fs::FileSelector selector;

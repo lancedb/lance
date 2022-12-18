@@ -23,10 +23,10 @@
 #  limitations under the License.
 from __future__ import annotations
 
+import functools
 import itertools
 from datetime import datetime, timezone
 from functools import cached_property
-from pathlib import Path
 from typing import Callable, Union
 
 import duckdb
@@ -70,26 +70,37 @@ def get_version_asof(ds: FileSystemDataset, ts: [datetime, pd.Timestamp, str]) -
 
 
 def compute_metric(
-    uri: [Path, str],
+    ds: FileSystemDataset,
     metric_func: Callable[[FileSystemDataset], pd.DataFrame],
     versions: list = None,
     with_version: Union[bool, str] = True,
 ) -> pd.DataFrame:
     """
     Compare metrics across versions of a dataset
-    """
-    import lance
 
+    Parameters
+    ----------
+    ds: FileSystemDataset
+        The base dataset we want to compute metrics across versions for.
+    metric_func: Callable[[FileSystemDataset], pd.DataFrame]
+        Function to compute metrics DataFrame from a given dataset version.
+    versions: list, default None
+        All versions if not specified.
+    with_version: bool or str, default True
+        If bool then controls whether to add the version as auxiliary output.
+        If str then assumed to be the name of the auxiliary output column.
+    """
     if versions is None:
-        versions = lance.dataset(uri).versions()
+        versions = ds.versions()
+    vcol_name = "version"
+    if isinstance(with_version, str):
+        vcol_name = with_version
+
     results = []
     for v in versions:
         if isinstance(v, dict):
             v = v["version"]
-        vdf = metric_func(lance.dataset(uri, version=v))
-        vcol_name = "version"
-        if isinstance(with_version, str):
-            vcol_name = with_version
+        vdf = metric_func(ds.checkout(v))
         if vcol_name in vdf:
             raise ValueError(f"{vcol_name} already in output df")
         vdf[vcol_name] = v
@@ -97,10 +108,13 @@ def compute_metric(
     return pd.concat(results)
 
 
-def diff(uri, v1: int, v2: int) -> LanceDiff:
+def _compute_metric(version, uri, func, vcol_name):
     import lance
-
-    return LanceDiff(lance.dataset(uri, version=v1), lance.dataset(uri, version=v2))
+    vdf = func(lance.dataset(uri, version=version))
+    if vcol_name in vdf:
+        raise ValueError(f"{vcol_name} already in output df")
+    vdf[vcol_name] = version
+    return vdf
 
 
 class LanceDiff:
@@ -126,7 +140,7 @@ class LanceDiff:
         """
         v2_fields = _flat_schema(self.v2.schema)
         v1_fields = set([f.name for f in _flat_schema(self.v1.schema)])
-        new_fields = [f for f in v2_fields if f not in v1_fields]
+        new_fields = [f for f in v2_fields if f.name not in v1_fields]
         return ColumnDiff(self.v2, new_fields)
 
 
@@ -179,7 +193,7 @@ class RowDiff:
         v1 = self.ds_start
         v2 = self.ds_end
         if columns is None:
-            columns = ["*"]
+            columns = ["v2.*"]
         qry = self._query(columns, limit=n)
         return duckdb.query(qry).to_arrow_table()
 

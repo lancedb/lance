@@ -4,9 +4,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Union
 
+import pandas as pd
 import pyarrow
 
 from cython.operator cimport dereference as deref
+from lance.util.versioning import LanceDiff, compute_metric
 from libc.stdint cimport int64_t, uint64_t
 from libc.time cimport time_t
 from libcpp cimport bool
@@ -227,6 +229,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
                 optional[uint64_t] version,
         )
 
+        CResult[shared_ptr[CLanceDataset]] Checkout(optional[uint64_t] version)
+
         CDatasetVersion version() const;
 
         CResult[CDatasetVersion] latest_version() const;
@@ -262,6 +266,23 @@ cdef class FileSystemDataset(Dataset):
     cdef void init(self, const shared_ptr[CDataset]& sp):
         Dataset.init(self, sp)
         self.lance_dataset = <CLanceDataset *> sp.get()
+
+    def checkout(self, version: Optional[int]) -> FileSystemDataset:
+        if version is None:
+            version = 0
+        return self._checkout(version)
+
+    def _checkout(self, uint64_t version) -> FileSystemDataset:
+        cdef:
+            shared_ptr[CLanceDataset] c_dataset
+            shared_ptr[CDataset] c_base_dataset
+            optional[uint64_t] c_version
+
+        c_version = optional[uint64_t](version)
+
+        c_dataset = GetResultValue(self.lance_dataset.Checkout(c_version))
+        c_base_dataset = static_pointer_cast[CDataset, CLanceDataset](c_dataset)
+        return FileSystemDataset.wrap(move(c_base_dataset))
 
     @property
     def uri(self) -> str:
@@ -363,6 +384,7 @@ cdef class FileSystemDataset(Dataset):
         )
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
+
 def _lance_dataset_write(
     Dataset data,
     object base_dir not None,
@@ -441,3 +463,4 @@ def _lance_dataset_make(
     c_dataset = GetResultValue(CLanceDataset.Make(c_filesystem, base_dir, c_version))
     c_base_dataset = static_pointer_cast[CDataset, CLanceDataset](c_dataset)
     return FileSystemDataset.wrap(move(c_base_dataset))
+
