@@ -384,33 +384,6 @@ cdef class FileSystemDataset(Dataset):
         )
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
-    def diff(self, v1: int, v2: int) -> LanceDiff:
-        """
-        Get the difference from v1 to v2 of this dataset
-
-        Parameters
-        ----------
-        v1: int
-            Start version
-        v2: int
-            End version
-        """
-        return LanceDiff(self.checkout(v1), self.checkout(v2))
-
-    def compute_metric(self, metric_func: Callable[[Dataset], pd.DataFrame],
-                       versions: list[int] = None) -> pd.DataFrame:
-        """
-        Compute a metric across versions for this dataset
-
-        Parameters
-        ----------
-        metric_func: FileSystemDataset -> pd.DataFrame
-            Function to compute some arbitrary metric for a given version
-        versions: list of int, default None
-            Compute for specified versions. Compute for all versions if None.
-        """
-        return compute_metric(self, metric_func, versions=versions)
-
 
 def _lance_dataset_write(
     Dataset data,

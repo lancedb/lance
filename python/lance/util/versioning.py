@@ -77,6 +77,18 @@ def compute_metric(
 ) -> pd.DataFrame:
     """
     Compare metrics across versions of a dataset
+
+    Parameters
+    ----------
+    ds: FileSystemDataset
+        The base dataset we want to compute metrics across versions for.
+    metric_func: Callable[[FileSystemDataset], pd.DataFrame]
+        Function to compute metrics DataFrame from a given dataset version.
+    versions: list, default None
+        All versions if not specified.
+    with_version: bool or str, default True
+        If bool then controls whether to add the version as auxiliary output.
+        If str then assumed to be the name of the auxiliary output column.
     """
     if versions is None:
         versions = ds.versions()
