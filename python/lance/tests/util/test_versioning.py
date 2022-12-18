@@ -23,7 +23,6 @@ from lance.util.versioning import (
     LanceDiff,
     RowDiff,
     compute_metric,
-    diff,
     get_version_asof,
 )
 
@@ -65,12 +64,12 @@ def _get_test_timestamps(naive):
 
 def test_compute_metric(tmp_path):
     base_dir = tmp_path / "test"
-    _create_dataset(base_dir)
+    ds = _create_dataset(base_dir)
 
     def func(dataset):
         return dataset.to_table().to_pandas().max().to_frame().T
 
-    metrics = compute_metric(base_dir, func)
+    metrics = ds.compute_metric(func)
     assert "version" in metrics
 
 
@@ -80,14 +79,14 @@ def _create_dataset(base_dir):
     table2 = pa.Table.from_pylist([{"a": 100, "b": 200}])
     lance.write_dataset(table2, base_dir, mode="append")
     table3 = pa.Table.from_pylist([{"a": 100, "c": 100, "d": 200}])
-    lance.dataset(base_dir).merge(table3, left_on="a", right_on="a")
+    return lance.dataset(base_dir).merge(table3, left_on="a", right_on="a")
 
 
 def test_diff(tmp_path):
     base_dir = tmp_path / "test"
-    _create_dataset(base_dir)
+    ds = _create_dataset(base_dir)
 
-    d = diff(base_dir, 1, 2)
+    d = ds.diff(1, 2)
     assert isinstance(d, LanceDiff)
 
     rows = d.rows_added(key="a")
