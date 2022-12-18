@@ -96,7 +96,7 @@ def test_diff(tmp_path):
     assert isinstance(tbl, pa.Table)
     assert len(tbl) == 1
 
-    cols = d.columns_added()
+    cols = ds.diff(2, 3).columns_added()
     assert isinstance(cols, ColumnDiff)
     assert len(cols.schema) == 2
     tbl = cols.head()
