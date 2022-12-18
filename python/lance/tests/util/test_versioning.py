@@ -18,7 +18,14 @@ import pytest
 import pytz
 
 import lance
-from lance.util.versioning import get_version_asof, compute_metric, diff, LanceDiff, RowDiff, ColumnDiff
+from lance.util.versioning import (
+    ColumnDiff,
+    LanceDiff,
+    RowDiff,
+    compute_metric,
+    diff,
+    get_version_asof,
+)
 
 
 def test_get_version_asof(tmp_path):
@@ -62,6 +69,7 @@ def test_compute_metric(tmp_path):
 
     def func(dataset):
         return dataset.to_table().to_pandas().max().to_frame().T
+
     metrics = compute_metric(base_dir, func)
     assert "version" in metrics
 

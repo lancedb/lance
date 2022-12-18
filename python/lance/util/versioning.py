@@ -69,15 +69,17 @@ def get_version_asof(ds: FileSystemDataset, ts: [datetime, pd.Timestamp, str]) -
     raise ValueError(f"{ts} is earlier than the first version of this dataset")
 
 
-def compute_metric(uri: [Path, str],
-                   metric_func: Callable[[FileSystemDataset], pd.DataFrame],
-                   versions: list = None,
-                   with_version: Union[bool, str] = True) \
-        -> pd.DataFrame:
+def compute_metric(
+    uri: [Path, str],
+    metric_func: Callable[[FileSystemDataset], pd.DataFrame],
+    versions: list = None,
+    with_version: Union[bool, str] = True,
+) -> pd.DataFrame:
     """
     Compare metrics across versions of a dataset
     """
     import lance
+
     if versions is None:
         versions = lance.dataset(uri).versions()
     results = []
@@ -97,20 +99,21 @@ def compute_metric(uri: [Path, str],
 
 def diff(uri, v1: int, v2: int) -> LanceDiff:
     import lance
-    return LanceDiff(lance.dataset(uri, version=v1),
-                     lance.dataset(uri, version=v2))
+
+    return LanceDiff(lance.dataset(uri, version=v1), lance.dataset(uri, version=v2))
 
 
 class LanceDiff:
-
     def __init__(self, v1: FileSystemDataset, v2: FileSystemDataset):
         self.v1 = v1
         self.v2 = v2
 
     def __repr__(self):
-        return ("LanceDiff\n"
-                f"  Added: {self.rows_added().count_rows} rows, "
-                f"{len(self.columns_added().schema)} columns")
+        return (
+            "LanceDiff\n"
+            f"  Added: {self.rows_added().count_rows} rows, "
+            f"{len(self.columns_added().schema)} columns"
+        )
 
     def rows_added(self, key: str = None) -> RowDiff:
         return RowDiff(self.v1, self.v2, key)
@@ -132,21 +135,23 @@ class RowDiff:
     Row diff between two dataset versions using the specified join keys
     """
 
-    def __init__(self,
-                 ds_start: FileSystemDataset,
-                 ds_end: FileSystemDataset,
-                 key: [str, list[str]]):
+    def __init__(
+        self,
+        ds_start: FileSystemDataset,
+        ds_end: FileSystemDataset,
+        key: [str, list[str]],
+    ):
         self.ds_start = ds_start
         self.ds_end = ds_end
         self.key = [key] if isinstance(key, str) else key
 
-    def _query(self, projection: list[str],
-               offset: int = 0,
-               limit: int = 0) -> str:
+    def _query(self, projection: list[str], offset: int = 0, limit: int = 0) -> str:
         join = " AND ".join([f"v2.{k}=v1.{k}" for k in self.key])
-        query = (f"SELECT {','.join(projection)} FROM v2 "
-                 f"LEFT JOIN v1 ON {join} "
-                 f"WHERE v1.{self.key[0]} IS NULL")
+        query = (
+            f"SELECT {','.join(projection)} FROM v2 "
+            f"LEFT JOIN v1 ON {join} "
+            f"WHERE v1.{self.key[0]} IS NULL"
+        )
         if offset > 0:
             query += f" OFFSET {offset}"
         if limit > 0:
@@ -180,7 +185,6 @@ class RowDiff:
 
 
 class ColumnDiff:
-
     def __init__(self, ds: FileSystemDataset, fields: list[pa.Field]):
         self.dataset = ds
         self.fields = fields
