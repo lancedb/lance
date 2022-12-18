@@ -18,7 +18,7 @@ import pytest
 import pytz
 
 import lance
-from lance.util.versioning import get_version_asof, compare
+from lance.util.versioning import get_version_asof, compute_metric
 
 
 def test_get_version_asof(tmp_path):
@@ -56,7 +56,7 @@ def _get_test_timestamps(naive):
     ]
 
 
-def test_compare(tmp_path):
+def test_compute_metric(tmp_path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}])
     base_dir = tmp_path / "test"
     lance.write_dataset(table1, base_dir)
@@ -65,5 +65,5 @@ def test_compare(tmp_path):
 
     def func(dataset):
         return dataset.to_table().to_pandas().max().to_frame().T
-    metrics = compare(base_dir, func)
+    metrics = compute_metric(base_dir, func)
     assert "version" in metrics
