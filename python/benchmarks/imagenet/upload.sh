@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Upload COCO dataset to S3
+# Upload Imagenet dataset to S3
+#
+# ./upload.sh [NUM_RECORDS_PER_SPLIT]
 
 set -e
 
@@ -26,7 +28,7 @@ rm -rf ${OUTPUT_PATH}
 rm -rf ${TARBALL}
 
 python ../../lance/data/convert/imagenet.py \
-  --limit 20000 ${OUTPUT_PATH}
+  --limit ${LIMIT} ${OUTPUT_PATH}
 
 pushd ${OUTPUT_PATH}/../
 tar -cvf ${TARBALL} ${OUTPUT_PATH}
