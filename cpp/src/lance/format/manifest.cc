@@ -43,7 +43,9 @@ Manifest::Manifest(const Manifest& other) noexcept
     : schema_(other.schema_), version_(other.version_), fragments_(other.fragments()) {}
 
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
-    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
+    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())),
+      version_(pb.version()),
+      version_aux_data_position_(pb.version_aux_data()) {
   for (auto& pb_fragment : pb.fragments()) {
     fragments_.emplace_back(std::make_shared<DataFragment>(pb_fragment));
   }
@@ -69,6 +71,7 @@ pb::Manifest Manifest::ToProto() const {
   }
   pb.mutable_metadata()->insert(schema_->metadata().begin(), schema_->metadata().end());
   pb.set_version(version_);
+  pb.set_version_aux_data(version_aux_data_position());
 
   for (const auto& fragment : fragments_) {
     auto pb_fragment = pb.add_fragments();
@@ -85,9 +88,7 @@ uint64_t Manifest::version_aux_data_position() const {
   return version_aux_data_position_.value_or(0);
 }
 
-void Manifest::SetVersionAuxDataPosition(uint64_t pos) {
-  version_aux_data_position_ = pos;
-}
+void Manifest::SetVersionAuxDataPosition(uint64_t pos) { version_aux_data_position_ = pos; }
 
 const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
