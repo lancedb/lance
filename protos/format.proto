@@ -32,13 +32,12 @@ Format:
 |       Encoded Column M, Chunk N - 1    |
 |       Encoded Column M, Chunk N        |
 |       Indices ...                      |
-|       Chunk Position (M x N x 8)        |
-|         Manifest                       |
+|       Chunk Position (M x N x 8)       |
+|         Manifest (Optional)            |
 |         Metadata                       |
-|        <metadata position>             |
-| MAJOR_VERSION | MINOR_VERSION | "NFFT" |
+| i64: metadata position                 |
+| MAJOR_VERSION | MINOR_VERSION | "LANC" |
 +----------------------------------------+
-
  */
 
 // Manifest is a global section shared between all the files.
@@ -46,20 +45,32 @@ message Manifest {
   // All fields of the dataset, including the nested fields.
   repeated Field fields = 1;
 
-  // Dataset metadata.
-  map<string, bytes> metadata = 2;
-
-  // Format / Specification version
-  int32 format_version = 3;
-
-  // Snapshot version
-  uint64 version = 4;
-
   // Fragments of the dataset.
-  repeated DataFragment fragments = 6;
+  repeated DataFragment fragments = 2;
 
-  // Timestamp, UTC timezone
-  google.protobuf.Timestamp timestamp = 7;
+  // Snapshot version number.
+  uint64 version = 3;
+
+  // The file position of the version auxiliary data.
+  //  * It is not inheritable between versions.
+  //  * It is not loaded by default during query.
+  uint64 version_aux_data = 4;
+
+  // Schema metadata.
+  map<string, bytes> metadata = 5;
+}
+
+// Auxiliary Data attached to a version.
+// Only load on-demand.
+message VersionAuxData {
+  // Version creation Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 1;
+
+  // Optional version tag
+  string tag = 2;
+
+  // key-value metadata.
+  map<string, bytes> metadata = 3;
 }
 
 // Data fragment. A fragment is a set of files which represent the

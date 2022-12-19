@@ -14,6 +14,8 @@ from libc.time cimport time_t
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
+from libcpp.unordered_map cimport unordered_map
+from libcpp.utility cimport pair
 
 from pyarrow import Table
 
@@ -169,6 +171,8 @@ cdef extern from "lance/arrow/updater.h" namespace "lance::arrow" nogil:
     cdef cppclass CUpdaterBuilder "::lance::arrow::UpdaterBuilder":
         void Project(vector[string] columns);
 
+        void Metadata(unordered_map[string, string] metadata);
+
         CResult[shared_ptr[CUpdater]] Finish();
 
 
@@ -210,6 +214,8 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 
         time_t timet_timestamp() const;
 
+        const unordered_map[string, string] metadata() const;
+
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         enum WriteMode "WriteMode":
             CREATE "::lance::arrow::LanceDataset::WriteMode::kCreate"
@@ -229,9 +235,9 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
                 optional[uint64_t] version,
         )
 
-        CResult[shared_ptr[CLanceDataset]] Checkout(optional[uint64_t] version)
+        CResult[CDatasetVersion] version() const;
 
-        CDatasetVersion version() const;
+        CResult[shared_ptr[CLanceDataset]] Checkout(optional[uint64_t] version)
 
         CResult[CDatasetVersion] latest_version() const;
 
@@ -240,18 +246,30 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
         CResult[shared_ptr[CUpdaterBuilder]] NewUpdate(const shared_ptr[CField]& field) const;
 
         CResult[shared_ptr[CLanceDataset]] AddColumn(
-                const shared_ptr[CField]& field, CExpression expression);
+            const shared_ptr[CField]& field,
+            CExpression expression,
+            const unordered_map[string, string]& metadata,
+        );
 
         CResult[shared_ptr[CLanceDataset]] Merge(
-                const shared_ptr[CTable]& table, const string& left_on, const string& right_on
+            const shared_ptr[CTable]& table,
+            const string& left_on,
+            const string& right_on,
+            const unordered_map[string, string]& metadata,
         )
 
         const string& uri() const;
 
 cdef _dataset_version_to_json(CDatasetVersion cdv):
+    kv_dict = {}
+    # cdef  pair[string, string]
+    for key in list(cdv.metadata()):
+        v = cdv.metadata().at(key)
+        kv_dict[key.decode()] = v.decode()
     return {
         "version": cdv.version(),
         "timestamp": datetime.fromtimestamp(cdv.timet_timestamp(), tz=timezone.utc),
+        "metadata": kv_dict,
     }
 
 cdef class FileSystemDataset(Dataset):
@@ -314,7 +332,7 @@ cdef class FileSystemDataset(Dataset):
         """Get the current version of the dataset."""
         cdef:
             CDatasetVersion c_version
-        c_version = self.lance_dataset.version()
+        c_version = GetResultValue(self.lance_dataset.version())
         return _dataset_version_to_json(c_version)
 
     def latest_version(self) -> Dict:
@@ -322,10 +340,20 @@ cdef class FileSystemDataset(Dataset):
         c_version = GetResultValue(self.lance_dataset.latest_version())
         return _dataset_version_to_json(c_version)
 
-    def _append_column_expr(self, field: Field, expression: Expression) -> FileSystemDataset:
+    def _append_column_expr(
+        self,
+        field: Field,
+        expression: Expression,
+        metadata: Optional[Dict[str, str]] = None
+    ) -> FileSystemDataset:
         cdef CExpression c_expression = expression.unwrap()
         cdef shared_ptr[CField] c_field = pyarrow_unwrap_field(field)
-        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumn(c_field, c_expression))
+        cdef unordered_map[string, string] c_kv_map
+        if metadata is not None:
+            for k, v in metadata.items():
+                c_kv_map[tobytes(k)] = tobytes(v)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(
+            self.lance_dataset.AddColumn(c_field, c_expression, c_kv_map))
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
     def append_column(
@@ -333,6 +361,7 @@ cdef class FileSystemDataset(Dataset):
         value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
         field: Optional[Field] = None,
         columns: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> FileSystemDataset:
         """Append a new column.
 
@@ -345,19 +374,26 @@ cdef class FileSystemDataset(Dataset):
             The name and schema of the newly added column.
         columns : list of strs, optional.
             The list of columns to read from the source dataset.
+        metadata : Dict[str, str], optional
+            Optional key-value metadata
         """
         cdef:
             shared_ptr[CUpdater] c_updater
             shared_ptr[CField] c_field
             shared_ptr[CUpdaterBuilder] c_update_builder
+            unordered_map[string, string] c_kv_map
 
         if isinstance(value, Expression):
-            return self._append_column_expr(field, value)
+            return self._append_column_expr(field, value, metadata)
         elif isinstance(value, Callable):
             c_field = pyarrow_unwrap_field(field)
             c_update_builder = GetResultValue(self.lance_dataset.NewUpdate(c_field))
             if columns is not None and len(columns) > 0:
                 c_update_builder.get().Project([tobytes(col) for col in columns])
+            if metadata is not None:
+                for k, v in metadata.items():
+                    c_kv_map[tobytes(k)] = tobytes(v)
+                c_update_builder.get().Metadata(c_kv_map)
             c_updater = GetResultValue(c_update_builder.get().Finish())
             updater = Updater.wrap(c_updater)
             for table in updater:
@@ -367,7 +403,12 @@ cdef class FileSystemDataset(Dataset):
         else:
             raise ValueError(f"Value does not accept type: {type(value)}")
 
-    def merge(self, right: pyarrow.Table, left_on: str, right_on: str) -> FileSystemDataset:
+    def merge(self,
+      right: pyarrow.Table,
+      left_on: str,
+      right_on: str,
+      metadata: Optional[Dict[str, str]] = None,
+    ) -> FileSystemDataset:
         """Merge another table using Left-join
 
         Parameters:
@@ -377,10 +418,16 @@ cdef class FileSystemDataset(Dataset):
             The name of the column in this dataset to be compared during merge.
         right_on : str
             The name of the column in the right table to be compared during merge.
+        metadata : Dict[str, str], optional
+            Optional key-value metadata
         """
         cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(right)
+        cdef unordered_map[string, string] c_kv_map
+        if metadata is not None:
+            for k, v in metadata.items():
+                c_kv_map[tobytes(k)] = tobytes(v)
         cdef shared_ptr[CLanceDataset] dataset = GetResultValue(
-            self.lance_dataset.Merge(c_table, tobytes(left_on), tobytes(right_on))
+            self.lance_dataset.Merge(c_table, tobytes(left_on), tobytes(right_on), c_kv_map)
         )
         return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 

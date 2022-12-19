@@ -27,6 +27,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lance::arrow {
@@ -36,15 +37,24 @@ class UpdaterBuilder;
 
 /// Dataset Version
 ///
+/// Includes:
+///   - version (number)
+///   - timestamp
+///   - key-value metadata, optional
 class DatasetVersion {
  public:
   using VersionNumberType = uint64_t;
+  using KeyValueMap = std::unordered_map<std::string, std::string>;
 
   DatasetVersion() = default;
 
   /// Construct a Dataset version from version number.
-  explicit DatasetVersion(VersionNumberType version,
-                          std::chrono::time_point<std::chrono::system_clock> created);
+  ///
+  /// \param version version number
+  /// \param timestamp dataset version creation time.
+  DatasetVersion(VersionNumberType version,
+                 std::chrono::time_point<std::chrono::system_clock> timestamp =
+                     std::chrono::system_clock::now());
 
   /// Get version number.
   VersionNumberType version() const;
@@ -55,20 +65,29 @@ class DatasetVersion {
   /// time_t representation of timestamp. Used for cython
   std::time_t timet_timestamp() const;
 
-  /// Increase version number
-  DatasetVersion& operator++();
+  /// Key-value metadata of this version.
+  const KeyValueMap& metadata() const;
 
-  /// Increase version number
-  DatasetVersion operator++(int);
+  /// Set metadata of this version.
+  void SetMetadata(KeyValueMap metadata);
 
-  /// Change timestamp to `Now()`.
-  void Touch();
+  /// Get the tag of this version.
+  const std::string& tag() const;
+
+  /// Set a tag for this version.
+  void SetTag(std::string tag);
 
  private:
   VersionNumberType version_ = 0;
 
   /// Dataset creation time, in UTC timezone.
   std::chrono::time_point<std::chrono::system_clock> timestamp_;
+
+  /// Key Value metadata.
+  KeyValueMap metadata_ = {};
+
+  /// Version tag
+  std::string tag_;
 };
 
 /// Lance Dataset, supports versioning and schema evolution.
@@ -95,22 +114,26 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
   /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  /// \param metadata additional metadata attached to the new version of data.
   ///
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                std::shared_ptr<::arrow::dataset::Scanner> scanner,
-                               WriteMode mode = kCreate);
+                               WriteMode mode = kCreate,
+                               const std::unordered_map<std::string, std::string>& metadata = {});
 
   /// Write Arrow dataset to disk.
   ///
   /// \param options Arrow Dataset Write Options.
   /// \param scanner the source dataset to be written.
   /// \param mode the mode to write the data. Default is `WriteMode::kCreate`.
+  /// \param metadata additional metadata attached to the new version of data.
   ///
   /// GH-62. To accommodate Cython lacking of arrow Scanner interface, we directly write
   /// `::arrow::dataset::Dataset`, which is public interface in PyArrow.
   static ::arrow::Status Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
-                               WriteMode mode = kCreate);
+                               WriteMode mode = kCreate,
+                               const std::unordered_map<std::string, std::string>& metadata = {});
 
   /// Load dataset, with a specific version.
   ///
@@ -142,7 +165,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<DatasetVersion> latest_version() const;
 
   /// Returns the version of this dataset.
-  DatasetVersion version() const;
+  ::arrow::Result<DatasetVersion> version() const;
 
   std::string type_name() const override { return "lance"; }
 
@@ -190,13 +213,16 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   /// \param left_on the column in this dataset be compared to.
   /// \param right_on the column in the table to be compared to.
   ///           This column must exist in both side and have the same data type.
+  /// \param metadata additional metadata attached to the new version of data.
   /// \param pool memory pool
+  ///
   /// \return `::arrow::Status::OK` if success.
   ///
   ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
       const std::shared_ptr<::arrow::Table>& right,
       const std::string& left_on,
       const std::string& right_on,
+      const std::unordered_map<std::string, std::string>& metadata = {},
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   /// Merge an in-memory table, both sides must have the same column specified by the "on" name.
@@ -205,6 +231,7 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ::arrow::Result<std::shared_ptr<LanceDataset>> Merge(
       const std::shared_ptr<::arrow::Table>& right,
       const std::string& on,
+      const std::unordered_map<std::string, std::string>& metadata = {},
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
   ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> ReplaceSchema(
@@ -214,11 +241,14 @@ class LanceDataset : public ::arrow::dataset::Dataset {
   ///
   /// \param field the new field.
   /// \param expression the expression to compute the column.
+  /// \param metadata additional metadata attached to the new version of data.
   /// \return a new version of the dataset.
   ///
   /// See `Updater` for details.
   ::arrow::Result<std::shared_ptr<LanceDataset>> AddColumn(
-      const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression);
+      const std::shared_ptr<::arrow::Field>& field,
+      ::arrow::compute::Expression expression,
+      const std::unordered_map<std::string, std::string>& metadata = {});
 
  protected:
   ::arrow::Result<::arrow::dataset::FragmentIterator> GetFragmentsImpl(

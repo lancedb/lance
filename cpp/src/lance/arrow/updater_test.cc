@@ -19,10 +19,12 @@
 #include <arrow/dataset/dataset.h>
 #include <arrow/filesystem/localfs.h>
 #include <arrow/table.h>
+#include <arrow/util/key_value_metadata.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <range/v3/all.hpp>
+#include <unordered_map>
 #include <vector>
 
 #include "lance/arrow/dataset.h"
@@ -35,14 +37,20 @@ using lance::arrow::LanceDataset;
 using lance::arrow::ToArray;
 namespace fs = std::filesystem;
 
-std::shared_ptr<LanceDataset> TestDataset() {
+std::shared_ptr<LanceDataset> TestDataset(
+    std::unordered_map<std::string, std::string> metadata = {}) {
   auto ints = views::iota(0, 100) | to<std::vector<int>>();
   auto ints_arr = ToArray(ints).ValueOrDie();
   auto strs = ints | views::transform([](auto v) { return fmt::format("{}", v); }) |
               to<std::vector<std::string>>;
   auto strs_arr = ToArray(strs).ValueOrDie();
-  auto schema =
-      arrow::schema({arrow::field("ints", arrow::int32()), ::arrow::field("strs", arrow::utf8())});
+
+  std::shared_ptr<arrow::KeyValueMetadata> kv_metadata;
+  if (!metadata.empty()) {
+    kv_metadata = std::make_shared<arrow::KeyValueMetadata>(metadata);
+  }
+  auto schema = arrow::schema(
+      {arrow::field("ints", arrow::int32()), ::arrow::field("strs", arrow::utf8())}, kv_metadata);
   auto table = arrow::Table::Make(schema, {ints_arr, strs_arr});
 
   auto dataset = std::make_shared<::arrow::dataset::InMemoryDataset>(table);
@@ -63,7 +71,7 @@ std::shared_ptr<LanceDataset> TestDataset() {
 
 TEST_CASE("Use updater to update one column") {
   auto lance_dataset = TestDataset();
-  CHECK(lance_dataset->version().version() == 1);
+  CHECK(lance_dataset->version().ValueOrDie().version() == 1);
   auto table = lance_dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
 
   auto updater = lance_dataset->NewUpdate(::arrow::field("values", arrow::utf8()))
@@ -158,7 +166,7 @@ TEST_CASE("Test data file stores the relative path to the data dir") {
   updater->Finish().ValueOrDie();
 
   dataset = LanceDataset::Make(local_fs, fs::path(dataset->uri()).filename().string()).ValueOrDie();
-  CHECK(dataset->version().version() == 2);
+  CHECK(dataset->version().ValueOrDie().version() == 2);
   auto table = dataset->NewScan().ValueOrDie()->Finish().ValueOrDie()->ToTable().ValueOrDie();
   CHECK(table->schema()->num_fields() == 3);
 
@@ -169,4 +177,52 @@ TEST_CASE("Test data file stores the relative path to the data dir") {
       CHECK(data_file.path().find("/") == std::string::npos);
     }
   }
+}
+
+TEST_CASE("Update schema with metadata") {
+  auto dataset = TestDataset({{"k1", "v1"}});
+
+  CHECK(dataset->schema()->metadata()->keys() == std::vector<std::string>({"k1"}));
+  CHECK(dataset->schema()->metadata()->values() == std::vector<std::string>({"v1"}));
+
+  // Do not change metadata
+  auto updater = dataset->NewUpdate(::arrow::field("col1", ::arrow::int32()))
+                     .ValueOrDie()
+                     ->Finish()
+                     .ValueOrDie();
+  while (true) {
+    auto batch = updater->Next().ValueOrDie();
+    if (!batch) {
+      break;
+    }
+    auto output = ::arrow::compute::Add(batch->GetColumnByName("ints"), ::arrow::Datum(2))
+                      .ValueOrDie()
+                      .make_array();
+    CHECK(updater->UpdateBatch(output).ok());
+  }
+  dataset = updater->Finish().ValueOrDie();
+  INFO("Expect the metadata is preserved if not overwrite");
+  CHECK(dataset->version().ValueOrDie().version() == 2);
+  CHECK(dataset->schema()->metadata()->keys() == std::vector<std::string>({"k1"}));
+  CHECK(dataset->schema()->metadata()->values() == std::vector<std::string>({"v1"}));
+
+  auto updater_builder = dataset->NewUpdate(::arrow::field("col", ::arrow::int32())).ValueOrDie();
+  std::unordered_map<std::string, std::string> new_metadata{{"k2", "v2"}, {"k3", "v3"}};
+  updater_builder->Metadata(new_metadata);
+  updater = updater_builder->Finish().ValueOrDie();
+
+  while (true) {
+    auto batch = updater->Next().ValueOrDie();
+    if (!batch) {
+      break;
+    }
+    auto output = ::arrow::compute::Add(batch->GetColumnByName("ints"), ::arrow::Datum(2))
+                      .ValueOrDie()
+                      .make_array();
+    CHECK(updater->UpdateBatch(output).ok());
+  }
+  dataset = updater->Finish().ValueOrDie();
+
+  CHECK(dataset->version().ValueOrDie().version() == 3);
+  CHECK(dataset->version()->metadata() == new_metadata);
 }

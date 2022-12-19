@@ -148,19 +148,13 @@ std::time_t DatasetVersion::timet_timestamp() const {
   return std::chrono::system_clock::to_time_t(timestamp_);
 }
 
-DatasetVersion& DatasetVersion::operator++() {
-  version_++;
-  Touch();
-  return *this;
-}
+const DatasetVersion::KeyValueMap& DatasetVersion::metadata() const { return metadata_; }
 
-DatasetVersion DatasetVersion::operator++(int) {
-  version_++;
-  Touch();
-  return *this;
-}
+void DatasetVersion::SetMetadata(KeyValueMap metadata) { metadata_ = std::move(metadata); }
 
-void DatasetVersion::Touch() { timestamp_ = std::chrono::system_clock::now(); }
+const std::string& DatasetVersion::tag() const { return tag_; }
+
+void DatasetVersion::SetTag(std::string tag) { tag_ = tag; }
 
 //-------------------------
 // LanceDataset::Impl
@@ -174,27 +168,31 @@ namespace {
 
 ::arrow::Status WriteManifest(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
                               const std::string& base_uri,
-                              const std::shared_ptr<format::Manifest>& manifest) {
+                              const std::shared_ptr<format::Manifest>& manifest,
+                              const DatasetVersion& version) {
+  if (manifest->version() != version.version()) {
+    return ::arrow::Status::Invalid(
+        "Manifest and version does not match: ", manifest->version(), " != ", version.version());
+  }
   // Write the manifest version file.
   // It only supports single writer at the moment.
   auto version_dir = (fs::path(base_uri) / kVersionsDir).string();
   ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
   auto manifest_path = GetManifestPath(base_uri, manifest->version());
   {
-    // Keep the serialized time, which is when this particular version of dataset is visible.
-    manifest->Touch();
     ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
+    ARROW_RETURN_NOT_OK(lance::io::WriteManifestWithVersion(out, *manifest, version));
+    // output stream is closed
   }
-  auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
+  auto latest_manifest_path = GetManifestPath(base_uri);
   return fs->CopyFile(manifest_path, latest_manifest_path);
 }
 
 }  // namespace
 
 ::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
-    std::shared_ptr<lance::format::Manifest> new_manifest) const {
-  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest));
+    std::shared_ptr<lance::format::Manifest> new_manifest, const DatasetVersion& version) const {
+  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest, version));
   return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
 }
 
@@ -209,20 +207,23 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     const std::shared_ptr<::arrow::dataset::Dataset>& dataset,
-                                    WriteMode mode) {
+                                    WriteMode mode,
+                                    const std::unordered_map<std::string, std::string>& metadata) {
   ARROW_ASSIGN_OR_RAISE(auto scan_builder, dataset->NewScan());
   ARROW_ASSIGN_OR_RAISE(auto scanner, scan_builder->Finish());
-  return Write(options, std::move(scanner), mode);
+  return Write(options, std::move(scanner), mode, metadata);
 }
 
 ::arrow::Status LanceDataset::Write(const ::arrow::dataset::FileSystemDatasetWriteOptions& options,
                                     std::shared_ptr<::arrow::dataset::Scanner> scanner,
-                                    WriteMode mode) {
+                                    WriteMode mode,
+                                    const std::unordered_map<std::string, std::string>& metadata) {
   const auto& base_dir = options.base_dir;
   const auto data_dir = (fs::path(base_dir) / kDataDir).string();
   auto& fs = options.filesystem;
 
   std::shared_ptr<lance::format::Manifest> manifest;
+  std::unique_ptr<DatasetVersion> version;
   if (mode == kCreate) {
     if (fs->GetFileInfo(base_dir)->type() != ::arrow::fs::FileType::NotFound) {
       return ::arrow::Status::AlreadyExists("Dataset ", base_dir, " already exists");
@@ -246,17 +247,28 @@ LanceDataset::~LanceDataset() {}
       }
 
       // Bump the version
-      manifest = cur_dataset->impl_->manifest->BumpVersion(mode == kOverwrite);
+      ARROW_ASSIGN_OR_RAISE(auto latest, cur_dataset->latest_version());
+      auto new_version_num = latest.version() + 1;
+      version = std::make_unique<DatasetVersion>(new_version_num);
+      std::vector<std::shared_ptr<lance::format::DataFragment>> fragments;
+      if (mode == kAppend) {
+        fragments = existing_manifest->fragments();
+      }
+      manifest = std::make_shared<lance::format::Manifest>(
+          existing_manifest->schema(), fragments, new_version_num);
     }
   }
   if (!manifest) {
-    // This is a completely new dataset, create Manifest with version 1.
     auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
     manifest = std::make_shared<lance::format::Manifest>(schema);
+    version = std::make_unique<DatasetVersion>(1);
   }
+  if (!metadata.empty()) {
+    version->SetMetadata(metadata);
+  }
+
   ARROW_RETURN_NOT_OK(CollectDictionary(manifest->schema(), scanner));
 
-  // Write manifest file
   auto lance_option = options;
   lance_option.base_dir = data_dir;
   lance_option.existing_data_behavior = ::arrow::dataset::ExistingDataBehavior::kOverwriteOrIgnore;
@@ -289,8 +301,11 @@ LanceDataset::~LanceDataset() {}
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
   manifest->AppendFragments(CreateFragments(paths, *manifest->schema()));
+  if (!metadata.empty()) {
+    manifest->schema()->SetMetadata(metadata);
+  }
 
-  return WriteManifest(fs, base_dir, manifest);
+  return WriteManifest(fs, base_dir, manifest, *version);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(const std::string& uri,
@@ -327,6 +342,18 @@ LanceDataset::~LanceDataset() {}
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
 }
 
+namespace {
+
+/// Read version auxiliary data from a manifest file.
+::arrow::Result<DatasetVersion> GetVersion(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+                                           const std::string& manifest_file) {
+  ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(manifest_file));
+  ARROW_ASSIGN_OR_RAISE(auto manifest, lance::io::FileReader::OpenManifest(in));
+  return lance::io::ReadDatasetVersion(in, *manifest);
+}
+
+}  // namespace
+
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Checkout(std::optional<uint64_t> version) const {
   return LanceDataset::Make(impl_->fs, impl_->base_uri, version);
 }
@@ -340,8 +367,8 @@ LanceDataset::~LanceDataset() {}
 
   ARROW_ASSIGN_OR_RAISE(auto file_infos, impl_->fs->GetFileInfo(selector));
   for (const auto& finfo : file_infos) {
-    ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, finfo.path()));
-    versions.emplace_back(manifest->GetDatasetVersion());
+    ARROW_ASSIGN_OR_RAISE(auto version, GetVersion(impl_->fs, finfo.path()));
+    versions.emplace_back(version);
   }
   versions |= actions::sort([](auto& v1, auto& v2) { return v1.version() < v2.version(); });
   return versions;
@@ -349,11 +376,13 @@ LanceDataset::~LanceDataset() {}
 
 ::arrow::Result<DatasetVersion> LanceDataset::latest_version() const {
   auto latest_version_path = GetManifestPath(impl_->base_uri);
-  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(impl_->fs, latest_version_path));
-  return manifest->GetDatasetVersion();
+  return GetVersion(impl_->fs, latest_version_path);
 }
 
-DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
+::arrow::Result<DatasetVersion> LanceDataset::version() const {
+  auto manifest_path = GetManifestPath(impl_->base_uri, impl_->manifest->version());
+  return GetVersion(impl_->fs, manifest_path);
+}
 
 const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 
@@ -368,7 +397,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
-    const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+    const std::shared_ptr<::arrow::Field>& field,
+    ::arrow::compute::Expression expression,
+    const std::unordered_map<std::string, std::string>& metadata) {
   if (!expression.IsScalarExpression()) {
     return ::arrow::Status::Invalid(
         "LanceDataset::AddColumn: expression is not a scalar expression.");
@@ -381,6 +412,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
       columns.emplace_back(arrow::ToColumnName(ref));
     }
     builder->Project(columns);
+  }
+  if (!metadata.empty()) {
+    builder->Metadata(metadata);
   }
   ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
 
@@ -435,14 +469,16 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
     const std::shared_ptr<::arrow::Table>& other,
     const std::string& on,
+    const std::unordered_map<std::string, std::string>& metadata,
     ::arrow::MemoryPool* pool) {
-  return Merge(other, on, on, pool);
+  return Merge(other, on, on, metadata, pool);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
     const std::shared_ptr<::arrow::Table>& right,
     const std::string& left_on,
     const std::string& right_on,
+    const std::unordered_map<std::string, std::string>& metadata,
     ::arrow::MemoryPool* pool) {
   /// Sanity checks
   auto left_column = schema_->GetFieldByName(left_on);
@@ -486,6 +522,9 @@ const std::string& LanceDataset::uri() const { return impl_->base_uri; }
                         table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
   ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
   update_builder->Project({left_on});
+  if (!metadata.empty()) {
+    update_builder->Metadata(metadata);
+  }
   ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
 
   while (true) {

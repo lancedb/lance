@@ -20,6 +20,7 @@
 #include <arrow/record_batch.h>
 #include <arrow/status.h>
 
+#include "lance/arrow/dataset.h"
 #include "lance/arrow/file_lance.h"
 #include "lance/arrow/type.h"
 #include "lance/format/format.h"
@@ -81,16 +82,38 @@ FileWriter::~FileWriter() {}
   return ::arrow::Status::OK();
 }
 
-::arrow::Status FileWriter::WriteManifest(
+namespace {
+
+/// Convert Dataset Version to Protobuf.
+lance::format::pb::VersionAuxData ToProto(const lance::arrow::DatasetVersion& version) {
+  lance::format::pb::VersionAuxData proto;
+  *proto.mutable_timestamp() = io::ToProto(version.timestamp());
+  proto.mutable_metadata()->insert(version.metadata().begin(), version.metadata().end());
+  proto.set_tag(version.tag());
+  return proto;
+}
+
+}  // namespace
+
+::arrow::Status WriteManifestWithVersion(
     const std::shared_ptr<::arrow::io::OutputStream>& destination,
-    const lance::format::Manifest& manifest) {
-  // Write dictionary values first.
+    const lance::format::Manifest& manifest,
+    const lance::arrow::DatasetVersion& version) {
+  // First, write dictionary values.
   auto visitor = format::WriteDictionaryVisitor(destination);
   ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest.schema()));
 
-  auto pb = manifest.ToProto();
-  ARROW_ASSIGN_OR_RAISE(auto offset, WriteProto(destination, pb));
-  return ::lance::io::WriteFooter(destination, offset);
+  // Second, write version auxiliary data.
+  auto aux_data = ToProto(version);
+  ARROW_ASSIGN_OR_RAISE(auto position, WriteProto(destination, aux_data));
+
+  format::Manifest copy(manifest);
+  copy.SetVersionAuxDataPosition(position);
+  // Last, write the manifest itself.
+  auto pb = copy.ToProto();
+  assert(pb.version() == version.version());
+  ARROW_ASSIGN_OR_RAISE(position, WriteProto(destination, pb));
+  return ::lance::io::WriteFooter(destination, position);
 }
 
 ::arrow::Status FileWriter::WriteArray(const std::shared_ptr<format::Field>& field,

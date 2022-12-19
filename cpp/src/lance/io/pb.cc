@@ -16,6 +16,8 @@
 
 #include <google/protobuf/message.h>
 
+#include <chrono>
+
 namespace lance::io {
 
 /// Write the protobuf message and returns the offset the message was written at.
@@ -27,5 +29,18 @@ namespace lance::io {
   ARROW_RETURN_NOT_OK(sink->Write(pb.SerializeAsString()));
   return offset;
 }
+
+std::chrono::time_point<std::chrono::system_clock> FromProto(
+    const google::protobuf::Timestamp& proto) {
+  auto micro_secs = google::protobuf::util::TimeUtil::TimestampToMicroseconds(proto);
+  auto dur = std::chrono::microseconds(micro_secs);
+  return std::chrono::system_clock::time_point{dur};
+}
+
+google::protobuf::Timestamp ToProto(const std::chrono::time_point<std::chrono::system_clock>& ts) {
+  auto micro_secs = std::chrono::time_point_cast<std::chrono::microseconds>(ts);
+  return google::protobuf::util::TimeUtil::MicrosecondsToTimestamp(
+      micro_secs.time_since_epoch().count());
+};
 
 }  // namespace lance::io

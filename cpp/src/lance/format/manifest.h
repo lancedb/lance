@@ -34,7 +34,7 @@ class Schema;
 /// \brief Manifest.
 ///
 ///  * Schema.
-///  * Version.
+///  * Dataset Version and file position of the version auxiliary data.
 ///  * Fragments.
 ///
 class Manifest final {
@@ -49,11 +49,11 @@ class Manifest final {
   /// Construct a Manifest with specific version.
   ///
   /// \param schema full dataset schema.
-  /// \param version a specific `DatasetVersion`.
   /// \param fragments a list of fragments containing data files.
+  /// \param version a specific version.
   Manifest(std::shared_ptr<Schema> schema,
-           lance::arrow::DatasetVersion version,
-           std::vector<std::shared_ptr<DataFragment>> fragments);
+           std::vector<std::shared_ptr<DataFragment>> fragments,
+           uint64_t version);
 
   /// Move constructor.
   Manifest(Manifest&& other) noexcept;
@@ -74,18 +74,16 @@ class Manifest final {
   /// Convert to protobuf.
   pb::Manifest ToProto() const;
 
-  /// Increase the version number and returns the new Manifest.
-  ///
-  std::shared_ptr<Manifest> BumpVersion(bool overwrite = false);
-
-  /// Update timestamps.
-  void Touch();
-
   /// Get schema of the dataset.
   const std::shared_ptr<Schema>& schema() const;
 
   /// Returns the version number.
   uint64_t version() const;
+
+  /// The file position of the version auxiliary data.
+  uint64_t version_aux_data_position() const;
+
+  void SetVersionAuxDataPosition(uint64_t pos);
 
   /// Get the fragments existed in this version of dataset.
   const std::vector<std::shared_ptr<DataFragment>>& fragments() const;
@@ -93,15 +91,14 @@ class Manifest final {
   /// Append more fragments to the dataset.
   void AppendFragments(const std::vector<std::shared_ptr<DataFragment>>& fragments);
 
-  /// Get the dataset version.
-  const arrow::DatasetVersion& GetDatasetVersion() const;
-
  private:
   /// Table schema.
   std::shared_ptr<Schema> schema_;
 
-  /// Dataset version.
-  ::lance::arrow::DatasetVersion version_;
+  uint64_t version_ = 0;
+
+  /// File location of the version aux data.
+  std::optional<uint64_t> version_aux_data_position_ = std::nullopt;
 
   /// Data fragments in this dataset.
   std::vector<std::shared_ptr<DataFragment>> fragments_;

@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "lance/arrow/dataset.h"
@@ -80,12 +81,14 @@ class Updater {
   /// \param dataset The dataset to be updated.
   /// \param schema the (new) columns to update.
   /// \param projection_columns the columns to read from source dataset.
+  /// \param metadata key value metadata for the new version.
   ///
   /// \return an Updater if success.
   static ::arrow::Result<std::shared_ptr<Updater>> Make(
       std::shared_ptr<LanceDataset> dataset,
       const std::shared_ptr<::arrow::Schema>& schema,
-      const std::vector<std::string>& projection_columns);
+      const std::vector<std::string>& projection_columns,
+      const std::unordered_map<std::string, std::string>& metadata);
 
   /// PIMPL
   class Impl;
@@ -108,6 +111,11 @@ class UpdaterBuilder {
   /// Set the projection columns from the source dataset.
   void Project(std::vector<std::string> columns);
 
+  /// Set the schema metadata for the new version.
+  ///
+  /// \param kv a map of string key, value pairs.
+  void Metadata(std::unordered_map<std::string, std::string> kv);
+
   ::arrow::Result<std::shared_ptr<Updater>> Finish();
 
  private:
@@ -116,6 +124,10 @@ class UpdaterBuilder {
   std::shared_ptr<::arrow::Schema> schema_;
 
   std::vector<std::string> projection_columns_;
+
+  /// Key-Value metadata.
+  std::unordered_map<std::string, std::string> key_value_metadata_;
+
 };
 
 }  // namespace lance::arrow

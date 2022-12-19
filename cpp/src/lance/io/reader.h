@@ -22,15 +22,32 @@
 #include <optional>
 #include <tuple>
 
-namespace lance::format {
+namespace lance {
+
+namespace arrow {
+class DatasetVersion;
+}
+
+namespace format {
 class Field;
 class Manifest;
 class Metadata;
 class PageTable;
 class Schema;
-}  // namespace lance::format
+}  // namespace format
+
+}  // namespace lance
 
 namespace lance::io {
+
+/// Read dataset version metadata from an opened manifest file.
+///
+/// \param in Opened file handler to the manifest file.
+/// \param manifest the manifest
+/// \return DatasetVersion from the manifest file.
+::arrow::Result<lance::arrow::DatasetVersion> ReadDatasetVersion(
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in,
+    const lance::format::Manifest& manifest);
 
 /// FileReader implementation.
 class FileReader {

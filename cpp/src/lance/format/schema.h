@@ -123,6 +123,9 @@ class Schema final {
   /// Schema metadata, k/v pairs.
   const std::unordered_map<std::string, std::string>& metadata() const { return metadata_; }
 
+  /// Set metadata key/value pairs.
+  void SetMetadata(const std::unordered_map<std::string, std::string>& metadata);
+
   std::string ToString() const;
 
   bool Equals(const std::shared_ptr<Schema>& other, bool check_id = true) const;

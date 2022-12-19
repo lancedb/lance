@@ -42,11 +42,13 @@ class Updater::Impl {
        ::arrow::dataset::FragmentVector fragments,
        std::shared_ptr<lance::format::Schema> full_schema,
        std::shared_ptr<lance::format::Schema> column_schema,
-       std::vector<std::string> projection_columns)
+       std::vector<std::string> projection_columns,
+       std::unordered_map<std::string, std::string> metadata = {})
       : dataset_(std::move(dataset)),
         full_schema_(std::move(full_schema)),
         column_schema_(std::move(column_schema)),
         fragments_(std::move(fragments)),
+        metadata_(std::move(metadata)),
         projected_columns_(std::move(projection_columns)),
         fragment_it_(fragments_.begin()) {}
 
@@ -56,6 +58,7 @@ class Updater::Impl {
         full_schema_(other.full_schema_),
         column_schema_(other.column_schema_),
         fragments_(other.fragments_.begin(), other.fragments_.end()),
+        metadata_(other.metadata_),
         projected_columns_(other.projected_columns_.begin(), other.projected_columns_.end()),
         fragment_it_(fragments_.begin()) {}
 
@@ -82,6 +85,8 @@ class Updater::Impl {
   std::shared_ptr<lance::format::Schema> column_schema_;
   /// A copy of fragments.
   ::arrow::dataset::FragmentVector fragments_;
+  /// Key value metadata of the new version generated.
+  std::unordered_map<std::string, std::string> metadata_;
 
   std::vector<std::string> projected_columns_;
 
@@ -175,10 +180,15 @@ class Updater::Impl {
     return ::arrow::Status::Invalid("Updater::Finish: there are remaining data to consume.");
   }
   ARROW_ASSIGN_OR_RAISE(auto latest_version, dataset_->latest_version());
-  ++latest_version;
-  auto new_manifest =
-      std::make_shared<lance::format::Manifest>(full_schema_, latest_version, data_fragments_);
-  ARROW_ASSIGN_OR_RAISE(auto dataset_impl, dataset_->impl_->WriteNewVersion(new_manifest));
+
+  auto new_version = DatasetVersion(latest_version.version() + 1);
+  if (!metadata_.empty()) {
+    new_version.SetMetadata(metadata_);
+  }
+  auto new_manifest = std::make_shared<lance::format::Manifest>(
+      full_schema_, data_fragments_, new_version.version());
+  ARROW_ASSIGN_OR_RAISE(auto dataset_impl,
+                        dataset_->impl_->WriteNewVersion(new_manifest, new_version));
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(dataset_impl)));
 }
 
@@ -187,7 +197,8 @@ Updater::~Updater() {}
 ::arrow::Result<std::shared_ptr<Updater>> Updater::Make(
     std::shared_ptr<LanceDataset> dataset,
     const std::shared_ptr<::arrow::Schema>& arrow_schema,
-    const std::vector<std::string>& projection_columns) {
+    const std::vector<std::string>& projection_columns,
+    const std::unordered_map<std::string, std::string>& metadata) {
   ARROW_ASSIGN_OR_RAISE(auto full_schema, dataset->impl_->manifest->schema()->Merge(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto column_schema, full_schema->Project(*arrow_schema));
   ARROW_ASSIGN_OR_RAISE(auto fragment_iter, dataset->GetFragments());
@@ -198,7 +209,8 @@ Updater::~Updater() {}
                                      std::move(fragments),
                                      std::move(full_schema),
                                      std::move(column_schema),
-                                     projection_columns);
+                                     projection_columns,
+                                     std::move(metadata));
   return std::shared_ptr<Updater>(new Updater(std::move(impl)));
 }
 
@@ -225,8 +237,12 @@ void UpdaterBuilder::Project(std::vector<std::string> columns) {
   projection_columns_ = std::move(columns);
 }
 
+void UpdaterBuilder::Metadata(std::unordered_map<std::string, std::string> kv) {
+  key_value_metadata_ = std::move(kv);
+}
+
 ::arrow::Result<std::shared_ptr<Updater>> UpdaterBuilder::Finish() {
-  return Updater::Make(dataset_, schema_, projection_columns_);
+  return Updater::Make(dataset_, schema_, projection_columns_, key_value_metadata_);
 }
 
 }  // namespace lance::arrow
