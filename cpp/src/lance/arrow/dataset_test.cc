@@ -357,3 +357,25 @@ TEST_CASE("Test throw error when merging with the same column names") {
   CHECK(result.status().message() ==
         "LanceDataset::Merge: column 'value' already exists in the dataset");
 }
+
+TEST_CASE("Test multi-versioned dataset with dictionary fields") {
+  //
+  auto indices = ToArray({0, 1, 2, 3, 4}).ValueOrDie();
+  auto values = ToArray({"one", "two", "three", "four", "five"}).ValueOrDie();
+  auto dict_arr = ::arrow::DictionaryArray::FromArrays(indices, values).ValueOrDie();
+  auto schema = ::arrow::schema(
+      {::arrow::field("id", ::arrow::int32()), ::arrow::field("value", dict_arr->type())});
+  auto table = ::arrow::Table::Make(schema, {indices, dict_arr});
+  auto base_uri = WriteTable(table);
+  auto fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  auto dataset = lance::arrow::LanceDataset::Make(fs, base_uri).ValueOrDie();
+  CHECK(dataset->version().ValueOrDie().version() == 1);
+
+  auto added_values = ToArray({50, 40, 30, 100, 120}).ValueOrDie();
+  auto added_table =
+      ::arrow::Table::Make(::arrow::schema({::arrow::field("id", indices->type()),
+                                            ::arrow::field("added", added_values->type())}),
+                           {indices, added_values});
+  auto new_dataset = dataset->Merge(added_table, "id").ValueOrDie();
+  CHECK(new_dataset->version().ValueOrDie().version() == 2);
+}

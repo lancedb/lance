@@ -4,6 +4,7 @@
 
 #include <arrow/buffer.h>
 #include <arrow/result.h>
+#include <fmt/format.h>
 #include <google/protobuf/message_lite.h>
 #include <google/protobuf/util/time_util.h>
 
@@ -35,8 +36,12 @@ template <ProtoMessage P>
   P proto;
   ARROW_ASSIGN_OR_RAISE(auto buf, source->ReadAt(offset + sizeof(pb_size), pb_size));
   if (!proto.ParseFromArray(buf->data(), buf->size())) {
-    return ::arrow::Status::Invalid("Failed to parse protobuf");
-  };
+    return ::arrow::Status::Invalid(fmt::format(
+        "Failed to parse protobuf at offset {}: expected protobuf size={} buffer size={}",
+        offset,
+        pb_size,
+        buf->size()));
+  }
   return proto;
 }
 
