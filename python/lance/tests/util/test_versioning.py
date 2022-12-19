@@ -101,3 +101,5 @@ def test_diff(tmp_path):
     tbl = cols.head()
     assert isinstance(tbl, pa.Table)
     assert len(tbl) == 2
+
+    assert cols.schema == lance.diff(ds, -1).columns_added().schema
