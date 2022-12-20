@@ -15,6 +15,7 @@
 
 import itertools
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 
@@ -85,20 +86,29 @@ def _record_batch_gen(
 def _read_labels(base_uri: str) -> tuple[dict, pd.CategoricalDtype]:
     LABEL_FILE = "LOC_synset_mapping.txt"
     labels = {}
-    label_names = ["unknown"]
+    label_names = OrderedDict()
+    label_names["unknown"] = True
     with open(os.path.join(base_uri, LABEL_FILE)) as fobj:
         for idx, line in enumerate(fobj.readlines()):
             tag, label = line.strip().split(maxsplit=1)
-            labels[tag] = (idx + 1, label)
-            label_names.append(label)
-    print(sorted(label_names))
-    for i in range(len(label_names) - 1):
-        if label_names[i] == label_names[i + 1]:
-            print(label_names[i])
-            import sys
-            sys.exit(1)
-    dtype = pd.CategoricalDtype(label_names, ordered=True)
+            labels[tag] = label
+            if label not in label_names:
+                label_names[label] = True
+    dtype = pd.CategoricalDtype(label_names.keys(), ordered=True)
     return labels, dtype
+
+
+def _generate_image_uri(df: pd.DataFrame) -> pd.DataFrame:
+    def generate_uri(image_id, split):
+        if split == "train":
+            image_id = f"{image_id.split('_')[0]}/{image_id}"
+        return (
+            f"s3://eto-public/datasets/imagenet_1k/Data/CLS-LOC/{split}/{image_id}.JPEG"
+        )
+
+    df["image_uri"] = df.apply(
+        lambda row: generate_uri(row["ImageId"], row["split"]), axis=1
+    )
 
 
 def convert_imagenet_1k(
@@ -134,8 +144,7 @@ def convert_imagenet_1k(
         kaggle competitions download -c imagenet-object-localization-challenge
 
     """
-    labels_map, dtype = _read_labels(uri)
-    print(labels_map, dtype)
+    labels_map, label_dtype = _read_labels(uri)
     IMAGESET_FILES = {
         "train": "LOC_train_solution.csv",
         "val": "LOC_val_solution.csv",
@@ -154,28 +163,31 @@ def convert_imagenet_1k(
                 sep=" ",
                 header=None,
             )
+            split_df = split_df.rename(columns={0: "ImageId"}).drop(columns=[1])
         else:
             split_df = pd.read_csv(os.path.join(uri, IMAGESET_FILES[s]))
+            split_df["class"] = split_df["PredictionString"].apply(
+                lambda s: labels_map[s.split()[0]]
+            )
+            split_df = split_df.drop(columns=["PredictionString"])
         split_df["split"] = s
-        split_df = split_df.rename(columns={0: "filename"}).drop(columns=[1])
-        split_df.drop(1)
         dfs.append(split_df)
     df = pd.concat(dfs)
     df["split"] = df["split"].astype("category")
-
-    print(df)
+    df["class"] = df["class"].astype(label_dtype)
+    _generate_image_uri(df)
 
     if limit:
         frac = limit * 1.0 / len(df)
-        print(frac)
+        print("Limit fraction: ", frac)
         df = df.groupby(["split", "class"]).apply(lambda f: f.sample(frac=frac))
-    print(df)
-    return
 
+    table = pa.Table.from_pandas(df)
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
     # it allows to write larger-than-memory data.
-    dataset = pa.dataset.dataset(list(_record_batch_gen(limit=limit)))
+    dataset = pa.dataset.dataset(table)
+
     lance.write_dataset(dataset, out, max_rows_per_group=group_size)
 
 
