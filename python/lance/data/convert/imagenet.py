@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.dataset
 
 import lance
+from lance.io import download_uris
 from lance.types.image import Image, ImageArray
 
 __all__ = ["convert_imagenet_1k"]
@@ -111,6 +112,23 @@ def _generate_image_uri(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _embedded_images(base_dir: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Include embedded images."""
+
+    def gen_image_uris(row):
+        if row.split == "train":
+            image_id = row.ImageId
+            image_id = f"{image_id.split('_')[0]}/{image_id}.JPEG"
+        else:
+            image_id = f"{row.ImageId}.JPEG"
+        image_uri = os.path.join(base_dir, "Data", "CLS-LOC", row.split, image_id)
+        return image_uri
+
+    image_uris = df.apply(lambda row: gen_image_uris(row), axis=1)
+    images = download_uris(image_uris)
+    df["image"] = images
+
+
 def convert_imagenet_1k(
     uri: str | Path,
     out: str | Path,
@@ -182,7 +200,9 @@ def convert_imagenet_1k(
         print("Limit fraction: ", frac)
         df = df.groupby(["split", "class"]).apply(lambda f: f.sample(frac=frac))
 
+    _embedded_images(uri, df)
     table = pa.Table.from_pandas(df)
+
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
     # it allows to write larger-than-memory data.
