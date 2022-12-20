@@ -25,7 +25,7 @@ import pyarrow.dataset
 
 import lance
 from lance.io import download_uris
-from lance.types.image import Image, ImageArray
+from lance.types.image import Image, ImageArray, ImageBinaryType
 
 __all__ = ["convert_imagenet_1k"]
 
@@ -126,7 +126,7 @@ def _embedded_images(base_dir: str, df: pd.DataFrame) -> pd.DataFrame:
 
     image_uris = df.apply(lambda row: gen_image_uris(row), axis=1)
     images = download_uris(image_uris)
-    df["image"] = images
+    return lance.types.ImageArray.from_pandas(images)
 
 
 def convert_imagenet_1k(
@@ -200,8 +200,12 @@ def convert_imagenet_1k(
         print("Limit fraction: ", frac)
         df = df.groupby(["split", "class"]).apply(lambda f: f.sample(frac=frac))
 
-    _embedded_images(uri, df)
-    table = pa.Table.from_pandas(df)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    image_arr = _embedded_images(uri, df)
+    table = table.append_column(
+        pa.field("image", ImageBinaryType()), image_arr
+    )
+
 
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
