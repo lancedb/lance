@@ -14,9 +14,11 @@
 
 
 import itertools
+import os
 from pathlib import Path
 from typing import Dict, Generator, List, Optional
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 
@@ -80,20 +82,96 @@ def _record_batch_gen(
             yield _to_record_batch(batch, hg_features["label"].names)
 
 
+def _read_labels(base_uri: str) -> tuple[dict, pd.CategoricalDtype]:
+    LABEL_FILE = "LOC_synset_mapping.txt"
+    labels = {}
+    label_names = ["unknown"]
+    with open(os.path.join(base_uri, LABEL_FILE)) as fobj:
+        for idx, line in enumerate(fobj.readlines()):
+            tag, label = line.strip().split(maxsplit=1)
+            labels[tag] = (idx + 1, label)
+            label_names.append(label)
+    print(sorted(label_names))
+    for i in range(len(label_names) - 1):
+        if label_names[i] == label_names[i + 1]:
+            print(label_names[i])
+            import sys
+            sys.exit(1)
+    dtype = pd.CategoricalDtype(label_names, ordered=True)
+    return labels, dtype
+
+
 def convert_imagenet_1k(
-    out: str | Path, group_size: int, limit: Optional[int] = None
+    uri: str | Path,
+    out: str | Path,
+    group_size: int,
+    limit: Optional[int] = None,
+    split: Optional[str | list[str]] = None,
 ) -> None:
     """Convert ImageNet 1K dataset to lance format
 
     Parameters
     ----------
+    uri : str or Path
+        Input Dataset URI
     out : str or Path
         Output URI
     group_size : int
         The size of each row group.
     limit : int, optional
         Limit number of records to generate, useful for testing.
+
+    It expects the input directory has the following directories:
+
+      - Data
+      - Annotations
+      - ImageSet
+      - LOC_val_solution.csv
+      - LOC_train_solution.csv
+
+    You can obtain the dataset from Kaggle:
+
+        kaggle competitions download -c imagenet-object-localization-challenge
+
     """
+    labels_map, dtype = _read_labels(uri)
+    print(labels_map, dtype)
+    IMAGESET_FILES = {
+        "train": "LOC_train_solution.csv",
+        "val": "LOC_val_solution.csv",
+        "test": "ImageSets/CLS-LOC/test.txt",
+    }
+    if split is None:
+        split = ["train", "val", "test"]
+    if isinstance(split, str):
+        split = [split]
+
+    dfs = []
+    for s in split:
+        if s == "test":
+            split_df = pd.read_csv(
+                os.path.join(uri, IMAGESET_FILES[s]),
+                sep=" ",
+                header=None,
+            )
+        else:
+            split_df = pd.read_csv(os.path.join(uri, IMAGESET_FILES[s]))
+        split_df["split"] = s
+        split_df = split_df.rename(columns={0: "filename"}).drop(columns=[1])
+        split_df.drop(1)
+        dfs.append(split_df)
+    df = pd.concat(dfs)
+    df["split"] = df["split"].astype("category")
+
+    print(df)
+
+    if limit:
+        frac = limit * 1.0 / len(df)
+        print(frac)
+        df = df.groupby(["split", "class"]).apply(lambda f: f.sample(frac=frac))
+    print(df)
+    return
+
     # batch_reader = pa.RecordBatchReader.from_batches(schema, _record_batch_gen())
     # TODO: Pending the response / fix from arrow to support directly write RecordBatchReader, so that
     # it allows to write larger-than-memory data.
@@ -105,7 +183,8 @@ if __name__ == "__main__":
     import click
 
     @click.command()
-    @click.argument("out")
+    @click.argument("uri")
+    @click.argument("out", default="imagenet_1k.lance")
     @click.option(
         "-g",
         "--group-size",
@@ -122,7 +201,7 @@ if __name__ == "__main__":
         metavar="N",
         show_default=True,
     )
-    def main(out, group_size, limit):
-        convert_imagenet_1k(out, group_size, limit=limit)
+    def main(uri, out, group_size, limit):
+        convert_imagenet_1k(uri, out, group_size, limit=limit)
 
     main()
