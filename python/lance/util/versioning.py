@@ -188,7 +188,11 @@ class RowDiff:
         columns: list[str], default None
             Get all rows if not specified
         """
-        import duckdb
+        try:
+            import duckdb
+        except ImportError:
+            print("Please `pip install duckdb` to use the Lance data diff tool")
+            raise
         v1 = self.ds_start
         v2 = self.ds_end
         if columns is None:
