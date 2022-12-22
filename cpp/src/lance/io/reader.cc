@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <range/v3/algorithm/max.hpp>
 
 #include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
@@ -49,6 +50,8 @@ typedef ::arrow::Result<std::shared_ptr<::arrow::Scalar>> ScalarResult;
 
 namespace lance::io {
 
+namespace {
+
 ::arrow::Result<int64_t> ReadFooter(const std::shared_ptr<::arrow::Buffer>& buf) {
   assert(buf->size() >= 16);
   if (auto magic_buf = ::arrow::SliceBuffer(buf, buf->size() - 4);
@@ -56,17 +59,50 @@ namespace lance::io {
     return Status::IOError(
         fmt::format("Invalidate file format: MAGIC NUM is not {}", lance::format::kMagic));
   }
-  // Metadata Offset
   return ReadInt<int64_t>(buf->data() + buf->size() - 16);
 }
+
+}  // namespace
 
 ::arrow::Result<std::unique_ptr<FileReader>> FileReader::Make(
     std::shared_ptr<::arrow::io::RandomAccessFile> in,
     std::shared_ptr<::lance::format::Manifest> manifest,
     ::arrow::MemoryPool* pool) {
-  auto reader = std::make_unique<FileReader>(in, manifest, pool);
+  auto reader = std::make_unique<FileReader>(std::move(in), std::move(manifest), pool);
   ARROW_RETURN_NOT_OK(reader->Open());
   return reader;
+}
+
+::arrow::Result<std::shared_ptr<::lance::format::Manifest>> FileReader::OpenManifest(
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in) {
+  constexpr auto kBufReadBytes = 8 * 1024 * 1024;  // Read 8 MB;
+  ::arrow::BufferVector buffers;
+  int64_t pos = 0;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto buf, in->ReadAt(pos, kBufReadBytes));
+    auto read_nbytes = buf->size();
+    if (read_nbytes > 0) {
+      buffers.emplace_back(std::move(buf));
+    }
+    if (read_nbytes < kBufReadBytes) {
+      break;
+    }
+    pos += read_nbytes;
+  }
+  assert(!buffers.empty());
+  auto buf = buffers[0];
+  if (buffers.size() > 1) {
+    // Unlikely to get here
+    ARROW_ASSIGN_OR_RAISE(buf, ::arrow::ConcatenateBuffers(buffers));
+  }
+  ARROW_ASSIGN_OR_RAISE(auto manifest_pos, ReadFooter(buf));
+  ARROW_ASSIGN_OR_RAISE(auto manifest,
+                        lance::format::Manifest::Parse(SliceBuffer(buf, manifest_pos)));
+
+  /// TODO: optimize ReadDictionaryVisitor to read from buffer.
+  auto visitor = format::ReadDictionaryVisitor(in);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest->schema()));
+  return manifest;
 }
 
 FileReader::FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
@@ -95,24 +131,26 @@ Status FileReader::Open() {
       metadata_, format::Metadata::Make(::arrow::SliceBuffer(cached_last_page_, inbuf_offset)));
 
   if (!manifest_) {
-    ARROW_ASSIGN_OR_RAISE(manifest_, metadata_->GetManifest(file_));
+    /// Multiple files can share the manifest.
+    ARROW_ASSIGN_OR_RAISE(manifest_,
+                          format::Manifest::Parse(file_, metadata_->manifest_position()));
     // We need read the dictionary from the same file.
     auto visitor = format::ReadDictionaryVisitor(file_);
-    ARROW_RETURN_NOT_OK(visitor.VisitSchema(manifest_->schema()));
+    ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest_->schema()));
   }
 
   // TODO: Let's assume that page position is prefetched in memory already.
   assert(metadata_->page_table_position() >= size - kPrefetchSize);
 
   auto num_batches = metadata_->num_batches();
-  auto num_columns = manifest_->schema().GetFieldsCount();
+  auto num_columns = ranges::max(manifest_->schema()->GetFieldIds()) + 1;
   ARROW_ASSIGN_OR_RAISE(
       page_table_,
       format::PageTable::Make(file_, metadata_->page_table_position(), num_columns, num_batches));
   return Status::OK();
 }
 
-const lance::format::Schema& FileReader::schema() const { return manifest_->schema(); }
+const lance::format::Schema& FileReader::schema() const { return *manifest_->schema(); }
 
 const std::shared_ptr<lance::format::Manifest>& FileReader::manifest() const { return manifest_; }
 
@@ -207,25 +245,17 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(
     int32_t idx, const std::vector<std::string>& columns) {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
+  ARROW_ASSIGN_OR_RAISE(auto projection, manifest_->schema()->Project(columns));
   return Get(idx, *projection);
 }
 
 ::arrow::Result<std::vector<::std::shared_ptr<::arrow::Scalar>>> FileReader::Get(int32_t idx) {
-  return Get(idx, manifest_->schema());
+  return Get(idx, *manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable() {
   std::vector<std::shared_ptr<::arrow::ChunkedArray>> columns;
-  return ReadTable(manifest_->schema());
-}
-
-::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
-    const std::vector<std::string>& columns) {
-  auto schema = manifest_->schema();
-  ARROW_ASSIGN_OR_RAISE(auto projection, schema.Project(columns));
-  return ReadTable(*projection);
+  return ReadTable(*manifest_->schema());
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::Table>> FileReader::ReadTable(
@@ -240,39 +270,6 @@ int32_t FileReader::num_batches() const { return metadata_->num_batches(); }
     columns.emplace_back(std::make_shared<::arrow::ChunkedArray>(chunks));
   }
   return ::arrow::Table::Make(schema.ToArrow(), columns);
-}
-
-::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadAt(
-    const lance::format::Schema& schema, int32_t offset, int32_t length) const {
-  ARROW_ASSIGN_OR_RAISE(auto batch, metadata_->LocateBatch(offset));
-  auto [batch_id, idx_in_batch] = batch;
-  std::vector<std::shared_ptr<::arrow::Array>> arrs;
-  for (auto& field : schema.fields()) {
-    auto len =
-        static_cast<int32_t>(std::min(static_cast<int64_t>(length), metadata_->length() - offset));
-    ::arrow::ArrayVector chunks;
-    // Make a local copy?
-    auto ckid = batch_id;
-    auto ck_index = idx_in_batch;
-    while (len > 0 && ckid < metadata_->num_batches()) {
-      auto page_length = metadata_->GetBatchLength(batch_id);
-      auto length_in_page = std::min(len, page_length - ck_index);
-      ARROW_ASSIGN_OR_RAISE(auto arr,
-                            GetArray(field, ckid, ArrayReadParams(ck_index, length_in_page)));
-      len -= length_in_page;
-      ckid++;
-      ck_index = 0;
-      chunks.emplace_back(arr);
-    }
-    assert(!chunks.empty());
-    if (chunks.size() > 1) {
-      ARROW_ASSIGN_OR_RAISE(auto arr, ::arrow::Concatenate(chunks, pool_));
-      arrs.emplace_back(arr);
-    } else {
-      arrs.emplace_back(chunks[0]);
-    }
-  }
-  return ::arrow::RecordBatch::Make(schema.ToArrow(), arrs[0]->length(), arrs);
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> FileReader::ReadBatch(

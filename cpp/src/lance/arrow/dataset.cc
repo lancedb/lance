@@ -14,22 +14,31 @@
 
 #include "lance/arrow/dataset.h"
 
-#include <arrow/dataset/api.h>
+#include <arrow/array.h>
+#include <arrow/array/concatenate.h>
 #include <arrow/status.h>
+#include <arrow/table.h>
+#include <arrow/type_traits.h>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
-#include <uuid.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <mutex>
-#include <random>
 #include <range/v3/all.hpp>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 
-#include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/dataset_ext.h"
+#include "lance/arrow/file_lance.h"
+#include "lance/arrow/fragment.h"
+#include "lance/arrow/hash_merger.h"
+#include "lance/arrow/updater.h"
+#include "lance/arrow/utils.h"
 #include "lance/format/manifest.h"
 #include "lance/format/schema.h"
+#include "lance/io/reader.h"
 #include "lance/io/writer.h"
 
 namespace fs = std::filesystem;
@@ -66,50 +75,132 @@ auto CreateFragments(const std::vector<std::string>& paths, const lance::format:
          to<std::vector<std::shared_ptr<lance::format::DataFragment>>>;
 }
 
-std::string GetBasenameTemplate() {
-  std::random_device rd;
-  auto seed_data = std::array<int, std::mt19937::state_size>{};
-  std::generate(std::begin(seed_data), std::end(seed_data), std::ref(rd));
-  std::seed_seq seq(std::begin(seed_data), std::end(seed_data));
-  std::mt19937 generator(seq);
-  uuids::uuid_random_generator gen{generator};
-  auto uuid = gen();
-
-  return uuids::to_string(uuid) + "_{i}.lance";
-}
+std::string GetBasenameTemplate() { return GetUUIDString() + "_{i}.lance"; }
 
 ::arrow::Result<std::shared_ptr<lance::format::Manifest>> OpenManifest(
     const std::shared_ptr<::arrow::fs::FileSystem>& fs, const std::string& path) {
   ARROW_ASSIGN_OR_RAISE(auto in, fs->OpenInputFile(path));
-  return lance::format::Manifest::Parse(in, 0);
+  return lance::io::FileReader::OpenManifest(in);
+}
+
+::arrow::Status CollectDictionary(const std::shared_ptr<lance::format::Field>& field,
+                                  const std::shared_ptr<::arrow::Array>& arr) {
+  assert(field && arr);
+  assert(field->type()->Equals(arr->type()));
+  auto data_type = field->type();
+  if (::arrow::is_dictionary(data_type->id())) {
+    auto dict_arr = std::dynamic_pointer_cast<::arrow::DictionaryArray>(arr);
+    return field->set_dictionary(dict_arr->dictionary());
+  }
+
+  if (is_list(data_type)) {
+    auto list_arr = std::dynamic_pointer_cast<::arrow::ListArray>(arr);
+    ARROW_RETURN_NOT_OK(CollectDictionary(field->field(0), list_arr->values()));
+  } else if (is_struct(data_type)) {
+    auto struct_arr = std::dynamic_pointer_cast<::arrow::StructArray>(arr);
+    for (auto& child : field->fields()) {
+      auto child_arr = struct_arr->GetFieldByName(child->name());
+      if (child_arr == nullptr) {
+        return ::arrow::Status::Invalid("CollectDictionary: schema mismatch: field ",
+                                        child->name(),
+                                        "does not exist in the table: ",
+                                        struct_arr->type());
+      }
+      ARROW_RETURN_NOT_OK(CollectDictionary(child, child_arr));
+    }
+  }
+  return ::arrow::Status::OK();
+}
+
+::arrow::Status CollectDictionary(const std::shared_ptr<lance::format::Schema>& schema,
+                                  const std::shared_ptr<::arrow::dataset::Scanner>& scanner) {
+  ARROW_ASSIGN_OR_RAISE(auto example, scanner->Head(1));
+  if (example->num_rows() == 0) {
+    return ::arrow::Status::Invalid("CollectDictionary: empty dataset");
+  }
+  for (auto& field : schema->fields()) {
+    auto chunked_arr = example->GetColumnByName(field->name());
+    if (chunked_arr == nullptr) {
+      return ::arrow::Status::Invalid("CollectDictionary: schema mismatch: field ",
+                                      field->name(),
+                                      "does not exist in the table: ",
+                                      example->schema());
+    }
+    assert(chunked_arr->num_chunks() > 0);
+    ARROW_RETURN_NOT_OK(CollectDictionary(field, chunked_arr->chunk(0)));
+  }
+  return ::arrow::Status::OK();
 }
 
 }  // namespace
 
-DatasetVersion::DatasetVersion(uint64_t version) : version_(version) {}
+DatasetVersion::DatasetVersion(uint64_t version,
+                               std::chrono::time_point<std::chrono::system_clock> created)
+    : version_(version), timestamp_(created) {}
 
 uint64_t DatasetVersion::version() const { return version_; }
 
-class LanceDataset::Impl {
- public:
-  Impl() = delete;
+const std::chrono::time_point<std::chrono::system_clock>& DatasetVersion::timestamp() const {
+  return timestamp_;
+}
 
-  Impl(std::shared_ptr<::arrow::fs::FileSystem> filesystem,
-       std::string uri,
-       std::shared_ptr<lance::format::Manifest> m)
-      : fs(std::move(filesystem)), base_uri(std::move(uri)), manifest(std::move(m)) {}
+std::time_t DatasetVersion::timet_timestamp() const {
+  return std::chrono::system_clock::to_time_t(timestamp_);
+}
 
-  std::string data_dir() const { return fs::path(base_uri) / kDataDir; }
+DatasetVersion& DatasetVersion::operator++() {
+  version_++;
+  Touch();
+  return *this;
+}
 
-  std::string versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
+DatasetVersion DatasetVersion::operator++(int) {
+  version_++;
+  Touch();
+  return *this;
+}
 
-  std::shared_ptr<::arrow::fs::FileSystem> fs;
-  std::string base_uri;
-  std::shared_ptr<lance::format::Manifest> manifest;
-};
+void DatasetVersion::Touch() { timestamp_ = std::chrono::system_clock::now(); }
 
+//-------------------------
+// LanceDataset::Impl
+//-------------------------
+
+std::string LanceDataset::Impl::data_dir() const { return fs::path(base_uri) / kDataDir; }
+
+std::string LanceDataset::Impl::versions_dir() const { return fs::path(base_uri) / kVersionsDir; }
+
+namespace {
+
+::arrow::Status WriteManifest(const std::shared_ptr<::arrow::fs::FileSystem>& fs,
+                              const std::string& base_uri,
+                              const std::shared_ptr<format::Manifest>& manifest) {
+  // Write the manifest version file.
+  // It only supports single writer at the moment.
+  auto version_dir = (fs::path(base_uri) / kVersionsDir).string();
+  ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
+  auto manifest_path = GetManifestPath(base_uri, manifest->version());
+  {
+    // Keep the serialized time, which is when this particular version of dataset is visible.
+    manifest->Touch();
+    ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
+    ARROW_RETURN_NOT_OK(lance::io::FileWriter::WriteManifest(out, *manifest));
+  }
+  auto latest_manifest_path = GetManifestPath(base_uri, std::nullopt);
+  return fs->CopyFile(manifest_path, latest_manifest_path);
+}
+
+}  // namespace
+
+::arrow::Result<std::unique_ptr<LanceDataset::Impl>> LanceDataset::Impl::WriteNewVersion(
+    std::shared_ptr<lance::format::Manifest> new_manifest) const {
+  ARROW_RETURN_NOT_OK(WriteManifest(fs, base_uri, new_manifest));
+  return std::make_unique<Impl>(fs, base_uri, std::move(new_manifest));
+}
+
+//---------------------------
 LanceDataset::LanceDataset(std::unique_ptr<LanceDataset::Impl> impl)
-    : ::arrow::dataset::Dataset(impl->manifest->schema().ToArrow()), impl_(std::move(impl)) {}
+    : ::arrow::dataset::Dataset(impl->manifest->schema()->ToArrow()), impl_(std::move(impl)) {}
 
 LanceDataset::LanceDataset(const LanceDataset& other)
     : LanceDataset(std::make_unique<Impl>(*other.impl_)) {}
@@ -145,7 +236,7 @@ LanceDataset::~LanceDataset() {}
       }
     } else {
       auto existing_manifest = cur_dataset->impl_->manifest;
-      auto existing_arrow_schema = existing_manifest->schema().ToArrow();
+      auto existing_arrow_schema = existing_manifest->schema()->ToArrow();
 
       if (!scanner->dataset()->schema()->Equals(existing_arrow_schema)) {
         return ::arrow::Status::IOError("Write dataset with different schema: ",
@@ -163,6 +254,7 @@ LanceDataset::~LanceDataset() {}
     auto schema = std::make_shared<lance::format::Schema>(scanner->options()->dataset_schema);
     manifest = std::make_shared<lance::format::Manifest>(schema);
   }
+  ARROW_RETURN_NOT_OK(CollectDictionary(manifest->schema(), scanner));
 
   // Write manifest file
   auto lance_option = options;
@@ -196,18 +288,16 @@ LanceDataset::~LanceDataset() {}
 
   ARROW_RETURN_NOT_OK(::arrow::dataset::FileSystemDataset::Write(lance_option, std::move(scanner)));
 
-  manifest->AppendFragments(CreateFragments(paths, manifest->schema()));
-  // Write the manifest version file.
-  // It only supports single writer at the moment.
-  auto version_dir = (fs::path(base_dir) / kVersionsDir).string();
-  ARROW_RETURN_NOT_OK(fs->CreateDir(version_dir));
-  auto manifest_path = GetManifestPath(base_dir, manifest->version());
-  {
-    ARROW_ASSIGN_OR_RAISE(auto out, fs->OpenOutputStream(manifest_path));
-    ARROW_RETURN_NOT_OK(manifest->Write(out));
-  }
-  auto latest_manifest_path = GetManifestPath(base_dir, std::nullopt);
-  return fs->CopyFile(manifest_path, latest_manifest_path);
+  manifest->AppendFragments(CreateFragments(paths, *manifest->schema()));
+
+  return WriteManifest(fs, base_dir, manifest);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(const std::string& uri,
+                                                                  std::optional<uint64_t> version) {
+  std::string path;
+  ARROW_ASSIGN_OR_RAISE(auto fs, ::arrow::fs::FileSystemFromUriOrPath(uri, &path));
+  return Make(fs, path, version);
 }
 
 ::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Make(
@@ -223,7 +313,16 @@ LanceDataset::~LanceDataset() {}
   if (finfo.type() == ::arrow::fs::FileType::NotFound) {
     return ::arrow::Status::IOError("Manifest not found: ", manifest_path);
   }
-  ARROW_ASSIGN_OR_RAISE(auto manifest, OpenManifest(fs, manifest_path));
+  auto result = OpenManifest(fs, manifest_path);
+
+  if (result.status().IsIOError() && result.status().message().starts_with("Path does not exist")) {
+    if (!version) {
+      return ::arrow::Status::IOError("Can not find the latest version of the dataset");
+    }
+    return ::arrow::Status::IOError("Version ", version.value(), " does not exist");
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto manifest, result);
   auto impl = std::make_unique<LanceDataset::Impl>(fs, base_uri, manifest);
   return std::shared_ptr<LanceDataset>(new LanceDataset(std::move(impl)));
 }
@@ -250,8 +349,64 @@ LanceDataset::~LanceDataset() {}
   return manifest->GetDatasetVersion();
 }
 
-DatasetVersion LanceDataset::version() const {
-  return impl_->manifest->GetDatasetVersion();
+DatasetVersion LanceDataset::version() const { return impl_->manifest->GetDatasetVersion(); }
+
+::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Field>& new_field) const {
+  return NewUpdate(::arrow::schema({new_field}));
+}
+
+::arrow::Result<std::shared_ptr<UpdaterBuilder>> LanceDataset::NewUpdate(
+    const std::shared_ptr<::arrow::Schema>& new_columns) const {
+  return std::make_shared<UpdaterBuilder>(std::make_shared<LanceDataset>(*this), new_columns);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::AddColumn(
+    const std::shared_ptr<::arrow::Field>& field, ::arrow::compute::Expression expression) {
+  if (!expression.IsScalarExpression()) {
+    return ::arrow::Status::Invalid(
+        "LanceDataset::AddColumn: expression is not a scalar expression.");
+  }
+  ARROW_ASSIGN_OR_RAISE(expression, expression.Bind(*schema()));
+  ARROW_ASSIGN_OR_RAISE(auto builder, NewUpdate(field));
+  if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+    std::vector<std::string> columns;
+    for (const auto& ref : ::arrow::compute::FieldsInExpression(expression)) {
+      columns.emplace_back(arrow::ToColumnName(ref));
+    }
+    builder->Project(columns);
+  }
+  ARROW_ASSIGN_OR_RAISE(auto updater, builder->Finish());
+
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
+    if (!batch) {
+      break;
+    }
+
+#ifndef NDEBUG
+    // Due to lack of injection point to test schema in the unit tests, let's do assert here.
+    // Assert will be disabled in the release build.
+    if (::arrow::compute::ExpressionHasFieldRefs(expression)) {
+      assert(batch->schema()->Equals(
+          impl_->manifest->schema()->Project(expression).ValueOrDie()->ToArrow()));
+    }
+#endif
+
+    ARROW_ASSIGN_OR_RAISE(auto datum,
+                          ::arrow::compute::ExecuteScalarExpression(expression, *schema(), batch));
+    std::shared_ptr<::arrow::Array> arr;
+    if (datum.is_scalar()) {
+      ARROW_ASSIGN_OR_RAISE(arr, CreateArray(datum.scalar(), batch->num_rows()));
+    } else if (datum.is_chunked_array()) {
+      auto chunked_arr = datum.chunked_array();
+      ARROW_ASSIGN_OR_RAISE(arr, ::arrow::Concatenate(chunked_arr->chunks()));
+    } else {
+      arr = datum.make_array();
+    }
+    ARROW_RETURN_NOT_OK(updater->UpdateBatch(arr));
+  }
+  return updater->Finish();
 }
 
 ::arrow::Result<std::shared_ptr<::arrow::dataset::Dataset>> LanceDataset::ReplaceSchema(
@@ -264,11 +419,69 @@ DatasetVersion LanceDataset::version() const {
   std::vector<std::shared_ptr<::arrow::dataset::Fragment>> fragments =
       impl_->manifest->fragments() | views::transform([this](auto& data_fragment) {
         return std::make_shared<LanceFragment>(
-            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest->schema());
+            impl_->fs, impl_->data_dir(), data_fragment, impl_->manifest);
       }) |
       ranges::to<decltype(fragments)>;
 
   return ::arrow::MakeVectorIterator(fragments);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
+    const std::shared_ptr<::arrow::Table>& other,
+    const std::string& on,
+    ::arrow::MemoryPool* pool) {
+  return Merge(other, on, on, pool);
+}
+
+::arrow::Result<std::shared_ptr<LanceDataset>> LanceDataset::Merge(
+    const std::shared_ptr<::arrow::Table>& right,
+    const std::string& left_on,
+    const std::string& right_on,
+    ::arrow::MemoryPool* pool) {
+  /// Sanity checks
+  auto left_column = schema_->GetFieldByName(left_on);
+  if (left_column == nullptr) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the dataset.", left_on));
+  }
+  auto right_column = right->GetColumnByName(right_on);
+  if (right_column == nullptr) {
+    return ::arrow::Status::Invalid(
+        fmt::format("Column {} does not exist in the table.", right_on));
+  }
+
+  auto& left_type = left_column->type();
+  auto& right_type = right_column->type();
+  if (!left_type->Equals(right_type)) {
+    return ::arrow::Status::Invalid("LanceDataset::AddColumns: types are not equal: ",
+                                    left_type->ToString(),
+                                    " != ",
+                                    right_type->ToString());
+  }
+
+  // First phase, build hash table (in memory for simplicity)
+  auto merger = HashMerger(right, right_on, pool);
+  ARROW_RETURN_NOT_OK(merger.Init());
+
+  // Second phase
+  auto table_schema = right->schema();
+  ARROW_ASSIGN_OR_RAISE(auto incoming_schema,
+                        table_schema->RemoveField(table_schema->GetFieldIndex(right_on)));
+  ARROW_ASSIGN_OR_RAISE(auto update_builder, NewUpdate(std::move(incoming_schema)));
+  update_builder->Project({left_on});
+  ARROW_ASSIGN_OR_RAISE(auto updater, update_builder->Finish());
+
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, updater->Next());
+    if (!batch) {
+      break;
+    }
+    assert(batch->schema()->Equals(::arrow::schema({left_column})));
+    auto index_arr = batch->GetColumnByName(left_on);
+    ARROW_ASSIGN_OR_RAISE(auto right_batch, merger.Collect(index_arr));
+    ARROW_RETURN_NOT_OK(updater->UpdateBatch(right_batch));
+  }
+  return updater->Finish();
 }
 
 }  // namespace lance::arrow

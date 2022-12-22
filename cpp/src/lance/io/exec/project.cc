@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 
 #include "lance/arrow/file_lance_ext.h"
+#include "lance/arrow/fragment.h"
 #include "lance/io/exec/filter.h"
 #include "lance/io/exec/limit.h"
 #include "lance/io/exec/scan.h"
@@ -32,14 +33,14 @@ Project::Project(std::unique_ptr<ExecNode> child,
     : child_(std::move(child)), projected_schema_(std::move(projected_schema)) {}
 
 ::arrow::Result<std::unique_ptr<Project>> Project::Make(
-    std::shared_ptr<FileReader> reader,
+    const lance::arrow::LanceFragment& fragment,
     std::shared_ptr<::arrow::dataset::ScanOptions> scan_options) {
-  auto& schema = reader->schema();
+  auto& schema = fragment.schema();
   auto projected_arrow_schema = scan_options->projected_schema;
   if (projected_arrow_schema->num_fields() == 0) {
     projected_arrow_schema = scan_options->dataset_schema;
   }
-  ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema.Project(*projected_arrow_schema));
+  ARROW_ASSIGN_OR_RAISE(auto projected_schema, schema->Project(*scan_options->projected_schema));
 
   std::shared_ptr<Counter> counter;
   if (scan_options->fragment_scan_options &&
@@ -48,24 +49,28 @@ Project::Project(std::unique_ptr<ExecNode> child,
         scan_options->fragment_scan_options);
     counter = fso->counter;
   }
+
+  auto executor = scan_options->io_context.executor();
   std::unique_ptr<ExecNode> child;
   if (Filter::HasFilter(scan_options->filter)) {
-    /// Build a chain of:
-    ///
-    /// Take -> (optionally) Limit -> Filter -> Scan
-    ARROW_ASSIGN_OR_RAISE(auto filter_scan_schema, schema.Project(scan_options->filter));
+    ARROW_ASSIGN_OR_RAISE(auto filter_scan_schema, schema->Project(scan_options->filter));
+    ARROW_ASSIGN_OR_RAISE(auto filter_readers, fragment.Open(*filter_scan_schema, executor));
     ARROW_ASSIGN_OR_RAISE(auto filter_scan_node,
-                          Scan::Make({{reader, filter_scan_schema}}, scan_options->batch_size));
+                          Scan::Make(filter_readers, scan_options->batch_size, executor));
     ARROW_ASSIGN_OR_RAISE(child, Filter::Make(scan_options->filter, std::move(filter_scan_node)));
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }
-    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema));
-    ARROW_ASSIGN_OR_RAISE(child, Take::Make(reader, take_schema, std::move(child)));
+    ARROW_ASSIGN_OR_RAISE(auto take_schema, projected_schema->Exclude(*filter_scan_schema))
+    ARROW_ASSIGN_OR_RAISE(auto take_readers, fragment.Open(*take_schema, executor));
+    std::unique_ptr<Scan> take_scan_node;
+    if (!take_schema->fields().empty() && !take_readers.empty()) {
+      ARROW_ASSIGN_OR_RAISE(take_scan_node, Scan::Make(take_readers, 1, executor));
+    };
+    child = std::make_unique<Take>(std::move(child), std::move(take_scan_node));
   } else {
-    /// (*optionally) Limit -> Scan
-    ARROW_ASSIGN_OR_RAISE(
-        child, Scan::Make({{std::move(reader), projected_schema}}, scan_options->batch_size));
+    ARROW_ASSIGN_OR_RAISE(auto readers, fragment.Open(*projected_schema, executor));
+    ARROW_ASSIGN_OR_RAISE(child, Scan::Make(readers, scan_options->batch_size, executor));
     if (counter) {
       ARROW_ASSIGN_OR_RAISE(child, Limit::Make(counter, std::move(child)));
     }

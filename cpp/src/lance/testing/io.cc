@@ -14,23 +14,26 @@
 
 #include "lance/testing/io.h"
 
-#include <arrow/dataset/api.h>
 #include <arrow/filesystem/api.h>
 #include <arrow/io/api.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
-#include <fmt/format.h>
 
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include "lance/arrow/file_lance.h"
+#include "lance/arrow/fragment.h"
 #include "lance/arrow/utils.h"
-#include "lance/arrow/writer.h"
+#include "lance/format/manifest.h"
 #include "lance/io/reader.h"
+#include "lance/io/writer.h"
+
+namespace fs = std::filesystem;
 
 namespace lance::testing {
 
@@ -44,9 +47,26 @@ namespace lance::testing {
 }
 
 ::arrow::Result<std::shared_ptr<io::FileReader>> MakeReader(
-    const std::shared_ptr<::arrow::Table>& table) {
+    const std::shared_ptr<::arrow::Table>& table,
+    uint64_t max_rows_per_group) {
   auto sink = ::arrow::io::BufferOutputStream::Create().ValueOrDie();
-  ARROW_RETURN_NOT_OK(lance::arrow::WriteTable(*table, sink));
+
+  auto options = std::make_shared<lance::arrow::FileWriteOptions>();
+  options->batch_size = max_rows_per_group;
+  auto schema = std::make_shared<lance::format::Schema>(table->schema());
+  lance::io::FileWriter writer(schema, options, sink, {});
+
+  std::shared_ptr<::arrow::RecordBatch> batch;
+  ::arrow::TableBatchReader batch_reader(table);
+  batch_reader.set_chunksize(options->batch_size);
+  while (true) {
+    ARROW_RETURN_NOT_OK(batch_reader.ReadNext(&batch));
+    if (!batch) {
+      break;
+    }
+    ARROW_RETURN_NOT_OK(writer.Write(batch));
+  }
+  writer.Finish().Wait();
   auto infile = make_shared<::arrow::io::BufferReader>(sink->Finish().ValueOrDie());
   auto reader = std::make_shared<io::FileReader>(infile);
   ARROW_RETURN_NOT_OK(reader->Open());
@@ -70,6 +90,7 @@ namespace lance::testing {
   auto tmp_dir = "file://" + MakeTemporaryDir().ValueOrDie();
   std::string path;
   std::vector<std::shared_ptr<::arrow::Field>> partition_fields;
+  partition_fields.reserve(partitions.size());
   for (auto& part_col : partitions) {
     partition_fields.emplace_back(table->schema()->GetFieldByName(part_col));
   }
@@ -116,5 +137,37 @@ std::unique_ptr<io::exec::ExecNode> TableScan::MakeEmpty() {
       0,
   };
 }
+
+/// Make one lance fragment from the table.
+::arrow::Result<std::shared_ptr<lance::arrow::LanceFragment>> MakeFragment(
+    const std::shared_ptr<::arrow::Table>& table) {
+  auto data_dir = lance::testing::MakeTemporaryDir().ValueOrDie();
+  auto local_fs = std::make_shared<::arrow::fs::LocalFileSystem>();
+  std::string filename(fs::path(data_dir) / "12345-67890.lance");
+  auto output = local_fs->OpenOutputStream(filename).ValueOrDie();
+
+  {
+    auto write_options = lance::arrow::LanceFileFormat().DefaultWriteOptions();
+    auto schema = std::make_shared<lance::format::Schema>(table->schema());
+    auto writer = lance::io::FileWriter(schema, write_options, output);
+    auto batch_reader = ::arrow::TableBatchReader(table);
+    std::shared_ptr<::arrow::RecordBatch> batch;
+    while (true) {
+      ARROW_RETURN_NOT_OK(batch_reader.ReadNext(&batch));
+      if (batch == nullptr) {
+        break;
+      }
+      ARROW_RETURN_NOT_OK(writer.Write(batch));
+    }
+    writer.Finish().Wait();
+  }
+
+  auto schema = std::make_shared<lance::format::Schema>(table->schema());
+  auto manifest = std::make_shared<lance::format::Manifest>(schema);
+  auto data_file = lance::format::DataFile(filename, schema->GetFieldIds());
+  auto fragment = std::make_shared<lance::format::DataFragment>(data_file);
+  return std::make_shared<lance::arrow::LanceFragment>(
+      local_fs, data_dir, std::move(fragment), std::move(manifest));
+};
 
 }  // namespace lance::testing

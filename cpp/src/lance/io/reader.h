@@ -41,6 +41,10 @@ class FileReader {
       std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool());
 
+  /// Open Manifest file
+  static ::arrow::Result<std::shared_ptr<::lance::format::Manifest>> OpenManifest(
+      const std::shared_ptr<::arrow::io::RandomAccessFile>& in);
+
   explicit FileReader(std::shared_ptr<::arrow::io::RandomAccessFile> in,
                       std::shared_ptr<::lance::format::Manifest> manifest = nullptr,
                       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool()) noexcept;
@@ -52,14 +56,6 @@ class FileReader {
   const lance::format::Schema& schema() const;
 
   ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable();
-
-  ::arrow::Result<std::shared_ptr<::arrow::Table>> ReadTable(
-      const std::vector<std::string>& columns);
-
-  /// Read a RecordBatch at the file offset.
-  ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadAt(const lance::format::Schema& schema,
-                                                                int32_t offset,
-                                                                int32_t length) const;
 
   /// Read a Batch
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch(

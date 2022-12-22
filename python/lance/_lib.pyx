@@ -1,9 +1,12 @@
 # distutils: language = c++
 
-from typing import Optional, List, Dict
+from datetime import datetime, timezone
+from typing import Callable, Optional, List, Dict, Union
 from pathlib import Path
 
+import pyarrow
 from cython.operator cimport dereference as deref
+from libc.time cimport time_t
 from libcpp cimport bool
 from libcpp.memory cimport shared_ptr, static_pointer_cast
 from libcpp.string cimport string
@@ -28,10 +31,19 @@ from pyarrow.includes.libarrow_dataset cimport (
 )
 from pyarrow.includes.libarrow_fs cimport CFileSystem
 from pyarrow.lib cimport (
+    CArray,
     CExpression,
+    CField,
+    CRecordBatch,
+    CTable,
+    Field,
     GetResultValue,
     RecordBatchReader,
     check_status,
+    pyarrow_wrap_batch,
+    pyarrow_unwrap_field,
+    pyarrow_unwrap_array,
+    pyarrow_unwrap_table,
 )
 from pyarrow.lib import tobytes
 from pyarrow.util import _stringify_path
@@ -138,9 +150,57 @@ cdef class LanceFileFormat(FileFormat):
         return LanceFileWriteOptions.wrap(self.format.DefaultWriteOptions())
 
 
+cdef extern from "lance/arrow/updater.h" namespace "lance::arrow" nogil:
+    cdef cppclass CUpdater "::lance::arrow::Updater":
+        CResult[shared_ptr[CRecordBatch]] Next();
+
+        CStatus UpdateBatch(const shared_ptr[CArray] arr);
+
+        CResult[shared_ptr[CLanceDataset]] Finish();
+
+    cdef cppclass CUpdaterBuilder "::lance::arrow::UpdaterBuilder":
+        void Project(vector[string] columns);
+
+        CResult[shared_ptr[CUpdater]] Finish();
+
+
+cdef class Updater:
+    cdef shared_ptr[CUpdater] sp_updater
+
+    @staticmethod
+    cdef wrap(const shared_ptr[CUpdater]& up):
+        cdef Updater self = Updater.__new__(Updater)
+        self.sp_updater = move(up)
+        return self
+
+    def update_batch(self, data: pyarrow.Array):
+        cdef shared_ptr[CArray] arr = pyarrow_unwrap_array(data)
+        with nogil:
+            check_status(self.sp_updater.get().UpdateBatch(arr))
+
+    def finish(self):
+        cdef shared_ptr[CLanceDataset] new_dataset = GetResultValue(
+            self.sp_updater.get().Finish()
+        )
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](new_dataset))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> pyarrow.Table:
+        cdef shared_ptr[CRecordBatch] c_batch
+        c_batch = GetResultValue(self.sp_updater.get().Next())
+        if c_batch.get() == NULL:
+            raise StopIteration
+        batch = pyarrow_wrap_batch(c_batch)
+        return pyarrow.Table.from_batches([batch])
+
+
 cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
     cdef cppclass CDatasetVersion "::lance::arrow::DatasetVersion":
         uint64_t version() const;
+
+        time_t timet_timestamp() const;
 
     cdef cppclass CLanceDataset "::lance::arrow::LanceDataset":
         enum WriteMode "WriteMode":
@@ -167,10 +227,19 @@ cdef extern from "lance/arrow/dataset.h" namespace "lance::arrow" nogil:
 
         CResult[vector[CDatasetVersion]] versions() const;
 
+        CResult[shared_ptr[CUpdaterBuilder]] NewUpdate(const shared_ptr[CField]& field) const;
+
+        CResult[shared_ptr[CLanceDataset]] AddColumn(
+                const shared_ptr[CField]& field, CExpression expression);
+
+        CResult[shared_ptr[CLanceDataset]] Merge(
+                const shared_ptr[CTable]& table, const string& left_on, const string& right_on
+        )
 
 cdef _dataset_version_to_json(CDatasetVersion cdv):
     return {
         "version": cdv.version(),
+        "timestamp": datetime.fromtimestamp(cdv.timet_timestamp(), tz=timezone.utc),
     }
 
 cdef class FileSystemDataset(Dataset):
@@ -219,6 +288,68 @@ cdef class FileSystemDataset(Dataset):
         """Get the latest version of the dataset."""
         c_version = GetResultValue(self.lance_dataset.latest_version())
         return _dataset_version_to_json(c_version)
+
+    def _append_column_expr(self, field: Field, expression: Expression) -> FileSystemDataset:
+        cdef CExpression c_expression = expression.unwrap()
+        cdef shared_ptr[CField] c_field = pyarrow_unwrap_field(field)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(self.lance_dataset.AddColumn(c_field, c_expression))
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
+
+    def append_column(
+        self,
+        value: Union[Callable[[pyarrow.Table], pyarrow.Array], Expression],
+        field: Optional[Field] = None,
+        columns: Optional[List[str]] = None,
+    ) -> FileSystemDataset:
+        """Append a new column.
+
+        Parameters
+        ----------
+        value : Callback[[pyarrow.Table], pyarrow.Array], pyarrow.compute.Expression
+            A function / callback that takes in a Batch and produces an Array. The generated array must
+            have the same length as the input batch.
+        field : pyarrow.Field, optional
+            The name and schema of the newly added column.
+        columns : list of strs, optional.
+            The list of columns to read from the source dataset.
+        """
+        cdef:
+            shared_ptr[CUpdater] c_updater
+            shared_ptr[CField] c_field
+            shared_ptr[CUpdaterBuilder] c_update_builder
+
+        if isinstance(value, Expression):
+            return self._append_column_expr(field, value)
+        elif isinstance(value, Callable):
+            c_field = pyarrow_unwrap_field(field)
+            c_update_builder = GetResultValue(self.lance_dataset.NewUpdate(c_field))
+            if columns is not None and len(columns) > 0:
+                c_update_builder.get().Project([tobytes(col) for col in columns])
+            c_updater = GetResultValue(c_update_builder.get().Finish())
+            updater = Updater.wrap(c_updater)
+            for table in updater:
+                arr = value(table)
+                updater.update_batch(arr)
+            return updater.finish()
+        else:
+            raise ValueError(f"Value does not accept type: {type(value)}")
+
+    def merge(self, right: pyarrow.Table, left_on: str, right_on: str) -> FileSystemDataset:
+        """Merge another table using Left-join
+
+        Parameters:
+        right : pyarrow.Table
+            The table to merge into this dataset.
+        left_on : str
+            The name of the column in this dataset to be compared during merge.
+        right_on : str
+            The name of the column in the right table to be compared during merge.
+        """
+        cdef shared_ptr[CTable] c_table = pyarrow_unwrap_table(right)
+        cdef shared_ptr[CLanceDataset] dataset = GetResultValue(
+            self.lance_dataset.Merge(c_table, tobytes(left_on), tobytes(right_on))
+        )
+        return FileSystemDataset.wrap(static_pointer_cast[CDataset, CLanceDataset](dataset))
 
 def _lance_dataset_write(
         Dataset data,

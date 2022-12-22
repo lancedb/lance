@@ -28,6 +28,7 @@ namespace lance::format {
 /// PageTable lookup table for pages.
 class PageTable {
  public:
+  /// Page info: [position, length].
   using PageInfo = std::tuple<int64_t, int64_t>;
 
   PageTable() = default;

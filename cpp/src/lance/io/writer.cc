@@ -34,7 +34,7 @@ namespace lance::io {
 static constexpr int16_t kMajorVersion = 0;
 static constexpr int16_t kMinorVersion = 1;
 
-namespace internal {
+namespace {
 
 /**
  * Write the 16 bytes footer to the end of a file.
@@ -50,7 +50,7 @@ namespace internal {
  *  - 2 bytes minor version number
  *  - 4 bytes magic word.
  */
-::arrow::Status WriteFooter(std::shared_ptr<::arrow::io::OutputStream> sink,
+::arrow::Status WriteFooter(const std::shared_ptr<::arrow::io::OutputStream>& sink,
                             int64_t metadata_offset) {
   ARROW_RETURN_NOT_OK(WriteInt<int64_t>(sink, metadata_offset));
   ARROW_RETURN_NOT_OK(WriteInt<int16_t>(sink, kMajorVersion));
@@ -58,16 +58,16 @@ namespace internal {
   return sink->Write(lance::format::kMagic, 4);
 }
 
-}  // namespace internal
+}  // namespace
 
-FileWriter::FileWriter(std::shared_ptr<::arrow::Schema> schema,
+FileWriter::FileWriter(std::shared_ptr<lance::format::Schema> schema,
                        std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
                        std::shared_ptr<::arrow::io::OutputStream> destination,
                        ::arrow::fs::FileLocator destination_locator)
-    : ::arrow::dataset::FileWriter(schema, options, destination, destination_locator),
-      lance_schema_(std::make_unique<lance::format::Schema>(schema)),
+    : ::arrow::dataset::FileWriter(schema->ToArrow(), options, destination, destination_locator),
+      lance_schema_(std::move(schema)),
       metadata_(std::make_unique<lance::format::Metadata>()) {
-  assert(schema->num_fields() > 0);
+  assert(lance_schema_->fields().size() > 0);
 }
 
 FileWriter::~FileWriter() {}
@@ -79,6 +79,18 @@ FileWriter::~FileWriter() {}
   }
   batch_id_++;
   return ::arrow::Status::OK();
+}
+
+::arrow::Status FileWriter::WriteManifest(
+    const std::shared_ptr<::arrow::io::OutputStream>& destination,
+    const lance::format::Manifest& manifest) {
+  // Write dictionary values first.
+  auto visitor = format::WriteDictionaryVisitor(destination);
+  ARROW_RETURN_NOT_OK(visitor.VisitSchema(*manifest.schema()));
+
+  auto pb = manifest.ToProto();
+  ARROW_ASSIGN_OR_RAISE(auto offset, WriteProto(destination, pb));
+  return ::lance::io::WriteFooter(destination, offset);
 }
 
 ::arrow::Status FileWriter::WriteArray(const std::shared_ptr<format::Field>& field,
@@ -194,11 +206,13 @@ FileWriter::~FileWriter() {}
     auto opts = std::dynamic_pointer_cast<lance::arrow::FileWriteOptions>(options_);
   }
   format::Manifest manifest(lance_schema_);
-  ARROW_ASSIGN_OR_RAISE(pos, manifest.Write(destination_));
+  auto pb = manifest.ToProto();
+  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, pb));
   metadata_->SetManifestPosition(pos);
 
-  ARROW_ASSIGN_OR_RAISE(pos, metadata_->Write(destination_));
-  return internal::WriteFooter(destination_, pos);
+  auto metadata_pb = metadata_->ToProto();
+  ARROW_ASSIGN_OR_RAISE(pos, WriteProto(destination_, metadata_pb));
+  return ::lance::io::WriteFooter(destination_, pos);
 }
 
 ::arrow::Future<> FileWriter::FinishInternal() {

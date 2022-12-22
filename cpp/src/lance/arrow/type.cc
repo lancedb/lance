@@ -22,6 +22,7 @@
 #include <fmt/format.h>
 
 #include <memory>
+#include <range/v3/all.hpp>
 
 #include "lance/format/schema.h"
 
@@ -253,6 +254,20 @@ std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> d
     return ext_type->extension_name();
   }
   return std::nullopt;
+}
+
+std::string ToColumnName(const ::arrow::FieldRef& field_ref) {
+  if (field_ref.IsName()) {
+    return *field_ref.name();
+  } else if (field_ref.IsNested()) {
+    return *field_ref.nested_refs()                                               //
+           | ranges::views::filter([](auto& ref) { return !ref.IsFieldPath(); })  //
+           | ranges::views::transform([](auto& ref) { return *ref.name(); })      //
+           | ranges::views::join('.')                                             // ;
+           | ranges::to<std::string>;
+  }
+  assert(false);
+  return "";
 }
 
 }  // namespace lance::arrow

@@ -54,8 +54,9 @@ from lance.data.convert.base import DatasetConverter
 class OxfordPetConverter(DatasetConverter):
     # TODO include trimaps
 
-    def __init__(self, uri_root, images_root):
-        super(OxfordPetConverter, self).__init__("oxford_pet", uri_root, images_root)
+    def __init__(self, uri_root, images_root=None):
+        super(OxfordPetConverter, self).__init__(
+            "oxford_pet", uri_root, images_root or uri_root)
         self._data_quality_issues = {}
 
     def read_metadata(self, num_rows: int = 0, check_quality=False) -> pd.DataFrame:
@@ -192,7 +193,7 @@ class OxfordPetConverter(DatasetConverter):
         return metadata_df
 
     def image_uris(self, table) -> List[str]:
-        uris = [os.path.join(self.uri_root, image_uri[len(self.images_root):])
+        uris = [os.path.join(self.uri_root, image_uri[len(self.images_root) + 1:])
                 for image_uri in table["external_image"].to_numpy()]
         return uris
 

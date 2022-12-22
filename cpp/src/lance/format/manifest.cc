@@ -15,6 +15,7 @@
 #include "lance/format/manifest.h"
 
 #include <arrow/result.h>
+#include <google/protobuf/util/time_util.h>
 
 #include <memory>
 
@@ -26,7 +27,28 @@ using arrow::Status;
 
 namespace lance::format {
 
-Manifest::Manifest(std::shared_ptr<Schema> schema) : schema_(std::move(schema)), version_(1) {}
+namespace {
+
+google::protobuf::Timestamp ToProto(const std::chrono::time_point<std::chrono::system_clock>& ts) {
+  return google::protobuf::util::TimeUtil::TimeTToTimestamp(
+      std::chrono::system_clock::to_time_t(ts));
+};
+
+std::chrono::time_point<std::chrono::system_clock> FromProto(
+    const google::protobuf::Timestamp& proto) {
+  return std::chrono::system_clock::from_time_t(
+      google::protobuf::util::TimeUtil::TimestampToTimeT(proto));
+}
+
+}  // namespace
+
+Manifest::Manifest(std::shared_ptr<Schema> schema)
+    : schema_(std::move(schema)), version_(1, std::chrono::system_clock::now()) {}
+
+Manifest::Manifest(std::shared_ptr<Schema> schema,
+                   lance::arrow::DatasetVersion version,
+                   std::vector<std::shared_ptr<DataFragment>> fragments)
+    : schema_(std::move(schema)), version_(version), fragments_(std::move(fragments)) {}
 
 Manifest::Manifest(Manifest&& other) noexcept
     : schema_(std::move(other.schema_)),
@@ -37,19 +59,26 @@ Manifest::Manifest(const Manifest& other) noexcept
     : schema_(other.schema_), version_(other.version_), fragments_(other.fragments()) {}
 
 Manifest::Manifest(const lance::format::pb::Manifest& pb)
-    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())), version_(pb.version()) {
+    : schema_(std::make_unique<Schema>(pb.fields(), pb.metadata())),
+      version_(pb.version(), FromProto(pb.timestamp())) {
   for (auto& pb_fragment : pb.fragments()) {
     fragments_.emplace_back(std::make_shared<DataFragment>(pb_fragment));
   }
 }
 
 ::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
-    std::shared_ptr<::arrow::io::RandomAccessFile> in, int64_t offset) {
+    const std::shared_ptr<::arrow::io::RandomAccessFile>& in, int64_t offset) {
   ARROW_ASSIGN_OR_RAISE(auto pb, io::ParseProto<pb::Manifest>(in, offset));
   return std::shared_ptr<Manifest>(new Manifest(pb));
 }
 
-::arrow::Result<int64_t> Manifest::Write(std::shared_ptr<::arrow::io::OutputStream> out) const {
+::arrow::Result<std::shared_ptr<Manifest>> Manifest::Parse(
+    const std::shared_ptr<::arrow::Buffer>& buffer) {
+  ARROW_ASSIGN_OR_RAISE(auto pb, io::ParseProto<pb::Manifest>(buffer));
+  return std::shared_ptr<Manifest>(new Manifest(pb));
+}
+
+pb::Manifest Manifest::ToProto() const {
   lance::format::pb::Manifest pb;
   for (auto field : schema_->ToProto()) {
     auto pb_field = pb.add_fields();
@@ -58,12 +87,14 @@ Manifest::Manifest(const lance::format::pb::Manifest& pb)
   for (const auto& [key, value] : schema_->metadata()) {
     (*pb.mutable_metadata())[key] = value;
   }
-  pb.set_version(version_);
+  pb.set_version(version_.version());
+  *pb.mutable_timestamp() = format::ToProto(version_.timestamp());
+
   for (const auto& fragment : fragments_) {
     auto pb_fragment = pb.add_fragments();
     *pb_fragment = fragment->ToProto();
   }
-  return io::WriteProto(out, pb);
+  return pb;
 }
 
 std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
@@ -75,9 +106,13 @@ std::shared_ptr<Manifest> Manifest::BumpVersion(bool overwrite) {
   return new_manifest;
 }
 
-const Schema& Manifest::schema() const { return *schema_; }
+void Manifest::Touch() {
+  version_.Touch();
+}
 
-uint64_t Manifest::version() const { return version_; }
+const std::shared_ptr<Schema>& Manifest::schema() const { return schema_; }
+
+uint64_t Manifest::version() const { return version_.version(); }
 
 const std::vector<std::shared_ptr<DataFragment>>& Manifest::fragments() const { return fragments_; }
 
@@ -85,8 +120,6 @@ void Manifest::AppendFragments(const std::vector<std::shared_ptr<DataFragment>>&
   fragments_.insert(std::end(fragments_), std::begin(fragments), std::end(fragments));
 }
 
-arrow::DatasetVersion Manifest::GetDatasetVersion() const {
-  return arrow::DatasetVersion{version_};
-}
+const arrow::DatasetVersion& Manifest::GetDatasetVersion() const { return version_; }
 
 }  // namespace lance::format

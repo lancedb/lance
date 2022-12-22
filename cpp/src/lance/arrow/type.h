@@ -27,6 +27,9 @@
 #include <vector>
 
 template <typename T>
+concept ArrowType = std::is_base_of<::arrow::DataType, T>::value;
+
+template <typename T>
 concept HasToString = requires(T t) {
                         { t.ToString() } -> std::same_as<std::string>;
                       };
@@ -105,5 +108,8 @@ inline bool is_fixed_length(const std::shared_ptr<::arrow::DataType>& data_type)
 ::arrow::Result<std::shared_ptr<::arrow::DataType>> FromLogicalType(const std::string& logical_type);
 
 std::optional<std::string> GetExtensionName(std::shared_ptr<::arrow::DataType> dtype);
+
+/// Convert an Arrow FieldRef to a Lance (nested) column name.
+std::string ToColumnName(const ::arrow::FieldRef& field_ref);
 
 }  // namespace lance::arrow

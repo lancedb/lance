@@ -24,6 +24,8 @@
 #include <filesystem>
 #include <future>
 
+#include "lance/arrow/dataset.h"
+
 std::shared_ptr<::arrow::dataset::Scanner> OpenScanner(
     const std::string& uri,
     const std::vector<std::string>& columns,
@@ -81,13 +83,13 @@ std::shared_ptr<::arrow::io::RandomAccessFile> OpenUri(const std::string& uri, b
 }
 
 /// Open Dataset from the URI.
-std::shared_ptr<::arrow::dataset::FileSystemDataset> OpenDataset(const std::string& uri,
-                                                                 const std::string& format) {
+std::shared_ptr<::arrow::dataset::Dataset> OpenDataset(const std::string& uri,
+                                                       const std::string& format) {
   std::string path;
   auto fs = ::arrow::fs::FileSystemFromUriOrPath(uri, &path).ValueOrDie();
   std::shared_ptr<arrow::dataset::FileFormat> file_format;
   if (format == "lance") {
-    file_format.reset(new lance::arrow::LanceFileFormat());
+    return lance::arrow::LanceDataset::Make(fs, path).ValueOrDie();
   } else if (format == "parquet") {
     file_format.reset(new arrow::dataset::ParquetFileFormat());
   } else {

@@ -15,7 +15,7 @@ from lance.io import download_uris
 sys.path.append("..")
 
 from suite import BenchmarkSuite, get_dataset, get_uri
-from datagen import OxfordPetConverter
+from lance.data.convert.oxford_pet import OxfordPetConverter
 
 import lance
 
@@ -39,7 +39,7 @@ def filter_data(base_uri: str, fmt: str, flavor: Optional[str]):
     uri = get_uri(base_uri, "oxford_pet", fmt, flavor)
     if fmt == "parquet":
         ds = get_dataset(uri)
-        query = "SELECT image, class FROM ds WHERE class='pug' " "LIMIT 50 OFFSET 20"
+        query = "SELECT image, class FROM ds WHERE class='pug' LIMIT 50 OFFSET 20"
         return duckdb.query(query).to_arrow_table()
     elif fmt == "lance":
         scanner = lance.dataset(uri).scanner(

@@ -199,6 +199,10 @@ class Field final {
 
   const std::shared_ptr<::arrow::Array>& dictionary() const;
 
+  /// Set the directory values for a dictionary field.
+  ///
+  /// \param dict_arr dictionary values
+  /// \return `status::OK()` if success. Fails if the dictionary is already set.
   ::arrow::Status set_dictionary(std::shared_ptr<::arrow::Array> dict_arr);
 
   lance::encodings::Encoding encoding() const { return encoding_; };

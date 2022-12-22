@@ -28,6 +28,11 @@
 namespace arrow::dataset {
 class ScanOptions;
 }
+
+namespace lance::arrow {
+class LanceFragment;
+}
+
 namespace lance::format {
 class Schema;
 }
@@ -43,10 +48,13 @@ class Project;
 /// Lance RecordBatchReader
 class RecordBatchReader : ::arrow::RecordBatchReader {
  public:
-  /// Constructor.
-  RecordBatchReader(std::shared_ptr<FileReader> reader,
-                    std::shared_ptr<::arrow::dataset::ScanOptions> options,
-                    ::arrow::internal::ThreadPool* thread_pool_) noexcept;
+  /// Factory method.
+  static ::arrow::Result<RecordBatchReader> Make(
+      const lance::arrow::LanceFragment& fragment,
+      std::shared_ptr<::arrow::dataset::ScanOptions> options,
+      ::arrow::internal::Executor* executor = ::arrow::internal::GetCpuThreadPool()) noexcept;
+
+  RecordBatchReader() = delete;
 
   /// Copy constructor.
   RecordBatchReader(const RecordBatchReader& other) noexcept;
@@ -54,10 +62,7 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   /// Move constructor.
   RecordBatchReader(RecordBatchReader&& other) noexcept;
 
-  ~RecordBatchReader() = default;
-
-  /// Open the RecordBatchReader. Must call it before start iterating.
-  ::arrow::Status Open();
+  ~RecordBatchReader() override = default;
 
   std::shared_ptr<::arrow::Schema> schema() const override;
 
@@ -67,15 +72,13 @@ class RecordBatchReader : ::arrow::RecordBatchReader {
   ::arrow::Future<std::shared_ptr<::arrow::RecordBatch>> operator()();
 
  private:
-  RecordBatchReader() = delete;
+  RecordBatchReader(std::shared_ptr<exec::Project> project, ::arrow::internal::Executor* executor);
 
   ::arrow::Result<std::shared_ptr<::arrow::RecordBatch>> ReadBatch() const;
 
-  std::shared_ptr<FileReader> reader_;
-  std::shared_ptr<::arrow::dataset::ScanOptions> options_;
   /// Projection over the dataset.
   std::shared_ptr<exec::Project> project_;
-  ::arrow::internal::ThreadPool* thread_pool_;
+  ::arrow::internal::Executor* executor_;
 };
 
 }  // namespace lance::io

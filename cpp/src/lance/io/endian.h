@@ -40,7 +40,7 @@ template <std::integral T>
 
 /// Write an integer to the output stream.
 template <std::integral T>
-::arrow::Status WriteInt(std::shared_ptr<::arrow::io::OutputStream>& sink, T value) {
+::arrow::Status WriteInt(const std::shared_ptr<::arrow::io::OutputStream>& sink, T value) {
   T v = ::arrow::bit_util::ToLittleEndian(value);
   return sink->Write(&v, sizeof(T));
 }

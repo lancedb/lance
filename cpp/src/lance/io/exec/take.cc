@@ -18,24 +18,15 @@
 
 #include <memory>
 
+#include "lance/arrow/type.h"
 #include "lance/arrow/utils.h"
+#include "lance/io/exec/scan.h"
 
 namespace lance::io::exec {
 
-Take::Take(std::shared_ptr<FileReader> reader,
-           std::shared_ptr<lance::format::Schema> schema,
-           std::unique_ptr<ExecNode> child)
-    : reader_(std::move(reader)), schema_(std::move(schema)), child_(std::move(child)) {
+Take::Take(std::unique_ptr<ExecNode> child, std::unique_ptr<Scan> scan)
+    : child_(std::move(child)), scan_(std::move(scan)) {
   assert(child_);
-}
-
-::arrow::Result<std::unique_ptr<Take>> Take::Make(std::shared_ptr<FileReader> reader,
-                                                  std::shared_ptr<lance::format::Schema> schema,
-                                                  std::unique_ptr<ExecNode> child) {
-  if (!child) {
-    return ::arrow::Status::Invalid("Take::Make: child can not be null");
-  }
-  return std::unique_ptr<Take>(new Take(reader, schema, std::move(child)));
 }
 
 ::arrow::Result<ScanBatch> Take::Next() {
@@ -46,21 +37,20 @@ Take::Take(std::shared_ptr<FileReader> reader,
   assert(filtered.indices);
   const auto batch_id = filtered.batch_id;
   auto offset = filtered.offset;
-  if (!schema_ || schema_->fields().empty()) {
+  if (!scan_) {
     return ScanBatch(filtered.batch, batch_id, offset);
-  } else {
-    auto offset_datum = ::arrow::Datum(offset);
-    ARROW_ASSIGN_OR_RAISE(auto adjusted_offsets,
-                          ::arrow::compute::Add(filtered.indices, offset_datum));
-    auto adjusted_offsets_arr =
-        std::dynamic_pointer_cast<::arrow::Int32Array>(adjusted_offsets.make_array());
-    ARROW_ASSIGN_OR_RAISE(auto rest_columns,
-                          reader_->ReadBatch(*schema_, batch_id, adjusted_offsets_arr));
-    assert(filtered.batch->num_rows() == rest_columns->num_rows());
-    ARROW_ASSIGN_OR_RAISE(auto merged_batch,
-                          lance::arrow::MergeRecordBatches(filtered.batch, rest_columns));
-    return ScanBatch(merged_batch, filtered.batch_id, offset);
   }
+
+  auto offset_datum = ::arrow::Datum(offset);
+  ARROW_ASSIGN_OR_RAISE(auto adjusted_offsets,
+                        ::arrow::compute::Add(filtered.indices, offset_datum));
+  auto adjusted_offsets_arr =
+      std::dynamic_pointer_cast<::arrow::Int32Array>(adjusted_offsets.make_array());
+  ARROW_ASSIGN_OR_RAISE(auto rest_columns, scan_->Take(batch_id, adjusted_offsets_arr));
+  assert(filtered.batch->num_rows() == rest_columns->num_rows());
+  ARROW_ASSIGN_OR_RAISE(auto merged_batch,
+                        lance::arrow::MergeRecordBatches(filtered.batch, rest_columns));
+  return ScanBatch(merged_batch, filtered.batch_id, offset);
 }
 
 std::string Take::ToString() const { return "Take"; }

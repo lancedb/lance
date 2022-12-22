@@ -36,15 +36,19 @@ namespace lance::io {
 /// Lance FileWriter
 class FileWriter final : public ::arrow::dataset::FileWriter {
  public:
-  FileWriter(std::shared_ptr<::arrow::Schema> schema,
+  FileWriter(std::shared_ptr<lance::format::Schema> schema,
              std::shared_ptr<::arrow::dataset::FileWriteOptions> options,
              std::shared_ptr<::arrow::io::OutputStream> destination,
-             ::arrow::fs::FileLocator destination_locator);
+             ::arrow::fs::FileLocator destination_locator = {});
 
-  ~FileWriter();
+  ~FileWriter() override;
 
   /// Write an arrow RecordBatch to the file.
   ::arrow::Status Write(const std::shared_ptr<::arrow::RecordBatch>& batch) override;
+
+  /// Write Manifest to a file.
+  static ::arrow::Status WriteManifest(const std::shared_ptr<::arrow::io::OutputStream>& destination,
+                                       const lance::format::Manifest& manifest);
 
  private:
   ::arrow::Future<> FinishInternal() override;
