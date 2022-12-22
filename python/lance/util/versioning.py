@@ -23,13 +23,11 @@
 #  limitations under the License.
 from __future__ import annotations
 
-import functools
 import itertools
 from datetime import datetime, timezone
 from functools import cached_property
 from typing import Callable, Union
 
-import duckdb
 import pandas as pd
 import pyarrow as pa
 
@@ -190,6 +188,7 @@ class RowDiff:
         columns: list[str], default None
             Get all rows if not specified
         """
+        import duckdb
         v1 = self.ds_start
         v2 = self.ds_end
         if columns is None:
