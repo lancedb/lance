@@ -100,18 +100,18 @@ def diff(dataset: FileSystemDataset, v1: int, v2: int = None) -> LanceDiff:
     dataset: FileSystemDataset
         The dataset we want to get the diff for
     v1: int
-        Start version. If negative then it is assumed to be reverse from latest.
-        So -1 would mean the second to the latest version
+        Start version. If negative then it is assumed to be offset from latest.
+        So -1 would mean the second-to-last version (i.e., dataset.versions()[-2])
     v2: int, default None
-        End version. If not specified, use the current version in the given
-        dataset
+        End version. If not specified (or 0), use the current version in the given
+        dataset.
     """
     if v1 < 0:
-        v1 = dataset.versions()[v1]["version"]
+        v1 = dataset.versions()[v1-1]["version"]
     if v2 is None:
         v2 = dataset.version["version"]
     if v2 < 0:
-        v2 = dataset.versions()[v2]["version"]
+        v2 = dataset.versions()[v2-1]["version"]
     if v1 > v2:
         raise ValueError("v2 must not be less than v1")
     return LanceDiff(dataset.checkout(v1),
