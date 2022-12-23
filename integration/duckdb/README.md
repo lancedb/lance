@@ -38,9 +38,9 @@ Vector functions
 
 Misc functions
 
-| Function     | Description                  |
-|--------------|------------------------------|
-| `dydx(y, x)` | Calculate $$\frac{dy}{dx} $$ |
+| Function     | Description                             |
+|--------------|-----------------------------------------|
+| `dydx(y, x)` | Calculate derivative $$\frac{dy}{dx} $$ |
 
 ## Development
 
