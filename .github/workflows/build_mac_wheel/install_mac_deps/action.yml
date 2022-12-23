@@ -5,6 +5,10 @@ runs:
   steps:
     - name: "brew install base libs"
       shell: bash
-      run: |        
-        brew update
+      run: |       
+        brew pin python@3.10
+        cd $(brew --repository)
+        git fetch origin --tags
+        git checkout 3.6.16  # Arrow 10.0
+        brew update          
         brew install apache-arrow protobuf
