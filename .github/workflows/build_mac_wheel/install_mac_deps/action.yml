@@ -5,6 +5,7 @@ runs:
   steps:
     - name: "brew install base libs"
       shell: bash
-      run: |        
+      run: |       
+        brew pin python
         brew update
         brew install apache-arrow protobuf

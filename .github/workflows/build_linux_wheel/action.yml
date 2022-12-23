@@ -3,7 +3,7 @@ name: build-linux-wheel
 description: "Build a manylinux wheel for lance"
 inputs:
   python-minor-version:
-    description: "8, 9, 10"
+    description: "8, 9, 10, 11"
     required: true
 runs:
   using: "composite"

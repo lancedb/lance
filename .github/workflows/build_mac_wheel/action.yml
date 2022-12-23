@@ -3,7 +3,7 @@ name: build_wheel
 description: "Build a lance wheel"
 inputs:
   python-minor-version:
-    description: "8, 9, 10"
+    description: "8, 9, 10, 11"
     required: true
 runs:
   using: "composite"
@@ -11,7 +11,7 @@ runs:
     - name: "Install macos dependencies"
       uses: ./.github/workflows/build_mac_wheel/install_mac_deps
     - name: Build macos wheels
-      uses: pypa/cibuildwheel@v2.8.1
+      uses: pypa/cibuildwheel@v2.11.3
       env:
         CIBW_BUILD: cp3${{ inputs.python-minor-version }}*
         CIBW_TEST_SKIP: "*"

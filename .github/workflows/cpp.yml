@@ -41,8 +41,13 @@ jobs:
         working-directory: ./cpp
     steps:
       - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
       - name: Install dependencies
         run: |
+          brew pin python
           brew update
           cd $(brew --repository)
           git checkout 3.6.8  # Arrow 10.0

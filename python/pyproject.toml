@@ -13,7 +13,7 @@ filterwarnings = ["error"]
 testpaths = ["lance/tests"]
 
 [tool.cibuildwheel]
-build = "cp38-* cp39-* cp310-*"
+build = "cp38-* cp39-* cp310-* cp311-*"
 test-command = "pytest {project}/python/lance/tests"
 test-extras = ["test"]
 test-skip = ["*universal2:arm64"]
