@@ -72,3 +72,6 @@ wheelhouse
 
 # pandas testing
 .hypothesis
+
+
+**/df.json
