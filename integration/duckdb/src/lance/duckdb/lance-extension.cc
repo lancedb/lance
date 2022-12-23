@@ -17,10 +17,13 @@
 #include "lance-extension.h"
 
 #include <duckdb.hpp>
+#include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 
 #include "lance/duckdb/lance_reader.h"
 #include "lance/duckdb/list_functions.h"
+#if defined(WITH_PYTORCH)
 #include "lance/duckdb/ml/functions.h"
+#endif
 #include "lance/duckdb/vector_functions.h"
 
 namespace duckdb {
@@ -40,6 +43,7 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
     catalog.CreateFunction(context, func.get());
   }
 
+#if defined(WITH_PYTORCH)
   for (auto &func : lance::duckdb::ml::GetMLFunctions()) {
     catalog.CreateFunction(context, func.get());
   }
@@ -47,6 +51,7 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
   for (auto &func : lance::duckdb::ml::GetMLTableFunctions()) {
     catalog.CreateTableFunction(context, func.get());
   }
+#endif
 
   auto scan_func = lance::duckdb::GetLanceReaderFunction();
   ::duckdb::CreateTableFunctionInfo scan(scan_func);
