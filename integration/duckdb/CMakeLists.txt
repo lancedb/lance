@@ -7,7 +7,8 @@ endif()
 #add_compile_options(-mf16c) # opencv
 
 project(lance_duckdb CXX)
-option(LANCE_BUILD_PYTORCH "Build with PyTorch" TRUE)
+# Build DuckDB PyTorch extension
+option(LANCE_BUILD_PYTORCH "Build with PyTorch" OFF)
 
 set(OS_ARCH "amd64")
 string(REGEX MATCH "(arm64|aarch64)" IS_ARM "${CMAKE_SYSTEM_PROCESSOR}")
@@ -35,7 +36,7 @@ FetchContent_Declare(
 list(APPEND available_contents duckdb)
 
 if(LANCE_BUILD_PYTORCH)
-
+  add_compile_definitions(WITH_PYTORCH)
   if(OS_ARCH STREQUAL "amd64")
     set(CPU_BASELINE AVX2)
   endif()
