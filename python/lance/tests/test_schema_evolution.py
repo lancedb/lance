@@ -53,8 +53,10 @@ def test_column_projection(tmp_path: Path):
         return pa.array([str(i) for i in x.column("a")])
 
     new_dataset = dataset.append_column(
-        value_func, field=pa.field("c", pa.utf8()), columns=["a"],
-        metadata={"author": "me"}
+        value_func,
+        field=pa.field("c", pa.utf8()),
+        columns=["a"],
+        metadata={"author": "me"},
     )
 
     actual_df = new_dataset.to_table().to_pandas()
@@ -136,7 +138,9 @@ def test_add_column_with_table_with_metadata(tmp_path: Path):
     dataset = lance.dataset(base_dir)
 
     new_table = pa.Table.from_pylist([{"a": i, "c": i * 10} for i in range(10)])
-    new_dataset = dataset.merge(new_table, left_on="a", right_on="a", metadata={"k1": "v2"})
+    new_dataset = dataset.merge(
+        new_table, left_on="a", right_on="a", metadata={"k1": "v2"}
+    )
     assert new_dataset.version["version"] == 2
     assert new_dataset.version["metadata"] == {"k1": "v2"}
 
