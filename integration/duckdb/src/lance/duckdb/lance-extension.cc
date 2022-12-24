@@ -34,7 +34,10 @@ static DefaultMacro macros[] = {
      "dydx",
      {"y", "x", nullptr},
      "y - lag(y, 1) OVER (ORDER BY x) / (x - lag(x, 1, 0) OVER (ORDER BY x))"},
-    {DEFAULT_SCHEMA, "is_window", {"expr", "start", "end", nullptr}, "bool_and(expr)"},
+    {DEFAULT_SCHEMA,
+     "is_window",
+     {"expr", "before", "after", nullptr},
+     "bool_and(expr) OVER (ROWS BETWEEN before PRECEDING AND after FOLLOWING)"},
     {nullptr, nullptr, {nullptr}, nullptr}};
 
 void LanceExtension::Load(::duckdb::DuckDB &db) {
