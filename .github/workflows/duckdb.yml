@@ -17,7 +17,7 @@ jobs:
     env:
       ArrowVersion: 10.0.1-1
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
       - name: Install dependencies
@@ -29,10 +29,8 @@ jobs:
           sudo apt update
           sudo apt install -y -V libarrow-dev=${ArrowVersion} libarrow-dataset-dev=${ArrowVersion} libparquet-dev=${ArrowVersion}
           pip install duckdb==0.6.1 pytest pylance
-      - name: Cmake
-        run: cmake -B build
       - name: Build
-        run: make -C build -j 4
+        run: make release-linux
       - name: Run tests
         run: pytest tests
   MacOS:
@@ -42,7 +40,7 @@ jobs:
       run:
         working-directory: ./integration/duckdb
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
           brew pin python@3.10
