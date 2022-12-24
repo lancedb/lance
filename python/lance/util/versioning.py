@@ -108,6 +108,7 @@ def compute_metric(
 
 def _compute_metric(version, uri, func, vcol_name):
     import lance
+
     vdf = func(lance.dataset(uri, version=version))
     if vcol_name in vdf:
         raise ValueError(f"{vcol_name} already in output df")

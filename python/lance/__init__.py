@@ -15,7 +15,7 @@
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union, Callable
+from typing import Callable, Optional, Union
 
 import pandas
 import pandas as pd
@@ -36,9 +36,16 @@ from lance.lib import (
 )
 from lance.types import register_extension_types
 
-__all__ = ["dataset", "write_dataset", "LanceFileFormat", "__version__", "diff", "compute_metric"]
+__all__ = [
+    "dataset",
+    "write_dataset",
+    "LanceFileFormat",
+    "__version__",
+    "diff",
+    "compute_metric",
+]
 
-from .util.versioning import get_version_asof, LanceDiff, compute_metric
+from .util.versioning import LanceDiff, compute_metric, get_version_asof
 
 register_extension_types()
 
@@ -107,15 +114,16 @@ def diff(dataset: FileSystemDataset, v1: int, v2: int = None) -> LanceDiff:
         dataset.
     """
     if v1 < 0:
-        v1 = dataset.versions()[v1-1]["version"]
+        v1 = dataset.versions()[v1 - 1]["version"]
     if v2 is None:
         v2 = dataset.version["version"]
     if v2 < 0:
-        v2 = dataset.versions()[v2-1]["version"]
+        v2 = dataset.versions()[v2 - 1]["version"]
     if v1 > v2:
         raise ValueError("v2 must not be less than v1")
-    return LanceDiff(dataset.checkout(v1),
-                     dataset if v2 is None else dataset.checkout(v2))
+    return LanceDiff(
+        dataset.checkout(v1), dataset if v2 is None else dataset.checkout(v2)
+    )
 
 
 def _is_plain_dataset(filesystem: pa.fs.FileSystem, uri: str):

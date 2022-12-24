@@ -18,12 +18,7 @@ import pytest
 import pytz
 
 import lance
-from lance.util.versioning import (
-    ColumnDiff,
-    LanceDiff,
-    RowDiff,
-    get_version_asof,
-)
+from lance.util.versioning import ColumnDiff, LanceDiff, RowDiff, get_version_asof
 
 
 def test_get_version_asof(tmp_path):
