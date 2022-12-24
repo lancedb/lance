@@ -20,7 +20,7 @@ Machine Learning functions
 | `predict(model, blob)`            | Run model inference over image |
 | `ml_models()`                     | Show all ML models             |
 
-Currently the Lance duckdb extension is compiled against pytorch 1.13
+Currently, the Lance duckdb extension is compiled against pytorch 1.13
 
 ```sql
 CALL create_pytorch_model('resnet', './resnet.pth', 'cpu')
@@ -36,6 +36,11 @@ Vector functions
 | `l2_distance(list, list)`        | Calculate L2 distance between two vectors |
 | `in_rectangle(list, list[list])` | Whether the point is in a bounding box    |
 
+Misc functions
+
+| Function     | Description                          |
+|--------------|--------------------------------------|
+| `dydx(y, x)` | Calculate derivative $\frac{dy}{dx}$ |
 
 ## Development
 

@@ -48,3 +48,8 @@ def test_list_argmax(db: duckdb.DuckDBPyConnection):
     for dtype in ["INT", "BIGINT", "FLOAT", "DOUBLE"]:
         df = db.query(f"""SELECT list_argmax([1, 2, 3, 2, 1]::{dtype}[]) as idx""").to_df()
         assert_series_equal(df.idx, pd.Series([2], name='idx', dtype='int32'))
+
+def test_derivative(db: duckdb.DuckDBPyConnection):
+    tbl = pa.Table.from_pylist([{"x": i * 0.2, "y": i * 1} for i in range(5)])
+    df = db.query("SELECT dydx(y, x) as d FROM tbl").to_df()
+    assert_series_equal(df.d, pd.Series([None, 5, 5, 5, 5]))
