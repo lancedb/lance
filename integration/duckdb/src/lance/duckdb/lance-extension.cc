@@ -29,11 +29,13 @@
 
 namespace duckdb {
 
-static DefaultMacro macros[] = {{DEFAULT_SCHEMA,
-                                 "dydx",
-                                 {"y", "x", nullptr},
-                                 "y - lag(y, 1) OVER (ORDER BY x) / (x - lag(x, 1, 0) OVER (ORDER BY x))"},
-                                {nullptr, nullptr, {nullptr}, nullptr}};
+static DefaultMacro macros[] = {
+    {DEFAULT_SCHEMA,
+     "dydx",
+     {"y", "x", nullptr},
+     "y - lag(y, 1) OVER (ORDER BY x) / (x - lag(x, 1, 0) OVER (ORDER BY x))"},
+    {DEFAULT_SCHEMA, "is_window", {"expr", "start", "end", nullptr}, "bool_and(expr)"},
+    {nullptr, nullptr, {nullptr}, nullptr}};
 
 void LanceExtension::Load(::duckdb::DuckDB &db) {
   duckdb::Connection con(db);
