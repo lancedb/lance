@@ -127,6 +127,9 @@ set(LANCE_EXT_SOURCE_COMMON
     src/lance/duckdb/list_functions.cc
     src/lance/duckdb/list_functions.h
     src/lance/duckdb/vector_functions.cc
+    src/lance/duckdb/vector_functions.h
+    src/lance/duckdb/macros.h
+    src/lance/duckdb/macros.cc
 )
 
 set(LANCE_EXT_SOURCE_ML

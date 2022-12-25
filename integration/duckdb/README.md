@@ -40,37 +40,25 @@ Vector functions
 
 Misc functions
 
-| Function                         | Description                                                                         |
-|----------------------------------|-------------------------------------------------------------------------------------|
-| `dydx(y, x)`                     | Calculate derivative $\frac{dy}{dx}$                                                |
-| `is_window(expr, before, after)` | Is the row in a window with size `[-before, start]` <br/> of all `expr` are `true`. |
+| Function                          | Description                                                                         |
+|-----------------------------------|-------------------------------------------------------------------------------------|
+| `dydx(y, x)`                      | Calculate derivative $\frac{dy}{dx}$                                                |
+| `window_all(expr, before, after)` | Is the row in a window `[-before, start]` <br/> where all `expr` are `true`.        |
+| `window_any(expr, before, after)` | Is the row in a window `[-before, start]` <br/> where at least one `expr` is `true` |
 
 ```sql
 
-SELECT x, is_window(x <= 3, 0, 1) FROM t;
-┌───────┬───────────────────────────┐
-│   x   │ is_window((x <= 3), 0, 1) │
-│ int32 │          boolean          │
-├───────┼───────────────────────────┤
-│     1 │ true                      │
-│     2 │ true                      │
-│     3 │ false                     │
-│     4 │ false                     │
-│     5 │ false                     │
-└───────┴───────────────────────────┘
-
-SELECT x, is_window(x <= 3, 2, 0) FROM t;
-
-┌───────┬───────────────────────────┐
-│   x   │ is_window((x <= 3), 2, 0) │
-│ int32 │          boolean          │
-├───────┼───────────────────────────┤
-│     1 │ true                      │
-│     2 │ true                      │
-│     3 │ true                      │
-│     4 │ false                     │
-│     5 │ false                     │
-└───────┴───────────────────────────┘
+SELECT x, window_all(x <= 3, 2, 0) FROM t;
+┌───────┬────────────────────────────┐
+│   x   │ window_all((x <= 3), 2, 0) │
+│ int32 │          boolean           │
+├───────┼────────────────────────────┤
+│     1 │ true                       │
+│     2 │ true                       │
+│     3 │ true                       │
+│     4 │ false                      │
+│     5 │ false                      │
+└───────┴────────────────────────────┘
 ```
 
 ## Development
