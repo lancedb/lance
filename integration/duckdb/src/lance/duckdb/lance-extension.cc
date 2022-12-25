@@ -17,7 +17,6 @@
 #include "lance-extension.h"
 
 #include <duckdb.hpp>
-#include <duckdb/catalog/default/default_functions.hpp>
 #include <duckdb/parser/parsed_data/create_table_function_info.hpp>
 
 #include "lance/duckdb/lance_reader.h"
@@ -25,15 +24,10 @@
 #if defined(WITH_PYTORCH)
 #include "lance/duckdb/ml/functions.h"
 #endif
+#include "lance/duckdb/macros.h"
 #include "lance/duckdb/vector_functions.h"
 
 namespace duckdb {
-
-static DefaultMacro macros[] = {{DEFAULT_SCHEMA,
-                                 "dydx",
-                                 {"y", "x", nullptr},
-                                 "y - lag(y, 1) OVER (ORDER BY x) / (x - lag(x, 1, 0) OVER (ORDER BY x))"},
-                                {nullptr, nullptr, {nullptr}, nullptr}};
 
 void LanceExtension::Load(::duckdb::DuckDB &db) {
   duckdb::Connection con(db);
@@ -50,9 +44,8 @@ void LanceExtension::Load(::duckdb::DuckDB &db) {
     catalog.CreateFunction(context, func.get());
   }
 
-  for (idx_t index = 0; macros[index].name != nullptr; index++) {
-    auto info = DefaultFunctionGenerator::CreateInternalMacroInfo(macros[index]);
-    catalog.CreateFunction(*con.context, info.get());
+  for (auto &func : lance::duckdb::GetMacroFunctions()) {
+    catalog.CreateFunction(context, func.get());
   }
 
 #if defined(WITH_PYTORCH)

@@ -24,9 +24,11 @@ Currently, the Lance duckdb extension is compiled against pytorch 1.13
 
 ```sql
 CALL create_pytorch_model('resnet', './resnet.pth', 'cpu')
-SELECT * FROM ml_models();
+SELECT *
+FROM ml_models();
 // Run inference
-SELECT predict('resnet', image) as pred FROM images
+SELECT predict('resnet', image) as pred
+FROM images
 ```
 
 Vector functions
@@ -38,9 +40,38 @@ Vector functions
 
 Misc functions
 
-| Function     | Description                          |
-|--------------|--------------------------------------|
-| `dydx(y, x)` | Calculate derivative $\frac{dy}{dx}$ |
+| Function                          | Description                                                                         |
+|-----------------------------------|-------------------------------------------------------------------------------------|
+| `dydx(y, x)`                      | Calculate derivative $\frac{dy}{dx}$                                                |
+| `window_all(expr, before, after)` | Is the row in a window `[-before, start]` <br/> where all `expr` are `true`.        |
+| `window_any(expr, before, after)` | Is the row in a window `[-before, start]` <br/> where at least one `expr` is `true` |
+
+```sql
+
+SELECT x, window_all(x <= 3, 2, 0) FROM t;
+┌───────┬────────────────────────────┐
+│   x   │ window_all((x <= 3), 2, 0) │
+│ int32 │          boolean           │
+├───────┼────────────────────────────┤
+│     1 │ true                       │
+│     2 │ true                       │
+│     3 │ true                       │
+│     4 │ false                      │
+│     5 │ false                      │
+└───────┴────────────────────────────┘
+
+SELECT x, window_any(x == 3, 2, 0) FROM t;
+┌───────┬───────────────────────────┐
+│   x   │ window_any((x = 3), 2, 0) │
+│ int32 │          boolean          │
+├───────┼───────────────────────────┤
+│     1 │ false                     │
+│     2 │ false                     │
+│     3 │ true                      │
+│     4 │ true                      │
+│     5 │ true                      │
+└───────┴───────────────────────────┘
+```
 
 ## Development
 
@@ -56,11 +87,11 @@ If you want to use GPU-enabled models, run:
 make release-cuda
 ```
 
-
 Load extension in Python
 
 ```python
 import duckdb
+
 duckdb.install_extension("./path/to/lance.duckdb_extension", force_install=True)
 duckdb.load_extension("lance")
 ```

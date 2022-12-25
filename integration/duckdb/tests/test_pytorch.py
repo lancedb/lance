@@ -3,8 +3,12 @@
 from pathlib import Path
 import pytest
 
+try:
+    import torch
+except ImportError:
+    pytest.skip("skipping pytorch tests", allow_module_level=True)
+
 import pandas as pd
-import torch
 import pyarrow as pa
 
 from PIL import Image
