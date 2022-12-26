@@ -19,6 +19,7 @@ crate-type=["staticlib", "cdylib", "lib"]
 arrow2 = {version = "0.14.2", features = ["compute_arithmetics", "compute_take"]}
 clap = { version = "3", features = ["derive"] }
 prost = "0.11.0"
+prost-types = { version = "0.11" , default-features = false }
 byteorder = "1.4"
 bytemuck = "1.12.1"
 
