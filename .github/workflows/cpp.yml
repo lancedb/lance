@@ -43,10 +43,19 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
-          brew pin python@3.10
           cd $(brew --repository)
           git fetch origin --tags
           git checkout 3.6.16  # Arrow 10.0
+          rm -rf /usr/local/bin/2to3
+          rm -rf /usr/local/bin/2to3-3.11        
+          rm -rf /usr/local/bin/idle3          
+          rm -rf /usr/local/bin/idle3.11          
+          rm -rf /usr/local/bin/pydoc3
+          rm -rf /usr/local/bin/pydoc3.11
+          rm -rf /usr/local/bin/python3
+          rm -rf /usr/local/bin/python3.11
+          rm -rf /usr/local/bin/python3-config
+          rm -rf /usr/local/bin/python3.11-config          
           brew update          
           brew install apache-arrow protobuf
       - name: Cmake
