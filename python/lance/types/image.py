@@ -95,6 +95,11 @@ class ImageBinaryType(ImageType):
     def __arrow_ext_scalar_class__(self):
         return ImageBinaryScalar
 
+    def to_pandas_dtype(self):
+        from lance.types.pandas.image import ImageBinaryDtype
+
+        return ImageBinaryDtype()
+
 
 class Image(ABC):
     """
@@ -257,6 +262,11 @@ class ImageUri(Image):
     @property
     def uri(self):
         return self._uri
+
+    @property
+    def bytes(self) -> bytes:
+        with self.open() as fh:
+            return fh.read()
 
     def open(self) -> IO:
         return open_uri(self.uri)
