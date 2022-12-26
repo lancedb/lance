@@ -43,10 +43,11 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
-          brew pin python@3.10
           cd $(brew --repository)
           git fetch origin --tags
           git checkout 3.6.16  # Arrow 10.0
+          brew link --force --overwrite python@3.10
+          brew link --force --overwrite python@3.11
           brew update          
           brew install apache-arrow protobuf
       - name: Cmake
