@@ -23,6 +23,7 @@ from typing import Iterable, List
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import urllib.parse
 
 import lance
 from lance.data.convert.base import DatasetConverter
@@ -167,6 +168,9 @@ class NuscenesConverter(DatasetConverter):
                 surface_ann = self._find_annotations(sample_data["token"] , "sample_data_token", "surface_ann")
                 sample_joined["object_ann"] = object_anns
                 sample_joined["surface_ann"] = surface_ann
+
+                # Encode a URL for external ref images
+                sample_joined["image_url"] = urllib.parse.quote(sample_data["sample_data_filename_"])
                 
                 instances_df.append(sample_joined)
         
@@ -181,7 +185,7 @@ class NuscenesConverter(DatasetConverter):
         """
         # Mask
         mask_schema = pa.struct([
-            pa.field("size", pa.list_(pa.int32(), 2)),
+            pa.field("size", pa.list_(pa.int32())),
             pa.field("counts", pa.string())
         ])
 
@@ -233,9 +237,9 @@ class NuscenesConverter(DatasetConverter):
             # Calibrated Sensor
             pa.field("calibrated_sensor_token_", pa.string()),
             pa.field("calibrated_sensor_sensor_token_", pa.string()),
-            pa.field("calibrated_sensor_translation_", pa.list_(pa.float32(), 3)),
-            pa.field("calibrated_sensor_rotation_", pa.list_(pa.float32(), 4)),
-            pa.field("calibrated_sensor_camera_intrinsic_", pa.list_(pa.list_(pa.float32(), 3))),
+            pa.field("calibrated_sensor_translation_", pa.list_(pa.float32())),
+            pa.field("calibrated_sensor_rotation_", pa.list_(pa.float32())),
+            pa.field("calibrated_sensor_camera_intrinsic_", pa.list_(pa.list_(pa.float32()))),
             pa.field("calibrated_sensor_camera_distortion_", pa.list_(pa.float32())), # can be 5 or 6 length
             
             # Sensor
@@ -259,16 +263,19 @@ class NuscenesConverter(DatasetConverter):
 
             # Ego Pose
             pa.field("ego_pose_token_", pa.string()),
-            pa.field("ego_pose_translation_", pa.list_(pa.float32(), 3)),
-            pa.field("ego_pose_rotation_", pa.list_(pa.float32(), 4)),
+            pa.field("ego_pose_translation_", pa.list_(pa.float32())),
+            pa.field("ego_pose_rotation_", pa.list_(pa.float32())),
             pa.field("ego_pose_timestamp_", pa.int64()),
-            pa.field("ego_pose_rotation_rate_", pa.list_(pa.float32(), 3)),
-            pa.field("ego_pose_acceleration_", pa.list_(pa.float32(), 3)),
+            pa.field("ego_pose_rotation_rate_", pa.list_(pa.float32())),
+            pa.field("ego_pose_acceleration_", pa.list_(pa.float32())),
             pa.field("ego_pose_speed_", pa.float32()),
 
             # Annotations
             pa.field("surface_ann", pa.list_(surface_ann_schema)),
-            pa.field("object_ann", pa.list_(object_ann_schema))
+            pa.field("object_ann", pa.list_(object_ann_schema)),
+
+            # Image URL
+            pa.field("image_url", pa.string())
         ])
     
     def image_uris(self, table) -> List[str]:
