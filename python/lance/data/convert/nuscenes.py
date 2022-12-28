@@ -170,7 +170,7 @@ class NuscenesConverter(DatasetConverter):
                 sample_joined["surface_ann"] = surface_ann
 
                 # Encode a URL for external ref images
-                sample_joined["image_url"] = urllib.parse.quote(sample_data["sample_data_filename_"])
+                sample_joined["image_url"] = urllib.parse.quote(sample_joined["sample_data_filename_"])
                 
                 instances_df.append(sample_joined)
         
