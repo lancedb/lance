@@ -1,0 +1,18 @@
+[profile.release]
+lto = true
+
+[target.'cfg(all())']
+rustflags = [
+    "-Wclippy::all",
+    # "-Wclippy::style",
+    "-Wclippy::fallible_impl_from",
+    "-Wclippy::redundant_pub_crate",
+    "-Wclippy::string_add_assign",
+    "-Wclippy::string_add",
+    "-Wclippy::string_lit_as_bytes",
+    "-Wclippy::string_to_string",
+    "-Wclippy::use_self",
+]
+
+[target.aarch64-apple-darwin]
+# rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon"]

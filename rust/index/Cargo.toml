@@ -1,0 +1,12 @@
+[package]
+name = "lance-index"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow-arith = "30"
+arrow-array = "30"
+cxx = "1.0"
+linfa-clustering = "0.6"
+object_store = "0.5"
+prost = "0.11"
