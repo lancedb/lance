@@ -6,7 +6,16 @@ edition = "2021"
 [dependencies]
 arrow-arith = "30"
 arrow-array = "30"
+arrow-schema = "30"
 cxx = "1.0"
 linfa-clustering = "0.6"
 object_store = "0.5"
 prost = "0.11"
+prost-types = "0.11"
+
+[build-dependencies]
+prost-build = { version = "0.11" }
+
+[dev-dependencies]
+tempfile = "3.3"
+rand = "0.8"
