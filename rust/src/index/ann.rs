@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 
 pub mod flat;
+pub mod ivf_pq;
 
 pub enum AnnIndexType {
     /// Flat Index

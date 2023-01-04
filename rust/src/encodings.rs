@@ -2,6 +2,7 @@ use std::io::Result;
 
 use arrow_array::Array;
 
+pub mod binary;
 pub mod plain;
 pub mod rle;
 use crate::format::pb;
@@ -25,7 +26,7 @@ impl From<Encoding> for pb::Encoding {
     }
 }
 
-/// Encoder - Write an Arrow array to file.
+/// Encoder - Write an arrow array to the file.
 pub trait Encoder {
     /// Write an array, and returns the file offset of the beginning of the batch.
     fn write(&mut self, array: &dyn Array) -> Result<i64>;

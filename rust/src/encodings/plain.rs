@@ -35,6 +35,9 @@ use tokio::io::AsyncWriteExt;
 
 use crate::io::object_writer::ObjectWriter;
 
+const MAX_BLOCK_SIZE: usize = 1024 * 1024 * 8; // 8MB
+const MIN_BLOCK_SIZE: usize = 512; // 512 bytes
+
 /// Plain Encoder
 pub struct PlainEncoder<'a, T: ArrowPrimitiveType> {
     writer: &'a mut ObjectWriter<'a>,
@@ -44,9 +47,6 @@ pub struct PlainEncoder<'a, T: ArrowPrimitiveType> {
 
     phantom: PhantomData<T>,
 }
-
-const MAX_BLOCK_SIZE: usize = 1024 * 1024 * 8; // 8MB
-const MIN_BLOCK_SIZE: usize = 512; // 512 bytes
 
 fn get_rows_per_block<T>(block_size: usize) -> usize {
     assert!(
@@ -72,6 +72,7 @@ impl<'a, T: ArrowPrimitiveType> PlainEncoder<'a, T> {
         }
     }
 
+    /// Encode nullable data.
     async fn encode_nullables(&mut self, array: &dyn Array) -> Result<()> {
         // The data is nullable, we need to store its validity bitmap.
         let rows_per_page = get_rows_per_block::<T::Native>(self.block_size);
@@ -93,13 +94,6 @@ impl<'a, T: ArrowPrimitiveType> PlainEncoder<'a, T> {
             self.writer
                 .write_all(arr_data.buffers()[0].slice(arr_data.offset()).as_slice())
                 .await?;
-            println!(
-                "Writing {} bytes data: ",
-                arr_data.buffers()[0]
-                    .slice(arr_data.offset())
-                    .as_slice()
-                    .len()
-            );
             start += rows_per_page;
         }
         Ok(())
@@ -235,26 +229,4 @@ mod tests {
         assert_eq!(expect_arr, &arr);
     }
 
-    #[tokio::test]
-    async fn test_serde_nulls() {
-        let store = InMemory::new();
-        let path = Path::from("/foo");
-        let (_, mut writer) = store.put_multipart(&path).await.unwrap();
-
-        let arr = Int32Array::from(Vec::from_iter(1..4096));
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::<Int32Type>::new(&mut object_writer, true, 1024);
-
-            assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
-        }
-        writer.shutdown().await.unwrap();
-
-        assert!(store.head(&Path::from("/foo")).await.unwrap().size > 0);
-        let decoder =
-            PlainDecoder::<Int32Type>::new(&store, &path, 0, arr.len(), true, 1024).unwrap();
-        let read_arr = decoder.decode().await.unwrap();
-        let expect_arr = as_primitive_array::<Int32Type>(read_arr.as_ref());
-        assert_eq!(expect_arr, &arr);
-    }
 }

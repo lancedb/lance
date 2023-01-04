@@ -16,6 +16,7 @@ use crate::index::{pb, Index};
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::{read_metadata_offset, AsyncWriteProtoExt};
+use crate::dataset::Dataset;
 
 /// Flat index.
 ///
@@ -24,8 +25,12 @@ pub struct FlatIndex<'a, S: ObjectStore> {
     columns: Vec<String>,
     // Index Path
     path: ObjectPath,
-    //
+
+    // Object Store
     object_store: &'a S,
+
+    // The dataset this index is attached to.
+    dataset: Option<Dataset>,
 }
 
 impl<'a, S: ObjectStore> FlatIndex<'a, S> {
@@ -35,6 +40,7 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             path: ObjectPath::from(path),
             object_store,
+            dataset: None,
         })
     }
 
@@ -55,16 +61,20 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
             columns: footer.columns,
             path: index_path,
             object_store,
+            dataset: None,
         })
     }
 
     /// Search Flat index.
     async fn search(&mut self, vector: &Float32Array, top_k: u32) -> Result<RecordBatch> {
-        assert!(vector.null_count() == 0);
+        assert!(self.dataset.is_some());
+        assert_eq!(vector.null_count(), 0);
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
             Field::new("score", DataType::Float32, false),
         ]));
+        let scanner = self.dataset.as_ref().unwrap().scan()?;
+        scanner.flat_map(|b| b);
         Ok(RecordBatch::new_empty(schema))
     }
 }
