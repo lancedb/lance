@@ -2,8 +2,10 @@
 //!
 
 use std::io::Result;
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, Float32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
@@ -13,7 +15,7 @@ use crate::index::pb::{AnnIndex as PbAnnIndex, Footer};
 use crate::index::{pb, Index};
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
-use crate::io::{object_reader, read_metadata_offset, AsyncWriteProtoExt};
+use crate::io::{read_metadata_offset, AsyncWriteProtoExt};
 
 /// Flat index.
 ///
@@ -36,12 +38,16 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
         })
     }
 
-    /// Open an index
-    pub async fn open(object_store: &'a S, path: &str) -> Result<FlatIndex<'a, S>> {
+    /// Open an index on object store.
+    pub async fn open(
+        object_store: &'a S,
+        path: &str,
+        prefetch_size: usize,
+    ) -> Result<FlatIndex<'a, S>> {
         let index_path = ObjectPath::from(path);
         let bytes = object_store.get(&index_path).await?.bytes().await?;
         let metadata_offset = read_metadata_offset(&bytes)?;
-        let mut object_reader = ObjectReader::new(object_store, index_path.clone())?;
+        let mut object_reader = ObjectReader::new(object_store, index_path.clone(), prefetch_size)?;
         let footer = object_reader
             .read_message::<pb::Footer>(metadata_offset)
             .await?;
@@ -50,6 +56,16 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
             path: index_path,
             object_store,
         })
+    }
+
+    /// Search Flat index.
+    async fn search(&mut self, vector: &Float32Array, top_k: u32) -> Result<RecordBatch> {
+        assert!(vector.null_count() == 0);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("score", DataType::Float32, false),
+        ]));
+        Ok(RecordBatch::new_empty(schema))
     }
 }
 
@@ -165,6 +181,7 @@ mod tests {
         )
         .unwrap();
 
-        flat_index.build(&batch).await.unwrap()
+        flat_index.build(&batch).await.unwrap();
+        assert_eq!(flat_index.columns, vec!["vec"]);
     }
 }

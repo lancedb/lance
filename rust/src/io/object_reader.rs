@@ -18,11 +18,8 @@
 use std::io::{Error, ErrorKind, Result};
 
 use byteorder::{ByteOrder, LittleEndian};
-use object_store::{aws::AmazonS3, path::Path, ObjectMeta, ObjectStore};
+use object_store::{path::Path, ObjectMeta, ObjectStore};
 use prost::Message;
-
-const PREFETCH_SIZE_CLOUD_STORAGE: usize = 64 * 1024;
-const PREFETCH_SIZE_SSD: usize = 4 * 1024;
 
 /// Object Reader
 ///
@@ -38,19 +35,16 @@ pub struct ObjectReader<'a, S: ObjectStore> {
 
 impl<'a, S: ObjectStore> ObjectReader<'a, S> {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: &'a S, path: Path) -> Result<Self> {
+    pub fn new(object_store: &'a S, path: Path, prefetch_size: usize) -> Result<Self> {
         Ok(Self {
             object_store,
             path,
             cached_metadata: None,
-            prefetch_size: match object_store {
-                AmazonS3 => PREFETCH_SIZE_CLOUD_STORAGE,
-                _ => PREFETCH_SIZE_SSD,
-            }
+            prefetch_size,
         })
     }
 
-    /// Read a protobuf message at position.
+    /// Read a protobuf message at position `pos`.
     pub async fn read_message<M: Message + Default>(&mut self, pos: u64) -> Result<M> {
         if self.cached_metadata.is_none() {
             self.cached_metadata = Some(self.object_store.head(&self.path).await?);
@@ -73,3 +67,6 @@ impl<'a, S: ObjectStore> ObjectReader<'a, S> {
         Ok(M::decode(&buf[8..8 + msg_len])?)
     }
 }
+
+#[cfg(test)]
+mod tests {}

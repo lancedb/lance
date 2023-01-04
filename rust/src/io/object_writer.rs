@@ -18,11 +18,10 @@
 use std::io::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use prost::Message;
-
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use pin_project::pin_project;
+use prost::Message;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///

@@ -20,15 +20,15 @@
 use std::io::{Error, ErrorKind, Result};
 
 use async_trait::async_trait;
+use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use byteorder::{LittleEndian, ByteOrder};
 
-pub mod object_writer;
 pub mod object_reader;
+pub mod object_writer;
 
-const MAGIC: &'static [u8; 4] = b"LANC";
-const INDEX_MAGIC: &'static [u8; 8] = b"LANC_IDX";
+// const MAGIC: &'static [u8; 4] = b"LANC";
+const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {

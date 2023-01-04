@@ -13,6 +13,9 @@ pub enum AnnIndexType {
 
 #[async_trait]
 pub trait AnnIndex {
+    //
     fn ann_index_type() -> AnnIndexType;
+
+    // Dimension
     fn dim(&self) -> usize;
 }

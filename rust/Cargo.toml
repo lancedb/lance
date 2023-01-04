@@ -7,6 +7,8 @@ edition = "2021"
 arrow-arith = "30"
 arrow-array = "30"
 arrow-schema = "30"
+arrow-buffer = "30"
+arrow-data = "30"
 cxx = "1.0"
 linfa-clustering = "0.6"
 object_store = { version = "0.5",  features = ["aws", "aws_profile"] }

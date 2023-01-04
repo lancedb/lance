@@ -1,3 +1,5 @@
+pub mod encodings;
+pub mod format;
 pub mod index;
 pub mod io;
 
