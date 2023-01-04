@@ -8,27 +8,27 @@ use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 
-use crate::ann::{AnnIndex, AnnIndexType};
-use crate::io::{AsyncWriteProtoExt, read_metadata_offset};
+use super::{AnnIndex, AnnIndexType};
+use crate::index::pb::{AnnIndex as PbAnnIndex, Footer};
+use crate::index::{pb, Index};
+use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
-use crate::pb;
-use crate::pb::{AnnIndex as PbAnnIndex, Footer};
-use crate::Index;
+use crate::io::{object_reader, read_metadata_offset, AsyncWriteProtoExt};
 
 /// Flat index.
 ///
 #[derive(Debug)]
-pub struct FlatIndex<'a> {
+pub struct FlatIndex<'a, S: ObjectStore> {
     columns: Vec<String>,
     // Index Path
     path: ObjectPath,
     //
-    object_store: &'a dyn ObjectStore,
+    object_store: &'a S,
 }
 
-impl<'a> FlatIndex<'a> {
+impl<'a, S: ObjectStore> FlatIndex<'a, S> {
     /// Create an empty index.
-    pub fn new(object_store: &'a dyn ObjectStore, path: &str, columns: &[&str]) -> Result<Self> {
+    pub fn new(object_store: &'a S, path: &str, columns: &[&str]) -> Result<Self> {
         Ok(Self {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             path: ObjectPath::from(path),
@@ -37,13 +37,16 @@ impl<'a> FlatIndex<'a> {
     }
 
     /// Open an index
-    pub async fn open(object_store: &'a dyn ObjectStore, path: &str) -> Result<FlatIndex<'a>> {
+    pub async fn open(object_store: &'a S, path: &str) -> Result<FlatIndex<'a, S>> {
         let index_path = ObjectPath::from(path);
         let bytes = object_store.get(&index_path).await?.bytes().await?;
         let metadata_offset = read_metadata_offset(&bytes)?;
-
+        let mut object_reader = ObjectReader::new(object_store, index_path.clone())?;
+        let footer = object_reader
+            .read_message::<pb::Footer>(metadata_offset)
+            .await?;
         Ok(Self {
-            columns: vec![],
+            columns: footer.columns,
             path: index_path,
             object_store,
         })
@@ -51,7 +54,7 @@ impl<'a> FlatIndex<'a> {
 }
 
 #[async_trait]
-impl Index for FlatIndex<'_> {
+impl<'a, S: ObjectStore> Index for FlatIndex<'a, S> {
     fn columns(&self) -> &[String] {
         self.columns.as_slice()
     }
@@ -73,7 +76,7 @@ impl Index for FlatIndex<'_> {
 }
 
 #[async_trait]
-impl AnnIndex for FlatIndex<'_> {
+impl<'a, S: ObjectStore> AnnIndex for FlatIndex<'_, S> {
     fn ann_index_type() -> AnnIndexType {
         AnnIndexType::Flat
     }
@@ -151,7 +154,6 @@ mod tests {
     async fn test_create_flat_index() {
         let arr = generate_vector_array(128, 1024);
         let pk_arr = Arc::new(Int64Array::from((1..1025).collect::<Vec<i64>>()));
-        println!("vec arr={}, pk={}", arr.len(), pk_arr.len());
         let batch = RecordBatch::try_from_iter(vec![("vec", arr), ("pk", pk_arr)]).unwrap();
 
         let index_file = NamedTempFile::new().unwrap();

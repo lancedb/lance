@@ -25,8 +25,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use byteorder::{LittleEndian, ByteOrder};
 
 pub mod object_writer;
+pub mod object_reader;
 
-// const MAGIC: &'static [u8; 4] = b"LANC";
+const MAGIC: &'static [u8; 4] = b"LANC";
 const INDEX_MAGIC: &'static [u8; 8] = b"LANC_IDX";
 
 #[async_trait]
