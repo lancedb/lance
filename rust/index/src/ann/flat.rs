@@ -7,11 +7,13 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use prost::Message;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::ann::{AnnIndex, AnnIndexType};
-use crate::Index;
 use crate::pb;
-use crate::pb::{Footer, AnnIndex as PbAnnIndex};
+use crate::pb::{AnnIndex as PbAnnIndex, Footer};
+use crate::Index;
 
 /// Flat index.
 ///
@@ -44,6 +46,31 @@ impl<'a> FlatIndex<'a> {
 }
 
 #[async_trait]
+trait AsyncWriteProtoExt {
+    async fn write_pb(&mut self, msg: impl Message) -> Result<u64>;
+
+    /// Write footer with the offset to the root metadata block.
+    async fn write_footer(&mut self, offset: u64) -> Result<()>;
+}
+
+#[async_trait]
+impl<T: AsyncWrite + Unpin + std::marker::Send> AsyncWriteProtoExt for T {
+    async fn write_pb(&mut self, msg: impl Message) -> Result<u64> {
+        let len = msg.encoded_len();
+
+        self.write_u32_le(len as u32).await?;
+        self.write_all(&msg.encode_to_vec()).await?;
+        Ok(0)
+    }
+
+    async fn write_footer(&mut self, offset: u64) -> Result<()> {
+        self.write_u64_le(offset).await?;
+        self.write_all(b"LANCEIDX").await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl Index for FlatIndex<'_> {
     fn columns(&self) -> &[String] {
         self.columns.as_slice()
@@ -51,13 +78,15 @@ impl Index for FlatIndex<'_> {
 
     /// Build index
     async fn build(&self, _reader: &RecordBatch) -> Result<()> {
-        let (multipart_id, writer) = self.object_store.put_multipart(&self.path).await?;
+        let (_multipart_id, mut writer) = self.object_store.put_multipart(&self.path).await?;
 
         let mut footer = Footer::default();
         footer.set_index_type(pb::footer::Type::Ann);
         footer.version = 1u64;
         footer.columns = self.columns.clone();
 
+        let offset = writer.write_pb(footer).await?;
+        writer.write_u64_le(offset).await?;
         Ok(())
     }
 }

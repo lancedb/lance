@@ -8,7 +8,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub async fn write_proto(msg: &impl Message, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let len = msg.encoded_len();
 
-    writer.write_u32(len as u32).await?;
+    writer.write_u32_le(len as u32).await?;
     writer.write_all(msg.encode_to_vec().as_slice()).await?;
 
     Ok(())
