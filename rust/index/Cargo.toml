@@ -15,6 +15,7 @@ prost-types = "0.11"
 async-trait = "0.1.60"
 tokio = { version = "1.23", features = ["macros", "io-util"] }
 byteorder = "1.4"
+pin-project = "1"
 
 [build-dependencies]
 prost-build = { version = "0.11" }

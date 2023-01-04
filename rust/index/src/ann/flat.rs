@@ -7,21 +7,22 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
-use tokio::io::{AsyncWriteExt};
 
 use crate::ann::{AnnIndex, AnnIndexType};
+use crate::io::{AsyncWriteProtoExt, read_metadata_offset};
+use crate::io::object_writer::ObjectWriter;
 use crate::pb;
 use crate::pb::{AnnIndex as PbAnnIndex, Footer};
 use crate::Index;
-use crate::io::AsyncWriteProtoExt;
 
 /// Flat index.
 ///
 #[derive(Debug)]
 pub struct FlatIndex<'a> {
     columns: Vec<String>,
-    // Index URI
+    // Index Path
     path: ObjectPath,
+    //
     object_store: &'a dyn ObjectStore,
 }
 
@@ -35,11 +36,15 @@ impl<'a> FlatIndex<'a> {
         })
     }
 
-    /// Open an index on a object store
+    /// Open an index
     pub async fn open(object_store: &'a dyn ObjectStore, path: &str) -> Result<FlatIndex<'a>> {
+        let index_path = ObjectPath::from(path);
+        let bytes = object_store.get(&index_path).await?.bytes().await?;
+        let metadata_offset = read_metadata_offset(&bytes)?;
+
         Ok(Self {
             columns: vec![],
-            path: ObjectPath::from(path),
+            path: index_path,
             object_store,
         })
     }
@@ -54,14 +59,15 @@ impl Index for FlatIndex<'_> {
     /// Build index
     async fn build(&self, _reader: &RecordBatch) -> Result<()> {
         let (_multipart_id, mut writer) = self.object_store.put_multipart(&self.path).await?;
+        let mut object_writer = ObjectWriter::new(writer.as_mut());
 
         let mut footer = Footer::default();
         footer.set_index_type(pb::footer::Type::Ann);
         footer.version = 1u64;
         footer.columns = self.columns.clone();
 
-        let offset = writer.write_pb(footer).await?;
-        writer.write_u64_le(offset).await?;
+        let offset = object_writer.write_protobuf(&footer).await?;
+        object_writer.write_footer(offset).await?;
         Ok(())
     }
 }
