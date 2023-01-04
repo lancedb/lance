@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use std::io::Result;
 
 pub mod ann;
+pub mod io;
 
+#[allow(clippy::all)]
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance_index.pb.rs"));
 }

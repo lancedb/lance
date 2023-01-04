@@ -13,6 +13,8 @@ object_store = "0.5"
 prost = "0.11"
 prost-types = "0.11"
 async-trait = "0.1.60"
+tokio = { version = "1.23", features = ["macros", "io-util"] }
+byteorder = "1.4"
 
 [build-dependencies]
 prost-build = { version = "0.11" }
@@ -20,4 +22,4 @@ prost-build = { version = "0.11" }
 [dev-dependencies]
 tempfile = "3.3"
 rand = "0.8"
-tokio = { version = "1.23", features = ["macros"] }
+

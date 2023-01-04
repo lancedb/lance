@@ -10,6 +10,8 @@ use object_store::ObjectStore;
 
 use crate::ann::{AnnIndex, AnnIndexType};
 use crate::Index;
+use crate::pb;
+use crate::pb::{Footer, AnnIndex as PbAnnIndex};
 
 /// Flat index.
 ///
@@ -50,6 +52,12 @@ impl Index for FlatIndex<'_> {
     /// Build index
     async fn build(&self, _reader: &RecordBatch) -> Result<()> {
         let (multipart_id, writer) = self.object_store.put_multipart(&self.path).await?;
+
+        let mut footer = Footer::default();
+        footer.set_index_type(pb::footer::Type::Ann);
+        footer.version = 1u64;
+        footer.columns = self.columns.clone();
+
         Ok(())
     }
 }
