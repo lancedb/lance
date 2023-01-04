@@ -1,4 +1,5 @@
-use arrow_array::RecordBatchReader;
+use arrow_array::RecordBatch;
+use async_trait::async_trait;
 use std::io::Result;
 
 pub mod ann;
@@ -11,10 +12,11 @@ pub mod pb {
 pub mod tests;
 
 /// Generic index traits
+#[async_trait]
 pub trait Index {
     /// Indexed columns
     fn columns(&self) -> &[String];
 
     /// Build index from a batch reader
-    fn build(&self, batch_reader: &impl RecordBatchReader) -> Result<()>;
+    async fn build(&self, _reader: &RecordBatch) -> Result<()>;
 }

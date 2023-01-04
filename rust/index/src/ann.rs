@@ -1,5 +1,7 @@
 //! Approximate Nearest Neighbour Index.
 
+use async_trait::async_trait;
+
 pub mod flat;
 
 pub enum AnnIndexType {
@@ -9,6 +11,7 @@ pub enum AnnIndexType {
     IvfPQ,
 }
 
+#[async_trait]
 pub trait AnnIndex {
     fn ann_index_type() -> AnnIndexType;
     fn dim(&self) -> usize;

@@ -3,7 +3,8 @@
 
 use std::io::Result;
 
-use arrow_array::RecordBatchReader;
+use arrow_array::RecordBatch;
+use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 
@@ -12,10 +13,11 @@ use crate::Index;
 
 /// Flat index.
 ///
+#[derive(Debug)]
 pub struct FlatIndex<'a> {
     columns: Vec<String>,
     // Index URI
-    uri: ObjectPath,
+    path: ObjectPath,
     object_store: &'a dyn ObjectStore,
 }
 
@@ -24,32 +26,35 @@ impl<'a> FlatIndex<'a> {
     pub fn new(object_store: &'a dyn ObjectStore, path: &str, columns: &[&str]) -> Result<Self> {
         Ok(Self {
             columns: columns.into_iter().map(|c| c.to_string()).collect(),
-            uri: ObjectPath::from(path),
+            path: ObjectPath::from(path),
             object_store,
         })
     }
 
     /// Open an index on a object store
-    pub fn open(object_store: &'a dyn ObjectStore, path: &str) -> Result<Self> {
+    pub async fn open(object_store: &'a dyn ObjectStore, path: &str) -> Result<FlatIndex<'a>> {
         Ok(Self {
             columns: vec![],
-            uri: ObjectPath::from(path),
+            path: ObjectPath::from(path).clone(),
             object_store,
         })
     }
 }
 
+#[async_trait]
 impl Index for FlatIndex<'_> {
     fn columns(&self) -> &[String] {
         self.columns.as_slice()
     }
 
     /// Build index
-    fn build(&self, _reader: &impl RecordBatchReader) -> Result<()> {
+    async fn build(&self, _reader: &RecordBatch) -> Result<()> {
+        let (multipart_id, writer) = self.object_store.put_multipart(&self.path).await?;
         Ok(())
     }
 }
 
+#[async_trait]
 impl AnnIndex for FlatIndex<'_> {
     fn ann_index_type() -> AnnIndexType {
         todo!()
@@ -68,11 +73,14 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::Int64Array;
-    use arrow_array::{types::Float32Type, Array, FixedSizeListArray, RecordBatch};
+    use arrow_array::{
+        types::Float32Type, Array, FixedSizeListArray, RecordBatch, RecordBatchReader,
+    };
     use arrow_schema::{ArrowError, SchemaRef};
     use rand::Rng;
     use tempfile::NamedTempFile;
 
+    /// Create a [rows, dim] of f32 matrix as `FixedSizeListArray[f32, dim]`.
     fn generate_vector_array(dim: i32, rows: i32) -> Arc<dyn Array> {
         let mut rng = rand::thread_rng();
         Arc::new(
@@ -112,12 +120,17 @@ mod tests {
         type Item = std::result::Result<RecordBatch, ArrowError>;
 
         fn next(&mut self) -> Option<Self::Item> {
-            todo!()
+            if self.idx >= self.batches.len() {
+                None
+            } else {
+                self.idx += 1;
+                Some(Ok(self.batches[self.idx - 1].clone()))
+            }
         }
     }
 
-    #[test]
-    fn test_create_flat_index() {
+    #[tokio::test]
+    async fn test_create_flat_index() {
         let arr = generate_vector_array(128, 1024);
         let pk_arr = Arc::new(Int64Array::from((1..1025).collect::<Vec<i64>>()));
         println!("vec arr={}, pk={}", arr.len(), pk_arr.len());
@@ -132,9 +145,6 @@ mod tests {
         )
         .unwrap();
 
-        let batches = vec![batch];
-        let reader = InMemoryBatchRecordReader::new(&batches);
-
-        flat_index.build(&reader).unwrap()
+        flat_index.build(&batch).await.unwrap()
     }
 }
