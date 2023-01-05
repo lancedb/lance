@@ -9,13 +9,14 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::ArrowError;
 
 /// Euclidean distance from a point to a list of points.
-fn euclidean_distance(
+pub fn euclidean_distance(
     from: &Float32Array,
     to: &FixedSizeListArray,
 ) -> Result<Float32Array, ArrowError> {
     assert_eq!(from.len(), to.value_length() as usize);
 
     // Naive implementation.
+    // TODO: benchmark and use SIMD or BLAS
     let scores: Float32Array = (0..to.len())
         .map(|idx| to.value(idx))
         .map(|left| {
@@ -48,6 +49,9 @@ mod tests {
         let point = Float32Array::from(vec![2.0, 3.0, 4.0]);
         let scores = euclidean_distance(&point, &mat).unwrap();
 
-        assert_eq!(scores, Float32Array::from(vec![3.0_f32.sqrt(), 0_f32, 3.0_f32.sqrt(), 12.0_f32.sqrt()]));
+        assert_eq!(
+            scores,
+            Float32Array::from(vec![3.0_f32.sqrt(), 0_f32, 3.0_f32.sqrt(), 12.0_f32.sqrt()])
+        );
     }
 }
