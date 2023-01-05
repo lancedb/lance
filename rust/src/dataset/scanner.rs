@@ -2,8 +2,7 @@ use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 
 /// Dataset Scanner
-pub struct Scanner {
-}
+pub struct Scanner {}
 
 impl Scanner {
     pub fn new() -> Self {

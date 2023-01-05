@@ -27,10 +27,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
+pub mod reader;
 
 pub use self::object_store::ObjectStore;
 
-// const MAGIC: &'static [u8; 4] = b"LANC";
+const MAGIC: &'static [u8; 4] = b"LANC";
 const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
 
 #[async_trait]

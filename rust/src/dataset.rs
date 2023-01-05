@@ -8,8 +8,10 @@ use chrono::prelude::*;
 use object_store::path::Path;
 
 use self::scanner::Scanner;
+use crate::datatypes::Schema;
 use crate::format::{pb, Manifest};
-use crate::io::{ObjectStore, read_metadata_offset};
+use crate::io::reader::read_manifest;
+use crate::io::{read_metadata_offset, ObjectStore};
 
 pub mod scanner;
 
@@ -60,7 +62,12 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
 
         let mut object_reader = object_store.open(&latest_manifest_path).await?;
-        let bytes = object_store.inner.get(&latest_manifest_path).await?.bytes().await?;
+        let bytes = object_store
+            .inner
+            .get(&latest_manifest_path)
+            .await?
+            .bytes()
+            .await?;
         let offset = read_metadata_offset(&bytes)?;
         let manifest_pb = object_reader.read_message::<pb::Manifest>(offset).await?;
         let manifest = (&manifest_pb).into();
@@ -80,7 +87,35 @@ impl Dataset {
         &self.object_store
     }
 
+    fn versions_dir(&self) -> Path {
+        self.base.child(VERSIONS_DIR)
+    }
+
     pub fn version(&self) -> Version {
         Version::from(&self.manifest)
+    }
+
+    /// Get all versions.
+    pub async fn versions(&self) -> Result<Vec<Version>> {
+        let paths: Vec<Path> = self
+            .object_store
+            .inner
+            .list_with_delimiter(Some(&self.versions_dir()))
+            .await?
+            .objects
+            .iter()
+            .filter(|&obj| obj.location.as_ref().ends_with(".manifest"))
+            .map(|o| o.location.clone())
+            .collect();
+        let mut versions = vec![];
+        for path in paths.iter() {
+            let manifest = read_manifest(&self.object_store, path).await?;
+            versions.push(Version::from(&manifest));
+        }
+        Ok(versions)
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.manifest.schema
     }
 }

@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 //! Wraps [ObjectStore](object_store::ObjectStore)
+use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
-use std::io::{Error, Result, ErrorKind};
 
 use ::object_store::{
-    aws::AmazonS3Builder, memory::InMemory, path::Path,
-    ObjectStore as OSObjectStore,
+    aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
 use url::Url;
 
@@ -102,4 +100,3 @@ impl ObjectStore {
         }
     }
 }
-
