@@ -17,17 +17,23 @@
 
 //! Lance Data File Reader
 
+use std::cmp::max;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 
+use arrow_array::RecordBatch;
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
 use object_store::path::Path;
 use prost::Message;
 
-use super::object_store::ObjectStore;
-use crate::format::pb;
+use crate::datatypes::Schema;
+use crate::format::{Metadata, pb};
 use crate::format::Manifest;
+use crate::io::object_reader::ObjectReader;
+use crate::io::{read_message, read_metadata_offset};
+
+use super::object_store::ObjectStore;
 
 /// Read Manifest on URI.
 pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
@@ -60,7 +66,61 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-pub struct FileReader {}
+pub struct FileReader {
+    object_reader: ObjectReader,
+    metadata: Metadata,
+    projection: Option<Schema>,
+}
+
+impl FileReader {
+    /// Open file reader
+    pub async fn new(
+        object_store: &ObjectStore,
+        path: &Path,
+        manifest: Option<Manifest>,
+    ) -> Result<Self> {
+        let mut object_reader = ObjectReader::new(
+            object_store.inner.clone(),
+            path.clone(),
+            object_store.prefetch_size(),
+        )?;
+
+        let file_size = object_reader.size().await?;
+        let tail_bytes = object_reader.object_store.get_range(
+            &path,
+            max(0 as usize, file_size - object_store.prefetch_size())..file_size,
+        ).await?;
+        let metadata_pos = read_metadata_offset(&tail_bytes)? as usize;
+        let metadata_pb = if metadata_pos < file_size - tail_bytes.len() {
+            // We have not read the metadata bytes yet.
+            object_reader.read_message::<pb::Metadata>(metadata_pos).await?
+        } else {
+            let offset = tail_bytes.len() - (file_size - metadata_pos);
+            read_message::<pb::Metadata>(&tail_bytes.slice(offset..))?
+        };
+        let metadata = Metadata::from(&metadata_pb);
+
+        if let None = manifest {}
+
+        Ok(Self {
+            object_reader,
+            metadata,
+            projection: None,
+        })
+    }
+
+    pub fn set_projection(&mut self, schema: Schema) {
+        self.projection = Some(schema)
+    }
+
+    pub fn schema(&self) -> &Schema {
+        self.projection.as_ref().unwrap()
+    }
+
+    pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
+        todo!();
+    }
+}
 
 #[cfg(test)]
 mod tests {}

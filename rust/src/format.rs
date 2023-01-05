@@ -1,7 +1,9 @@
 use crate::datatypes::Schema;
 
 mod fragment;
-use fragment::Fragment;
+mod metadata;
+pub use fragment::Fragment;
+pub use metadata::Metadata;
 
 /// Protobuf definitions
 #[allow(clippy::all)]

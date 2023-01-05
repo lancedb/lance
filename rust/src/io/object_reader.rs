@@ -28,11 +28,11 @@ use prost::Message;
 ///
 /// Object Store + Base Path
 pub struct ObjectReader {
-    // Index Path
+    // File path
     path: Path,
     // Object Store.
     // TODO: can we use reference instead?
-    object_store: Arc<dyn ObjectStore>,
+    pub object_store: Arc<dyn ObjectStore>,
     cached_metadata: Option<ObjectMeta>,
     prefetch_size: usize,
 }
@@ -52,19 +52,19 @@ impl ObjectReader {
         })
     }
 
-    /// Read a protobuf message at position `pos`.
-    pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
+    /// Object/File Size.
+    pub async fn size(&mut self) -> Result<usize> {
         if self.cached_metadata.is_none() {
             self.cached_metadata = Some(self.object_store.head(&self.path).await?);
         };
-        let file_size: usize;
-        if let Some(metadata) = self.cached_metadata.clone() {
-            if pos > metadata.size {
-                return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
-            }
-            file_size = metadata.size;
-        } else {
-            panic!("Should not get here");
+        Ok(self.cached_metadata.as_ref().map_or(0, |m| m.size))
+    }
+
+    /// Read a protobuf message at position `pos`.
+    pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
+        let file_size = self.size().await?;
+        if pos > file_size {
+            return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
         }
 
         let range = pos..min(pos + self.prefetch_size, file_size);
