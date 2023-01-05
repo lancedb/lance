@@ -109,8 +109,10 @@ message Metadata {
   // The <position, length> of all the pages in the same column are then contiguously stored.
   //
   // For example, for the column 5 and batch 4, we have:
+  // ```text
   //   position = page_table[5][4][0];
   //   length = page_table[5][4][1];
+  // ```
   uint64 page_table_position = 3;
 }
 
@@ -120,6 +122,7 @@ enum Encoding {
   PLAIN = 1;
   VAR_BINARY = 2;
   DICTIONARY = 3;
+  RLE = 4;
 }
 
 /// Dictionary field metadata
