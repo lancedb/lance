@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Lance Columnar Data Format
+//!
+//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
+//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
+//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
+
 pub mod dataset;
 pub mod datatypes;
 pub mod encodings;

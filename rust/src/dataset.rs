@@ -69,9 +69,8 @@ impl Dataset {
             .bytes()
             .await?;
         let offset = read_metadata_offset(&bytes)?;
-        let manifest_pb = object_reader.read_message::<pb::Manifest>(offset).await?;
+        let manifest_pb = object_reader.read_message::<pb::Manifest>(offset as usize).await?;
         let manifest = (&manifest_pb).into();
-
         Ok(Self {
             object_store,
             base: Path::from(uri),
