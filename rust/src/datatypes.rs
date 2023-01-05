@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
 
 use crate::encodings::Encoding;
 use crate::format::pb;
@@ -32,7 +32,7 @@ impl LogicalType {
 
 impl From<&str> for LogicalType {
     fn from(s: &str) -> Self {
-        LogicalType(s.to_string())
+        Self(s.to_string())
     }
 }
 
@@ -64,7 +64,7 @@ impl TryFrom<&DataType> for LogicalType {
             _ => Err(format!("Unsupport data type: {:?}", dt)),
         }?;
 
-        Ok(LogicalType(type_str.to_string()))
+        Ok(Self(type_str.to_string()))
     }
 }
 
@@ -149,18 +149,24 @@ impl fmt::Display for Field {
     }
 }
 
-impl From<&ArrowField> for Field {
-    fn from(field: &ArrowField) -> Self {
+impl TryFrom<&ArrowField> for Field {
+    type Error = ArrowError;
+
+    fn try_from(field: &ArrowField) -> Result<Self, ArrowError> {
         let children = match field.data_type() {
-            DataType::Struct(children) => children.iter().map(Self::from).collect(),
-            DataType::List(item) => vec![Self::from(item.as_ref())],
+            DataType::Struct(children) => children
+                .iter()
+                .map(Self::try_from)
+                .collect::<Result<_, _>>()?,
+            DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
-        Self {
+        Ok(Self {
             id: -1,
             parent_id: -1,
             name: field.name().clone(),
-            logical_type: LogicalType::try_from(field.data_type()).unwrap(),
+            logical_type: LogicalType::try_from(field.data_type())
+                .map_err(ArrowError::SchemaError)?,
             encoding: match field.data_type() {
                 dt if is_numeric(dt) => Some(Encoding::Plain),
                 dt if is_binary(dt) => Some(Encoding::VarBinary),
@@ -170,7 +176,7 @@ impl From<&ArrowField> for Field {
             extension_name: "".to_string(),
             nullable: field.is_nullable(),
             children,
-        }
+        })
     }
 }
 
@@ -240,19 +246,25 @@ impl fmt::Display for Schema {
 }
 
 /// Convert `arrow2::datatype::Schema` to Lance
-impl From<&ArrowSchema> for Schema {
-    fn from(schema: &ArrowSchema) -> Self {
-        Schema {
-            fields: schema.fields.iter().map(Field::from).collect(),
+impl TryFrom<&ArrowSchema> for Schema {
+    type Error = ArrowError;
+
+    fn try_from(schema: &ArrowSchema) -> Result<Self, ArrowError> {
+        Ok(Self {
+            fields: schema
+                .fields
+                .iter()
+                .map(Field::try_from)
+                .collect::<Result<_, _>>()?,
             metadata: schema.metadata.clone(),
-        }
+        })
     }
 }
 
 /// Convert Lance Schema to Arrow Schema
 impl From<&Schema> for ArrowSchema {
     fn from(schema: &Schema) -> Self {
-        ArrowSchema {
+        Self {
             fields: schema.fields.iter().map(ArrowField::from).collect(),
             metadata: schema.metadata.clone(),
         }
@@ -262,7 +274,7 @@ impl From<&Schema> for ArrowSchema {
 /// Convert list of protobuf `Field` to a Schema.
 impl From<&Vec<pb::Field>> for Schema {
     fn from(fields: &Vec<pb::Field>) -> Self {
-        Schema {
+        Self {
             fields: fields.iter().map(Field::from).collect(),
             metadata: HashMap::default(),
         }

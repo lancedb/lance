@@ -23,7 +23,7 @@ use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
 use object_store::local::LocalFileSystem;
-use url::{Url, ParseError};
+use url::{ParseError, Url};
 
 use super::object_reader::ObjectReader;
 
@@ -64,7 +64,7 @@ impl ObjectStore {
                     base_path: Path::from(uri),
                     prefetch_size: 4 * 1024,
                 });
-            },
+            }
             Err(e) => {
                 return Err(Error::new(ErrorKind::InvalidInput, e.to_string()));
             }
@@ -96,7 +96,6 @@ impl ObjectStore {
             base_path: Path::from(parsed.path()),
             prefetch_size: 64 * 1024,
         })
-
     }
 
     pub fn prefetch_size(&self) -> usize {

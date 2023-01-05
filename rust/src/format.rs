@@ -4,7 +4,7 @@ mod fragment;
 use fragment::Fragment;
 
 /// Protobuf definitions
-#[allow(clippy)]
+#[allow(clippy::all)]
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
 }

@@ -14,7 +14,7 @@ pub struct DataFile {
 
 impl From<&DataFile> for pb::DataFile {
     fn from(df: &DataFile) -> Self {
-        pb::DataFile {
+        Self {
             path: df.path.clone(),
             fields: df.fields.clone(),
         }
@@ -23,7 +23,7 @@ impl From<&DataFile> for pb::DataFile {
 
 impl From<&pb::DataFile> for DataFile {
     fn from(proto: &pb::DataFile) -> Self {
-        DataFile {
+        Self {
             path: proto.path.clone(),
             fields: proto.fields.clone(),
         }
@@ -52,7 +52,7 @@ impl Fragment {
 
 impl From<&pb::DataFragment> for Fragment {
     fn from(p: &DataFragment) -> Self {
-        Fragment {
+        Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
         }
