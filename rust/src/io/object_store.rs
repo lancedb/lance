@@ -111,7 +111,7 @@ impl ObjectStore {
     }
 
     pub async fn open(&self, path: &Path) -> Result<ObjectReader> {
-        match ObjectReader::new(self.inner.clone(), path.clone(), self.prefetch_size) {
+        match ObjectReader::new(self, path.clone(), self.prefetch_size) {
             Ok(r) => Ok(r),
             Err(e) => Err(e.into()),
         }

@@ -25,6 +25,7 @@ categories = [
 ]
 
 [dependencies]
+bytes = "1.3"
 arrow-array = "30.0"
 arrow-buffer = "30.0"
 arrow-data = "30.0"

@@ -16,11 +16,12 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::io::Result;
 
-use arrow_array::types::Int64;
+use arrow_array::{types::Int64Type, Int64Array};
 
 use crate::encodings::plain::PlainDecoder;
-use crate::io::object_store::ObjectReader;
+use crate::io::object_reader::ObjectReader;
 
 #[derive(Debug)]
 pub struct PageInfo {
@@ -35,38 +36,46 @@ pub struct PageTable {
 
 impl PageTable {
     /// Create page table from disk.
-    pub async fn new(
-        reader: &ObjectReader,
+    pub async fn new<'a>(
+        reader: &'a ObjectReader<'_>,
         position: usize,
         num_columns: i32,
         num_batches: i32,
     ) -> Result<Self> {
         let length = num_columns * num_batches * 2;
-        let decoder = PlainDecoder::<Int64Type>::new(reader, reader.path, position, length);
-        let arr = decode.decode().await?.as_any().downcast_array::<Int64Array>()?;
+        let decoder = PlainDecoder::<Int64Type>::new(reader, position, length as usize)?;
+        let raw_arr = decoder.decode().await?;
+        let arr = raw_arr.as_any().downcast_ref::<Int64Array>().unwrap();
 
+        let mut pages = HashMap::default();
         for col in 0..num_columns {
-            pages[col] = HashMap::default();
+            pages.insert(col, HashMap::default());
             for batch in 0..num_batches {
                 let idx = col * num_batches + batch;
-                let batch_position = arr.value(idx * 2);
-                let batch_length = arr.value(idx * 2 + 1);
-                pages[col][batch] = PageInfo{
-                    position: batch_position,
-                    length: batch_length,
-                }
+                let batch_position = &arr.value((idx * 2) as usize);
+                let batch_length = &arr.value((idx * 2 + 1) as usize);
+                pages.get_mut(&col).unwrap().insert(
+                    batch,
+                    PageInfo {
+                        position: *batch_position as usize,
+                        length: *batch_length as usize,
+                    },
+                );
             }
         }
+
+        Ok(Self { pages })
     }
 
     pub fn set_page_info(&mut self) {}
 
-    pub fn get(&self, column: i32, batch: i32) -> Option<PageInfo> {
-        pages.get(column).get(batch)
+    pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
+        match self.pages.get(&column) {
+            Some(column_map) => column_map.get(&batch),
+            None => None,
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-
-}
+mod tests {}

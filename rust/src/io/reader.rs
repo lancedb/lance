@@ -34,7 +34,7 @@ use prost::Message;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::plain::PlainDecoder;
 use crate::format::Manifest;
-use crate::format::{pb, Metadata};
+use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::ObjectReader;
 use crate::io::{read_message, read_metadata_offset};
 
@@ -71,29 +71,28 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-pub struct FileReader {
-    object_reader: ObjectReader,
+pub struct FileReader<'a> {
+    object_reader: ObjectReader<'a>,
     metadata: Metadata,
     manifest: Manifest,
+    page_table: PageTable,
     projection: Option<Schema>,
 }
 
-impl FileReader {
+impl<'a> FileReader<'a> {
     /// Open file reader
     pub async fn new(
-        object_store: &ObjectStore,
+        object_store: &'a ObjectStore,
         path: &Path,
         manifest: Option<Manifest>,
-    ) -> Result<Self> {
-        let mut object_reader = ObjectReader::new(
-            object_store.inner.clone(),
-            path.clone(),
-            object_store.prefetch_size(),
-        )?;
+    ) -> Result<FileReader<'a>> {
+        let mut object_reader =
+            ObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
 
         let file_size = object_reader.size().await?;
         let tail_bytes = object_reader
             .object_store
+            .inner
             .get_range(
                 &path,
                 max(0 as usize, file_size - object_store.prefetch_size())..file_size,
@@ -120,11 +119,20 @@ impl FileReader {
                 Manifest::from(&manifest_pb)
             }
         };
+        let num_columns = manifest_for_file.schema.max_field_id().unwrap();
+        let page_table = PageTable::new(
+            &object_reader,
+            metadata.page_table_position,
+            num_columns,
+            metadata.num_batches() as i32,
+        )
+        .await?;
 
         Ok(Self {
             object_reader,
             metadata,
-            projection: None,
+            projection: Some(manifest_for_file.schema.clone()),
+            page_table,
             manifest: manifest_for_file,
         })
     }
@@ -159,7 +167,6 @@ impl FileReader {
     async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         self.read_primitive_array(field, batch_id).await
     }
-
 }
 
 #[cfg(test)]

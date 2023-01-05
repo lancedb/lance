@@ -2,8 +2,10 @@ use crate::datatypes::Schema;
 
 mod fragment;
 mod metadata;
+mod page_table;
 pub use fragment::Fragment;
 pub use metadata::Metadata;
+pub use page_table::{PageInfo, PageTable};
 
 /// Protobuf definitions
 #[allow(clippy::all)]

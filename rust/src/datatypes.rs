@@ -1,5 +1,6 @@
 //! Lance data types, [Schema] and [Field]
 
+use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
@@ -242,6 +243,14 @@ impl Field {
         }
         Ok(())
     }
+
+    // Get the max field id of itself and all children.
+    fn max_id(&self) -> i32 {
+        min(
+            self.id,
+            self.children.iter().map(|c| c.id).min().unwrap_or(i32::MAX),
+        )
+    }
 }
 
 impl fmt::Display for Field {
@@ -415,6 +424,13 @@ impl From<&Vec<pb::Field>> for Schema {
             fields: fields.iter().map(Field::from).collect(),
             metadata: HashMap::default(),
         }
+    }
+}
+
+impl Schema {
+    /// Get the max field id of this schema. Returns None if the schema is empty.
+    pub fn max_field_id(&self) -> Option<i32> {
+        self.fields.iter().map(|f| f.max_id()).min()
     }
 }
 
