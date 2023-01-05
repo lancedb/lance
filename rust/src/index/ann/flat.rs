@@ -47,7 +47,6 @@ impl<'a> FlatIndex<'a> {
     pub async fn open(
         object_store: &'a ObjectStore,
         path: &str,
-        prefetch_size: usize,
     ) -> Result<FlatIndex<'a>> {
         let index_path = ObjectPath::from(path);
         let bytes = object_store.inner.get(&index_path).await?.bytes().await?;
@@ -65,15 +64,21 @@ impl<'a> FlatIndex<'a> {
     }
 
     /// Search Flat index.
+    /// Returns a RecordBatch with {score:float, row_id:u64}.
     async fn search(&mut self, vector: &Float32Array, top_k: u32) -> Result<RecordBatch> {
         assert!(self.dataset.is_some());
         assert_eq!(vector.null_count(), 0);
+        assert_eq!(self.columns.len(), 1);
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
             Field::new("score", DataType::Float32, false),
         ]));
         let scanner = self.dataset.as_ref().unwrap().scan()?;
-        scanner.flat_map(|b| b);
+
+        // Exhausticallly compute all distance.
+        // scanner.flat_map(|b| b.map(|batch| {
+        //     vec![0]
+        // // })).collect();
         Ok(RecordBatch::new_empty(schema))
     }
 }
@@ -182,7 +187,7 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![("vec", arr), ("pk", pk_arr)]).unwrap();
 
         let index_file = NamedTempFile::new().unwrap();
-        let object_store = object_store::local::LocalFileSystem::new();
+        let object_store = ObjectStore::new(":memory:").unwrap();
         let flat_index = FlatIndex::new(
             &object_store,
             &index_file.path().to_str().unwrap(),

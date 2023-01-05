@@ -38,7 +38,8 @@ use crate::io::object_writer::ObjectWriter;
 const MAX_BLOCK_SIZE: usize = 1024 * 1024 * 8; // 8MB
 const MIN_BLOCK_SIZE: usize = 512; // 512 bytes
 
-/// Plain Encoder
+/// Encoder for plain encoding.
+///
 pub struct PlainEncoder<'a, T: ArrowPrimitiveType> {
     writer: &'a mut ObjectWriter<'a>,
     nullable: bool,

@@ -11,7 +11,7 @@ use self::scanner::Scanner;
 use crate::format::{pb, Manifest};
 use crate::io::{ObjectStore, read_metadata_offset};
 
-mod scanner;
+pub mod scanner;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";

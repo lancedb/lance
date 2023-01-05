@@ -1,3 +1,5 @@
+//! Data encodings
+//!
 use std::io::Result;
 
 use arrow_array::Array;
@@ -7,11 +9,16 @@ pub mod plain;
 pub mod rle;
 use crate::format::pb;
 
+/// Encoding enum.
 #[derive(Debug)]
 pub enum Encoding {
+    /// Plain encoding.
     Plain,
+    /// Binary encoding.
     VarBinary,
+    /// Dictionary encoding.
     Dictionary,
+    /// RLE encoding.
     RLE,
 }
 
