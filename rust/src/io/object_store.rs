@@ -22,7 +22,8 @@ use std::sync::Arc;
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
-use url::Url;
+use object_store::local::LocalFileSystem;
+use url::{Url, ParseError};
 
 use super::object_reader::ObjectReader;
 
@@ -44,41 +45,62 @@ impl std::fmt::Display for ObjectStore {
 }
 
 impl ObjectStore {
+    /// Create a ObjectStore instance from a given URL.
     pub fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
             return Ok(Self {
                 inner: Arc::new(InMemory::new()),
                 scheme: String::from("memory"),
                 bucket: String::from(""),
-                base_path: Path::from(""),
+                base_path: Path::from("/"),
                 prefetch_size: 64 * 1024,
             });
         };
 
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
+            Err(ParseError::RelativeUrlWithoutBase) => {
+                return Ok(Self {
+                    inner: Arc::new(LocalFileSystem::new()),
+                    scheme: String::from("file"),
+                    bucket: "".to_string(),
+                    base_path: Path::from(uri),
+                    prefetch_size: 4 * 1024,
+                });
+            },
             Err(e) => {
-                return Err(Error::new(ErrorKind::InvalidInput, "Invalid uri "));
+                return Err(Error::new(ErrorKind::InvalidInput, e.to_string()));
             }
         };
 
         let bucket_name = parsed.host().unwrap().to_string();
-        let object_store = match parsed.scheme() {
+        let scheme: String;
+        let object_store: Arc<dyn OSObjectStore> = match parsed.scheme() {
             "s3" => {
-                let bucket_name = parsed.host().unwrap().to_string();
-
+                scheme = "s3".to_string();
                 match AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket_name)
+                    .with_bucket_name(bucket_name.clone())
                     .build()
                 {
                     Ok(s3) => Arc::new(s3),
                     Err(e) => return Err(e.into()),
                 }
             }
+            "file" => {
+                scheme = "flle".to_string();
+                Arc::new(LocalFileSystem::new())
+            }
             &_ => todo!(),
         };
 
-        todo!()
+        Ok(Self {
+            inner: object_store,
+            scheme,
+            bucket: bucket_name,
+            base_path: Path::from(parsed.path()),
+            prefetch_size: 64 * 1024,
+        })
+
     }
 
     pub fn prefetch_size(&self) -> usize {
