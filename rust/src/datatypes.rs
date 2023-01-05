@@ -152,11 +152,11 @@ impl fmt::Display for Field {
 impl From<&ArrowField> for Field {
     fn from(field: &ArrowField) -> Self {
         let children = match field.data_type() {
-            DataType::Struct(children) => children.iter().map(Field::from).collect(),
-            DataType::List(item) => vec![Field::from(item.as_ref())],
+            DataType::Struct(children) => children.iter().map(Self::from).collect(),
+            DataType::List(item) => vec![Self::from(item.as_ref())],
             _ => vec![],
         };
-        Field {
+        Self {
             id: -1,
             parent_id: -1,
             name: field.name().clone(),
@@ -176,13 +176,13 @@ impl From<&ArrowField> for Field {
 
 impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
-        ArrowField::new(&field.name, field.data_type(), field.nullable)
+        Self::new(&field.name, field.data_type(), field.nullable)
     }
 }
 
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
-        Field {
+        Self {
             name: field.name.clone(),
             id: field.id,
             parent_id: field.parent_id,

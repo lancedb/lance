@@ -31,7 +31,7 @@ pub mod reader;
 
 pub use self::object_store::ObjectStore;
 
-const MAGIC: &'static [u8; 4] = b"LANC";
+const MAGIC: &[u8; 4] = b"LANC";
 const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
 
 #[async_trait]

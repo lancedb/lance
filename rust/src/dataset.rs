@@ -46,7 +46,7 @@ pub struct Version {
 /// Convert Manifest to Data Version.
 impl From<&Manifest> for Version {
     fn from(m: &Manifest) -> Self {
-        Version {
+        Self {
             version: m.version,
             timestamp: Utc::now(),
             metadata: BTreeMap::default(),

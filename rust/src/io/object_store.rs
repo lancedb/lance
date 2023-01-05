@@ -33,7 +33,6 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
-    bucket: String,
     base_path: Path,
     prefetch_size: usize,
 }
@@ -51,7 +50,6 @@ impl ObjectStore {
             return Ok(Self {
                 inner: Arc::new(InMemory::new()),
                 scheme: String::from("memory"),
-                bucket: String::from(""),
                 base_path: Path::from("/"),
                 prefetch_size: 64 * 1024,
             });
@@ -63,7 +61,6 @@ impl ObjectStore {
                 return Ok(Self {
                     inner: Arc::new(LocalFileSystem::new()),
                     scheme: String::from("file"),
-                    bucket: "".to_string(),
                     base_path: Path::from(uri),
                     prefetch_size: 4 * 1024,
                 });
@@ -96,7 +93,6 @@ impl ObjectStore {
         Ok(Self {
             inner: object_store,
             scheme,
-            bucket: bucket_name,
             base_path: Path::from(parsed.path()),
             prefetch_size: 64 * 1024,
         })

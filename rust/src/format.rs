@@ -4,7 +4,7 @@ mod fragment;
 use fragment::Fragment;
 
 /// Protobuf definitions
-#[allow(clippy::all)]
+#[allow(clippy)]
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
 }
@@ -28,7 +28,7 @@ pub struct Manifest {
 
 impl From<&pb::Manifest> for Manifest {
     fn from(p: &pb::Manifest) -> Self {
-        Manifest {
+        Self {
             schema: Schema::from(&p.fields),
             version: p.version,
             fragments: p.fragments.iter().map(Fragment::from).collect(),

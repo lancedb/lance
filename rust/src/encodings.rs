@@ -25,10 +25,10 @@ pub enum Encoding {
 impl From<Encoding> for pb::Encoding {
     fn from(e: Encoding) -> Self {
         match e {
-            Encoding::Plain => pb::Encoding::Plain,
-            Encoding::VarBinary => pb::Encoding::VarBinary,
-            Encoding::Dictionary => pb::Encoding::Dictionary,
-            Encoding::RLE => pb::Encoding::Rle,
+            Encoding::Plain => Self::Plain,
+            Encoding::VarBinary => Self::VarBinary,
+            Encoding::Dictionary => Self::Dictionary,
+            Encoding::RLE => Self::Rle,
         }
     }
 }
