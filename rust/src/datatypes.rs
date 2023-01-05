@@ -305,7 +305,7 @@ mod tests {
             ("float64", DataType::Float64),
         ] {
             let arrow_field = ArrowField::new(name, data_type.clone(), true);
-            let field = Field::from(&arrow_field);
+            let field = Field::try_from(&arrow_field).unwrap();
             assert_eq!(field.name, name);
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
@@ -319,7 +319,7 @@ mod tests {
             DataType::Struct(vec![ArrowField::new("a", DataType::Int32, true)]),
             false,
         );
-        let field = Field::from(&arrow_field);
+        let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
