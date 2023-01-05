@@ -1,0 +1,51 @@
+[package]
+name = "lance"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lance Devs <dev@eto.ai>"]
+description = "A columnar data format that is 100x faster than Parquet for random access."
+license_file = "../LICENSE"
+repository = "https://github.com/eto-ai/lance"
+readme = "../README.md"
+rust-version = "1.65"
+keywords = [
+    "data-format",
+    "data-science",
+    "machine-learning",
+    "apache-arrow",
+    "duckdb",
+    "dataops",
+    "data-analytics"
+]
+categories = [
+    "database-implementations",
+    "data-structures",
+    "development-tools",
+    "science"
+]
+
+[dependencies]
+arrow-array = "30.0"
+arrow-buffer = "30.0"
+arrow-data = "30.0"
+arrow-schema = "30.0"
+async-trait = "0.1.60"
+byteorder = "1.4.3"
+chrono = "0.4.23"
+clap = { version = "4.0.32", features = ["derive"], optional = true }
+object_store = { version = "0.5", features = ["aws"] }
+pin-project = "1.0"
+prost = "0.11"
+prost-types = "0.11"
+tokio = { version = "1.23", features = ["rt-multi-thread"] }
+url = "2.3"
+
+[build-dependencies]
+prost-build = "0.11"
+
+[features]
+cli = ["clap"]
+
+[[bin]]
+name = "lq"
+required-features = ["cli"]
