@@ -23,35 +23,22 @@
 
 use std::io::{ErrorKind, Result};
 use std::marker::PhantomData;
-use std::mem::size_of;
 use std::ops::Range;
 
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::Buffer;
-use arrow_data::{ArrayDataBuilder, Bitmap};
+use arrow_data::ArrayDataBuilder;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::io::AsyncWriteExt;
 
 use crate::io::object_writer::ObjectWriter;
 
-const MAX_BLOCK_SIZE: usize = 1024 * 1024 * 8; // 8MB
-const MIN_BLOCK_SIZE: usize = 512; // 512 bytes
-
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a, T: ArrowPrimitiveType> {
     writer: &'a mut ObjectWriter<'a>,
     phantom: PhantomData<T>,
-}
-
-fn get_rows_per_block<T>(block_size: usize) -> usize {
-    assert!(
-        block_size.is_power_of_two() && (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size),
-    );
-
-    // 1 bit for validity map, and 8 bits * size_of(T) for actual data.
-    block_size * 8 / (1 + size_of::<T>() * 8)
 }
 
 impl<'a, T: ArrowPrimitiveType> PlainEncoder<'a, T> {
@@ -150,13 +137,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_rows_per_block() {
-        assert_eq!(504, get_rows_per_block::<i64>(4096));
-        assert_eq!(504, get_rows_per_block::<u64>(4096));
-        assert_eq!(504, get_rows_per_block::<f64>(4096));
-    }
-
     #[tokio::test]
     async fn test_encode_decode_int_array() {
         let store = InMemory::new();
@@ -173,8 +153,7 @@ mod tests {
         writer.shutdown().await.unwrap();
 
         assert!(store.head(&Path::from("/foo")).await.unwrap().size > 0);
-        let decoder =
-            PlainDecoder::<Int32Type>::new(&store, &path, 0, arr.len()).unwrap();
+        let decoder = PlainDecoder::<Int32Type>::new(&store, &path, 0, arr.len()).unwrap();
         let read_arr = decoder.decode().await.unwrap();
         let expect_arr = as_primitive_array::<Int32Type>(read_arr.as_ref());
         assert_eq!(expect_arr, &arr);

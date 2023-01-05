@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! I/Os
+//! I/O utilities.
 
 use std::io::{Error, ErrorKind, Result};
 
 use async_trait::async_trait;
-
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
 use tokio::io::{AsyncWrite, AsyncWriteExt};

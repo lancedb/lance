@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod dataset;
 pub mod datatypes;
 pub mod encodings;
 pub mod format;
