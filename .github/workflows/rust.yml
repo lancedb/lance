@@ -5,8 +5,8 @@ on:
       - main
   pull_request:
     paths:
-      - 'rust/**.rs'
-      - 'protos/**'
+      - rust/**
+      - protos/**
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -19,7 +19,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy -- --deny "warnings"
       - name: Run tests
-	    run: cargo test
+        run: cargo test
   mac-build:
     runs-on: macos-12
     timeout-minutes: 30
@@ -28,5 +28,5 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v3
-	  - name: Run tests
-	    run: cargo test
+      - name: Run tests
+	      run: cargo test
