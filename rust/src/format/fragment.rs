@@ -4,6 +4,7 @@ use crate::format::pb::DataFragment;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
+#[derive(Debug)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -33,6 +34,7 @@ impl From<&pb::DataFile> for DataFile {
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
 /// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
+#[derive(Debug)]
 pub struct Fragment {
     /// Fragment ID
     pub id: u64,

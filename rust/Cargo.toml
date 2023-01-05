@@ -3,6 +3,10 @@ name = "lance"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "lq"
+required-features = ["cli"]
+
 [dependencies]
 arrow-arith = "30"
 arrow-array = "30"
@@ -15,10 +19,12 @@ object_store = { version = "0.5",  features = ["aws", "aws_profile"] }
 prost = "0.11"
 prost-types = "0.11"
 async-trait = "0.1.60"
-tokio = { version = "1.23", features = ["macros", "io-util"] }
+tokio = { version = "1.23", features = ["macros", "io-util", "rt-multi-thread"] }
 byteorder = "1.4"
 pin-project = "1"
 url = "2.3"
+clap = { version = "4", features = ["derive"], optional = true }
+chrono = "0.4"
 
 [build-dependencies]
 prost-build = { version = "0.11" }
@@ -27,3 +33,5 @@ prost-build = { version = "0.11" }
 tempfile = "3.3"
 rand = "0.8"
 
+[features]
+cli = ["clap"]

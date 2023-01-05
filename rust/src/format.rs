@@ -14,7 +14,7 @@ pub mod pb {
 ///  * Schema
 ///  * Version
 ///  * Fragments.
-///
+#[derive(Debug)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,

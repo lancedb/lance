@@ -11,6 +11,7 @@ use crate::format::pb;
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
+#[derive(Debug)]
 pub struct LogicalType(String);
 
 impl fmt::Display for LogicalType {
@@ -110,6 +111,9 @@ fn is_binary(data_type: &DataType) -> bool {
     matches!(data_type, Binary | Utf8 | LargeBinary | LargeUtf8)
 }
 
+/// Lance Schema Field
+///
+#[derive(Debug)]
 pub struct Field {
     pub name: String,
     pub id: i32,
@@ -220,7 +224,7 @@ impl From<&Field> for pb::Field {
 }
 
 /// Lance Schema.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Schema {
     pub fields: Vec<Field>,
     pub metadata: HashMap<String, String>,

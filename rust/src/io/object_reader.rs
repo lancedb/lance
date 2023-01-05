@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use std::io::{Error, ErrorKind, Result};
 
 use byteorder::{ByteOrder, LittleEndian};
@@ -24,18 +26,23 @@ use prost::Message;
 /// Object Reader
 ///
 /// Object Store + Base Path
-pub struct ObjectReader<'a, S: ObjectStore> {
+pub struct ObjectReader {
     // Index Path
     path: Path,
-    // Object Store
-    object_store: &'a S,
+    // Object Store.
+    // TODO: can we use reference instead?
+    object_store: Arc<dyn ObjectStore>,
     cached_metadata: Option<ObjectMeta>,
     prefetch_size: usize,
 }
 
-impl<'a, S: ObjectStore> ObjectReader<'a, S> {
+impl ObjectReader {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: &'a S, path: Path, prefetch_size: usize) -> Result<Self> {
+    pub fn new(
+        object_store: Arc<dyn ObjectStore>,
+        path: Path,
+        prefetch_size: usize,
+    ) -> Result<Self> {
         Ok(Self {
             object_store,
             path,
@@ -51,10 +58,7 @@ impl<'a, S: ObjectStore> ObjectReader<'a, S> {
         };
         if let Some(metadata) = self.cached_metadata.clone() {
             if pos as usize > metadata.size {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "access position beyond file size",
-                ));
+                return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
             }
         } else {
             panic!("Should not get here");

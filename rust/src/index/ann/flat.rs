@@ -8,34 +8,33 @@ use arrow_array::{Array, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
-use object_store::ObjectStore;
 
 use super::{AnnIndex, AnnIndexType};
-use crate::index::pb::{AnnIndex as PbAnnIndex, Footer};
+use crate::index::pb::{Footer};
 use crate::index::{pb, Index};
-use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
-use crate::io::{read_metadata_offset, AsyncWriteProtoExt};
+use crate::io::{read_metadata_offset, AsyncWriteProtoExt, ObjectStore};
 use crate::dataset::Dataset;
 
 /// Flat index.
 ///
 #[derive(Debug)]
-pub struct FlatIndex<'a, S: ObjectStore> {
+pub struct FlatIndex<'a> {
     columns: Vec<String>,
     // Index Path
     path: ObjectPath,
 
     // Object Store
-    object_store: &'a S,
+    object_store: &'a ObjectStore,
 
     // The dataset this index is attached to.
     dataset: Option<Dataset>,
 }
 
-impl<'a, S: ObjectStore> FlatIndex<'a, S> {
+impl<'a> FlatIndex<'a> {
+
     /// Create an empty index.
-    pub fn new(object_store: &'a S, path: &str, columns: &[&str]) -> Result<Self> {
+    pub fn new(object_store: &'a ObjectStore, path: &str, columns: &[&str]) -> Result<Self> {
         Ok(Self {
             columns: columns.iter().map(|c| c.to_string()).collect(),
             path: ObjectPath::from(path),
@@ -46,14 +45,14 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
 
     /// Open an index on object store.
     pub async fn open(
-        object_store: &'a S,
+        object_store: &'a ObjectStore,
         path: &str,
         prefetch_size: usize,
-    ) -> Result<FlatIndex<'a, S>> {
+    ) -> Result<FlatIndex<'a>> {
         let index_path = ObjectPath::from(path);
-        let bytes = object_store.get(&index_path).await?.bytes().await?;
+        let bytes = object_store.inner.get(&index_path).await?.bytes().await?;
         let metadata_offset = read_metadata_offset(&bytes)?;
-        let mut object_reader = ObjectReader::new(object_store, index_path.clone(), prefetch_size)?;
+        let mut object_reader = object_store.open(&index_path).await?;
         let footer = object_reader
             .read_message::<pb::Footer>(metadata_offset)
             .await?;
@@ -80,14 +79,14 @@ impl<'a, S: ObjectStore> FlatIndex<'a, S> {
 }
 
 #[async_trait]
-impl<'a, S: ObjectStore> Index for FlatIndex<'a, S> {
+impl<'a> Index for FlatIndex<'a> {
     fn columns(&self) -> &[String] {
         self.columns.as_slice()
     }
 
     /// Build index
     async fn build(&self, _reader: &RecordBatch) -> Result<()> {
-        let (_multipart_id, mut writer) = self.object_store.put_multipart(&self.path).await?;
+        let (_multipart_id, mut writer) = self.object_store.inner.put_multipart(&self.path).await?;
         let mut object_writer = ObjectWriter::new(writer.as_mut());
 
         let mut footer = Footer::default();
@@ -102,7 +101,7 @@ impl<'a, S: ObjectStore> Index for FlatIndex<'a, S> {
 }
 
 #[async_trait]
-impl<'a, S: ObjectStore> AnnIndex for FlatIndex<'_, S> {
+impl<'a> AnnIndex for FlatIndex<'_> {
     fn ann_index_type() -> AnnIndexType {
         AnnIndexType::Flat
     }
