@@ -21,13 +21,13 @@ use crate::format::pb;
 #[derive(Debug, Default)]
 pub struct Metadata {
     /// Offset of each record batch.
-    batch_offsets: Vec<i32>,
+    pub batch_offsets: Vec<i32>,
 
     /// The file position of the page table in the file.
-    page_table_position: usize,
+    pub page_table_position: usize,
 
     /// The file position of the manifest block in the file.
-    manifest_position: Option<usize>,
+    pub manifest_position: Option<usize>,
 }
 
 impl From<&Metadata> for pb::Metadata {
@@ -51,7 +51,6 @@ impl From<&pb::Metadata> for Metadata {
 }
 
 impl Metadata {
-
     /// Get the number of batches in this file.
     pub fn num_batches(&self) -> usize {
         if self.batch_offsets.is_empty() {
@@ -71,7 +70,8 @@ impl Metadata {
         if self.batch_offsets.is_empty() {
             self.batch_offsets.push(0)
         }
-        self.batch_offsets.push(batch_len + self.batch_offsets.last().unwrap())
+        self.batch_offsets
+            .push(batch_len + self.batch_offsets.last().unwrap())
     }
 
     /// Get the logical length of a batch.
@@ -83,5 +83,4 @@ impl Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 }

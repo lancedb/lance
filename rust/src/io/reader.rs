@@ -17,19 +17,24 @@
 
 //! Lance Data File Reader
 
+// Standard
 use std::cmp::max;
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
+// Third party
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::DataType;
+use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-use crate::datatypes::Schema;
-use crate::format::{Metadata, pb};
+// Lance
+use crate::datatypes::{Field, Schema};
+use crate::encodings::plain::PlainDecoder;
 use crate::format::Manifest;
+use crate::format::{pb, Metadata};
 use crate::io::object_reader::ObjectReader;
 use crate::io::{read_message, read_metadata_offset};
 
@@ -69,6 +74,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 pub struct FileReader {
     object_reader: ObjectReader,
     metadata: Metadata,
+    manifest: Manifest,
     projection: Option<Schema>,
 }
 
@@ -86,26 +92,40 @@ impl FileReader {
         )?;
 
         let file_size = object_reader.size().await?;
-        let tail_bytes = object_reader.object_store.get_range(
-            &path,
-            max(0 as usize, file_size - object_store.prefetch_size())..file_size,
-        ).await?;
+        let tail_bytes = object_reader
+            .object_store
+            .get_range(
+                &path,
+                max(0 as usize, file_size - object_store.prefetch_size())..file_size,
+            )
+            .await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)? as usize;
         let metadata_pb = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
-            object_reader.read_message::<pb::Metadata>(metadata_pos).await?
+            object_reader
+                .read_message::<pb::Metadata>(metadata_pos)
+                .await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
             read_message::<pb::Metadata>(&tail_bytes.slice(offset..))?
         };
         let metadata = Metadata::from(&metadata_pb);
 
-        if let None = manifest {}
+        let manifest_for_file = match manifest {
+            Some(m) => m,
+            None => {
+                let manifest_pb = object_reader
+                    .read_message::<pb::Manifest>(metadata.manifest_position.unwrap())
+                    .await?;
+                Manifest::from(&manifest_pb)
+            }
+        };
 
         Ok(Self {
             object_reader,
             metadata,
             projection: None,
+            manifest: manifest_for_file,
         })
     }
 
@@ -118,8 +138,28 @@ impl FileReader {
     }
 
     pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
-        todo!();
+        let schema = self.projection.as_ref().unwrap();
+        // TODO spawn more threads
+        let mut arrs = vec![];
+        for field in schema.fields.iter() {
+            let arr = self.read_array(&field, batch_id).await?;
+            arrs.push(arr);
+        }
+        RecordBatch::try_new(Arc::new(schema.into()), arrs)
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
+
+    /// Read primitive array
+    ///
+    async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        todo!()
+    }
+
+    /// Read an array of the batch.
+    async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        self.read_primitive_array(field, batch_id).await
+    }
+
 }
 
 #[cfg(test)]
