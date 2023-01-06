@@ -7,8 +7,8 @@ use async_trait::async_trait;
 pub mod binary;
 pub mod plain;
 pub mod rle;
-use crate::format::pb;
 use crate::error::Result;
+use crate::format::pb;
 
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq)]

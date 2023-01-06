@@ -58,7 +58,6 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             phantom: PhantomData,
         }
     }
-
 }
 
 #[async_trait]

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use arrow_array::{types::Int64Type, Int64Array};
+use std::collections::HashMap;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
@@ -70,7 +70,10 @@ impl PageTable {
     pub fn set_page_info(&mut self) {}
 
     pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
-        self.pages.get(&column).map(|c_map| c_map.get(&batch)).flatten()
+        self.pages
+            .get(&column)
+            .map(|c_map| c_map.get(&batch))
+            .flatten()
     }
 }
 

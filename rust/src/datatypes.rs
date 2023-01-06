@@ -133,10 +133,7 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema(format!(
-                            "Unsupported logical type: {}",
-                            lt
-                        )))
+                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
                         let size: i32 = splits[2]
@@ -150,10 +147,7 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(Error::Schema(format!(
-                            "Unsupported logical type: {}",
-                            lt
-                        )))
+                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
                         let size: i32 = splits[1]
                             .parse::<i32>()
@@ -163,10 +157,7 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema(format!(
-                            "Unsupport dictionary type: {}",
-                            lt
-                        )))
+                        Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
                     } else {
                         let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
@@ -176,10 +167,7 @@ impl TryFrom<&LogicalType> for DataType {
                         ))
                     }
                 }
-                _ => Err(Error::Schema(format!(
-                    "Unsupported logical type: {}",
-                    lt
-                ))),
+                _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
             }
         }
     }
