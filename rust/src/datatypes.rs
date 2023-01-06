@@ -342,7 +342,7 @@ impl From<&Field> for pb::Field {
 }
 
 /// Lance Schema.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct Schema {
     pub fields: Vec<Field>,
     pub metadata: HashMap<String, String>,
