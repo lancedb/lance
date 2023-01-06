@@ -346,7 +346,7 @@ impl Schema {
     pub fn project(&self, columns: &[&str]) -> Result<Schema> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
-            let mut split = (*col).split('.').collect::<Vec<_>>();
+            let split = (*col).split('.').collect::<Vec<_>>();
             if split.is_empty() {
                 return Err(Error::Schema("Empty column name".to_string()));
             }
@@ -537,18 +537,22 @@ mod tests {
                 ]),
                 true,
             ),
+            ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project(&["b.f1", "b.f3"]).unwrap();
+        let projected = schema.project(&["b.f1", "b.f3", "c"]).unwrap();
 
-        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "b",
-            DataType::Struct(vec![
-                ArrowField::new("f1", DataType::Utf8, true),
-                ArrowField::new("f3", DataType::Float32, false),
-            ]),
-            true,
-        )]);
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
         assert_eq!(projected, Schema::try_from(&expected_arrow_schema).unwrap());
     }
 }
