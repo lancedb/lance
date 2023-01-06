@@ -82,6 +82,7 @@ impl TryFrom<&DataType> for LogicalType {
                 LogicalType::try_from(dt.data_type())?.0,
                 *len
             ),
+            DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => return Err(format!("Unsupport data type: {:?}", dt)),
         };
 
@@ -94,35 +95,62 @@ impl TryFrom<&LogicalType> for DataType {
 
     fn try_from(lt: &LogicalType) -> Result<Self, Self::Error> {
         use DataType::*;
-        match lt.0.as_str() {
-            "null" => Ok(Null),
-            "bool" => Ok(Boolean),
-            "int8" => Ok(Int8),
-            "uint8" => Ok(UInt8),
-            "int16" => Ok(Int16),
-            "uint16" => Ok(UInt16),
-            "int32" => Ok(Int32),
-            "uint32" => Ok(UInt32),
-            "int64" => Ok(Int64),
-            "uint64" => Ok(UInt64),
-            "halffloat" => Ok(Float16),
-            "float" => Ok(Float32),
-            "double" => Ok(Float64),
-            "string" => Ok(Utf8),
-            "binary" => Ok(Binary),
-            "large_string" => Ok(LargeUtf8),
-            "large_binary" => Ok(LargeBinary),
-            "date32:day" => Ok(Date32),
-            "date64:ms" => Ok(Date64),
-            "time32:s" => Ok(Time32(TimeUnit::Second)),
-            "time32:ms" => Ok(Time32(TimeUnit::Millisecond)),
-            "time64:us" => Ok(Time64(TimeUnit::Microsecond)),
-            "time64:ns" => Ok(Time64(TimeUnit::Nanosecond)),
-            "timestamp:s" => Ok(Timestamp(TimeUnit::Second, None)),
-            "timestamp:ms" => Ok(Timestamp(TimeUnit::Millisecond, None)),
-            "timestamp:us" => Ok(Timestamp(TimeUnit::Microsecond, None)),
-            "timestamp:ns" => Ok(Timestamp(TimeUnit::Nanosecond, None)),
-            _ => Err(format!("Unsupported type, {}", lt.0.as_str())),
+        if let Some(t) = match lt.0.as_str() {
+            "null" => Some(Null),
+            "bool" => Some(Boolean),
+            "int8" => Some(Int8),
+            "uint8" => Some(UInt8),
+            "int16" => Some(Int16),
+            "uint16" => Some(UInt16),
+            "int32" => Some(Int32),
+            "uint32" => Some(UInt32),
+            "int64" => Some(Int64),
+            "uint64" => Some(UInt64),
+            "halffloat" => Some(Float16),
+            "float" => Some(Float32),
+            "double" => Some(Float64),
+            "string" => Some(Utf8),
+            "binary" => Some(Binary),
+            "large_string" => Some(LargeUtf8),
+            "large_binary" => Some(LargeBinary),
+            "date32:day" => Some(Date32),
+            "date64:ms" => Some(Date64),
+            "time32:s" => Some(Time32(TimeUnit::Second)),
+            "time32:ms" => Some(Time32(TimeUnit::Millisecond)),
+            "time64:us" => Some(Time64(TimeUnit::Microsecond)),
+            "time64:ns" => Some(Time64(TimeUnit::Nanosecond)),
+            "timestamp:s" => Some(Timestamp(TimeUnit::Second, None)),
+            "timestamp:ms" => Some(Timestamp(TimeUnit::Millisecond, None)),
+            "timestamp:us" => Some(Timestamp(TimeUnit::Microsecond, None)),
+            "timestamp:ns" => Some(Timestamp(TimeUnit::Nanosecond, None)),
+            _ => None,
+        } {
+            Ok(t)
+        } else {
+            let splits = lt.0.split(":").collect::<Vec<_>>();
+            match splits[0] {
+                "fixed_size_list" => {
+                    if splits.len() != 3 {
+                        Err(format!("Unsupported logical type: {}", lt))
+                    } else {
+                        let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
+                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        Ok(FixedSizeList(
+                            Box::new(ArrowField::new("item", elem_type, true)),
+                            size,
+                        ))
+                    }
+                }
+                "fixed_size_binary" => {
+                    if splits.len() != 2 {
+                        Err(format!("Unsupported logical type: {}", lt))
+                    } else {
+                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        Ok(FixedSizeBinary(size))
+                    }
+                }
+                _ => Err(format!("Unsupported logical type: {}", lt)),
+            }
         }
     }
 }
@@ -349,6 +377,14 @@ mod tests {
             ("time32:ms", DataType::Time32(TimeUnit::Millisecond)),
             ("time64:us", DataType::Time64(TimeUnit::Microsecond)),
             ("time64:ns", DataType::Time64(TimeUnit::Nanosecond)),
+            ("fixed_size_binary:100", DataType::FixedSizeBinary(100)),
+            (
+                "fixed_size_list:int32:10",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Int32, true)),
+                    10,
+                ),
+            ),
         ] {
             let arrow_field = ArrowField::new(name, data_type.clone(), true);
             let field = Field::try_from(&arrow_field).unwrap();
