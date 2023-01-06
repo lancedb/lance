@@ -28,7 +28,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-use crate::encodings::{Decoder, dictionary::DictionaryDecoder};
+use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
@@ -196,14 +196,21 @@ impl<'a> FileReader<'a> {
             page_info.position,
             page_info.length,
             &data_type,
-            field.dictionary.as_ref().unwrap().values.as_ref().unwrap().clone(),
+            field
+                .dictionary
+                .as_ref()
+                .unwrap()
+                .values
+                .as_ref()
+                .unwrap()
+                .clone(),
         );
         decoder.decode().await
     }
 
     /// Read an array of the batch.
     async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        if field.data_type().is_dictionary_key_type() {
+        if let DataType::Dictionary(_, _) = field.data_type() {
             self.read_dictionary_array(field, batch_id).await
         } else if field.data_type().is_numeric() {
             self.read_primitive_array(field, batch_id).await
