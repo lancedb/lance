@@ -210,7 +210,7 @@ pub struct Field {
     encoding: Option<Encoding>,
     nullable: bool,
 
-    children: Vec<Field>,
+    pub children: Vec<Field>,
 }
 
 impl Field {
@@ -385,14 +385,19 @@ impl From<&Field> for pb::Field {
 /// Lance Schema.
 #[derive(Default, Debug, PartialEq, Clone)]
 pub struct Schema {
+    /// Top-level fields in the dataset.
     pub fields: Vec<Field>,
+    /// Metadata of the schema
     pub metadata: HashMap<String, String>,
 }
 
 impl Schema {
     /// Project the columns over the schema.
     ///
-    ///
+    /// ```ignore
+    /// let schema = Schema::from(...);
+    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
+    /// ```
     pub fn project(&self, columns: &[&str]) -> Result<Schema> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
@@ -434,7 +439,7 @@ impl Schema {
         None
     }
 
-    pub fn max_field_id(&self) -> Option<i32> {
+    pub(crate) fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
     }
 }
