@@ -187,35 +187,11 @@ impl<'a> FileReader<'a> {
     }
 
     async fn read_binary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        let column = field.id;
-        let page_info = self
-            .page_table
-            .get(column, batch_id)
-            .ok_or(Error::IO(format!(
-                "field: {} batch {} does not exist in page table",
-                field, batch_id
-            )))?;
+        let page_info = self.page_info(field, batch_id)?;
 
-        use DataType::*;
-        let decoder: Box<dyn Decoder> = match field.data_type() {
-            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
-                &self.object_reader,
-                page_info.position,
-                page_info.length,
-            )),
-            Binary => Box::new(BinaryDecoder::<BinaryType>::new(
-                &self.object_reader,
-                page_info.position,
-                page_info.length,
-            )),
-            _ => {
-                return Err(Error::IO(format!(
-                    "Unsupported binary type: {}",
-                    field.data_type()
-                )))
-            }
-        };
-        decoder.decode().await
+        self.object_reader
+            .read_binary_array(field.data_type(), page_info.position, page_info.length)
+            .await
     }
 
     async fn read_dictionary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {

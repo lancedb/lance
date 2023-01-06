@@ -21,10 +21,11 @@ use std::ops::Range;
 
 use arrow_array::{
     types::{
-        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Utf8Type,
     },
-    ArrayRef, ArrowPrimitiveType,
+    ArrayRef,
 };
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
@@ -32,7 +33,7 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
-use crate::encodings::{plain::PlainDecoder, Decoder};
+use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 
@@ -88,6 +89,8 @@ impl<'a> ObjectReader<'a> {
         Ok(bytes)
     }
 
+    /// Read a primitive array from disk.
+    ///
     pub async fn read_primitive_array(
         &self,
         data_type: DataType,
@@ -121,6 +124,26 @@ impl<'a> ObjectReader<'a> {
                 return Err(Error::Schema(format!(
                     "Unsupport primitive type: {}",
                     data_type
+                )))
+            }
+        };
+        decoder.decode().await
+    }
+
+    pub async fn read_binary_array(
+        &self,
+        data_type: DataType,
+        position: usize,
+        length: usize,
+    ) -> Result<ArrayRef> {
+        use arrow_schema::DataType::*;
+        let decoder: Box<dyn Decoder> = match data_type {
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
+            _ => {
+                return Err(Error::IO(format!(
+                    "Unsupported binary type: {}",
+                    data_type,
                 )))
             }
         };
