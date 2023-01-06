@@ -17,6 +17,7 @@ use super::plain::PlainDecoder;
 
 pub struct BinaryEncoder {}
 
+/// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
     reader: &'a ObjectReader<'a>,
 
@@ -30,6 +31,27 @@ pub struct BinaryDecoder<'a, T: ByteArrayType> {
 /// Var-length Binary Decoder
 ///
 impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
+
+    /// Create a [BinaryEncoder] to decode one batch.
+    ///
+    ///  - `position`, file position where this batch starts.
+    ///  - `length`, the number of records in this batch.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use arrow_array::types::Utf8Type;
+    /// use object_store::path::Path;
+    /// use lance::io::ObjectStore;
+    /// use lance::encodings::binary::BinaryDecoder;
+    ///
+    /// async {
+    ///     let object_store = ObjectStore::new(":memory:").unwrap();
+    ///     let path = Path::from("/data.lance");
+    ///     let reader = object_store.open(&path).await.unwrap();
+    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(&reader, 100, 1024);
+    /// };
+    /// ```
     pub fn new(reader: &'a ObjectReader, position: usize, length: usize) -> Self {
         Self {
             reader,

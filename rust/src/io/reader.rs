@@ -23,18 +23,18 @@ use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::types::{
-    BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-    UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+use arrow_array::{
+    types::{
+        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+    },
+    ArrayRef, Int32Array, RecordBatch,
 };
-// Third party
-use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-// Lance
 use crate::datatypes::{Field, Schema};
 use crate::encodings::binary::BinaryDecoder;
 use crate::encodings::plain::PlainDecoder;
@@ -80,7 +80,6 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 pub struct FileReader<'a> {
     object_reader: ObjectReader<'a>,
     metadata: Metadata,
-    manifest: Manifest,
     page_table: PageTable,
     projection: Option<Schema>,
 }
@@ -139,7 +138,6 @@ impl<'a> FileReader<'a> {
             metadata,
             projection: Some(manifest_for_file.schema.clone()),
             page_table,
-            manifest: manifest_for_file,
         })
     }
 

@@ -18,8 +18,7 @@
 //! Plain encoding
 //!
 //! Plain encoding works with primitive types, i.e., `boolean`, `i8...i64`,
-//! it stores the array directly in the file. Therefore, it offers O(1) read
-//! access.
+//! it stores the array directly in the file. It offers O(1) read access.
 
 use std::io::{ErrorKind, Result};
 use std::marker::PhantomData;

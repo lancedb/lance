@@ -40,6 +40,7 @@ pub trait Encoder {
     fn write(&mut self, array: &dyn Array) -> Result<i64>;
 }
 
+/// Decoder - Read Arrow Array from file.
 #[async_trait]
 pub trait Decoder {
     async fn decode(&self) -> Result<ArrayRef>;
