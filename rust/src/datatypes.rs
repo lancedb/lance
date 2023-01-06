@@ -1,17 +1,18 @@
-//! Lance data types
+//! Lance data types, [Schema] and [Field]
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 
 use crate::encodings::Encoding;
 use crate::format::pb;
+use crate::{LanceError, Result};
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogicalType(String);
 
 impl fmt::Display for LogicalType {
@@ -46,9 +47,9 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
 }
 
 impl TryFrom<&DataType> for LogicalType {
-    type Error = String;
+    type Error = LanceError;
 
-    fn try_from(dt: &DataType) -> Result<Self, Self::Error> {
+    fn try_from(dt: &DataType) -> Result<Self> {
         let type_str = match dt {
             DataType::Null => "null".to_string(),
             DataType::Boolean => "bool".to_string(),
@@ -83,7 +84,7 @@ impl TryFrom<&DataType> for LogicalType {
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
-            _ => return Err(format!("Unsupport data type: {:?}", dt)),
+            _ => return Err(LanceError::Schema(format!("Unsupport data type: {:?}", dt))),
         };
 
         Ok(Self(type_str.to_string()))
@@ -91,9 +92,9 @@ impl TryFrom<&DataType> for LogicalType {
 }
 
 impl TryFrom<&LogicalType> for DataType {
-    type Error = String;
+    type Error = LanceError;
 
-    fn try_from(lt: &LogicalType) -> Result<Self, Self::Error> {
+    fn try_from(lt: &LogicalType) -> Result<Self> {
         use DataType::*;
         if let Some(t) = match lt.0.as_str() {
             "null" => Some(Null),
@@ -131,10 +132,10 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(format!("Unsupported logical type: {}", lt))
+                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
                         Ok(FixedSizeList(
                             Box::new(ArrowField::new("item", elem_type, true)),
                             size,
@@ -143,13 +144,13 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(format!("Unsupported logical type: {}", lt))
+                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
-                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
-                _ => Err(format!("Unsupported logical type: {}", lt)),
+                _ => Err(LanceError::Schema(format!("Unsupported logical type: {}", lt))),
             }
         }
     }
@@ -170,15 +171,15 @@ fn is_binary(data_type: &DataType) -> bool {
 
 /// Lance Schema Field
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub name: String,
     pub id: i32,
-    pub parent_id: i32,
-    pub logical_type: LogicalType,
-    pub extension_name: String,
-    pub encoding: Option<Encoding>,
-    pub nullable: bool,
+    parent_id: i32,
+    logical_type: LogicalType,
+    extension_name: String,
+    encoding: Option<Encoding>,
+    nullable: bool,
 
     children: Vec<Field>,
 }
@@ -194,6 +195,53 @@ impl Field {
             lt => DataType::try_from(lt).unwrap(),
         }
     }
+
+    pub fn child(&self, name: &str) -> Option<&Field> {
+        self.children.iter().find(|f| f.name == name)
+    }
+
+    pub fn child_mut(&mut self, name: &str) -> Option<&mut Field> {
+        self.children.iter_mut().find(|f| f.name == name)
+    }
+
+    fn project(&self, path_components: &[&str]) -> Result<Field> {
+        let mut f = Field {
+            name: self.name.clone(),
+            id: self.id,
+            parent_id: self.parent_id,
+            logical_type: self.logical_type.clone(),
+            extension_name: self.extension_name.clone(),
+            encoding: self.encoding.clone(),
+            nullable: self.nullable,
+            children: vec![],
+        };
+        if path_components.is_empty() {
+            // Project stops here, copy all the remaining children.
+            f.children = self.children.clone()
+        } else {
+            let first = path_components[0];
+            for c in self.children.as_slice() {
+                if c.name == first {
+                    let projected = c.project(&path_components[1..])?;
+                    f.children.push(projected);
+                    break;
+                }
+            }
+        }
+        Ok(f)
+    }
+
+    /// Merge the children of other field into this one.
+    fn merge(&mut self, other: &Field) -> Result<()> {
+        for other_child in other.children.as_slice() {
+            if let Some(field) = self.child_mut(&other_child.name) {
+                field.merge(other_child)?;
+            } else {
+                self.children.push(other_child.clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Field {
@@ -207,14 +255,13 @@ impl fmt::Display for Field {
 }
 
 impl TryFrom<&ArrowField> for Field {
-    type Error = ArrowError;
+    type Error = LanceError;
 
-    fn try_from(field: &ArrowField) -> Result<Self, ArrowError> {
+    fn try_from(field: &ArrowField) -> Result<Self> {
         let children = match field.data_type() {
-            DataType::Struct(children) => children
-                .iter()
-                .map(Self::try_from)
-                .collect::<Result<_, _>>()?,
+            DataType::Struct(children) => {
+                children.iter().map(Self::try_from).collect::<Result<_>>()?
+            }
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
@@ -222,8 +269,7 @@ impl TryFrom<&ArrowField> for Field {
             id: -1,
             parent_id: -1,
             name: field.name().clone(),
-            logical_type: LogicalType::try_from(field.data_type())
-                .map_err(ArrowError::SchemaError)?,
+            logical_type: LogicalType::try_from(field.data_type())?,
             encoding: match field.data_type() {
                 dt if is_numeric(dt) => Some(Encoding::Plain),
                 dt if is_binary(dt) => Some(Encoding::VarBinary),
@@ -287,10 +333,44 @@ impl From<&Field> for pb::Field {
 }
 
 /// Lance Schema.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq)]
 pub struct Schema {
     pub fields: Vec<Field>,
     pub metadata: HashMap<String, String>,
+}
+
+impl Schema {
+    /// Project the columns over the schema.
+    ///
+    ///
+    pub fn project(&self, columns: &[&str]) -> Result<Schema> {
+        let mut candidates: Vec<Field> = vec![];
+        for col in columns {
+            let split = (*col).split('.').collect::<Vec<_>>();
+            let first = split[0];
+            if let Some(field) = self.field(first) {
+                let projected_field = field.project(&split[1..])?;
+                if let Some(candidate_field) =
+                    candidates.iter_mut().filter(|f| f.name == first).next()
+                {
+                    candidate_field.merge(&projected_field)?;
+                } else {
+                    candidates.push(projected_field)
+                }
+            } else {
+                return Err(LanceError::Schema(format!("Column {} does not exist", col)));
+            }
+        }
+
+        Ok(Schema {
+            fields: candidates,
+            metadata: self.metadata.clone(),
+        })
+    }
+
+    fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().filter(|f| f.name == name).next()
+    }
 }
 
 impl fmt::Display for Schema {
@@ -304,15 +384,15 @@ impl fmt::Display for Schema {
 
 /// Convert `arrow2::datatype::Schema` to Lance
 impl TryFrom<&ArrowSchema> for Schema {
-    type Error = ArrowError;
+    type Error = LanceError;
 
-    fn try_from(schema: &ArrowSchema) -> Result<Self, ArrowError> {
+    fn try_from(schema: &ArrowSchema) -> Result<Self> {
         Ok(Self {
             fields: schema
                 .fields
                 .iter()
                 .map(Field::try_from)
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
         })
     }
@@ -442,17 +522,34 @@ mod tests {
     }
 
     #[test]
-    fn test_list_of_list() {
-        let arrow_field = ArrowField::new(
-            "data",
-            DataType::List(Box::new(ArrowField::new(
-                "item",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Float16, true))),
+    fn test_schema_projection() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
                 true,
-            ))),
-            true,
-        );
-        let field = Field::try_from(&arrow_field).unwrap();
-        assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let projected = schema.project(&["b.f1", "b.f3", "c"]).unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(projected, Schema::try_from(&expected_arrow_schema).unwrap());
     }
 }

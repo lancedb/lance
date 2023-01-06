@@ -15,17 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lance Columnar Data Format
-//!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
+use std::error::Error as StdError;
 
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod io;
+use arrow_schema::ArrowError;
 
-pub use error::{LanceError, Result};
+#[derive(Debug)]
+pub enum LanceError {
+    Arrow(String),
+    Schema(String),
+}
+
+pub type Result<T> = std::result::Result<T, LanceError>;
+
+impl std::fmt::Display for LanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (catelog, message) = match self {
+            Self::Arrow(s) => ("Arrow", s),
+            Self::Schema(s) => ("Schema", s),
+        };
+        write!(f, "LanceError({}): {}", catelog, message)
+    }
+}
+
+impl From<ArrowError> for LanceError {
+    fn from(value: ArrowError) -> Self {
+        LanceError::Arrow(value.to_string())
+    }
+}
+
+impl StdError for LanceError {}
