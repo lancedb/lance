@@ -1,3 +1,5 @@
+extern crate core;
+
 pub mod dataset;
 pub mod encodings;
 pub mod format;

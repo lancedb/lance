@@ -2,10 +2,12 @@
 //!
 
 use std::io::Result;
+use std::ops::DerefMut;
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_select::concat::concat;
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 
@@ -15,6 +17,8 @@ use crate::index::{pb, Index};
 use crate::io::object_writer::ObjectWriter;
 use crate::io::{read_metadata_offset, AsyncWriteProtoExt, ObjectStore};
 use crate::dataset::Dataset;
+use crate::index::ann::distance::euclidean_distance;
+use crate::index::ann::sort::find_topk;
 
 /// Flat index.
 ///
@@ -65,22 +69,56 @@ impl<'a> FlatIndex<'a> {
 
     /// Search Flat index.
     /// Returns a RecordBatch with {score:float, row_id:u64}.
-    async fn search(&mut self, vector: &Float32Array, top_k: u32) -> Result<RecordBatch> {
-        assert!(self.dataset.is_some());
-        assert_eq!(vector.null_count(), 0);
-        assert_eq!(self.columns.len(), 1);
+    async fn search(&mut self, vector: &Float32Array, top_k: u32) -> core::result::Result<RecordBatch, ArrowError> {
+        if !self.dataset.is_some() {
+            return Err(ArrowError::ComputeError("Empty dataset".to_string()));
+        }
+        if vector.null_count() != 0 {
+            return Err(ArrowError::ComputeError("Input vector must not contain nulls".to_string()));
+        }
+        if self.columns.len() != 1 {
+            return Err(ArrowError::ComputeError(format!("1 and only 1 vector columns allowed in the index. Found {}.", self.columns.len())));
+        }
+        let scanner = self.dataset.as_ref().unwrap().scan()?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("row_id", DataType::UInt64, false),
             Field::new("score", DataType::Float32, false),
-        ]));
-        let scanner = self.dataset.as_ref().unwrap().scan()?;
+        ])) as SchemaRef;
 
-        // Exhausticallly compute all distance.
-        // scanner.flat_map(|b| b.map(|batch| {
-        //     vec![0]
-        // // })).collect();
-        Ok(RecordBatch::new_empty(schema))
+        let mut total = 0;
+        let mut all_row_ids: Vec<u64> = vec![];
+        let mut all_scores: Vec<f32> = vec![];
+
+        // TODO parallelize each batch?
+        for next in scanner {
+            let batch = next?;
+            let scores = compute_scores(&batch, self.columns[0].as_str(), vector, &total)?;
+            let row_ids: Vec<u64> = (total..total+batch.num_rows() as u64).collect();
+            total += batch.num_rows() as u64;
+            all_row_ids.extend(&row_ids);
+            all_scores.extend(&scores);
+        }
+
+        // How to handle NAs?
+        let compare = |l: &f32, r: &f32| l.total_cmp(r);
+        find_topk(&mut all_scores, &mut all_row_ids, top_k as usize, &compare)?;
+
+        let top_scores: Vec<f32> = all_scores[0..top_k as usize].to_vec();
+        let top_indices: Vec<u64> = all_row_ids[0..top_k as usize].to_vec();
+        let columns = vec![
+            Arc::new(UInt64Array::from(top_indices)) as ArrayRef,
+            Arc::new(Float32Array::from(top_scores)) as ArrayRef
+        ];
+        RecordBatch::try_new(schema, columns)
     }
+}
+
+fn compute_scores(batch: &RecordBatch, column: &str, v: &Float32Array, total: &u64) -> core::result::Result<Vec<f32>, ArrowError> {
+    let col_idx = batch.schema().index_of(column)?;
+    let col = batch.column(col_idx);
+    let vectors = col.as_any().downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| ArrowError::SchemaError("Could not downcast to fixed size list".to_string()))?;
+    euclidean_distance(v, vectors)
 }
 
 #[async_trait]

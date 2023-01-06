@@ -6,27 +6,40 @@
 use arrow_arith::aggregate::sum;
 use arrow_arith::arithmetic::{multiply, subtract};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 
 /// Euclidean distance from a point to a list of points.
 pub fn euclidean_distance(
     from: &Float32Array,
     to: &FixedSizeListArray,
-) -> Result<Float32Array, ArrowError> {
-    assert_eq!(from.len(), to.value_length() as usize);
+) -> Result<Vec<f32>, ArrowError> {
+    if from.len() != to.value_length() as usize {
+        return Err(ArrowError::ComputeError(format!("Index has {} dims but in put has {}", to.value_length(), from.len())));
+    }
+    if to.value_type() != DataType::Float32 {
+        return Err(ArrowError::SchemaError("Index needs to have Float32 values".to_string()));
+    }
 
     // Naive implementation.
     // TODO: benchmark and use SIMD or BLAS
-    let scores: Float32Array = (0..to.len())
+    let scores = (0..to.len())
         .map(|idx| to.value(idx))
         .map(|left| {
             let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
-            let mut sub = subtract(arr, from).unwrap();
-            sub = multiply(&sub, &sub).unwrap();
-            sum(&sub).unwrap().sqrt()
+            euclidean_distanc(from, arr).unwrap()  // how to handle NAs ?
         })
         .collect();
     Ok(scores)
+}
+
+
+pub fn euclidean_distanc(
+    from: &Float32Array,
+    to: &Float32Array
+) -> Result<f32, ArrowError> {
+    let diff = subtract(from, to)?;
+    let pow = multiply(&diff, &diff)?;
+    sum(&pow).ok_or_else(|| ArrowError::ComputeError("".to_string()))
 }
 
 #[cfg(test)]
@@ -50,7 +63,7 @@ mod tests {
         let scores = euclidean_distance(&point, &mat).unwrap();
 
         assert_eq!(
-            scores,
+            Float32Array::from(scores),
             Float32Array::from(vec![3.0_f32.sqrt(), 0_f32, 3.0_f32.sqrt(), 12.0_f32.sqrt()])
         );
     }

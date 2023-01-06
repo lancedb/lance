@@ -13,6 +13,7 @@ arrow-array = "30"
 arrow-schema = "30"
 arrow-buffer = "30"
 arrow-data = "30"
+arrow-select = "30"
 cxx = "1.0"
 linfa-clustering = "0.6"
 object_store = { version = "0.5",  features = ["aws", "aws_profile"] }
@@ -26,6 +27,7 @@ url = "2.3"
 clap = { version = "4", features = ["derive"], optional = true }
 chrono = "0.4"
 rand = "0.8.5"
+rayon = "1.6.1"
 
 [build-dependencies]
 prost-build = { version = "0.11" }
