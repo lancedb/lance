@@ -1,4 +1,4 @@
-//! Lance data types
+//! Lance data types, [Schema] and [Field]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -175,11 +175,11 @@ fn is_binary(data_type: &DataType) -> bool {
 pub struct Field {
     pub name: String,
     pub id: i32,
-    pub parent_id: i32,
-    pub logical_type: LogicalType,
-    pub extension_name: String,
-    pub encoding: Option<Encoding>,
-    pub nullable: bool,
+    parent_id: i32,
+    logical_type: LogicalType,
+    extension_name: String,
+    encoding: Option<Encoding>,
+    nullable: bool,
 
     children: Vec<Field>,
 }
