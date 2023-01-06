@@ -30,6 +30,7 @@ use crate::io::ObjectStore;
 /// Object Reader
 ///
 /// Object Store + Base Path
+#[derive(Debug)]
 pub struct ObjectReader<'a> {
     // Object Store.
     // TODO: can we use reference instead?
