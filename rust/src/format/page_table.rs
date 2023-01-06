@@ -21,8 +21,8 @@ use std::io::Result;
 use arrow_array::{types::Int64Type, Int64Array};
 
 use crate::encodings::plain::PlainDecoder;
-use crate::io::object_reader::ObjectReader;
 use crate::encodings::Decoder;
+use crate::io::object_reader::ObjectReader;
 
 #[derive(Debug)]
 pub struct PageInfo {

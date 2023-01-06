@@ -266,15 +266,4 @@ mod tests {
 
     use super::FileReader;
     use crate::io::ObjectStore;
-
-    #[tokio::test]
-    async fn test_read_real_file() {
-        let store = ObjectStore::new("/Users/lei/work/lance/rust").unwrap();
-        let path = Path::from(
-            "/Users/lei/work/lance/rust/data/7d159bc9-36f2-40ae-8cfa-baadd7178981_0.lance",
-        );
-
-        let reader = FileReader::new(&store, &path, None).await.unwrap();
-        let batch = reader.read_batch(0).await.unwrap();
-    }
 }

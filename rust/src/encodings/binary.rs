@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::types::{ByteArrayType, Int64Type};
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, GenericByteArray};
+use arrow_array::{Array, ArrayRef, GenericByteArray, Int32Array, Int64Array};
 use arrow_data::ArrayDataBuilder;
 use async_trait::async_trait;
 

@@ -133,10 +133,15 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(LanceError::Schema(format!(
+                            "Unsupported logical type: {}",
+                            lt
+                        )))
                     } else {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                        let size: i32 = splits[2]
+                            .parse::<i32>()
+                            .map_err(|e: _| LanceError::Schema(e.to_string()))?;
                         Ok(FixedSizeList(
                             Box::new(ArrowField::new("item", elem_type, true)),
                             size,
@@ -145,23 +150,36 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(LanceError::Schema(format!(
+                            "Unsupported logical type: {}",
+                            lt
+                        )))
                     } else {
-                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                        let size: i32 = splits[1]
+                            .parse::<i32>()
+                            .map_err(|e: _| LanceError::Schema(e.to_string()))?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(LanceError::Schema(format!("Unsupport dictionary type: {}", lt)))
+                        Err(LanceError::Schema(format!(
+                            "Unsupport dictionary type: {}",
+                            lt
+                        )))
                     } else {
                         let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
-                        Ok(DataType::Dictionary(Box::new(index_type), Box::new(value_type)))
+                        Ok(DataType::Dictionary(
+                            Box::new(index_type),
+                            Box::new(value_type),
+                        ))
                     }
-
                 }
-                _ => Err(LanceError::Schema(format!("Unsupported logical type: {}", lt))),
+                _ => Err(LanceError::Schema(format!(
+                    "Unsupported logical type: {}",
+                    lt
+                ))),
             }
         }
     }
@@ -274,7 +292,6 @@ impl Field {
         }
         None
     }
-
 }
 
 impl fmt::Display for Field {
@@ -420,7 +437,6 @@ impl Schema {
     pub fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
     }
-
 }
 
 impl fmt::Display for Schema {
@@ -478,7 +494,6 @@ impl From<&Vec<pb::Field>> for Schema {
         schema
     }
 }
-
 
 #[cfg(test)]
 mod tests {
