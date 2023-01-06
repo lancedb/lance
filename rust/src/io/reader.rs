@@ -34,8 +34,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-use crate::datatypes::{Field, Schema};
-use crate::encodings::binary::BinaryDecoder;
+use crate::encodings::{binary::BinaryDecoder, dictionary::DictionaryDecoder};
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::{Error, Result};
@@ -43,6 +42,10 @@ use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::ObjectReader;
 use crate::io::{read_message, read_metadata_offset};
+use crate::{
+    datatypes::{Field, Schema},
+    format::PageInfo,
+};
 
 use super::object_store::ObjectStore;
 
@@ -164,17 +167,20 @@ impl<'a> FileReader<'a> {
         Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     }
 
-    /// Read primitive array for batch `batch_idx`.
-    ///
-    async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+    fn page_info(&self, field: &Field, batch_id: i32) -> Result<&PageInfo> {
         let column = field.id;
-        let page_info = self
-            .page_table
+        self.page_table
             .get(column, batch_id)
             .ok_or(Error::IO(format!(
                 "No page info found for field: {}, batch={}",
                 field.name, batch_id
-            )))?;
+            )))
+    }
+
+    /// Read primitive array for batch `batch_idx`.
+    ///
+    async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        let page_info = self.page_info(field, batch_id)?;
         use DataType::*;
 
         macro_rules! create_plain_decoder {
@@ -241,10 +247,19 @@ impl<'a> FileReader<'a> {
         decoder.decode().await
     }
 
+    async fn read_dictionary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        let page_info = self.page_info(field, batch_id)?;
+        // let decoder = DictionaryDecoder::new(&self.object_reader, page_info.position, page_info.length,
+        // &field.data_type());
+        todo!();
+    }
+
     /// Read an array of the batch.
     async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        if field.data_type().is_numeric() {
-            return self.read_primitive_array(field, batch_id).await;
+        if field.data_type().is_dictionary_key_type() {
+            self.read_dictionary_array(field, batch_id).await
+        } else if field.data_type().is_numeric() {
+            self.read_primitive_array(field, batch_id).await
         } else if matches!(
             field.data_type(),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
