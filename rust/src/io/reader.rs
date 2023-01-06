@@ -23,9 +23,12 @@ use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type, Float16Type, Float32Type, Float64Type};
+use arrow_array::types::{
+    BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+};
 // Third party
-use arrow_array::{ArrayRef, RecordBatch, Int16Array, Int32Array};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
@@ -33,6 +36,7 @@ use prost::Message;
 
 // Lance
 use crate::datatypes::{Field, Schema};
+use crate::encodings::binary::BinaryDecoder;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::format::Manifest;
@@ -153,6 +157,7 @@ impl<'a> FileReader<'a> {
         let mut arrs = vec![];
         for field in schema.fields.iter() {
             let arr = self.read_array(&field, batch_id).await?;
+            println!("Read array: {:?}\n", arr);
             arrs.push(arr);
         }
         RecordBatch::try_new(Arc::new(schema.into()), arrs)
@@ -194,7 +199,44 @@ impl<'a> FileReader<'a> {
             Float16 => create_plain_decoder!(Float16Type),
             Float32 => create_plain_decoder!(Float32Type),
             Float64 => create_plain_decoder!(Float64Type),
-            _ => return Err(Error::new(ErrorKind::InvalidData, format!("Unsupport primitive type: {}", field.data_type()))),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unsupport primitive type: {}", field.data_type()),
+                ))
+            }
+        };
+        decoder.decode().await
+    }
+
+    async fn read_binary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        let column = field.id;
+        let page_info = self.page_table.get(column, batch_id).ok_or(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "field: {} batch {} does not exist in page table",
+                field, batch_id
+            ),
+        ))?;
+
+        use DataType::*;
+        let decoder: Box<dyn Decoder> = match field.data_type() {
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
+                &self.object_reader,
+                page_info.position,
+                page_info.length,
+            )),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(
+                &self.object_reader,
+                page_info.position,
+                page_info.length,
+            )),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unsupported binary type: {}", field.data_type()),
+                ))
+            }
         };
         decoder.decode().await
     }
@@ -202,11 +244,18 @@ impl<'a> FileReader<'a> {
     /// Read an array of the batch.
     async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         if field.data_type().is_numeric() {
-            self.read_primitive_array(field, batch_id).await
+            return self.read_primitive_array(field, batch_id).await;
+        } else if matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+        ) {
+            self.read_binary_array(field, batch_id).await
         } else {
             println!("Reading: {}", field);
             let page_info = self.page_table.get(field.id, batch_id).unwrap();
-            Ok(Arc::new(Int32Array::from((0..page_info.length as i32).collect::<Vec<_>>())))
+            Ok(Arc::new(Int32Array::from(
+                (0..page_info.length as i32).collect::<Vec<_>>(),
+            )))
         }
     }
 }
@@ -221,7 +270,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_real_file() {
         let store = ObjectStore::new("/Users/lei/work/lance/rust").unwrap();
-        let path = Path::from("/Users/lei/work/lance/rust/data/7d159bc9-36f2-40ae-8cfa-baadd7178981_0.lance");
+        let path = Path::from(
+            "/Users/lei/work/lance/rust/data/7d159bc9-36f2-40ae-8cfa-baadd7178981_0.lance",
+        );
 
         let reader = FileReader::new(&store, &path, None).await.unwrap();
         let batch = reader.read_batch(0).await.unwrap();
