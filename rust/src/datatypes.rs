@@ -190,12 +190,12 @@ fn is_binary(data_type: &DataType) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Dictionary {
+pub struct Dictionary {
     offset: usize,
 
     length: usize,
 
-    values: Option<ArrayRef>,
+    pub(crate) values: Option<ArrayRef>,
 }
 
 impl From<&pb::Dictionary> for Dictionary {
@@ -223,7 +223,7 @@ pub struct Field {
     pub children: Vec<Field>,
 
     /// Dictionary value array if this field is dictionary.
-    dictionary: Option<Dictionary>,
+    pub dictionary: Option<Dictionary>,
 }
 
 impl Field {

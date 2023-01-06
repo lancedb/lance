@@ -22,14 +22,13 @@ use std::cmp::max;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{
-    ArrayRef, Int32Array, RecordBatch,
-};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
+use crate::encodings::{Decoder, dictionary::DictionaryDecoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
@@ -191,9 +190,15 @@ impl<'a> FileReader<'a> {
 
     async fn read_dictionary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
-        // let decoder = DictionaryDecoder::new(&self.object_reader, page_info.position, page_info.length,
-        // &field.data_type());
-        todo!();
+        let data_type = field.data_type();
+        let decoder = DictionaryDecoder::new(
+            &self.object_reader,
+            page_info.position,
+            page_info.length,
+            &data_type,
+            field.dictionary.as_ref().unwrap().values.as_ref().unwrap().clone(),
+        );
+        decoder.decode().await
     }
 
     /// Read an array of the batch.
