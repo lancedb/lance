@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 
 use crate::encodings::Encoding;
 use crate::format::pb;
@@ -36,33 +36,55 @@ impl From<&str> for LogicalType {
     }
 }
 
+fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "s",
+        TimeUnit::Millisecond => "ms",
+        TimeUnit::Microsecond => "us",
+        TimeUnit::Nanosecond => "ns",
+    }
+}
+
 impl TryFrom<&DataType> for LogicalType {
     type Error = String;
 
     fn try_from(dt: &DataType) -> Result<Self, Self::Error> {
         let type_str = match dt {
-            DataType::Null => Ok("null"),
-            DataType::Boolean => Ok("bool"),
-            DataType::Int8 => Ok("int8"),
-            DataType::UInt8 => Ok("uint8"),
-            DataType::Int16 => Ok("int16"),
-            DataType::UInt16 => Ok("uint16"),
-            DataType::Int32 => Ok("int32"),
-            DataType::UInt32 => Ok("uint32"),
-            DataType::Int64 => Ok("int64"),
-            DataType::UInt64 => Ok("uint64"),
-            DataType::Float16 => Ok("halffloat"),
-            DataType::Float32 => Ok("float"),
-            DataType::Float64 => Ok("double"),
-            DataType::Utf8 => Ok("string"),
-            DataType::Binary => Ok("binary"),
-            DataType::LargeUtf8 => Ok("large_string"),
-            DataType::LargeBinary => Ok("large_binary"),
-            DataType::Date32 => Ok("date32:day"),
-            DataType::Date64 => Ok("date64:ms"),
-            DataType::Struct(_) => Ok("struct"),
-            _ => Err(format!("Unsupport data type: {:?}", dt)),
-        }?;
+            DataType::Null => "null".to_string(),
+            DataType::Boolean => "bool".to_string(),
+            DataType::Int8 => "int8".to_string(),
+            DataType::UInt8 => "uint8".to_string(),
+            DataType::Int16 => "int16".to_string(),
+            DataType::UInt16 => "uint16".to_string(),
+            DataType::Int32 => "int32".to_string(),
+            DataType::UInt32 => "uint32".to_string(),
+            DataType::Int64 => "int64".to_string(),
+            DataType::UInt64 => "uint64".to_string(),
+            DataType::Float16 => "halffloat".to_string(),
+            DataType::Float32 => "float".to_string(),
+            DataType::Float64 => "double".to_string(),
+            DataType::Utf8 => "string".to_string(),
+            DataType::Binary => "binary".to_string(),
+            DataType::LargeUtf8 => "large_string".to_string(),
+            DataType::LargeBinary => "large_binary".to_string(),
+            DataType::Date32 => "date32:day".to_string(),
+            DataType::Date64 => "date64:ms".to_string(),
+            DataType::Time32(tu) => format!("time32:{}", timeunit_to_str(tu)),
+            DataType::Time64(tu) => format!("time64:{}", timeunit_to_str(tu)),
+            DataType::Timestamp(tu, _) => format!("timestamp:{}", timeunit_to_str(tu)),
+            DataType::Struct(_) => "struct".to_string(),
+            DataType::List(elem) => match elem.data_type() {
+                DataType::Struct(_) => "list.struct".to_string(),
+                _ => "list".to_string(),
+            },
+            DataType::FixedSizeList(dt, len) => format!(
+                "fixed_size_list:{}:{}",
+                LogicalType::try_from(dt.data_type())?.0,
+                *len
+            ),
+            DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
+            _ => return Err(format!("Unsupport data type: {:?}", dt)),
+        };
 
         Ok(Self(type_str.to_string()))
     }
@@ -73,27 +95,62 @@ impl TryFrom<&LogicalType> for DataType {
 
     fn try_from(lt: &LogicalType) -> Result<Self, Self::Error> {
         use DataType::*;
-        match lt.0.as_str() {
-            "null" => Ok(Null),
-            "bool" => Ok(Boolean),
-            "int8" => Ok(Int8),
-            "uint8" => Ok(UInt8),
-            "int16" => Ok(Int16),
-            "uint16" => Ok(UInt16),
-            "int32" => Ok(Int32),
-            "uint32" => Ok(UInt32),
-            "int64" => Ok(Int64),
-            "uint64" => Ok(UInt64),
-            "halffloat" => Ok(Float16),
-            "float" => Ok(Float32),
-            "double" => Ok(Float64),
-            "string" => Ok(Utf8),
-            "binary" => Ok(Binary),
-            "large_string" => Ok(LargeUtf8),
-            "large_binary" => Ok(LargeBinary),
-            "date32:day" => Ok(Date32),
-            "date64:ms" => Ok(Date64),
-            _ => Err(format!("Unsupported type, {}", lt.0.as_str())),
+        if let Some(t) = match lt.0.as_str() {
+            "null" => Some(Null),
+            "bool" => Some(Boolean),
+            "int8" => Some(Int8),
+            "uint8" => Some(UInt8),
+            "int16" => Some(Int16),
+            "uint16" => Some(UInt16),
+            "int32" => Some(Int32),
+            "uint32" => Some(UInt32),
+            "int64" => Some(Int64),
+            "uint64" => Some(UInt64),
+            "halffloat" => Some(Float16),
+            "float" => Some(Float32),
+            "double" => Some(Float64),
+            "string" => Some(Utf8),
+            "binary" => Some(Binary),
+            "large_string" => Some(LargeUtf8),
+            "large_binary" => Some(LargeBinary),
+            "date32:day" => Some(Date32),
+            "date64:ms" => Some(Date64),
+            "time32:s" => Some(Time32(TimeUnit::Second)),
+            "time32:ms" => Some(Time32(TimeUnit::Millisecond)),
+            "time64:us" => Some(Time64(TimeUnit::Microsecond)),
+            "time64:ns" => Some(Time64(TimeUnit::Nanosecond)),
+            "timestamp:s" => Some(Timestamp(TimeUnit::Second, None)),
+            "timestamp:ms" => Some(Timestamp(TimeUnit::Millisecond, None)),
+            "timestamp:us" => Some(Timestamp(TimeUnit::Microsecond, None)),
+            "timestamp:ns" => Some(Timestamp(TimeUnit::Nanosecond, None)),
+            _ => None,
+        } {
+            Ok(t)
+        } else {
+            let splits = lt.0.split(":").collect::<Vec<_>>();
+            match splits[0] {
+                "fixed_size_list" => {
+                    if splits.len() != 3 {
+                        Err(format!("Unsupported logical type: {}", lt))
+                    } else {
+                        let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
+                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        Ok(FixedSizeList(
+                            Box::new(ArrowField::new("item", elem_type, true)),
+                            size,
+                        ))
+                    }
+                }
+                "fixed_size_binary" => {
+                    if splits.len() != 2 {
+                        Err(format!("Unsupported logical type: {}", lt))
+                    } else {
+                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| e.to_string())?;
+                        Ok(FixedSizeBinary(size))
+                    }
+                }
+                _ => Err(format!("Unsupported logical type: {}", lt)),
+            }
         }
     }
 }
@@ -283,7 +340,7 @@ impl From<&Vec<pb::Field>> for Schema {
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::Field as ArrowField;
+    use arrow_schema::{Field as ArrowField, TimeUnit};
 
     use super::*;
 
@@ -303,6 +360,31 @@ mod tests {
             ("float16", DataType::Float16),
             ("float32", DataType::Float32),
             ("float64", DataType::Float64),
+            ("timestamp:s", DataType::Timestamp(TimeUnit::Second, None)),
+            (
+                "timestamp:ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            (
+                "timestamp:us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "timestamp:ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            ("time32:s", DataType::Time32(TimeUnit::Second)),
+            ("time32:ms", DataType::Time32(TimeUnit::Millisecond)),
+            ("time64:us", DataType::Time64(TimeUnit::Microsecond)),
+            ("time64:ns", DataType::Time64(TimeUnit::Nanosecond)),
+            ("fixed_size_binary:100", DataType::FixedSizeBinary(100)),
+            (
+                "fixed_size_list:int32:10",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Int32, true)),
+                    10,
+                ),
+            ),
         ] {
             let arrow_field = ArrowField::new(name, data_type.clone(), true);
             let field = Field::try_from(&arrow_field).unwrap();
@@ -310,6 +392,40 @@ mod tests {
             assert_eq!(field.data_type(), data_type);
             assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
         }
+    }
+
+    #[test]
+    fn test_nested_types() {
+        assert_eq!(
+            LogicalType::try_from(&DataType::List(Box::new(ArrowField::new(
+                "item",
+                DataType::Binary,
+                false
+            ))))
+            .unwrap()
+            .0,
+            "list"
+        );
+        assert_eq!(
+            LogicalType::try_from(&DataType::List(Box::new(ArrowField::new(
+                "item",
+                DataType::Struct(vec![]),
+                false
+            ))))
+            .unwrap()
+            .0,
+            "list.struct"
+        );
+        assert_eq!(
+            LogicalType::try_from(&DataType::Struct(vec![ArrowField::new(
+                "item",
+                DataType::Binary,
+                false
+            )]))
+            .unwrap()
+            .0,
+            "struct"
+        );
     }
 
     #[test]
@@ -322,6 +438,21 @@ mod tests {
         let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
+        assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+    }
+
+    #[test]
+    fn test_list_of_list() {
+        let arrow_field = ArrowField::new(
+            "data",
+            DataType::List(Box::new(ArrowField::new(
+                "item",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Float16, true))),
+                true,
+            ))),
+            true,
+        );
+        let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
     }
 }
