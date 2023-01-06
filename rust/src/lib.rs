@@ -28,4 +28,4 @@ pub mod error;
 pub mod format;
 pub mod io;
 
-pub use error::{LanceError, Result};
+pub use error::{Error, Result};

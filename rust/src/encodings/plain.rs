@@ -20,7 +20,6 @@
 //! Plain encoding works with primitive types, i.e., `boolean`, `i8...i64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::io::{ErrorKind, Result};
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,6 +31,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
 use super::Decoder;
+use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
@@ -102,22 +102,14 @@ impl<'a, T: ArrowPrimitiveType + Sync + Send> Decoder for PlainDecoder<'a, T> {
         };
 
         let data = self.reader.get_range(range).await?;
-        // A memory copy occurs here.
-        // TODO: zero-copy
-        // https://docs.rs/arrow-buffer/29.0.0/arrow_buffer/struct.Buffer.html#method.from_custom_allocation
         let buf: Buffer = data.into();
-        let array_data = match ArrayDataBuilder::new(T::DATA_TYPE)
+        let array_data = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(self.length)
             .null_count(0)
             .add_buffer(buf)
-            .build()
-        {
-            Ok(d) => d,
-            Err(e) => return Err(std::io::Error::new(ErrorKind::InvalidData, e.to_string())),
-        };
+            .build()?;
         Ok(Arc::new(PrimitiveArray::<T>::from(array_data)))
     }
-    // }
 }
 
 #[cfg(test)]

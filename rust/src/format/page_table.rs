@@ -16,12 +16,11 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::io::Result;
-
 use arrow_array::{types::Int64Type, Int64Array};
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
+use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 
 #[derive(Debug)]
@@ -71,10 +70,7 @@ impl PageTable {
     pub fn set_page_info(&mut self) {}
 
     pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
-        match self.pages.get(&column) {
-            Some(column_map) => column_map.get(&batch),
-            None => None,
-        }
+        self.pages.get(&column).map(|c_map| c_map.get(&batch)).flatten()
     }
 }
 

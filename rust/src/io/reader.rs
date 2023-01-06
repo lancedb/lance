@@ -19,7 +19,6 @@
 
 // Standard
 use std::cmp::max;
-use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -39,6 +38,7 @@ use crate::datatypes::{Field, Schema};
 use crate::encodings::binary::BinaryDecoder;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
+use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::ObjectReader;
@@ -56,15 +56,13 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     };
     let buf = object_store.inner.get_range(path, range).await?;
     if buf.len() < 16 {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "Invalid format: file size is smaller than 8 bytes",
+        return Err(Error::IO(
+            "Invalid format: file size is smaller than 16 bytes".to_string(),
         ));
     }
     if !buf.ends_with(super::MAGIC) {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "Invalid format: magic number does not match",
+        return Err(Error::IO(
+            "Invalid format: magic number does not match".to_string(),
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
@@ -163,21 +161,20 @@ impl<'a> FileReader<'a> {
             println!("Read array: {:?}\n", arr);
             arrs.push(arr);
         }
-        RecordBatch::try_new(Arc::new(schema.into()), arrs)
-            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
+        Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
     }
 
     /// Read primitive array for batch `batch_idx`.
     ///
     async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let column = field.id;
-        let page_info = self.page_table.get(column, batch_id).ok_or(Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "field: {} batch {} does not exist in page table",
-                field, batch_id
-            ),
-        ))?;
+        let page_info = self
+            .page_table
+            .get(column, batch_id)
+            .ok_or(Error::IO(format!(
+                "No page info found for field: {}, batch={}",
+                field.name, batch_id
+            )))?;
         use DataType::*;
 
         macro_rules! create_plain_decoder {
@@ -203,10 +200,10 @@ impl<'a> FileReader<'a> {
             Float32 => create_plain_decoder!(Float32Type),
             Float64 => create_plain_decoder!(Float64Type),
             _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unsupport primitive type: {}", field.data_type()),
-                ))
+                return Err(Error::Schema(format!(
+                    "Unsupport primitive type: {}",
+                    field.data_type()
+                )))
             }
         };
         decoder.decode().await
@@ -214,13 +211,13 @@ impl<'a> FileReader<'a> {
 
     async fn read_binary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let column = field.id;
-        let page_info = self.page_table.get(column, batch_id).ok_or(Error::new(
-            ErrorKind::InvalidData,
-            format!(
+        let page_info = self
+            .page_table
+            .get(column, batch_id)
+            .ok_or(Error::IO(format!(
                 "field: {} batch {} does not exist in page table",
                 field, batch_id
-            ),
-        ))?;
+            )))?;
 
         use DataType::*;
         let decoder: Box<dyn Decoder> = match field.data_type() {
@@ -235,10 +232,10 @@ impl<'a> FileReader<'a> {
                 page_info.length,
             )),
             _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("Unsupported binary type: {}", field.data_type()),
-                ))
+                return Err(Error::IO(format!(
+                    "Unsupported binary type: {}",
+                    field.data_type()
+                )))
             }
         };
         decoder.decode().await

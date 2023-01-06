@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUni
 
 use crate::encodings::Encoding;
 use crate::format::pb;
-use crate::{LanceError, Result};
+use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
@@ -48,7 +48,7 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
 }
 
 impl TryFrom<&DataType> for LogicalType {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(dt: &DataType) -> Result<Self> {
         let type_str = match dt {
@@ -85,7 +85,7 @@ impl TryFrom<&DataType> for LogicalType {
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
-            _ => return Err(LanceError::Schema(format!("Unsupport data type: {:?}", dt))),
+            _ => return Err(Error::Schema(format!("Unsupport data type: {:?}", dt))),
         };
 
         Ok(Self(type_str.to_string()))
@@ -93,7 +93,7 @@ impl TryFrom<&DataType> for LogicalType {
 }
 
 impl TryFrom<&LogicalType> for DataType {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(lt: &LogicalType) -> Result<Self> {
         use DataType::*;
@@ -133,7 +133,7 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(LanceError::Schema(format!(
+                        Err(Error::Schema(format!(
                             "Unsupported logical type: {}",
                             lt
                         )))
@@ -141,7 +141,7 @@ impl TryFrom<&LogicalType> for DataType {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
                         let size: i32 = splits[2]
                             .parse::<i32>()
-                            .map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                            .map_err(|e: _| Error::Schema(e.to_string()))?;
                         Ok(FixedSizeList(
                             Box::new(ArrowField::new("item", elem_type, true)),
                             size,
@@ -150,20 +150,20 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(LanceError::Schema(format!(
+                        Err(Error::Schema(format!(
                             "Unsupported logical type: {}",
                             lt
                         )))
                     } else {
                         let size: i32 = splits[1]
                             .parse::<i32>()
-                            .map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                            .map_err(|e: _| Error::Schema(e.to_string()))?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(LanceError::Schema(format!(
+                        Err(Error::Schema(format!(
                             "Unsupport dictionary type: {}",
                             lt
                         )))
@@ -176,7 +176,7 @@ impl TryFrom<&LogicalType> for DataType {
                         ))
                     }
                 }
-                _ => Err(LanceError::Schema(format!(
+                _ => Err(Error::Schema(format!(
                     "Unsupported logical type: {}",
                     lt
                 ))),
@@ -305,7 +305,7 @@ impl fmt::Display for Field {
 }
 
 impl TryFrom<&ArrowField> for Field {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let children = match field.data_type() {
@@ -413,7 +413,7 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(LanceError::Schema(format!("Column {} does not exist", col)));
+                return Err(Error::Schema(format!("Column {} does not exist", col)));
             }
         }
 
@@ -455,7 +455,7 @@ impl fmt::Display for Schema {
 
 /// Convert `arrow2::datatype::Schema` to Lance
 impl TryFrom<&ArrowSchema> for Schema {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(schema: &ArrowSchema) -> Result<Self> {
         Ok(Self {

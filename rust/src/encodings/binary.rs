@@ -1,7 +1,6 @@
 //! Var-length Binary Encoding
 //!
 
-use std::io::Result;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -10,10 +9,10 @@ use arrow_array::{Array, ArrayRef, GenericByteArray, Int32Array, Int64Array};
 use arrow_data::ArrayDataBuilder;
 use async_trait::async_trait;
 
-use crate::encodings::Decoder;
-use crate::io::object_reader::ObjectReader;
-
 use super::plain::PlainDecoder;
+use crate::encodings::Decoder;
+use crate::error::Result;
+use crate::io::object_reader::ObjectReader;
 
 pub struct BinaryEncoder {}
 
@@ -59,6 +58,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             phantom: PhantomData,
         }
     }
+
 }
 
 #[async_trait]
@@ -88,8 +88,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .null_count(0)
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(bytes.into())
-            .build()
-            .unwrap();
+            .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
     }

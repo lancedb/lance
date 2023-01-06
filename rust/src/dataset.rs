@@ -2,12 +2,12 @@
 //!
 
 use std::collections::BTreeMap;
-use std::io::Result;
 
 use chrono::prelude::*;
 use object_store::path::Path;
 
 use self::scanner::Scanner;
+use crate::error::Result;
 use crate::datatypes::Schema;
 use crate::format::{pb, Manifest};
 use crate::io::reader::read_manifest;

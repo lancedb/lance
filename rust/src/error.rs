@@ -15,32 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::error::Error as StdError;
-
 use arrow_schema::ArrowError;
 
 #[derive(Debug)]
-pub enum LanceError {
+pub enum Error {
     Arrow(String),
     Schema(String),
+    IO(String),
 }
 
-pub type Result<T> = std::result::Result<T, LanceError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
-impl std::fmt::Display for LanceError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (catelog, message) = match self {
             Self::Arrow(s) => ("Arrow", s),
             Self::Schema(s) => ("Schema", s),
+            Self::IO(s) => ("I/O", s),
         };
         write!(f, "LanceError({}): {}", catelog, message)
     }
 }
 
-impl From<ArrowError> for LanceError {
-    fn from(value: ArrowError) -> Self {
-        LanceError::Arrow(value.to_string())
+impl From<ArrowError> for Error {
+    fn from(e: ArrowError) -> Self {
+        Error::Arrow(e.to_string())
     }
 }
 
-impl StdError for LanceError {}
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::IO(e.to_string())
+    }
+}
+
+impl From<object_store::Error> for Error {
+    fn from(e: object_store::Error) -> Self {
+        Error::IO(e.to_string())
+    }
+}
+
+impl From<prost::DecodeError> for Error {
+    fn from(e: prost::DecodeError) -> Self {
+        Error::IO(e.to_string())
+    }
+}
+
+impl std::error::Error for Error {}
