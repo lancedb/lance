@@ -20,14 +20,14 @@ use std::error::Error as StdError;
 use arrow_schema::ArrowError;
 
 #[derive(Debug)]
-pub enum Error {
+pub enum LanceError {
     Arrow(String),
     Schema(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, LanceError>;
 
-impl std::fmt::Display for Error {
+impl std::fmt::Display for LanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (catelog, message) = match self {
             Self::Arrow(s) => ("Arrow", s),
@@ -37,10 +37,10 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl From<ArrowError> for Error {
+impl From<ArrowError> for LanceError {
     fn from(value: ArrowError) -> Self {
-        Error::Arrow(value.to_string())
+        LanceError::Arrow(value.to_string())
     }
 }
 
-impl StdError for Error {}
+impl StdError for LanceError {}
