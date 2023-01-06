@@ -26,3 +26,7 @@ pub mod datatypes;
 pub mod encodings;
 pub mod format;
 pub mod io;
+
+pub mod error;
+
+pub use error::{Error, Result};

@@ -10,7 +10,7 @@ pub mod rle;
 use crate::format::pb;
 
 /// Encoding enum.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Encoding {
     /// Plain encoding.
     Plain,
