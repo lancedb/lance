@@ -41,13 +41,13 @@ impl ObjectStore {
 
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
-            Err(e) => {
+            Err(_e) => {
                 return Err(Error::new(ErrorKind::InvalidInput, "Invalid uri "));
             }
         };
 
-        let bucket_name = parsed.host().unwrap().to_string();
-        let object_store = match parsed.scheme() {
+        let _bucket_name = parsed.host().unwrap().to_string();
+        let _object_store = match parsed.scheme() {
             "s3" => {
                 let bucket_name = parsed.host().unwrap().to_string();
 

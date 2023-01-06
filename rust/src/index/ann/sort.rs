@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use arrow_array::{Float32Array, UInt64Array};
+
 use arrow_schema::ArrowError;
 use rayon::prelude::*;
 use rand::{Rng, SeedableRng};

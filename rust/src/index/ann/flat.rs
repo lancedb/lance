@@ -2,12 +2,12 @@
 //!
 
 use std::io::Result;
-use std::ops::DerefMut;
+
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use arrow_select::concat::concat;
+
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 
@@ -113,7 +113,7 @@ impl<'a> FlatIndex<'a> {
     }
 }
 
-fn compute_scores(batch: &RecordBatch, column: &str, v: &Float32Array, total: &u64) -> core::result::Result<Vec<f32>, ArrowError> {
+fn compute_scores(batch: &RecordBatch, column: &str, v: &Float32Array, _total: &u64) -> core::result::Result<Vec<f32>, ArrowError> {
     let col_idx = batch.schema().index_of(column)?;
     let col = batch.column(col_idx);
     let vectors = col.as_any().downcast_ref::<FixedSizeListArray>()
