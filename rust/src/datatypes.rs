@@ -204,7 +204,7 @@ impl Field {
         self.children.iter_mut().find(|f| f.name == name)
     }
 
-    fn project(&self, split: &[&str]) -> Result<Field> {
+    fn project(&self, path_components: &[&str]) -> Result<Field> {
         let mut f = Field {
             name: self.name.clone(),
             id: self.id,
@@ -215,14 +215,14 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
         };
-        if split.is_empty() {
+        if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
             f.children = self.children.clone()
         } else {
-            let first = split[0];
+            let first = path_components[0];
             for c in self.children.as_slice() {
                 if c.name == first {
-                    let projected = c.project(&split[1..])?;
+                    let projected = c.project(&path_components[1..])?;
                     f.children.push(projected);
                     break;
                 }
