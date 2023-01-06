@@ -17,14 +17,23 @@
 
 use std::cmp::min;
 
-use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 
+use arrow_array::{
+    types::{
+        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    ArrayRef, ArrowPrimitiveType,
+};
+use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
+use crate::encodings::{plain::PlainDecoder, Decoder};
+use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 
 /// Object Reader
@@ -64,7 +73,7 @@ impl<'a> ObjectReader<'a> {
     pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
         let file_size = self.size().await?;
         if pos > file_size {
-            return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
+            return Err(Error::IO("file size is too small".to_string()));
         }
 
         let range = pos..min(pos + self.prefetch_size, file_size);
@@ -77,6 +86,45 @@ impl<'a> ObjectReader<'a> {
     pub async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let bytes = self.object_store.inner.get_range(&self.path, range).await?;
         Ok(bytes)
+    }
+
+    pub async fn read_primitive_array(
+        &self,
+        data_type: DataType,
+        position: usize,
+        length: usize,
+    ) -> Result<ArrayRef> {
+        assert!(data_type.is_primitive());
+
+        // TODO: support more than plain encoding here.
+        use arrow_schema::DataType::*;
+
+        macro_rules! create_plain_decoder {
+            ($a:ty) => {
+                Box::new(PlainDecoder::<$a>::new(self, position, length)?)
+            };
+        }
+
+        let decoder: Box<dyn Decoder> = match data_type {
+            Int8 => create_plain_decoder!(Int8Type),
+            Int16 => create_plain_decoder!(Int16Type),
+            Int32 => create_plain_decoder!(Int32Type),
+            Int64 => create_plain_decoder!(Int64Type),
+            UInt8 => create_plain_decoder!(UInt8Type),
+            UInt16 => create_plain_decoder!(UInt16Type),
+            UInt32 => create_plain_decoder!(UInt32Type),
+            UInt64 => create_plain_decoder!(UInt64Type),
+            Float16 => create_plain_decoder!(Float16Type),
+            Float32 => create_plain_decoder!(Float32Type),
+            Float64 => create_plain_decoder!(Float64Type),
+            _ => {
+                return Err(Error::Schema(format!(
+                    "Unsupport primitive type: {}",
+                    data_type
+                )))
+            }
+        };
+        decoder.decode().await
     }
 }
 

@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
+use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 
-use crate::encodings::Encoding;
+use crate::encodings::{dictionary, Encoding};
 use crate::format::pb;
+use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
@@ -186,6 +188,25 @@ fn is_binary(data_type: &DataType) -> bool {
     matches!(data_type, Binary | Utf8 | LargeBinary | LargeUtf8)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct Dictionary {
+    offset: usize,
+
+    length: usize,
+
+    values: Option<ArrayRef>,
+}
+
+impl From<&pb::Dictionary> for Dictionary {
+    fn from(proto: &pb::Dictionary) -> Self {
+        Self {
+            offset: proto.offset as usize,
+            length: proto.length as usize,
+            values: None,
+        }
+    }
+}
+
 /// Lance Schema Field
 ///
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +220,9 @@ pub struct Field {
     nullable: bool,
 
     pub children: Vec<Field>,
+
+    /// Dictionary value array if this field is dictionary.
+    dictionary: Option<Dictionary>,
 }
 
 impl Field {
@@ -231,6 +255,7 @@ impl Field {
             encoding: self.encoding.clone(),
             nullable: self.nullable,
             children: vec![],
+            dictionary: self.dictionary.clone(),
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -280,6 +305,24 @@ impl Field {
         }
         None
     }
+
+    fn load_dictionary(&mut self, reader: &ObjectReader) -> Result<()> {
+        if let DataType::Dictionary(_, value_type) = self.data_type() {
+            assert!(self.dictionary.is_some());
+            if let Some(dict_info) = self.dictionary.as_mut() {
+                if dict_info.values.is_none() {}
+            } else {
+                panic!("Should not reach here: dictionary field does not load dictionary info")
+            }
+            Ok(())
+        } else {
+            self.children
+                .iter_mut()
+                .map(|f| f.load_dictionary(&reader))
+                .collect::<Result<_>>()?;
+            Ok(())
+        }
+    }
 }
 
 impl fmt::Display for Field {
@@ -317,6 +360,7 @@ impl TryFrom<&ArrowField> for Field {
             extension_name: "".to_string(),
             nullable: field.is_nullable(),
             children,
+            dictionary: None,
         })
     }
 }
@@ -344,6 +388,7 @@ impl From<&pb::Field> for Field {
             },
             nullable: field.nullable,
             children: vec![],
+            dictionary: field.dictionary.as_ref().map(|d| Dictionary::from(d)),
         }
     }
 }
@@ -429,6 +474,15 @@ impl Schema {
 
     pub(crate) fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
+    }
+
+    /// Load dictionary value array from manifest files.
+    pub(crate) fn load_dictionary(&mut self, reader: &ObjectReader) -> Result<()> {
+        self.fields
+            .iter_mut()
+            .map(|f| f.load_dictionary(&reader))
+            .collect::<Result<_>>()?;
+        Ok(())
     }
 }
 

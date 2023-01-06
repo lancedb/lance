@@ -34,9 +34,9 @@ use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-use crate::encodings::{binary::BinaryDecoder, dictionary::DictionaryDecoder};
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
+use crate::encodings::{binary::BinaryDecoder, dictionary::DictionaryDecoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
@@ -178,41 +178,12 @@ impl<'a> FileReader<'a> {
     }
 
     /// Read primitive array for batch `batch_idx`.
-    ///
     async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
-        use DataType::*;
 
-        macro_rules! create_plain_decoder {
-            ($a:ty) => {
-                Box::new(PlainDecoder::<$a>::new(
-                    &self.object_reader,
-                    page_info.position,
-                    page_info.length,
-                )?)
-            };
-        }
-
-        let decoder: Box<dyn Decoder> = match field.data_type() {
-            Int8 => create_plain_decoder!(Int8Type),
-            Int16 => create_plain_decoder!(Int16Type),
-            Int32 => create_plain_decoder!(Int32Type),
-            Int64 => create_plain_decoder!(Int64Type),
-            UInt8 => create_plain_decoder!(UInt8Type),
-            UInt16 => create_plain_decoder!(UInt16Type),
-            UInt32 => create_plain_decoder!(UInt32Type),
-            UInt64 => create_plain_decoder!(UInt64Type),
-            Float16 => create_plain_decoder!(Float16Type),
-            Float32 => create_plain_decoder!(Float32Type),
-            Float64 => create_plain_decoder!(Float64Type),
-            _ => {
-                return Err(Error::Schema(format!(
-                    "Unsupport primitive type: {}",
-                    field.data_type()
-                )))
-            }
-        };
-        decoder.decode().await
+        self.object_reader
+            .read_primitive_array(field.data_type(), page_info.position, page_info.length)
+            .await
     }
 
     async fn read_binary_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {

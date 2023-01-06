@@ -16,7 +16,6 @@
 // under the License.
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
-use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 
 use ::object_store::{
@@ -26,6 +25,7 @@ use object_store::local::LocalFileSystem;
 use url::{ParseError, Url};
 
 use super::object_reader::ObjectReader;
+use crate::error::{Error, Result};
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug)]
@@ -66,7 +66,7 @@ impl ObjectStore {
                 });
             }
             Err(e) => {
-                return Err(Error::new(ErrorKind::InvalidInput, e.to_string()));
+                return Err(Error::IO(e.to_string()));
             }
         };
 
