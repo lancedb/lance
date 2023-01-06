@@ -141,14 +141,19 @@ impl<'a> FileReader<'a> {
         })
     }
 
+    /// Set the projection [Schema].
     pub fn set_projection(&mut self, schema: Schema) {
         self.projection = Some(schema)
     }
 
+    /// Schema of the returning RecordBatch.
     pub fn schema(&self) -> &Schema {
         self.projection.as_ref().unwrap()
     }
 
+    /// Read a batch of data from the file.
+    ///
+    /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
         // TODO spawn more threads

@@ -31,7 +31,6 @@ pub struct BinaryDecoder<'a, T: ByteArrayType> {
 /// Var-length Binary Decoder
 ///
 impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
-
     /// Create a [BinaryEncoder] to decode one batch.
     ///
     ///  - `position`, file position where this batch starts.
