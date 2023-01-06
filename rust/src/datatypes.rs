@@ -7,6 +7,7 @@ use std::fmt::Formatter;
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use async_recursion::async_recursion;
 
 use crate::encodings::{dictionary, Encoding};
 use crate::format::pb;
@@ -306,20 +307,50 @@ impl Field {
         None
     }
 
-    fn load_dictionary(&mut self, reader: &ObjectReader) -> Result<()> {
+    #[async_recursion]
+    async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
         if let DataType::Dictionary(_, value_type) = self.data_type() {
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {
-                if dict_info.values.is_none() {}
+                use DataType::*;
+                match value_type.as_ref() {
+                    Utf8 | Binary => {
+                        dict_info.values = Some(
+                            reader
+                                .read_binary_array(
+                                    value_type.as_ref(),
+                                    dict_info.offset,
+                                    dict_info.length,
+                                )
+                                .await?,
+                        );
+                    }
+                    Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
+                        dict_info.values = Some(
+                            reader
+                                .read_primitive_array(
+                                    value_type.as_ref(),
+                                    dict_info.offset,
+                                    dict_info.length,
+                                )
+                                .await?,
+                        );
+                    }
+                    _ => {
+                        return Err(Error::Schema(format!(
+                            "Does not support {} as dictionary value type",
+                            value_type
+                        )));
+                    }
+                }
             } else {
                 panic!("Should not reach here: dictionary field does not load dictionary info")
             }
             Ok(())
         } else {
-            self.children
-                .iter_mut()
-                .map(|f| f.load_dictionary(&reader))
-                .collect::<Result<_>>()?;
+            for child in self.children.as_mut_slice() {
+                child.load_dictionary(reader).await?;
+            }
             Ok(())
         }
     }
@@ -477,11 +508,10 @@ impl Schema {
     }
 
     /// Load dictionary value array from manifest files.
-    pub(crate) fn load_dictionary(&mut self, reader: &ObjectReader) -> Result<()> {
-        self.fields
-            .iter_mut()
-            .map(|f| f.load_dictionary(&reader))
-            .collect::<Result<_>>()?;
+    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+        for field in self.fields.as_mut_slice() {
+            field.load_dictionary(reader).await?;
+        }
         Ok(())
     }
 }

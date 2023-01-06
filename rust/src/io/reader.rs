@@ -23,10 +23,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{
-    types::{
-        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-        Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
-    },
     ArrayRef, Int32Array, RecordBatch,
 };
 use arrow_schema::DataType;
@@ -34,9 +30,6 @@ use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
-use crate::encodings::plain::PlainDecoder;
-use crate::encodings::Decoder;
-use crate::encodings::{binary::BinaryDecoder, dictionary::DictionaryDecoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
@@ -101,7 +94,7 @@ impl<'a> FileReader<'a> {
             .inner
             .get_range(
                 &path,
-                max(0 as usize, file_size - object_store.prefetch_size())..file_size,
+                max(0, file_size - object_store.prefetch_size())..file_size,
             )
             .await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)? as usize;
@@ -122,7 +115,9 @@ impl<'a> FileReader<'a> {
                 let manifest_pb = object_reader
                     .read_message::<pb::Manifest>(metadata.manifest_position.unwrap())
                     .await?;
-                Manifest::from(&manifest_pb)
+                let mut m = Manifest::from(&manifest_pb);
+                m.schema.load_dictionary(&object_reader).await?;
+                m
             }
         };
         let num_columns = manifest_for_file.schema.max_field_id().unwrap();
@@ -182,7 +177,7 @@ impl<'a> FileReader<'a> {
         let page_info = self.page_info(field, batch_id)?;
 
         self.object_reader
-            .read_primitive_array(field.data_type(), page_info.position, page_info.length)
+            .read_primitive_array(&field.data_type(), page_info.position, page_info.length)
             .await
     }
 
@@ -190,7 +185,7 @@ impl<'a> FileReader<'a> {
         let page_info = self.page_info(field, batch_id)?;
 
         self.object_reader
-            .read_binary_array(field.data_type(), page_info.position, page_info.length)
+            .read_binary_array(&field.data_type(), page_info.position, page_info.length)
             .await
     }
 

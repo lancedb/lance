@@ -93,7 +93,7 @@ impl<'a> ObjectReader<'a> {
     ///
     pub async fn read_primitive_array(
         &self,
-        data_type: DataType,
+        data_type: &DataType,
         position: usize,
         length: usize,
     ) -> Result<ArrayRef> {
@@ -108,7 +108,7 @@ impl<'a> ObjectReader<'a> {
             };
         }
 
-        let decoder: Box<dyn Decoder> = match data_type {
+        let decoder: Box<dyn Decoder + Send> = match data_type {
             Int8 => create_plain_decoder!(Int8Type),
             Int16 => create_plain_decoder!(Int16Type),
             Int32 => create_plain_decoder!(Int32Type),
@@ -127,17 +127,18 @@ impl<'a> ObjectReader<'a> {
                 )))
             }
         };
-        decoder.decode().await
+        let fut = decoder.decode();
+        fut.await
     }
 
     pub async fn read_binary_array(
         &self,
-        data_type: DataType,
+        data_type: &DataType,
         position: usize,
         length: usize,
     ) -> Result<ArrayRef> {
         use arrow_schema::DataType::*;
-        let decoder: Box<dyn Decoder> = match data_type {
+        let decoder: Box<dyn Decoder + Send> = match data_type {
             Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
             Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
             _ => {
@@ -147,8 +148,10 @@ impl<'a> ObjectReader<'a> {
                 )))
             }
         };
-        decoder.decode().await
+        let fut = decoder.decode();
+        fut.await
     }
+
 }
 
 #[cfg(test)]
