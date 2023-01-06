@@ -3,8 +3,10 @@
 //! Support method:
 //!  - Euclidean Distance (L2)
 
+use rayon::prelude::*;
+
 use arrow_arith::aggregate::sum;
-use arrow_arith::arithmetic::{multiply, subtract};
+use arrow_arith::arithmetic::{multiply, powf_scalar, subtract};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::{ArrowError, DataType};
 
@@ -23,6 +25,7 @@ pub fn euclidean_distance(
     // Naive implementation.
     // TODO: benchmark and use SIMD or BLAS
     let scores = (0..to.len())
+        .into_par_iter()
         .map(|idx| to.value(idx))
         .map(|left| {
             let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -64,7 +67,7 @@ mod tests {
 
         assert_eq!(
             Float32Array::from(scores),
-            Float32Array::from(vec![3.0_f32.sqrt(), 0_f32, 3.0_f32.sqrt(), 12.0_f32.sqrt()])
+            Float32Array::from(vec![3.0_f32, 0_f32, 3.0_f32, 12.0_f32])
         );
     }
 }

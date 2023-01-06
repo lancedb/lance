@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{max, Ordering};
 
 use arrow_schema::ArrowError;
 use rayon::prelude::*;
@@ -15,6 +15,7 @@ pub fn find_topk<T: Send, F>(values: &mut [T], indices: &mut [u64], topk: usize,
     let mut low = 0;  // inclusive
     let mut high = values.len();  // exclusive
     // TODO handle worse case scenarios and fallback to nlog(n) sort
+    let mut limit = max(10, values.len());
     loop {
         let pivot: usize = rng.gen_range(low..high);  // choose random pivot
         let left = partition(values, indices, low, high, pivot, compare)?;
@@ -25,6 +26,8 @@ pub fn find_topk<T: Send, F>(values: &mut [T], indices: &mut [u64], topk: usize,
         } else if left < topk {
             low = left;
         }
+        limit -= 1;
+        assert!(limit > 0);
     }
 }
 
@@ -41,7 +44,6 @@ pub(crate) fn partition<T: Send, F>(arr: &mut [T], indices: &mut [u64], low: usi
     if pivot == 0 {
         return Ok(0);
     }
-    println!("Pivot is {}", pivot);
 
     // sweep from both ends til the two cursors meet
     let mut left_cursor = low;
@@ -63,14 +65,12 @@ pub(crate) fn partition<T: Send, F>(arr: &mut [T], indices: &mut [u64], low: usi
             break;
         } else {
             // otherwise we swap elements to the right partition and continue
-            println!("Swapping {} with {}", left_cursor, right_cursor);
             arr.swap(left_cursor, right_cursor);
             indices.swap(left_cursor, right_cursor);
             left_cursor += 1;
             right_cursor -= 1;
         }
     }
-    println!("Swapping {} with {}", left_cursor, pivot);
     arr.swap(left_cursor, pivot);
     indices.swap(left_cursor, pivot);
     Ok(left_cursor)
@@ -79,9 +79,12 @@ pub(crate) fn partition<T: Send, F>(arr: &mut [T], indices: &mut [u64], low: usi
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
     use arrow_array::ArrowNativeTypeOp;
     use rand::{Rng, SeedableRng};
+    use rayon::prelude::*;
     use crate::index::ann::sort::{find_topk, partition};
+    use crate::tests::generate_random_array;
 
     #[test]
     fn test_partition() {
@@ -116,19 +119,20 @@ mod tests {
 
     #[test]
     fn test_find_topk() {
-        let compare = |a: &f32, b: &f32| a.compare(*b);
+        let compare = |a: &f32, b: &f32| a.total_cmp(b);
         let mut rows: Vec<u64> = (0..100).collect();
         let mut rng = rand::rngs::SmallRng::from_entropy();
         let mut scores:[f32; 100] = [0.0; 100];
-        let mut sorted = scores.clone();
-        sorted.sort_by(compare);
-
         rng.fill(&mut scores[..]);
+
+        let mut sorted = scores.clone();
+        sorted.par_sort_unstable_by(|a, b| a.total_cmp(b));
+
         let topk = 10;
-        let (top_scores, top_indices) = find_topk(&mut scores, &mut rows, topk, &compare).unwrap();
+        find_topk(&mut scores, &mut rows, topk, &compare).unwrap();
 
         for i in 0..topk {
-            assert!(top_scores[i] <= sorted[topk])
+            assert!(scores[i] <= sorted[topk])
         }
     }
 }

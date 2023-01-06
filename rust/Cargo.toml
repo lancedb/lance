@@ -43,3 +43,7 @@ cli = ["clap"]
 [[bench]]
 name = "distance"
 harness = false
+
+[[bench]]
+name = "topk"
+harness = false
