@@ -23,9 +23,9 @@ use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type};
+use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type, Float16Type, Float32Type, Float64Type};
 // Third party
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, Int16Array, Int32Array};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
@@ -129,7 +129,6 @@ impl<'a> FileReader<'a> {
             metadata.num_batches() as i32,
         )
         .await?;
-        println!("Page table is: {:?}, num_columns={}", page_table, num_columns);
 
         Ok(Self {
             object_reader,
@@ -160,7 +159,7 @@ impl<'a> FileReader<'a> {
             .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
 
-    /// Read primitive array
+    /// Read primitive array for batch `batch_idx`.
     ///
     async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let column = field.id;
@@ -188,22 +187,14 @@ impl<'a> FileReader<'a> {
             Int16 => create_plain_decoder!(Int16Type),
             Int32 => create_plain_decoder!(Int32Type),
             Int64 => create_plain_decoder!(Int64Type),
-            UInt8 => todo!(),
-            UInt16 => todo!(),
-            UInt32 => todo!(),
-            UInt64 => todo!(),
-            Float16 => todo!(),
-            Float32 => todo!(),
-            Float64 => todo!(),
-            Timestamp(_, _) => todo!(),
-
-            FixedSizeBinary(_) => todo!(),
-            FixedSizeList(_, _) => todo!(),
-            LargeList(_) => todo!(),
-            Dictionary(_, _) => todo!(),
-            Decimal128(_, _) => todo!(),
-            Decimal256(_, _) => todo!(),
-            _ => todo!(),
+            UInt8 => create_plain_decoder!(UInt8Type),
+            UInt16 => create_plain_decoder!(UInt16Type),
+            UInt32 => create_plain_decoder!(UInt32Type),
+            UInt64 => create_plain_decoder!(UInt64Type),
+            Float16 => create_plain_decoder!(Float16Type),
+            Float32 => create_plain_decoder!(Float32Type),
+            Float64 => create_plain_decoder!(Float64Type),
+            _ => return Err(Error::new(ErrorKind::InvalidData, format!("Unsupport primitive type: {}", field.data_type()))),
         };
         decoder.decode().await
     }
@@ -213,7 +204,9 @@ impl<'a> FileReader<'a> {
         if field.data_type().is_numeric() {
             self.read_primitive_array(field, batch_id).await
         } else {
-            todo!()
+            println!("Reading: {}", field);
+            let page_info = self.page_table.get(field.id, batch_id).unwrap();
+            Ok(Arc::new(Int32Array::from((0..page_info.length as i32).collect::<Vec<_>>())))
         }
     }
 }

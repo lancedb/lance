@@ -151,6 +151,16 @@ impl TryFrom<&LogicalType> for DataType {
                         Ok(FixedSizeBinary(size))
                     }
                 }
+                "dict" => {
+                    if splits.len() != 4 {
+                        Err(LanceError::Schema(format!("Unsupport dictionary type: {}", lt)))
+                    } else {
+                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
+                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        Ok(DataType::Dictionary(Box::new(index_type), Box::new(value_type)))
+                    }
+
+                }
                 _ => Err(LanceError::Schema(format!("Unsupported logical type: {}", lt))),
             }
         }
@@ -251,6 +261,20 @@ impl Field {
             self.children.iter().map(|c| c.id).min().unwrap_or(i32::MAX),
         )
     }
+
+    // Find any nested child with a specific field id
+    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+        for child in self.children.as_mut_slice() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(grandchild) = child.mut_field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
 }
 
 impl fmt::Display for Field {
@@ -380,6 +404,23 @@ impl Schema {
     fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().filter(|f| f.name == name).next()
     }
+
+    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+        for field in self.fields.as_mut_slice() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(grandchild) = field.mut_field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
+    pub fn max_field_id(&self) -> Option<i32> {
+        self.fields.iter().map(|f| f.max_id()).max()
+    }
+
 }
 
 impl fmt::Display for Schema {
@@ -420,19 +461,24 @@ impl From<&Schema> for ArrowSchema {
 /// Convert list of protobuf `Field` to a Schema.
 impl From<&Vec<pb::Field>> for Schema {
     fn from(fields: &Vec<pb::Field>) -> Self {
-        Self {
-            fields: fields.iter().map(Field::from).collect(),
+        let mut schema = Self {
+            fields: vec![],
             metadata: HashMap::default(),
-        }
+        };
+
+        fields.iter().for_each(|f| {
+            if f.parent_id == -1 {
+                schema.fields.push(Field::from(f));
+            } else {
+                let parent = schema.mut_field_by_id(f.parent_id).unwrap();
+                parent.children.push(Field::from(f));
+            }
+        });
+
+        schema
     }
 }
 
-impl Schema {
-    /// Get the max field id of this schema. Returns None if the schema is empty.
-    pub fn max_field_id(&self) -> Option<i32> {
-        self.fields.iter().map(|f| f.max_id()).min()
-    }
-}
 
 #[cfg(test)]
 mod tests {
