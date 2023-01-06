@@ -445,13 +445,14 @@ mod tests {
     fn test_list_of_list() {
         let arrow_field = ArrowField::new(
             "data",
-            DataType::List(Box::new(ArrowField::new("item", DataType::List(
-                Box::new(ArrowField::new("item", DataType::Float16, true))
-            ), true))),
+            DataType::List(Box::new(ArrowField::new(
+                "item",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Float16, true))),
+                true,
+            ))),
             true,
         );
         let field = Field::try_from(&arrow_field).unwrap();
         assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
     }
-
 }
