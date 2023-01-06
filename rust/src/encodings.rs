@@ -2,7 +2,8 @@
 //!
 use std::io::Result;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
+use async_trait::async_trait;
 
 pub mod binary;
 pub mod plain;
@@ -37,4 +38,9 @@ impl From<Encoding> for pb::Encoding {
 pub trait Encoder {
     /// Write an array, and returns the file offset of the beginning of the batch.
     fn write(&mut self, array: &dyn Array) -> Result<i64>;
+}
+
+#[async_trait]
+pub trait Decoder {
+    async fn decode(&self) -> Result<ArrayRef>;
 }

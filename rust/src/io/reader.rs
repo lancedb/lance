@@ -23,6 +23,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type};
 // Third party
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
@@ -33,6 +34,7 @@ use prost::Message;
 // Lance
 use crate::datatypes::{Field, Schema};
 use crate::encodings::plain::PlainDecoder;
+use crate::encodings::Decoder;
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::ObjectReader;
@@ -127,6 +129,7 @@ impl<'a> FileReader<'a> {
             metadata.num_batches() as i32,
         )
         .await?;
+        println!("Page table is: {:?}, num_columns={}", page_table, num_columns);
 
         Ok(Self {
             object_reader,
@@ -160,14 +163,74 @@ impl<'a> FileReader<'a> {
     /// Read primitive array
     ///
     async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        todo!()
+        let column = field.id;
+        let page_info = self.page_table.get(column, batch_id).ok_or(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "field: {} batch {} does not exist in page table",
+                field, batch_id
+            ),
+        ))?;
+        use DataType::*;
+
+        macro_rules! create_plain_decoder {
+            ($a:ty) => {
+                Box::new(PlainDecoder::<$a>::new(
+                    &self.object_reader,
+                    page_info.position,
+                    page_info.length,
+                )?)
+            };
+        }
+
+        let decoder: Box<dyn Decoder> = match field.data_type() {
+            Int8 => create_plain_decoder!(Int8Type),
+            Int16 => create_plain_decoder!(Int16Type),
+            Int32 => create_plain_decoder!(Int32Type),
+            Int64 => create_plain_decoder!(Int64Type),
+            UInt8 => todo!(),
+            UInt16 => todo!(),
+            UInt32 => todo!(),
+            UInt64 => todo!(),
+            Float16 => todo!(),
+            Float32 => todo!(),
+            Float64 => todo!(),
+            Timestamp(_, _) => todo!(),
+
+            FixedSizeBinary(_) => todo!(),
+            FixedSizeList(_, _) => todo!(),
+            LargeList(_) => todo!(),
+            Dictionary(_, _) => todo!(),
+            Decimal128(_, _) => todo!(),
+            Decimal256(_, _) => todo!(),
+            _ => todo!(),
+        };
+        decoder.decode().await
     }
 
     /// Read an array of the batch.
     async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        self.read_primitive_array(field, batch_id).await
+        if field.data_type().is_numeric() {
+            self.read_primitive_array(field, batch_id).await
+        } else {
+            todo!()
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use object_store::path::Path;
+
+    use super::FileReader;
+    use crate::io::ObjectStore;
+
+    #[tokio::test]
+    async fn test_read_real_file() {
+        let store = ObjectStore::new("/Users/lei/work/lance/rust").unwrap();
+        let path = Path::from("/Users/lei/work/lance/rust/data/7d159bc9-36f2-40ae-8cfa-baadd7178981_0.lance");
+
+        let reader = FileReader::new(&store, &path, None).await.unwrap();
+        let batch = reader.read_batch(0).await.unwrap();
+    }
+}

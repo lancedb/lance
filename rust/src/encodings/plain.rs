@@ -24,12 +24,15 @@
 use std::io::{ErrorKind, Result};
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::Arc;
 
-use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
+use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
+use super::Decoder;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
@@ -88,8 +91,11 @@ impl<'a, T: ArrowPrimitiveType> PlainDecoder<'a, T> {
     pub async fn at(&self, _idx: usize) -> Result<Option<T>> {
         todo!()
     }
+}
 
-    pub async fn decode(&self) -> Result<Box<dyn Array>> {
+#[async_trait]
+impl<'a, T: ArrowPrimitiveType + Sync + Send> Decoder for PlainDecoder<'a, T> {
+    async fn decode(&self) -> Result<ArrayRef> {
         let array_bytes = T::get_byte_width() * self.length;
         let range = Range {
             start: self.position,
@@ -110,7 +116,7 @@ impl<'a, T: ArrowPrimitiveType> PlainDecoder<'a, T> {
             Ok(d) => d,
             Err(e) => return Err(std::io::Error::new(ErrorKind::InvalidData, e.to_string())),
         };
-        Ok(Box::new(PrimitiveArray::<T>::from(array_data)))
+        Ok(Arc::new(PrimitiveArray::<T>::from(array_data)))
     }
     // }
 }
