@@ -22,6 +22,7 @@ use std::io::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
+use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub mod object_reader;
@@ -49,7 +50,7 @@ impl<T: AsyncWrite + Unpin + std::marker::Send> AsyncWriteProtoExt for T {
     }
 }
 
-pub fn read_metadata_offset(bytes: &Bytes) -> Result<u64> {
+pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
     if len < 16 {
         return Err(Error::new(
@@ -58,5 +59,10 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<u64> {
         ));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
-    Ok(LittleEndian::read_u64(offset_bytes.as_ref()))
+    Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
+}
+
+pub fn read_message<M: Message + Default>(buf: &Bytes) -> Result<M> {
+    let msg_len = LittleEndian::read_u32(&buf) as usize;
+    Ok(M::decode(&buf[4..4 + msg_len])?)
 }

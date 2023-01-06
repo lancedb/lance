@@ -16,34 +16,33 @@
 // under the License.
 
 use std::cmp::min;
-use std::sync::Arc;
 
 use std::io::{Error, ErrorKind, Result};
+use std::ops::Range;
 
 use byteorder::{ByteOrder, LittleEndian};
-use object_store::{path::Path, ObjectMeta, ObjectStore};
+use bytes::Bytes;
+use object_store::{path::Path, ObjectMeta};
 use prost::Message;
+
+use crate::io::ObjectStore;
 
 /// Object Reader
 ///
 /// Object Store + Base Path
-pub struct ObjectReader {
-    // Index Path
-    path: Path,
+pub struct ObjectReader<'a> {
     // Object Store.
     // TODO: can we use reference instead?
-    object_store: Arc<dyn ObjectStore>,
+    pub object_store: &'a ObjectStore,
+    // File path
+    pub path: Path,
     cached_metadata: Option<ObjectMeta>,
     prefetch_size: usize,
 }
 
-impl ObjectReader {
+impl<'a> ObjectReader<'a> {
     /// Create an ObjectReader from URI
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        path: Path,
-        prefetch_size: usize,
-    ) -> Result<Self> {
+    pub fn new(object_store: &'a ObjectStore, path: Path, prefetch_size: usize) -> Result<Self> {
         Ok(Self {
             object_store,
             path,
@@ -52,26 +51,31 @@ impl ObjectReader {
         })
     }
 
+    /// Object/File Size.
+    pub async fn size(&mut self) -> Result<usize> {
+        if self.cached_metadata.is_none() {
+            self.cached_metadata = Some(self.object_store.inner.head(&self.path).await?);
+        };
+        Ok(self.cached_metadata.as_ref().map_or(0, |m| m.size))
+    }
+
     /// Read a protobuf message at position `pos`.
     pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
-        if self.cached_metadata.is_none() {
-            self.cached_metadata = Some(self.object_store.head(&self.path).await?);
-        };
-        let file_size: usize;
-        if let Some(metadata) = self.cached_metadata.clone() {
-            if pos > metadata.size {
-                return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
-            }
-            file_size = metadata.size;
-        } else {
-            panic!("Should not get here");
+        let file_size = self.size().await?;
+        if pos > file_size {
+            return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
         }
 
         let range = pos..min(pos + self.prefetch_size, file_size);
-        let buf = self.object_store.get_range(&self.path, range).await?;
+        let buf = self.object_store.inner.get_range(&self.path, range).await?;
 
         let msg_len = LittleEndian::read_u32(&buf) as usize;
         Ok(M::decode(&buf[4..4 + msg_len])?)
+    }
+
+    pub async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+        let bytes = self.object_store.inner.get_range(&self.path, range).await?;
+        Ok(bytes)
     }
 }
 

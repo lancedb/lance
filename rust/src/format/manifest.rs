@@ -15,17 +15,33 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lance Columnar Data Format
-//!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
+use super::Fragment;
+use crate::datatypes::Schema;
+use crate::format::pb;
 
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod io;
+/// Manifest of a dataset
+///
+///  * Schema
+///  * Version
+///  * Fragments.
+#[derive(Debug)]
+pub struct Manifest {
+    /// Dataset schema.
+    pub schema: Schema,
 
-pub use error::{Error, Result};
+    /// Dataset version
+    pub version: u64,
+
+    /// Fragments, the pieces to build the dataset.
+    pub fragments: Vec<Fragment>,
+}
+
+impl From<&pb::Manifest> for Manifest {
+    fn from(p: &pb::Manifest) -> Self {
+        Self {
+            schema: Schema::from(&p.fields),
+            version: p.version,
+            fragments: p.fragments.iter().map(Fragment::from).collect(),
+        }
+    }
+}

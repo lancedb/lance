@@ -1,12 +1,13 @@
 //! Data encodings
 //!
-use std::io::Result;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
+use async_trait::async_trait;
 
 pub mod binary;
 pub mod plain;
 pub mod rle;
+use crate::error::Result;
 use crate::format::pb;
 
 /// Encoding enum.
@@ -37,4 +38,10 @@ impl From<Encoding> for pb::Encoding {
 pub trait Encoder {
     /// Write an array, and returns the file offset of the beginning of the batch.
     fn write(&mut self, array: &dyn Array) -> Result<i64>;
+}
+
+/// Decoder - Read Arrow Array from file.
+#[async_trait]
+pub trait Decoder {
+    async fn decode(&self) -> Result<ArrayRef>;
 }

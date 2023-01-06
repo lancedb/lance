@@ -1,5 +1,6 @@
 //! Lance data types, [Schema] and [Field]
 
+use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
@@ -8,7 +9,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUni
 
 use crate::encodings::Encoding;
 use crate::format::pb;
-use crate::{LanceError, Result};
+use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
@@ -47,7 +48,7 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
 }
 
 impl TryFrom<&DataType> for LogicalType {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(dt: &DataType) -> Result<Self> {
         let type_str = match dt {
@@ -84,7 +85,7 @@ impl TryFrom<&DataType> for LogicalType {
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
-            _ => return Err(LanceError::Schema(format!("Unsupport data type: {:?}", dt))),
+            _ => return Err(Error::Schema(format!("Unsupport data type: {:?}", dt))),
         };
 
         Ok(Self(type_str.to_string()))
@@ -92,7 +93,7 @@ impl TryFrom<&DataType> for LogicalType {
 }
 
 impl TryFrom<&LogicalType> for DataType {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(lt: &LogicalType) -> Result<Self> {
         use DataType::*;
@@ -132,10 +133,12 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                        let size: i32 = splits[2]
+                            .parse::<i32>()
+                            .map_err(|e: _| Error::Schema(e.to_string()))?;
                         Ok(FixedSizeList(
                             Box::new(ArrowField::new("item", elem_type, true)),
                             size,
@@ -144,13 +147,27 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(LanceError::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
                     } else {
-                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| LanceError::Schema(e.to_string()))?;
+                        let size: i32 = splits[1]
+                            .parse::<i32>()
+                            .map_err(|e: _| Error::Schema(e.to_string()))?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
-                _ => Err(LanceError::Schema(format!("Unsupported logical type: {}", lt))),
+                "dict" => {
+                    if splits.len() != 4 {
+                        Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
+                    } else {
+                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
+                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        Ok(DataType::Dictionary(
+                            Box::new(index_type),
+                            Box::new(value_type),
+                        ))
+                    }
+                }
+                _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
             }
         }
     }
@@ -181,7 +198,7 @@ pub struct Field {
     encoding: Option<Encoding>,
     nullable: bool,
 
-    children: Vec<Field>,
+    pub children: Vec<Field>,
 }
 
 impl Field {
@@ -242,6 +259,27 @@ impl Field {
         }
         Ok(())
     }
+
+    // Get the max field id of itself and all children.
+    fn max_id(&self) -> i32 {
+        min(
+            self.id,
+            self.children.iter().map(|c| c.id).min().unwrap_or(i32::MAX),
+        )
+    }
+
+    // Find any nested child with a specific field id
+    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+        for child in self.children.as_mut_slice() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(grandchild) = child.mut_field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
 }
 
 impl fmt::Display for Field {
@@ -255,7 +293,7 @@ impl fmt::Display for Field {
 }
 
 impl TryFrom<&ArrowField> for Field {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let children = match field.data_type() {
@@ -333,16 +371,21 @@ impl From<&Field> for pb::Field {
 }
 
 /// Lance Schema.
-#[derive(Default, Debug, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct Schema {
+    /// Top-level fields in the dataset.
     pub fields: Vec<Field>,
+    /// Metadata of the schema
     pub metadata: HashMap<String, String>,
 }
 
 impl Schema {
     /// Project the columns over the schema.
     ///
-    ///
+    /// ```ignore
+    /// let schema = Schema::from(...);
+    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
+    /// ```
     pub fn project(&self, columns: &[&str]) -> Result<Schema> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
@@ -358,7 +401,7 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(LanceError::Schema(format!("Column {} does not exist", col)));
+                return Err(Error::Schema(format!("Column {} does not exist", col)));
             }
         }
 
@@ -370,6 +413,22 @@ impl Schema {
 
     fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().filter(|f| f.name == name).next()
+    }
+
+    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+        for field in self.fields.as_mut_slice() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(grandchild) = field.mut_field_by_id(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn max_field_id(&self) -> Option<i32> {
+        self.fields.iter().map(|f| f.max_id()).max()
     }
 }
 
@@ -384,7 +443,7 @@ impl fmt::Display for Schema {
 
 /// Convert `arrow2::datatype::Schema` to Lance
 impl TryFrom<&ArrowSchema> for Schema {
-    type Error = LanceError;
+    type Error = Error;
 
     fn try_from(schema: &ArrowSchema) -> Result<Self> {
         Ok(Self {
@@ -411,10 +470,21 @@ impl From<&Schema> for ArrowSchema {
 /// Convert list of protobuf `Field` to a Schema.
 impl From<&Vec<pb::Field>> for Schema {
     fn from(fields: &Vec<pb::Field>) -> Self {
-        Self {
-            fields: fields.iter().map(Field::from).collect(),
+        let mut schema = Self {
+            fields: vec![],
             metadata: HashMap::default(),
-        }
+        };
+
+        fields.iter().for_each(|f| {
+            if f.parent_id == -1 {
+                schema.fields.push(Field::from(f));
+            } else {
+                let parent = schema.mut_field_by_id(f.parent_id).unwrap();
+                parent.children.push(Field::from(f));
+            }
+        });
+
+        schema
     }
 }
 

@@ -84,7 +84,7 @@ message DataFragment {
   repeated DataFile files = 2;
 }
 
-/// Lance Data File
+// Lance Data File
 message DataFile {
   // Relative path to the root.
   string path = 1;
@@ -116,16 +116,21 @@ message Metadata {
   uint64 page_table_position = 3;
 }
 
-/// Supported encodings.
+// Supported encodings.
 enum Encoding {
+  // Invalid encoding.
   NONE = 0;
+  // Plain encoding.
   PLAIN = 1;
+  // Var-length binary encoding.
   VAR_BINARY = 2;
+  // Dictionary encoding.
   DICTIONARY = 3;
+  // Run-length encoding.
   RLE = 4;
 }
 
-/// Dictionary field metadata
+// Dictionary field metadata
 message Dictionary {
   /// The file offset for storing the dictionary value.
   /// It is only valid if encoding is DICTIONARY.
@@ -137,9 +142,8 @@ message Dictionary {
   int64 length = 2;
 }
 
-/**
- * Field metadata for a column.
- */
+
+// Field metadata for a column.
 message Field {
   enum Type {
     PARENT = 0;
