@@ -22,8 +22,9 @@ use std::cmp::max;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{subtract_scalar};
-use arrow_array::{Array, ArrayRef, Int32Array, ListArray, RecordBatch, StructArray};
+use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::cast::as_primitive_array;
+use arrow_array::{ArrayRef, ListArray, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
@@ -215,7 +216,6 @@ impl<'a> FileReader<'a> {
         // TODO: use tokio to make the reads in parallel.
         let mut sub_arrays = vec![];
         for child in field.children.as_slice() {
-            // let arr = self.read_array(, batch_id)
             let arr = self.read_array(&child, batch_id).await?;
             sub_arrays.push((child.into(), arr));
         }
@@ -229,7 +229,7 @@ impl<'a> FileReader<'a> {
             .object_reader
             .read_primitive_array(&DataType::Int32, page_info.position, page_info.length)
             .await?;
-        let positions = position_arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        let positions = as_primitive_array(position_arr.as_ref());
         let start_position = positions.value(0);
         // Compute offsets
         let offset_arr = subtract_scalar(positions, start_position)?;
