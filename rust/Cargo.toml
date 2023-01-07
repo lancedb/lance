@@ -13,8 +13,6 @@ keywords = [
     "data-science",
     "machine-learning",
     "apache-arrow",
-    "duckdb",
-    "dataops",
     "data-analytics"
 ]
 categories = [
