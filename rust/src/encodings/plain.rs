@@ -24,7 +24,7 @@ use std::any::Any;
 use std::ops::Range;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;

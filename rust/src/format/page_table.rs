@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{types::Int64Type, Int64Array};
+use arrow_array::Int64Array;
 use arrow_schema::DataType;
 use std::collections::HashMap;
 
