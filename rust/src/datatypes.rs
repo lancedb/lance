@@ -5,10 +5,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
+use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+use async_recursion::async_recursion;
 
-use crate::encodings::Encoding;
+use crate::encodings::{dictionary, Encoding};
 use crate::format::pb;
+use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
@@ -186,6 +189,25 @@ fn is_binary(data_type: &DataType) -> bool {
     matches!(data_type, Binary | Utf8 | LargeBinary | LargeUtf8)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Dictionary {
+    offset: usize,
+
+    length: usize,
+
+    pub(crate) values: Option<ArrayRef>,
+}
+
+impl From<&pb::Dictionary> for Dictionary {
+    fn from(proto: &pb::Dictionary) -> Self {
+        Self {
+            offset: proto.offset as usize,
+            length: proto.length as usize,
+            values: None,
+        }
+    }
+}
+
 /// Lance Schema Field
 ///
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +221,9 @@ pub struct Field {
     nullable: bool,
 
     pub children: Vec<Field>,
+
+    /// Dictionary value array if this field is dictionary.
+    pub dictionary: Option<Dictionary>,
 }
 
 impl Field {
@@ -231,6 +256,7 @@ impl Field {
             encoding: self.encoding.clone(),
             nullable: self.nullable,
             children: vec![],
+            dictionary: self.dictionary.clone(),
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -280,6 +306,54 @@ impl Field {
         }
         None
     }
+
+    #[async_recursion]
+    async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+        if let DataType::Dictionary(_, value_type) = self.data_type() {
+            assert!(self.dictionary.is_some());
+            if let Some(dict_info) = self.dictionary.as_mut() {
+                use DataType::*;
+                match value_type.as_ref() {
+                    Utf8 | Binary => {
+                        dict_info.values = Some(
+                            reader
+                                .read_binary_array(
+                                    value_type.as_ref(),
+                                    dict_info.offset,
+                                    dict_info.length,
+                                )
+                                .await?,
+                        );
+                    }
+                    Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
+                        dict_info.values = Some(
+                            reader
+                                .read_primitive_array(
+                                    value_type.as_ref(),
+                                    dict_info.offset,
+                                    dict_info.length,
+                                )
+                                .await?,
+                        );
+                    }
+                    _ => {
+                        return Err(Error::Schema(format!(
+                            "Does not support {} as dictionary value type",
+                            value_type
+                        )));
+                    }
+                }
+            } else {
+                panic!("Should not reach here: dictionary field does not load dictionary info")
+            }
+            Ok(())
+        } else {
+            for child in self.children.as_mut_slice() {
+                child.load_dictionary(reader).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 impl fmt::Display for Field {
@@ -317,6 +391,7 @@ impl TryFrom<&ArrowField> for Field {
             extension_name: "".to_string(),
             nullable: field.is_nullable(),
             children,
+            dictionary: None,
         })
     }
 }
@@ -344,6 +419,7 @@ impl From<&pb::Field> for Field {
             },
             nullable: field.nullable,
             children: vec![],
+            dictionary: field.dictionary.as_ref().map(|d| Dictionary::from(d)),
         }
     }
 }
@@ -429,6 +505,14 @@ impl Schema {
 
     pub(crate) fn max_field_id(&self) -> Option<i32> {
         self.fields.iter().map(|f| f.max_id()).max()
+    }
+
+    /// Load dictionary value array from manifest files.
+    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+        for field in self.fields.as_mut_slice() {
+            field.load_dictionary(reader).await?;
+        }
+        Ok(())
     }
 }
 

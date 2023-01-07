@@ -5,6 +5,7 @@ use arrow_array::{Array, ArrayRef};
 use async_trait::async_trait;
 
 pub mod binary;
+pub mod dictionary;
 pub mod plain;
 pub mod rle;
 use crate::error::Result;

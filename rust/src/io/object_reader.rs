@@ -17,19 +17,30 @@
 
 use std::cmp::min;
 
-use std::io::{Error, ErrorKind, Result};
 use std::ops::Range;
 
+use arrow_array::{
+    types::{
+        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Utf8Type,
+    },
+    ArrayRef,
+};
+use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
+use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
+use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 
 /// Object Reader
 ///
 /// Object Store + Base Path
+#[derive(Debug)]
 pub struct ObjectReader<'a> {
     // Object Store.
     // TODO: can we use reference instead?
@@ -63,7 +74,7 @@ impl<'a> ObjectReader<'a> {
     pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
         let file_size = self.size().await?;
         if pos > file_size {
-            return Err(Error::new(ErrorKind::InvalidData, "file size is too small"));
+            return Err(Error::IO("file size is too small".to_string()));
         }
 
         let range = pos..min(pos + self.prefetch_size, file_size);
@@ -77,6 +88,70 @@ impl<'a> ObjectReader<'a> {
         let bytes = self.object_store.inner.get_range(&self.path, range).await?;
         Ok(bytes)
     }
+
+    /// Read a primitive array from disk.
+    ///
+    pub async fn read_primitive_array(
+        &self,
+        data_type: &DataType,
+        position: usize,
+        length: usize,
+    ) -> Result<ArrayRef> {
+        assert!(data_type.is_primitive());
+
+        // TODO: support more than plain encoding here.
+        use arrow_schema::DataType::*;
+
+        macro_rules! create_plain_decoder {
+            ($a:ty) => {
+                Box::new(PlainDecoder::<$a>::new(self, position, length)?)
+            };
+        }
+
+        let decoder: Box<dyn Decoder + Send> = match data_type {
+            Int8 => create_plain_decoder!(Int8Type),
+            Int16 => create_plain_decoder!(Int16Type),
+            Int32 => create_plain_decoder!(Int32Type),
+            Int64 => create_plain_decoder!(Int64Type),
+            UInt8 => create_plain_decoder!(UInt8Type),
+            UInt16 => create_plain_decoder!(UInt16Type),
+            UInt32 => create_plain_decoder!(UInt32Type),
+            UInt64 => create_plain_decoder!(UInt64Type),
+            Float16 => create_plain_decoder!(Float16Type),
+            Float32 => create_plain_decoder!(Float32Type),
+            Float64 => create_plain_decoder!(Float64Type),
+            _ => {
+                return Err(Error::Schema(format!(
+                    "Unsupport primitive type: {}",
+                    data_type
+                )))
+            }
+        };
+        let fut = decoder.decode();
+        fut.await
+    }
+
+    pub async fn read_binary_array(
+        &self,
+        data_type: &DataType,
+        position: usize,
+        length: usize,
+    ) -> Result<ArrayRef> {
+        use arrow_schema::DataType::*;
+        let decoder: Box<dyn Decoder + Send> = match data_type {
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
+            _ => {
+                return Err(Error::IO(format!(
+                    "Unsupported binary type: {}",
+                    data_type,
+                )))
+            }
+        };
+        let fut = decoder.decode();
+        fut.await
+    }
+
 }
 
 #[cfg(test)]
