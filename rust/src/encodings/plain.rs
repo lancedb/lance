@@ -113,8 +113,6 @@ impl<'a, T: ArrowPrimitiveType + Sync + Send> Decoder for PlainDecoder<'a, T> {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use crate::io::ObjectStore;

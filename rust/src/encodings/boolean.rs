@@ -1,15 +1,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray};
+use crate::encodings::Decoder;
 use arrow_array::cast::as_boolean_array;
+use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
-use crate::encodings::Decoder;
 
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
@@ -24,9 +24,7 @@ pub struct BooleanEncoder<'a> {
 
 impl<'a> BooleanEncoder<'a> {
     pub fn new(writer: &'a mut ObjectWriter<'a>) -> BooleanEncoder<'a> {
-        BooleanEncoder {
-            writer,
-        }
+        BooleanEncoder { writer }
     }
 
     /// Encode an array of a batch.
@@ -59,7 +57,7 @@ impl<'a> BooleanDecoder<'a> {
         Ok(BooleanDecoder {
             reader,
             position,
-            length
+            length,
         })
     }
 
@@ -88,7 +86,6 @@ impl<'a> Decoder for BooleanDecoder<'a> {
         Ok(Arc::new(BooleanArray::from(array_data)))
     }
 }
-
 
 #[tokio::test]
 async fn test_encode_decode_bool_array() {

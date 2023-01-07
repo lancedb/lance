@@ -33,8 +33,8 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
-use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::encodings::boolean::BooleanDecoder;
+use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 
@@ -144,16 +144,14 @@ impl<'a> ObjectReader<'a> {
             Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
             Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
             _ => {
-                return Err(Error::IO(format!(
-                    "Unsupported binary type: {}",
-                    data_type,
-                )))
+                return Err(Error::IO(
+                    format!("Unsupported binary type: {}", data_type,),
+                ))
             }
         };
         let fut = decoder.decode();
         fut.await
     }
-
 }
 
 #[cfg(test)]
