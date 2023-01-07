@@ -2,19 +2,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::encodings::Decoder;
-use arrow_array::cast::as_boolean_array;
 use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
-use crate::io::ObjectStore;
 
 // Because Boolean type is special, it cannot be a PlainEncoder/PlainDecoder
 
@@ -87,25 +84,37 @@ impl<'a> Decoder for BooleanDecoder<'a> {
     }
 }
 
-#[tokio::test]
-async fn test_encode_decode_bool_array() {
-    let store = ObjectStore::new(":memory:").unwrap();
-    let path = Path::from("/foo");
-    let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
+#[cfg(test)]
+mod tests {
+    use arrow_array::BooleanArray;
+    use arrow_array::cast::as_boolean_array;
+    use object_store::path::Path;
+    use tokio::io::AsyncWriteExt;
+    use crate::encodings::boolean::{BooleanDecoder, BooleanEncoder};
+    use crate::encodings::Decoder;
+    use crate::io::object_writer::ObjectWriter;
+    use crate::io::ObjectStore;
 
-    let arr = BooleanArray::from(vec![true, false].repeat(100));
-    {
-        let mut object_writer = ObjectWriter::new(writer.as_mut());
-        let mut encoder = BooleanEncoder::new(&mut object_writer);
+    #[tokio::test]
+    async fn test_encode_decode_bool_array() {
+        let store = ObjectStore::new(":memory:").unwrap();
+        let path = Path::from("/foo");
+        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
 
-        assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
+        let arr = BooleanArray::from(vec![true, false].repeat(100));
+        {
+            let mut object_writer = ObjectWriter::new(writer.as_mut());
+            let mut encoder = BooleanEncoder::new(&mut object_writer);
+
+            assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
+        }
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder = BooleanDecoder::new(&reader, 0, arr.len()).unwrap();
+        let read_arr = decoder.decode().await.unwrap();
+        let expect_arr = as_boolean_array(read_arr.as_ref());
+        assert_eq!(expect_arr, &arr);
     }
-    writer.shutdown().await.unwrap();
-
-    let mut reader = store.open(&path).await.unwrap();
-    assert!(reader.size().await.unwrap() > 0);
-    let decoder = BooleanDecoder::new(&reader, 0, arr.len()).unwrap();
-    let read_arr = decoder.decode().await.unwrap();
-    let expect_arr = as_boolean_array(read_arr.as_ref());
-    assert_eq!(expect_arr, &arr);
 }
