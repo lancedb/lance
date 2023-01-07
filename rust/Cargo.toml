@@ -6,15 +6,13 @@ authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
 license = "Apache-2.0"
 repository = "https://github.com/eto-ai/lance"
-readme = "../README.md"
+readme = "README.md"
 rust-version = "1.65"
 keywords = [
     "data-format",
     "data-science",
     "machine-learning",
     "apache-arrow",
-    "duckdb",
-    "dataops",
     "data-analytics"
 ]
 categories = [
