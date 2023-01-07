@@ -22,8 +22,7 @@ use std::ops::Range;
 use arrow_array::{
     types::{
         BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-        Int8Type, LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-        Utf8Type,
+        Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
     },
     ArrayRef,
 };
@@ -100,33 +99,7 @@ impl<'a> ObjectReader<'a> {
         assert!(data_type.is_primitive());
 
         // TODO: support more than plain encoding here.
-        use arrow_schema::DataType::*;
-
-        macro_rules! create_plain_decoder {
-            ($a:ty) => {
-                Box::new(PlainDecoder::<$a>::new(self, position, length)?)
-            };
-        }
-
-        let decoder: Box<dyn Decoder + Send> = match data_type {
-            Int8 => create_plain_decoder!(Int8Type),
-            Int16 => create_plain_decoder!(Int16Type),
-            Int32 => create_plain_decoder!(Int32Type),
-            Int64 => create_plain_decoder!(Int64Type),
-            UInt8 => create_plain_decoder!(UInt8Type),
-            UInt16 => create_plain_decoder!(UInt16Type),
-            UInt32 => create_plain_decoder!(UInt32Type),
-            UInt64 => create_plain_decoder!(UInt64Type),
-            Float16 => create_plain_decoder!(Float16Type),
-            Float32 => create_plain_decoder!(Float32Type),
-            Float64 => create_plain_decoder!(Float64Type),
-            _ => {
-                return Err(Error::Schema(format!(
-                    "Unsupport primitive type: {}",
-                    data_type
-                )))
-            }
-        };
+        let decoder = PlainDecoder::new(self, data_type, position, length)?;
         let fut = decoder.decode();
         fut.await
     }
@@ -142,16 +115,14 @@ impl<'a> ObjectReader<'a> {
             Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
             Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
             _ => {
-                return Err(Error::IO(format!(
-                    "Unsupported binary type: {}",
-                    data_type,
-                )))
+                return Err(Error::IO(
+                    format!("Unsupported binary type: {}", data_type,),
+                ))
             }
         };
         let fut = decoder.decode();
         fut.await
     }
-
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use arrow_array::{ArrayRef, DictionaryArray, PrimitiveArray};
+use arrow_array::{ArrayRef, ArrowPrimitiveType, DictionaryArray, PrimitiveArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
@@ -66,10 +66,30 @@ impl<'a> DictionaryDecoder<'a> {
         }
     }
 
-    async fn decode_index<T: ArrowDictionaryKeyType + Sync + Send>(&self) -> Result<ArrayRef> {
-        let index_decoder = PlainDecoder::<T>::new(self.reader, self.position, self.length)?;
-        let arr = index_decoder.decode().await?;
-        let keys = arr.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
+    async fn decode_index(&self, index_type: &DataType) -> Result<ArrayRef> {
+        let index_decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
+        let index_array = index_decoder.decode().await?;
+
+        match index_type {
+            DataType::Int8 => self.make_dict_array::<Int8Type>(index_array).await,
+            DataType::Int16 => self.make_dict_array::<Int16Type>(index_array).await,
+            DataType::Int32 => self.make_dict_array::<Int32Type>(index_array).await,
+            DataType::Int64 => self.make_dict_array::<Int64Type>(index_array).await,
+            DataType::UInt8 => self.make_dict_array::<UInt8Type>(index_array).await,
+            DataType::UInt16 => self.make_dict_array::<UInt16Type>(index_array).await,
+            DataType::UInt32 => self.make_dict_array::<UInt32Type>(index_array).await,
+            DataType::UInt64 => self.make_dict_array::<UInt64Type>(index_array).await,
+            _ => {
+                return Err(Error::Arrow(format!(
+                    "Dictionary encoding does not support index type: {}",
+                    index_type
+                )))
+            }
+        }
+    }
+
+    async fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(&self, index_array: ArrayRef) -> Result<ArrayRef> {
+        let keys = index_array.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
         Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
     }
 }
@@ -80,23 +100,7 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
         use DataType::*;
         if let Dictionary(index_type, _) = &self.data_type {
             assert!(index_type.as_ref().is_dictionary_key_type());
-
-            match index_type.as_ref() {
-                Int8 => self.decode_index::<Int8Type>().await,
-                Int16 => self.decode_index::<Int16Type>().await,
-                Int32 => self.decode_index::<Int32Type>().await,
-                Int64 => self.decode_index::<Int64Type>().await,
-                UInt8 => self.decode_index::<UInt8Type>().await,
-                UInt16 => self.decode_index::<UInt16Type>().await,
-                UInt32 => self.decode_index::<UInt32Type>().await,
-                UInt64 => self.decode_index::<UInt64Type>().await,
-                _ => {
-                    return Err(Error::Arrow(format!(
-                        "Dictionary encoding does not support index type: {}",
-                        index_type
-                    )))
-                }
-            }
+            self.decode_index(index_type).await
         } else {
             Err(Error::Arrow(format!(
                 "Not a dictionary type: {}",
@@ -129,7 +133,7 @@ mod tests {
         {
             let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
             let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::<T>::new(&mut object_writer);
+            let mut encoder = PlainEncoder::new(&mut object_writer, arr.keys().data_type());
             pos = encoder.encode(arr.keys()).await.unwrap();
             writer.shutdown().await.unwrap();
         }

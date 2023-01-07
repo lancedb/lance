@@ -9,7 +9,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
-use crate::encodings::{dictionary, Encoding};
+use crate::encodings::Encoding;
 use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
