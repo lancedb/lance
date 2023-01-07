@@ -80,8 +80,8 @@ impl Dataset {
         })
     }
 
-    pub fn scan(&self) -> Result<Scanner> {
-        todo!()
+    pub fn scan(&self) -> Scanner {
+        Scanner::new(&self)
     }
 
     pub fn object_store(&self) -> &ObjectStore {
