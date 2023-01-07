@@ -46,7 +46,6 @@ pub trait ListArrayExt {
 }
 
 impl ListArrayExt for ListArray {
-
     fn new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
             "item",

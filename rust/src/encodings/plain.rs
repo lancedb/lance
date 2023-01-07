@@ -23,15 +23,15 @@
 use std::any::Any;
 use std::ops::Range;
 
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, make_array, PrimitiveArray};
 use arrow_array::types::*;
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 
+use crate::Error;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
-use crate::Error;
 
 use super::Decoder;
 use crate::error::Result;
@@ -42,15 +42,12 @@ use crate::io::object_writer::ObjectWriter;
 ///
 pub struct PlainEncoder<'a> {
     writer: &'a mut ObjectWriter<'a>,
-    data_type: &'a DataType
+    data_type: &'a DataType,
 }
 
 impl<'a> PlainEncoder<'a> {
     pub fn new(writer: &'a mut ObjectWriter<'a>, data_type: &'a DataType) -> PlainEncoder<'a> {
-        PlainEncoder {
-            writer,
-            data_type
-        }
+        PlainEncoder { writer, data_type }
     }
 
     /// Encode an array of a batch.
@@ -72,22 +69,21 @@ pub struct PlainDecoder<'a> {
     /// The start position of the batch in the file.
     position: usize,
     /// Number of the rows in this batch.
-    length: usize
+    length: usize,
 }
-
 
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a ObjectReader,
         data_type: &'a DataType,
         position: usize,
-        length: usize
+        length: usize,
     ) -> Result<PlainDecoder<'a>> {
         Ok(PlainDecoder {
             reader,
             data_type,
             position,
-            length
+            length,
         })
     }
 
@@ -108,7 +104,10 @@ impl<'a> PlainDecoder<'a> {
             DataType::Float16 => Ok(Float16Type::get_byte_width()),
             DataType::Float32 => Ok(Float32Type::get_byte_width()),
             DataType::Float64 => Ok(Float64Type::get_byte_width()),
-            _ => Err(Error::Schema(format!("Unsupport primitive type: {}", self.data_type)))
+            _ => Err(Error::Schema(format!(
+                "Unsupport primitive type: {}",
+                self.data_type
+            ))),
         }
     }
 }
@@ -118,7 +117,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         let array_bytes = match self.data_type {
             DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => self.get_byte_width()? * self.length
+            _ => self.get_byte_width()? * self.length,
         };
         let range = Range {
             start: self.position,
@@ -136,15 +135,14 @@ impl<'a> Decoder for PlainDecoder<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use crate::io::ObjectStore;
     use arrow_array::cast::as_boolean_array;
     use arrow_array::*;
     use half::f16;
     use object_store::path::Path;
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
     use crate::io::object_writer::ObjectWriter;
@@ -171,14 +169,28 @@ mod tests {
         let arr = UInt64Array::from(Vec::from_iter(1..4096));
         test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt64).await;
 
-        let arr = Float16Array::from_iter(Vec::from_iter(1..4096 as i16).iter().map(|&i| f16::from_f32(1.0 * i as f32)).collect::<Vec<_>>());
+        let arr = Float16Array::from_iter(
+            Vec::from_iter(1..4096 as i16)
+                .iter()
+                .map(|&i| f16::from_f32(1.0 * i as f32))
+                .collect::<Vec<_>>(),
+        );
         test_primitive(Arc::new(arr) as ArrayRef, DataType::Float16).await;
-        let arr = Float32Array::from(Vec::from_iter(1..4096).iter().map(|&i| 1.0 * i as f32).collect::<Vec<_>>());
+        let arr = Float32Array::from(
+            Vec::from_iter(1..4096)
+                .iter()
+                .map(|&i| 1.0 * i as f32)
+                .collect::<Vec<_>>(),
+        );
         test_primitive(Arc::new(arr) as ArrayRef, DataType::Float32).await;
-        let arr = Float64Array::from(Vec::from_iter(1..4096).iter().map(|&i| 1.0 * i as f64).collect::<Vec<_>>());
+        let arr = Float64Array::from(
+            Vec::from_iter(1..4096)
+                .iter()
+                .map(|&i| 1.0 * i as f64)
+                .collect::<Vec<_>>(),
+        );
         test_primitive(Arc::new(arr) as ArrayRef, DataType::Float64).await;
     }
-
 
     async fn test_primitive(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();

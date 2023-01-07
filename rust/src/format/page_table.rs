@@ -16,8 +16,8 @@
 // under the License.
 
 use arrow_array::{types::Int64Type, Int64Array};
-use std::collections::HashMap;
 use arrow_schema::DataType;
+use std::collections::HashMap;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;

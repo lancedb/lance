@@ -37,13 +37,14 @@ impl From<Encoding> for pb::Encoding {
 }
 
 /// Encoder - Write an arrow array to the file.
+#[async_trait]
 pub trait Encoder {
     /// Write an array, and returns the file offset of the beginning of the batch.
-    fn write(&mut self, array: &dyn Array) -> Result<i64>;
+    async fn encode(&mut self, array: &dyn Array) -> Result<usize>;
 }
 
 /// Decoder - Read Arrow Array from file.
 #[async_trait]
-pub trait Decoder : Send {
+pub trait Decoder: Send {
     async fn decode(&self) -> Result<ArrayRef>;
 }

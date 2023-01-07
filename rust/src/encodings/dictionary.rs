@@ -88,8 +88,14 @@ impl<'a> DictionaryDecoder<'a> {
         }
     }
 
-    async fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(&self, index_array: ArrayRef) -> Result<ArrayRef> {
-        let keys = index_array.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
+    async fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(
+        &self,
+        index_array: ArrayRef,
+    ) -> Result<ArrayRef> {
+        let keys = index_array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .unwrap();
         Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
     }
 }
