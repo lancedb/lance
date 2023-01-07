@@ -32,7 +32,6 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
-use crate::encodings::boolean::BooleanDecoder;
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
@@ -100,34 +99,7 @@ impl<'a> ObjectReader<'a> {
         assert!(data_type.is_primitive());
 
         // TODO: support more than plain encoding here.
-        use arrow_schema::DataType::*;
-
-        macro_rules! create_plain_decoder {
-            ($a:ty) => {
-                Box::new(PlainDecoder::<$a>::new(self, position, length)?)
-            };
-        }
-
-        let decoder: Box<dyn Decoder + Send> = match data_type {
-            Int8 => create_plain_decoder!(Int8Type),
-            Int16 => create_plain_decoder!(Int16Type),
-            Int32 => create_plain_decoder!(Int32Type),
-            Int64 => create_plain_decoder!(Int64Type),
-            UInt8 => create_plain_decoder!(UInt8Type),
-            UInt16 => create_plain_decoder!(UInt16Type),
-            UInt32 => create_plain_decoder!(UInt32Type),
-            UInt64 => create_plain_decoder!(UInt64Type),
-            Float16 => create_plain_decoder!(Float16Type),
-            Float32 => create_plain_decoder!(Float32Type),
-            Float64 => create_plain_decoder!(Float64Type),
-            Boolean => Box::new(BooleanDecoder::new(self, position, length)?),
-            _ => {
-                return Err(Error::Schema(format!(
-                    "Unsupport primitive type: {}",
-                    data_type
-                )))
-            }
-        };
+        let decoder = PlainDecoder::new(self, data_type, position, length)?;
         let fut = decoder.decode();
         fut.await
     }

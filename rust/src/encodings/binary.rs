@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow_array::types::{ByteArrayType, Int64Type};
 use arrow_array::{Array, ArrayRef, GenericByteArray, Int32Array, Int64Array};
 use arrow_data::ArrayDataBuilder;
+use arrow_schema::DataType;
 use async_trait::async_trait;
 
 use super::plain::PlainDecoder;
@@ -64,7 +65,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
 impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
         let position_decoder =
-            PlainDecoder::<Int64Type>::new(self.reader, self.position, self.length + 1)?;
+            PlainDecoder::new(self.reader, &DataType::Int64, self.position, self.length + 1)?;
         let positions = position_decoder.decode().await?;
         let int64_positions = positions.as_any().downcast_ref::<Int64Array>().unwrap();
 

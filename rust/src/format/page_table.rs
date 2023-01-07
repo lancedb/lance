@@ -17,6 +17,7 @@
 
 use arrow_array::{types::Int64Type, Int64Array};
 use std::collections::HashMap;
+use arrow_schema::DataType;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
@@ -43,7 +44,7 @@ impl PageTable {
         num_batches: i32,
     ) -> Result<Self> {
         let length = num_columns * num_batches * 2;
-        let decoder = PlainDecoder::<Int64Type>::new(reader, position, length as usize)?;
+        let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length as usize)?;
         let raw_arr = decoder.decode().await?;
         let arr = raw_arr.as_any().downcast_ref::<Int64Array>().unwrap();
 
