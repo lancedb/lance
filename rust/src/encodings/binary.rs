@@ -4,7 +4,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow_array::types::{ByteArrayType, Int64Type};
+use arrow_array::types::{ByteArrayType};
 use arrow_array::{Array, ArrayRef, GenericByteArray, Int32Array, Int64Array};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -14,8 +14,20 @@ use super::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
+use crate::io::object_writer::ObjectWriter;
 
-pub struct BinaryEncoder {}
+/// Encoder for Var-binary encoding.
+pub struct BinaryEncoder<'a> {
+    writer: &'a mut ObjectWriter<'a>,
+}
+
+impl<'a> BinaryEncoder<'a> {
+    pub fn new(writer: &'a mut ObjectWriter<'a>) -> Self {
+        Self {
+            writer
+        }
+    }
+}
 
 /// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
