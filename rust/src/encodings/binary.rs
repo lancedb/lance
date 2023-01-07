@@ -4,13 +4,20 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow_array::types::{ByteArrayType};
-use arrow_array::{Array, ArrayRef, GenericByteArray, Int32Array, Int64Array};
+use arrow_array::types::{ByteArrayType, Int64Type};
+use arrow_array::PrimitiveArray;
+use arrow_array::{
+    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
+    Array, ArrayRef, GenericByteArray, Int32Array, Int64Array,
+};
+use arrow_buffer::ArrowNativeType;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 use super::plain::PlainDecoder;
+use super::Encoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
@@ -23,8 +30,50 @@ pub struct BinaryEncoder<'a> {
 
 impl<'a> BinaryEncoder<'a> {
     pub fn new(writer: &'a mut ObjectWriter<'a>) -> Self {
-        Self {
-            writer
+        Self { writer }
+    }
+
+    async fn encode_typed_arr<T: ByteArrayType>(&mut self, array: &dyn Array) -> Result<usize> {
+        let arr = array
+            .as_any()
+            .downcast_ref::<GenericByteArray<T>>()
+            .unwrap();
+
+        let value_offset = self.writer.tell() as usize;
+        self.writer.write_all(arr.value_data()).await?;
+        let offset = self.writer.tell() as usize;
+
+        let offsets = arr.value_offsets();
+        let start_offset = offsets[0];
+        // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
+        let positions = PrimitiveArray::<Int64Type>::from_iter(
+            offsets
+                .iter()
+                .map(|o| (((*o - start_offset).as_usize() + value_offset) as i64)),
+        );
+        self.writer
+            .write_all(positions.data().buffers()[0].as_slice())
+            .await?;
+        println!("Offset arra: {:?}", offsets);
+
+        Ok(offset)
+    }
+}
+
+#[async_trait]
+impl<'a> Encoder for BinaryEncoder<'a> {
+    async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+        match array.data_type() {
+            DataType::Utf8 => self.encode_typed_arr::<Utf8Type>(array).await,
+            DataType::Binary => self.encode_typed_arr::<BinaryType>(array).await,
+            DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(array).await,
+            DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(array).await,
+            _ => {
+                return Err(crate::Error::IO(format!(
+                    "Binary encoder does not support {}",
+                    array.data_type()
+                )))
+            }
         }
     }
 }
@@ -76,8 +125,12 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
 #[async_trait]
 impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
-        let position_decoder =
-            PlainDecoder::new(self.reader, &DataType::Int64, self.position, self.length + 1)?;
+        let position_decoder = PlainDecoder::new(
+            self.reader,
+            &DataType::Int64,
+            self.position,
+            self.length + 1,
+        )?;
         let positions = position_decoder.decode().await?;
         let int64_positions = positions.as_any().downcast_ref::<Int64Array>().unwrap();
 
@@ -103,5 +156,40 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{cast::as_string_array, StringArray};
+    use object_store::path::Path;
+
+    use crate::io::ObjectStore;
+
+    #[tokio::test]
+    async fn test_write_binary_data() {
+        let store = ObjectStore::new(":memory:").unwrap();
+        let path = Path::from("/foo");
+
+        let arr = StringArray::from(vec!["a", "b", "cd", "efg"]);
+
+        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
+
+        {
+            let mut object_writer = ObjectWriter::new(writer.as_mut());
+            // Write some gabage to reset "tell()".
+            object_writer.write_all(b"1234").await.unwrap();
+            let mut encoder = BinaryEncoder::new(&mut object_writer);
+
+            assert_eq!(encoder.encode(&arr).await.unwrap(), 11);
+        }
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, 11, arr.len());
+        let actual_arr = decoder.decode().await.unwrap();
+        assert_eq!(as_string_array(actual_arr.as_ref()), &arr);
     }
 }
