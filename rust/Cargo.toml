@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
-license_file = "../LICENSE"
+license = "Apache-2.0"
 repository = "https://github.com/eto-ai/lance"
 readme = "../README.md"
 rust-version = "1.65"
@@ -26,6 +26,7 @@ categories = [
 
 [dependencies]
 bytes = "1.3"
+arrow-arith = "30.0"
 arrow-array = "30.0"
 arrow-buffer = "30.0"
 arrow-data = "30.0"

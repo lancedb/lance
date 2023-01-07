@@ -61,4 +61,10 @@ impl From<prost::DecodeError> for Error {
     }
 }
 
+impl From<tokio::task::JoinError> for Error {
+    fn from(e: tokio::task::JoinError) -> Self {
+        Error::IO(e.to_string())
+    }
+}
+
 impl std::error::Error for Error {}

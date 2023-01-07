@@ -22,12 +22,16 @@ use std::cmp::max;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::cast::as_primitive_array;
+use arrow_array::{ArrayRef, ListArray, RecordBatch, StructArray};
 use arrow_schema::DataType;
+use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
 use prost::Message;
 
+use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
@@ -208,26 +212,62 @@ impl<'a> FileReader<'a> {
         decoder.decode().await
     }
 
+    async fn read_struct_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        // TODO: use tokio to make the reads in parallel.
+        let mut sub_arrays = vec![];
+        for child in field.children.as_slice() {
+            let arr = self.read_array(&child, batch_id).await?;
+            sub_arrays.push((child.into(), arr));
+        }
+
+        Ok(Arc::new(StructArray::from(sub_arrays)))
+    }
+
+    async fn read_list_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        let page_info = self.page_info(field, batch_id)?;
+        let position_arr = self
+            .object_reader
+            .read_primitive_array(&DataType::Int32, page_info.position, page_info.length)
+            .await?;
+        let positions = as_primitive_array(position_arr.as_ref());
+        let start_position = positions.value(0);
+        // Compute offsets
+        let offset_arr = subtract_scalar(positions, start_position)?;
+        let value_arrs = self.read_array(&field.children[0], batch_id).await?;
+
+        Ok(Arc::new(ListArray::new(value_arrs, &offset_arr)?))
+    }
+
     /// Read an array of the batch.
-    async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
-        if let DataType::Dictionary(_, _) = field.data_type() {
-            self.read_dictionary_array(field, batch_id).await
-        } else if field.data_type().is_numeric() {
-            self.read_primitive_array(field, batch_id).await
-        } else if matches!(
-            field.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-        ) {
-            self.read_binary_array(field, batch_id).await
-        } else {
-            println!("Reading: {}", field);
-            let page_info = self.page_table.get(field.id, batch_id).unwrap();
-            Ok(Arc::new(Int32Array::from(
-                (0..page_info.length as i32).collect::<Vec<_>>(),
-            )))
+    #[async_recursion]
+    async fn read_array<'f>(&self, field: &'f Field, batch_id: i32) -> Result<ArrayRef> {
+        let data_type = field.data_type();
+
+        use DataType::*;
+
+        match data_type {
+            UInt8
+            | UInt16
+            | UInt32
+            | UInt64
+            | Int8
+            | Int16
+            | Int32
+            | Int64
+            | Float16
+            | Float32
+            | Float64
+            | Decimal128(_, _)
+            | Decimal256(_, _) => self.read_primitive_array(field, batch_id).await,
+            Utf8 | LargeUtf8 | Binary | LargeBinary => {
+                self.read_binary_array(field, batch_id).await
+            }
+            Struct(_) => self.read_struct_array(field, batch_id).await,
+            Dictionary(_, _) => self.read_dictionary_array(field, batch_id).await,
+            List(_) => self.read_list_array(field, batch_id).await,
+            _ => {
+                todo!()
+            }
         }
     }
 }
-
-#[cfg(test)]
-mod tests {}

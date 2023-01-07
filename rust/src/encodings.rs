@@ -44,6 +44,6 @@ pub trait Encoder {
 
 /// Decoder - Read Arrow Array from file.
 #[async_trait]
-pub trait Decoder {
+pub trait Decoder : Send {
     async fn decode(&self) -> Result<ArrayRef>;
 }

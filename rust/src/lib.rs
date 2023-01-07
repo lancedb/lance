@@ -21,6 +21,7 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
+pub mod arrow;
 pub mod dataset;
 pub mod datatypes;
 pub mod encodings;
