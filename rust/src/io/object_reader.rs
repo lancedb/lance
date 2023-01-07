@@ -34,6 +34,7 @@ use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
+use crate::encodings::boolean::BooleanDecoder;
 use crate::error::{Error, Result};
 use crate::io::ObjectStore;
 
@@ -120,6 +121,7 @@ impl<'a> ObjectReader<'a> {
             Float16 => create_plain_decoder!(Float16Type),
             Float32 => create_plain_decoder!(Float32Type),
             Float64 => create_plain_decoder!(Float64Type),
+            Boolean => Box::new(BooleanDecoder::new(self, position, length)?),
             _ => {
                 return Err(Error::Schema(format!(
                     "Unsupport primitive type: {}",

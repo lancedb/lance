@@ -8,6 +8,8 @@ pub mod binary;
 pub mod dictionary;
 pub mod plain;
 pub mod rle;
+pub mod boolean;
+
 use crate::error::Result;
 use crate::format::pb;
 
