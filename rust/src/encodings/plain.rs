@@ -27,7 +27,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::DataType;
+
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
@@ -117,8 +117,8 @@ impl<'a, T: ArrowPrimitiveType + Sync + Send> Decoder for PlainDecoder<'a, T> {
 mod tests {
     use crate::io::ObjectStore;
     use arrow_array::cast::as_primitive_array;
-    use arrow_array::types::{BooleanType, Int32Type};
-    use arrow_array::{BooleanArray, Int32Array};
+    use arrow_array::types::{Int32Type};
+    use arrow_array::{Int32Array};
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 

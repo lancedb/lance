@@ -231,8 +231,8 @@ impl<'a> FileReader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use object_store::path::Path;
+    
 
-    use super::FileReader;
-    use crate::io::ObjectStore;
+    
+    
 }
