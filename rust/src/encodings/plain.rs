@@ -139,10 +139,11 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use crate::io::ObjectStore;
-    use arrow_array::cast::{as_boolean_array, as_primitive_array};
-    use arrow_array::types::Int32Type;
-    use arrow_array::{BooleanArray, Int32Array};
+    use arrow_array::cast::as_boolean_array;
+    use arrow_array::*;
+    use half::f16;
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 
@@ -151,26 +152,53 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_encode_decode_int_array() {
+    async fn test_encode_decode_primitive_array() {
+        let arr = Int8Array::from(Vec::from_iter(1..127));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int8).await;
+        let arr = Int16Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int16).await;
+        let arr = Int32Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int32).await;
+        let arr = Int64Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int64).await;
+
+        let arr = UInt8Array::from(Vec::from_iter(1..255));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt8).await;
+        let arr = UInt16Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt16).await;
+        let arr = UInt32Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt32).await;
+        let arr = UInt64Array::from(Vec::from_iter(1..4096));
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt64).await;
+
+        let arr = Float16Array::from_iter(Vec::from_iter(1..4096 as i16).iter().map(|&i| f16::from_f32(1.0 * i as f32)).collect::<Vec<_>>());
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float16).await;
+        let arr = Float32Array::from(Vec::from_iter(1..4096).iter().map(|&i| 1.0 * i as f32).collect::<Vec<_>>());
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float32).await;
+        let arr = Float64Array::from(Vec::from_iter(1..4096).iter().map(|&i| 1.0 * i as f64).collect::<Vec<_>>());
+        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float64).await;
+    }
+
+
+    async fn test_primitive(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
         let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
 
-        let arr = Int32Array::from(Vec::from_iter(1..4096));
         {
             let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::new(&mut object_writer, &DataType::Int32);
+            let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
-            assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
+            assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
         }
         writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, &DataType::Int32, 0, arr.len()).unwrap();
-        let read_arr = decoder.decode().await.unwrap();
-        let expect_arr = as_primitive_array::<Int32Type>(read_arr.as_ref());
-        assert_eq!(expect_arr, &arr);
+        let decoder = PlainDecoder::new(&reader, &data_type, 0, expected.len()).unwrap();
+        let arr = decoder.decode().await.unwrap();
+        let actual = arr.as_ref();
+        assert_eq!(expected.as_ref(), actual);
     }
 
     #[tokio::test]
