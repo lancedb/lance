@@ -10,7 +10,7 @@ use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int32Array, Int64Array,
 };
-use arrow_buffer::ArrowNativeType;
+use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -54,7 +54,6 @@ impl<'a> BinaryEncoder<'a> {
         self.writer
             .write_all(positions.data().buffers()[0].as_slice())
             .await?;
-        println!("Offset arra: {:?}", offsets);
 
         Ok(offset)
     }
@@ -141,6 +140,19 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                 .map(|v| v.map(|o| (o - start_position) as i32))
                 .collect::<Vec<_>>(),
         );
+
+        // Count nulls
+        let mut null_buf = MutableBuffer::new_null(self.length);
+        let mut null_count = 0;
+        for idx in 0..self.length {
+            if offset_arr.value(idx) == offset_arr.value(idx + 1) {
+                bit_util::unset_bit(null_buf.as_mut(), idx);
+                null_count += 1;
+            } else {
+                bit_util::set_bit(null_buf.as_mut(), idx);
+            }
+        }
+
         let offset_data = offset_arr.into_data();
 
         let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
@@ -148,9 +160,11 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .reader
             .get_range(start_position as usize..(start_position + read_len) as usize)
             .await?;
+
         let array_data = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(self.length)
-            .null_count(0)
+            .null_count(null_count)
+            .null_bit_buffer(Some(null_buf.into()))
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(bytes.into())
             .build()?;
@@ -168,28 +182,29 @@ mod tests {
 
     use crate::io::ObjectStore;
 
-    #[tokio::test]
-    async fn test_write_binary_data() {
+    async fn test_round_trips(arr: &StringArray) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
-
-        let arr = StringArray::from(vec!["a", "b", "cd", "efg"]);
-
         let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
 
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            // Write some gabage to reset "tell()".
-            object_writer.write_all(b"1234").await.unwrap();
-            let mut encoder = BinaryEncoder::new(&mut object_writer);
+        let mut object_writer = ObjectWriter::new(writer.as_mut());
+        // Write some gabage to reset "tell()".
+        object_writer.write_all(b"1234").await.unwrap();
+        let mut encoder = BinaryEncoder::new(&mut object_writer);
 
-            assert_eq!(encoder.encode(&arr).await.unwrap(), 11);
-        }
+        let pos = encoder.encode(&arr).await.unwrap();
+
         writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, 11, arr.len());
+        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, arr.len());
         let actual_arr = decoder.decode().await.unwrap();
-        assert_eq!(as_string_array(actual_arr.as_ref()), &arr);
+        assert_eq!(as_string_array(actual_arr.as_ref()), arr);
+    }
+
+    #[tokio::test]
+    async fn test_write_binary_data() {
+        test_round_trips(&StringArray::from(vec!["a", "b", "cd", "efg"])).await;
+        test_round_trips(&StringArray::from(vec![Some("a"), None, Some("cd"), None])).await;
     }
 }
