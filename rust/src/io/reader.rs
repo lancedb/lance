@@ -230,9 +230,4 @@ impl<'a> FileReader<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    
-
-    
-    
-}
+mod tests {}

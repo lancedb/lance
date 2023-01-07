@@ -117,8 +117,8 @@ impl<'a, T: ArrowPrimitiveType + Sync + Send> Decoder for PlainDecoder<'a, T> {
 mod tests {
     use crate::io::ObjectStore;
     use arrow_array::cast::as_primitive_array;
-    use arrow_array::types::{Int32Type};
-    use arrow_array::{Int32Array};
+    use arrow_array::types::Int32Type;
+    use arrow_array::Int32Array;
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 

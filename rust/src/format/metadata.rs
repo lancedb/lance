@@ -81,6 +81,4 @@ impl Metadata {
 }
 
 #[cfg(test)]
-mod tests {
-    
-}
+mod tests {}

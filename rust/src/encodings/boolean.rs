@@ -86,14 +86,14 @@ impl<'a> Decoder for BooleanDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::BooleanArray;
-    use arrow_array::cast::as_boolean_array;
-    use object_store::path::Path;
-    use tokio::io::AsyncWriteExt;
     use crate::encodings::boolean::{BooleanDecoder, BooleanEncoder};
     use crate::encodings::Decoder;
     use crate::io::object_writer::ObjectWriter;
     use crate::io::ObjectStore;
+    use arrow_array::cast::as_boolean_array;
+    use arrow_array::BooleanArray;
+    use object_store::path::Path;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn test_encode_decode_bool_array() {
