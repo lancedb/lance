@@ -19,10 +19,18 @@
 
 // Standard
 use std::cmp::max;
+use std::iter::zip;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_array::{
+    types::{
+        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
+    },
+    ArrayRef, RecordBatch, StructArray,
+};
 use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use object_store::path::Path;
@@ -225,6 +233,71 @@ impl<'a> FileReader<'a> {
             Ok(Arc::new(Int32Array::from(
                 (0..page_info.length as i32).collect::<Vec<_>>(),
             )))
+        use DataType::*;
+        let decoder: Box<dyn Decoder> = match field.data_type() {
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
+                &self.object_reader,
+                page_info.position,
+                page_info.length,
+            )),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(
+                &self.object_reader,
+                page_info.position,
+                page_info.length,
+            )),
+            _ => {
+                return Err(Error::IO(format!(
+                    "Unsupported binary type: {}",
+                    field.data_type()
+                )))
+            }
+        };
+        let arr = decoder.decode();
+        arr.await
+        // decoder.decode().await
+    }
+
+    /// Read an array of the batch.
+    #[async_recursion::async_recursion]
+    async fn read_array<'f>(&self, field: &'f Field, batch_id: i32) -> Result<ArrayRef> {
+        let data_type = field.data_type();
+
+        use DataType::*;
+
+        match data_type {
+            UInt8
+            | UInt16
+            | UInt32
+            | UInt64
+            | Int8
+            | Int16
+            | Int32
+            | Int64
+            | Float16
+            | Float32
+            | Float64
+            | Decimal128(_, _)
+            | Decimal256(_, _) => self.read_primitive_array(field, batch_id).await,
+            Utf8 | LargeUtf8 | Binary | LargeBinary => {
+                self.read_binary_array(field, batch_id).await
+            }
+            Struct(fields) => {
+                // TODO: use tokio to make the reads in parallel.
+                let mut sub_arrays = vec![];
+                for (arrow_field, child) in zip(fields, field.children.as_slice()) {
+                    // let arr = self.read_array(, batch_id)
+                    let arr = self.read_array(&child, batch_id).await?;
+                    sub_arrays.push((arrow_field.clone(), arr));
+                }
+
+                Ok(Arc::new(StructArray::from(sub_arrays)) as ArrayRef)
+            }
+            List(item) => {
+                todo!()
+            }
+            _ => {
+                todo!()
+            }
         }
     }
 }
