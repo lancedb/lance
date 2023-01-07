@@ -75,23 +75,6 @@ pub struct PlainDecoder<'a> {
     length: usize
 }
 
-fn get_byte_width(data_type: &DataType) -> Result<usize> {
-    match data_type {
-        DataType::Int8 => Ok(Int8Type::get_byte_width()),
-        DataType::Int16 => Ok(Int16Type::get_byte_width()),
-        DataType::Int32 => Ok(Int32Type::get_byte_width()),
-        DataType::Int64 => Ok(Int64Type::get_byte_width()),
-        DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
-        DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
-        DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
-        DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
-        DataType::Float16 => Ok(Float16Type::get_byte_width()),
-        DataType::Float32 => Ok(Float32Type::get_byte_width()),
-        DataType::Float64 => Ok(Float64Type::get_byte_width()),
-        _ => Err(Error::Schema(format!("Unsupport primitive type: {}", data_type)))
-    }
-}
-
 
 impl<'a> PlainDecoder<'a> {
     pub fn new(
@@ -111,6 +94,23 @@ impl<'a> PlainDecoder<'a> {
     pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
         todo!()
     }
+
+    fn get_byte_width(&self) -> Result<usize> {
+        match self.data_type {
+            DataType::Int8 => Ok(Int8Type::get_byte_width()),
+            DataType::Int16 => Ok(Int16Type::get_byte_width()),
+            DataType::Int32 => Ok(Int32Type::get_byte_width()),
+            DataType::Int64 => Ok(Int64Type::get_byte_width()),
+            DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
+            DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
+            DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
+            DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
+            DataType::Float16 => Ok(Float16Type::get_byte_width()),
+            DataType::Float32 => Ok(Float32Type::get_byte_width()),
+            DataType::Float64 => Ok(Float64Type::get_byte_width()),
+            _ => Err(Error::Schema(format!("Unsupport primitive type: {}", self.data_type)))
+        }
+    }
 }
 
 #[async_trait]
@@ -118,7 +118,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         let array_bytes = match self.data_type {
             DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => get_byte_width(&self.data_type)? * self.length
+            _ => self.get_byte_width()? * self.length
         };
         let range = Range {
             start: self.position,
