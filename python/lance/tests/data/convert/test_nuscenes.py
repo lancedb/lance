@@ -22,20 +22,20 @@ from lance.data.convert.nuscenes import NuscenesConverter
 def download_fixtures(tmp_path):
     r = requests.get(f"{BASE_URI_FIXTURES}{URI_FIXTURES}", stream=True)
     if r.status_code == 200:
-        with open(f"{tmp_path}/{LOCAL_ZIP_PATH}", 'wb') as f:
+        with open(tmp_path / LOCAL_ZIP_PATH, "wb") as f:
             f.write(r.raw.read())
 
 def unpack_fixtures(tmp_path):
-    if tarfile.is_tarfile(f"{tmp_path}/{LOCAL_ZIP_PATH}"):
-        with tarfile.open(f"{tmp_path}/{LOCAL_ZIP_PATH}") as f:
+    if tarfile.is_tarfile(tmp_path / LOCAL_ZIP_PATH):
+        with tarfile.open(tmp_path / LOCAL_ZIP_PATH) as f:
             f.extractall(path=tmp_path)
 
 def test_nuscenes_dataset_converter(tmp_path):
     download_fixtures(tmp_path)
     unpack_fixtures(tmp_path)
     c = NuscenesConverter(
-        uri_root=f"{tmp_path}/nuimages-v1.0-mini-test-fixtures",
-        images_root=f"{tmp_path}/nuimages-v1.0-mini-test-fixtures",
+        uri_root=tmp_path / "nuimages-v1.0-mini-test-fixtures",
+        images_root=tmp_path / "nuimages-v1.0-mini-test-fixtures",
         dataset_verson="v1.0-mini"
     )
     nuscenes_df = c.read_metadata()
