@@ -782,7 +782,7 @@ mod tests {
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
-        assert_eq!(projected, Schema::try_from(&expected_arrow_schema).unwrap());
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
 
     #[test]
@@ -801,6 +801,19 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 4, 5]).unwrap();
+        let projected = schema.project_by_ids(&[1, 2, 4, 5]).unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
 }
