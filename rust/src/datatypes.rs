@@ -577,7 +577,6 @@ impl Schema {
             .iter_mut()
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
-
 }
 
 impl fmt::Display for Schema {
@@ -657,7 +656,6 @@ mod tests {
     use std::collections::BTreeSet;
 
     use arrow_schema::{Field as ArrowField, TimeUnit};
-
 
     #[test]
     fn arrow_field_to_field() {
@@ -843,5 +841,4 @@ mod tests {
         assert_eq!(*all_ids.first().unwrap(), 0);
         assert_eq!(*all_ids.last().unwrap(), 5);
     }
-
 }
