@@ -39,31 +39,31 @@ impl std::fmt::Display for Error {
 
 impl From<ArrowError> for Error {
     fn from(e: ArrowError) -> Self {
-        Error::Arrow(e.to_string())
+        Self::Arrow(e.to_string())
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::IO(e.to_string())
+        Self::IO(e.to_string())
     }
 }
 
 impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
-        Error::IO(e.to_string())
+        Self::IO(e.to_string())
     }
 }
 
 impl From<prost::DecodeError> for Error {
     fn from(e: prost::DecodeError) -> Self {
-        Error::IO(e.to_string())
+        Self::IO(e.to_string())
     }
 }
 
 impl From<tokio::task::JoinError> for Error {
     fn from(e: tokio::task::JoinError) -> Self {
-        Error::IO(e.to_string())
+        Self::IO(e.to_string())
     }
 }
 

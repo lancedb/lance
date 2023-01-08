@@ -66,7 +66,7 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 
 /// Read protobuf from a buffer.
 pub fn read_message<M: Message + Default>(buf: &Bytes) -> Result<M> {
-    let msg_len = LittleEndian::read_u32(&buf) as usize;
+    let msg_len = LittleEndian::read_u32(buf) as usize;
     Ok(M::decode(&buf[4..4 + msg_len])?)
 }
 

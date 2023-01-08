@@ -129,11 +129,11 @@ impl<'a> ObjectReader<'a> {
     ) -> Result<ArrayRef> {
         use arrow_schema::DataType::*;
         let decoder: Box<dyn Decoder + Send> = match data_type {
-            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
-            Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
-            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(&self, position, length)),
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(self, position, length)),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(self, position, length)),
+            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(self, position, length)),
             LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-                &self, position, length,
+                self, position, length,
             )),
             _ => {
                 return Err(Error::IO(

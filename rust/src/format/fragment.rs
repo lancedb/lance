@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::format::{pb, ProtoStruct};
+use crate::format::pb;
 
 /// Lance Data File
 ///
@@ -30,24 +30,11 @@ pub struct DataFile {
     fields: Vec<i32>,
 }
 
-impl ProtoStruct for DataFile {
-    type Proto = pb::DataFile;
-}
-
 impl From<&DataFile> for pb::DataFile {
     fn from(df: &DataFile) -> Self {
         Self {
             path: df.path.clone(),
             fields: df.fields.clone(),
-        }
-    }
-}
-
-impl From<pb::DataFile> for DataFile {
-    fn from(proto: pb::DataFile) -> Self {
-        Self {
-            path: proto.path.clone(),
-            fields: proto.fields.clone(),
         }
     }
 }
@@ -82,10 +69,6 @@ impl Fragment {
             .into_iter()
             .collect()
     }
-}
-
-impl ProtoStruct for Fragment {
-    type Proto = pb::DataFragment;
 }
 
 impl From<&pb::DataFragment> for Fragment {
