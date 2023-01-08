@@ -19,38 +19,51 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema as ArrowSchema, SchemaRef};
+use tokio::runtime::{Builder, Runtime};
 
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::error::Result;
 use crate::format::Fragment;
+use crate::io::reader::FileReader;
 
 /// Dataset Scanner
-#[derive(Debug)]
 pub struct Scanner<'a> {
     dataset: &'a Dataset,
 
     projections: Schema,
 
-    batch_size: usize,
-
     // filter: how to present filter
     limit: Option<i64>,
     offset: Option<i64>,
 
-    fragments: Vec<Fragment>
+    fragments: Vec<Fragment>,
+
+    // use for iterator
+    fragment_idx: usize,
+    batch_id: i32,
+    reader: Option<FileReader<'a>>,
+
+    // TODO: RecordBatchReader does not support async iterator yet,
+    // we need to use a tokio::rt::block_on for the iterator.
+    rt: Runtime,
 }
 
 impl<'a> Scanner<'a> {
-    pub fn new(dataset: &'a Dataset) -> Self {
-        Self {
+    pub fn new(dataset: &'a Dataset) -> Result<Self> {
+        Ok(Self {
             dataset,
             projections: dataset.schema().clone(),
-            batch_size: 1024,
             limit: None,
             offset: None,
             fragments: dataset.fragments().to_vec(),
-        }
+
+            fragment_idx: 0,
+            batch_id: 0,
+            reader: None,
+
+            rt: Builder::new_current_thread().build()?,
+        })
     }
 
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
@@ -63,18 +76,45 @@ impl<'a> Scanner<'a> {
         self.offset = offset;
         self
     }
-}
 
-impl<'a> RecordBatchReader for Scanner<'a> {
+    pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        if self.fragment_idx >= self.fragments.len() {
+            return None;
+        }
+
+        let fragment = &self.fragments[self.fragment_idx];
+        // Only support 1 data file (no schema evolution for now);
+        assert!(fragment.files.len() == 1);
+        let data_file = &fragment.files[0];
+        self.fragment_idx += 1;
+        let path = self.dataset.data_dir().child(data_file.path.clone());
+        if self.reader.is_none() {
+            self.reader = Some(
+                FileReader::new(
+                    &self.dataset.object_store,
+                    &path,
+                    Some(&self.dataset.manifest),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        if let Some(reader) = &self.reader {
+            let batch = reader.read_batch(self.batch_id).await;
+            self.batch_id += 1;
+            if self.batch_id as usize >= reader.num_batches() {
+                self.batch_id = 0;
+                self.fragment_idx += 1;
+                self.reader = None;
+            }
+            return Some(batch);
+        } else {
+            panic!("should not reach here");
+        }
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::new(ArrowSchema::from(&self.projections))
-    }
-}
-
-impl<'a> Iterator for Scanner<'a> {
-    type Item = std::result::Result<RecordBatch, ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
     }
 }

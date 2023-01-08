@@ -471,6 +471,14 @@ impl From<&Field> for pb::Field {
     }
 }
 
+impl From<&Field> for Vec<pb::Field> {
+    fn from(field: &Field) -> Self {
+        let mut protos = vec![pb::Field::from(field)];
+        protos.extend(field.children.iter().flat_map(|c| Self::from(c)));
+        protos
+    }
+}
+
 /// Lance Schema.
 #[derive(Default, Debug, PartialEq, Clone)]
 pub struct Schema {
@@ -510,6 +518,17 @@ impl Schema {
             fields: candidates,
             metadata: self.metadata.clone(),
         })
+    }
+
+    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Schema> {
+        let protos: Vec<pb::Field> = self.into();
+
+        let filtered_protos: Vec<pb::Field> = protos
+            .iter()
+            .filter(|p| column_ids.contains(&p.id))
+            .cloned()
+            .collect();
+        Ok(Schema::from(&filtered_protos))
     }
 
     fn field(&self, name: &str) -> Option<&Field> {
@@ -594,6 +613,17 @@ impl From<&Vec<pb::Field>> for Schema {
         });
 
         schema
+    }
+}
+
+/// Convert a Schema to a list of protobuf Field.
+impl From<&Schema> for Vec<pb::Field> {
+    fn from(schema: &Schema) -> Self {
+        let mut protos: Self = vec![];
+        schema.fields.iter().for_each(|f| {
+            protos.extend(Self::from(f));
+        });
+        protos
     }
 }
 
@@ -730,5 +760,24 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(projected, Schema::try_from(&expected_arrow_schema).unwrap());
+    }
+
+    #[test]
+    fn test_schema_project_by_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let projected = schema.project_by_ids(&[1, 4, 5]).unwrap();
     }
 }

@@ -87,7 +87,7 @@ impl<'a> FileReader<'a> {
     pub async fn new(
         object_store: &'a ObjectStore,
         path: &Path,
-        manifest: Option<Manifest>,
+        manifest: Option<&Manifest>,
     ) -> Result<FileReader<'a>> {
         let mut object_reader =
             ObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
@@ -113,18 +113,15 @@ impl<'a> FileReader<'a> {
         };
         let metadata = Metadata::from(&metadata_pb);
 
-        let manifest_for_file = match manifest {
-            Some(m) => m,
-            None => {
-                let manifest_pb = object_reader
-                    .read_message::<pb::Manifest>(metadata.manifest_position.unwrap())
-                    .await?;
-                let mut m = Manifest::from(&manifest_pb);
-                m.schema.load_dictionary(&object_reader).await?;
-                m
-            }
+        let (projection, num_columns) = if let Some(m) = manifest {
+            (m.schema.clone(), m.schema.max_field_id().unwrap())
+        } else {
+            let manifest_pb = object_reader
+                .read_message::<pb::Manifest>(metadata.manifest_position.unwrap())
+                .await?;
+            let m = Manifest::from(&manifest_pb);
+            (m.schema.clone(), m.schema.max_field_id().unwrap())
         };
-        let num_columns = manifest_for_file.schema.max_field_id().unwrap();
         let page_table = PageTable::new(
             &object_reader,
             metadata.page_table_position,
@@ -136,7 +133,7 @@ impl<'a> FileReader<'a> {
         Ok(Self {
             object_reader,
             metadata,
-            projection: Some(manifest_for_file.schema.clone()),
+            projection: Some(projection),
             page_table,
         })
     }
@@ -149,6 +146,10 @@ impl<'a> FileReader<'a> {
     /// Schema of the returning RecordBatch.
     pub fn schema(&self) -> &Schema {
         self.projection.as_ref().unwrap()
+    }
+
+    pub fn num_batches(&self) -> usize {
+        self.metadata.num_batches()
     }
 
     /// Read a batch of data from the file.

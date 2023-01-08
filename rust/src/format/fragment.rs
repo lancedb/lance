@@ -1,3 +1,24 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::BTreeSet;
+
+use object_store::path::Path;
+
 use crate::format::pb;
 use crate::format::pb::DataFragment;
 
@@ -7,7 +28,7 @@ use crate::format::pb::DataFragment;
 #[derive(Debug, Clone)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
-    path: String,
+    pub path: String,
     /// The Ids of fields in this file.
     fields: Vec<i32>,
 }
@@ -44,9 +65,12 @@ pub struct Fragment {
 }
 
 impl Fragment {
-    /// Get all field IDs from this datafragment
+    /// Get all field IDs from this fragment, sorted.
+    ///
     pub fn field_ids(&self) -> Vec<i32> {
-        vec![]
+        BTreeSet::from_iter(self.files.iter().flat_map(|f| f.fields.clone()))
+            .into_iter()
+            .collect()
     }
 }
 

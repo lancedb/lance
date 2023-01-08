@@ -80,7 +80,7 @@ impl Dataset {
         })
     }
 
-    pub fn scan(&self) -> Scanner {
+    pub fn scan(&self) -> Result<Scanner> {
         Scanner::new(&self)
     }
 
@@ -90,6 +90,10 @@ impl Dataset {
 
     fn versions_dir(&self) -> Path {
         self.base.child(VERSIONS_DIR)
+    }
+
+    fn data_dir(&self) -> Path {
+        self.base.child(DATA_DIR)
     }
 
     pub fn version(&self) -> Version {

@@ -45,9 +45,9 @@ async fn main() {
         }
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
-            let mut scanner = dataset.scan();
+            let mut scanner = dataset.scan().unwrap();
             scanner.limit(*n, None);
-            println!("{:?}", scanner.next().unwrap().unwrap());
+            println!("{:?}", scanner.next_batch().await.unwrap().unwrap());
         }
     }
 }
