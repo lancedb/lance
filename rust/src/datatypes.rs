@@ -9,6 +9,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
+use crate::arrow::DataTypeExt;
 use crate::encodings::Encoding;
 use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
@@ -201,18 +202,6 @@ impl TryFrom<&LogicalType> for DataType {
     }
 }
 
-fn is_numeric(data_type: &DataType) -> bool {
-    use DataType::*;
-    matches!(
-        data_type,
-        UInt8 | UInt16 | UInt32 | UInt64 | Int8 | Int16 | Int32 | Int64 | Float32 | Float64
-    )
-}
-
-fn is_binary(data_type: &DataType) -> bool {
-    use DataType::*;
-    matches!(data_type, Binary | Utf8 | LargeBinary | LargeUtf8)
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dictionary {
@@ -420,8 +409,8 @@ impl TryFrom<&ArrowField> for Field {
             name: field.name().clone(),
             logical_type: LogicalType::try_from(field.data_type())?,
             encoding: match field.data_type() {
-                dt if is_numeric(dt) => Some(Encoding::Plain),
-                dt if is_binary(dt) => Some(Encoding::VarBinary),
+                dt if dt.is_numeric() => Some(Encoding::Plain),
+                dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
                 _ => None,
             },

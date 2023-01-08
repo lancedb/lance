@@ -155,7 +155,65 @@ impl<'a> FileWriter<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::{Float32Array, Int64Array, StringArray};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use object_store::path::Path;
+
+    use crate::io::{ObjectStore, FileReader};
 
     #[tokio::test]
-    async fn test_write_file() {}
+    async fn test_write_file() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+            ArrowField::new("b", DataType::Utf8, true),
+            ArrowField::new(
+                "s",
+                DataType::Struct(vec![
+                    ArrowField::new("si", DataType::Int64, true),
+                    ArrowField::new("sb", DataType::Utf8, true),
+                ]),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let writer = store.create(&path).await.unwrap();
+
+        let mut file_writer = FileWriter::new(writer, &schema);
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter((0..100).collect::<Vec<_>>())),
+            Arc::new(Float32Array::from_iter(
+                (0..100).map(|n| n as f32).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StructArray::from(vec![
+                (
+                    ArrowField::new("si", DataType::Int64, true),
+                    Arc::new(Int64Array::from_iter((100..200).collect::<Vec<_>>())) as ArrayRef,
+                ),
+                (
+                    ArrowField::new("sb", DataType::Utf8, true),
+                    Arc::new(StringArray::from(
+                        (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+            ])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::new(&store, &path, None).await;
+
+    }
 }

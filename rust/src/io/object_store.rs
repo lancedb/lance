@@ -49,12 +49,7 @@ impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
     pub fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
-            return Ok(Self {
-                inner: Arc::new(InMemory::new()),
-                scheme: String::from("memory"),
-                base_path: Path::from("/"),
-                prefetch_size: 64 * 1024,
-            });
+            return Ok(ObjectStore::memory());
         };
 
         let parsed = match Url::parse(uri) {
@@ -98,6 +93,16 @@ impl ObjectStore {
             base_path: Path::from(parsed.path()),
             prefetch_size: 64 * 1024,
         })
+    }
+
+    /// Create a in-memory object store directly.
+    pub(crate) fn memory() -> Self {
+        Self {
+            inner: Arc::new(InMemory::new()),
+            scheme: String::from("memory"),
+            base_path: Path::from("/"),
+            prefetch_size: 64 * 1024,
+        }
     }
 
     pub fn prefetch_size(&self) -> usize {
