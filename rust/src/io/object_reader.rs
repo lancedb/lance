@@ -32,6 +32,7 @@ use prost::Message;
 
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
+use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
 
 /// Object Reader
@@ -65,6 +66,20 @@ impl<'a> ObjectReader<'a> {
             self.cached_metadata = Some(self.object_store.inner.head(&self.path).await?);
         };
         Ok(self.cached_metadata.as_ref().map_or(0, |m| m.size))
+    }
+
+    /// Read a Protobuf-backed struct at file position: `pos`.
+    pub async fn read_struct<
+        'm,
+        M: Message + Default + 'static,
+        T: ProtoStruct<Proto = M> + From<M>,
+    >(
+        &mut self,
+        pos: usize,
+    ) -> Result<T> {
+        let msg = self.read_message::<M>(pos).await?;
+        let obj = T::from(msg);
+        Ok(obj)
     }
 
     /// Read a protobuf message at position `pos`.
@@ -114,11 +129,11 @@ impl<'a> ObjectReader<'a> {
     ) -> Result<ArrayRef> {
         use arrow_schema::DataType::*;
         let decoder: Box<dyn Decoder + Send> = match data_type {
-            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
-            Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
-            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(&self, position, length)),
+            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(self, position, length)),
+            Binary => Box::new(BinaryDecoder::<BinaryType>::new(self, position, length)),
+            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(self, position, length)),
             LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-                &self, position, length,
+                self, position, length,
             )),
             _ => {
                 return Err(Error::IO(

@@ -23,6 +23,8 @@ use pin_project::pin_project;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::format::ProtoStruct;
+
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
 #[pin_project]
@@ -39,12 +41,12 @@ impl<'a> ObjectWriter<'a> {
     }
 
     /// Tell the current position (file size).
-    pub fn tell(&self) -> u64 {
-        self.cursor as u64
+    pub fn tell(&self) -> usize {
+        self.cursor
     }
 
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
-    pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<u64, Error> {
+    pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize, Error> {
         let offset = self.tell();
 
         let len = msg.encoded_len();
@@ -53,6 +55,14 @@ impl<'a> ObjectWriter<'a> {
         self.write_all(&msg.encode_to_vec()).await?;
 
         Ok(offset)
+    }
+
+    pub async fn write_struct<'b, M: Message + From<&'b T>, T: ProtoStruct<Proto = M> + 'b>(
+        &mut self,
+        obj: &'b T,
+    ) -> Result<usize, Error> {
+        let msg: M = M::from(obj);
+        self.write_protobuf(&msg).await
     }
 }
 
@@ -78,17 +88,24 @@ impl AsyncWrite for ObjectWriter<'_> {
 
 #[cfg(test)]
 mod tests {
-    use object_store::memory::InMemory;
+
     use object_store::path::Path;
-    use object_store::ObjectStore;
     use tokio::io::AsyncWriteExt;
+
+    use crate::format::Metadata;
+    use crate::io::object_reader::ObjectReader;
+    use crate::io::ObjectStore;
 
     use super::*;
 
     #[tokio::test]
     async fn test_write() {
-        let store = InMemory::new();
-        let (_, mut writer) = store.put_multipart(&Path::from("/foo")).await.unwrap();
+        let store = ObjectStore::new(":memory:").unwrap();
+        let (_, mut writer) = store
+            .inner
+            .put_multipart(&Path::from("/foo"))
+            .await
+            .unwrap();
 
         let mut object_writer = ObjectWriter::new(writer.as_mut());
         assert_eq!(object_writer.tell(), 0);
@@ -106,6 +123,31 @@ mod tests {
 
         object_writer.shutdown().await.unwrap();
 
-        assert_eq!(store.head(&Path::from("/foo")).await.unwrap().size, 256 * 3);
+        assert_eq!(
+            store.inner.head(&Path::from("/foo")).await.unwrap().size,
+            256 * 3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_proto_structs() {
+        let store = ObjectStore::new(":memory:").unwrap();
+        let path = Path::from("/foo");
+        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
+
+        let mut object_writer = ObjectWriter::new(writer.as_mut());
+        assert_eq!(object_writer.tell(), 0);
+
+        let mut metadata = Metadata::default();
+        metadata.manifest_position = Some(100);
+        metadata.batch_offsets.extend([1, 2, 3, 4]);
+
+        let pos = object_writer.write_struct(&metadata).await.unwrap();
+        assert_eq!(pos, 0);
+        object_writer.shutdown().await.unwrap();
+
+        let mut object_reader = ObjectReader::new(&store, path, 1024).unwrap();
+        let actual: Metadata = object_reader.read_struct(pos).await.unwrap();
+        assert_eq!(metadata, actual);
     }
 }

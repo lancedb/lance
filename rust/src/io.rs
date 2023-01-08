@@ -30,6 +30,8 @@ pub mod object_store;
 pub mod object_writer;
 pub mod reader;
 
+use crate::format::ProtoStruct;
+
 pub use self::object_store::ObjectStore;
 
 const MAGIC: &[u8; 4] = b"LANC";
@@ -62,7 +64,16 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
 }
 
+/// Read protobuf from a buffer.
 pub fn read_message<M: Message + Default>(buf: &Bytes) -> Result<M> {
-    let msg_len = LittleEndian::read_u32(&buf) as usize;
+    let msg_len = LittleEndian::read_u32(buf) as usize;
     Ok(M::decode(&buf[4..4 + msg_len])?)
+}
+
+/// Read a Protobuf-backed struct from a buffer.
+pub fn read_struct<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+    buf: &Bytes,
+) -> Result<T> {
+    let msg: M = read_message(buf)?;
+    Ok(T::from(msg))
 }

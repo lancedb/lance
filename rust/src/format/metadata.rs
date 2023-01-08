@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::format::pb;
+use crate::format::{pb, ProtoStruct};
 
 /// Data File Metadata
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Metadata {
     /// Offset of each record batch.
     pub batch_offsets: Vec<i32>,
@@ -28,6 +28,10 @@ pub struct Metadata {
 
     /// The file position of the manifest block in the file.
     pub manifest_position: Option<usize>,
+}
+
+impl ProtoStruct for Metadata {
+    type Proto = pb::Metadata;
 }
 
 impl From<&Metadata> for pb::Metadata {
@@ -40,8 +44,8 @@ impl From<&Metadata> for pb::Metadata {
     }
 }
 
-impl From<&pb::Metadata> for Metadata {
-    fn from(m: &pb::Metadata) -> Self {
+impl From<pb::Metadata> for Metadata {
+    fn from(m: pb::Metadata) -> Self {
         Self {
             batch_offsets: m.batch_offsets.clone(),
             page_table_position: m.page_table_position as usize,

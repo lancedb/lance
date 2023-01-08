@@ -18,7 +18,6 @@
 use std::collections::BTreeSet;
 
 use crate::format::pb;
-use crate::format::pb::DataFragment;
 
 /// Lance Data File
 ///
@@ -73,7 +72,7 @@ impl Fragment {
 }
 
 impl From<&pb::DataFragment> for Fragment {
-    fn from(p: &DataFragment) -> Self {
+    fn from(p: &pb::DataFragment) -> Self {
         Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),

@@ -76,7 +76,7 @@ impl ObjectStore {
             "s3" => {
                 scheme = "s3".to_string();
                 match AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket_name.clone())
+                    .with_bucket_name(bucket_name)
                     .build()
                 {
                     Ok(s3) => Arc::new(s3),
@@ -113,7 +113,7 @@ impl ObjectStore {
     pub async fn open(&self, path: &Path) -> Result<ObjectReader> {
         match ObjectReader::new(self, path.clone(), self.prefetch_size) {
             Ok(r) => Ok(r),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 }

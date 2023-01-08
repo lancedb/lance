@@ -17,7 +17,7 @@
 
 use super::Fragment;
 use crate::datatypes::Schema;
-use crate::format::pb;
+use crate::format::{pb, ProtoStruct};
 
 /// Manifest of a dataset
 ///
@@ -36,8 +36,12 @@ pub struct Manifest {
     pub fragments: Vec<Fragment>,
 }
 
-impl From<&pb::Manifest> for Manifest {
-    fn from(p: &pb::Manifest) -> Self {
+impl ProtoStruct for Manifest {
+    type Proto = pb::Manifest;
+}
+
+impl From<pb::Manifest> for Manifest {
+    fn from(p: pb::Manifest) -> Self {
         Self {
             schema: Schema::from(&p.fields),
             version: p.version,
