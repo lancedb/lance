@@ -97,11 +97,11 @@ impl<'a> FileReader<'a> {
             .object_store
             .inner
             .get_range(
-                &path,
+                path,
                 max(0, file_size - object_store.prefetch_size())..file_size,
             )
             .await?;
-        let metadata_pos = read_metadata_offset(&tail_bytes)? as usize;
+        let metadata_pos = read_metadata_offset(&tail_bytes)?;
         let metadata_pb = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
             object_reader
@@ -160,7 +160,7 @@ impl<'a> FileReader<'a> {
         // TODO spawn more threads
         let mut arrs = vec![];
         for field in schema.fields.iter() {
-            let arr = self.read_array(&field, batch_id).await?;
+            let arr = self.read_array(field, batch_id).await?;
             arrs.push(arr);
         }
         Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
@@ -168,12 +168,12 @@ impl<'a> FileReader<'a> {
 
     fn page_info(&self, field: &Field, batch_id: i32) -> Result<&PageInfo> {
         let column = field.id;
-        self.page_table
-            .get(column, batch_id)
-            .ok_or(Error::IO(format!(
+        self.page_table.get(column, batch_id).ok_or_else(|| {
+            Error::IO(format!(
                 "No page info found for field: {}, batch={}",
                 field.name, batch_id
-            )))
+            ))
+        })
     }
 
     /// Read primitive array for batch `batch_idx`.
@@ -217,7 +217,7 @@ impl<'a> FileReader<'a> {
         // TODO: use tokio to make the reads in parallel.
         let mut sub_arrays = vec![];
         for child in field.children.as_slice() {
-            let arr = self.read_array(&child, batch_id).await?;
+            let arr = self.read_array(child, batch_id).await?;
             sub_arrays.push((child.into(), arr));
         }
 

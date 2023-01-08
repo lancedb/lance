@@ -17,8 +17,6 @@
 
 use std::collections::BTreeSet;
 
-use object_store::path::Path;
-
 use crate::format::pb;
 use crate::format::pb::DataFragment;
 

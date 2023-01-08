@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use tokio::runtime::Builder;
 
 use super::Dataset;
 use crate::datatypes::Schema;
