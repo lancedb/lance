@@ -25,7 +25,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{ make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray };
+use arrow_array::{
+    make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray,
+};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
