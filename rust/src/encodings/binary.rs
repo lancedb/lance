@@ -4,13 +4,13 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow_array::types::{ByteArrayType, Int64Type};
-use arrow_array::PrimitiveArray;
+use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::{
-    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int32Array, Int64Array,
+    types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
+use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -134,26 +134,28 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let int64_positions = positions.as_any().downcast_ref::<Int64Array>().unwrap();
 
         let start_position = int64_positions.value(0);
-        let offset_arr = Int32Array::from(
-            int64_positions
-                .iter()
-                .map(|v| v.map(|o| (o - start_position) as i32))
-                .collect::<Vec<_>>(),
-        );
+
+        let offset_data = if T::Offset::IS_LARGE {
+            subtract_scalar(int64_positions, start_position)?.into_data()
+        } else {
+            cast(
+                &subtract_scalar_dyn::<Int64Type>(&positions, start_position)?,
+                &DataType::Int32,
+            )?
+            .into_data()
+        };
 
         // Count nulls
         let mut null_buf = MutableBuffer::new_null(self.length);
         let mut null_count = 0;
         for idx in 0..self.length {
-            if offset_arr.value(idx) == offset_arr.value(idx + 1) {
+            if int64_positions.value(idx) == int64_positions.value(idx + 1) {
                 bit_util::unset_bit(null_buf.as_mut(), idx);
                 null_count += 1;
             } else {
                 bit_util::set_bit(null_buf.as_mut(), idx);
             }
         }
-
-        let offset_data = offset_arr.into_data();
 
         let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
         let bytes = self
@@ -177,12 +179,15 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 mod tests {
     use super::*;
 
-    use arrow_array::{cast::as_string_array, StringArray};
+    use arrow_array::{
+        types::GenericStringType, GenericStringArray, LargeStringArray, OffsetSizeTrait,
+        StringArray,
+    };
     use object_store::path::Path;
 
     use crate::io::ObjectStore;
 
-    async fn test_round_trips(arr: &StringArray) {
+    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
         let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
@@ -197,14 +202,29 @@ mod tests {
         writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, arr.len());
+        let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
         let actual_arr = decoder.decode().await.unwrap();
-        assert_eq!(as_string_array(actual_arr.as_ref()), arr);
+        assert_eq!(
+            actual_arr
+                .as_any()
+                .downcast_ref::<GenericStringArray<O>>()
+                .unwrap(),
+            arr
+        );
     }
 
     #[tokio::test]
     async fn test_write_binary_data() {
         test_round_trips(&StringArray::from(vec!["a", "b", "cd", "efg"])).await;
         test_round_trips(&StringArray::from(vec![Some("a"), None, Some("cd"), None])).await;
+
+        test_round_trips(&LargeStringArray::from(vec!["a", "b", "cd", "efg"])).await;
+        test_round_trips(&LargeStringArray::from(vec![
+            Some("a"),
+            None,
+            Some("cd"),
+            None,
+        ]))
+        .await;
     }
 }

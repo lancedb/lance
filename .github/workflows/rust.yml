@@ -20,6 +20,8 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler
+      - name: Run cargo fmt
+        run: cargo fmt --check
       - name: Run clippy
         #run: cargo clippy -- --deny "warnings"
         run: cargo clippy

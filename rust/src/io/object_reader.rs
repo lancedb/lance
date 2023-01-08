@@ -20,10 +20,7 @@ use std::cmp::min;
 use std::ops::Range;
 
 use arrow_array::{
-    types::{
-        BinaryType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-        Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
-    },
+    types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
 };
 use arrow_schema::DataType;
@@ -114,6 +111,10 @@ impl<'a> ObjectReader<'a> {
         let decoder: Box<dyn Decoder + Send> = match data_type {
             Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(&self, position, length)),
             Binary => Box::new(BinaryDecoder::<BinaryType>::new(&self, position, length)),
+            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(&self, position, length)),
+            LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
+                &self, position, length,
+            )),
             _ => {
                 return Err(Error::IO(
                     format!("Unsupported binary type: {}", data_type,),
