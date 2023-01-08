@@ -19,7 +19,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 
 use crate::datatypes::{is_fixed_stride, Field, Schema};
 use crate::encodings::{plain::PlainEncoder, Encoding};
-use crate::format::{PageInfo, PageTable};
+use crate::format::{PageInfo, PageTable, Metadata};
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
 
@@ -81,6 +81,8 @@ impl<'a> FileWriter<'a> {
         // Step 3. Write manifest.
 
         // Step 4. Write metadata.
+        let metadata = Metadata::default();
+        self.object_writer.write_struct(metadata).await?;
 
         // Step 5. Write magics.
         Ok(())

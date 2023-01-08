@@ -57,6 +57,10 @@ impl ObjectWriter {
         self.cursor
     }
 
+    pub async fn write_struct<T: Into<M>, M: Message + Sized>(&mut self, obj: T) -> Result<u64> {
+        self.write_protobuf(&obj.into()).await
+    }
+
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
     pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
         let offset = self.tell();
