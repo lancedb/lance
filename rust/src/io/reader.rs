@@ -38,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::ObjectReader;
-use crate::io::{read_message, read_metadata_offset};
+use crate::io::{read_metadata_offset, read_struct};
 use crate::{
     datatypes::{Field, Schema},
     format::PageInfo,
@@ -108,8 +108,7 @@ impl<'a> FileReader<'a> {
             object_reader.read_struct(metadata_pos).await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
-            let proto = read_message::<pb::Metadata>(&tail_bytes.slice(offset..))?;
-            Metadata::from(proto)
+            read_struct(&tail_bytes.slice(offset..))?
         };
 
         let (projection, num_columns) = if let Some(m) = manifest {
