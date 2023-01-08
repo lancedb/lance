@@ -16,8 +16,9 @@
 // under the License.
 
 use arrow_array::cast::as_struct_array;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::DataType;
+use async_recursion::async_recursion;
 
 use crate::arrow::*;
 use crate::datatypes::{is_fixed_stride, Field, Schema};
@@ -26,7 +27,7 @@ use crate::encodings::Encoder;
 use crate::encodings::{plain::PlainEncoder, Encoding};
 use crate::format::{Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
-use crate::Result;
+use crate::{Error, Result};
 
 /// FileWriter writes Arrow Table to a file.
 pub struct FileWriter<'a> {
@@ -72,12 +73,14 @@ impl<'a> FileWriter<'a> {
         Ok(self.object_writer.shutdown().await?)
     }
 
+    #[async_recursion]
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let data_type = array.data_type();
         if is_fixed_stride(array.data_type()) {
             self.write_fixed_stride_array(field, array).await?;
         } else if matches!(array.data_type(), DataType::Struct(_)) {
             let struct_arr = as_struct_array(array);
+            self.write_struct_array(field, struct_arr).await?;
         } else if data_type.is_binary_like() {
             self.write_binary_array(field, array).await?;
         };
@@ -102,6 +105,24 @@ impl<'a> FileWriter<'a> {
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
+        Ok(())
+    }
+
+    #[async_recursion]
+    async fn write_struct_array(&mut self, field: &Field, array: &StructArray) -> Result<()> {
+        assert_eq!(array.num_columns(), field.children.len());
+        for child in &field.children {
+            if let Some(arr) = array.column_by_name(&child.name) {
+                self.write_array(child, arr).await?;
+            } else {
+                return Err(Error::Schema(format!(
+                    "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                    child.name,
+                    array.data_type()
+                )));
+            }
+        }
+
         Ok(())
     }
 
