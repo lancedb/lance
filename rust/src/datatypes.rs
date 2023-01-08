@@ -808,13 +808,11 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
-                    ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                DataType::Struct(vec![ArrowField::new("f3", DataType::Float32, false)]),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
-        assert_eq!( Schema::try_from(&expected_arrow_schema).unwrap(), projected)
+        assert_eq!(Schema::try_from(&expected_arrow_schema).unwrap(), projected)
     }
 }
