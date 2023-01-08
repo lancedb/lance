@@ -19,7 +19,7 @@
 //!
 //! To improve Arrow-RS egonomitic
 
-use arrow_array::{Array, Int32Array, ListArray, FixedSizeListArray};
+use arrow_array::{Array, FixedSizeListArray, Int32Array, ListArray};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 
@@ -85,11 +85,10 @@ pub trait FixedSizeListArrayExt {
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
     fn new<T: Array>(values: T, list_size: i32) -> Result<Self> {
-        let list_type = DataType::FixedSizeList(Box::new(Field::new(
-            "item",
-            values.data_type().clone(),
-            true,
-        )), list_size);
+        let list_type = DataType::FixedSizeList(
+            Box::new(Field::new("item", values.data_type().clone(), true)),
+            list_size,
+        );
         let data = ArrayDataBuilder::new(list_type)
             .len(values.len() / list_size as usize)
             .add_child_data(values.data().clone())

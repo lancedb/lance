@@ -25,7 +25,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
+use arrow_array::{ make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -58,7 +58,7 @@ impl<'a> PlainEncoder<'a> {
 
         let data = match array.data_type() {
             DataType::FixedSizeList(_, _) => array.data().child_data()[0].buffers()[0].as_ref(),
-            _ => array.data().buffers()[0].as_ref()
+            _ => array.data().buffers()[0].as_ref(),
         };
         self.writer.write_all(data).await?;
 
@@ -119,16 +119,18 @@ fn get_byte_width(data_type: &DataType) -> Result<usize> {
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        if let DataType::FixedSizeList(items, list_size) = self.data_type
-        {
+        if let DataType::FixedSizeList(items, list_size) = self.data_type {
             if !items.data_type().is_primitive() {
-                return Err(Error::Schema("Items for fixed size list should be primitives".to_string()));
+                return Err(Error::Schema(
+                    "Items for fixed size list should be primitives".to_string(),
+                ));
             };
             let item_decoder = PlainDecoder::new(
                 self.reader,
                 items.data_type(),
                 self.position,
-                self.length * (*list_size) as usize)?;
+                self.length * (*list_size) as usize,
+            )?;
             let item_array = item_decoder.decode().await?;
             let array_data = ArrayDataBuilder::new(self.data_type.clone())
                 .len(self.length)
@@ -158,21 +160,20 @@ impl<'a> Decoder for PlainDecoder<'a> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::io::ObjectStore;
     use arrow_array::cast::as_boolean_array;
     use arrow_array::*;
+    use arrow_schema::Field;
     use half::f16;
     use object_store::path::Path;
     use std::sync::Arc;
-    use arrow_schema::Field;
     use tokio::io::AsyncWriteExt;
 
-    use crate::io::object_writer::ObjectWriter;
-    use crate::arrow::*;
     use super::*;
+    use crate::arrow::*;
+    use crate::io::object_writer::ObjectWriter;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
@@ -267,7 +268,8 @@ mod tests {
     async fn test_encode_decode_fixed_size_list_array() {
         let items = Int8Array::from(Vec::from_iter(1..127));
         let arr = FixedSizeListArray::new(items, 3).unwrap();
-        let list_type = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int8, true)), 3);
+        let list_type =
+            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int8, true)), 3);
         test_primitive(Arc::new(arr) as ArrayRef, list_type).await;
     }
 }
