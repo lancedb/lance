@@ -17,7 +17,7 @@
 
 //! Plain encoding
 //!
-//! Plain encoding works with primitive types, i.e., `boolean`, `i8...i64`,
+//! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::any::Any;
@@ -25,14 +25,17 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, FixedSizeBinaryArray, UInt8Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 
 use crate::Error;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
+use crate::arrow::FixedSizeListArrayExt;
+use crate::arrow::FixedSizeBinaryArrayExt;
+use crate::datatypes::is_fixed_stride;
 
 use super::Decoder;
 use crate::error::Result;
@@ -66,6 +69,7 @@ impl<'a> PlainEncoder<'a> {
     }
 }
 
+
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
     reader: &'a ObjectReader<'a>,
@@ -94,9 +98,58 @@ impl<'a> PlainDecoder<'a> {
     pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
         todo!()
     }
+
+    async fn decode_primitive(&self) -> Result<ArrayRef> {
+        let array_bytes = match self.data_type {
+            DataType::Boolean => bit_util::ceil(self.length, 8),
+            _ => get_primitive_byte_width(self.data_type)? * self.length,
+        };
+        let range = Range {
+            start: self.position,
+            end: self.position + array_bytes,
+        };
+
+        let data = self.reader.get_range(range).await?;
+        let buf: Buffer = data.into();
+        let array_data = ArrayDataBuilder::new(self.data_type.clone())
+            .len(self.length)
+            .null_count(0)
+            .add_buffer(buf)
+            .build()?;
+        Ok(make_array(array_data))
+    }
+
+    async fn decode_fixed_size_list(&self, items: &Box<Field>, list_size: &i32) -> Result<ArrayRef> {
+        if !is_fixed_stride(items.data_type()) {
+            return Err(Error::Schema(
+                format!("Items for fixed size list should be primitives but found {}", items.data_type())
+            ));
+        };
+        let item_decoder = PlainDecoder::new(
+            self.reader,
+            items.data_type(),
+            self.position,
+            self.length * (*list_size) as usize,
+        )?;
+        let item_array = item_decoder.decode().await?;
+        Ok(Arc::new(FixedSizeListArray::new(item_array, *list_size)?) as ArrayRef)
+    }
+
+    async fn decode_fixed_size_binary(&self, stride: &i32) -> Result<ArrayRef> {
+        let bytes_decoder = PlainDecoder::new(
+            self.reader,
+            &DataType::UInt8,
+            self.position,
+            self.length * (*stride) as usize,
+        )?;
+        let bytes_array = bytes_decoder.decode().await?;
+        let values = bytes_array.as_any().downcast_ref::<UInt8Array>()
+            .ok_or_else(|| Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string()))?;
+        Ok(Arc::new(FixedSizeBinaryArray::new(values, *stride)?) as ArrayRef)
+    }
 }
 
-fn get_byte_width(data_type: &DataType) -> Result<usize> {
+fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
     match data_type {
         DataType::Int8 => Ok(Int8Type::get_byte_width()),
         DataType::Int16 => Ok(Int16Type::get_byte_width()),
@@ -119,44 +172,10 @@ fn get_byte_width(data_type: &DataType) -> Result<usize> {
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        if let DataType::FixedSizeList(items, list_size) = self.data_type {
-            let data_type = items.data_type().clone();
-            if !data_type.is_primitive() && data_type != DataType::Boolean {
-                return Err(Error::Schema(
-                    "Items for fixed size list should be primitives".to_string(),
-                ));
-            };
-            let item_decoder = PlainDecoder::new(
-                self.reader,
-                items.data_type(),
-                self.position,
-                self.length * (*list_size) as usize,
-            )?;
-            let item_array = item_decoder.decode().await?;
-            let array_data = ArrayDataBuilder::new(self.data_type.clone())
-                .len(self.length)
-                .null_count(0)
-                .add_child_data(item_array.data().clone())
-                .build()?;
-            Ok(Arc::new(FixedSizeListArray::from(array_data)) as ArrayRef)
-        } else {
-            let array_bytes = match self.data_type {
-                DataType::Boolean => bit_util::ceil(self.length, 8),
-                _ => get_byte_width(self.data_type)? * self.length,
-            };
-            let range = Range {
-                start: self.position,
-                end: self.position + array_bytes,
-            };
-
-            let data = self.reader.get_range(range).await?;
-            let buf: Buffer = data.into();
-            let array_data = ArrayDataBuilder::new(self.data_type.clone())
-                .len(self.length)
-                .null_count(0)
-                .add_buffer(buf)
-                .build()?;
-            Ok(make_array(array_data))
+        match self.data_type {
+            DataType::FixedSizeList(items, list_size) => self.decode_fixed_size_list(items, list_size).await,
+            DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
+            _ => self.decode_primitive().await
         }
     }
 }
@@ -164,7 +183,6 @@ impl<'a> Decoder for PlainDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use crate::io::ObjectStore;
-    use arrow_array::cast::as_boolean_array;
     use arrow_array::*;
     use arrow_schema::Field;
     use object_store::path::Path;
@@ -269,6 +287,14 @@ mod tests {
         let list_type =
             DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
         test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_fixed_size_binary_array() {
+        let t = DataType::FixedSizeBinary(3);
+        let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
+        let arr = FixedSizeBinaryArray::new(&values, 3).unwrap();
+        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
