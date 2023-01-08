@@ -224,7 +224,6 @@ impl<'a> Decoder for PlainDecoder<'a> {
 mod tests {
     use crate::io::ObjectStore;
     use arrow_array::*;
-    use arrow_schema::DataType::FixedSizeList;
     use arrow_schema::Field;
     use object_store::path::Path;
     use rand::prelude::*;

@@ -19,12 +19,10 @@
 //!
 //! To improve Arrow-RS egonomitic
 
-use arrow_array::types::UInt8Type;
 use arrow_array::{
     Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
 };
-use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::DataType::FixedSizeBinary;
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 
 use crate::error::Result;
