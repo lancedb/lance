@@ -32,6 +32,7 @@ use arrow_array::{
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
+use async_recursion::async_recursion;
 
 use crate::arrow::FixedSizeBinaryArrayExt;
 use crate::arrow::FixedSizeListArrayExt;
@@ -60,17 +61,32 @@ impl<'a> PlainEncoder<'a> {
     /// Encode an array of a batch.
     /// Returns the offset of the metadata
     pub async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+        self.encode_internal(array, self.data_type).await
+    }
+
+    #[async_recursion]
+    async fn encode_internal(&mut self, array: &dyn Array, data_type: &DataType) -> Result<usize> {
+        if let DataType::FixedSizeList(items, _) = data_type {
+            self.encode_fixed_size_list(array, items).await
+        } else {
+            self.encode_primitive(array).await
+        }
+    }
+
+    async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell() as usize;
-
-        let data = match array.data_type() {
-            DataType::FixedSizeList(_, _) => array.data().child_data()[0].buffers()[0].as_ref(),
-            _ => array.data().buffers()[0].as_ref(),
-        };
+        let data = array.data().buffers()[0].as_ref();
         self.writer.write_all(data).await?;
-
         Ok(offset)
     }
+
+    async fn encode_fixed_size_list(&mut self, array: &dyn Array, items: &Box<Field>) -> Result<usize> {
+        let list_array = array.as_any().downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| Error::Schema(format!("Needed a FixedSizeListArray but got {}", array.data_type())))?;
+        self.encode_internal(list_array.values().as_ref(), items.data_type()).await
+    }
 }
+
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
@@ -195,12 +211,14 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Borrow;
     use crate::io::ObjectStore;
     use arrow_array::*;
     use arrow_schema::Field;
     use object_store::path::Path;
     use rand::prelude::*;
     use std::sync::Arc;
+    use arrow_schema::DataType::FixedSizeList;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -308,6 +326,30 @@ mod tests {
         let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
         let arr = FixedSizeBinaryArray::new(&values, 3).unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_nested_fixed_size_list() {
+        // FixedSizeList of FixedSizeList
+        let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
+        let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
+        let values = Int64Array::from_iter_values(1..=120 as i64);
+        let arr = FixedSizeListArray::new(
+            FixedSizeListArray::new(values, 2).unwrap(),
+            2
+        ).unwrap();
+        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+
+        // FixedSizeList of FixedSizeBinary
+        let inner = DataType::FixedSizeBinary(2);
+        let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
+        let values = UInt8Array::from_iter_values(1..=120 as u8);
+        let arr = FixedSizeListArray::new(
+            FixedSizeBinaryArray::new(&values, 2).unwrap().borrow(),
+            2
+        ).unwrap();
+        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
