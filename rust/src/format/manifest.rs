@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use super::Fragment;
 use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
+use std::collections::HashMap;
 
 /// Manifest of a dataset
 ///

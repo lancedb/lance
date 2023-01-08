@@ -19,13 +19,14 @@ use arrow_array::cast::as_struct_array;
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
+use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
 use crate::datatypes::{is_fixed_stride, Field, Schema};
 use crate::encodings::binary::BinaryEncoder;
 use crate::encodings::Encoder;
 use crate::encodings::{plain::PlainEncoder, Encoding};
-use crate::format::{Metadata, PageInfo, PageTable, Manifest};
+use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
@@ -70,7 +71,7 @@ impl<'a> FileWriter<'a> {
 
     pub async fn finish(&mut self) -> Result<()> {
         self.write_footer().await?;
-        Ok(self.object_writer.shutdown().await?)
+        self.object_writer.shutdown().await
     }
 
     #[async_recursion]
@@ -140,6 +141,14 @@ impl<'a> FileWriter<'a> {
         let pos = self.object_writer.write_struct(&self.metadata).await?;
 
         // Step 5. Write magics.
+        self.write_magics(pos).await
+    }
+
+    async fn write_magics(&mut self, pos: usize) -> Result<()> {
+        self.object_writer.write_i64_le(pos as i64).await?;
+        self.object_writer.write_i16_le(MAJOR_VERSION).await?;
+        self.object_writer.write_i16_le(MINOR_VERSION).await?;
+        self.object_writer.write_all(MAGIC).await?;
         Ok(())
     }
 }
