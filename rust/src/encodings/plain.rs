@@ -49,12 +49,12 @@ use crate::io::object_writer::ObjectWriter;
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
-    writer: &'a mut ObjectWriter<'a>,
+    writer: &'a mut ObjectWriter,
     data_type: &'a DataType,
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut ObjectWriter<'a>, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut ObjectWriter, data_type: &'a DataType) -> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 

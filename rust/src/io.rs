@@ -34,8 +34,8 @@ mod writer;
 use crate::format::ProtoStruct;
 
 pub use self::object_store::ObjectStore;
-pub use writer::FileWriter;
 pub use reader::FileReader;
+pub use writer::FileWriter;
 
 const MAGIC: &[u8; 4] = b"LANC";
 const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";

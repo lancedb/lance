@@ -15,6 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_array::{ArrayRef, RecordBatch};
+use object_store::MultipartId;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+use crate::datatypes::{Field, Schema};
+use crate::io::object_writer::ObjectWriter;
+use crate::Result;
 
 /// FileWriter writes Arrow Table to a file.
-pub struct FileWriter {}
+pub struct FileWriter<'a> {
+    object_writer: ObjectWriter,
+    multipart_id: MultipartId,
+    schema: &'a Schema,
+}
+
+impl<'a> FileWriter<'a> {
+    /// Write a record batch.
+    pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        Ok(())
+    }
+
+    pub async fn abort(&self) -> Result<()> {
+        // self.object_writer.
+        Ok(())
+    }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        Ok(self.object_writer.shutdown().await?)
+    }
+
+    async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        Ok(())
+    }
+}

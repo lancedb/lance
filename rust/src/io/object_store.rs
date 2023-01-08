@@ -16,6 +16,7 @@
 // under the License.
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
+
 use std::sync::Arc;
 
 use ::object_store::{
@@ -24,11 +25,12 @@ use ::object_store::{
 use object_store::local::LocalFileSystem;
 use url::{ParseError, Url};
 
-use super::object_reader::ObjectReader;
 use crate::error::{Error, Result};
+use crate::io::object_reader::ObjectReader;
+use crate::io::object_writer::ObjectWriter;
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
@@ -116,4 +118,10 @@ impl ObjectStore {
             Err(e) => Err(e),
         }
     }
+
+    /// Create a new file.
+    pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
+        ObjectWriter::new(self, path).await
+    }
+
 }

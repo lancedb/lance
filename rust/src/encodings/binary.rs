@@ -25,11 +25,11 @@ use crate::io::object_writer::ObjectWriter;
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
-    writer: &'a mut ObjectWriter<'a>,
+    writer: &'a mut ObjectWriter,
 }
 
 impl<'a> BinaryEncoder<'a> {
-    pub fn new(writer: &'a mut ObjectWriter<'a>) -> Self {
+    pub fn new(writer: &'a mut ObjectWriter) -> Self {
         Self { writer }
     }
 
