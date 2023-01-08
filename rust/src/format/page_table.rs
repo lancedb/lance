@@ -24,20 +24,27 @@ use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageInfo {
     pub position: usize,
     pub length: usize,
 }
 
+impl PageInfo {
+    pub fn new(position: usize, length: usize) -> Self {
+        Self { position, length }
+    }
+}
+
+/// Page lookup table.
 #[derive(Debug, Default)]
 pub struct PageTable {
     pages: HashMap<i32, HashMap<i32, PageInfo>>,
 }
 
 impl PageTable {
-    /// Create page table from disk.
-    pub async fn new<'a>(
+    /// Load [PageTable] from disk.
+    pub async fn load<'a>(
         reader: &'a ObjectReader<'_>,
         position: usize,
         num_columns: i32,
@@ -68,7 +75,15 @@ impl PageTable {
         Ok(Self { pages })
     }
 
-    pub fn set_page_info(&mut self) {}
+    /// Set page lookup info for a page identified by `(column, batch)` pair.
+    pub fn set(&mut self, column: i32, batch: i32, page_info: PageInfo) {
+        if !self.pages.contains_key(&column) {
+            self.pages.insert(column, HashMap::new());
+        }
+        self.pages
+            .get_mut(&column)
+            .map(|c_map| c_map.insert(batch, page_info));
+    }
 
     pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
         self.pages
@@ -76,7 +91,20 @@ impl PageTable {
             .map(|c_map| c_map.get(&batch))
             .flatten()
     }
+
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_page_info() {
+        let mut page_table = PageTable::default();
+        let page_info = PageInfo::new(1, 2);
+        page_table.set(10, 20, page_info.clone());
+
+        let actual = page_table.get(10, 20).unwrap();
+        assert_eq!(actual, &page_info);
+    }
+}

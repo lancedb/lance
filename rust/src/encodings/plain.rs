@@ -222,14 +222,13 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::{object_writer, ObjectStore};
+    use crate::io::ObjectStore;
     use arrow_array::*;
     use arrow_schema::Field;
     use object_store::path::Path;
     use rand::prelude::*;
     use std::borrow::Borrow;
     use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
 
     use super::*;
     use crate::arrow::*;

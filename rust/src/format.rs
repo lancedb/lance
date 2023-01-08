@@ -1,3 +1,5 @@
+//! On-disk format
+
 mod fragment;
 mod manifest;
 mod metadata;

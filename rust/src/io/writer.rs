@@ -19,6 +19,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 
 use crate::datatypes::{Field, Schema, is_fixed_stride};
 use crate::encodings::plain::PlainEncoder;
+use crate::format::{PageTable, PageInfo};
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
 
@@ -27,6 +28,7 @@ pub struct FileWriter<'a> {
     object_writer: ObjectWriter,
     schema: &'a Schema,
     batch_id: i32,
+    page_table: PageTable,
 }
 
 impl<'a> FileWriter<'a> {
@@ -64,6 +66,8 @@ impl<'a> FileWriter<'a> {
     async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
         let pos = encoder.encode(array).await?;
+        let page_info = PageInfo::new(pos, array.len());
+        self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
 

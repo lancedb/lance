@@ -119,7 +119,7 @@ impl<'a> FileReader<'a> {
                 .await?;
             (m.schema.clone(), m.schema.max_field_id().unwrap())
         };
-        let page_table = PageTable::new(
+        let page_table = PageTable::load(
             &object_reader,
             metadata.page_table_position,
             num_columns,
