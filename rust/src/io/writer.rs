@@ -17,9 +17,9 @@
 
 use arrow_array::{ArrayRef, RecordBatch};
 
-use crate::datatypes::{Field, Schema, is_fixed_stride};
-use crate::encodings::plain::PlainEncoder;
-use crate::format::{PageTable, PageInfo};
+use crate::datatypes::{is_fixed_stride, Field, Schema};
+use crate::encodings::{plain::PlainEncoder, Encoding};
+use crate::format::{PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
 
@@ -50,7 +50,8 @@ impl<'a> FileWriter<'a> {
     //     Ok(())
     // }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
+    pub async fn finish(&mut self) -> Result<()> {
+        self.write_footer().await?;
         Ok(self.object_writer.shutdown().await?)
     }
 
@@ -64,10 +65,24 @@ impl<'a> FileWriter<'a> {
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
     async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        assert_eq!(field.encoding, Some(Encoding::Plain));
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
+        Ok(())
+    }
+
+    async fn write_footer(&self) -> Result<()> {
+        // Step 1. write dictionary values.
+
+        // Step 2. Write page table.
+
+        // Step 3. Write manifest.
+
+        // Step 4. Write metadata.
+
+        // Step 5. Write magics.
         Ok(())
     }
 

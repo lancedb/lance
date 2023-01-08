@@ -242,7 +242,7 @@ pub struct Field {
     parent_id: i32,
     logical_type: LogicalType,
     extension_name: String,
-    encoding: Option<Encoding>,
+    pub(crate) encoding: Option<Encoding>,
     nullable: bool,
 
     pub children: Vec<Field>,
