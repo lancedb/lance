@@ -653,8 +653,6 @@ impl From<&Schema> for Vec<pb::Field> {
 mod tests {
     use super::*;
 
-    use std::collections::BTreeSet;
-
     use arrow_schema::{Field as ArrowField, TimeUnit};
 
     #[test]
