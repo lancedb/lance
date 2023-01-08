@@ -80,13 +80,24 @@ impl<'a> PlainEncoder<'a> {
         Ok(offset)
     }
 
-    async fn encode_fixed_size_list(&mut self, array: &dyn Array, items: &Box<Field>) -> Result<usize> {
-        let list_array = array.as_any().downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| Error::Schema(format!("Needed a FixedSizeListArray but got {}", array.data_type())))?;
-        self.encode_internal(list_array.values().as_ref(), items.data_type()).await
+    async fn encode_fixed_size_list(
+        &mut self,
+        array: &dyn Array,
+        items: &Box<Field>,
+    ) -> Result<usize> {
+        let list_array = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .ok_or_else(|| {
+                Error::Schema(format!(
+                    "Needed a FixedSizeListArray but got {}",
+                    array.data_type()
+                ))
+            })?;
+        self.encode_internal(list_array.values().as_ref(), items.data_type())
+            .await
     }
 }
-
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
@@ -211,14 +222,14 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Borrow;
     use crate::io::ObjectStore;
     use arrow_array::*;
+    use arrow_schema::DataType::FixedSizeList;
     use arrow_schema::Field;
     use object_store::path::Path;
     use rand::prelude::*;
+    use std::borrow::Borrow;
     use std::sync::Arc;
-    use arrow_schema::DataType::FixedSizeList;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
@@ -334,22 +345,17 @@ mod tests {
         let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = Int64Array::from_iter_values(1..=120 as i64);
-        let arr = FixedSizeListArray::new(
-            FixedSizeListArray::new(values, 2).unwrap(),
-            2
-        ).unwrap();
+        let arr = FixedSizeListArray::new(FixedSizeListArray::new(values, 2).unwrap(), 2).unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
 
         // FixedSizeList of FixedSizeBinary
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr = FixedSizeListArray::new(
-            FixedSizeBinaryArray::new(&values, 2).unwrap().borrow(),
-            2
-        ).unwrap();
+        let arr =
+            FixedSizeListArray::new(FixedSizeBinaryArray::new(&values, 2).unwrap().borrow(), 2)
+                .unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
-
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
