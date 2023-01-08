@@ -319,6 +319,18 @@ impl Field {
         )
     }
 
+    /// Recursively set field ID and parent ID for this field and all its children.
+    fn set_id(&mut self, parent_id: i32, id_seed: &mut i32) {
+        self.parent_id = parent_id;
+        if self.id < 0 {
+            self.id = *id_seed;
+            *id_seed += 1;
+        }
+        self.children
+            .iter_mut()
+            .for_each(|f| f.set_id(self.id, id_seed));
+    }
+
     // Find any nested child with a specific field id
     fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
         for child in self.children.as_mut_slice() {
@@ -558,6 +570,14 @@ impl Schema {
         }
         Ok(())
     }
+
+    fn set_field_id(&mut self) {
+        let mut current_id = self.max_field_id().unwrap_or(-1);
+        self.fields
+            .iter_mut()
+            .for_each(|f| f.set_id(-1, &mut current_id));
+    }
+
 }
 
 impl fmt::Display for Schema {
@@ -574,14 +594,17 @@ impl TryFrom<&ArrowSchema> for Schema {
     type Error = Error;
 
     fn try_from(schema: &ArrowSchema) -> Result<Self> {
-        Ok(Self {
+        let mut schema = Self {
             fields: schema
                 .fields
                 .iter()
                 .map(Field::try_from)
                 .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
-        })
+        };
+        schema.set_field_id();
+
+        Ok(schema)
     }
 }
 
