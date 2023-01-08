@@ -91,7 +91,6 @@ impl PageTable {
             .map(|c_map| c_map.get(&batch))
             .flatten()
     }
-
 }
 
 #[cfg(test)]

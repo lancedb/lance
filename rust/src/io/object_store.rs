@@ -123,5 +123,4 @@ impl ObjectStore {
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
         ObjectWriter::new(self, path).await
     }
-
 }

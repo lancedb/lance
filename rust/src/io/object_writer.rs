@@ -80,7 +80,6 @@ impl ObjectWriter {
     pub async fn shutdown(&mut self) -> Result<()> {
         Ok(self.writer.shutdown().await?)
     }
-
 }
 
 impl AsyncWrite for ObjectWriter {

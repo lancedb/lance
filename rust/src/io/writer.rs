@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::cast::{as_string_array, as_struct_array};
+use arrow_array::cast::as_struct_array;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::DataType;
 
+use crate::arrow::*;
 use crate::datatypes::{is_fixed_stride, Field, Schema};
+use crate::encodings::binary::BinaryEncoder;
+use crate::encodings::Encoder;
 use crate::encodings::{plain::PlainEncoder, Encoding};
 use crate::format::{Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
-use crate::arrow::*;
 
 /// FileWriter writes Arrow Table to a file.
 pub struct FileWriter<'a> {
@@ -36,7 +38,6 @@ pub struct FileWriter<'a> {
 }
 
 impl<'a> FileWriter<'a> {
-
     pub fn new(object_writer: ObjectWriter, schema: &'a Schema) -> Self {
         Self {
             object_writer,
@@ -94,11 +95,17 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
+    /// Write var-length binary arrays.
     async fn write_binary_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        assert_eq!(field.encoding, Some(Encoding::VarBinary));
+        let mut encoder = BinaryEncoder::new(&mut self.object_writer);
+        let pos = encoder.encode(array).await?;
+        let page_info = PageInfo::new(pos, array.len());
+        self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
 
-    async fn write_footer(&self) -> Result<()> {
+    async fn write_footer(&mut self) -> Result<()> {
         // Step 1. write dictionary values.
 
         // Step 2. Write page table.
@@ -106,6 +113,7 @@ impl<'a> FileWriter<'a> {
         // Step 3. Write manifest.
 
         // Step 4. Write metadata.
+        self.object_writer.write_struct(&self.metadata).await?;
 
         // Step 5. Write magics.
         Ok(())
