@@ -25,7 +25,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, make_array};
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -120,7 +120,8 @@ fn get_byte_width(data_type: &DataType) -> Result<usize> {
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         if let DataType::FixedSizeList(items, list_size) = self.data_type {
-            if !items.data_type().is_primitive() {
+            let data_type = items.data_type().clone();
+            if !data_type.is_primitive() && data_type != DataType::Boolean {
                 return Err(Error::Schema(
                     "Items for fixed size list should be primitives".to_string(),
                 ));
@@ -166,8 +167,8 @@ mod tests {
     use arrow_array::cast::as_boolean_array;
     use arrow_array::*;
     use arrow_schema::Field;
-    use half::f16;
     use object_store::path::Path;
+    use rand::prelude::*;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
@@ -177,48 +178,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
-        let arr = Int8Array::from(Vec::from_iter(1..127));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int8).await;
-        let arr = Int16Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int16).await;
-        let arr = Int32Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int32).await;
-        let arr = Int64Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int64).await;
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let input: Vec<i64> = Vec::from_iter(1..127 as i64);
+        for t in int_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let arr = make_array_(&t, &buffer).await;
+            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        }
 
-        let arr = UInt8Array::from(Vec::from_iter(1..255));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt8).await;
-        let arr = UInt16Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt16).await;
-        let arr = UInt32Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt32).await;
-        let arr = UInt64Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt64).await;
-
-        let arr = Float16Array::from_iter(
-            Vec::from_iter(1..4096 as i16)
-                .iter()
-                .map(|&i| f16::from_f32(1.0 * i as f32))
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float16).await;
-        let arr = Float32Array::from(
-            Vec::from_iter(1..4096)
-                .iter()
-                .map(|&i| 1.0 * i as f32)
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float32).await;
-        let arr = Float64Array::from(
-            Vec::from_iter(1..4096)
-                .iter()
-                .map(|&i| 1.0 * i as f64)
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float64).await;
+        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+        let mut rng = rand::thread_rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        for t in float_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let arr = make_array_(&t, &buffer).await;
+            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        }
     }
 
-    async fn test_primitive(expected: ArrayRef, data_type: DataType) {
+    async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
         let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
@@ -241,41 +228,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_bool_array() {
-        let store = ObjectStore::new(":memory:").unwrap();
-        let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
-
         let arr = BooleanArray::from(vec![true, false].repeat(100));
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::new(&mut object_writer, &DataType::Boolean);
-
-            assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
-        }
-        writer.shutdown().await.unwrap();
-
-        let mut reader = store.open(&path).await.unwrap();
-        assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, &DataType::Boolean, 0, arr.len()).unwrap();
-        let read_arr = decoder.decode().await.unwrap();
-        let actual_arr = as_boolean_array(read_arr.as_ref());
-        println!("Actual {:?}", actual_arr);
-        println!("Expected {:?}", arr);
-        assert_eq!(&arr, actual_arr);
+        test_round_trip(Arc::new(arr) as ArrayRef, DataType::Boolean).await;
     }
 
     #[tokio::test]
     async fn test_encode_decode_fixed_size_list_array() {
-        let int_types = vec![DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64, DataType::UInt8, DataType::UInt16, DataType::UInt32, DataType::UInt64];
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let input = Vec::from_iter(1..127 as i64);
         for t in int_types {
-            let buffer = Buffer::from_slice_ref(Vec::from_iter(1..127).as_slice());
-            let items = make_array(ArrayDataBuilder::new(t.clone())
-                .len(buffer.len())
-                .add_buffer(buffer).build().unwrap());
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let items = make_array_(&t, &buffer).await;
             let arr = FixedSizeListArray::new(items, 3).unwrap();
-            let list_type =
-                DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
-            test_primitive(Arc::new(arr) as ArrayRef, list_type).await;
+            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
+            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
         }
+
+        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+        let mut rng = rand::thread_rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        for t in float_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let items = make_array_(&t, &buffer).await;
+            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
+            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+        }
+
+        let items = BooleanArray::from(vec![true, false, true].repeat(42));
+        let arr = FixedSizeListArray::new(items, 3).unwrap();
+        let list_type =
+            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
+        test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+    }
+
+    async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
+        make_array(
+            ArrayDataBuilder::new(data_type.clone())
+                .len(126)
+                .add_buffer(buffer.clone())
+                .build()
+                .unwrap(),
+        )
     }
 }

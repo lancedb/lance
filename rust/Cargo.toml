@@ -35,13 +35,13 @@ async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
 clap = { version = "4.0.32", features = ["derive"], optional = true }
-half = "2.2.0"
 object_store = { version = "0.5", features = ["aws"] }
 pin-project = "1.0"
 prost = "0.11"
 prost-types = "0.11"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
+rand = "0.8.3"
 
 [build-dependencies]
 prost-build = "0.11"
