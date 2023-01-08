@@ -9,7 +9,7 @@ use object_store::path::Path;
 use self::scanner::Scanner;
 use crate::datatypes::Schema;
 use crate::error::Result;
-use crate::format::{pb, Manifest};
+use crate::format::{pb, Fragment, Manifest};
 use crate::io::reader::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
 
@@ -72,7 +72,8 @@ impl Dataset {
         let manifest_pb = object_reader
             .read_message::<pb::Manifest>(offset as usize)
             .await?;
-        let manifest = (&manifest_pb).into();
+        let mut manifest: Manifest = (&manifest_pb).into();
+        manifest.schema.load_dictionary(&object_reader).await?;
         Ok(Self {
             object_store,
             base: Path::from(uri),
@@ -81,7 +82,7 @@ impl Dataset {
     }
 
     pub fn scan(&self) -> Result<Scanner> {
-        todo!()
+        Scanner::new(&self)
     }
 
     pub fn object_store(&self) -> &ObjectStore {
@@ -90,6 +91,10 @@ impl Dataset {
 
     fn versions_dir(&self) -> Path {
         self.base.child(VERSIONS_DIR)
+    }
+
+    fn data_dir(&self) -> Path {
+        self.base.child(DATA_DIR)
     }
 
     pub fn version(&self) -> Version {
@@ -118,5 +123,9 @@ impl Dataset {
 
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    pub fn fragments(&self) -> &[Fragment] {
+        &self.manifest.fragments
     }
 }

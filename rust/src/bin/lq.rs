@@ -17,6 +17,15 @@ enum Commands {
         /// AWS profile
         aws_profile: Option<String>,
     },
+
+    /// Query the dataset
+    Query {
+        uri: String,
+
+        /// The counts of record to print.
+        #[arg(short, default_value_t = 100)]
+        n: i64,
+    },
 }
 
 #[tokio::main]
@@ -33,6 +42,12 @@ async fn main() {
                 dataset.versions().await.unwrap().len()
             );
             println!("Schema:\n{}", dataset.schema())
+        }
+        Commands::Query { uri, n } => {
+            let dataset = Dataset::open(uri).await.unwrap();
+            let mut scanner = dataset.scan().unwrap();
+            scanner.limit(*n, None);
+            println!("{:?}", scanner.next_batch().await.unwrap().unwrap());
         }
     }
 }
