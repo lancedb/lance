@@ -93,12 +93,17 @@ impl<'a> FileReader<'a> {
             ObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
 
         let file_size = object_reader.size().await?;
+        let begin = if file_size < object_store.prefetch_size() {
+            0
+        } else {
+            file_size - object_store.prefetch_size()
+        };
         let tail_bytes = object_reader
             .object_store
             .inner
             .get_range(
                 path,
-                max(0, file_size - object_store.prefetch_size())..file_size,
+                begin..file_size,
             )
             .await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)?;
@@ -112,12 +117,12 @@ impl<'a> FileReader<'a> {
         };
 
         let (projection, num_columns) = if let Some(m) = manifest {
-            (m.schema.clone(), m.schema.max_field_id().unwrap())
+            (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         } else {
             let m: Manifest = object_reader
                 .read_struct(metadata.manifest_position.unwrap())
                 .await?;
-            (m.schema.clone(), m.schema.max_field_id().unwrap())
+            (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         };
         let page_table = PageTable::load(
             &object_reader,
@@ -167,8 +172,8 @@ impl<'a> FileReader<'a> {
         let column = field.id;
         self.page_table.get(column, batch_id).ok_or_else(|| {
             Error::IO(format!(
-                "No page info found for field: {}, batch={}",
-                field.name, batch_id
+                "No page info found for field: {}, field_id={} batch={}",
+                field.name, field.id, batch_id
             ))
         })
     }

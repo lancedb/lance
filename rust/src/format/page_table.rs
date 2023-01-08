@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::Int64Array;
+use arrow_array::{Int64Array, Array};
+use arrow_array::builder::Int64Builder;
 use arrow_schema::DataType;
-use std::collections::HashMap;
+use tokio::io::AsyncWriteExt;
+use std::collections::BTreeMap;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
+use crate::io::object_writer::ObjectWriter;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageInfo {
@@ -39,7 +42,7 @@ impl PageInfo {
 /// Page lookup table.
 #[derive(Debug, Default)]
 pub struct PageTable {
-    pages: HashMap<i32, HashMap<i32, PageInfo>>,
+    pages: BTreeMap<i32, BTreeMap<i32, PageInfo>>,
 }
 
 impl PageTable {
@@ -50,14 +53,15 @@ impl PageTable {
         num_columns: i32,
         num_batches: i32,
     ) -> Result<Self> {
+        println!("Loading page table: columns={} batches={}", num_columns, num_batches);
         let length = num_columns * num_batches * 2;
         let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length as usize)?;
         let raw_arr = decoder.decode().await?;
         let arr = raw_arr.as_any().downcast_ref::<Int64Array>().unwrap();
 
-        let mut pages = HashMap::default();
+        let mut pages = BTreeMap::default();
         for col in 0..num_columns {
-            pages.insert(col, HashMap::default());
+            pages.insert(col, BTreeMap::default());
             for batch in 0..num_batches {
                 let idx = col * num_batches + batch;
                 let batch_position = &arr.value((idx * 2) as usize);
@@ -75,10 +79,38 @@ impl PageTable {
         Ok(Self { pages })
     }
 
+    pub async fn write(&self, writer: &mut ObjectWriter) -> Result<usize> {
+        let pos = writer.tell();
+        assert!(!self.pages.is_empty());
+        let num_columns = self.pages.keys().max().unwrap() + 1;
+        let num_batches = self
+            .pages
+            .values()
+            .map(|c_map| c_map.keys().max())
+            .flatten()
+            .max().unwrap() + 1;
+
+        let mut builder = Int64Builder::with_capacity((num_columns * num_batches) as usize);
+        for col in 0..num_columns {
+            for batch in 0..num_batches {
+                if let Some(page_info) = self.get(col, batch) {
+                    builder.append_value(page_info.position as i64);
+                    builder.append_value(page_info.length as i64);
+                } else {
+                    builder.append_slice(&[0, 0]);
+                }
+            }
+        }
+        let arr = builder.finish();
+        writer.write_all(arr.into_data().buffers()[0].as_slice()).await?;
+
+        Ok(pos)
+    }
+
     /// Set page lookup info for a page identified by `(column, batch)` pair.
     pub fn set(&mut self, column: i32, batch: i32, page_info: PageInfo) {
         if !self.pages.contains_key(&column) {
-            self.pages.insert(column, HashMap::new());
+            self.pages.insert(column, BTreeMap::default());
         }
         self.pages
             .get_mut(&column)

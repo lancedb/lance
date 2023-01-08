@@ -1,6 +1,6 @@
 //! Lance data types, [Schema] and [Field]
 
-use std::cmp::min;
+use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
@@ -302,9 +302,9 @@ impl Field {
 
     // Get the max field id of itself and all children.
     fn max_id(&self) -> i32 {
-        min(
+        max(
             self.id,
-            self.children.iter().map(|c| c.id).min().unwrap_or(i32::MAX),
+            self.children.iter().map(|c| c.max_id()).max().unwrap_or(i32::MIN),
         )
     }
 

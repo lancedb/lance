@@ -123,7 +123,6 @@ impl<'a> FileWriter<'a> {
                 )));
             }
         }
-
         Ok(())
     }
 
@@ -131,6 +130,8 @@ impl<'a> FileWriter<'a> {
         // Step 1. write dictionary values.
 
         // Step 2. Write page table.
+        let pos = self.page_table.write(&mut self.object_writer).await?;
+        self.metadata.page_table_position = pos;
 
         // Step 3. Write manifest.
         let manifest = Manifest::new(self.schema);
@@ -213,7 +214,9 @@ mod tests {
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::new(&store, &path, None).await;
+        let reader = FileReader::new(&store, &path, None).await.unwrap();
+        let actual = reader.read_batch(0).await.unwrap();
+        assert_eq!(actual, batch);
 
     }
 }
