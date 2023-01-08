@@ -19,11 +19,13 @@
 //!
 //! To improve Arrow-RS egonomitic
 
-use arrow_array::{Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array};
 use arrow_array::types::UInt8Type;
+use arrow_array::{
+    Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::{DataType, Field};
 use arrow_schema::DataType::FixedSizeBinary;
+use arrow_schema::{DataType, Field};
 
 use crate::error::Result;
 pub trait ListArrayExt {
@@ -99,7 +101,6 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         Ok(Self::from(data))
     }
 }
-
 
 pub trait FixedSizeBinaryArrayExt {
     /// Create an [`FixedSizeBinaryArray`] from values and stride.

@@ -19,6 +19,7 @@ use std::cmp::min;
 
 use std::ops::Range;
 
+use crate::datatypes::is_fixed_stride;
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
@@ -28,7 +29,6 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
-use crate::datatypes::is_fixed_stride;
 
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
@@ -95,7 +95,10 @@ impl<'a> ObjectReader<'a> {
         length: usize,
     ) -> Result<ArrayRef> {
         if !is_fixed_stride(data_type) {
-            return Err(Error::Schema(format!("{} is not a fixed stride type", data_type)));
+            return Err(Error::Schema(format!(
+                "{} is not a fixed stride type",
+                data_type
+            )));
         }
         // TODO: support more than plain encoding here.
         let decoder = PlainDecoder::new(self, data_type, position, length)?;

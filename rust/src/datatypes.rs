@@ -14,7 +14,6 @@ use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
-
 /// Check whether the given Arrow DataType is fixed stride.
 /// A fixed stride type has the same byte width for all array elements
 /// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
@@ -36,7 +35,7 @@ pub fn is_fixed_stride(arrow_type: &DataType) -> bool {
         | DataType::Decimal256(_, _)
         | DataType::FixedSizeList(_, _)
         | DataType::FixedSizeBinary(_) => true,
-        _ => false
+        _ => false,
     }
 }
 

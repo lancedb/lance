@@ -25,17 +25,20 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, FixedSizeBinaryArray, UInt8Array};
+use arrow_array::{
+    make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray, FixedSizeListArray,
+    UInt8Array,
+};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 
+use crate::arrow::FixedSizeBinaryArrayExt;
+use crate::arrow::FixedSizeListArrayExt;
+use crate::datatypes::is_fixed_stride;
 use crate::Error;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
-use crate::arrow::FixedSizeListArrayExt;
-use crate::arrow::FixedSizeBinaryArrayExt;
-use crate::datatypes::is_fixed_stride;
 
 use super::Decoder;
 use crate::error::Result;
@@ -68,7 +71,6 @@ impl<'a> PlainEncoder<'a> {
         Ok(offset)
     }
 }
-
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
@@ -119,11 +121,16 @@ impl<'a> PlainDecoder<'a> {
         Ok(make_array(array_data))
     }
 
-    async fn decode_fixed_size_list(&self, items: &Box<Field>, list_size: &i32) -> Result<ArrayRef> {
+    async fn decode_fixed_size_list(
+        &self,
+        items: &Box<Field>,
+        list_size: &i32,
+    ) -> Result<ArrayRef> {
         if !is_fixed_stride(items.data_type()) {
-            return Err(Error::Schema(
-                format!("Items for fixed size list should be primitives but found {}", items.data_type())
-            ));
+            return Err(Error::Schema(format!(
+                "Items for fixed size list should be primitives but found {}",
+                items.data_type()
+            )));
         };
         let item_decoder = PlainDecoder::new(
             self.reader,
@@ -143,8 +150,12 @@ impl<'a> PlainDecoder<'a> {
             self.length * (*stride) as usize,
         )?;
         let bytes_array = bytes_decoder.decode().await?;
-        let values = bytes_array.as_any().downcast_ref::<UInt8Array>()
-            .ok_or_else(|| Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string()))?;
+        let values = bytes_array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .ok_or_else(|| {
+                Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
+            })?;
         Ok(Arc::new(FixedSizeBinaryArray::new(values, *stride)?) as ArrayRef)
     }
 }
@@ -173,9 +184,11 @@ fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         match self.data_type {
-            DataType::FixedSizeList(items, list_size) => self.decode_fixed_size_list(items, list_size).await,
+            DataType::FixedSizeList(items, list_size) => {
+                self.decode_fixed_size_list(items, list_size).await
+            }
             DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
-            _ => self.decode_primitive().await
+            _ => self.decode_primitive().await,
         }
     }
 }

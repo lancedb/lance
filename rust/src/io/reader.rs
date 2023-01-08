@@ -32,6 +32,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::arrow::*;
+use crate::datatypes::is_fixed_stride;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
@@ -42,7 +43,6 @@ use crate::{
     datatypes::{Field, Schema},
     format::PageInfo,
 };
-use crate::datatypes::is_fixed_stride;
 
 use super::object_store::ObjectStore;
 
