@@ -126,7 +126,6 @@ mod tests {
     };
     use arrow_array::Array;
     use object_store::path::Path;
-    use tokio::io::AsyncWriteExt;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
         let values = vec!["a", "b", "b", "a", "c"];
@@ -137,11 +136,10 @@ mod tests {
 
         let pos;
         {
-            let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
+            let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut object_writer, arr.keys().data_type());
             pos = encoder.encode(arr.keys()).await.unwrap();
-            writer.shutdown().await.unwrap();
+            object_writer.shutdown().await.unwrap();
         }
 
         let reader = store.open(&path).await.unwrap();

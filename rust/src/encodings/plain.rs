@@ -222,7 +222,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::ObjectStore;
+    use crate::io::{object_writer, ObjectStore};
     use arrow_array::*;
     use arrow_schema::Field;
     use object_store::path::Path;
@@ -267,15 +267,11 @@ mod tests {
     async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
-
-            assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
-        }
-        writer.shutdown().await.unwrap();
+        assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
+        object_writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);

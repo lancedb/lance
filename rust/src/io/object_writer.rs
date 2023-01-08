@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Error;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use object_store::{path::Path, MultipartId};
@@ -78,6 +76,11 @@ impl ObjectWriter {
         let msg: M = M::from(obj);
         self.write_protobuf(&msg).await
     }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        Ok(self.writer.shutdown().await?)
+    }
+
 }
 
 impl AsyncWrite for ObjectWriter {
@@ -102,7 +105,6 @@ impl AsyncWrite for ObjectWriter {
 
 #[cfg(test)]
 mod tests {
-
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 

@@ -190,16 +190,12 @@ mod tests {
     async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
-
-        let mut object_writer = ObjectWriter::new(writer.as_mut());
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
-
         let pos = encoder.encode(&arr).await.unwrap();
-
-        writer.shutdown().await.unwrap();
+        object_writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
         let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
