@@ -25,9 +25,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{
-    make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray,
-};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, make_array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -268,10 +266,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_fixed_size_list_array() {
-        let items = Int8Array::from(Vec::from_iter(1..127));
-        let arr = FixedSizeListArray::new(items, 3).unwrap();
-        let list_type =
-            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int8, true)), 3);
-        test_primitive(Arc::new(arr) as ArrayRef, list_type).await;
+        let int_types = vec![DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64, DataType::UInt8, DataType::UInt16, DataType::UInt32, DataType::UInt64];
+        for t in int_types {
+            let buffer = Buffer::from_slice_ref(Vec::from_iter(1..127).as_slice());
+            let items = make_array(ArrayDataBuilder::new(t.clone())
+                .len(buffer.len())
+                .add_buffer(buffer).build().unwrap());
+            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let list_type =
+                DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
+            test_primitive(Arc::new(arr) as ArrayRef, list_type).await;
+        }
     }
 }
