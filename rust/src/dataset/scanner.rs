@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Builder;
 
 use super::Dataset;
 use crate::datatypes::Schema;
@@ -28,6 +28,9 @@ use crate::format::Fragment;
 use crate::io::reader::FileReader;
 
 /// Dataset Scanner
+///
+/// TODO: RecordBatchReader does not support async iterator yet
+/// we need to use a tokio::rt::block_on for the iterator.
 pub struct Scanner<'a> {
     dataset: &'a Dataset,
 
@@ -43,10 +46,6 @@ pub struct Scanner<'a> {
     fragment_idx: usize,
     batch_id: i32,
     reader: Option<FileReader<'a>>,
-
-    // TODO: RecordBatchReader does not support async iterator yet,
-    // we need to use a tokio::rt::block_on for the iterator.
-    rt: Runtime,
 }
 
 impl<'a> Scanner<'a> {
@@ -61,8 +60,6 @@ impl<'a> Scanner<'a> {
             fragment_idx: 0,
             batch_id: 0,
             reader: None,
-
-            rt: Builder::new_current_thread().build()?,
         })
     }
 
