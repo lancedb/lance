@@ -26,6 +26,38 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 
 use crate::error::Result;
+
+pub trait DataTypeExt {
+    /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.
+    ///
+    /// ```
+    /// use lance::arrow::*;
+    /// use arrow_schema::DataType;
+    ///
+    /// assert!(DataType::Utf8.is_binary_like());
+    /// assert!(DataType::Binary.is_binary_like());
+    /// assert!(DataType::LargeUtf8.is_binary_like());
+    /// assert!(DataType::LargeBinary.is_binary_like());
+    /// assert!(!DataType::Int32.is_binary_like());
+    /// ```
+    fn is_binary_like(&self) -> bool;
+
+    fn is_struct(&self) -> bool;
+}
+
+impl DataTypeExt for DataType {
+    fn is_binary_like(&self) -> bool {
+        matches!(
+            self,
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary
+        )
+    }
+
+    fn is_struct(&self) -> bool {
+        matches!(self, DataType::Struct(_))
+    }
+}
+
 pub trait ListArrayExt {
     /// Create an [`ListArray`] from values and offsets.
     ///

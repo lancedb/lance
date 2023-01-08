@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_array::cast::{as_string_array, as_struct_array};
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::DataType;
 
 use crate::datatypes::{is_fixed_stride, Field, Schema};
 use crate::encodings::{plain::PlainEncoder, Encoding};
-use crate::format::{PageInfo, PageTable, Metadata};
+use crate::format::{Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::Result;
+use crate::arrow::*;
 
 /// FileWriter writes Arrow Table to a file.
 pub struct FileWriter<'a> {
@@ -29,9 +32,21 @@ pub struct FileWriter<'a> {
     schema: &'a Schema,
     batch_id: i32,
     page_table: PageTable,
+    metadata: Metadata,
 }
 
 impl<'a> FileWriter<'a> {
+
+    pub fn new(object_writer: ObjectWriter, schema: &'a Schema) -> Self {
+        Self {
+            object_writer,
+            schema,
+            batch_id: 0,
+            page_table: PageTable::default(),
+            metadata: Metadata::default(),
+        }
+    }
+
     /// Write a [RecordBatch] to the open file.
     ///
     /// Returns [Err] if the schema does not match with the batch.
@@ -41,6 +56,7 @@ impl<'a> FileWriter<'a> {
             let array = batch.column(column_id);
             self.write_array(field, array).await?;
         }
+        self.metadata.push_batch_length(batch.num_rows() as i32);
         self.batch_id += 1;
         Ok(())
     }
@@ -56,9 +72,14 @@ impl<'a> FileWriter<'a> {
     }
 
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        let data_type = array.data_type();
         if is_fixed_stride(array.data_type()) {
             self.write_fixed_stride_array(field, array).await?;
-        }
+        } else if matches!(array.data_type(), DataType::Struct(_)) {
+            let struct_arr = as_struct_array(array);
+        } else if data_type.is_binary_like() {
+            self.write_binary_array(field, array).await?;
+        };
 
         Ok(())
     }
@@ -73,6 +94,10 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
+    async fn write_binary_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        Ok(())
+    }
+
     async fn write_footer(&self) -> Result<()> {
         // Step 1. write dictionary values.
 
@@ -81,11 +106,15 @@ impl<'a> FileWriter<'a> {
         // Step 3. Write manifest.
 
         // Step 4. Write metadata.
-        let metadata = Metadata::default();
-        self.object_writer.write_struct(metadata).await?;
 
         // Step 5. Write magics.
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn test_write_file() {}
 }
