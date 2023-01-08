@@ -652,9 +652,12 @@ impl From<&Schema> for Vec<pb::Field> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+
     use arrow_schema::{Field as ArrowField, TimeUnit};
 
-    use super::*;
 
     #[test]
     fn arrow_field_to_field() {
@@ -816,4 +819,29 @@ mod tests {
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
     }
+
+    #[test]
+    fn test_schema_set_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let protos: Vec<pb::Field> = (&schema).into();
+        let all_ids: BTreeSet<_> = protos.iter().map(|p| p.id).collect();
+        assert_eq!(all_ids.len(), 6);
+        assert_eq!(*all_ids.first().unwrap(), 0);
+        assert_eq!(*all_ids.last().unwrap(), 5);
+    }
+
 }
