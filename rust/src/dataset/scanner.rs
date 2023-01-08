@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema as ArrowSchema, SchemaRef};
+use arrow_array::RecordBatch;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use tokio::runtime::{Builder, Runtime};
 
 use super::Dataset;
@@ -114,7 +114,7 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    fn schema(&self) -> SchemaRef {
+    pub fn schema(&self) -> SchemaRef {
         Arc::new(ArrowSchema::from(&self.projections))
     }
 }

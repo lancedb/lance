@@ -72,7 +72,8 @@ impl Dataset {
         let manifest_pb = object_reader
             .read_message::<pb::Manifest>(offset as usize)
             .await?;
-        let manifest = (&manifest_pb).into();
+        let mut manifest: Manifest = (&manifest_pb).into();
+        manifest.schema.load_dictionary(&object_reader).await?;
         Ok(Self {
             object_store,
             base: Path::from(uri),
