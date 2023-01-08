@@ -29,10 +29,13 @@ pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
 pub mod reader;
+mod writer;
 
 use crate::format::ProtoStruct;
 
 pub use self::object_store::ObjectStore;
+pub use writer::FileWriter;
+pub use reader::FileReader;
 
 const MAGIC: &[u8; 4] = b"LANC";
 const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
