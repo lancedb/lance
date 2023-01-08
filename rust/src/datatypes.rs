@@ -836,9 +836,9 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let protos: Vec<pb::Field> = (&schema).into();
-        let all_ids: BTreeSet<_> = protos.iter().map(|p| p.id).collect();
-        assert_eq!(all_ids.len(), 6);
-        assert_eq!(*all_ids.first().unwrap(), 0);
-        assert_eq!(*all_ids.last().unwrap(), 5);
+        assert_eq!(
+            protos.iter().map(|p| p.id).collect::<Vec<_>>(),
+            (0..6).collect::<Vec<_>>()
+        );
     }
 }
