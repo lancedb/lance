@@ -9,7 +9,7 @@ use object_store::path::Path;
 use self::scanner::Scanner;
 use crate::datatypes::Schema;
 use crate::error::Result;
-use crate::format::{pb, Fragment, Manifest};
+use crate::format::{Fragment, Manifest};
 use crate::io::reader::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
 
@@ -69,10 +69,7 @@ impl Dataset {
             .bytes()
             .await?;
         let offset = read_metadata_offset(&bytes)?;
-        let manifest_pb = object_reader
-            .read_message::<pb::Manifest>(offset as usize)
-            .await?;
-        let mut manifest: Manifest = (&manifest_pb).into();
+        let mut manifest: Manifest = object_reader.read_struct(offset).await?;
         manifest.schema.load_dictionary(&object_reader).await?;
         Ok(Self {
             object_store,

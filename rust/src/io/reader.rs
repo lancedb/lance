@@ -69,7 +69,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     assert!(file_size - manifest_pos < buf.len());
     let proto =
         pb::Manifest::decode(&buf[buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16])?;
-    Ok(Manifest::from(&proto))
+    Ok(Manifest::from(proto))
 }
 
 /// Lance File Reader.
@@ -102,24 +102,22 @@ impl<'a> FileReader<'a> {
             )
             .await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)?;
-        let metadata_pb = if metadata_pos < file_size - tail_bytes.len() {
+
+        let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
-            object_reader
-                .read_message::<pb::Metadata>(metadata_pos)
-                .await?
+            object_reader.read_struct(metadata_pos).await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_message::<pb::Metadata>(&tail_bytes.slice(offset..))?
+            let proto = read_message::<pb::Metadata>(&tail_bytes.slice(offset..))?;
+            Metadata::from(proto)
         };
-        let metadata = Metadata::from(&metadata_pb);
 
         let (projection, num_columns) = if let Some(m) = manifest {
             (m.schema.clone(), m.schema.max_field_id().unwrap())
         } else {
-            let manifest_pb = object_reader
-                .read_message::<pb::Manifest>(metadata.manifest_position.unwrap())
+            let m: Manifest = object_reader
+                .read_struct(metadata.manifest_position.unwrap())
                 .await?;
-            let m = Manifest::from(&manifest_pb);
             (m.schema.clone(), m.schema.max_field_id().unwrap())
         };
         let page_table = PageTable::new(
