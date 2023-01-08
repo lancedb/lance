@@ -22,9 +22,10 @@
 
 use std::any::Any;
 use std::ops::Range;
+use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType};
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -55,7 +56,10 @@ impl<'a> PlainEncoder<'a> {
     pub async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell() as usize;
 
-        let data = array.data().buffers()[0].as_slice();
+        let data = match array.data_type() {
+            DataType::FixedSizeList(_, _) => array.data().child_data()[0].buffers()[0].as_ref(),
+            _ => array.data().buffers()[0].as_ref()
+        };
         self.writer.write_all(data).await?;
 
         Ok(offset)
@@ -90,50 +94,70 @@ impl<'a> PlainDecoder<'a> {
     pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
         todo!()
     }
+}
 
-    fn get_byte_width(&self) -> Result<usize> {
-        match self.data_type {
-            DataType::Int8 => Ok(Int8Type::get_byte_width()),
-            DataType::Int16 => Ok(Int16Type::get_byte_width()),
-            DataType::Int32 => Ok(Int32Type::get_byte_width()),
-            DataType::Int64 => Ok(Int64Type::get_byte_width()),
-            DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
-            DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
-            DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
-            DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
-            DataType::Float16 => Ok(Float16Type::get_byte_width()),
-            DataType::Float32 => Ok(Float32Type::get_byte_width()),
-            DataType::Float64 => Ok(Float64Type::get_byte_width()),
-            _ => Err(Error::Schema(format!(
-                "Unsupport primitive type: {}",
-                self.data_type
-            ))),
-        }
+fn get_byte_width(data_type: &DataType) -> Result<usize> {
+    match data_type {
+        DataType::Int8 => Ok(Int8Type::get_byte_width()),
+        DataType::Int16 => Ok(Int16Type::get_byte_width()),
+        DataType::Int32 => Ok(Int32Type::get_byte_width()),
+        DataType::Int64 => Ok(Int64Type::get_byte_width()),
+        DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
+        DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
+        DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
+        DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
+        DataType::Float16 => Ok(Float16Type::get_byte_width()),
+        DataType::Float32 => Ok(Float32Type::get_byte_width()),
+        DataType::Float64 => Ok(Float64Type::get_byte_width()),
+        _ => Err(Error::Schema(format!(
+            "Unsupport primitive type: {}",
+            data_type
+        ))),
     }
 }
 
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        let array_bytes = match self.data_type {
-            DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => self.get_byte_width()? * self.length,
-        };
-        let range = Range {
-            start: self.position,
-            end: self.position + array_bytes,
-        };
+        if let DataType::FixedSizeList(items, list_size) = self.data_type
+        {
+            if !items.data_type().is_primitive() {
+                return Err(Error::Schema("Items for fixed size list should be primitives".to_string()));
+            };
+            let item_decoder = PlainDecoder::new(
+                self.reader,
+                items.data_type(),
+                self.position,
+                self.length * (*list_size) as usize)?;
+            let item_array = item_decoder.decode().await?;
+            let array_data = ArrayDataBuilder::new(self.data_type.clone())
+                .len(self.length)
+                .null_count(0)
+                .add_child_data(item_array.data().clone())
+                .build()?;
+            Ok(Arc::new(FixedSizeListArray::from(array_data)) as ArrayRef)
+        } else {
+            let array_bytes = match self.data_type {
+                DataType::Boolean => bit_util::ceil(self.length, 8),
+                _ => get_byte_width(self.data_type)? * self.length,
+            };
+            let range = Range {
+                start: self.position,
+                end: self.position + array_bytes,
+            };
 
-        let data = self.reader.get_range(range).await?;
-        let buf: Buffer = data.into();
-        let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(self.length)
-            .null_count(0)
-            .add_buffer(buf)
-            .build()?;
-        Ok(make_array(array_data))
+            let data = self.reader.get_range(range).await?;
+            let buf: Buffer = data.into();
+            let array_data = ArrayDataBuilder::new(self.data_type.clone())
+                .len(self.length)
+                .null_count(0)
+                .add_buffer(buf)
+                .build()?;
+            Ok(make_array(array_data))
+        }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -143,10 +167,11 @@ mod tests {
     use half::f16;
     use object_store::path::Path;
     use std::sync::Arc;
+    use arrow_schema::Field;
     use tokio::io::AsyncWriteExt;
 
     use crate::io::object_writer::ObjectWriter;
-
+    use crate::arrow::*;
     use super::*;
 
     #[tokio::test]
@@ -232,7 +257,17 @@ mod tests {
         assert!(reader.size().await.unwrap() > 0);
         let decoder = PlainDecoder::new(&reader, &DataType::Boolean, 0, arr.len()).unwrap();
         let read_arr = decoder.decode().await.unwrap();
-        let expect_arr = as_boolean_array(read_arr.as_ref());
-        assert_eq!(expect_arr, &arr);
+        let actual_arr = as_boolean_array(read_arr.as_ref());
+        println!("Actual {:?}", actual_arr);
+        println!("Expected {:?}", arr);
+        assert_eq!(&arr, actual_arr);
+    }
+
+    #[tokio::test]
+    async fn test_encode_decode_fixed_size_list_array() {
+        let items = Int8Array::from(Vec::from_iter(1..127));
+        let arr = FixedSizeListArray::new(items, 3).unwrap();
+        let list_type = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int8, true)), 3);
+        test_primitive(Arc::new(arr) as ArrayRef, list_type).await;
     }
 }

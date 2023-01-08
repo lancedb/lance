@@ -258,7 +258,8 @@ impl<'a> FileReader<'a> {
             | Float32
             | Float64
             | Decimal128(_, _)
-            | Decimal256(_, _) => self.read_primitive_array(field, batch_id).await,
+            | Decimal256(_, _)
+            | FixedSizeList(_, _) => self.read_primitive_array(field, batch_id).await,
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
                 self.read_binary_array(field, batch_id).await
             }
