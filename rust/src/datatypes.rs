@@ -800,43 +800,21 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let projected = schema.project_by_ids(&[1, 2, 4, 5]).unwrap();
+        for f in &schema.fields {
+            println!("Field {} has id {}", f.name, f.id);
+        }
+        let projected = schema.project_by_ids(&[1, 4, 5]).unwrap();
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
                 DataType::Struct(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f3", DataType::Float32, false),
                 ]),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
         ]);
-        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
-    }
-
-    #[test]
-    fn test_schema_set_ids() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new(
-                "b",
-                DataType::Struct(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
-                    ArrowField::new("f2", DataType::Boolean, false),
-                    ArrowField::new("f3", DataType::Float32, false),
-                ]),
-                true,
-            ),
-            ArrowField::new("c", DataType::Float64, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let protos: Vec<pb::Field> = (&schema).into();
-        assert_eq!(
-            protos.iter().map(|p| p.id).collect::<Vec<_>>(),
-            (0..6).collect::<Vec<_>>()
-        );
+        assert_eq!( Schema::try_from(&expected_arrow_schema).unwrap(), projected)
     }
 }

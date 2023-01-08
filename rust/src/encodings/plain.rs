@@ -106,7 +106,7 @@ pub struct PlainDecoder<'a> {
     /// The start position of the batch in the file.
     position: usize,
     /// Number of the rows in this batch.
-    length: usize,
+    num_rows: usize,
 }
 
 impl<'a> PlainDecoder<'a> {
@@ -120,7 +120,7 @@ impl<'a> PlainDecoder<'a> {
             reader,
             data_type,
             position,
-            length,
+            num_rows: length,
         })
     }
 
@@ -130,8 +130,8 @@ impl<'a> PlainDecoder<'a> {
 
     async fn decode_primitive(&self) -> Result<ArrayRef> {
         let array_bytes = match self.data_type {
-            DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => get_primitive_byte_width(self.data_type)? * self.length,
+            DataType::Boolean => bit_util::ceil(self.num_rows, 8),
+            _ => get_primitive_byte_width(self.data_type)? * self.num_rows,
         };
         let range = Range {
             start: self.position,
@@ -141,7 +141,7 @@ impl<'a> PlainDecoder<'a> {
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(self.length)
+            .len(self.num_rows)
             .null_count(0)
             .add_buffer(buf)
             .build()?;
@@ -163,7 +163,7 @@ impl<'a> PlainDecoder<'a> {
             self.reader,
             items.data_type(),
             self.position,
-            self.length * (*list_size) as usize,
+            self.num_rows * (*list_size) as usize,
         )?;
         let item_array = item_decoder.decode().await?;
         Ok(Arc::new(FixedSizeListArray::new(item_array, *list_size)?) as ArrayRef)
@@ -174,7 +174,7 @@ impl<'a> PlainDecoder<'a> {
             self.reader,
             &DataType::UInt8,
             self.position,
-            self.length * (*stride) as usize,
+            self.num_rows * (*stride) as usize,
         )?;
         let bytes_array = bytes_decoder.decode().await?;
         let values = bytes_array
@@ -232,7 +232,6 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crate::arrow::*;
     use crate::io::object_writer::ObjectWriter;
 
     #[tokio::test]
