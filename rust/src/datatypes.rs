@@ -572,7 +572,7 @@ impl Schema {
     }
 
     fn set_field_id(&mut self) {
-        let mut current_id = self.max_field_id().unwrap_or(-1);
+        let mut current_id = self.max_field_id().unwrap_or(-1) + 1;
         self.fields
             .iter_mut()
             .for_each(|f| f.set_id(-1, &mut current_id));
