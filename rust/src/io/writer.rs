@@ -16,7 +16,6 @@
 // under the License.
 
 use arrow_array::{ArrayRef, RecordBatch};
-use tokio::io::AsyncWriteExt;
 
 use crate::datatypes::{Field, Schema, is_fixed_stride};
 use crate::encodings::plain::PlainEncoder;
