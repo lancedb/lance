@@ -23,6 +23,7 @@ use arrow_schema::{ArrowError, Schema as ArrowSchema, SchemaRef};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::error::Result;
+use crate::format::Fragment;
 
 /// Dataset Scanner
 #[derive(Debug)]
@@ -36,6 +37,8 @@ pub struct Scanner<'a> {
     // filter: how to present filter
     limit: Option<i64>,
     offset: Option<i64>,
+
+    fragments: Vec<Fragment>
 }
 
 impl<'a> Scanner<'a> {
@@ -46,6 +49,7 @@ impl<'a> Scanner<'a> {
             batch_size: 1024,
             limit: None,
             offset: None,
+            fragments: dataset.fragments().to_vec(),
         }
     }
 

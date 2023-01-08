@@ -9,7 +9,7 @@ use object_store::path::Path;
 use self::scanner::Scanner;
 use crate::datatypes::Schema;
 use crate::error::Result;
-use crate::format::{pb, Manifest};
+use crate::format::{pb, Fragment, Manifest};
 use crate::io::reader::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
 
@@ -118,5 +118,9 @@ impl Dataset {
 
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    pub fn fragments(&self) -> &[Fragment] {
+        &self.manifest.fragments
     }
 }
