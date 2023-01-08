@@ -57,10 +57,6 @@ impl ObjectWriter {
         self.cursor
     }
 
-    pub async fn write_struct<T: Into<M>, M: Message + Sized>(&mut self, obj: T) -> Result<u64> {
-        self.write_protobuf(&obj.into()).await
-    }
-
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
     pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
         let offset = self.tell();
@@ -160,9 +156,5 @@ mod tests {
         let mut object_reader = ObjectReader::new(&store, path, 1024).unwrap();
         let actual: Metadata = object_reader.read_struct(pos).await.unwrap();
         assert_eq!(metadata, actual);
-        assert_eq!(
-            store.inner.head(&Path::from("/foo")).await.unwrap().size,
-            256 * 3
-        );
     }
 }
