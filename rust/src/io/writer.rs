@@ -25,7 +25,7 @@ use crate::datatypes::{is_fixed_stride, Field, Schema};
 use crate::encodings::binary::BinaryEncoder;
 use crate::encodings::Encoder;
 use crate::encodings::{plain::PlainEncoder, Encoding};
-use crate::format::{Metadata, PageInfo, PageTable};
+use crate::format::{Metadata, PageInfo, PageTable, Manifest};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
@@ -132,9 +132,12 @@ impl<'a> FileWriter<'a> {
         // Step 2. Write page table.
 
         // Step 3. Write manifest.
+        let manifest = Manifest::new(self.schema);
+        let pos = self.object_writer.write_struct(&manifest).await?;
 
         // Step 4. Write metadata.
-        self.object_writer.write_struct(&self.metadata).await?;
+        self.metadata.manifest_position = Some(pos);
+        let pos = self.object_writer.write_struct(&self.metadata).await?;
 
         // Step 5. Write magics.
         Ok(())

@@ -79,3 +79,12 @@ impl From<&pb::DataFragment> for Fragment {
         }
     }
 }
+
+impl From<&Fragment> for pb::DataFragment {
+    fn from(f: &Fragment) -> Self {
+        Self {
+            id: f.id,
+            files: f.files.iter().map(pb::DataFile::from).collect(),
+        }
+    }
+}
