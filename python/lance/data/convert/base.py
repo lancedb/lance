@@ -97,8 +97,8 @@ class DatasetConverter(ABC):
         """Convert each metdata column to pyarrow with lance types"""
         schema = self.get_schema()
         arrays = []
-        for name, col in df.items():
-            field = schema.field(name)
+        for field in schema:
+            col = df[field.name]
             arr = self._convert_field(field.name, field.type, col)
             arrays.append(arr)
         table = pa.Table.from_arrays(arrays=arrays, schema=schema).unify_dictionaries()
