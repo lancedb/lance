@@ -22,9 +22,10 @@
 
 use std::any::Any;
 use std::ops::Range;
+use std::sync::Arc;
 
 use arrow_array::types::*;
-use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType};
+use arrow_array::{make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -55,7 +56,10 @@ impl<'a> PlainEncoder<'a> {
     pub async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell() as usize;
 
-        let data = array.data().buffers()[0].as_slice();
+        let data = match array.data_type() {
+            DataType::FixedSizeList(_, _) => array.data().child_data()[0].buffers()[0].as_ref(),
+            _ => array.data().buffers()[0].as_ref(),
+        };
         self.writer.write_all(data).await?;
 
         Ok(offset)
@@ -90,48 +94,70 @@ impl<'a> PlainDecoder<'a> {
     pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
         todo!()
     }
+}
 
-    fn get_byte_width(&self) -> Result<usize> {
-        match self.data_type {
-            DataType::Int8 => Ok(Int8Type::get_byte_width()),
-            DataType::Int16 => Ok(Int16Type::get_byte_width()),
-            DataType::Int32 => Ok(Int32Type::get_byte_width()),
-            DataType::Int64 => Ok(Int64Type::get_byte_width()),
-            DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
-            DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
-            DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
-            DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
-            DataType::Float16 => Ok(Float16Type::get_byte_width()),
-            DataType::Float32 => Ok(Float32Type::get_byte_width()),
-            DataType::Float64 => Ok(Float64Type::get_byte_width()),
-            _ => Err(Error::Schema(format!(
-                "Unsupport primitive type: {}",
-                self.data_type
-            ))),
-        }
+fn get_byte_width(data_type: &DataType) -> Result<usize> {
+    match data_type {
+        DataType::Int8 => Ok(Int8Type::get_byte_width()),
+        DataType::Int16 => Ok(Int16Type::get_byte_width()),
+        DataType::Int32 => Ok(Int32Type::get_byte_width()),
+        DataType::Int64 => Ok(Int64Type::get_byte_width()),
+        DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
+        DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
+        DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
+        DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
+        DataType::Float16 => Ok(Float16Type::get_byte_width()),
+        DataType::Float32 => Ok(Float32Type::get_byte_width()),
+        DataType::Float64 => Ok(Float64Type::get_byte_width()),
+        _ => Err(Error::Schema(format!(
+            "Unsupport primitive type: {}",
+            data_type
+        ))),
     }
 }
 
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        let array_bytes = match self.data_type {
-            DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => self.get_byte_width()? * self.length,
-        };
-        let range = Range {
-            start: self.position,
-            end: self.position + array_bytes,
-        };
+        if let DataType::FixedSizeList(items, list_size) = self.data_type {
+            let data_type = items.data_type().clone();
+            if !data_type.is_primitive() && data_type != DataType::Boolean {
+                return Err(Error::Schema(
+                    "Items for fixed size list should be primitives".to_string(),
+                ));
+            };
+            let item_decoder = PlainDecoder::new(
+                self.reader,
+                items.data_type(),
+                self.position,
+                self.length * (*list_size) as usize,
+            )?;
+            let item_array = item_decoder.decode().await?;
+            let array_data = ArrayDataBuilder::new(self.data_type.clone())
+                .len(self.length)
+                .null_count(0)
+                .add_child_data(item_array.data().clone())
+                .build()?;
+            Ok(Arc::new(FixedSizeListArray::from(array_data)) as ArrayRef)
+        } else {
+            let array_bytes = match self.data_type {
+                DataType::Boolean => bit_util::ceil(self.length, 8),
+                _ => get_byte_width(self.data_type)? * self.length,
+            };
+            let range = Range {
+                start: self.position,
+                end: self.position + array_bytes,
+            };
 
-        let data = self.reader.get_range(range).await?;
-        let buf: Buffer = data.into();
-        let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(self.length)
-            .null_count(0)
-            .add_buffer(buf)
-            .build()?;
-        Ok(make_array(array_data))
+            let data = self.reader.get_range(range).await?;
+            let buf: Buffer = data.into();
+            let array_data = ArrayDataBuilder::new(self.data_type.clone())
+                .len(self.length)
+                .null_count(0)
+                .add_buffer(buf)
+                .build()?;
+            Ok(make_array(array_data))
+        }
     }
 }
 
@@ -140,59 +166,46 @@ mod tests {
     use crate::io::ObjectStore;
     use arrow_array::cast::as_boolean_array;
     use arrow_array::*;
-    use half::f16;
+    use arrow_schema::Field;
     use object_store::path::Path;
+    use rand::prelude::*;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
 
-    use crate::io::object_writer::ObjectWriter;
-
     use super::*;
+    use crate::arrow::*;
+    use crate::io::object_writer::ObjectWriter;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
-        let arr = Int8Array::from(Vec::from_iter(1..127));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int8).await;
-        let arr = Int16Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int16).await;
-        let arr = Int32Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int32).await;
-        let arr = Int64Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Int64).await;
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let input: Vec<i64> = Vec::from_iter(1..127 as i64);
+        for t in int_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let arr = make_array_(&t, &buffer).await;
+            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        }
 
-        let arr = UInt8Array::from(Vec::from_iter(1..255));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt8).await;
-        let arr = UInt16Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt16).await;
-        let arr = UInt32Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt32).await;
-        let arr = UInt64Array::from(Vec::from_iter(1..4096));
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::UInt64).await;
-
-        let arr = Float16Array::from_iter(
-            Vec::from_iter(1..4096 as i16)
-                .iter()
-                .map(|&i| f16::from_f32(1.0 * i as f32))
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float16).await;
-        let arr = Float32Array::from(
-            Vec::from_iter(1..4096)
-                .iter()
-                .map(|&i| 1.0 * i as f32)
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float32).await;
-        let arr = Float64Array::from(
-            Vec::from_iter(1..4096)
-                .iter()
-                .map(|&i| 1.0 * i as f64)
-                .collect::<Vec<_>>(),
-        );
-        test_primitive(Arc::new(arr) as ArrayRef, DataType::Float64).await;
+        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+        let mut rng = rand::thread_rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        for t in float_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let arr = make_array_(&t, &buffer).await;
+            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        }
     }
 
-    async fn test_primitive(expected: ArrayRef, data_type: DataType) {
+    async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
         let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
@@ -215,24 +228,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_bool_array() {
-        let store = ObjectStore::new(":memory:").unwrap();
-        let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
-
         let arr = BooleanArray::from(vec![true, false].repeat(100));
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::new(&mut object_writer, &DataType::Boolean);
+        test_round_trip(Arc::new(arr) as ArrayRef, DataType::Boolean).await;
+    }
 
-            assert_eq!(encoder.encode(&arr).await.unwrap(), 0);
+    #[tokio::test]
+    async fn test_encode_decode_fixed_size_list_array() {
+        let int_types = vec![
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let input = Vec::from_iter(1..127 as i64);
+        for t in int_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let items = make_array_(&t, &buffer).await;
+            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
+            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
         }
-        writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
-        assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, &DataType::Boolean, 0, arr.len()).unwrap();
-        let read_arr = decoder.decode().await.unwrap();
-        let expect_arr = as_boolean_array(read_arr.as_ref());
-        assert_eq!(expect_arr, &arr);
+        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
+        let mut rng = rand::thread_rng();
+        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
+        for t in float_types {
+            let buffer = Buffer::from_slice_ref(input.as_slice());
+            let items = make_array_(&t, &buffer).await;
+            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
+            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+        }
+
+        let items = BooleanArray::from(vec![true, false, true].repeat(42));
+        let arr = FixedSizeListArray::new(items, 3).unwrap();
+        let list_type =
+            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
+        test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+    }
+
+    async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
+        make_array(
+            ArrayDataBuilder::new(data_type.clone())
+                .len(126)
+                .add_buffer(buffer.clone())
+                .build()
+                .unwrap(),
+        )
     }
 }

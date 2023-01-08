@@ -19,7 +19,7 @@
 //!
 //! To improve Arrow-RS egonomitic
 
-use arrow_array::{Array, Int32Array, ListArray};
+use arrow_array::{Array, FixedSizeListArray, Int32Array, ListArray};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 
@@ -56,6 +56,43 @@ impl ListArrayExt for ListArray {
         .add_buffer(offsets.into_data().buffers()[0].clone())
         .add_child_data(values.into_data().clone())
         .build()?;
+
+        Ok(Self::from(data))
+    }
+}
+
+pub trait FixedSizeListArrayExt {
+    /// Create an [`FixedSizeListArray`] from values and offsets.
+    ///
+    /// ```
+    /// use arrow_array::{Int64Array, FixedSizeListArray};
+    /// use arrow_array::types::Int64Type;
+    /// use lance::arrow::FixedSizeListArrayExt;
+    ///
+    /// let int_values = Int64Array::from_iter(0..10);
+    /// let fixed_size_list_arr = FixedSizeListArray::new(int_values, 2).unwrap();
+    /// assert_eq!(fixed_size_list_arr,
+    ///     FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+    ///         Some(vec![Some(0), Some(1)]),
+    ///         Some(vec![Some(2), Some(3)]),
+    ///         Some(vec![Some(4), Some(5)]),
+    ///         Some(vec![Some(6), Some(7)]),
+    ///         Some(vec![Some(8), Some(9)])
+    /// ], 2))
+    /// ```
+    fn new<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
+}
+
+impl FixedSizeListArrayExt for FixedSizeListArray {
+    fn new<T: Array>(values: T, list_size: i32) -> Result<Self> {
+        let list_type = DataType::FixedSizeList(
+            Box::new(Field::new("item", values.data_type().clone(), true)),
+            list_size,
+        );
+        let data = ArrayDataBuilder::new(list_type)
+            .len(values.len() / list_size as usize)
+            .add_child_data(values.data().clone())
+            .build()?;
 
         Ok(Self::from(data))
     }
