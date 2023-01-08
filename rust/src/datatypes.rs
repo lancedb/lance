@@ -202,7 +202,6 @@ impl TryFrom<&LogicalType> for DataType {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dictionary {
     offset: usize,
@@ -304,7 +303,11 @@ impl Field {
     fn max_id(&self) -> i32 {
         max(
             self.id,
-            self.children.iter().map(|c| c.max_id()).max().unwrap_or(i32::MIN),
+            self.children
+                .iter()
+                .map(|c| c.max_id())
+                .max()
+                .unwrap_or(i32::MIN),
         )
     }
 

@@ -101,10 +101,7 @@ impl<'a> FileReader<'a> {
         let tail_bytes = object_reader
             .object_store
             .inner
-            .get_range(
-                path,
-                begin..file_size,
-            )
+            .get_range(path, begin..file_size)
             .await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)?;
 

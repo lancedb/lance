@@ -164,7 +164,7 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
 
-    use crate::io::{ObjectStore, FileReader};
+    use crate::io::{FileReader, ObjectStore};
 
     #[tokio::test]
     async fn test_write_file() {
@@ -217,6 +217,5 @@ mod tests {
         let reader = FileReader::new(&store, &path, None).await.unwrap();
         let actual = reader.read_batch(0).await.unwrap();
         assert_eq!(actual, batch);
-
     }
 }

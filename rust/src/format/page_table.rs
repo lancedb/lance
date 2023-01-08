@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{Int64Array, Array};
 use arrow_array::builder::Int64Builder;
+use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
-use tokio::io::AsyncWriteExt;
 use std::collections::BTreeMap;
+use tokio::io::AsyncWriteExt;
 
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
@@ -53,7 +53,10 @@ impl PageTable {
         num_columns: i32,
         num_batches: i32,
     ) -> Result<Self> {
-        println!("Loading page table: columns={} batches={}", num_columns, num_batches);
+        println!(
+            "Loading page table: columns={} batches={}",
+            num_columns, num_batches
+        );
         let length = num_columns * num_batches * 2;
         let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length as usize)?;
         let raw_arr = decoder.decode().await?;
@@ -88,7 +91,9 @@ impl PageTable {
             .values()
             .map(|c_map| c_map.keys().max())
             .flatten()
-            .max().unwrap() + 1;
+            .max()
+            .unwrap()
+            + 1;
 
         let mut builder = Int64Builder::with_capacity((num_columns * num_batches) as usize);
         for col in 0..num_columns {
@@ -102,7 +107,9 @@ impl PageTable {
             }
         }
         let arr = builder.finish();
-        writer.write_all(arr.into_data().buffers()[0].as_slice()).await?;
+        writer
+            .write_all(arr.into_data().buffers()[0].as_slice())
+            .await?;
 
         Ok(pos)
     }
