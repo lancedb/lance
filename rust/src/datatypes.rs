@@ -14,6 +14,31 @@ use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
+/// Check whether the given Arrow DataType is fixed stride.
+/// A fixed stride type has the same byte width for all array elements
+/// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
+pub fn is_fixed_stride(arrow_type: &DataType) -> bool {
+    match arrow_type {
+        DataType::Boolean
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::FixedSizeList(_, _)
+        | DataType::FixedSizeBinary(_) => true,
+        _ => false,
+    }
+}
+
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
 #[derive(Debug, Clone, PartialEq)]
@@ -328,7 +353,7 @@ impl Field {
                     Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
                         dict_info.values = Some(
                             reader
-                                .read_primitive_array(
+                                .read_fixed_stride_array(
                                     value_type.as_ref(),
                                     dict_info.offset,
                                     dict_info.length,

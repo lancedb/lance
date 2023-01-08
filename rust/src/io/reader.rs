@@ -32,6 +32,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::arrow::*;
+use crate::datatypes::is_fixed_stride;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
@@ -159,7 +160,6 @@ impl<'a> FileReader<'a> {
         let mut arrs = vec![];
         for field in schema.fields.iter() {
             let arr = self.read_array(&field, batch_id).await?;
-            println!("Read array: {:?}\n", arr);
             arrs.push(arr);
         }
         Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
@@ -176,11 +176,11 @@ impl<'a> FileReader<'a> {
     }
 
     /// Read primitive array for batch `batch_idx`.
-    async fn read_primitive_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+    async fn read_fixed_stride_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
 
         self.object_reader
-            .read_primitive_array(&field.data_type(), page_info.position, page_info.length)
+            .read_fixed_stride_array(&field.data_type(), page_info.position, page_info.length)
             .await
     }
 
@@ -227,7 +227,7 @@ impl<'a> FileReader<'a> {
         let page_info = self.page_info(field, batch_id)?;
         let position_arr = self
             .object_reader
-            .read_primitive_array(&DataType::Int32, page_info.position, page_info.length)
+            .read_fixed_stride_array(&DataType::Int32, page_info.position, page_info.length)
             .await?;
         let positions = as_primitive_array(position_arr.as_ref());
         let start_position = positions.value(0);
@@ -240,34 +240,24 @@ impl<'a> FileReader<'a> {
 
     /// Read an array of the batch.
     #[async_recursion]
-    async fn read_array<'f>(&self, field: &'f Field, batch_id: i32) -> Result<ArrayRef> {
+    async fn read_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let data_type = field.data_type();
 
         use DataType::*;
 
-        match data_type {
-            UInt8
-            | UInt16
-            | UInt32
-            | UInt64
-            | Int8
-            | Int16
-            | Int32
-            | Int64
-            | Float16
-            | Float32
-            | Float64
-            | Decimal128(_, _)
-            | Decimal256(_, _)
-            | FixedSizeList(_, _) => self.read_primitive_array(field, batch_id).await,
-            Utf8 | LargeUtf8 | Binary | LargeBinary => {
-                self.read_binary_array(field, batch_id).await
-            }
-            Struct(_) => self.read_struct_array(field, batch_id).await,
-            Dictionary(_, _) => self.read_dictionary_array(field, batch_id).await,
-            List(_) => self.read_list_array(field, batch_id).await,
-            _ => {
-                todo!()
+        if is_fixed_stride(&data_type) {
+            self.read_fixed_stride_array(field, batch_id).await
+        } else {
+            match data_type {
+                Utf8 | LargeUtf8 | Binary | LargeBinary => {
+                    self.read_binary_array(field, batch_id).await
+                }
+                Struct(_) => self.read_struct_array(field, batch_id).await,
+                Dictionary(_, _) => self.read_dictionary_array(field, batch_id).await,
+                List(_) => self.read_list_array(field, batch_id).await,
+                _ => {
+                    unimplemented!("{}", format!("No support for {data_type} yet"));
+                }
             }
         }
     }

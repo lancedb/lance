@@ -19,8 +19,12 @@
 //!
 //! To improve Arrow-RS egonomitic
 
-use arrow_array::{Array, FixedSizeListArray, Int32Array, ListArray};
-use arrow_data::ArrayDataBuilder;
+use arrow_array::types::UInt8Type;
+use arrow_array::{
+    Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+};
+use arrow_data::{ArrayData, ArrayDataBuilder};
+use arrow_schema::DataType::FixedSizeBinary;
 use arrow_schema::{DataType, Field};
 
 use crate::error::Result;
@@ -62,7 +66,7 @@ impl ListArrayExt for ListArray {
 }
 
 pub trait FixedSizeListArrayExt {
-    /// Create an [`FixedSizeListArray`] from values and offsets.
+    /// Create an [`FixedSizeListArray`] from values and list size.
     ///
     /// ```
     /// use arrow_array::{Int64Array, FixedSizeListArray};
@@ -94,6 +98,39 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
             .add_child_data(values.data().clone())
             .build()?;
 
+        Ok(Self::from(data))
+    }
+}
+
+pub trait FixedSizeBinaryArrayExt {
+    /// Create an [`FixedSizeBinaryArray`] from values and stride.
+    ///
+    /// ```
+    /// use arrow_array::{UInt8Array, FixedSizeBinaryArray};
+    /// use arrow_array::types::UInt8Type;
+    /// use lance::arrow::FixedSizeBinaryArrayExt;
+    ///
+    /// let int_values = UInt8Array::from_iter(0..10);
+    /// let fixed_size_list_arr = FixedSizeBinaryArray::new(&int_values, 2).unwrap();
+    /// assert_eq!(fixed_size_list_arr,
+    ///     FixedSizeBinaryArray::from(vec![
+    ///         Some(vec![0, 1].as_slice()),
+    ///         Some(vec![2, 3].as_slice()),
+    ///         Some(vec![4, 5].as_slice()),
+    ///         Some(vec![6, 7].as_slice()),
+    ///         Some(vec![8, 9].as_slice())
+    /// ]))
+    /// ```
+    fn new(values: &UInt8Array, stride: i32) -> Result<FixedSizeBinaryArray>;
+}
+
+impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
+    fn new(values: &UInt8Array, stride: i32) -> Result<Self> {
+        let data_type = DataType::FixedSizeBinary(stride);
+        let data = ArrayDataBuilder::new(data_type)
+            .len(values.len() / stride as usize)
+            .add_buffer(values.data().buffers()[0].clone())
+            .build()?;
         Ok(Self::from(data))
     }
 }

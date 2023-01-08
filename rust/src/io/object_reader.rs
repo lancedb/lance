@@ -19,6 +19,7 @@ use std::cmp::min;
 
 use std::ops::Range;
 
+use crate::datatypes::is_fixed_stride;
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
@@ -85,16 +86,20 @@ impl<'a> ObjectReader<'a> {
         Ok(bytes)
     }
 
-    /// Read a primitive array from disk.
+    /// Read a fixed stride array from disk.
     ///
-    pub async fn read_primitive_array(
+    pub async fn read_fixed_stride_array(
         &self,
         data_type: &DataType,
         position: usize,
         length: usize,
     ) -> Result<ArrayRef> {
-        assert!(data_type.is_primitive());
-
+        if !is_fixed_stride(data_type) {
+            return Err(Error::Schema(format!(
+                "{} is not a fixed stride type",
+                data_type
+            )));
+        }
         // TODO: support more than plain encoding here.
         let decoder = PlainDecoder::new(self, data_type, position, length)?;
         let fut = decoder.decode();
