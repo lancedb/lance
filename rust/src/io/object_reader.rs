@@ -19,7 +19,6 @@ use std::cmp::min;
 
 use std::ops::Range;
 
-use crate::datatypes::is_fixed_stride;
 use arrow_array::{
     types::{BinaryType, LargeBinaryType, LargeUtf8Type, Utf8Type},
     ArrayRef,
@@ -30,6 +29,7 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
+use crate::arrow::*;
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
@@ -109,7 +109,7 @@ impl<'a> ObjectReader<'a> {
         position: usize,
         length: usize,
     ) -> Result<ArrayRef> {
-        if !is_fixed_stride(data_type) {
+        if !data_type.is_fixed_stride() {
             return Err(Error::Schema(format!(
                 "{} is not a fixed stride type",
                 data_type

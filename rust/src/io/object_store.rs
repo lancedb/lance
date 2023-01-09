@@ -16,6 +16,7 @@
 // under the License.
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
+
 use std::sync::Arc;
 
 use ::object_store::{
@@ -24,11 +25,12 @@ use ::object_store::{
 use object_store::local::LocalFileSystem;
 use url::{ParseError, Url};
 
-use super::object_reader::ObjectReader;
 use crate::error::{Error, Result};
+use crate::io::object_reader::ObjectReader;
+use crate::io::object_writer::ObjectWriter;
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
@@ -47,12 +49,7 @@ impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
     pub fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
-            return Ok(Self {
-                inner: Arc::new(InMemory::new()),
-                scheme: String::from("memory"),
-                base_path: Path::from("/"),
-                prefetch_size: 64 * 1024,
-            });
+            return Ok(ObjectStore::memory());
         };
 
         let parsed = match Url::parse(uri) {
@@ -98,6 +95,16 @@ impl ObjectStore {
         })
     }
 
+    /// Create a in-memory object store directly.
+    pub(crate) fn memory() -> Self {
+        Self {
+            inner: Arc::new(InMemory::new()),
+            scheme: String::from("memory"),
+            base_path: Path::from("/"),
+            prefetch_size: 64 * 1024,
+        }
+    }
+
     pub fn prefetch_size(&self) -> usize {
         self.prefetch_size
     }
@@ -115,5 +122,10 @@ impl ObjectStore {
             Ok(r) => Ok(r),
             Err(e) => Err(e),
         }
+    }
+
+    /// Create a new file.
+    pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
+        ObjectWriter::new(self, path).await
     }
 }

@@ -33,13 +33,13 @@ use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
+use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 use crate::arrow::FixedSizeBinaryArrayExt;
 use crate::arrow::FixedSizeListArrayExt;
-use crate::datatypes::is_fixed_stride;
+use crate::arrow::*;
 use crate::Error;
-use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
 
 use super::Decoder;
 use crate::error::Result;
@@ -49,12 +49,12 @@ use crate::io::object_writer::ObjectWriter;
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
-    writer: &'a mut ObjectWriter<'a>,
+    writer: &'a mut ObjectWriter,
     data_type: &'a DataType,
 }
 
 impl<'a> PlainEncoder<'a> {
-    pub fn new(writer: &'a mut ObjectWriter<'a>, data_type: &'a DataType) -> PlainEncoder<'a> {
+    pub fn new(writer: &'a mut ObjectWriter, data_type: &'a DataType) -> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 
@@ -153,7 +153,7 @@ impl<'a> PlainDecoder<'a> {
         items: &Box<Field>,
         list_size: &i32,
     ) -> Result<ArrayRef> {
-        if !is_fixed_stride(items.data_type()) {
+        if !items.data_type().is_fixed_stride() {
             return Err(Error::Schema(format!(
                 "Items for fixed size list should be primitives but found {}",
                 items.data_type()
@@ -229,10 +229,8 @@ mod tests {
     use rand::prelude::*;
     use std::borrow::Borrow;
     use std::sync::Arc;
-    use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crate::arrow::*;
     use crate::io::object_writer::ObjectWriter;
 
     #[tokio::test]
@@ -267,15 +265,11 @@ mod tests {
     async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
-        {
-            let mut object_writer = ObjectWriter::new(writer.as_mut());
-            let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
-
-            assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
-        }
-        writer.shutdown().await.unwrap();
+        assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
+        object_writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);

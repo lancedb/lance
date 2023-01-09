@@ -18,6 +18,7 @@
 use super::Fragment;
 use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
+use std::collections::HashMap;
 
 /// Manifest of a dataset
 ///
@@ -36,6 +37,16 @@ pub struct Manifest {
     pub fragments: Vec<Fragment>,
 }
 
+impl Manifest {
+    pub fn new(schema: &Schema) -> Self {
+        Self {
+            schema: schema.clone(),
+            version: 1,
+            fragments: vec![],
+        }
+    }
+}
+
 impl ProtoStruct for Manifest {
     type Proto = pb::Manifest;
 }
@@ -46,6 +57,18 @@ impl From<pb::Manifest> for Manifest {
             schema: Schema::from(&p.fields),
             version: p.version,
             fragments: p.fragments.iter().map(Fragment::from).collect(),
+        }
+    }
+}
+
+impl From<&Manifest> for pb::Manifest {
+    fn from(m: &Manifest) -> Self {
+        Self {
+            fields: (&m.schema).into(),
+            version: m.version,
+            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            metadata: HashMap::default(),
+            version_aux_data: 0,
         }
     }
 }

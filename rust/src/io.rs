@@ -29,13 +29,13 @@ pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
 pub mod reader;
+mod writer;
 
-use crate::format::ProtoStruct;
+use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
-
-const MAGIC: &[u8; 4] = b"LANC";
-const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
+pub use reader::FileReader;
+pub use writer::FileWriter;
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {

@@ -1,3 +1,5 @@
+//! On-disk format
+
 mod fragment;
 mod manifest;
 mod metadata;
@@ -14,6 +16,11 @@ use prost::Message;
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
 }
+
+pub const MAJOR_VERSION: i16 = 0;
+pub const MINOR_VERSION: i16 = 1;
+pub const MAGIC: &[u8; 4] = b"LANC";
+pub const INDEX_MAGIC: &[u8; 8] = b"LANC_IDX";
 
 /// Annotation on a struct that can be converted a Protobuf message.
 pub trait ProtoStruct {

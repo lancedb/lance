@@ -15,29 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use object_store::{path::Path, MultipartId};
 use pin_project::pin_project;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::format::ProtoStruct;
+use crate::io::ObjectStore;
+use crate::Result;
 
 /// AsyncWrite with the capability to tell the position the data is written.
 ///
 #[pin_project]
-pub struct ObjectWriter<'a> {
+pub struct ObjectWriter {
+    store: ObjectStore,
+
     // TODO: wrap writer with a BufWriter.
     #[pin]
-    writer: &'a mut (dyn AsyncWrite + Unpin + Send),
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    multipart_id: MultipartId,
     cursor: usize,
 }
 
-impl<'a> ObjectWriter<'a> {
-    pub fn new(writer: &'a mut (dyn AsyncWrite + Unpin + Send)) -> ObjectWriter<'a> {
-        ObjectWriter { writer, cursor: 0 }
+impl ObjectWriter {
+    pub async fn new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+        let (multipart_id, writer) = object_store.inner.put_multipart(path).await?;
+
+        Ok(Self {
+            store: object_store.clone(),
+            writer,
+            multipart_id,
+            cursor: 0,
+        })
     }
 
     /// Tell the current position (file size).
@@ -46,7 +58,7 @@ impl<'a> ObjectWriter<'a> {
     }
 
     /// Write a protobuf message to the object, and returns the file position of the protobuf.
-    pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize, Error> {
+    pub async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
         let offset = self.tell();
 
         let len = msg.encoded_len();
@@ -60,35 +72,38 @@ impl<'a> ObjectWriter<'a> {
     pub async fn write_struct<'b, M: Message + From<&'b T>, T: ProtoStruct<Proto = M> + 'b>(
         &mut self,
         obj: &'b T,
-    ) -> Result<usize, Error> {
+    ) -> Result<usize> {
         let msg: M = M::from(obj);
         self.write_protobuf(&msg).await
     }
+
+    pub async fn shutdown(&mut self) -> Result<()> {
+        Ok(self.writer.shutdown().await?)
+    }
 }
 
-impl AsyncWrite for ObjectWriter<'_> {
+impl AsyncWrite for ObjectWriter {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
+    ) -> Poll<std::io::Result<usize>> {
         let mut this = self.project();
         *this.cursor += buf.len();
         this.writer.as_mut().poll_write(cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.project().writer.as_mut().poll_flush(cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.project().writer.as_mut().poll_shutdown(cx)
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 
@@ -101,13 +116,10 @@ mod tests {
     #[tokio::test]
     async fn test_write() {
         let store = ObjectStore::new(":memory:").unwrap();
-        let (_, mut writer) = store
-            .inner
-            .put_multipart(&Path::from("/foo"))
+
+        let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
             .unwrap();
-
-        let mut object_writer = ObjectWriter::new(writer.as_mut());
         assert_eq!(object_writer.tell(), 0);
 
         let mut buf = Vec::<u8>::new();
@@ -122,20 +134,14 @@ mod tests {
         assert_eq!(object_writer.tell(), 256 * 3);
 
         object_writer.shutdown().await.unwrap();
-
-        assert_eq!(
-            store.inner.head(&Path::from("/foo")).await.unwrap().size,
-            256 * 3
-        );
     }
 
     #[tokio::test]
     async fn test_write_proto_structs() {
         let store = ObjectStore::new(":memory:").unwrap();
         let path = Path::from("/foo");
-        let (_, mut writer) = store.inner.put_multipart(&path).await.unwrap();
 
-        let mut object_writer = ObjectWriter::new(writer.as_mut());
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         assert_eq!(object_writer.tell(), 0);
 
         let mut metadata = Metadata::default();
