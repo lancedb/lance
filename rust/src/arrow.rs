@@ -21,7 +21,7 @@
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
-    UInt8Array,
+    UInt8Array, Int64Array, LargeListArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -117,6 +117,27 @@ pub trait ListArrayExt {
 impl ListArrayExt for ListArray {
     fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        ))))
+        .len(offsets.len() - 1)
+        .add_buffer(offsets.into_data().buffers()[0].clone())
+        .add_child_data(values.into_data().clone())
+        .build()?;
+
+        Ok(Self::from(data))
+    }
+}
+
+// TODO: merge with ListArrayExt?;
+pub trait LargeListArrayExt {
+    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<LargeListArray>;
+}
+
+impl LargeListArrayExt for LargeListArray {
+    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
+        let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
             "item",
             values.data_type().clone(),
             true,

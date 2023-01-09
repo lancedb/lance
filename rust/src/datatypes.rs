@@ -31,6 +31,10 @@ impl LogicalType {
         self.0 == "list" || self.0 == "list.struct"
     }
 
+    fn is_large_list(&self) -> bool {
+        self.0 == "large_list" || self.0 == "large_list.struct"
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
@@ -90,6 +94,10 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
+            },
+            DataType::LargeList(elem) => match elem.data_type() {
+                DataType::Struct(_) => "large_list.struct".to_string(),
+                _ => "large_list".to_string(),
             },
             DataType::FixedSizeList(dt, len) => format!(
                 "fixed_size_list:{}:{}",
@@ -236,6 +244,9 @@ impl Field {
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {
             lt if lt.is_list() => DataType::List(Box::new(ArrowField::from(&self.children[0]))),
+            lt if lt.is_large_list() => {
+                DataType::LargeList(Box::new(ArrowField::from(&self.children[0])))
+            }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
             }
@@ -403,6 +414,7 @@ impl TryFrom<&ArrowField> for Field {
                 children.iter().map(Self::try_from).collect::<Result<_>>()?
             }
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
         Ok(Self {
@@ -414,6 +426,8 @@ impl TryFrom<&ArrowField> for Field {
                 dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
+                // Use plain encoder to store the offsets of list.
+                DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
             extension_name: "".to_string(),

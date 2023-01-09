@@ -16,13 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow_array::cast::{as_dictionary_array, as_struct_array};
+use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::{
     types::{
         Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, RecordBatch, StructArray,
+    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray,
 };
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
@@ -139,9 +141,8 @@ impl<'a> FileWriter<'a> {
             DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
                 self.write_fixed_stride_array(field, array).await
             }
-            DataType::List(_) => {
-                todo!()
-            }
+            DataType::List(_) => self.write_list_array(field, array).await,
+            DataType::LargeList(_) => self.write_large_list_array(field, array).await,
             _ => {
                 return Err(Error::Schema(format!(
                     "FileWriter::write: unsupported data type: {:?}",
@@ -227,6 +228,26 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
+    async fn write_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        let list_arr = as_list_array(array);
+        let offsets: Int32Array = list_arr.value_offsets().iter().map(|o| *o).collect();
+        assert!(!offsets.is_empty());
+        let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
+        self.write_fixed_stride_array(field, &offsets).await?;
+        self.write_array(&field.children[0], &list_arr.values())
+            .await
+    }
+
+    async fn write_large_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        let list_arr = as_large_list_array(array);
+        let offsets: Int64Array = list_arr.value_offsets().iter().map(|o| *o).collect();
+        assert!(!offsets.is_empty());
+        let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
+        self.write_fixed_stride_array(field, &offsets).await?;
+        self.write_array(&field.children[0], &list_arr.values())
+            .await
+    }
+
     async fn write_footer(&mut self) -> Result<()> {
         // Step 1. Write page table.
         let pos = self.page_table.write(&mut self.object_writer).await?;
@@ -270,7 +291,7 @@ mod tests {
 
     use arrow_array::{
         types::UInt32Type, BooleanArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
-        Float32Array, Int64Array, StringArray, UInt8Array,
+        Float32Array, Int64Array, LargeListArray, ListArray, StringArray, UInt8Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
@@ -298,6 +319,16 @@ mod tests {
                 true,
             ),
             ArrowField::new("fixed_size_binary", DataType::FixedSizeBinary(8), true),
+            ArrowField::new(
+                "l",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            ArrowField::new(
+                "large_l",
+                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                true,
+            ),
             ArrowField::new(
                 "s",
                 DataType::Struct(vec![
@@ -329,6 +360,17 @@ mod tests {
         let fixed_size_binary_arr =
             FixedSizeBinaryArray::try_new(&UInt8Array::from_iter(binary_data), 8).unwrap();
 
+        let list_offsets = (0..202).step_by(2).collect();
+        let list_values =
+            StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
+        let list_arr = ListArray::try_new(list_values, &list_offsets).unwrap();
+
+        let large_list_offsets: Int64Array = (0..202).step_by(2).collect();
+        let large_list_values =
+            StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
+        let large_list_arr =
+            LargeListArray::try_new(large_list_values, &large_list_offsets).unwrap();
+
         let columns: Vec<ArrayRef> = vec![
             Arc::new(BooleanArray::from_iter(
                 (0..100).map(|f| Some(f % 3 == 0)).collect::<Vec<_>>(),
@@ -343,6 +385,8 @@ mod tests {
             Arc::new(dict_arr),
             Arc::new(fixed_size_list_arr),
             Arc::new(fixed_size_binary_arr),
+            Arc::new(list_arr),
+            Arc::new(large_list_arr),
             Arc::new(StructArray::from(vec![
                 (
                     ArrowField::new("si", DataType::Int64, true),
