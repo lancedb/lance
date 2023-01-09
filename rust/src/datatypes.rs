@@ -181,10 +181,7 @@ impl TryFrom<&LogicalType> for DataType {
                     } else {
                         let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
                         let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
-                        Ok(Dictionary(
-                            Box::new(index_type),
-                            Box::new(value_type),
-                        ))
+                        Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
                     }
                 }
                 _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
