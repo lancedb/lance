@@ -59,10 +59,7 @@ pub trait DataTypeExt {
 impl DataTypeExt for DataType {
     fn is_binary_like(&self) -> bool {
         use DataType::*;
-        matches!(
-            self,
-            Utf8 | Binary | LargeUtf8 | LargeBinary
-        )
+        matches!(self, Utf8 | Binary | LargeUtf8 | LargeBinary)
     }
 
     fn is_struct(&self) -> bool {

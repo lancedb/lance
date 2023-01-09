@@ -136,6 +136,12 @@ impl<'a> FileWriter<'a> {
                 let struct_arr = as_struct_array(array);
                 self.write_struct_array(field, struct_arr).await
             }
+            DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
+                self.write_fixed_stride_array(field, array).await
+            }
+            DataType::List(_) => {
+                todo!()
+            }
             _ => {
                 return Err(Error::Schema(format!(
                     "FileWriter::write: unsupported data type: {:?}",
@@ -263,7 +269,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, DictionaryArray, Float32Array, Int64Array, StringArray,
+        types::UInt32Type, BooleanArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
+        Float32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
@@ -282,6 +289,15 @@ mod tests {
                 DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
                 true,
             ),
+            ArrowField::new(
+                "fixed_size_list",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    16,
+                ),
+                true,
+            ),
+            ArrowField::new("fixed_size_binary", DataType::FixedSizeBinary(8), true),
             ArrowField::new(
                 "s",
                 DataType::Struct(vec![
@@ -303,6 +319,16 @@ mod tests {
             .collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
+        let fixed_size_list_arr = FixedSizeListArray::try_new(
+            Float32Array::from_iter((0..1600).map(|n| n as f32).collect::<Vec<_>>()),
+            16,
+        )
+        .unwrap();
+
+        let binary_data: [u8; 800] = [123; 800];
+        let fixed_size_binary_arr =
+            FixedSizeBinaryArray::try_new(&UInt8Array::from_iter(binary_data), 8).unwrap();
+
         let columns: Vec<ArrayRef> = vec![
             Arc::new(BooleanArray::from_iter(
                 (0..100).map(|f| Some(f % 3 == 0)).collect::<Vec<_>>(),
@@ -315,6 +341,8 @@ mod tests {
                 (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
             )),
             Arc::new(dict_arr),
+            Arc::new(fixed_size_list_arr),
+            Arc::new(fixed_size_binary_arr),
             Arc::new(StructArray::from(vec![
                 (
                     ArrowField::new("si", DataType::Int64, true),
