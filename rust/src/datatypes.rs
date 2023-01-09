@@ -238,6 +238,8 @@ impl Field {
         self.children.iter_mut().find(|f| f.name == name)
     }
 
+    /// Recursively attach Dictionary's value array to the field, so we can later serialize
+    /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) -> Result<()> {
         assert_eq!(&self.data_type(), arr.data_type());
 
@@ -272,7 +274,14 @@ impl Field {
             DataType::Struct(_) => {
                 let struct_arr = as_struct_array(arr);
                 assert!(self.logical_type.is_struct());
-                todo!()
+                for field in &mut self.children {
+                    if let Some(sub_array)  = struct_arr.column_by_name(&field.name) {
+                        field.set_dictionary_values(sub_array)?;
+                    } else {
+                        return Err(Error::Schema(format!("Struct array does not have field: {}", field.name)));
+                    }
+                }
+                Ok(())
             }
             DataType::List(_) => {
                 let list_arr = as_list_array(arr);
