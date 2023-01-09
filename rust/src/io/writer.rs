@@ -202,13 +202,11 @@ mod tests {
                 true,
             ),
         ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let writer = store.create(&path).await.unwrap();
-
-        let mut file_writer = FileWriter::new(writer, &schema);
 
         let dict_vec = (0..100).into_iter().map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
@@ -239,6 +237,8 @@ mod tests {
             ])),
         ];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+        schema.set_dictionary_values(&batch).unwrap();
+        let mut file_writer = FileWriter::new(writer, &schema);
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();
 

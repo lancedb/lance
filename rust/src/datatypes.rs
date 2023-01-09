@@ -175,8 +175,8 @@ impl TryFrom<&LogicalType> for DataType {
                     if splits.len() != 4 {
                         Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
                     } else {
-                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
-                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
+                        let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(DataType::Dictionary(
                             Box::new(index_type),
                             Box::new(value_type),
