@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_array::cast::as_dictionary_array;
+use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -243,7 +243,14 @@ impl Field {
 
         match arr.data_type() {
             DataType::Dictionary(key_type, _) => {
-                // asse
+                if self
+                    .dictionary
+                    .as_ref()
+                    .map_or(false, |f| f.values.is_some())
+                {
+                    // Already set.
+                    return Ok(());
+                }
                 let value_arrs = match key_type.as_ref() {
                     DataType::UInt8 => Some(as_dictionary_array::<UInt8Type>(arr).values()),
                     DataType::UInt16 => Some(as_dictionary_array::<UInt16Type>(arr).values()),
@@ -255,21 +262,29 @@ impl Field {
                     DataType::Int64 => Some(as_dictionary_array::<Int64Type>(arr).values()),
                     _ => None,
                 };
+                self.dictionary = Some(Dictionary {
+                    offset: 0,
+                    length: 0,
+                    values: value_arrs.map(|a| a.clone()),
+                });
+                Ok(())
             }
-            DataType::Struct(fields) => {
+            DataType::Struct(_) => {
                 todo!()
             }
-            DataType::List(item) => {
-                todo!()
+            DataType::List(_) => {
+                let list_arr = as_list_array(arr);
+                self.children[0].set_dictionary_values(&list_arr.values())
             }
-            DataType::LargeList(item) => {
-                todo!()
+            DataType::LargeList(_) => {
+                let list_arr = as_large_list_array(arr);
+                self.children[0].set_dictionary_values(&list_arr.values())
             }
-            _ => { // ignore
+            _ => {
+                // ignore
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     fn project(&self, path_components: &[&str]) -> Result<Field> {

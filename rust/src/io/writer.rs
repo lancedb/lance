@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::cast::{as_dictionary_array, as_struct_array};
-use arrow_array::types::{
-    ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
-};
+use arrow_array::cast::as_struct_array;
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
@@ -78,7 +74,7 @@ impl<'a> FileWriter<'a> {
         match data_type {
             dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
             dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
-            DataType::Dictionary(key_type, value_type) => {
+            DataType::Dictionary(key_type, _) => {
                 self.write_dictionary_arr(field, array, &key_type).await
             }
             dt if dt.is_struct() => {
