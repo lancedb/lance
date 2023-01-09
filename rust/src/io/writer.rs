@@ -15,8 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::cast::as_struct_array;
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use std::collections::HashMap;
+
+use arrow_array::cast::{as_dictionary_array, as_struct_array};
+use arrow_array::{
+    types::{
+        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    Array, ArrayRef, RecordBatch, StructArray,
+};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use tokio::io::AsyncWriteExt;
@@ -36,6 +43,11 @@ pub struct FileWriter<'a> {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
+
+    // Lazily loaded dictoinary value arrays, <field_id, value_arr>.
+    // It is populared during the write() process, and later will be
+    // serialized to the manifest.
+    dictionary_value_arrs: HashMap<i32, ArrayRef>,
 }
 
 impl<'a> FileWriter<'a> {
@@ -46,6 +58,7 @@ impl<'a> FileWriter<'a> {
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
+            dictionary_value_arrs: HashMap::default(),
         }
     }
 
@@ -117,6 +130,31 @@ impl<'a> FileWriter<'a> {
         key_type: &DataType,
     ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
+
+        if self.batch_id == 0 {
+            // Only load value error for the first batch.
+            assert!(self.dictionary_value_arrs.contains_key(&field.id));
+            use DataType::*;
+            let values = match key_type {
+                UInt8 => as_dictionary_array::<UInt8Type>(array).values(),
+                UInt16 => as_dictionary_array::<UInt16Type>(array).values(),
+                UInt32 => as_dictionary_array::<UInt32Type>(array).values(),
+                UInt64 => as_dictionary_array::<UInt64Type>(array).values(),
+                Int8 => as_dictionary_array::<Int8Type>(array).values(),
+                Int16 => as_dictionary_array::<Int16Type>(array).values(),
+                Int32 => as_dictionary_array::<Int32Type>(array).values(),
+                Int64 => as_dictionary_array::<Int64Type>(array).values(),
+                _ => {
+                    return Err(Error::Schema(format!(
+                        "DictionaryEncoder: unsurpported key type: {:?}",
+                        key_type,
+                    )))
+                }
+            };
+            self.dictionary_value_arrs.insert(field.id, values.clone());
+        };
+
+        // Write data.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
@@ -208,7 +246,10 @@ mod tests {
         let path = Path::from("/foo");
         let writer = store.create(&path).await.unwrap();
 
-        let dict_vec = (0..100).into_iter().map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
+        let dict_vec = (0..100)
+            .into_iter()
+            .map(|n| ["a", "b", "c"][n % 3])
+            .collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
         let columns: Vec<ArrayRef> = vec![
