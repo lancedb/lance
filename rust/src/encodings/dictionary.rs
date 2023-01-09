@@ -20,19 +20,68 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::as_dictionary_array;
 use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use arrow_array::{ArrayRef, DictionaryArray, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
 use crate::encodings::plain::PlainDecoder;
-use crate::encodings::Decoder;
+use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::object_reader::ObjectReader;
+use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter};
 use crate::Error;
+
+use super::plain::PlainEncoder;
+
+/// Encoder for Dictionary encoding.
+pub struct DictionaryEncoder<'a> {
+    writer: &'a mut ObjectWriter,
+    key_type: &'a DataType,
+}
+
+impl<'a> DictionaryEncoder<'a> {
+    pub fn new(writer: &'a mut ObjectWriter, key_type: &'a DataType) -> Self {
+        Self { writer, key_type }
+    }
+
+    async fn write_typed_array<T: ArrowDictionaryKeyType>(
+        &mut self,
+        arr: &dyn Array,
+    ) -> Result<usize> {
+        let pos = self.writer.tell();
+        let dict_arr = as_dictionary_array::<T>(arr);
+
+        let mut plain_encoder = PlainEncoder::new(self.writer, dict_arr.data_type());
+        plain_encoder.encode(dict_arr.keys()).await?;
+        Ok(pos)
+    }
+}
+
+#[async_trait]
+impl<'a> Encoder for DictionaryEncoder<'a> {
+    async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+        use DataType::*;
+
+        match self.key_type {
+            UInt8 => self.write_typed_array::<UInt8Type>(array).await,
+            UInt16 => self.write_typed_array::<UInt16Type>(array).await,
+            UInt32 => self.write_typed_array::<UInt32Type>(array).await,
+            UInt64 => self.write_typed_array::<UInt64Type>(array).await,
+            Int8 => self.write_typed_array::<Int8Type>(array).await,
+            Int16 => self.write_typed_array::<Int16Type>(array).await,
+            Int32 => self.write_typed_array::<Int32Type>(array).await,
+            Int64 => self.write_typed_array::<Int64Type>(array).await,
+            _ => Err(Error::Schema(format!(
+                "DictionaryEncoder: unsurpported key type: {:?}",
+                self.key_type
+            ))),
+        }
+    }
+}
 
 /// Decoder for Dictionary encoding.
 #[derive(Debug)]

@@ -43,6 +43,7 @@ pub trait DataTypeExt {
     /// ```
     fn is_binary_like(&self) -> bool;
 
+    /// Returns true if the data type is a struct.
     fn is_struct(&self) -> bool;
 
     /// Check whether the given Arrow DataType is fixed stride.
@@ -50,6 +51,9 @@ pub trait DataTypeExt {
     /// A fixed stride type has the same byte width for all array elements
     /// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
     fn is_fixed_stride(&self) -> bool;
+
+    /// Returns true if the [DataType] is a dictionary type.
+    fn is_dictionary(&self) -> bool;
 }
 
 impl DataTypeExt for DataType {
@@ -84,6 +88,10 @@ impl DataTypeExt for DataType {
             | DataType::FixedSizeBinary(_) => true,
             _ => false,
         }
+    }
+
+    fn is_dictionary(&self) -> bool {
+        matches!(self, DataType::Dictionary(_, _))
     }
 }
 

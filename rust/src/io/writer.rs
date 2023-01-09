@@ -27,9 +27,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
-use crate::encodings::binary::BinaryEncoder;
-use crate::encodings::Encoder;
-use crate::encodings::{plain::PlainEncoder, Encoding};
+use crate::encodings::dictionary::DictionaryEncoder;
+use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
 use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
@@ -58,10 +57,6 @@ impl<'a> FileWriter<'a> {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        if self.batch_id == 0 {
-            // Set the dictionary values for the first batch.
-        }
-
         for field in self.schema.fields.as_slice() {
             let column_id = batch.schema().index_of(&field.name)?;
             let array = batch.column(column_id);
@@ -71,11 +66,6 @@ impl<'a> FileWriter<'a> {
         self.batch_id += 1;
         Ok(())
     }
-
-    // pub async fn abort(&self) -> Result<()> {
-    //     // self.object_writer.
-    //     Ok(())
-    // }
 
     pub async fn finish(&mut self) -> Result<()> {
         self.write_footer().await?;
@@ -89,8 +79,7 @@ impl<'a> FileWriter<'a> {
             dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
             dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
             DataType::Dictionary(key_type, value_type) => {
-                self.write_dictionary_arr(field, array, &key_type, &value_type)
-                    .await
+                self.write_dictionary_arr(field, array, &key_type).await
             }
             dt if dt.is_struct() => {
                 let struct_arr = as_struct_array(array);
@@ -125,68 +114,18 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
-    async fn write_dictionary_arr_typed<T: ArrowDictionaryKeyType>(
-        &mut self,
-        field: &Field,
-        array: &ArrayRef,
-    ) -> Result<()> {
-        let dict_arr = as_dictionary_array::<T>(array);
-
-        // // Set dictoinary values on demand.
-        // if field.dictionary.as_ref().map_or(true, |d| d.values.is_none()) {
-        //     field.set_dictionary_values(dict_arr);
-        // }
-        Ok(())
-    }
-
     async fn write_dictionary_arr(
         &mut self,
         field: &Field,
         array: &ArrayRef,
         key_type: &DataType,
-        value_type: &DataType,
     ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
-
-        use DataType::*;
-        match key_type {
-            UInt8 => {
-                self.write_dictionary_arr_typed::<UInt8Type>(field, array)
-                    .await
-            }
-            UInt16 => {
-                self.write_dictionary_arr_typed::<UInt16Type>(field, array)
-                    .await
-            }
-            UInt32 => {
-                self.write_dictionary_arr_typed::<UInt32Type>(field, array)
-                    .await
-            }
-            UInt64 => {
-                self.write_dictionary_arr_typed::<UInt64Type>(field, array)
-                    .await
-            }
-            Int8 => {
-                self.write_dictionary_arr_typed::<Int8Type>(field, array)
-                    .await
-            }
-            Int16 => {
-                self.write_dictionary_arr_typed::<Int16Type>(field, array)
-                    .await
-            }
-            Int32 => {
-                self.write_dictionary_arr_typed::<Int32Type>(field, array)
-                    .await
-            }
-            Int64 => {
-                self.write_dictionary_arr_typed::<Int64Type>(field, array)
-                    .await
-            }
-            _ => Err(Error::Schema(format!(
-                "dictoinary array: unsurpported key type: {:?}",
-                key_type
-            ))),
-        }
+        let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
+        let pos = encoder.encode(array).await?;
+        let page_info = PageInfo::new(pos, array.len());
+        self.page_table.set(field.id, self.batch_id, page_info);
+        Ok(())
     }
 
     #[async_recursion]
