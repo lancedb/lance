@@ -91,9 +91,11 @@ impl<'a> Scanner<'a> {
                     Some(&self.dataset.manifest),
                 )
                 .await
-                .unwrap()
+                .unwrap(),
             );
-            self.reader.as_mut().map(|reader| reader.set_projection(self.projections.clone()));
+            self.reader
+                .as_mut()
+                .map(|reader| reader.set_projection(self.projections.clone()));
         }
 
         if let Some(reader) = &self.reader {

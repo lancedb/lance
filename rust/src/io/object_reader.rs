@@ -90,12 +90,20 @@ impl<'a> ObjectReader<'a> {
         }
 
         let range = pos..min(pos + self.prefetch_size, file_size);
-        let buf = self.object_store.inner.get_range(&self.path, range.clone()).await?;
+        let buf = self
+            .object_store
+            .inner
+            .get_range(&self.path, range.clone())
+            .await?;
         let msg_len = LittleEndian::read_u32(&buf) as usize;
 
         if msg_len + 4 > buf.len() {
-            let remaining_range = range.end..min(4 + pos + msg_len,file_size);
-            let remaining_bytes = self.object_store.inner.get_range(&self.path, remaining_range).await?;
+            let remaining_range = range.end..min(4 + pos + msg_len, file_size);
+            let remaining_bytes = self
+                .object_store
+                .inner
+                .get_range(&self.path, remaining_range)
+                .await?;
             let buf = [buf, remaining_bytes].concat();
             assert!(buf.len() >= msg_len + 4);
             Ok(M::decode(&buf[4..4 + msg_len])?)
