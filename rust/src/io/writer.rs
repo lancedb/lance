@@ -42,35 +42,36 @@ pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) 
     for field_id in 1..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() {
-                if let Some(dict_info) = field.dictionary.as_mut() {
-                    if let Some(value_arr) = dict_info.values.as_ref() {
-                        let data_type = value_arr.data_type();
-                        let pos = match data_type {
-                            dt if dt.is_numeric() => {
-                                let mut encoder = PlainEncoder::new(writer, dt);
-                                encoder.encode(value_arr).await?
-                            }
-                            dt if dt.is_binary_like() => {
-                                let mut encoder = BinaryEncoder::new(writer);
-                                encoder.encode(value_arr).await?
-                            }
-                            _ => {
-                                return Err(Error::IO(format!(
-                                    "Does not support {} as dictionary value type",
-                                    value_arr.data_type()
-                                )));
-                            }
-                        };
-                        dict_info.offset = pos;
-                        dict_info.length = value_arr.len();
-                    } else {
-                    }
-                } else {
-                    panic!(
-                        "Panicking: dictionary field does not have value array: {}",
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
+                    Error::IO(format!("Lance field {} misses dictionary info", field.name))
+                })?;
+
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
+                    Error::IO(format!(
+                        "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
-                    )
-                }
+                    ))
+                })?;
+
+                let data_type = value_arr.data_type();
+                let pos = match data_type {
+                    dt if dt.is_numeric() => {
+                        let mut encoder = PlainEncoder::new(writer, dt);
+                        encoder.encode(value_arr).await?
+                    }
+                    dt if dt.is_binary_like() => {
+                        let mut encoder = BinaryEncoder::new(writer);
+                        encoder.encode(value_arr).await?
+                    }
+                    _ => {
+                        return Err(Error::IO(format!(
+                            "Does not support {} as dictionary value type",
+                            value_arr.data_type()
+                        )));
+                    }
+                };
+                dict_info.offset = pos;
+                dict_info.length = value_arr.len();
             }
         }
     }
@@ -173,7 +174,7 @@ impl<'a> FileWriter<'a> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
 
         if self.batch_id == 0 {
-            // Only load value error for the first batch.
+            // Only load value arrays for the first batch.
             assert!(!self.dictionary_value_arrs.contains_key(&field.id));
             use DataType::*;
             let values = match key_type {
