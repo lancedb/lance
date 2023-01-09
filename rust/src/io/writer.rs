@@ -36,6 +36,47 @@ use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSIO
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
+pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) -> Result<usize> {
+    // Write dictionary values.
+    let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
+    for field_id in 1..max_field_id + 1 {
+        if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
+            if field.data_type().is_dictionary() {
+                if let Some(dict_info) = field.dictionary.as_mut() {
+                    if let Some(value_arr) = dict_info.values.as_ref() {
+                        let data_type = value_arr.data_type();
+                        let pos = match data_type {
+                            dt if dt.is_numeric() => {
+                                let mut encoder = PlainEncoder::new(writer, dt);
+                                encoder.encode(value_arr).await?
+                            }
+                            dt if dt.is_binary_like() => {
+                                let mut encoder = BinaryEncoder::new(writer);
+                                encoder.encode(value_arr).await?
+                            }
+                            _ => {
+                                return Err(Error::IO(format!(
+                                    "Does not support {} as dictionary value type",
+                                    value_arr.data_type()
+                                )));
+                            }
+                        };
+                        dict_info.offset = pos;
+                        dict_info.length = value_arr.len();
+                    } else {
+                    }
+                } else {
+                    panic!(
+                        "Panicking: dictionary field does not have value array: {}",
+                        field.name
+                    )
+                }
+            }
+        }
+    }
+    writer.write_struct(manifest).await
+}
+
 /// [FileWriter] writes Arrow [RecordBatch] to a file.
 pub struct FileWriter<'a> {
     object_writer: ObjectWriter,
@@ -194,8 +235,8 @@ impl<'a> FileWriter<'a> {
             field.set_dictionary_values(value_arrs);
         }
         // Write dictionary values to disk.
-        let manifest = Manifest::new(self.schema);
-        let pos = self.object_writer.write_struct(&manifest).await?;
+        let mut manifest = Manifest::new(&schema);
+        let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
 
         // Step 3. Write metadata.
         self.metadata.manifest_position = Some(pos);

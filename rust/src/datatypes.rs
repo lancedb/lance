@@ -187,9 +187,9 @@ impl TryFrom<&LogicalType> for DataType {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dictionary {
-    offset: usize,
+    pub(crate) offset: usize,
 
-    length: usize,
+    pub(crate) length: usize,
 
     pub(crate) values: Option<ArrayRef>,
 }
@@ -200,6 +200,15 @@ impl From<&pb::Dictionary> for Dictionary {
             offset: proto.offset as usize,
             length: proto.length as usize,
             values: None,
+        }
+    }
+}
+
+impl From<&Dictionary> for pb::Dictionary {
+    fn from(d: &Dictionary) -> Self {
+        Self {
+            offset: d.offset as i64,
+            length: d.length as i64,
         }
     }
 }
@@ -244,7 +253,7 @@ impl Field {
 
     /// Recursively attach Dictionary's value array to the field, so we can later serialize
     /// the dictionary to the manifest.
-    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef)  {
+    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
         assert!(self.data_type().is_dictionary());
         self.dictionary = Some(Dictionary {
             offset: 0,
@@ -458,7 +467,7 @@ impl From<&Field> for pb::Field {
                 _ => 0,
             },
             nullable: field.nullable,
-            dictionary: None,
+            dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
             extension_name: field.extension_name.clone(),
             r#type: 0,
         }

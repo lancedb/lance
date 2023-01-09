@@ -114,9 +114,10 @@ impl<'a> FileReader<'a> {
         let (projection, num_columns) = if let Some(m) = manifest {
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         } else {
-            let m: Manifest = object_reader
+            let mut m: Manifest = object_reader
                 .read_struct(metadata.manifest_position.unwrap())
                 .await?;
+            m.schema.load_dictionary(&object_reader).await?;
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         };
         let page_table = PageTable::load(
