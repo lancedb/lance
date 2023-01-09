@@ -74,7 +74,6 @@ impl<'a> Scanner<'a> {
     }
 
     pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
-        println!("fragment {} of {}", self.fragment_idx, self.fragments.len());
         if self.fragment_idx >= self.fragments.len() {
             return None;
         }
@@ -92,12 +91,12 @@ impl<'a> Scanner<'a> {
                     Some(&self.dataset.manifest),
                 )
                 .await
-                .unwrap(),
+                .unwrap()
             );
+            self.reader.as_mut().map(|reader| reader.set_projection(self.projections.clone()));
         }
 
         if let Some(reader) = &self.reader {
-            println!("batch {} of {}", self.batch_id, reader.num_batches());
             let batch = reader.read_batch(self.batch_id).await;
             self.batch_id += 1;
             if self.batch_id as usize >= reader.num_batches() {
