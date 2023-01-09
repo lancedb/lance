@@ -412,7 +412,7 @@ impl TryFrom<&ArrowField> for Field {
             name: field.name().clone(),
             logical_type: LogicalType::try_from(field.data_type())?,
             encoding: match field.data_type() {
-                dt if dt.is_numeric() => Some(Encoding::Plain),
+                dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
                 _ => None,

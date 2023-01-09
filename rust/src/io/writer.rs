@@ -160,7 +160,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{Float32Array, Int64Array, StringArray};
+    use arrow_array::{BooleanArray, Float32Array, Int64Array, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
 
@@ -169,6 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file() {
         let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("bool", DataType::Boolean, true),
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
             ArrowField::new("b", DataType::Utf8, true),
@@ -190,6 +191,9 @@ mod tests {
         let mut file_writer = FileWriter::new(writer, &schema);
 
         let columns: Vec<ArrayRef> = vec![
+            Arc::new(BooleanArray::from_iter(
+                (0..100).map(|f| Some(f % 3 == 0)).collect::<Vec<_>>(),
+            )),
             Arc::new(Int64Array::from_iter((0..100).collect::<Vec<_>>())),
             Arc::new(Float32Array::from_iter(
                 (0..100).map(|n| n as f32).collect::<Vec<_>>(),
