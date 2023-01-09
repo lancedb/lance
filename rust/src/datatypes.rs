@@ -278,11 +278,7 @@ impl Field {
     fn max_id(&self) -> i32 {
         max(
             self.id,
-            self.children
-                .iter()
-                .map(|c| c.max_id())
-                .max()
-                .unwrap_or(-1),
+            self.children.iter().map(|c| c.max_id()).max().unwrap_or(-1),
         )
     }
 

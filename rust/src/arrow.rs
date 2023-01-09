@@ -83,7 +83,6 @@ impl DataTypeExt for DataType {
             _ => false,
         }
     }
-
 }
 
 pub trait ListArrayExt {

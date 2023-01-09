@@ -160,7 +160,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{BooleanArray, Float32Array, Int64Array, StringArray};
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, DataType};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
 
     use crate::io::{FileReader, ObjectStore};
