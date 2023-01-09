@@ -231,7 +231,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::arrow::*;
     use crate::io::object_writer::ObjectWriter;
 
     #[tokio::test]

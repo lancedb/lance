@@ -18,7 +18,6 @@
 //! Lance Data File Reader
 
 // Standard
-use std::cmp::max;
 use std::ops::Range;
 use std::sync::Arc;
 
