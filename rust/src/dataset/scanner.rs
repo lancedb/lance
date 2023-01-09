@@ -82,7 +82,6 @@ impl<'a> Scanner<'a> {
         // Only support 1 data file (no schema evolution for now);
         assert!(fragment.files.len() == 1);
         let data_file = &fragment.files[0];
-        self.fragment_idx += 1;
         let path = self.dataset.data_dir().child(data_file.path.clone());
         if self.reader.is_none() {
             self.reader = Some(
@@ -94,6 +93,9 @@ impl<'a> Scanner<'a> {
                 .await
                 .unwrap(),
             );
+            self.reader
+                .as_mut()
+                .map(|reader| reader.set_projection(self.projections.clone()));
         }
 
         if let Some(reader) = &self.reader {
