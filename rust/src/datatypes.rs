@@ -505,9 +505,7 @@ impl Schema {
             let first = split[0];
             if let Some(field) = self.field(first) {
                 let projected_field = field.project(&split[1..])?;
-                if let Some(candidate_field) =
-                    candidates.iter_mut().find(|f| f.name == first)
-                {
+                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
                     candidate_field.merge(&projected_field)?;
                 } else {
                     candidates.push(projected_field)
