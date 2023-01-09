@@ -82,8 +82,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Dictionary(key_type, value_type) => {
                 format!(
                     "dict:{}:{}:{}",
-                    LogicalType::try_from(key_type.as_ref())?.0,
-                    LogicalType::try_from(value_type.as_ref())?.0,
+                    Self::try_from(key_type.as_ref())?.0,
+                    Self::try_from(value_type.as_ref())?.0,
                     false
                 )
             }
@@ -447,7 +447,7 @@ impl From<&pb::Field> for Field {
             },
             nullable: field.nullable,
             children: vec![],
-            dictionary: field.dictionary.as_ref().map(|d| Dictionary::from(d)),
+            dictionary: field.dictionary.as_ref().map(Dictionary::from),
         }
     }
 }
@@ -498,7 +498,7 @@ impl Schema {
     /// let schema = Schema::from(...);
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
-    pub fn project(&self, columns: &[&str]) -> Result<Schema> {
+    pub fn project(&self, columns: &[&str]) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = (*col).split('.').collect::<Vec<_>>();
@@ -506,7 +506,7 @@ impl Schema {
             if let Some(field) = self.field(first) {
                 let projected_field = field.project(&split[1..])?;
                 if let Some(candidate_field) =
-                    candidates.iter_mut().filter(|f| f.name == first).next()
+                    candidates.iter_mut().find(|f| f.name == first)
                 {
                     candidate_field.merge(&projected_field)?;
                 } else {
@@ -523,7 +523,7 @@ impl Schema {
         })
     }
 
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Schema> {
+    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
         let protos: Vec<pb::Field> = self.into();
 
         let filtered_protos: Vec<pb::Field> = protos
@@ -531,11 +531,11 @@ impl Schema {
             .filter(|p| column_ids.contains(&p.id))
             .cloned()
             .collect();
-        Ok(Schema::from(&filtered_protos))
+        Ok(Self::from(&filtered_protos))
     }
 
     fn field(&self, name: &str) -> Option<&Field> {
-        self.fields.iter().filter(|f| f.name == name).next()
+        self.fields.iter().find(|f| f.name == name)
     }
 
     pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {

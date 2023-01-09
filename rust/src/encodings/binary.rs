@@ -39,9 +39,9 @@ impl<'a> BinaryEncoder<'a> {
             .downcast_ref::<GenericByteArray<T>>()
             .unwrap();
 
-        let value_offset = self.writer.tell() as usize;
+        let value_offset = self.writer.tell();
         self.writer.write_all(arr.value_data()).await?;
-        let offset = self.writer.tell() as usize;
+        let offset = self.writer.tell();
 
         let offsets = arr.value_offsets();
         let start_offset = offsets[0];

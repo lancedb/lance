@@ -49,7 +49,7 @@ impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
     pub fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
-            return Ok(ObjectStore::memory());
+            return Ok(Self::memory());
         };
 
         let parsed = match Url::parse(uri) {

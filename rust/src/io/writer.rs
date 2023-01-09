@@ -129,7 +129,7 @@ impl<'a> FileWriter<'a> {
             dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
             dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
             DataType::Dictionary(key_type, _) => {
-                self.write_dictionary_arr(field, array, &key_type).await
+                self.write_dictionary_arr(field, array, key_type).await
             }
             dt if dt.is_struct() => {
                 let struct_arr = as_struct_array(array);
@@ -231,7 +231,7 @@ impl<'a> FileWriter<'a> {
         for (field_id, value_arrs) in &self.dictionary_value_arrs {
             let field = schema
                 .mut_field_by_id(*field_id)
-                .ok_or(Error::IO("Schema mismatch".to_string()))?;
+                .ok_or_else(|| Error::IO("Schema mismatch".to_string()))?;
             field.set_dictionary_values(value_arrs);
         }
         // Write dictionary values to disk.

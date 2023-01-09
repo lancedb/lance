@@ -55,10 +55,6 @@ impl PageTable {
         num_columns: i32,
         num_batches: i32,
     ) -> Result<Self> {
-        println!(
-            "Loading page table: columns={} batches={}",
-            num_columns, num_batches
-        );
         let length = num_columns * num_batches * 2;
         let decoder = PlainDecoder::new(reader, &DataType::Int64, position, length as usize)?;
         let raw_arr = decoder.decode().await?;
@@ -118,12 +114,10 @@ impl PageTable {
 
     /// Set page lookup info for a page identified by `(column, batch)` pair.
     pub fn set(&mut self, column: i32, batch: i32, page_info: PageInfo) {
-        if !self.pages.contains_key(&column) {
-            self.pages.insert(column, BTreeMap::default());
-        }
         self.pages
-            .get_mut(&column)
-            .map(|c_map| c_map.insert(batch, page_info));
+            .entry(column)
+            .or_insert_with(BTreeMap::default)
+            .insert(batch, page_info);
     }
 
     pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
