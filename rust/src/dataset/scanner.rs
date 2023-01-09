@@ -74,6 +74,7 @@ impl<'a> Scanner<'a> {
     }
 
     pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
+        println!("fragment {} of {}", self.fragment_idx, self.fragments.len());
         if self.fragment_idx >= self.fragments.len() {
             return None;
         }
@@ -82,7 +83,6 @@ impl<'a> Scanner<'a> {
         // Only support 1 data file (no schema evolution for now);
         assert!(fragment.files.len() == 1);
         let data_file = &fragment.files[0];
-        self.fragment_idx += 1;
         let path = self.dataset.data_dir().child(data_file.path.clone());
         if self.reader.is_none() {
             self.reader = Some(
@@ -97,6 +97,7 @@ impl<'a> Scanner<'a> {
         }
 
         if let Some(reader) = &self.reader {
+            println!("batch {} of {}", self.batch_id, reader.num_batches());
             let batch = reader.read_batch(self.batch_id).await;
             self.batch_id += 1;
             if self.batch_id as usize >= reader.num_batches() {
