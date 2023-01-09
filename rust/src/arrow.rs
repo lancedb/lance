@@ -20,8 +20,8 @@
 //! To improve Arrow-RS egonomitic
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
-    UInt8Array,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, Int64Array,
+    LargeListArray, ListArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -58,10 +58,8 @@ pub trait DataTypeExt {
 
 impl DataTypeExt for DataType {
     fn is_binary_like(&self) -> bool {
-        matches!(
-            self,
-            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary
-        )
+        use DataType::*;
+        matches!(self, Utf8 | Binary | LargeUtf8 | LargeBinary)
     }
 
     fn is_struct(&self) -> bool {
@@ -105,7 +103,7 @@ pub trait ListArrayExt {
     ///
     /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
     /// let int_values = Int64Array::from_iter(0..10);
-    /// let list_arr = ListArray::new(int_values, &offsets).unwrap();
+    /// let list_arr = ListArray::try_new(int_values, &offsets).unwrap();
     /// assert_eq!(list_arr,
     ///     ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
     ///         Some(vec![Some(0), Some(1)]),
@@ -113,12 +111,33 @@ pub trait ListArrayExt {
     ///         Some(vec![Some(7), Some(8), Some(9)]),
     /// ]))
     /// ```
-    fn new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
+    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
 }
 
 impl ListArrayExt for ListArray {
-    fn new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
+    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        ))))
+        .len(offsets.len() - 1)
+        .add_buffer(offsets.into_data().buffers()[0].clone())
+        .add_child_data(values.into_data().clone())
+        .build()?;
+
+        Ok(Self::from(data))
+    }
+}
+
+// TODO: merge with ListArrayExt?;
+pub trait LargeListArrayExt {
+    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<LargeListArray>;
+}
+
+impl LargeListArrayExt for LargeListArray {
+    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
+        let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
             "item",
             values.data_type().clone(),
             true,
@@ -141,7 +160,7 @@ pub trait FixedSizeListArrayExt {
     /// use lance::arrow::FixedSizeListArrayExt;
     ///
     /// let int_values = Int64Array::from_iter(0..10);
-    /// let fixed_size_list_arr = FixedSizeListArray::new(int_values, 2).unwrap();
+    /// let fixed_size_list_arr = FixedSizeListArray::try_new(int_values, 2).unwrap();
     /// assert_eq!(fixed_size_list_arr,
     ///     FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(vec![
     ///         Some(vec![Some(0), Some(1)]),
@@ -151,11 +170,11 @@ pub trait FixedSizeListArrayExt {
     ///         Some(vec![Some(8), Some(9)])
     /// ], 2))
     /// ```
-    fn new<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
+    fn try_new<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
-    fn new<T: Array>(values: T, list_size: i32) -> Result<Self> {
+    fn try_new<T: Array>(values: T, list_size: i32) -> Result<Self> {
         let list_type = DataType::FixedSizeList(
             Box::new(Field::new("item", values.data_type().clone(), true)),
             list_size,
@@ -178,7 +197,7 @@ pub trait FixedSizeBinaryArrayExt {
     /// use lance::arrow::FixedSizeBinaryArrayExt;
     ///
     /// let int_values = UInt8Array::from_iter(0..10);
-    /// let fixed_size_list_arr = FixedSizeBinaryArray::new(&int_values, 2).unwrap();
+    /// let fixed_size_list_arr = FixedSizeBinaryArray::try_new(&int_values, 2).unwrap();
     /// assert_eq!(fixed_size_list_arr,
     ///     FixedSizeBinaryArray::from(vec![
     ///         Some(vec![0, 1].as_slice()),
@@ -188,11 +207,11 @@ pub trait FixedSizeBinaryArrayExt {
     ///         Some(vec![8, 9].as_slice())
     /// ]))
     /// ```
-    fn new(values: &UInt8Array, stride: i32) -> Result<FixedSizeBinaryArray>;
+    fn try_new(values: &UInt8Array, stride: i32) -> Result<FixedSizeBinaryArray>;
 }
 
 impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
-    fn new(values: &UInt8Array, stride: i32) -> Result<Self> {
+    fn try_new(values: &UInt8Array, stride: i32) -> Result<Self> {
         let data_type = DataType::FixedSizeBinary(stride);
         let data = ArrayDataBuilder::new(data_type)
             .len(values.len() / stride as usize)

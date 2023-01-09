@@ -162,7 +162,7 @@ impl<'a> PlainDecoder<'a> {
             self.length * (*list_size) as usize,
         )?;
         let item_array = item_decoder.decode().await?;
-        Ok(Arc::new(FixedSizeListArray::new(item_array, *list_size)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeListArray::try_new(item_array, *list_size)?) as ArrayRef)
     }
 
     async fn decode_fixed_size_binary(&self, stride: &i32) -> Result<ArrayRef> {
@@ -179,7 +179,7 @@ impl<'a> PlainDecoder<'a> {
             .ok_or_else(|| {
                 Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
             })?;
-        Ok(Arc::new(FixedSizeBinaryArray::new(values, *stride)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, *stride)?) as ArrayRef)
     }
 }
 
@@ -297,7 +297,7 @@ mod tests {
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
             let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
             test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
         }
@@ -308,13 +308,13 @@ mod tests {
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::new(items, 3).unwrap();
+            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
             let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
             test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
         }
 
         let items = BooleanArray::from(vec![true, false, true].repeat(42));
-        let arr = FixedSizeListArray::new(items, 3).unwrap();
+        let arr = FixedSizeListArray::try_new(items, 3).unwrap();
         let list_type =
             DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
         test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
@@ -324,7 +324,7 @@ mod tests {
     async fn test_encode_decode_fixed_size_binary_array() {
         let t = DataType::FixedSizeBinary(3);
         let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
-        let arr = FixedSizeBinaryArray::new(&values, 3).unwrap();
+        let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
     }
 
@@ -334,16 +334,19 @@ mod tests {
         let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = Int64Array::from_iter_values(1..=120 as i64);
-        let arr = FixedSizeListArray::new(FixedSizeListArray::new(values, 2).unwrap(), 2).unwrap();
+        let arr = FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
+            .unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
 
         // FixedSizeList of FixedSizeBinary
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr =
-            FixedSizeListArray::new(FixedSizeBinaryArray::new(&values, 2).unwrap().borrow(), 2)
-                .unwrap();
+        let arr = FixedSizeListArray::try_new(
+            FixedSizeBinaryArray::try_new(&values, 2).unwrap().borrow(),
+            2,
+        )
+        .unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
     }
 

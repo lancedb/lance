@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{ArrayRef, ListArray, RecordBatch, StructArray};
+use arrow_array::{ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
@@ -224,6 +224,7 @@ impl<'a> FileReader<'a> {
 
     async fn read_list_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
+
         let position_arr = self
             .object_reader
             .read_fixed_stride_array(&DataType::Int32, page_info.position, page_info.length)
@@ -234,7 +235,23 @@ impl<'a> FileReader<'a> {
         let offset_arr = subtract_scalar(positions, start_position)?;
         let value_arrs = self.read_array(&field.children[0], batch_id).await?;
 
-        Ok(Arc::new(ListArray::new(value_arrs, &offset_arr)?))
+        Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
+    }
+
+    // TODO: merge with [read_list_array]?
+    async fn read_large_list_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
+        let page_info = self.page_info(field, batch_id)?;
+        let position_arr = self
+            .object_reader
+            .read_fixed_stride_array(&DataType::Int64, page_info.position, page_info.length)
+            .await?;
+        let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
+        let start_position = positions.value(0);
+        // Compute offsets
+        let offset_arr = subtract_scalar(positions, start_position)?;
+        let value_arrs = self.read_array(&field.children[0], batch_id).await?;
+
+        Ok(Arc::new(LargeListArray::try_new(value_arrs, &offset_arr)?))
     }
 
     /// Read an array of the batch.
@@ -254,6 +271,7 @@ impl<'a> FileReader<'a> {
                 Struct(_) => self.read_struct_array(field, batch_id).await,
                 Dictionary(_, _) => self.read_dictionary_array(field, batch_id).await,
                 List(_) => self.read_list_array(field, batch_id).await,
+                LargeList(_) => self.read_large_list_array(field, batch_id).await,
                 _ => {
                     unimplemented!("{}", format!("No support for {data_type} yet"));
                 }

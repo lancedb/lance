@@ -31,6 +31,10 @@ impl LogicalType {
         self.0 == "list" || self.0 == "list.struct"
     }
 
+    fn is_large_list(&self) -> bool {
+        self.0 == "large_list" || self.0 == "large_list.struct"
+    }
+
     fn is_struct(&self) -> bool {
         self.0 == "struct"
     }
@@ -91,6 +95,10 @@ impl TryFrom<&DataType> for LogicalType {
                 DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
             },
+            DataType::LargeList(elem) => match elem.data_type() {
+                DataType::Struct(_) => "large_list.struct".to_string(),
+                _ => "large_list".to_string(),
+            },
             DataType::FixedSizeList(dt, len) => format!(
                 "fixed_size_list:{}:{}",
                 LogicalType::try_from(dt.data_type())?.0,
@@ -100,7 +108,7 @@ impl TryFrom<&DataType> for LogicalType {
             _ => return Err(Error::Schema(format!("Unsupport data type: {:?}", dt))),
         };
 
-        Ok(Self(type_str.to_string()))
+        Ok(Self(type_str))
     }
 }
 
@@ -141,7 +149,7 @@ impl TryFrom<&LogicalType> for DataType {
         } {
             Ok(t)
         } else {
-            let splits = lt.0.split(":").collect::<Vec<_>>();
+            let splits = lt.0.split(':').collect::<Vec<_>>();
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
@@ -173,10 +181,7 @@ impl TryFrom<&LogicalType> for DataType {
                     } else {
                         let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
                         let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
-                        Ok(DataType::Dictionary(
-                            Box::new(index_type),
-                            Box::new(value_type),
-                        ))
+                        Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
                     }
                 }
                 _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
@@ -236,6 +241,9 @@ impl Field {
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {
             lt if lt.is_list() => DataType::List(Box::new(ArrowField::from(&self.children[0]))),
+            lt if lt.is_large_list() => {
+                DataType::LargeList(Box::new(ArrowField::from(&self.children[0])))
+            }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
             }
@@ -262,8 +270,8 @@ impl Field {
         });
     }
 
-    fn project(&self, path_components: &[&str]) -> Result<Field> {
-        let mut f = Field {
+    fn project(&self, path_components: &[&str]) -> Result<Self> {
+        let mut f = Self {
             name: self.name.clone(),
             id: self.id,
             parent_id: self.parent_id,
@@ -403,6 +411,7 @@ impl TryFrom<&ArrowField> for Field {
                 children.iter().map(Self::try_from).collect::<Result<_>>()?
             }
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
+            DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
         };
         Ok(Self {
@@ -414,6 +423,8 @@ impl TryFrom<&ArrowField> for Field {
                 dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
+                // Use plain encoder to store the offsets of list.
+                DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
             extension_name: "".to_string(),
@@ -477,7 +488,7 @@ impl From<&Field> for pb::Field {
 impl From<&Field> for Vec<pb::Field> {
     fn from(field: &Field) -> Self {
         let mut protos = vec![pb::Field::from(field)];
-        protos.extend(field.children.iter().flat_map(|c| Self::from(c)));
+        protos.extend(field.children.iter().flat_map(Self::from));
         protos
     }
 }
@@ -515,7 +526,7 @@ impl Schema {
             }
         }
 
-        Ok(Schema {
+        Ok(Self {
             fields: candidates,
             metadata: self.metadata.clone(),
         })
