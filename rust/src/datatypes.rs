@@ -108,7 +108,7 @@ impl TryFrom<&DataType> for LogicalType {
             _ => return Err(Error::Schema(format!("Unsupport data type: {:?}", dt))),
         };
 
-        Ok(Self(type_str.to_string()))
+        Ok(Self(type_str))
     }
 }
 
@@ -149,7 +149,7 @@ impl TryFrom<&LogicalType> for DataType {
         } {
             Ok(t)
         } else {
-            let splits = lt.0.split(":").collect::<Vec<_>>();
+            let splits = lt.0.split(':').collect::<Vec<_>>();
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
@@ -181,7 +181,7 @@ impl TryFrom<&LogicalType> for DataType {
                     } else {
                         let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
                         let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
-                        Ok(DataType::Dictionary(
+                        Ok(Dictionary(
                             Box::new(index_type),
                             Box::new(value_type),
                         ))
@@ -273,8 +273,8 @@ impl Field {
         });
     }
 
-    fn project(&self, path_components: &[&str]) -> Result<Field> {
-        let mut f = Field {
+    fn project(&self, path_components: &[&str]) -> Result<Self> {
+        let mut f = Self {
             name: self.name.clone(),
             id: self.id,
             parent_id: self.parent_id,
@@ -491,7 +491,7 @@ impl From<&Field> for pb::Field {
 impl From<&Field> for Vec<pb::Field> {
     fn from(field: &Field) -> Self {
         let mut protos = vec![pb::Field::from(field)];
-        protos.extend(field.children.iter().flat_map(|c| Self::from(c)));
+        protos.extend(field.children.iter().flat_map(Self::from));
         protos
     }
 }
@@ -529,7 +529,7 @@ impl Schema {
             }
         }
 
-        Ok(Schema {
+        Ok(Self {
             fields: candidates,
             metadata: self.metadata.clone(),
         })

@@ -230,7 +230,7 @@ impl<'a> FileWriter<'a> {
 
     async fn write_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let list_arr = as_list_array(array);
-        let offsets: Int32Array = list_arr.value_offsets().iter().map(|o| *o).collect();
+        let offsets: Int32Array = list_arr.value_offsets().iter().copied().collect();
         assert!(!offsets.is_empty());
         let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
         self.write_fixed_stride_array(field, &offsets).await?;
@@ -240,7 +240,7 @@ impl<'a> FileWriter<'a> {
 
     async fn write_large_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let list_arr = as_large_list_array(array);
-        let offsets: Int64Array = list_arr.value_offsets().iter().map(|o| *o).collect();
+        let offsets: Int64Array = list_arr.value_offsets().iter().copied().collect();
         assert!(!offsets.is_empty());
         let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
         self.write_fixed_stride_array(field, &offsets).await?;
