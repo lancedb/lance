@@ -173,7 +173,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{BooleanArray, Float32Array, Int64Array, StringArray};
+    use arrow_array::{
+        types::UInt32Type, BooleanArray, DictionaryArray, Float32Array, Int64Array, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
 
@@ -186,6 +188,11 @@ mod tests {
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
             ArrowField::new("b", DataType::Utf8, true),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            ),
             ArrowField::new(
                 "s",
                 DataType::Struct(vec![
@@ -203,6 +210,9 @@ mod tests {
 
         let mut file_writer = FileWriter::new(writer, &schema);
 
+        let dict_vec = (0..100).into_iter().map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
+        let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
+
         let columns: Vec<ArrayRef> = vec![
             Arc::new(BooleanArray::from_iter(
                 (0..100).map(|f| Some(f % 3 == 0)).collect::<Vec<_>>(),
@@ -214,6 +224,7 @@ mod tests {
             Arc::new(StringArray::from(
                 (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
             )),
+            Arc::new(dict_arr),
             Arc::new(StructArray::from(vec![
                 (
                     ArrowField::new("si", DataType::Int64, true),

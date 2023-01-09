@@ -2,8 +2,8 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt;
 use std::fmt::Formatter;
+use std::fmt::{self, format};
 
 use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{
@@ -83,6 +83,14 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Time64(tu) => format!("time64:{}", timeunit_to_str(tu)),
             DataType::Timestamp(tu, _) => format!("timestamp:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
+            DataType::Dictionary(key_type, value_type) => {
+                format!(
+                    "dict:{}:{}:{}",
+                    LogicalType::try_from(key_type.as_ref())?.0,
+                    LogicalType::try_from(value_type.as_ref())?.0,
+                    false
+                )
+            }
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
@@ -275,10 +283,13 @@ impl Field {
                 let struct_arr = as_struct_array(arr);
                 assert!(self.logical_type.is_struct());
                 for field in &mut self.children {
-                    if let Some(sub_array)  = struct_arr.column_by_name(&field.name) {
+                    if let Some(sub_array) = struct_arr.column_by_name(&field.name) {
                         field.set_dictionary_values(sub_array)?;
                     } else {
-                        return Err(Error::Schema(format!("Struct array does not have field: {}", field.name)));
+                        return Err(Error::Schema(format!(
+                            "Struct array does not have field: {}",
+                            field.name
+                        )));
                     }
                 }
                 Ok(())
