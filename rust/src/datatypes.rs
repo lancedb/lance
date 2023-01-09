@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, DictionaryArray};
+use arrow_array::types::ArrowDictionaryKeyType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -177,7 +178,7 @@ impl TryFrom<&LogicalType> for DataType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dictionary {
     offset: usize,
 
@@ -232,6 +233,17 @@ impl Field {
 
     pub fn child_mut(&mut self, name: &str) -> Option<&mut Field> {
         self.children.iter_mut().find(|f| f.name == name)
+    }
+
+    pub fn set_dictionary_values<T: ArrowDictionaryKeyType>(&mut self, arr: &DictionaryArray<T>) {
+        if self.dictionary.is_none() {
+            self.dictionary = Some(Dictionary::default());
+        }
+        if let Some(dict_meta) = self.dictionary.as_mut() {
+            if dict_meta.values.is_none() {
+                dict_meta.values = Some(arr.values().clone())
+            }
+        }
     }
 
     fn project(&self, path_components: &[&str]) -> Result<Field> {

@@ -15,8 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::cast::as_struct_array;
+
+use arrow_array::cast::{as_dictionary_array, as_struct_array};
+use arrow_array::types::{
+    ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+    UInt64Type, UInt8Type,
+};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use tokio::io::AsyncWriteExt;
 
@@ -29,7 +35,7 @@ use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSIO
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
-/// FileWriter writes Arrow Table to a file.
+/// [FileWriter] writes Arrow [RecordBatch] to a file.
 pub struct FileWriter<'a> {
     object_writer: ObjectWriter,
     schema: &'a Schema,
@@ -53,7 +59,11 @@ impl<'a> FileWriter<'a> {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        for field in &self.schema.fields {
+        // if self.batch_id == 0 {
+        //     // Try to set dictionary values.
+        // }
+
+        for field in self.schema.fields.as_slice() {
             let column_id = batch.schema().index_of(&field.name)?;
             let array = batch.column(column_id);
             self.write_array(field, array).await?;
@@ -76,16 +86,24 @@ impl<'a> FileWriter<'a> {
     #[async_recursion]
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let data_type = array.data_type();
-        if data_type.is_fixed_stride() {
-            self.write_fixed_stride_array(field, array).await?;
-        } else if data_type.is_struct() {
-            let struct_arr = as_struct_array(array);
-            self.write_struct_array(field, struct_arr).await?;
-        } else if data_type.is_binary_like() {
-            self.write_binary_array(field, array).await?;
-        };
-
-        Ok(())
+        match data_type {
+            dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
+            dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
+            DataType::Dictionary(key_type, value_type) => {
+                self.write_dictionary_arr(field, array, &key_type, &value_type)
+                    .await
+            }
+            dt if dt.is_struct() => {
+                let struct_arr = as_struct_array(array);
+                self.write_struct_array(field, struct_arr).await
+            }
+            _ => {
+                return Err(Error::Schema(format!(
+                    "FileWriter::write: unsupported data type: {:?}",
+                    data_type
+                )))
+            }
+        }
     }
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
@@ -108,6 +126,70 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
+    async fn write_dictionary_arr_typed<T: ArrowDictionaryKeyType>(
+        &mut self,
+        field: &Field,
+        array: &ArrayRef,
+    ) -> Result<()> {
+        let dict_arr = as_dictionary_array::<T>(array);
+
+        // // Set dictoinary values on demand.
+        // if field.dictionary.as_ref().map_or(true, |d| d.values.is_none()) {
+        //     field.set_dictionary_values(dict_arr);
+        // }
+        Ok(())
+    }
+
+    async fn write_dictionary_arr(
+        &mut self,
+        field: &Field,
+        array: &ArrayRef,
+        key_type: &DataType,
+        value_type: &DataType,
+    ) -> Result<()> {
+        assert_eq!(field.encoding, Some(Encoding::Dictionary));
+
+        use DataType::*;
+        match key_type {
+            UInt8 => {
+                self.write_dictionary_arr_typed::<UInt8Type>(field, array)
+                    .await
+            }
+            UInt16 => {
+                self.write_dictionary_arr_typed::<UInt16Type>(field, array)
+                    .await
+            }
+            UInt32 => {
+                self.write_dictionary_arr_typed::<UInt32Type>(field, array)
+                    .await
+            }
+            UInt64 => {
+                self.write_dictionary_arr_typed::<UInt64Type>(field, array)
+                    .await
+            }
+            Int8 => {
+                self.write_dictionary_arr_typed::<Int8Type>(field, array)
+                    .await
+            }
+            Int16 => {
+                self.write_dictionary_arr_typed::<Int16Type>(field, array)
+                    .await
+            }
+            Int32 => {
+                self.write_dictionary_arr_typed::<Int32Type>(field, array)
+                    .await
+            }
+            Int64 => {
+                self.write_dictionary_arr_typed::<Int64Type>(field, array)
+                    .await
+            }
+            _ => Err(Error::Schema(format!(
+                "dictoinary array: unsurpported key type: {:?}",
+                key_type
+            ))),
+        }
+    }
+
     #[async_recursion]
     async fn write_struct_array(&mut self, field: &Field, array: &StructArray) -> Result<()> {
         assert_eq!(array.num_columns(), field.children.len());
@@ -126,21 +208,19 @@ impl<'a> FileWriter<'a> {
     }
 
     async fn write_footer(&mut self) -> Result<()> {
-        // Step 1. write dictionary values.
-
-        // Step 2. Write page table.
+        // Step 1. Write page table.
         let pos = self.page_table.write(&mut self.object_writer).await?;
         self.metadata.page_table_position = pos;
 
-        // Step 3. Write manifest.
+        // Step 2. Write manifest and dictionary values.
         let manifest = Manifest::new(self.schema);
         let pos = self.object_writer.write_struct(&manifest).await?;
 
-        // Step 4. Write metadata.
+        // Step 3. Write metadata.
         self.metadata.manifest_position = Some(pos);
         let pos = self.object_writer.write_struct(&self.metadata).await?;
 
-        // Step 5. Write magics.
+        // Step 4. Write magics.
         self.write_magics(pos).await
     }
 
