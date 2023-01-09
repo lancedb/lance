@@ -28,12 +28,13 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
-pub mod reader;
+mod reader;
 mod writer;
 
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
+pub use reader::read_manifest;
 pub use reader::FileReader;
 pub use writer::FileWriter;
 

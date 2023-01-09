@@ -10,7 +10,7 @@ use self::scanner::Scanner;
 use crate::datatypes::Schema;
 use crate::error::Result;
 use crate::format::{Fragment, Manifest};
-use crate::io::reader::read_manifest;
+use crate::io::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
 
 pub mod scanner;

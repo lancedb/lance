@@ -2,8 +2,8 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt;
 use std::fmt::Formatter;
+use std::fmt::{self};
 
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -79,6 +79,14 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Time64(tu) => format!("time64:{}", timeunit_to_str(tu)),
             DataType::Timestamp(tu, _) => format!("timestamp:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
+            DataType::Dictionary(key_type, value_type) => {
+                format!(
+                    "dict:{}:{}:{}",
+                    Self::try_from(key_type.as_ref())?.0,
+                    Self::try_from(value_type.as_ref())?.0,
+                    false
+                )
+            }
             DataType::List(elem) => match elem.data_type() {
                 DataType::Struct(_) => "list.struct".to_string(),
                 _ => "list".to_string(),
@@ -163,8 +171,8 @@ impl TryFrom<&LogicalType> for DataType {
                     if splits.len() != 4 {
                         Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
                     } else {
-                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
-                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
+                        let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(DataType::Dictionary(
                             Box::new(index_type),
                             Box::new(value_type),
@@ -177,11 +185,11 @@ impl TryFrom<&LogicalType> for DataType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dictionary {
-    offset: usize,
+    pub(crate) offset: usize,
 
-    length: usize,
+    pub(crate) length: usize,
 
     pub(crate) values: Option<ArrayRef>,
 }
@@ -192,6 +200,15 @@ impl From<&pb::Dictionary> for Dictionary {
             offset: proto.offset as usize,
             length: proto.length as usize,
             values: None,
+        }
+    }
+}
+
+impl From<&Dictionary> for pb::Dictionary {
+    fn from(d: &Dictionary) -> Self {
+        Self {
+            offset: d.offset as i64,
+            length: d.length as i64,
         }
     }
 }
@@ -232,6 +249,17 @@ impl Field {
 
     pub fn child_mut(&mut self, name: &str) -> Option<&mut Field> {
         self.children.iter_mut().find(|f| f.name == name)
+    }
+
+    /// Recursively attach Dictionary's value array to the field, so we can later serialize
+    /// the dictionary to the manifest.
+    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
+        assert!(self.data_type().is_dictionary());
+        self.dictionary = Some(Dictionary {
+            offset: 0,
+            length: 0,
+            values: Some(arr.clone()),
+        });
     }
 
     fn project(&self, path_components: &[&str]) -> Result<Field> {
@@ -419,7 +447,7 @@ impl From<&pb::Field> for Field {
             },
             nullable: field.nullable,
             children: vec![],
-            dictionary: field.dictionary.as_ref().map(|d| Dictionary::from(d)),
+            dictionary: field.dictionary.as_ref().map(Dictionary::from),
         }
     }
 }
@@ -439,7 +467,7 @@ impl From<&Field> for pb::Field {
                 _ => 0,
             },
             nullable: field.nullable,
-            dictionary: None,
+            dictionary: field.dictionary.as_ref().map(pb::Dictionary::from),
             extension_name: field.extension_name.clone(),
             r#type: 0,
         }
@@ -470,16 +498,14 @@ impl Schema {
     /// let schema = Schema::from(...);
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
-    pub fn project(&self, columns: &[&str]) -> Result<Schema> {
+    pub fn project(&self, columns: &[&str]) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = (*col).split('.').collect::<Vec<_>>();
             let first = split[0];
             if let Some(field) = self.field(first) {
                 let projected_field = field.project(&split[1..])?;
-                if let Some(candidate_field) =
-                    candidates.iter_mut().filter(|f| f.name == first).next()
-                {
+                if let Some(candidate_field) = candidates.iter_mut().find(|f| f.name == first) {
                     candidate_field.merge(&projected_field)?;
                 } else {
                     candidates.push(projected_field)
@@ -495,7 +521,7 @@ impl Schema {
         })
     }
 
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Schema> {
+    pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
         let protos: Vec<pb::Field> = self.into();
 
         let filtered_protos: Vec<pb::Field> = protos
@@ -503,14 +529,14 @@ impl Schema {
             .filter(|p| column_ids.contains(&p.id))
             .cloned()
             .collect();
-        Ok(Schema::from(&filtered_protos))
+        Ok(Self::from(&filtered_protos))
     }
 
     fn field(&self, name: &str) -> Option<&Field> {
-        self.fields.iter().filter(|f| f.name == name).next()
+        self.fields.iter().find(|f| f.name == name)
     }
 
-    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+    pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
         for field in self.fields.as_mut_slice() {
             if field.id == id {
                 return Some(field);

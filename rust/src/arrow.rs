@@ -20,7 +20,8 @@
 //! To improve Arrow-RS egonomitic
 
 use arrow_array::{
-    Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
+    UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -42,12 +43,17 @@ pub trait DataTypeExt {
     /// ```
     fn is_binary_like(&self) -> bool;
 
+    /// Returns true if the data type is a struct.
     fn is_struct(&self) -> bool;
 
     /// Check whether the given Arrow DataType is fixed stride.
+    ///
     /// A fixed stride type has the same byte width for all array elements
     /// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
     fn is_fixed_stride(&self) -> bool;
+
+    /// Returns true if the [DataType] is a dictionary type.
+    fn is_dictionary(&self) -> bool;
 }
 
 impl DataTypeExt for DataType {
@@ -82,6 +88,10 @@ impl DataTypeExt for DataType {
             | DataType::FixedSizeBinary(_) => true,
             _ => false,
         }
+    }
+
+    fn is_dictionary(&self) -> bool {
+        matches!(self, DataType::Dictionary(_, _))
     }
 }
 
@@ -189,5 +199,22 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
             .add_buffer(values.data().buffers()[0].clone())
             .build()?;
         Ok(Self::from(data))
+    }
+}
+
+/// Extends Arrow's [RecordBatch].
+pub trait RecordBatchExt {
+    /// Get a column by its name.
+    ///
+    /// Returns None if the column does not exist.
+    fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
+}
+
+impl RecordBatchExt for RecordBatch {
+    fn column_with_name(&self, name: &str) -> Option<&ArrayRef> {
+        self.schema()
+            .index_of(name)
+            .ok()
+            .map(|idx| self.column(idx))
     }
 }

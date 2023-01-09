@@ -24,7 +24,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::error::Result;
 use crate::format::Fragment;
-use crate::io::reader::FileReader;
+use crate::io::FileReader;
 
 /// Dataset Scanner
 ///
