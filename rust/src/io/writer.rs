@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 use arrow_array::cast::{as_dictionary_array, as_struct_array};
 use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
@@ -59,9 +58,9 @@ impl<'a> FileWriter<'a> {
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        // if self.batch_id == 0 {
-        //     // Try to set dictionary values.
-        // }
+        if self.batch_id == 0 {
+            // Set the dictionary values for the first batch.
+        }
 
         for field in self.schema.fields.as_slice() {
             let column_id = batch.schema().index_of(&field.name)?;

@@ -20,7 +20,8 @@
 //! To improve Arrow-RS egonomitic
 
 use arrow_array::{
-    Array, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, UInt8Array,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
+    UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -189,5 +190,20 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
             .add_buffer(values.data().buffers()[0].clone())
             .build()?;
         Ok(Self::from(data))
+    }
+}
+
+/// Extends Arrow's [RecordBatch].
+pub trait RecordBatchExt {
+    /// Get a column by its name.
+    fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
+}
+
+impl RecordBatchExt for RecordBatch {
+    fn column_with_name(&self, name: &str) -> Option<&ArrayRef> {
+        self.schema()
+            .index_of(name)
+            .ok()
+            .map(|idx| self.column(idx))
     }
 }
