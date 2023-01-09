@@ -46,6 +46,7 @@ pub trait DataTypeExt {
     fn is_struct(&self) -> bool;
 
     /// Check whether the given Arrow DataType is fixed stride.
+    ///
     /// A fixed stride type has the same byte width for all array elements
     /// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
     fn is_fixed_stride(&self) -> bool;
@@ -196,6 +197,8 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Get a column by its name.
+    ///
+    /// Returns None if the column does not exist.
     fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
 }
 
