@@ -234,7 +234,7 @@ impl<'a> FileReader<'a> {
         let offset_arr = subtract_scalar(positions, start_position)?;
         let value_arrs = self.read_array(&field.children[0], batch_id).await?;
 
-        Ok(Arc::new(ListArray::new(value_arrs, &offset_arr)?))
+        Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
     }
 
     /// Read an array of the batch.
