@@ -224,6 +224,7 @@ impl<'a> FileReader<'a> {
 
     async fn read_list_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
+
         let position_arr = self
             .object_reader
             .read_fixed_stride_array(&DataType::Int32, page_info.position, page_info.length)
@@ -237,6 +238,7 @@ impl<'a> FileReader<'a> {
         Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
     }
 
+    // TODO: merge with [read_list_array]?
     async fn read_large_list_array(&self, field: &Field, batch_id: i32) -> Result<ArrayRef> {
         let page_info = self.page_info(field, batch_id)?;
         let position_arr = self
