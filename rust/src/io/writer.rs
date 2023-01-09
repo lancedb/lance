@@ -133,7 +133,7 @@ impl<'a> FileWriter<'a> {
 
         if self.batch_id == 0 {
             // Only load value error for the first batch.
-            assert!(self.dictionary_value_arrs.contains_key(&field.id));
+            assert!(!self.dictionary_value_arrs.contains_key(&field.id));
             use DataType::*;
             let values = match key_type {
                 UInt8 => as_dictionary_array::<UInt8Type>(array).values(),
@@ -185,6 +185,15 @@ impl<'a> FileWriter<'a> {
         self.metadata.page_table_position = pos;
 
         // Step 2. Write manifest and dictionary values.
+        // Populate schema
+        let mut schema = self.schema.clone();
+        for (field_id, value_arrs) in &self.dictionary_value_arrs {
+            let field = schema
+                .mut_field_by_id(*field_id)
+                .ok_or(Error::IO("Schema mismatch".to_string()))?;
+            field.set_dictionary_values(value_arrs);
+        }
+        // Write dictionary values to disk.
         let manifest = Manifest::new(self.schema);
         let pos = self.object_writer.write_struct(&manifest).await?;
 
@@ -240,7 +249,7 @@ mod tests {
                 true,
             ),
         ]);
-        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
@@ -278,7 +287,6 @@ mod tests {
             ])),
         ];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
-        schema.set_dictionary_values(&batch).unwrap();
         let mut file_writer = FileWriter::new(writer, &schema);
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();

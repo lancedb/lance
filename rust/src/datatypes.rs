@@ -3,17 +3,13 @@
 use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::Formatter;
-use std::fmt::{self, format};
+use std::fmt::{self};
 
-use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array, as_struct_array};
-use arrow_array::types::{
-    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-};
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
-use crate::arrow::{DataTypeExt, RecordBatchExt};
+use crate::arrow::DataTypeExt;
 use crate::encodings::Encoding;
 use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
@@ -248,65 +244,13 @@ impl Field {
 
     /// Recursively attach Dictionary's value array to the field, so we can later serialize
     /// the dictionary to the manifest.
-    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) -> Result<()> {
-        assert_eq!(&self.data_type(), arr.data_type());
-
-        match arr.data_type() {
-            DataType::Dictionary(key_type, _) => {
-                if self
-                    .dictionary
-                    .as_ref()
-                    .map_or(false, |f| f.values.is_some())
-                {
-                    // Already set.
-                    return Ok(());
-                }
-                let value_arrs = match key_type.as_ref() {
-                    DataType::UInt8 => Some(as_dictionary_array::<UInt8Type>(arr).values()),
-                    DataType::UInt16 => Some(as_dictionary_array::<UInt16Type>(arr).values()),
-                    DataType::UInt32 => Some(as_dictionary_array::<UInt32Type>(arr).values()),
-                    DataType::UInt64 => Some(as_dictionary_array::<UInt64Type>(arr).values()),
-                    DataType::Int8 => Some(as_dictionary_array::<Int8Type>(arr).values()),
-                    DataType::Int16 => Some(as_dictionary_array::<Int16Type>(arr).values()),
-                    DataType::Int32 => Some(as_dictionary_array::<Int32Type>(arr).values()),
-                    DataType::Int64 => Some(as_dictionary_array::<Int64Type>(arr).values()),
-                    _ => None,
-                };
-                self.dictionary = Some(Dictionary {
-                    offset: 0,
-                    length: 0,
-                    values: value_arrs.map(|a| a.clone()),
-                });
-                Ok(())
-            }
-            DataType::Struct(_) => {
-                let struct_arr = as_struct_array(arr);
-                assert!(self.logical_type.is_struct());
-                for field in &mut self.children {
-                    if let Some(sub_array) = struct_arr.column_by_name(&field.name) {
-                        field.set_dictionary_values(sub_array)?;
-                    } else {
-                        return Err(Error::Schema(format!(
-                            "Struct array does not have field: {}",
-                            field.name
-                        )));
-                    }
-                }
-                Ok(())
-            }
-            DataType::List(_) => {
-                let list_arr = as_list_array(arr);
-                self.children[0].set_dictionary_values(&list_arr.values())
-            }
-            DataType::LargeList(_) => {
-                let list_arr = as_large_list_array(arr);
-                self.children[0].set_dictionary_values(&list_arr.values())
-            }
-            _ => {
-                // ignore
-                Ok(())
-            }
-        }
+    pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef)  {
+        assert!(self.data_type().is_dictionary());
+        self.dictionary = Some(Dictionary {
+            offset: 0,
+            length: 0,
+            values: Some(arr.clone()),
+        });
     }
 
     fn project(&self, path_components: &[&str]) -> Result<Field> {
@@ -585,7 +529,7 @@ impl Schema {
         self.fields.iter().filter(|f| f.name == name).next()
     }
 
-    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+    pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
         for field in self.fields.as_mut_slice() {
             if field.id == id {
                 return Some(field);
@@ -606,24 +550,6 @@ impl Schema {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
         }
-        Ok(())
-    }
-
-    /// Use a record batch to set the dictionary values.
-    pub(crate) fn set_dictionary_values(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.fields
-            .iter_mut()
-            .map(|f| {
-                if let Some(arr) = batch.column_with_name(&f.name) {
-                    f.set_dictionary_values(arr)
-                } else {
-                    Err(Error::Schema(format!(
-                        "column {} does not exist in RecordBatch / Array.",
-                        f.name
-                    )))
-                }
-            })
-            .collect::<Result<_>>()?;
         Ok(())
     }
 
