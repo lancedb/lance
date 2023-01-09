@@ -15,31 +15,6 @@ use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
-/// Check whether the given Arrow DataType is fixed stride.
-/// A fixed stride type has the same byte width for all array elements
-/// This includes all PrimitiveType's Boolean, FixedSizeList, FixedSizeBinary, and Decimals
-pub fn is_fixed_stride(arrow_type: &DataType) -> bool {
-    match arrow_type {
-        DataType::Boolean
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Decimal128(_, _)
-        | DataType::Decimal256(_, _)
-        | DataType::FixedSizeList(_, _)
-        | DataType::FixedSizeBinary(_) => true,
-        _ => false,
-    }
-}
-
 /// LogicalType is a string presentation of arrow type.
 /// to be serialized into protobuf.
 #[derive(Debug, Clone, PartialEq)]
@@ -307,7 +282,7 @@ impl Field {
                 .iter()
                 .map(|c| c.max_id())
                 .max()
-                .unwrap_or(i32::MIN),
+                .unwrap_or(-1),
         )
     }
 
@@ -412,7 +387,7 @@ impl TryFrom<&ArrowField> for Field {
             name: field.name().clone(),
             logical_type: LogicalType::try_from(field.data_type())?,
             encoding: match field.data_type() {
-                dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => Some(Encoding::Plain),
+                dt if dt.is_fixed_stride() => Some(Encoding::Plain),
                 dt if dt.is_binary_like() => Some(Encoding::VarBinary),
                 DataType::Dictionary(_, _) => Some(Encoding::Dictionary),
                 _ => None,

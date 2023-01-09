@@ -33,13 +33,13 @@ use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use async_recursion::async_recursion;
+use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 use crate::arrow::FixedSizeBinaryArrayExt;
 use crate::arrow::FixedSizeListArrayExt;
-use crate::datatypes::is_fixed_stride;
+use crate::arrow::*;
 use crate::Error;
-use async_trait::async_trait;
-use tokio::io::AsyncWriteExt;
 
 use super::Decoder;
 use crate::error::Result;
@@ -153,7 +153,7 @@ impl<'a> PlainDecoder<'a> {
         items: &Box<Field>,
         list_size: &i32,
     ) -> Result<ArrayRef> {
-        if !is_fixed_stride(items.data_type()) {
+        if !items.data_type().is_fixed_stride() {
             return Err(Error::Schema(format!(
                 "Items for fixed size list should be primitives but found {}",
                 items.data_type()

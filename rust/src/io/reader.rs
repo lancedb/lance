@@ -31,7 +31,6 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::arrow::*;
-use crate::datatypes::is_fixed_stride;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
@@ -244,7 +243,7 @@ impl<'a> FileReader<'a> {
 
         use DataType::*;
 
-        if is_fixed_stride(&data_type) {
+        if data_type.is_fixed_stride() {
             self.read_fixed_stride_array(field, batch_id).await
         } else {
             match data_type {

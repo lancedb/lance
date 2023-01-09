@@ -17,12 +17,11 @@
 
 use arrow_array::cast::as_struct_array;
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
-use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
-use crate::datatypes::{is_fixed_stride, Field, Schema};
+use crate::datatypes::{Field, Schema};
 use crate::encodings::binary::BinaryEncoder;
 use crate::encodings::Encoder;
 use crate::encodings::{plain::PlainEncoder, Encoding};
@@ -77,9 +76,9 @@ impl<'a> FileWriter<'a> {
     #[async_recursion]
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let data_type = array.data_type();
-        if is_fixed_stride(array.data_type()) {
+        if data_type.is_fixed_stride() {
             self.write_fixed_stride_array(field, array).await?;
-        } else if matches!(array.data_type(), DataType::Struct(_)) {
+        } else if data_type.is_struct() {
             let struct_arr = as_struct_array(array);
             self.write_struct_array(field, struct_arr).await?;
         } else if data_type.is_binary_like() {
@@ -161,7 +160,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{BooleanArray, Float32Array, Int64Array, StringArray};
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, DataType};
     use object_store::path::Path;
 
     use crate::io::{FileReader, ObjectStore};

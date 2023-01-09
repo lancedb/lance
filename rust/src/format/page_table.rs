@@ -40,8 +40,10 @@ impl PageInfo {
 }
 
 /// Page lookup table.
+///
 #[derive(Debug, Default)]
 pub struct PageTable {
+    /// map[field-id,  map[batch-id, PageInfo]]
     pages: BTreeMap<i32, BTreeMap<i32, PageInfo>>,
 }
 
