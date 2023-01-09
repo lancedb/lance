@@ -20,8 +20,8 @@
 //! To improve Arrow-RS egonomitic
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, ListArray, RecordBatch,
-    UInt8Array, Int64Array, LargeListArray,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, Int64Array,
+    LargeListArray, ListArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
