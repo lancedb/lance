@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
 
-use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array};
+use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
@@ -270,6 +270,8 @@ impl Field {
                 Ok(())
             }
             DataType::Struct(_) => {
+                let struct_arr = as_struct_array(arr);
+                assert!(self.logical_type.is_struct());
                 todo!()
             }
             DataType::List(_) => {
