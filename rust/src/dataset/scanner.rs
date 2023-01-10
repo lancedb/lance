@@ -77,14 +77,14 @@ impl<'a> Scanner<'a> {
     }
 
     pub fn into_stream(&self) -> ScannerStream {
-        let prefetch_size = 8;
+        const PREFECTH_SIZE: usize = 8;
         let object_store = self.dataset.object_store.clone();
 
         let data_dir = self.dataset.data_dir().clone();
         let fragments = self.fragments.clone();
         let manifest = self.dataset.manifest.clone();
 
-        ScannerStream::new(object_store, data_dir, fragments, manifest, prefetch_size)
+        ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE)
     }
 
     pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
