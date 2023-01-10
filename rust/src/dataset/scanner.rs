@@ -15,16 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::{self, Stream};
+use futures::stream::{self, Scan, Stream};
+use object_store::path::Path;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::FileReader;
+use crate::io::{FileReader, ObjectStore};
 use crate::{Error, Result};
 
 /// Dataset Scanner
@@ -74,6 +77,16 @@ impl<'a> Scanner<'a> {
         self
     }
 
+    pub fn into_stream(&self) -> ScannerStream {
+        let prefetch_size = 8;
+        let object_store = &self.dataset.object_store;
+
+        let data_dir = self.dataset.data_dir().clone();
+        let fragments = self.fragments.clone();
+
+       ScannerStream::new(object_store, data_dir, fragments, prefetch_size)
+    }
+
     pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
         if self.fragment_idx >= self.fragments.len() {
             return None;
@@ -116,32 +129,44 @@ impl<'a> Scanner<'a> {
     pub fn schema(&self) -> SchemaRef {
         Arc::new(ArrowSchema::from(&self.projections))
     }
+}
 
-    pub fn into_stream(&self) -> impl Stream<Item = Result<RecordBatch>> + '_ {
-        let fragments = &self.fragments;
-        let object_store = &self.dataset.object_store;
-        let manifest = &self.dataset.manifest;
-        stream::unfold(
-            (0_usize, 0_i32, None::<FileReader>),
-            move |(frag_idx, batch, reader)| async move {
-                if frag_idx >= fragments.len() {
-                    return None;
-                }
-                let mut local_reader = reader;
-                if local_reader.is_none() {
-                    let data_file = &fragments[frag_idx].files[0];
-                    let path = self.dataset.data_dir().child(data_file.path.clone());
-                    local_reader = Some(
-                        FileReader::new(object_store, &path, Some(manifest)).await.unwrap()
-                    );
-                };
-                if let Some(r) = local_reader.as_ref() {
-                    let b = r.read_batch(batch).await;
-                    Some((b, (frag_idx, batch, local_reader)))
-                } else {
-                    Some((Err(Error::IO(format!(""))), (frag_idx, batch, local_reader)))
-                }
-            },
-        )
+pub struct ScannerStream<'a> {
+    object_store: &'a ObjectStore,
+    data_dir: Path,
+    rx: Receiver<Result<RecordBatch>>,
+}
+
+impl<'a> ScannerStream<'a> {
+    fn new(
+        object_store: &'a ObjectStore,
+        data_dir: Path,
+        fragments: Vec<Fragment>,
+        prefetch_size: usize,
+    ) -> Self {
+        let (tx, mut rx) = mpsc::channel(prefetch_size);
+
+        tokio::spawn(async move {
+            for frag in fragments {
+                tx.send(Err(Error::IO("NO".to_string()))).await;
+            }
+            drop(tx)
+        });
+        Self {
+            object_store,
+            data_dir,
+            rx,
+        }
+    }
+}
+
+impl Stream for ScannerStream<'_> {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
