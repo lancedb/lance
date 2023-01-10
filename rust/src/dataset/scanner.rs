@@ -137,19 +137,4 @@ mod tests {
     use super::*;
 
     use futures::stream::StreamExt;
-
-    #[tokio::test]
-    async fn test_scan_stream() {
-        let uri = "/Users/lei/work/lance/rust/data";
-        let dataset = Dataset::open(uri).await.unwrap();
-        let stream = dataset
-            .scan()
-            .project(&["class"])
-            .unwrap()
-            .into_stream();
-        stream
-            .map(|b| async { println!("{}", b.unwrap().num_rows()); 0 })
-            .buffer_unordered(10)
-            .collect::<Vec<_>>().await;
-    }
 }
