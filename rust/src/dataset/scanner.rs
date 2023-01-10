@@ -16,7 +16,6 @@
 // under the License.
 
 use std::sync::Arc;
-use std::pin::Pin;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
@@ -133,7 +132,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-pub struct ScannerStream  {
+pub struct ScannerStream {
     rx: Receiver<Result<RecordBatch>>,
 }
 
@@ -160,7 +159,9 @@ impl ScannerStream {
                         }
                     };
                 for batch_id in 0..reader.num_batches() {
-                    tx.send(reader.read_batch(batch_id as i32).await).await.unwrap();
+                    tx.send(reader.read_batch(batch_id as i32).await)
+                        .await
+                        .unwrap();
                 }
             }
             drop(tx)
@@ -180,13 +181,22 @@ impl Stream for ScannerStream {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    #[test]
-    fn test_scan_stream() {
-
-        
+    #[tokio::test]
+    async fn test_scan_stream() {
+        let uri = "/Users/lei/work/lance/rust/data";
+        let dataset = Dataset::open(uri).await.unwrap();
+        let stream = dataset
+            .scan()
+            .unwrap()
+            .project(&["class"])
+            .unwrap()
+            .into_stream();
+        stream
+            .for_each(|b| async { println!("{}", b.unwrap().num_rows()) })
+            .await;
     }
 }
