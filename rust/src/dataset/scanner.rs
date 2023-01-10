@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::{Stream};
+use futures::stream::Stream;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -65,17 +65,29 @@ impl<'a> Scanner<'a> {
         }
     }
 
+    /// Projection.
+    ///
+    /// Only seelect the specific columns. If not specifid, all columns will be scanned.
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
     }
 
+    /// Set limit and offset.
     pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> &mut Self {
         self.limit = Some(limit);
         self.offset = offset;
         self
     }
 
+    /// The schema of the output, a.k.a, projection schema.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(ArrowSchema::from(&self.projections))
+    }
+
+    /// Create a stream of this Scanner.
+    ///
+    /// TODO: implement as IntoStream/IntoIterator.
     pub fn into_stream(&self) -> ScannerStream {
         const PREFECTH_SIZE: usize = 8;
         let object_store = self.dataset.object_store.clone();
@@ -86,11 +98,6 @@ impl<'a> Scanner<'a> {
 
         ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE)
     }
-
-    pub fn schema(&self) -> SchemaRef {
-        Arc::new(ArrowSchema::from(&self.projections))
-    }
-
 }
 
 pub struct ScannerStream {
