@@ -16,10 +16,12 @@
 // under the License.
 
 use std::sync::Arc;
+use std::pin::Pin;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
+use futures::StreamExt;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -27,7 +29,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, ObjectStore};
-use crate::{Error, Result};
+use crate::Result;
 
 /// Dataset Scanner
 ///
@@ -131,7 +133,7 @@ impl<'a> Scanner<'a> {
     }
 }
 
-pub struct ScannerStream {
+pub struct ScannerStream  {
     rx: Receiver<Result<RecordBatch>>,
 }
 
@@ -149,8 +151,17 @@ impl ScannerStream {
             for frag in &fragments {
                 let data_file = &frag.files[0];
                 let path = data_dir.child(data_file.path.clone());
-                FileReader::new(&object_store, &path, Some(manifest.as_ref())).await;
-                tx.send(Err(Error::IO("NO".to_string()))).await;
+                let reader =
+                    match FileReader::new(&object_store, &path, Some(manifest.as_ref())).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tx.send(Err(e)).await.unwrap();
+                            continue;
+                        }
+                    };
+                for batch_id in 0..reader.num_batches() {
+                    tx.send(reader.read_batch(batch_id as i32).await).await.unwrap();
+                }
             }
             drop(tx)
         });
@@ -166,5 +177,16 @@ impl Stream for ScannerStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_scan_stream() {
+
+        
     }
 }
