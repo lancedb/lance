@@ -31,8 +31,16 @@ use crate::Result;
 
 /// Dataset Scanner
 ///
-/// TODO: RecordBatchReader does not support async iterator yet
-/// we need to use a tokio::rt::block_on for the iterator.
+/// ```rust,ignore
+/// let dataset = Dataset::open(uri).await.unwrap();
+/// let stream = dataset.scan()
+///     .project(&["col", "col2.subfield"]).unwrap()
+///     .limit(10)
+///     .into_stream();
+/// stream
+///   .map(|batch| batch.num_rows())
+///   .sum()
+/// ```
 pub struct Scanner<'a> {
     dataset: &'a Dataset,
 
@@ -81,6 +89,7 @@ impl<'a> Scanner<'a> {
     pub fn schema(&self) -> SchemaRef {
         Arc::new(ArrowSchema::from(&self.projections))
     }
+
 }
 
 pub struct ScannerStream {
