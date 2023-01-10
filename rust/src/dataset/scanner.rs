@@ -96,7 +96,14 @@ impl<'a> Scanner<'a> {
         let fragments = self.fragments.clone();
         let manifest = self.dataset.manifest.clone();
 
-        ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE, &self.projections)
+        ScannerStream::new(
+            object_store,
+            data_dir,
+            fragments,
+            manifest,
+            PREFECTH_SIZE,
+            &self.projections,
+        )
     }
 }
 
@@ -111,7 +118,7 @@ impl ScannerStream {
         fragments: Vec<Fragment>,
         manifest: Arc<Manifest>,
         prefetch_size: usize,
-        schema: &Schema
+        schema: &Schema,
     ) -> Self {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
@@ -125,7 +132,7 @@ impl ScannerStream {
                         Ok(mut r) => {
                             r.set_projection(schema.clone());
                             r
-                        },
+                        }
                         Err(e) => {
                             tx.send(Err(e)).await.unwrap();
                             continue;
