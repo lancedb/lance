@@ -96,7 +96,7 @@ impl<'a> Scanner<'a> {
         let fragments = self.fragments.clone();
         let manifest = self.dataset.manifest.clone();
 
-        ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE)
+        ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE, &self.projections)
     }
 }
 
@@ -111,16 +111,21 @@ impl ScannerStream {
         fragments: Vec<Fragment>,
         manifest: Arc<Manifest>,
         prefetch_size: usize,
+        schema: &Schema
     ) -> Self {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
+        let schema = schema.clone();
         tokio::spawn(async move {
             for frag in &fragments {
                 let data_file = &frag.files[0];
                 let path = data_dir.child(data_file.path.clone());
                 let reader =
                     match FileReader::new(&object_store, &path, Some(manifest.as_ref())).await {
-                        Ok(r) => r,
+                        Ok(mut r) => {
+                            r.set_projection(schema.clone());
+                            r
+                        },
                         Err(e) => {
                             tx.send(Err(e)).await.unwrap();
                             continue;
