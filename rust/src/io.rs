@@ -19,11 +19,9 @@
 
 use std::io::{Error, ErrorKind, Result};
 
-use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
 use prost::Message;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 pub mod object_reader;
 pub mod object_store;
@@ -31,27 +29,12 @@ pub mod object_writer;
 mod reader;
 mod writer;
 
-use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
+use crate::format::{ProtoStruct, MAGIC};
 
 pub use self::object_store::ObjectStore;
 pub use reader::read_manifest;
 pub use reader::FileReader;
 pub use writer::FileWriter;
-
-#[async_trait]
-pub trait AsyncWriteProtoExt {
-    /// Write footer with the offset to the root metadata block.
-    async fn write_footer(&mut self, offset: u64) -> Result<()>;
-}
-
-#[async_trait]
-impl<T: AsyncWrite + Unpin + std::marker::Send> AsyncWriteProtoExt for T {
-    async fn write_footer(&mut self, offset: u64) -> Result<()> {
-        self.write_u64_le(offset).await?;
-        self.write_all(INDEX_MAGIC).await?;
-        Ok(())
-    }
-}
 
 pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
     let len = bytes.len();
@@ -62,7 +45,7 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
         ));
     }
     let offset_bytes = bytes.slice(len - 16..len - 8);
-    Ok(LittleEndian::read_u64(offset_bytes.as_ref()) as usize)
+    Ok(LittleEndian::read_i64(offset_bytes.as_ref()) as usize)
 }
 
 /// Read protobuf from a buffer.

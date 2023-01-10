@@ -22,12 +22,15 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::Stream;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
+use tokio::task::JoinHandle;
 
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, ObjectStore};
 use crate::{Error, Result};
+
+const DEFAULT_PREFETCH_SIZE: usize = 8;
 
 /// Dataset Scanner
 ///
@@ -51,10 +54,14 @@ pub struct Scanner<'a> {
     limit: Option<i64>,
     offset: Option<i64>,
 
-    fragments: Vec<Fragment>,
-
-    /// Scan the dataset with a meta column: "_rowid"
+    // If set true, returns the row ID from the dataset alongside with the
+    // actual data.
     with_row_id: bool,
+
+    /// How many batches to read ahead.
+    prefetch_size: usize,
+
+    fragments: Vec<Fragment>,
 }
 
 impl<'a> Scanner<'a> {
@@ -64,8 +71,9 @@ impl<'a> Scanner<'a> {
             projections: dataset.schema().clone(),
             limit: None,
             offset: None,
-            fragments: dataset.fragments().to_vec(),
             with_row_id: false,
+            prefetch_size: DEFAULT_PREFETCH_SIZE,
+            fragments: dataset.fragments().to_vec(),
         }
     }
 
@@ -84,6 +92,12 @@ impl<'a> Scanner<'a> {
         self
     }
 
+    /// How many batches to read ahead (prefetch).
+    pub fn prefetch_size(&mut self, n: usize) -> &mut Self {
+        self.prefetch_size = n;
+        self
+    }
+
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
@@ -99,7 +113,6 @@ impl<'a> Scanner<'a> {
     ///
     /// TODO: implement as IntoStream/IntoIterator.
     pub fn into_stream(&self) -> ScannerStream {
-        const PREFECTH_SIZE: usize = 8;
         let object_store = self.dataset.object_store.clone();
 
         let data_dir = self.dataset.data_dir().clone();
@@ -111,7 +124,7 @@ impl<'a> Scanner<'a> {
             data_dir,
             fragments,
             manifest,
-            PREFECTH_SIZE,
+            self.prefetch_size,
             &self.projections,
             self.with_row_id,
         )
@@ -120,6 +133,8 @@ impl<'a> Scanner<'a> {
 
 pub struct ScannerStream {
     rx: Receiver<Result<RecordBatch>>,
+
+    threads: JoinHandle<()>,
 }
 
 impl ScannerStream {
@@ -135,7 +150,7 @@ impl ScannerStream {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
         let schema = schema.clone();
-        tokio::spawn(async move {
+        let bg_thread = tokio::spawn(async move {
             for frag in &fragments {
                 if tx.is_closed() {
                     return;
@@ -178,7 +193,10 @@ impl ScannerStream {
             }
             drop(tx)
         });
-        Self { rx }
+        Self {
+            rx,
+            threads: bg_thread,
+        }
     }
 }
 

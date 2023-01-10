@@ -21,6 +21,7 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::any::Any;
+use std::cmp::min;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -129,13 +130,16 @@ impl<'a> PlainDecoder<'a> {
             DataType::Boolean => bit_util::ceil(self.length, 8),
             _ => get_primitive_byte_width(self.data_type)? * self.length,
         };
-        let range = Range {
-            start: self.position,
-            end: self.position + array_bytes,
-        };
+        let mut start = self.position;
+        let end = self.position + array_bytes;
+        let mut ranges: Vec<Range<usize>> = vec![];
+        while start < end {
+            ranges.push(start..min(start + 1 * 1024 * 1024, end));
+            start += 1 * 1024 * 1024;
+        }
 
-        let data = self.reader.get_range(range).await?;
-        let buf: Buffer = data.into();
+        let data = self.reader.get_ranges(&ranges).await?;
+        let buf: Buffer = data.concat().into();
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
             .len(self.length)
             .null_count(0)

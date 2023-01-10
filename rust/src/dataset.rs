@@ -7,7 +7,6 @@ use std::sync::Arc;
 use chrono::prelude::*;
 use object_store::path::Path;
 
-use self::scanner::Scanner;
 use crate::datatypes::Schema;
 use crate::error::Result;
 use crate::format::{Fragment, Manifest};
@@ -15,10 +14,13 @@ use crate::io::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
 
 pub mod scanner;
+pub use self::scanner::Scanner;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const DATA_DIR: &str = "data";
+const INDEX_DIR: &str = "_indices";
+pub const ROW_ID: &str = "_rowid";
 
 fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
@@ -27,7 +29,7 @@ fn latest_manifest_path(base: &Path) -> Path {
 /// Lance Dataset
 #[derive(Debug)]
 pub struct Dataset {
-    object_store: Arc<ObjectStore>,
+    pub(crate) object_store: Arc<ObjectStore>,
     base: Path,
     manifest: Arc<Manifest>,
 }
@@ -93,6 +95,10 @@ impl Dataset {
 
     fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
+    }
+
+    pub(crate) fn index_dir(&self) -> Path {
+        self.base.child(INDEX_DIR)
     }
 
     pub fn version(&self) -> Version {

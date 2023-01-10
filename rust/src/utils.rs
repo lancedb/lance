@@ -15,20 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lance Columnar Data Format
-//!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
+use rand::Rng;
+use std::iter::repeat_with;
 
-pub mod arrow;
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod index;
-pub mod io;
-pub mod utils;
+use arrow_array::Float32Array;
 
-pub use error::{Error, Result};
+/// Create a random float32 array.
+pub fn generate_random_array(n: usize) -> Float32Array {
+    let mut rng = rand::thread_rng();
+    Float32Array::from(
+        repeat_with(|| rng.gen::<f32>())
+            .take(n)
+            .collect::<Vec<f32>>(),
+    )
+}

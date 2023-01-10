@@ -544,7 +544,7 @@ impl Schema {
         Ok(Self::from(&filtered_protos))
     }
 
-    fn field(&self, name: &str) -> Option<&Field> {
+    pub(crate) fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.name == name)
     }
 

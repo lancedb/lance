@@ -31,22 +31,29 @@ arrow-cast = "30.0.0"
 arrow-data = "30.0"
 arrow-ord = "30.0"
 arrow-schema = "30.0"
+arrow-select = "30.0"
 async-recursion = "1.0"
 async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
-clap = { version = "4.0.32", features = ["derive"], optional = true }
+clap = { version = "4.1", features = ["derive"], optional = true }
 object_store = { version = "0.5", features = ["aws"] }
 pin-project = "1.0"
 prost = "0.11"
 prost-types = "0.11"
-tokio = { version = "1.23", features = ["rt-multi-thread"] }
+tokio = { version = "1.23", features = ["rt-multi-thread", "rt", "macros"] }
 url = "2.3"
 rand = "0.8.3"
 futures = "0.3"
+"faiss" = {version = "0.11.0"}
 
 [build-dependencies]
 prost-build = "0.11"
+
+[dev-dependencies]
+criterion = { version="0.4", features = ["async", "async_tokio"]}
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+clap = { version = "4.1.1", features = ["derive"] }
 
 [features]
 cli = ["clap"]
@@ -54,3 +61,22 @@ cli = ["clap"]
 [[bin]]
 name = "lq"
 required-features = ["cli"]
+
+[[bench]]
+name = "flat_idx"
+harness = false
+
+[[bench]]
+name = "ivf_pq_idx"
+harness = false
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "kmeans"
+harness = false
+
+[profile.bench]
+debug = true

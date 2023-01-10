@@ -15,20 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lance Columnar Data Format
+//! Secondary Index
 //!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
-pub mod arrow;
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod index;
-pub mod io;
-pub mod utils;
+use async_trait::async_trait;
 
-pub use error::{Error, Result};
+pub mod ann;
+use crate::Result;
+
+/// Protobuf definitions
+#[allow(clippy::all)]
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+}
+
+pub enum IndexType {
+    // Preserve 0-100 for simple indices.
+
+    // 100+ and up for vector index.
+    /// Flat vector index.
+    VectorFlat = 100,
+
+    /// IVF_PQ vector index.
+    VectorIvfPQ = 101,
+}
+
+/// Present an index.
+#[async_trait]
+pub trait Index {
+    fn index_type() -> IndexType;
+
+    async fn build(&self) -> Result<()>;
+}
+
+/// Builds index.
+#[async_trait]
+pub trait IndexBuilder {
+    fn index_type() -> IndexType;
+
+    async fn build(&self) -> Result<()>;
+}

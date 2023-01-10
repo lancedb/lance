@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use futures::stream::StreamExt;
+
 use lance::dataset::Dataset;
 
 #[derive(Parser)]
@@ -45,9 +47,9 @@ async fn main() {
         }
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
-            let mut scanner = dataset.scan().unwrap();
+            let mut scanner = dataset.scan();
             scanner.limit(*n, None);
-            println!("{:?}", scanner.next_batch().await.unwrap().unwrap());
+            println!("{:?}", scanner.into_stream().next().await.unwrap().unwrap());
         }
     }
 }

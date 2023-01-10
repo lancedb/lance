@@ -34,6 +34,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use crate::arrow::*;
+use crate::dataset::ROW_ID;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
@@ -267,10 +268,8 @@ async fn read_batch(
                 .map(|o| compute_row_id(fragment_id, o))
                 .collect::<Vec<_>>(),
         ));
-        batch = batch.try_with_column(
-            ArrowField::new("_rowid", DataType::UInt64, false),
-            row_id_arr,
-        )?;
+        batch =
+            batch.try_with_column(ArrowField::new(ROW_ID, DataType::UInt64, false), row_id_arr)?;
     }
     Ok(batch)
 }
