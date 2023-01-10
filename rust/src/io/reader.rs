@@ -187,7 +187,12 @@ impl<'a> FileReader<'a> {
         let page_info = self.page_info(field, batch_id)?;
 
         self.object_reader
-            .read_binary_array(&field.data_type(), page_info.position, page_info.length)
+            .read_binary_array(
+                &field.data_type(),
+                page_info.position,
+                page_info.length,
+                field.nullable,
+            )
             .await
     }
 
@@ -235,7 +240,11 @@ impl<'a> FileReader<'a> {
         let offset_arr = subtract_scalar(positions, start_position)?;
         let value_arrs = self.read_array(&field.children[0], batch_id).await?;
 
-        Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
+        Ok(Arc::new(ListArray::try_new(
+            value_arrs,
+            &offset_arr,
+            field.nullable,
+        )?))
     }
 
     // TODO: merge with [read_list_array]?

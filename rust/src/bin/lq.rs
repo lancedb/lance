@@ -47,7 +47,8 @@ async fn main() {
             let dataset = Dataset::open(uri).await.unwrap();
             let mut scanner = dataset.scan().unwrap();
             scanner.limit(*n, None);
-            println!("{:?}", scanner.next_batch().await.unwrap().unwrap());
+            let batch = scanner.next_batch().await.unwrap().unwrap();
+            println!("Batch: {:?}", batch);
         }
     }
 }

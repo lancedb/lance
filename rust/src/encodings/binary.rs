@@ -85,6 +85,8 @@ pub struct BinaryDecoder<'a, T: ByteArrayType> {
 
     length: usize,
 
+    nullable: bool,
+
     phantom: PhantomData<T>,
 }
 
@@ -108,14 +110,15 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///     let object_store = ObjectStore::new(":memory:").unwrap();
     ///     let path = Path::from("/data.lance");
     ///     let reader = object_store.open(&path).await.unwrap();
-    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(&reader, 100, 1024);
+    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(&reader, 100, 1024, true);
     /// };
     /// ```
-    pub fn new(reader: &'a ObjectReader, position: usize, length: usize) -> Self {
+    pub fn new(reader: &'a ObjectReader, position: usize, length: usize, nullable: bool) -> Self {
         Self {
             reader,
             position,
             length,
+            nullable,
             phantom: PhantomData,
         }
     }
@@ -145,28 +148,32 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        // Count nulls
-        let mut null_buf = MutableBuffer::new_null(self.length);
-        let mut null_count = 0;
-        for idx in 0..self.length {
-            if int64_positions.value(idx) == int64_positions.value(idx + 1) {
-                bit_util::unset_bit(null_buf.as_mut(), idx);
-                null_count += 1;
-            } else {
-                bit_util::set_bit(null_buf.as_mut(), idx);
-            }
-        }
-
         let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
         let bytes = self
             .reader
             .get_range(start_position as usize..(start_position + read_len) as usize)
             .await?;
 
-        let array_data = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(self.length)
-            .null_count(null_count)
-            .null_bit_buffer(Some(null_buf.into()))
+        let mut builder = ArrayDataBuilder::new(T::DATA_TYPE).len(self.length);
+        if self.nullable {
+            // Count nulls
+            let mut null_buf = MutableBuffer::new_null(self.length);
+            let mut null_count = 0;
+
+            for idx in 0..self.length {
+                if int64_positions.value(idx) == int64_positions.value(idx + 1) {
+                    bit_util::unset_bit(null_buf.as_mut(), idx);
+                    null_count += 1;
+                } else {
+                    bit_util::set_bit(null_buf.as_mut(), idx);
+                }
+            }
+
+            builder = builder
+                .null_count(null_count)
+                .null_bit_buffer(Some(null_buf.into()))
+        }
+        let array_data = builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(bytes.into())
             .build()?;
@@ -198,7 +205,7 @@ mod tests {
         object_writer.shutdown().await.unwrap();
 
         let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
+        let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len(), true);
         let actual_arr = decoder.decode().await.unwrap();
         assert_eq!(
             actual_arr

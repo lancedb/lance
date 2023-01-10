@@ -103,7 +103,7 @@ pub trait ListArrayExt {
     ///
     /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
     /// let int_values = Int64Array::from_iter(0..10);
-    /// let list_arr = ListArray::try_new(int_values, &offsets).unwrap();
+    /// let list_arr = ListArray::try_new(int_values, &offsets, true).unwrap();
     /// assert_eq!(list_arr,
     ///     ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
     ///         Some(vec![Some(0), Some(1)]),
@@ -111,15 +111,15 @@ pub trait ListArrayExt {
     ///         Some(vec![Some(7), Some(8), Some(9)]),
     /// ]))
     /// ```
-    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
+    fn try_new<T: Array>(values: T, offsets: &Int32Array, nullable: bool) -> Result<ListArray>;
 }
 
 impl ListArrayExt for ListArray {
-    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
+    fn try_new<T: Array>(values: T, offsets: &Int32Array, nullable: bool) -> Result<Self> {
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
             "item",
             values.data_type().clone(),
-            true,
+            nullable,
         ))))
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
