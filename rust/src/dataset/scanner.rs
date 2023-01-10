@@ -16,11 +16,9 @@
 // under the License.
 
 use std::sync::Arc;
-use std::task::Poll;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::Stream;
 
 use super::Dataset;
 use crate::datatypes::Schema;

@@ -17,7 +17,6 @@
 
 //! Lance Data File Reader
 
-use core::num;
 // Standard
 use std::ops::Range;
 use std::sync::Arc;
@@ -160,16 +159,17 @@ impl<'a> FileReader<'a> {
         read_batch(&self.object_reader, schema, batch_id, &self.page_table).await
     }
 
-    /// TODO: use IntoStream trait?
-    pub fn into_stream(&mut self) -> impl Stream<Item = Result<RecordBatch>> + '_ {
+    // TODO: use IntoStream trait?
+    // it only do batch based scan. We need add batch size later.
+    pub fn into_stream(&self) -> impl Stream<Item = Result<RecordBatch>> + '_ {
         let num_batches = self.num_batches() as i32;
         let object_reader = &self.object_reader;
         let schema = self.schema();
         let page_table = &self.page_table;
         // let file_reader = &self;
-        stream::unfold(0 as i32, move |batch_id| async move {
+        stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
-            if batch_id < num_batches as i32 {
+            if batch_id < num_batches {
                 let batch = read_batch(object_reader, schema, batch_id, page_table).await;
                 Some((batch, batch_id + 1))
             } else {
@@ -344,4 +344,52 @@ async fn read_large_list_array(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    use arrow_array::{Float32Array, Int64Array};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use futures::StreamExt;
+
+    use crate::io::FileWriter;
+
+    #[tokio::test]
+    async fn file_reader_into_stream() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let writer = store.create(&path).await.unwrap();
+
+        // Write 5 batches.
+        let mut file_writer = FileWriter::new(writer, &schema);
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter((0..100).collect::<Vec<_>>())),
+            Arc::new(Float32Array::from_iter(
+                (0..100).map(|n| n as f32).collect::<Vec<_>>(),
+            )),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+        for _ in 0..5 {
+            file_writer.write(&batch).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::new(&store, &path, None).await.unwrap();
+        let stream = reader.into_stream();
+
+        assert_eq!(stream.count().await, 5);
+
+        let stream = reader.into_stream();
+        assert!(
+            stream
+                .map(|f| f.unwrap() == batch)
+                .all(|f| async move { f })
+                .await
+        );
+    }
+}
