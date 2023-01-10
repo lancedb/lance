@@ -159,14 +159,20 @@ impl<'a> FileReader<'a> {
         read_batch(&self.object_reader, schema, batch_id, &self.page_table).await
     }
 
+    /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
+    ///
+    /// Currently, it only does batch based scan.
+    /// Will add support for scanning with batch size later.
+    ///
     // TODO: use IntoStream trait?
-    // it only do batch based scan. We need add batch size later.
     pub fn into_stream(&self) -> impl Stream<Item = Result<RecordBatch>> + '_ {
         let num_batches = self.num_batches() as i32;
+
+        // Deref a bunch.
         let object_reader = &self.object_reader;
         let schema = self.schema();
         let page_table = &self.page_table;
-        // let file_reader = &self;
+
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
             if batch_id < num_batches {
