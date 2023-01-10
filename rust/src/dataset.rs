@@ -27,7 +27,7 @@ fn latest_manifest_path(base: &Path) -> Path {
 /// Lance Dataset
 #[derive(Debug)]
 pub struct Dataset {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     base: Path,
     manifest: Arc<Manifest>,
 }
@@ -58,7 +58,7 @@ impl From<&Manifest> for Version {
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = ObjectStore::new(uri)?;
+        let object_store = Arc::new(ObjectStore::new(uri)?);
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
 

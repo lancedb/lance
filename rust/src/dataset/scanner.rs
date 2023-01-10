@@ -15,18 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::{self, Scan, Stream};
+use futures::stream::{self, Stream};
 use object_store::path::Path;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver};
 
 use super::Dataset;
 use crate::datatypes::Schema;
-use crate::format::Fragment;
+use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, ObjectStore};
 use crate::{Error, Result};
 
@@ -79,12 +78,13 @@ impl<'a> Scanner<'a> {
 
     pub fn into_stream(&self) -> ScannerStream {
         let prefetch_size = 8;
-        let object_store = &self.dataset.object_store;
+        let object_store = self.dataset.object_store.clone();
 
         let data_dir = self.dataset.data_dir().clone();
         let fragments = self.fragments.clone();
+        let manifest = self.dataset.manifest.clone();
 
-       ScannerStream::new(object_store, data_dir, fragments, prefetch_size)
+        ScannerStream::new(object_store, data_dir, fragments, manifest, prefetch_size)
     }
 
     pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
@@ -131,36 +131,34 @@ impl<'a> Scanner<'a> {
     }
 }
 
-pub struct ScannerStream<'a> {
-    object_store: &'a ObjectStore,
-    data_dir: Path,
+pub struct ScannerStream {
     rx: Receiver<Result<RecordBatch>>,
 }
 
-impl<'a> ScannerStream<'a> {
+impl ScannerStream {
     fn new(
-        object_store: &'a ObjectStore,
+        object_store: Arc<ObjectStore>,
         data_dir: Path,
         fragments: Vec<Fragment>,
+        manifest: Arc<Manifest>,
         prefetch_size: usize,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel(prefetch_size);
+        let (tx, rx) = mpsc::channel(prefetch_size);
 
         tokio::spawn(async move {
-            for frag in fragments {
+            for frag in &fragments {
+                let data_file = &frag.files[0];
+                let path = data_dir.child(data_file.path.clone());
+                FileReader::new(&object_store, &path, Some(manifest.as_ref())).await;
                 tx.send(Err(Error::IO("NO".to_string()))).await;
             }
             drop(tx)
         });
-        Self {
-            object_store,
-            data_dir,
-            rx,
-        }
+        Self { rx }
     }
 }
 
-impl Stream for ScannerStream<'_> {
+impl Stream for ScannerStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(
