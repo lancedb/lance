@@ -19,8 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::Stream;
-use futures::StreamExt;
+use futures::stream::{Stream};
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -44,26 +43,17 @@ pub struct Scanner<'a> {
     offset: Option<i64>,
 
     fragments: Vec<Fragment>,
-
-    // use for iterator
-    fragment_idx: usize,
-    batch_id: i32,
-    reader: Option<FileReader<'a>>,
 }
 
 impl<'a> Scanner<'a> {
-    pub fn new(dataset: &'a Dataset) -> Result<Self> {
-        Ok(Self {
+    pub fn new(dataset: &'a Dataset) -> Self {
+        Self {
             dataset,
             projections: dataset.schema().clone(),
             limit: None,
             offset: None,
             fragments: dataset.fragments().to_vec(),
-
-            fragment_idx: 0,
-            batch_id: 0,
-            reader: None,
-        })
+        }
     }
 
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
@@ -86,45 +76,6 @@ impl<'a> Scanner<'a> {
         let manifest = self.dataset.manifest.clone();
 
         ScannerStream::new(object_store, data_dir, fragments, manifest, PREFECTH_SIZE)
-    }
-
-    pub async fn next_batch(&mut self) -> Option<Result<RecordBatch>> {
-        if self.fragment_idx >= self.fragments.len() {
-            return None;
-        }
-
-        let fragment = &self.fragments[self.fragment_idx];
-        // Only support 1 data file (no schema evolution for now);
-        assert!(fragment.files.len() == 1);
-        let data_file = &fragment.files[0];
-        let path = self.dataset.data_dir().child(data_file.path.clone());
-        if self.reader.is_none() {
-            self.reader = Some(
-                FileReader::new(
-                    &self.dataset.object_store,
-                    &path,
-                    Some(&self.dataset.manifest),
-                )
-                .await
-                .unwrap(),
-            );
-            self.reader
-                .as_mut()
-                .map(|reader| reader.set_projection(self.projections.clone()));
-        }
-
-        if let Some(reader) = &self.reader {
-            let batch = reader.read_batch(self.batch_id).await;
-            self.batch_id += 1;
-            if self.batch_id as usize >= reader.num_batches() {
-                self.batch_id = 0;
-                self.fragment_idx += 1;
-                self.reader = None;
-            }
-            return Some(batch);
-        } else {
-            panic!("should not reach here");
-        }
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -185,18 +136,20 @@ impl Stream for ScannerStream {
 mod tests {
     use super::*;
 
+    use futures::stream::StreamExt;
+
     #[tokio::test]
     async fn test_scan_stream() {
         let uri = "/Users/lei/work/lance/rust/data";
         let dataset = Dataset::open(uri).await.unwrap();
         let stream = dataset
             .scan()
-            .unwrap()
             .project(&["class"])
             .unwrap()
             .into_stream();
         stream
-            .for_each(|b| async { println!("{}", b.unwrap().num_rows()) })
-            .await;
+            .map(|b| async { println!("{}", b.unwrap().num_rows()); 0 })
+            .buffer_unordered(10)
+            .collect::<Vec<_>>().await;
     }
 }

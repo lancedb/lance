@@ -79,7 +79,7 @@ impl Dataset {
         })
     }
 
-    pub fn scan(&self) -> Result<Scanner> {
+    pub fn scan(&self) -> Scanner {
         Scanner::new(&self)
     }
 
