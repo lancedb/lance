@@ -2,6 +2,7 @@
 //!
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use chrono::prelude::*;
 use object_store::path::Path;
@@ -26,9 +27,9 @@ fn latest_manifest_path(base: &Path) -> Path {
 /// Lance Dataset
 #[derive(Debug)]
 pub struct Dataset {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     base: Path,
-    manifest: Manifest,
+    manifest: Arc<Manifest>,
 }
 
 /// Dataset Version
@@ -57,7 +58,7 @@ impl From<&Manifest> for Version {
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = ObjectStore::new(uri)?;
+        let object_store = Arc::new(ObjectStore::new(uri)?);
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
 
@@ -74,11 +75,11 @@ impl Dataset {
         Ok(Self {
             object_store,
             base: Path::from(uri),
-            manifest,
+            manifest: Arc::new(manifest),
         })
     }
 
-    pub fn scan(&self) -> Result<Scanner> {
+    pub fn scan(&self) -> Scanner {
         Scanner::new(&self)
     }
 
@@ -95,7 +96,7 @@ impl Dataset {
     }
 
     pub fn version(&self) -> Version {
-        Version::from(&self.manifest)
+        Version::from(self.manifest.as_ref())
     }
 
     /// Get all versions.

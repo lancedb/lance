@@ -42,6 +42,7 @@ prost-types = "0.11"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
 rand = "0.8.3"
+futures = "0.3"
 
 [build-dependencies]
 prost-build = "0.11"
