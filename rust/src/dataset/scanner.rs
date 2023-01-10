@@ -39,6 +39,7 @@ use crate::Result;
 ///     .into_stream();
 /// stream
 ///   .map(|batch| batch.num_rows())
+///   .buffered(16)
 ///   .sum()
 /// ```
 pub struct Scanner<'a> {
