@@ -86,8 +86,9 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Dictionary(key_type, value_type) => {
                 format!(
                     "dict:{}:{}:{}",
-                    Self::try_from(key_type.as_ref())?.0,
                     Self::try_from(value_type.as_ref())?.0,
+                    Self::try_from(key_type.as_ref())?.0,
+                    // Arrow C++ Dictionary has "ordered:bool" field, but it does not exist in `arrow-rs`.
                     false
                 )
             }
@@ -179,8 +180,8 @@ impl TryFrom<&LogicalType> for DataType {
                     if splits.len() != 4 {
                         Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
                     } else {
-                        let index_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
-                        let value_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
+                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
                     }
                 }
