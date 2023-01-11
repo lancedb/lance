@@ -78,9 +78,9 @@ impl Metadata {
             .push(batch_len + self.batch_offsets.last().unwrap())
     }
 
-    /// Get the logical length of a batch.
-    pub fn get_batch_length(&self, batch_id: usize) -> Option<i32> {
-        self.batch_offsets.get(batch_id).copied()
+    /// Get the starting offset of the batch.
+    pub fn get_offset(&self, batch_id: i32) -> Option<i32> {
+        self.batch_offsets.get(batch_id as usize).copied()
     }
 }
 
