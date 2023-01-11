@@ -250,7 +250,10 @@ pub trait RecordBatchExt {
     ///     new_record_batch,
     ///     RecordBatch::try_new(
     ///         Arc::new(Schema::new(
-    ///             vec![Field::new("a", DataType::Int32, true), Field::new("s", DataType::Utf8, true)])
+    ///             vec![
+    ///                 Field::new("a", DataType::Int32, true),
+    ///                 Field::new("s", DataType::Utf8, true)
+    ///             ])
     ///         ),
     ///         vec![int_arr, str_arr],
     ///     ).unwrap()
