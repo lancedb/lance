@@ -244,7 +244,7 @@ pub trait RecordBatchExt {
     ///
     /// let new_field = Field::new("s", DataType::Utf8, true);
     /// let str_arr = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
-    /// let new_record_batch = record_batch.try_append_column(new_field, str_arr.clone()).unwrap();
+    /// let new_record_batch = record_batch.try_with_column(new_field, str_arr.clone()).unwrap();
     ///
     /// assert_eq!(
     ///     new_record_batch,
@@ -259,7 +259,7 @@ pub trait RecordBatchExt {
     ///     ).unwrap()
     /// )
     /// ```
-    fn try_append_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
+    fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -270,7 +270,7 @@ impl RecordBatchExt for RecordBatch {
             .map(|idx| self.column(idx))
     }
 
-    fn try_append_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
+    fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
         let mut new_fields = self.schema().fields.clone();
         new_fields.push(field);
         let new_schema = Arc::new(Schema::new_with_metadata(
