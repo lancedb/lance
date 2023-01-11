@@ -79,13 +79,22 @@ pub struct FileReader<'a> {
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
+
+    /// The id of the fragment which this file belong to.
+    /// For simple file access, this can just be zero.
+    fragment_id: u64,
+
+    /// If set true, returns the row ID from the dataset alongside with the
+    /// actual data.
+    with_row_id: bool,
 }
 
 impl<'a> FileReader<'a> {
     /// Open file reader
-    pub async fn new(
+    pub(crate) async fn try_new_with_fragment(
         object_store: &'a ObjectStore,
         path: &Path,
+        fragment_id: u64,
         manifest: Option<&Manifest>,
     ) -> Result<FileReader<'a>> {
         let mut object_reader =
@@ -134,12 +143,28 @@ impl<'a> FileReader<'a> {
             metadata,
             projection: Some(projection),
             page_table,
+            fragment_id,
+            with_row_id: false,
         })
+    }
+
+    /// Open one Lance data file for read.
+    pub async fn try_new(
+        object_store: &'a ObjectStore,
+        path: &Path
+    ) -> Result<FileReader<'a>> {
+        Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
     /// Set the projection [Schema].
     pub fn set_projection(&mut self, schema: Schema) {
         self.projection = Some(schema)
+    }
+
+    /// Instruct the FileReader to return meta row id column.
+    pub(crate) fn with_row_id(&mut self, v: bool) -> &mut Self {
+        self.with_row_id = v;
+        self
     }
 
     /// Schema of the returning RecordBatch.
@@ -385,7 +410,7 @@ mod tests {
         }
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::new(&store, &path, None).await.unwrap();
+        let reader = FileReader::try_new(&store, &path, None).await.unwrap();
         let stream = reader.into_stream();
 
         assert_eq!(stream.count().await, 5);
