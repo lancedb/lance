@@ -19,12 +19,14 @@
 //!
 //! To improve Arrow-RS egonomitic
 
+use std::sync::Arc;
+
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, Int64Array,
     LargeListArray, ListArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::error::Result;
 
@@ -227,6 +229,37 @@ pub trait RecordBatchExt {
     ///
     /// Returns None if the column does not exist.
     fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
+
+    /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_array::{RecordBatch, Int32Array, StringArray};
+    /// use arrow_schema::{Schema, Field, DataType};
+    /// use lance::arrow::*;
+    ///
+    /// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+    /// let int_arr = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+    /// let record_batch = RecordBatch::try_new(schema, vec![int_arr.clone()]).unwrap();
+    ///
+    /// let new_field = Field::new("s", DataType::Utf8, true);
+    /// let str_arr = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
+    /// let new_record_batch = record_batch.try_with_column(new_field, str_arr.clone()).unwrap();
+    ///
+    /// assert_eq!(
+    ///     new_record_batch,
+    ///     RecordBatch::try_new(
+    ///         Arc::new(Schema::new(
+    ///             vec![
+    ///                 Field::new("a", DataType::Int32, true),
+    ///                 Field::new("s", DataType::Utf8, true)
+    ///             ])
+    ///         ),
+    ///         vec![int_arr, str_arr],
+    ///     ).unwrap()
+    /// )
+    /// ```
+    fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -235,5 +268,17 @@ impl RecordBatchExt for RecordBatch {
             .index_of(name)
             .ok()
             .map(|idx| self.column(idx))
+    }
+
+    fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
+        let mut new_fields = self.schema().fields.clone();
+        new_fields.push(field);
+        let new_schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            self.schema().metadata.clone(),
+        ));
+        let mut new_columns = self.columns().to_vec();
+        new_columns.push(arr);
+        Ok(RecordBatch::try_new(new_schema, new_columns)?)
     }
 }
