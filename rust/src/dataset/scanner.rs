@@ -179,10 +179,3 @@ impl Stream for ScannerStream {
         std::pin::Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use futures::stream::StreamExt;
-}

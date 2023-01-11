@@ -149,10 +149,7 @@ impl<'a> FileReader<'a> {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(
-        object_store: &'a ObjectStore,
-        path: &Path
-    ) -> Result<FileReader<'a>> {
+    pub async fn try_new(object_store: &'a ObjectStore, path: &Path) -> Result<FileReader<'a>> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -181,7 +178,15 @@ impl<'a> FileReader<'a> {
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
-        read_batch(&self.object_reader, schema, batch_id, &self.page_table).await
+        read_batch(
+            &self.object_reader,
+            schema,
+            batch_id,
+            &self.page_table,
+            self.fragment_id,
+            self.with_row_id,
+        )
+        .await
     }
 
     /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
@@ -197,11 +202,21 @@ impl<'a> FileReader<'a> {
         let object_reader = &self.object_reader;
         let schema = self.schema();
         let page_table = &self.page_table;
+        let fragment_id = self.fragment_id;
+        let with_row_id = self.with_row_id;
 
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
             if batch_id < num_batches {
-                let batch = read_batch(object_reader, schema, batch_id, page_table).await;
+                let batch = read_batch(
+                    object_reader,
+                    schema,
+                    batch_id,
+                    page_table,
+                    fragment_id,
+                    with_row_id,
+                )
+                .await;
                 Some((batch, batch_id + 1))
             } else {
                 None
@@ -215,6 +230,8 @@ async fn read_batch(
     schema: &Schema,
     batch_id: i32,
     page_table: &PageTable,
+    fragment_id: u64,
+    with_row_id: bool,
 ) -> Result<RecordBatch> {
     let mut arrs = vec![];
     for field in schema.fields.iter() {
@@ -410,7 +427,7 @@ mod tests {
         }
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::try_new(&store, &path, None).await.unwrap();
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
         let stream = reader.into_stream();
 
         assert_eq!(stream.count().await, 5);
