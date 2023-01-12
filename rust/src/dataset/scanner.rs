@@ -27,7 +27,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, ObjectStore};
-use crate::Result;
+use crate::{Error, Result};
 
 /// Dataset Scanner
 ///
@@ -52,6 +52,9 @@ pub struct Scanner<'a> {
     offset: Option<i64>,
 
     fragments: Vec<Fragment>,
+
+    /// Scan the dataset with a meta column: "_rowid"
+    with_row_id: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -62,6 +65,7 @@ impl<'a> Scanner<'a> {
             limit: None,
             offset: None,
             fragments: dataset.fragments().to_vec(),
+            with_row_id: false,
         }
     }
 
@@ -77,6 +81,12 @@ impl<'a> Scanner<'a> {
     pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> &mut Self {
         self.limit = Some(limit);
         self.offset = offset;
+        self
+    }
+
+    /// Instruct the scanner to return the `_rowid` meta column from the dataset.
+    pub fn with_row_id(&mut self) -> &mut Self {
+        self.with_row_id = true;
         self
     }
 
@@ -103,6 +113,7 @@ impl<'a> Scanner<'a> {
             manifest,
             PREFECTH_SIZE,
             &self.projections,
+            self.with_row_id,
         )
     }
 }
@@ -119,6 +130,7 @@ impl ScannerStream {
         manifest: Arc<Manifest>,
         prefetch_size: usize,
         schema: &Schema,
+        with_row_id: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
@@ -127,17 +139,31 @@ impl ScannerStream {
             for frag in &fragments {
                 let data_file = &frag.files[0];
                 let path = data_dir.child(data_file.path.clone());
-                let reader =
-                    match FileReader::new(&object_store, &path, Some(manifest.as_ref())).await {
-                        Ok(mut r) => {
-                            r.set_projection(schema.clone());
-                            r
-                        }
-                        Err(e) => {
-                            tx.send(Err(e)).await.unwrap();
-                            continue;
-                        }
-                    };
+                let reader = match FileReader::try_new_with_fragment(
+                    &object_store,
+                    &path,
+                    frag.id,
+                    Some(manifest.as_ref()),
+                )
+                .await
+                {
+                    Ok(mut r) => {
+                        r.set_projection(schema.clone());
+                        r.with_row_id(with_row_id);
+                        r
+                    }
+                    Err(e) => {
+                        tx.send(Err(Error::IO(format!(
+                            "Failed to open file: {}: {}",
+                            path.to_string(),
+                            e.to_string()
+                        ))))
+                        .await
+                        .unwrap();
+                        // Stop reading.
+                        break;
+                    }
+                };
                 for batch_id in 0..reader.num_batches() {
                     tx.send(reader.read_batch(batch_id as i32).await)
                         .await
@@ -159,11 +185,4 @@ impl Stream for ScannerStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         std::pin::Pin::into_inner(self).rx.poll_recv(cx)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use futures::stream::StreamExt;
 }

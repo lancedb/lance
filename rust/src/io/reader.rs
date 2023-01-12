@@ -23,8 +23,10 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray};
-use arrow_schema::DataType;
+use arrow_array::{
+    ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray, UInt64Array,
+};
+use arrow_schema::{DataType, Field as ArrowField};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use futures::stream::{self, Stream};
@@ -71,6 +73,11 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     Ok(Manifest::from(proto))
 }
 
+/// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
+fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
+    (fragment_id << 32) + offset as u64
+}
+
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
@@ -79,13 +86,22 @@ pub struct FileReader<'a> {
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
+
+    /// The id of the fragment which this file belong to.
+    /// For simple file access, this can just be zero.
+    fragment_id: u64,
+
+    /// If set true, returns the row ID from the dataset alongside with the
+    /// actual data.
+    with_row_id: bool,
 }
 
 impl<'a> FileReader<'a> {
     /// Open file reader
-    pub async fn new(
+    pub(crate) async fn try_new_with_fragment(
         object_store: &'a ObjectStore,
         path: &Path,
+        fragment_id: u64,
         manifest: Option<&Manifest>,
     ) -> Result<FileReader<'a>> {
         let mut object_reader =
@@ -134,12 +150,25 @@ impl<'a> FileReader<'a> {
             metadata,
             projection: Some(projection),
             page_table,
+            fragment_id,
+            with_row_id: false,
         })
+    }
+
+    /// Open one Lance data file for read.
+    pub async fn try_new(object_store: &'a ObjectStore, path: &Path) -> Result<FileReader<'a>> {
+        Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
     /// Set the projection [Schema].
     pub fn set_projection(&mut self, schema: Schema) {
         self.projection = Some(schema)
+    }
+
+    /// Instruct the FileReader to return meta row id column.
+    pub(crate) fn with_row_id(&mut self, v: bool) -> &mut Self {
+        self.with_row_id = v;
+        self
     }
 
     /// Schema of the returning RecordBatch.
@@ -156,7 +185,20 @@ impl<'a> FileReader<'a> {
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
-        read_batch(&self.object_reader, schema, batch_id, &self.page_table).await
+        let batch_offset = self
+            .metadata
+            .get_offset(batch_id)
+            .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))?;
+        read_batch(
+            &self.object_reader,
+            schema,
+            batch_id,
+            &self.page_table,
+            self.fragment_id,
+            batch_offset,
+            self.with_row_id,
+        )
+        .await
     }
 
     /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
@@ -172,11 +214,30 @@ impl<'a> FileReader<'a> {
         let object_reader = &self.object_reader;
         let schema = self.schema();
         let page_table = &self.page_table;
+        let fragment_id = self.fragment_id;
+        let with_row_id = self.with_row_id;
 
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
+            let batch_offset = match self
+                .metadata
+                .get_offset(batch_id)
+                .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))
+            {
+                Ok(o) => o,
+                Err(e) => return Some((Err(e), batch_id + 1)),
+            };
             if batch_id < num_batches {
-                let batch = read_batch(object_reader, schema, batch_id, page_table).await;
+                let batch = read_batch(
+                    object_reader,
+                    schema,
+                    batch_id,
+                    page_table,
+                    fragment_id,
+                    batch_offset,
+                    with_row_id,
+                )
+                .await;
                 Some((batch, batch_id + 1))
             } else {
                 None
@@ -190,13 +251,28 @@ async fn read_batch(
     schema: &Schema,
     batch_id: i32,
     page_table: &PageTable,
+    fragment_id: u64,
+    batch_offset: i32,
+    with_row_id: bool,
 ) -> Result<RecordBatch> {
     let mut arrs = vec![];
     for field in schema.fields.iter() {
         let arr = read_array(reader, field, batch_id, page_table).await?;
         arrs.push(arr);
     }
-    Ok(RecordBatch::try_new(Arc::new(schema.into()), arrs)?)
+    let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
+    if with_row_id {
+        let row_id_arr = Arc::new(UInt64Array::from_iter_values(
+            (batch_offset..(batch_offset + batch.num_rows() as i32))
+                .map(|o| compute_row_id(fragment_id, o))
+                .collect::<Vec<_>>(),
+        ));
+        batch = batch.try_with_column(
+            ArrowField::new("_rowid", DataType::UInt64, false),
+            row_id_arr,
+        )?;
+    }
+    Ok(batch)
 }
 
 #[async_recursion]
@@ -353,7 +429,7 @@ async fn read_large_list_array(
 mod tests {
     use super::*;
 
-    use arrow_array::{Float32Array, Int64Array};
+    use arrow_array::{cast::as_primitive_array, Float32Array, Int64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -385,7 +461,7 @@ mod tests {
         }
         file_writer.finish().await.unwrap();
 
-        let reader = FileReader::new(&store, &path, None).await.unwrap();
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
         let stream = reader.into_stream();
 
         assert_eq!(stream.count().await, 5);
@@ -397,5 +473,54 @@ mod tests {
                 .all(|f| async move { f })
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn read_with_row_id() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let writer = store.create(&path).await.unwrap();
+
+        // Write 10 batches.
+        let mut file_writer = FileWriter::new(writer, &schema);
+        for batch_id in 0..10 {
+            let value_range = batch_id * 10..batch_id * 10 + 10;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(
+                    value_range.clone().collect::<Vec<_>>(),
+                )),
+                Arc::new(Float32Array::from_iter(
+                    value_range.map(|n| n as f32).collect::<Vec<_>>(),
+                )),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+            file_writer.write(&batch).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let fragment = 123;
+        let mut reader = FileReader::try_new_with_fragment(&store, &path, fragment, None)
+            .await
+            .unwrap();
+        reader.with_row_id(true);
+
+        for b in 0..10 {
+            let batch = reader.read_batch(b).await.unwrap();
+            assert!(batch.column_with_name("_rowid").is_some());
+            let row_ids_col = batch.column_with_name("_rowid").unwrap();
+            // Do the same computation as `compute_row_id`.
+            let start_pos = (fragment << 32) as u64 + 10 * b as u64;
+
+            assert_eq!(
+                &UInt64Array::from_iter_values(start_pos..start_pos + 10),
+                as_primitive_array(row_ids_col)
+            );
+        }
     }
 }
