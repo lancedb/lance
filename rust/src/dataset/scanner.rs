@@ -27,7 +27,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, ObjectStore};
-use crate::Result;
+use crate::{Error, Result};
 
 /// Dataset Scanner
 ///
@@ -153,8 +153,15 @@ impl ScannerStream {
                         r
                     }
                     Err(e) => {
-                        tx.send(Err(e)).await.unwrap();
-                        continue;
+                        tx.send(Err(Error::IO(format!(
+                            "Failed to open file: {}: {}",
+                            path.to_string(),
+                            e.to_string()
+                        ))))
+                        .await
+                        .unwrap();
+                        // Stop reading.
+                        break;
                     }
                 };
                 for batch_id in 0..reader.num_batches() {

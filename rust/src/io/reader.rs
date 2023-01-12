@@ -73,6 +73,11 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     Ok(Manifest::from(proto))
 }
 
+/// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
+fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
+    (fragment_id << 32) + offset as u64
+}
+
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
@@ -214,11 +219,14 @@ impl<'a> FileReader<'a> {
 
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
-            let batch_offset = self
+            let batch_offset = match self
                 .metadata
                 .get_offset(batch_id)
                 .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))
-                .unwrap();
+            {
+                Ok(o) => o,
+                Err(e) => return Some((Err(e), batch_id + 1)),
+            };
             if batch_id < num_batches {
                 let batch = read_batch(
                     object_reader,
@@ -256,7 +264,7 @@ async fn read_batch(
     if with_row_id {
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
             (batch_offset..(batch_offset + batch.num_rows() as i32))
-                .map(|v| v as u64 + (fragment_id << 32))
+                .map(|o| compute_row_id(fragment_id, o))
                 .collect::<Vec<_>>(),
         ));
         batch = batch.try_with_column(
@@ -506,6 +514,7 @@ mod tests {
             let batch = reader.read_batch(b).await.unwrap();
             assert!(batch.column_with_name("_rowid").is_some());
             let row_ids_col = batch.column_with_name("_rowid").unwrap();
+            // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) as u64 + 10 * b as u64;
 
             assert_eq!(
