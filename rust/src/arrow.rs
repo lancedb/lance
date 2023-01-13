@@ -28,6 +28,8 @@ use arrow_array::{
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Schema};
 
+mod kernels;
+pub use kernels::*;
 use crate::error::Result;
 
 pub trait DataTypeExt {
