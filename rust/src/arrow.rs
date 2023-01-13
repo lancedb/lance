@@ -29,8 +29,8 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Schema};
 
 mod kernels;
-pub use kernels::*;
 use crate::error::Result;
+pub use kernels::*;
 
 pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.
