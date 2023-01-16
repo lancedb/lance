@@ -89,14 +89,10 @@ impl AsyncWrite for ObjectWriter {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut this = self.project();
-        let p = this.writer.as_mut().poll_write(cx, buf);
-        match p {
-            Poll::Ready(Ok(n)) => {
-                *this.cursor += n;
-                p
-            }
-            _ => p,
-        }
+        this.writer.as_mut().poll_write(cx, buf).map_ok(|n| {
+            *this.cursor += n;
+            n
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
