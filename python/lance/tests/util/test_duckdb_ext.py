@@ -4,6 +4,7 @@ import platform
 from pathlib import Path
 
 import duckdb
+import lance
 import pytest
 import torch
 
