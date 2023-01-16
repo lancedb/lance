@@ -41,10 +41,10 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: "3.11"
+        python-version: "3.10"
     - uses: ./.github/workflows/build_mac_wheel
       with:
-        python-minor-version: "11"
+        python-minor-version: "10"
     - uses: ./.github/workflows/run_tests
       with:
-        python-minor-version: "11"
+        python-minor-version: "10"

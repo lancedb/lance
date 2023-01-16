@@ -7,7 +7,6 @@ on:
     paths:
       - src/**
       - protos/**
-      - .github/workflows/cpp.yml
 jobs:
   build:
     runs-on: ubuntu-22.04
