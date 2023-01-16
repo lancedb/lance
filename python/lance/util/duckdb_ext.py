@@ -44,7 +44,7 @@ def _check_duckdb_version():
     Currently the extension is pre-built for v0.6.0 of duckdb and duckdb
     does not support binary compatibility between patch versions
     """
-    CURR_VER = "0.6.0"
+    CURR_VER = "0.6.1"
     if duckdb.__version__ != CURR_VER:
         msg = (
             f"The lance extension is built against DuckDB version f{CURR_VER} but "
@@ -59,22 +59,12 @@ def _get_uri(version):
     arch = uname.machine  # arm64, x86_64
     system = uname.system
     system = "osx" if system.lower() == "darwin" else system
-    device = _get_device()
-    zip_name = f"lance.duckdb_extension.{system}.{arch}.{device}.zip"
+    zip_name = f"lance.duckdb_extension.{system}.{arch}.cpu.zip"
     uri_root = "https://eto-public.s3.us-west-2.amazonaws.com/"
     uri = os.path.join(
         uri_root, "artifacts", "lance", "lance_duckdb", version, zip_name
     )
     return uri
-
-
-def _get_device():
-    import torch
-
-    if torch.cuda.is_available():
-        return f"cu{torch.version.cuda.replace('.', '')}"
-    else:
-        return "cpu"
 
 
 def _get_latest_version(org="lance", ext="lance_duckdb"):

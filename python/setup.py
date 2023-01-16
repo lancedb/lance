@@ -75,7 +75,7 @@ setup(
     zip_safe=False,
     install_requires=["numpy", "pillow", "pyarrow>=10,<11", "requests", "pandas"],
     extras_require={
-        "test": ["pytest>=6.0", "duckdb==0.6.0", "click", "requests_mock", "hypothesis"]
+        "test": ["pytest>=6.0", "duckdb==0.6.1", "click", "requests_mock", "hypothesis"]
     },
     python_requires=">=3.8",
     packages=find_packages(),
@@ -86,6 +86,7 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Operating System :: POSIX :: Linux",
         "Intended Audience :: Developers",
     ],

@@ -17,7 +17,7 @@ jobs:
     env:
       ArrowVersion: 10.0.1-1
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
       - name: Install dependencies
@@ -32,6 +32,12 @@ jobs:
         run: cmake -B build
       - name: Build
         run: make -C build -j 4
+      - name: Upload Lance duckdb extension
+        uses: actions/upload-artifact@v3
+        with:
+          name: duckdb-ubuntu-extension
+          path: integration/duckdb/build/lance.duckdb_extension
+          retention-days: 1
   MacOS:
     runs-on: macos-12
     timeout-minutes: 40
@@ -39,7 +45,7 @@ jobs:
       run:
         working-directory: ./integration/duckdb
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
           cd $(brew --repository)
@@ -61,3 +67,10 @@ jobs:
         run: cmake -B build
       - name: Build
         run: make -C build -j
+      - name: Upload Lance duckdb extension
+        uses: actions/upload-artifact@v3
+        with:
+          name: duckdb-intel-mac-extension
+          path: integration/duckdb/build/lance.duckdb_extension
+          retention-days: 1
+

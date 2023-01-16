@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import lance
 from pathlib import Path
 import pytest
 
