@@ -94,7 +94,7 @@ impl AsyncWrite for ObjectWriter {
             Poll::Ready(Ok(n)) => {
                 *this.cursor += n;
                 p
-            },
+            }
             _ => p,
         }
     }
