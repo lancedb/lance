@@ -17,7 +17,7 @@ jobs:
     env:
       ArrowVersion: 10.0.1-1
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: ccache
         uses: hendrikmuhs/ccache-action@v1
       - name: Install dependencies
@@ -36,7 +36,7 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: duckdb-ubuntu-extension
-          path: build/lance.duckdb_extension
+          path: ./build/lance.duckdb_extension
           retention-days: 1
   MacOS:
     runs-on: macos-12
