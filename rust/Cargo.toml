@@ -45,7 +45,7 @@ tokio = { version = "1.23", features = ["rt-multi-thread", "rt", "macros"] }
 url = "2.3"
 rand = "0.8.3"
 futures = "0.3"
-"faiss" = {version = "0.11.0"}
+faiss  = {version = "0.11.0", features=["gpu"]}
 
 [build-dependencies]
 prost-build = "0.11"

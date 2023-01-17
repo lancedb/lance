@@ -483,7 +483,7 @@ async fn train_kmean_model(
     let mut arr_list = vec![];
     for batch in batches {
         let b = batch.unwrap();
-        let arr = b.column_with_name("vec").unwrap();
+        let arr = b.column_with_name("vector").unwrap();
         let list_arr = as_fixed_size_list_array(&arr);
         arr_list.push(list_arr.values().clone());
     }
@@ -658,7 +658,7 @@ mod tests {
         let dataset = Dataset::open(dataset_uri.as_path().to_str().unwrap())
             .await
             .unwrap();
-        let idx = IvfPqIndexBuilder::try_new(&dataset, "vec", 64, 16).unwrap();
+        let idx = IvfPqIndexBuilder::try_new(&dataset, "vector", 256, 16).unwrap();
         idx.build().await.unwrap();
     }
 

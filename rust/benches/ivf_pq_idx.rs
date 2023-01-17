@@ -54,6 +54,7 @@ fn bench_search(c: &mut Criterion) {
 
     c.bench_function("vec-ivf_pq-index_top_100", move |b| {
         let mut rand = rand::thread_rng();
+        let column = "vector".to_string();
 
         let dataset_uri = current_dir().unwrap().join("vec_data");
         let dataset = runtime.block_on(async {
@@ -63,12 +64,12 @@ fn bench_search(c: &mut Criterion) {
         });
 
         let (first_batch, index) = runtime.block_on(async {
-            let mut stream = dataset.scan().project(&["vec"]).unwrap().into_stream();
+            let mut stream = dataset.scan().project(&[&column]).unwrap().into_stream();
             let first_batch = stream.next().await.unwrap().unwrap();
 
             (
                 first_batch.column(0).clone(),
-                IvfPQIndex::open(&dataset, "vec").await.unwrap(),
+                IvfPQIndex::open(&dataset, &column).await.unwrap(),
             )
         });
 
@@ -89,7 +90,7 @@ fn bench_search(c: &mut Criterion) {
 
         // Compute recall
         runtime.block_on(async {
-            let flat_index = FlatIndex::new(&dataset, "vec".to_string());
+            let flat_index = FlatIndex::new(&dataset, column.clone());
             let ivf_results = index.search(&params).await.unwrap();
             let flat_results = flat_index.search(&params).await.unwrap();
             println!("Recall: {}", compute_recall(&ivf_results, &flat_results))
