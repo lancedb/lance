@@ -137,6 +137,9 @@ impl ScannerStream {
         let schema = schema.clone();
         tokio::spawn(async move {
             for frag in &fragments {
+                if tx.is_closed() {
+                    return;
+                }
                 let data_file = &frag.files[0];
                 let path = data_dir.child(data_file.path.clone());
                 let reader = match FileReader::try_new_with_fragment(
@@ -159,15 +162,18 @@ impl ScannerStream {
                             e.to_string()
                         ))))
                         .await
-                        .unwrap();
+                        .expect("Scanner sending error message");
                         // Stop reading.
                         break;
                     }
                 };
                 for batch_id in 0..reader.num_batches() {
+                    if tx.is_closed() {
+                        return;
+                    }
                     tx.send(reader.read_batch(batch_id as i32).await)
                         .await
-                        .unwrap();
+                        .expect("Scanner: failed to send record batch");
                 }
             }
             drop(tx)
