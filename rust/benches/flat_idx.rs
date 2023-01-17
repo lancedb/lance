@@ -2,7 +2,7 @@ use std::env::current_dir;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance::dataset::Dataset;
-use lance::index::ann::{FlatIndex, SearchParams};
+use lance::index::ann::{FlatIndex, Query};
 use lance::utils::generate_random_array;
 
 fn bench_search(c: &mut Criterion) {
@@ -22,7 +22,7 @@ fn bench_search(c: &mut Criterion) {
         });
 
         let index = FlatIndex::new(&dataset, "vec".to_string());
-        let params = SearchParams {
+        let params = Query {
             key: generate_random_array(256),
             k: 10,
             nprob: 0,

@@ -27,7 +27,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures::StreamExt;
 use lance::arrow::*;
 use lance::dataset::Dataset;
-use lance::index::ann::{FlatIndex, IvfPQIndex, SearchParams};
+use lance::index::ann::{FlatIndex, IvfPQIndex, Query};
 use pprof::criterion::{Output, PProfProfiler};
 
 fn compute_recall(predicts: &RecordBatch, ground_truth: &RecordBatch) -> f32 {
@@ -77,7 +77,7 @@ fn bench_search(c: &mut Criterion) {
             as_fixed_size_list_array(&first_batch).value(rand.gen_range(0..first_batch.len()));
         let key = as_primitive_array(&key).clone();
 
-        let params = SearchParams {
+        let params = Query {
             key,
             k: 100,
             nprob: 60,

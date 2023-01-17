@@ -39,7 +39,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 
 use super::distance::euclidean_distance;
 use super::pq::ProductQuantizer;
-use super::SearchParams;
+use super::Query;
 use crate::index::{pb, IndexBuilder, IndexType};
 use crate::io::object_reader::ObjectReader;
 use crate::{arrow::*, io::read_metadata_offset};
@@ -104,7 +104,7 @@ impl<'a> IvfPQIndex<'a> {
         })
     }
 
-    pub async fn search(&self, params: &SearchParams) -> Result<RecordBatch> {
+    pub async fn search(&self, params: &Query) -> Result<RecordBatch> {
         let partition_ids = self.ivf.locate_partitions(&params.key, params.nprob)?;
         let key = &params.key;
         let candidates = stream::iter(partition_ids.iter().map(|p| p.unwrap()))
@@ -669,7 +669,7 @@ mod tests {
             .await
             .unwrap();
         let idx = IvfPQIndex::open(&dataset, "vec").await.unwrap();
-        let params = &SearchParams {
+        let params = &Query {
             key: generate_random_array(1024),
             k: 10,
             nprob: 10,

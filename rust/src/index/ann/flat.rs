@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 
 use super::distance::euclidean_distance;
-use super::SearchParams;
+use super::Query;
 use crate::arrow::RecordBatchExt;
 use crate::dataset::Dataset;
 use crate::index::{Index, IndexType};
@@ -71,7 +71,7 @@ impl<'a> FlatIndex<'a> {
     ///
     /// WARNINGS:
     ///  - Only supports f32 now. we add f64 later.
-    pub async fn search(&self, params: &SearchParams) -> Result<RecordBatch> {
+    pub async fn search(&self, params: &Query) -> Result<RecordBatch> {
         let stream = self
             .dataset
             .scan()

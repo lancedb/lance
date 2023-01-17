@@ -29,7 +29,7 @@ pub use flat::FlatIndex;
 pub use ivf_pq::IvfPQIndex;
 
 /// Search parameters for the ANN indices
-pub struct SearchParams {
+pub struct Query {
     /// The vector to be searched.
     pub key: Float32Array,
     /// Top k results to return.
