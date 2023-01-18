@@ -20,7 +20,8 @@
 use rand::Rng;
 use std::iter::repeat_with;
 
-use arrow_array::Float32Array;
+use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, SchemaRef};
 
 /// Create a random float32 array.
 pub fn generate_random_array(n: usize) -> Float32Array {
@@ -30,4 +31,35 @@ pub fn generate_random_array(n: usize) -> Float32Array {
             .take(n)
             .collect::<Vec<f32>>(),
     )
+}
+
+pub struct RecordBatchBuffer {
+    pub batches: Vec<RecordBatch>,
+    idx: usize,
+}
+
+impl RecordBatchBuffer {
+    pub fn new(batches: Vec<RecordBatch>) -> Self {
+        Self { batches, idx: 0 }
+    }
+}
+
+impl RecordBatchReader for RecordBatchBuffer {
+    fn schema(&self) -> SchemaRef {
+        self.batches[0].schema()
+    }
+}
+
+impl Iterator for RecordBatchBuffer {
+    type Item = std::result::Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx < self.batches.len() {
+            let idx = self.idx;
+            self.idx += 1;
+            Some(Ok(self.batches[idx].clone()))
+        } else {
+            None
+        }
+    }
 }

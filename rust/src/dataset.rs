@@ -4,17 +4,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow_array::{RecordBatch, RecordBatchReader};
 use chrono::prelude::*;
 use object_store::path::Path;
+use uuid::Uuid;
+
+pub mod scanner;
+mod write;
 
 use self::scanner::Scanner;
 use crate::datatypes::Schema;
-use crate::error::Result;
 use crate::format::{Fragment, Manifest};
 use crate::io::read_manifest;
 use crate::io::{read_metadata_offset, ObjectStore};
-
-pub mod scanner;
+use crate::{Error, Result};
+pub use write::*;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
@@ -79,11 +83,39 @@ impl Dataset {
         })
     }
 
+    /// Create a new dataset with [RecordBatch]s.
+    pub async fn create(
+        batches: &mut dyn RecordBatchReader,
+        uri: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+
+        // 1. check the directory does not exist.
+        let object_store = Arc::new(ObjectStore::new(uri)?);
+
+        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        match object_store.inner.head(&latest_manifest_path).await {
+            Ok(_) => return Err(Error::IO(format!("Dataset already exists: {}", uri))),
+            Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
+            Err(e) => return Err(Error::from(e)),
+        }
+
+        let params = params.unwrap_or_default();
+        let file_path = object_store.base_path().child(DATA_DIR).child(format!("{}.lance", Uuid::new_v4()));
+        println!("Create file path");
+        let batch_buffer: Vec<&RecordBatch> = vec![];
+        for batch in batches {
+            println!("Batch is : {:?}", batch);
+        }
+        todo!()
+    }
+
+    /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(&self)
     }
 
-    pub fn object_store(&self) -> &ObjectStore {
+    pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
 
@@ -125,5 +157,25 @@ impl Dataset {
 
     pub fn fragments(&self) -> &[Fragment] {
         &self.manifest.fragments
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::utils::testing::RecordBatchBuffer;
+
+    use super::*;
+
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn create_dataset() {
+        let test_dir = tempdir().unwrap();
+
+
+        let mut batches = RecordBatchBuffer::new(vec![]);
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = Dataset::create(&mut batches, test_uri, None).await.unwrap();
     }
 }
