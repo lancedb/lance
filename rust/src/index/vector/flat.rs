@@ -51,6 +51,13 @@ pub struct FlatIndex<'a> {
     column: String,
 }
 
+impl<'a> FlatIndex<'a> {
+
+    pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
+        todo!();
+    }
+}
+
 #[async_trait]
 impl VectorIndex for FlatIndex<'_> {
     async fn search(&self, params: &Query) -> Result<RecordBatch> {
