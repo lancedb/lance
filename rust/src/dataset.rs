@@ -102,12 +102,7 @@ impl Dataset {
         }
 
         let params = params.unwrap_or_default();
-        let file_path = object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(format!("{}.lance", Uuid::new_v4()));
-        println!("Create file path: {}", file_path);
-        let mut buffer = RecordBatchBuffer::empty();
+
 
         let mut peekable = batches.peekable();
         let schema: Schema;
@@ -123,6 +118,16 @@ impl Dataset {
             ));
         }
 
+        let mut manifest = Manifest::new(&schema);
+
+        let mut fragment = 
+        let file_path = object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(format!("{}.lance", Uuid::new_v4()));
+        println!("Create file path: {}", file_path);
+        let mut buffer = RecordBatchBuffer::empty();
+
         let object_writer = object_store.create(&file_path).await?;
         let mut file_writer = FileWriter::new(object_writer, &schema);
         for batch_result in peekable {
@@ -133,6 +138,8 @@ impl Dataset {
                 buffer = RecordBatchBuffer::empty();
             }
         }
+        drop(file_writer);
+
 
         todo!()
     }
