@@ -65,16 +65,8 @@ pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
     sum(&mul).unwrap()
 }
 
-/// Euclidean Distance (L2) from a point to a list of points.
-pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
-    assert_eq!(from.len(), to.value_length() as usize);
-    assert_eq!(to.value_type(), DataType::Float32);
-    assert_eq!(
-        to.value_length() % 8,
-        0,
-        "Vector dimension must be a mulitply of 8"
-    );
-
+#[cfg(any(target_arch = "x86_64"))]
+fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     let inner_array = to.values();
     let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
     let dimension = from.len();
@@ -83,14 +75,11 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         Float32Array::from_trusted_len_iter(
             (0..to.len())
                 .map(|idx| {
-                    #[cfg(any(target_arch = "x86_64"))]
-                    {
-                        if is_x86_feature_detected!("fma") {
-                            return euclidean_distance_fma(
-                                from.values(),
-                                &buffer[idx * dimension as usize..(idx + 1) * dimension as usize],
-                            );
-                        }
+                    if is_x86_feature_detected!("fma") {
+                        return euclidean_distance_fma(
+                            from.values(),
+                            &buffer[idx * dimension as usize..(idx + 1) * dimension as usize],
+                        );
                     }
                     // Fallback
                     let left = to.value(idx);
@@ -101,6 +90,38 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         )
     };
     Ok(Arc::new(scores))
+}
+
+/// Euclidean Distance (L2) from a point to a list of points.
+pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
+    assert_eq!(from.len(), to.value_length() as usize);
+    assert_eq!(to.value_type(), DataType::Float32);
+    assert_eq!(
+        to.value_length() % 8,
+        0,
+        "Vector dimension must be a mulitply of 8"
+    );
+
+    #[cfg(any(target_arch = "x86_64"))]
+    {
+        return l2_distance_x86_64(from, to);
+    }
+
+    #[cfg(not(any(target_arch = "x86_64")))]
+    {
+        let scores: Float32Array = unsafe {
+            Float32Array::from_trusted_len_iter(
+                (0..to.len())
+                    .map(|idx| {
+                        let left = to.value(idx);
+                        let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
+                        l2_distance_arrow(from, arr)
+                    })
+                    .map(|d| Some(d)),
+            )
+        };
+        Ok(Arc::new(scores))
+    }
 }
 
 #[cfg(test)]
