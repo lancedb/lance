@@ -18,6 +18,7 @@
 use std::collections::BTreeSet;
 
 use crate::format::pb;
+use crate::datatypes::Schema;
 
 /// Lance Data File
 ///
@@ -28,6 +29,15 @@ pub struct DataFile {
     pub path: String,
     /// The Ids of fields in this file.
     fields: Vec<i32>,
+}
+
+impl DataFile {
+    pub fn new(path: &str, schema: &Schema) -> Self {
+        Self {
+            path: path.to_string(),
+            fields: schema.field_ids(),
+        }
+    }
 }
 
 impl From<&DataFile> for pb::DataFile {

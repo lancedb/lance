@@ -548,6 +548,14 @@ impl Schema {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    /// Recursively collect all the field IDs,
+    pub(crate) fn field_ids(&self) -> Vec<i32> {
+        // TODO: make a tree travesal iterator.
+
+        let protos: Vec<pb::Field> = self.into();
+        protos.iter().map(|f| f.id).collect()
+    }
+
     pub(crate) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
         for field in self.fields.as_mut_slice() {
             if field.id == id {
