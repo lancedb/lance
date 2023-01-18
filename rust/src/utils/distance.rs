@@ -56,8 +56,8 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     results[7]
 }
 
-// Calculate L2 distance directly using Arrow compute kernels.
-//
+/// Calculate L2 distance directly using Arrow compute kernels.
+///
 #[inline]
 pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
     let mul: Float32Array = binary(from, to, |a, b| (a - b).powf(2.0)).unwrap();
@@ -71,13 +71,14 @@ fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Ar
     let inner_array = to.values();
     let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
     let dimension = from.len();
+    let from_vector = from.values();
 
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
             (0..to.len())
                 .map(|idx| {
                     return euclidean_distance_fma(
-                        from.values(),
+                        from_vector,
                         &buffer[idx * dimension as usize..(idx + 1) * dimension as usize],
                     );
                 })
@@ -137,6 +138,23 @@ mod tests {
         assert_eq!(
             scores.as_ref(),
             &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
+        );
+    }
+
+    #[test]
+    fn test_odd_length_vector() {
+        let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            vec![
+                Some((0..5).map(|v| Some(v as f32)).collect::<Vec<_>>()),
+            ],
+            5,
+        );
+        let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
+        let scores = l2_distance(&point, &mat).unwrap();
+
+        assert_eq!(
+            scores.as_ref(),
+            &Float32Array::from(vec![20.0])
         );
     }
 }
