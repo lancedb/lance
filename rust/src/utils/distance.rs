@@ -77,12 +77,12 @@ fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Ar
         Float32Array::from_trusted_len_iter(
             (0..to.len())
                 .map(|idx| {
-                    return euclidean_distance_fma(
+                    euclidean_distance_fma(
                         from_vector,
-                        &buffer[idx * dimension as usize..(idx + 1) * dimension as usize],
-                    );
+                        &buffer[idx * dimension..(idx + 1) * dimension],
+                    )
                 })
-                .map(|d| Some(d)),
+                .map(Some),
         )
     };
     Ok(Arc::new(scores))
@@ -108,7 +108,7 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
                     let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
                     l2_distance_arrow(from, arr)
                 })
-                .map(|d| Some(d)),
+                .map(Some),
         )
     };
     Ok(Arc::new(scores))
