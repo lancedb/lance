@@ -15,4 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Various utilities
+
 pub mod distance;
+pub mod testing;
