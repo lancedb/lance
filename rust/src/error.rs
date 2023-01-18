@@ -43,6 +43,12 @@ impl From<ArrowError> for Error {
     }
 }
 
+impl From<&ArrowError> for Error {
+    fn from(e: &ArrowError) -> Self {
+        Self::Arrow(e.to_string())
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::IO(e.to_string())

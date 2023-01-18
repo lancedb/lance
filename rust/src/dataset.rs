@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use chrono::prelude::*;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -13,9 +14,10 @@ pub mod scanner;
 mod write;
 
 use self::scanner::Scanner;
+use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
-use crate::io::read_manifest;
+use crate::io::{read_manifest, FileWriter};
 use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
 pub use write::*;
@@ -89,7 +91,6 @@ impl Dataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-
         // 1. check the directory does not exist.
         let object_store = Arc::new(ObjectStore::new(uri)?);
 
@@ -101,12 +102,38 @@ impl Dataset {
         }
 
         let params = params.unwrap_or_default();
-        let file_path = object_store.base_path().child(DATA_DIR).child(format!("{}.lance", Uuid::new_v4()));
-        println!("Create file path");
-        let batch_buffer: Vec<&RecordBatch> = vec![];
-        for batch in batches {
-            println!("Batch is : {:?}", batch);
+        let file_path = object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(format!("{}.lance", Uuid::new_v4()));
+        println!("Create file path: {}", file_path);
+        let mut buffer = RecordBatchBuffer::empty();
+
+        let mut peekable = batches.peekable();
+        let schema: Schema;
+        if let Some(batch) = peekable.peek() {
+            if let Ok(b) = batch {
+                schema = Schema::try_from(b.schema().as_ref())?;
+            } else {
+                return Err(Error::from(batch.as_ref().unwrap_err()));
+            }
+        } else {
+            return Err(Error::IO(
+                "Attempt to write empty record batches".to_string(),
+            ));
         }
+
+        let object_writer = object_store.create(&file_path).await?;
+        let mut file_writer = FileWriter::new(object_writer, &schema);
+        for batch_result in peekable {
+            let batch = batch_result?;
+            buffer.batches.push(batch);
+            if buffer.num_rows() >= params.max_rows_per_group {
+                file_writer.write(&buffer.finish()?).await?;
+                buffer = RecordBatchBuffer::empty();
+            }
+        }
+
         todo!()
     }
 
@@ -162,9 +189,10 @@ impl Dataset {
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::testing::RecordBatchBuffer;
-
     use super::*;
+
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
 
     use tempfile::tempdir;
 
@@ -172,8 +200,12 @@ mod tests {
     async fn create_dataset() {
         let test_dir = tempdir().unwrap();
 
-
-        let mut batches = RecordBatchBuffer::new(vec![]);
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let mut batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(1..10))],
+        )
+        .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = Dataset::create(&mut batches, test_uri, None).await.unwrap();
