@@ -17,28 +17,30 @@
 
 //! Flat Vector Index.
 
-use std::sync::Arc;
-
-use arrow_array::{
-    cast::{as_primitive_array, as_struct_array},
-    Float32Array, RecordBatch,
-};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::concat::concat_batches;
-use futures::stream::StreamExt;
+use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
+use arrow_ord::sort::sort_to_indices;
+use arrow_schema::{DataType, Field as ArrowField};
+use arrow_select::{concat::concat, take::take};
+use async_trait::async_trait;
+use futures::TryStreamExt;
 
 use super::{Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
-use crate::Result;
+use crate::utils::distance::l2_distance;
+use crate::{Error, Result};
 
 /// Flat Vector Index.
 ///
 /// Flat index is a meta index. It does not build extra index structure,
-/// and just uses the full scan to compute the distances.
+/// and does exhaustive search.
+///
+/// Flat index always provides 100% recall because exhaustive search over the
+/// uncompressed original vectors.
 ///
 /// Reference:
 ///   - <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>
+#[derive(Debug)]
 pub struct FlatIndex<'a> {
     dataset: &'a Dataset,
 
@@ -49,7 +51,8 @@ pub struct FlatIndex<'a> {
     column: String,
 }
 
-impl<'a> VectorIndex for FlatIndex<'_> {
+#[async_trait]
+impl VectorIndex for FlatIndex<'_> {
     async fn search(&self, params: &Query) -> Result<RecordBatch> {
         let stream = self
             .dataset
@@ -58,45 +61,46 @@ impl<'a> VectorIndex for FlatIndex<'_> {
             .with_row_id()
             .into_stream();
 
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("_rowid", DataType::UInt64, false),
-            ArrowField::new("score", DataType::Float32, false),
-        ]));
-        let key_arr: &Float32Array = as_primitive_array(&params.key);
-        let all_scores = stream
-            .map(|b| async {
-                if let Ok(batch) = b {
-                    let key_arr = key_arr.clone();
-                    let value_arr = batch.column_with_name(&self.column).unwrap().clone();
-                    let scores = tokio::task::spawn_blocking(move || {
-                        let targets = downcast_array::<FixedSizeListArray>(&value_arr);
-                        euclidean_distance(&key_arr, &targets).unwrap()
-                    })
-                    .await
-                    .unwrap();
-                    Ok(RecordBatch::try_new(
-                        schema.clone(),
-                        vec![batch.column_with_name("_rowid").unwrap().clone(), scores],
-                    )?)
-                } else {
-                    b
-                }
+        let score_and_row_ids = stream
+            .and_then(|batch| async move {
+                let k = params.key.clone();
+                let batch = batch.clone();
+                let vectors = batch
+                    .column_with_name(&self.column)
+                    .ok_or(Error::Schema(format!(
+                        "column {} does not exist in dataset",
+                        self.column,
+                    )))?
+                    .clone();
+                let scores = tokio::task::spawn_blocking(move || {
+                    l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
+                })
+                .await?;
+                // TODO: only pick top-k in each batch first.
+                let row_id_array = batch.column_with_name("_rowid").unwrap().clone();
+                Ok((scores as ArrayRef, row_id_array))
             })
-            .buffered(10)
-            .collect::<Vec<_>>()
-            .await;
-        let scores = concat_batches(
-            &schema,
-            all_scores
-                .iter()
-                .map(|s| s.as_ref().unwrap().clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?;
-        let scores_arr = scores.column_with_name("score").unwrap();
-        let indices = sort_to_indices(scores_arr, None, Some(params.k))?;
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        let struct_arr = StructArray::from(scores);
+        let scores_arrays = score_and_row_ids
+            .iter()
+            .map(|(score, _)| score.as_ref())
+            .collect::<Vec<_>>();
+        let row_ids_arrays = score_and_row_ids
+            .iter()
+            .map(|(_, row_id)| row_id.as_ref())
+            .collect::<Vec<_>>();
+        let scores = concat(&scores_arrays)?;
+        let row_ids = concat(&row_ids_arrays)?;
+
+        let indices = sort_to_indices(&scores, None, Some(params.k))?;
+
+        let struct_arr = StructArray::try_from(vec![
+            (ArrowField::new("_rowid", DataType::UInt64, false), row_ids),
+            (ArrowField::new("score", DataType::Float32, false), scores),
+        ])
+        .map_err(|e| Error::IO(format!("Can not build struct array: {}", e.to_string())))?;
         let taken_scores = take(&struct_arr, &indices, None)?;
         Ok(as_struct_array(&taken_scores).into())
     }

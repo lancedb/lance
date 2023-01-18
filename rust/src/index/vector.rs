@@ -18,6 +18,8 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
+use std::sync::Arc;
+
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
 
@@ -28,13 +30,14 @@ use crate::Result;
 /// Query parameters for the vector indices
 pub struct Query {
     /// The vector to be searched.
-    pub key: Float32Array,
+    pub key: Arc<Float32Array>,
     /// Top k results to return.
     pub k: usize,
     /// The number of probs to load and search.
     pub nprobs: usize,
 }
 
+/// Vector Index for (Appoximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 pub trait VectorIndex {
     /// Search the vector for nearest neighbours.
