@@ -35,7 +35,7 @@ async-recursion = "1.0"
 async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
-clap = { version = "4.0.32", features = ["derive"], optional = true }
+clap = { version = "4.1.1", features = ["derive"], optional = true }
 object_store = { version = "0.5", features = ["aws"] }
 pin-project = "1.0"
 prost = "0.11"
@@ -48,9 +48,18 @@ futures = "0.3"
 [build-dependencies]
 prost-build = "0.11"
 
+[dev-dependencies]
+criterion = { version="0.4", features = ["async", "async_tokio"]}
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+clap = { version = "4.1.1", features = ["derive"] }
+
 [features]
 cli = ["clap"]
 
 [[bin]]
 name = "lq"
 required-features = ["cli"]
+
+[[bench]]
+name = "distance"
+harness = false
