@@ -35,6 +35,7 @@ use ::lance::io::{FileWriter, ObjectStore, object_writer::ObjectWriter};
 
 #[pyfunction]
 #[pyo3(pass_module)]
+#[pyo3(text_signature = "(uri, /)")]
 fn read_batch(m: &PyModule, uri: &str) -> PyResult<PyObject> {
     let rt = Runtime::new().unwrap();
     let batch : RecordBatch = rt.block_on(async {
@@ -48,6 +49,7 @@ fn read_batch(m: &PyModule, uri: &str) -> PyResult<PyObject> {
 }
 
 #[pyfunction]
+#[pyo3(text_signature = "(batch, uri, /)")]
 fn write_batch(py_batch: &PyAny, uri: &str) -> PyResult<bool> {
     let rt = Runtime::new().unwrap();
     let object_store = ObjectStore::new(uri).unwrap();
