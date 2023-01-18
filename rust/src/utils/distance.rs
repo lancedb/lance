@@ -21,9 +21,7 @@
 use std::sync::Arc;
 
 use arrow_arith::{aggregate::sum, arity::binary};
-use arrow_array::{
-    cast::as_primitive_array, types::Float32Type, Array, FixedSizeListArray, Float32Array,
-};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 
 use crate::Result;
@@ -67,6 +65,8 @@ pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
 
 #[cfg(any(target_arch = "x86_64"))]
 fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
+    use arrow::{cast::as_primitive_array, types::Float32Type};
+
     let inner_array = to.values();
     let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
     let dimension = from.len();
