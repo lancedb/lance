@@ -60,7 +60,7 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
 // Calculate L2 distance directly using Arrow compute kernels.
 //
 #[inline]
-pub(crate) fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
+pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
     let mul: Float32Array = binary(from, to, |a, b| (a - b).powf(2.0)).unwrap();
     sum(&mul).unwrap()
 }
@@ -75,12 +75,10 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         "Vector dimension must be a mulitply of 8"
     );
 
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        let inner_array = to.values();
-        let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
-        let dimension = from.len();
-    };
+    let inner_array = to.values();
+    let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
+    let dimension = from.len();
+
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
             (0..to.len())

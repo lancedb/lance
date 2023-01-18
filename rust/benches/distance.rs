@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_arith::aggregate::sum;
+use arrow_arith::arithmetic::{multiply_dyn, subtract_dyn};
+use arrow_array::cast::as_primitive_array;
+use arrow_array::types::Float32Type;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
-
-use arrow_array::FixedSizeListArray;
+use pprof::criterion::{Output, PProfProfiler};
 
 use lance::utils::distance::{l2_distance, l2_distance_arrow};
 use lance::{arrow::FixedSizeListArrayExt, utils::testing::generate_random_array};
@@ -37,11 +41,38 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     c.bench_function("L2_distance_arrow", |b| {
-        b.iter(|| {
-            l2_distance(&key, &target).unwrap();
-        })
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter(
+                (0..target.len())
+                    .map(|idx| {
+                        let left = target.value(idx);
+                        let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
+                        l2_distance_arrow(&key, arr)
+                    })
+                    .map(|d| Some(d)),
+            )
+        });
+    });
+
+    c.bench_function("L2_distance_arrow_arith", |b| {
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter(
+                (0..target.len())
+                    .map(|idx| {
+                        let left = target.value(idx);
+                        let sub = subtract_dyn(left.as_ref(), &key).unwrap();
+                        let mul = multiply_dyn(&sub, &sub).unwrap();
+                        sum(as_primitive_array::<Float32Type>(&mul)).unwrap_or(0.0)
+                    })
+                    .map(|d| Some(d)),
+            )
+        });
     });
 }
 
-criterion_group!(benches, bench_distance);
+criterion_group!(
+    name=benches;
+    config = Criterion::default().significance_level(0.1).sample_size(10)
+        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = bench_distance);
 criterion_main!(benches);
