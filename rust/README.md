@@ -21,3 +21,7 @@
 | Dictionary        | Yes  | No    | No   |
 | RLE               | No   | No    | No   |
 
+
+## Python integration
+
+Done via pyo3 under `pylance` directory (still `import lance` module name though)
