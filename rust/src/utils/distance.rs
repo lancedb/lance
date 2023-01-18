@@ -91,7 +91,7 @@ fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Ar
 /// Euclidean Distance (L2) from one vector to a list of vectors.
 pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     assert_eq!(from.len(), to.value_length() as usize);
-    debug_assert_eq!(to.value_type(), DataType::Float32);
+    assert_eq!(to.value_type(), DataType::Float32);
 
     #[cfg(any(target_arch = "x86_64"))]
     {
