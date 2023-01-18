@@ -144,17 +144,12 @@ mod tests {
     #[test]
     fn test_odd_length_vector() {
         let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vec![
-                Some((0..5).map(|v| Some(v as f32)).collect::<Vec<_>>()),
-            ],
+            vec![Some((0..5).map(|v| Some(v as f32)).collect::<Vec<_>>())],
             5,
         );
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
         let scores = l2_distance(&point, &mat).unwrap();
 
-        assert_eq!(
-            scores.as_ref(),
-            &Float32Array::from(vec![20.0])
-        );
+        assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
 }
