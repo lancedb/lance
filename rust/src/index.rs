@@ -15,20 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lance Columnar Data Format
+//! Secondary Index
 //!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
-pub mod arrow;
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod index;
-pub mod io;
-pub mod utils;
+/// Protobuf definitions for the index on-disk format.
+#[allow(clippy::all)]
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+}
 
-pub use error::{Error, Result};
+pub mod vector;
