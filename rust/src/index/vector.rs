@@ -29,6 +29,7 @@ use crate::Result;
 
 /// Query parameters for the vector indices
 pub struct Query {
+    pub column: String,
     /// The vector to be searched.
     pub key: Arc<Float32Array>,
     /// Top k results to return.

@@ -52,7 +52,6 @@ pub struct FlatIndex<'a> {
 }
 
 impl<'a> FlatIndex<'a> {
-
     pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
         todo!();
     }
