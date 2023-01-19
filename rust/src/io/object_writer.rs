@@ -23,7 +23,7 @@ use pin_project::pin_project;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::format::ProtoStruct;
+use crate::format::{ProtoStruct, MAGIC, MAJOR_VERSION, MINOR_VERSION};
 use crate::io::ObjectStore;
 use crate::Result;
 
@@ -75,6 +75,15 @@ impl ObjectWriter {
     ) -> Result<usize> {
         let msg: M = M::from(obj);
         self.write_protobuf(&msg).await
+    }
+
+    /// Write magics to the tail of a file before closing the file.
+    pub async fn write_magics(&mut self, pos: usize) -> Result<()> {
+        self.write_i64_le(pos as i64).await?;
+        self.write_i16_le(MAJOR_VERSION).await?;
+        self.write_i16_le(MINOR_VERSION).await?;
+        self.write_all(MAGIC).await?;
+        Ok(())
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {

@@ -17,7 +17,7 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
-use crate::io::{read_manifest, FileWriter};
+use crate::io::{read_manifest, write_manifest, FileWriter};
 use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
 pub use write::*;
@@ -103,7 +103,6 @@ impl Dataset {
 
         let params = params.unwrap_or_default();
 
-
         let mut peekable = batches.peekable();
         let schema: Schema;
         if let Some(batch) = peekable.peek() {
@@ -120,15 +119,20 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema);
 
-        let mut fragment = 
-        let file_path = object_store
+        let mut fragment_id = 0;
+        let file_path = format!("{}.lance", Uuid::new_v4());
+        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+        manifest.fragments.push(fragment);
+        fragment_id += 1;
+
+        let full_path = object_store
             .base_path()
             .child(DATA_DIR)
-            .child(format!("{}.lance", Uuid::new_v4()));
-        println!("Create file path: {}", file_path);
+            .child(file_path.clone());
+        println!("Create file path: {}", full_path);
         let mut buffer = RecordBatchBuffer::empty();
 
-        let object_writer = object_store.create(&file_path).await?;
+        let object_writer = object_store.create(&full_path).await?;
         let mut file_writer = FileWriter::new(object_writer, &schema);
         for batch_result in peekable {
             let batch = batch_result?;
@@ -138,10 +142,31 @@ impl Dataset {
                 buffer = RecordBatchBuffer::empty();
             }
         }
+        if buffer.num_rows() > 0 {
+            file_writer.write(&buffer.finish()?).await?;
+        }
+        file_writer.finish().await?;
         drop(file_writer);
 
+        let manifest_file_path = object_store
+            .base_path()
+            .child(VERSIONS_DIR)
+            .child(format!("{}.manifest", manifest.version));
+        {
+            let mut object_writer = object_store.create(&manifest_file_path).await?;
+            let pos = write_manifest(&mut object_writer, &mut manifest).await?;
+            object_writer.write_magics(pos).await?;
+            object_writer.shutdown().await?;
+        }
+        let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
+        object_store.inner.copy(&manifest_file_path, &latest_manifest).await?;
 
-        todo!()
+        let base = object_store.base_path().clone();
+        Ok(Dataset {
+            object_store,
+            base,
+            manifest: Arc::new(manifest.clone()),
+        })
     }
 
     /// Create a Scanner to scan the dataset.
@@ -209,12 +234,20 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
         let mut batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(1..10))],
         )
         .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = Dataset::create(&mut batches, test_uri, None).await.unwrap();
+        Dataset::create(&mut batches, test_uri, None).await.unwrap();
+
+        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(actual_ds.version().version, 1);
+        let actual_schema = Schema::from(actual_ds.schema());
+        assert_eq!(&actual_schema, schema.as_ref());
+
+        let actual_batches = actual_ds.scan().into_stream().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.batches, actual_batches);
     }
 }

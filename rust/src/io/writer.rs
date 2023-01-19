@@ -28,13 +28,12 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
-use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use crate::format::{Manifest, Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
@@ -271,15 +270,7 @@ impl<'a> FileWriter<'a> {
         let pos = self.object_writer.write_struct(&self.metadata).await?;
 
         // Step 4. Write magics.
-        self.write_magics(pos).await
-    }
-
-    async fn write_magics(&mut self, pos: usize) -> Result<()> {
-        self.object_writer.write_i64_le(pos as i64).await?;
-        self.object_writer.write_i16_le(MAJOR_VERSION).await?;
-        self.object_writer.write_i16_le(MINOR_VERSION).await?;
-        self.object_writer.write_all(MAGIC).await?;
-        Ok(())
+        self.object_writer.write_magics(pos).await
     }
 }
 
