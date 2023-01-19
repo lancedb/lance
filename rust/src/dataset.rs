@@ -206,10 +206,6 @@ impl Dataset {
         Scanner::new(&self)
     }
 
-    pub(crate) fn object_store(&self) -> &ObjectStore {
-        &self.object_store
-    }
-
     fn versions_dir(&self) -> Path {
         self.base.child(VERSIONS_DIR)
     }
