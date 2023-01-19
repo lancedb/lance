@@ -73,11 +73,6 @@ async fn new_file_writer<'a>(
     Ok(FileWriter::try_new(&object_store, &full_path, schema).await?)
 }
 
-#[inline]
-fn new_file_name() -> String {
-    format!("{}.lance", Uuid::new_v4())
-}
-
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
@@ -139,14 +134,19 @@ impl Dataset {
         }
 
         let mut manifest = Manifest::new(&schema);
-
         let mut fragment_id = 0;
-        let file_path = new_file_name();
-        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-        manifest.fragments.push(fragment);
-        fragment_id += 1;
-        let mut writer = new_file_writer(&object_store, &file_path, &schema).await?;
 
+        macro_rules! new_writer {
+            () => {{
+                let file_path = format!("{}.lance", Uuid::new_v4());
+                let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                manifest.fragments.push(fragment);
+                fragment_id += 1;
+                new_file_writer(&object_store, &file_path, &schema).await?
+            }};
+        }
+
+        let mut writer = new_writer!();
         let mut buffer = RecordBatchBuffer::empty();
         for batch_result in peekable {
             let batch = batch_result?;
@@ -158,12 +158,7 @@ impl Dataset {
             }
             if writer.len() >= params.max_rows_per_file {
                 writer.finish().await?;
-                let file_path = new_file_name();
-                let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                manifest.fragments.push(fragment);
-                fragment_id += 1;
-
-                writer = new_file_writer(&object_store, &file_path, &schema).await?;
+                writer = new_writer!();
             }
         }
         if buffer.num_rows() > 0 {
