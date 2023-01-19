@@ -154,8 +154,10 @@ impl<'a> PlainDecoder<'a> {
 
     async fn decode_fixed_size_list(
         &self,
-        items: &Box<Field>,
-        list_size: &i32,
+        items: &Field,
+        list_size: i32,
+        start: usize,
+        end: usize,
     ) -> Result<ArrayRef> {
         if !items.data_type().is_fixed_stride() {
             return Err(Error::Schema(format!(
@@ -167,27 +169,36 @@ impl<'a> PlainDecoder<'a> {
             self.reader,
             items.data_type(),
             self.position,
-            self.length * (*list_size) as usize,
+            self.length * list_size as usize,
         )?;
-        let item_array = item_decoder.decode().await?;
-        Ok(Arc::new(FixedSizeListArray::try_new(item_array, *list_size)?) as ArrayRef)
+        let item_array = item_decoder
+            .get(start * list_size as usize..end * list_size as usize)
+            .await?;
+        Ok(Arc::new(FixedSizeListArray::try_new(item_array, list_size)?) as ArrayRef)
     }
 
-    async fn decode_fixed_size_binary(&self, stride: &i32) -> Result<ArrayRef> {
+    async fn decode_fixed_size_binary(
+        &self,
+        stride: i32,
+        start: usize,
+        end: usize,
+    ) -> Result<ArrayRef> {
         let bytes_decoder = PlainDecoder::new(
             self.reader,
             &DataType::UInt8,
             self.position,
-            self.length * (*stride) as usize,
+            self.length * stride as usize,
         )?;
-        let bytes_array = bytes_decoder.decode().await?;
+        let bytes_array = bytes_decoder
+            .get(start * stride as usize..end * stride as usize)
+            .await?;
         let values = bytes_array
             .as_any()
             .downcast_ref::<UInt8Array>()
             .ok_or_else(|| {
                 Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
             })?;
-        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, *stride)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
     }
 }
 
@@ -214,13 +225,7 @@ fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        match self.data_type {
-            DataType::FixedSizeList(items, list_size) => {
-                self.decode_fixed_size_list(items, list_size).await
-            }
-            DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
-            _ => self.decode_primitive(0, self.length).await,
-        }
+        self.get(0..self.length).await
     }
 }
 
@@ -229,7 +234,7 @@ impl AsyncIndex<usize> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: usize) -> Self::Output {
-        self.decode_primitive(index, index + 1).await
+        self.get(index..index + 1).await
     }
 }
 
@@ -238,7 +243,17 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
-        self.decode_primitive(index.start, index.end).await
+        match self.data_type {
+            DataType::FixedSizeList(items, list_size) => {
+                self.decode_fixed_size_list(items, *list_size, index.start, index.end)
+                    .await
+            }
+            DataType::FixedSizeBinary(stride) => {
+                self.decode_fixed_size_binary(*stride, index.start, index.end)
+                    .await
+            }
+            _ => self.decode_primitive(index.start, index.end).await,
+        }
     }
 }
 
@@ -247,7 +262,7 @@ impl AsyncIndex<RangeFrom<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
-        self.decode_primitive(index.start, self.length).await
+        self.get(index.start..self.length).await
     }
 }
 
@@ -256,7 +271,7 @@ impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeTo<usize>) -> Self::Output {
-        self.decode_primitive(0, index.end).await
+        self.get(0..index.end).await
     }
 }
 
