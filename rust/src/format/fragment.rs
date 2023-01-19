@@ -17,17 +17,27 @@
 
 use std::collections::BTreeSet;
 
+use crate::datatypes::Schema;
 use crate::format::pb;
 
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
     /// The Ids of fields in this file.
     fields: Vec<i32>,
+}
+
+impl DataFile {
+    pub fn new(path: &str, schema: &Schema) -> Self {
+        Self {
+            path: path.to_string(),
+            fields: schema.field_ids(),
+        }
+    }
 }
 
 impl From<&DataFile> for pb::DataFile {
@@ -62,8 +72,19 @@ pub struct Fragment {
 }
 
 impl Fragment {
+    pub fn new(id: u64) -> Self {
+        Self { id, files: vec![] }
+    }
+
+    /// Create a `Fragment` with one DataFile
+    pub fn with_file(id: u64, path: &str, schema: &Schema) -> Self {
+        Self {
+            id,
+            files: vec![DataFile::new(path, schema)],
+        }
+    }
+
     /// Get all field IDs from this fragment, sorted.
-    ///
     pub fn field_ids(&self) -> Vec<i32> {
         BTreeSet::from_iter(self.files.iter().flat_map(|f| f.fields.clone()))
             .into_iter()
@@ -86,5 +107,40 @@ impl From<&Fragment> for pb::DataFragment {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    #[test]
+    fn test_new_fragment() {
+        let path = "foobar.lance";
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(vec![
+                    ArrowField::new("si", DataType::Int32, false),
+                    ArrowField::new("sb", DataType::Binary, true),
+                ]),
+                true,
+            ),
+            ArrowField::new("bool", DataType::Boolean, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragment = Fragment::with_file(123, &path, &schema);
+
+        assert_eq!(123, fragment.id);
+        assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);
+        assert_eq!(
+            fragment.files,
+            vec![DataFile {
+                path: path.to_string(),
+                fields: vec![0, 1, 2, 3]
+            }]
+        )
     }
 }
