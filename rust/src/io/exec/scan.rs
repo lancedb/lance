@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 //! Table Scan Node.
 
 use arrow_array::RecordBatch;

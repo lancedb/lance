@@ -32,7 +32,6 @@ pub(crate) struct KNNScan<'a> {
 }
 
 impl<'a> KNNScan<'a> {
-
     /// Create a KNNScan exec node.
     pub fn new(dataset: &'a Dataset) -> Self {
         todo!()
