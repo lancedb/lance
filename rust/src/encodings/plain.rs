@@ -21,14 +21,14 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::any::Any;
-use std::ops::Range;
+use std::ops::{Index, Range};
 use std::sync::Arc;
 
-use arrow_array::types::*;
 use arrow_array::{
     make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray, FixedSizeListArray,
     UInt8Array,
 };
+use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -213,6 +213,23 @@ impl<'a> Decoder for PlainDecoder<'a> {
             DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
             _ => self.decode_primitive().await,
         }
+    }
+
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        if indices.is_empty() {
+            // TODO: return empty array.
+        }
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        todo!()
+    }
+}
+
+impl Index<usize> for PlainDecoder<'_> {
+    type Output = dyn std::future::Future<Output = Result<ArrayRef>>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        todo!()
     }
 }
 

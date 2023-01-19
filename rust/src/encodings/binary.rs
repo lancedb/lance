@@ -2,12 +2,13 @@
 //!
 
 use std::marker::PhantomData;
+use std::ops::Index;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::{
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray, UInt32Array,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
@@ -172,6 +173,18 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+    }
+
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        todo!()
+    }
+}
+
+impl<'a, T: ByteArrayType> Index<usize> for BinaryDecoder<'a, T> {
+    type Output = dyn std::future::Future<Output = Result<ArrayRef>>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        todo!()
     }
 }
 

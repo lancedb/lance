@@ -1,7 +1,10 @@
 //! Data encodings
 //!
 
-use arrow_array::{Array, ArrayRef};
+use std::future::Future;
+use std::ops::{Index, Range};
+
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, UInt32Array};
 use async_trait::async_trait;
 
 pub mod binary;
@@ -43,8 +46,13 @@ pub trait Encoder {
     async fn encode(&mut self, array: &dyn Array) -> Result<usize>;
 }
 
-/// Decoder - Read Arrow Array from file.
+/// Decoder - Read Arrow Data.
 #[async_trait]
-pub trait Decoder: Send {
+pub trait Decoder: Send + Index<usize, Output = dyn Future<Output = Result<ArrayRef>>> {
     async fn decode(&self) -> Result<ArrayRef>;
+
+    /// Take the values by the indices.
+    ///
+    /// The indices must be sorted.
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef>;
 }
