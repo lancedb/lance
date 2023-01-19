@@ -14,3 +14,32 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+
+//! Table Scan Node.
+
+use arrow_array::RecordBatch;
+use futures::Stream;
+
+use super::{ExecNode, Type};
+use crate::dataset::Dataset;
+use crate::Result;
+
+pub(crate) struct Scan<'a> {
+    dataset: &'a Dataset,
+}
+
+impl ExecNode for Scan<'_> {
+    const TYPE: Type = Type::Scan;
+}
+
+impl Stream for Scan<'_> {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
