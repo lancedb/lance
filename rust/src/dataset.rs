@@ -4,9 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::RecordBatchReader;
 use chrono::prelude::*;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -61,6 +60,24 @@ impl From<&Manifest> for Version {
     }
 }
 
+/// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
+async fn new_file_writer<'a>(
+    object_store: &'a ObjectStore,
+    data_file_path: &str,
+    schema: &'a Schema,
+) -> Result<FileWriter<'a>> {
+    let full_path = object_store
+        .base_path()
+        .child(DATA_DIR)
+        .child(data_file_path);
+    Ok(FileWriter::try_new(&object_store, &full_path, schema).await?)
+}
+
+#[inline]
+fn new_file_name() -> String {
+    format!("{}.lance", Uuid::new_v4())
+}
+
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
@@ -86,6 +103,10 @@ impl Dataset {
     }
 
     /// Create a new dataset with [RecordBatch]s.
+    ///
+    /// Returns the newly created dataset.
+    ///
+    /// Returns [Error] if the dataset already exists.
     pub async fn create(
         batches: &mut dyn RecordBatchReader,
         uri: &str,
@@ -120,33 +141,36 @@ impl Dataset {
         let mut manifest = Manifest::new(&schema);
 
         let mut fragment_id = 0;
-        let file_path = format!("{}.lance", Uuid::new_v4());
+        let file_path = new_file_name();
         let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
         manifest.fragments.push(fragment);
         fragment_id += 1;
+        let mut writer = new_file_writer(&object_store, &file_path, &schema).await?;
 
-        let full_path = object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(file_path.clone());
-        println!("Create file path: {}", full_path);
         let mut buffer = RecordBatchBuffer::empty();
-
-        let object_writer = object_store.create(&full_path).await?;
-        let mut file_writer = FileWriter::new(object_writer, &schema);
         for batch_result in peekable {
             let batch = batch_result?;
             buffer.batches.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
-                file_writer.write(&buffer.finish()?).await?;
+                // TODO: the max rows per group boundry is not accurately calculated yet.
+                writer.write(&buffer.finish()?).await?;
                 buffer = RecordBatchBuffer::empty();
+            }
+            if writer.len() >= params.max_rows_per_file {
+                writer.finish().await?;
+                let file_path = new_file_name();
+                let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                manifest.fragments.push(fragment);
+                fragment_id += 1;
+
+                writer = new_file_writer(&object_store, &file_path, &schema).await?;
             }
         }
         if buffer.num_rows() > 0 {
-            file_writer.write(&buffer.finish()?).await?;
+            writer.write(&buffer.finish()?).await?;
         }
-        file_writer.finish().await?;
-        drop(file_writer);
+        writer.finish().await?;
+        drop(writer);
 
         let manifest_file_path = object_store
             .base_path()
@@ -159,7 +183,10 @@ impl Dataset {
             object_writer.shutdown().await?;
         }
         let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
-        object_store.inner.copy(&manifest_file_path, &latest_manifest).await?;
+        object_store
+            .inner
+            .copy(&manifest_file_path, &latest_manifest)
+            .await?;
 
         let base = object_store.base_path().clone();
         Ok(Dataset {
@@ -223,8 +250,9 @@ impl Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use futures::stream::TryStreamExt;
 
     use tempfile::tempdir;
 
@@ -247,7 +275,12 @@ mod tests {
         let actual_schema = Schema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
-        let actual_batches = actual_ds.scan().into_stream().try_collect::<Vec<_>>().await.unwrap();
+        let actual_batches = actual_ds
+            .scan()
+            .into_stream()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         assert_eq!(batches.batches, actual_batches);
     }
 }

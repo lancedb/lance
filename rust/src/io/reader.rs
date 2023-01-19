@@ -445,10 +445,8 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let writer = store.create(&path).await.unwrap();
-
         // Write 5 batches.
-        let mut file_writer = FileWriter::new(writer, &schema);
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from_iter((0..100).collect::<Vec<_>>())),
             Arc::new(Float32Array::from_iter(
@@ -485,10 +483,9 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let writer = store.create(&path).await.unwrap();
 
         // Write 10 batches.
-        let mut file_writer = FileWriter::new(writer, &schema);
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         for batch_id in 0..10 {
             let value_range = batch_id * 10..batch_id * 10 + 10;
             let columns: Vec<ArrayRef> = vec![
