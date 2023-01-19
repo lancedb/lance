@@ -135,6 +135,12 @@ mod tests {
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);
-        assert_eq!(fragment.files, vec![DataFile{path: path.to_string(), fields: vec![0, 1, 2, 3]}])
+        assert_eq!(
+            fragment.files,
+            vec![DataFile {
+                path: path.to_string(),
+                fields: vec![0, 1, 2, 3]
+            }]
+        )
     }
 }
