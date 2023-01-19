@@ -50,9 +50,4 @@ pub trait Encoder {
 #[async_trait]
 pub trait Decoder: Send + Index<usize, Output = dyn Future<Output = Result<ArrayRef>>> {
     async fn decode(&self) -> Result<ArrayRef>;
-
-    /// Take the values by the indices.
-    ///
-    /// The indices must be sorted.
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef>;
 }

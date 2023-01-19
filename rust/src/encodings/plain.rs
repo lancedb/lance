@@ -20,7 +20,6 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::any::Any;
 use std::ops::{Index, Range};
 use std::sync::Arc;
 
@@ -120,24 +119,32 @@ impl<'a> PlainDecoder<'a> {
         })
     }
 
-    pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
-        todo!()
-    }
-
-    async fn decode_primitive(&self) -> Result<ArrayRef> {
-        let array_bytes = match self.data_type {
-            DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => get_primitive_byte_width(self.data_type)? * self.length,
+    /// Decode primitive values, from "offset" to "offset + length".
+    ///
+    async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
+        if end > self.length {
+            return Err(Error::IO(format!(
+                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                start, end, self.length
+            )));
+        }
+        let start_offset = match self.data_type {
+            DataType::Boolean => bit_util::ceil(start, 8),
+            _ => get_primitive_byte_width(self.data_type)? * start,
+        };
+        let end_offset = match self.data_type {
+            DataType::Boolean => bit_util::ceil(end, 8),
+            _ => get_primitive_byte_width(self.data_type)? * end,
         };
         let range = Range {
-            start: self.position,
-            end: self.position + array_bytes,
+            start: self.position + start_offset,
+            end: self.position + end_offset,
         };
 
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(self.length)
+            .len(end - start)
             .null_count(0)
             .add_buffer(buf)
             .build()?;
@@ -211,17 +218,8 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 self.decode_fixed_size_list(items, list_size).await
             }
             DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
-            _ => self.decode_primitive().await,
+            _ => self.decode_primitive(0, self.length).await,
         }
-    }
-
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        if indices.is_empty() {
-            // TODO: return empty array.
-        }
-        let start = indices.value(0);
-        let end = indices.value(indices.len() - 1);
-        todo!()
     }
 }
 

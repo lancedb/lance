@@ -164,10 +164,6 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
             )))
         }
     }
-
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        todo!()
-    }
 }
 
 impl<'a> Index<usize> for DictionaryDecoder<'a> {

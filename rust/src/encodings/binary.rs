@@ -174,10 +174,6 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
     }
-
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        todo!()
-    }
 }
 
 impl<'a, T: ByteArrayType> Index<usize> for BinaryDecoder<'a, T> {
