@@ -142,29 +142,39 @@ impl Dataset {
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                 manifest.fragments.push(fragment);
                 fragment_id += 1;
-                new_file_writer(&object_store, &file_path, &schema).await?
+                Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
         }
 
-        let mut writer = new_writer!();
+        let mut writer = None;
         let mut buffer = RecordBatchBuffer::empty();
         for batch_result in peekable {
             let batch = batch_result?;
             buffer.batches.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
                 // TODO: the max rows per group boundry is not accurately calculated yet.
-                writer.write(&buffer.finish()?).await?;
+                if writer.is_none() {
+                    writer = new_writer!();
+                };
+                writer.as_mut().unwrap().write(&buffer.finish()?).await?;
                 buffer = RecordBatchBuffer::empty();
             }
-            if writer.len() >= params.max_rows_per_file {
-                writer.finish().await?;
-                writer = new_writer!();
+            if let Some(w) = writer.as_mut() {
+                if w.len() >= params.max_rows_per_file {
+                    w.finish().await?;
+                    writer = None;
+                }
             }
         }
         if buffer.num_rows() > 0 {
-            writer.write(&buffer.finish()?).await?;
+            if writer.is_none() {
+                writer = new_writer!();
+            };
+            writer.as_mut().unwrap().write(&buffer.finish()?).await?;
         }
-        writer.finish().await?;
+        if let Some(w) = writer.as_mut() {
+            w.finish().await?;
+        };
         drop(writer);
 
         let manifest_file_path = object_store
@@ -256,14 +266,26 @@ mod tests {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
-        let mut batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(1..10))],
-        )
-        .unwrap()]);
+        let mut batches = RecordBatchBuffer::new(
+            (0..20)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
 
         let test_uri = test_dir.path().to_str().unwrap();
-        Dataset::create(&mut batches, test_uri, None).await.unwrap();
+
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        Dataset::create(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 1);
@@ -277,5 +299,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batches.batches, actual_batches);
+
+        // Each fragments has different fragment ID
+        assert_eq!(
+            actual_ds
+                .fragments()
+                .iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        )
     }
 }
