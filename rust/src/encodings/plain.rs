@@ -20,15 +20,14 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::Range;
-use std::pin::Pin;
+use std::ops::{Range, RangeFrom, RangeTo};
 use std::sync::Arc;
 
+use arrow_array::types::*;
 use arrow_array::{
     make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray, FixedSizeListArray,
     UInt8Array,
 };
-use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -234,6 +233,33 @@ impl AsyncIndex<usize> for PlainDecoder<'_> {
     }
 }
 
+#[async_trait]
+impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: Range<usize>) -> Self::Output {
+        self.decode_primitive(index.start, index.end).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeFrom<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
+        self.decode_primitive(index.start, self.length).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeTo<usize>) -> Self::Output {
+        self.decode_primitive(0, index.end).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::io::ObjectStore;
@@ -376,5 +402,34 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_get_one_scalar_value() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/scalar");
+        let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+        assert_eq!(
+            decoder.get(2..4).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([2, 3])
+        );
+
+        assert_eq!(
+            decoder.get(..4).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([0, 1, 2, 3])
+        );
+
+        assert_eq!(
+            decoder.get(2..).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([2, 3, 4, 5])
+        );
     }
 }

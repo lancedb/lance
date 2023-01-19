@@ -170,7 +170,7 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
 impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
     type Output = Result<ArrayRef>;
 
-    async fn get(&self, index: usize) -> Self::Output {
+    async fn get(&self, _index: usize) -> Self::Output {
         todo!()
     }
 }

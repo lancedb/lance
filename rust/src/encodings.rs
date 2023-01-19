@@ -1,11 +1,9 @@
 //! Data encodings
 //!
 
-use std::pin::Pin;
-use std::future::Future;
-use std::ops::{Index, Range};
+use std::ops::Range;
 
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, UInt32Array};
+use arrow_array::{Array, ArrayRef};
 use async_trait::async_trait;
 
 pub mod binary;
