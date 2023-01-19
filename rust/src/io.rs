@@ -36,7 +36,7 @@ use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 pub use self::object_store::ObjectStore;
 pub use reader::read_manifest;
 pub use reader::FileReader;
-pub use writer::FileWriter;
+pub use writer::*;
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {

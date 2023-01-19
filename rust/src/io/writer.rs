@@ -28,15 +28,17 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
-use tokio::io::AsyncWriteExt;
+use object_store::path::Path;
 
 use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
-use crate::format::{Manifest, Metadata, PageInfo, PageTable, MAGIC, MAJOR_VERSION, MINOR_VERSION};
+use crate::format::{Manifest, Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
+
+use super::ObjectStore;
 
 pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) -> Result<usize> {
     // Write dictionary values.
@@ -80,7 +82,19 @@ pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) 
     writer.write_struct(manifest).await
 }
 
-/// [FileWriter] writes Arrow [RecordBatch] to a file.
+/// [FileWriter] writes Arrow [RecordBatch] to one Lance file.
+///
+/// ```ignored
+/// use lance::io::FileWriter;
+/// use futures::stream::Stream;
+///
+/// let mut file_writer = FileWriter::new(object_store, &path, &schema);
+/// while let Ok(batch) = stream.next().await {
+///     file_writer.write(&batch).unwrap();
+/// }
+/// // Need to close file writer to flush buffer and footer.
+/// file_writer.shutdown();
+/// ```
 pub struct FileWriter<'a> {
     object_writer: ObjectWriter,
     schema: &'a Schema,
@@ -95,15 +109,20 @@ pub struct FileWriter<'a> {
 }
 
 impl<'a> FileWriter<'a> {
-    pub fn new(object_writer: ObjectWriter, schema: &'a Schema) -> Self {
-        Self {
+    pub async fn try_new(
+        object_store: &ObjectStore,
+        path: &Path,
+        schema: &'a Schema,
+    ) -> Result<FileWriter<'a>> {
+        let object_writer = object_store.create(path).await?;
+        Ok(Self {
             object_writer,
             schema,
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
             dictionary_value_arrs: HashMap::default(),
-        }
+        })
     }
 
     /// Write a [RecordBatch] to the open file.
@@ -123,6 +142,11 @@ impl<'a> FileWriter<'a> {
     pub async fn finish(&mut self) -> Result<()> {
         self.write_footer().await?;
         self.object_writer.shutdown().await
+    }
+
+    /// Total records written in this file.
+    pub fn len(&self) -> usize {
+        self.metadata.len()
     }
 
     #[async_recursion]
@@ -271,15 +295,7 @@ impl<'a> FileWriter<'a> {
         let pos = self.object_writer.write_struct(&self.metadata).await?;
 
         // Step 4. Write magics.
-        self.write_magics(pos).await
-    }
-
-    async fn write_magics(&mut self, pos: usize) -> Result<()> {
-        self.object_writer.write_i64_le(pos as i64).await?;
-        self.object_writer.write_i16_le(MAJOR_VERSION).await?;
-        self.object_writer.write_i16_le(MINOR_VERSION).await?;
-        self.object_writer.write_all(MAGIC).await?;
-        Ok(())
+        self.object_writer.write_magics(pos).await
     }
 }
 
@@ -340,10 +356,6 @@ mod tests {
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        let writer = store.create(&path).await.unwrap();
-
         let dict_vec = (0..100)
             .into_iter()
             .map(|n| ["a", "b", "c"][n % 3])
@@ -401,7 +413,10 @@ mod tests {
             ])),
         ];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
-        let mut file_writer = FileWriter::new(writer, &schema);
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();
 

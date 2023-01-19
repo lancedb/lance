@@ -31,6 +31,7 @@ arrow-cast = "31.0.0"
 arrow-data = "31.0"
 arrow-ord = "31.0"
 arrow-schema = "31.0"
+arrow-select = "31.0"
 async-recursion = "1.0"
 async-trait = "0.1.60"
 byteorder = "1.4.3"
@@ -44,14 +45,16 @@ tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
 rand = "0.8.3"
 futures = "0.3"
+uuid = { version = "1.2", features = ["v4"] }
 
 [build-dependencies]
 prost-build = "0.11"
 
 [dev-dependencies]
-criterion = { version="0.4", features = ["async", "async_tokio"]}
-pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 clap = { version = "4.1.1", features = ["derive"] }
+criterion = { version = "0.4", features = ["async", "async_tokio"] }
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+tempfile = "3.3.0"
 
 [features]
 cli = ["clap"]

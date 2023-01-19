@@ -25,7 +25,7 @@ use std::collections::HashMap;
 ///  * Schema
 ///  * Version
 ///  * Fragments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
