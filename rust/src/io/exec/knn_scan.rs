@@ -17,10 +17,15 @@
 
 //! I/O execution pipeline
 
+use std::pin::Pin;
+
 use arrow_array::RecordBatch;
-use futures::stream::Stream;
+use futures::stream::{BoxStream, Stream};
+use futures::{FutureExt, StreamExt};
 
 use crate::dataset::Dataset;
+use crate::index::vector::flat::FlatIndex;
+use crate::index::vector::{Query, VectorIndex};
 use crate::io::exec::ExecNode;
 use crate::Result;
 
@@ -28,13 +33,20 @@ use super::Type;
 
 /// K-nearest-neighbors Scan
 pub(crate) struct KNNScan<'a> {
-    dataset: &'a Dataset,
+    // dataset: &'a Dataset,
+    index: Box<dyn VectorIndex>,
+    query: &'a Query,
+    stream: Option<BoxStream<'a, dyn Stream<Item = Result<RecordBatch>>>>,
 }
 
 impl<'a> KNNScan<'a> {
     /// Create a KNNScan exec node.
-    pub fn new(dataset: &'a Dataset) -> Self {
-        todo!()
+    pub fn try_new(dataset: &'static Dataset, column: &str, query: &'a Query) -> Result<Self> {
+        Ok(Self {
+            index: Box::new(FlatIndex::try_new(dataset, column)?),
+            query,
+            stream: None,
+        })
     }
 }
 
@@ -49,6 +61,21 @@ impl Stream for KNNScan<'_> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        todo!()
+        let this = Pin::into_inner(self);
+        if this.stream.is_none() {
+            let mut stream = this.index.search(this.query).into_stream();
+
+            this.stream = Some(Box::pin(stream)?);
+        }
+        let mut stream = this.index.search(this.query).into_stream();
+        stream.poll_next_unpin(cx)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knn_scan() {}
 }

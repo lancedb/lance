@@ -24,6 +24,7 @@ use super::{ExecNode, Type};
 use crate::dataset::Dataset;
 use crate::Result;
 
+/// Dataset scan node.
 pub(crate) struct Scan<'a> {
     dataset: &'a Dataset,
 }
