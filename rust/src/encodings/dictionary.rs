@@ -18,7 +18,6 @@
 //! Dictinary encoding.
 //!
 
-use std::ops::Index;
 use std::sync::Arc;
 
 use arrow_array::cast::as_dictionary_array;
@@ -26,7 +25,7 @@ use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
+use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
@@ -37,6 +36,7 @@ use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter};
 use crate::Error;
 
 use super::plain::PlainEncoder;
+use super::AsyncIndex;
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
@@ -166,10 +166,11 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
     }
 }
 
-impl<'a> Index<usize> for DictionaryDecoder<'a> {
-    type Output = dyn std::future::Future<Output = Result<ArrayRef>>;
+#[async_trait]
+impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
+    type Output = Result<ArrayRef>;
 
-    fn index(&self, index: usize) -> &Self::Output {
+    async fn get(&self, index: usize) -> Self::Output {
         todo!()
     }
 }

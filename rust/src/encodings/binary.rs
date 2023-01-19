@@ -2,7 +2,6 @@
 //!
 
 use std::marker::PhantomData;
-use std::ops::Index;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
@@ -17,7 +16,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
-use super::plain::PlainDecoder;
+use super::{plain::PlainDecoder, AsyncIndex};
 use super::Encoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
@@ -176,10 +175,11 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     }
 }
 
-impl<'a, T: ByteArrayType> Index<usize> for BinaryDecoder<'a, T> {
-    type Output = dyn std::future::Future<Output = Result<ArrayRef>>;
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
 
-    fn index(&self, index: usize) -> &Self::Output {
+    async fn get(&self, index: usize) -> Self::Output {
         todo!()
     }
 }

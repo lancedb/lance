@@ -20,7 +20,8 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::{Index, Range};
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -41,6 +42,7 @@ use crate::arrow::*;
 use crate::Error;
 
 use super::Decoder;
+use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
@@ -223,11 +225,12 @@ impl<'a> Decoder for PlainDecoder<'a> {
     }
 }
 
-impl Index<usize> for PlainDecoder<'_> {
-    type Output = dyn std::future::Future<Output = Result<ArrayRef>>;
+#[async_trait]
+impl AsyncIndex<usize> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
 
-    fn index(&self, index: usize) -> &Self::Output {
-        todo!()
+    async fn get(&self, index: usize) -> Self::Output {
+        self.decode_primitive(index, index + 1).await
     }
 }
 

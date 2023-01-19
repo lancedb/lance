@@ -1,6 +1,7 @@
 //! Data encodings
 //!
 
+use std::pin::Pin;
 use std::future::Future;
 use std::ops::{Index, Range};
 
@@ -48,6 +49,13 @@ pub trait Encoder {
 
 /// Decoder - Read Arrow Data.
 #[async_trait]
-pub trait Decoder: Send + Index<usize, Output = dyn Future<Output = Result<ArrayRef>>> {
+pub trait Decoder: Send + AsyncIndex<usize, Output = Result<ArrayRef>> {
     async fn decode(&self) -> Result<ArrayRef>;
+}
+
+#[async_trait]
+pub trait AsyncIndex<IndexType> {
+    type Output: Send + Sync;
+
+    async fn get(&self, index: IndexType) -> Self::Output;
 }
