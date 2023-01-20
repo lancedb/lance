@@ -135,7 +135,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: usize) -> Self::Output {
-        self.get(index..index+1).await
+        self.get(index..index + 1).await
     }
 }
 
