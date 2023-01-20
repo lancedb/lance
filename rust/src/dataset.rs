@@ -23,6 +23,7 @@ pub use write::*;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
+const INDICES_DIR: &str = "_indices";
 const DATA_DIR: &str = "data";
 
 fn latest_manifest_path(base: &Path) -> Path {
@@ -97,7 +98,7 @@ impl Dataset {
         })
     }
 
-    /// Create a new dataset with [RecordBatch]s.
+    /// Create a new dataset with RecordBatch.
     ///
     /// Returns the newly created dataset.
     ///
@@ -212,6 +213,10 @@ impl Dataset {
 
     fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
+    }
+
+    fn indices_dir(&self) -> Path {
+        self.base.child(INDICES_DIR)
     }
 
     pub fn version(&self) -> Version {

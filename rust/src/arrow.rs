@@ -194,6 +194,12 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
     }
 }
 
+/// Force downcast of an [`Array`], such as an [`ArrayRef`], to
+/// [`FixedSizeListArray`], panic'ing on failure.
+pub fn as_fixed_size_list_array(arr: &dyn Array) -> &FixedSizeListArray {
+    arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap()
+}
+
 pub trait FixedSizeBinaryArrayExt {
     /// Create an [`FixedSizeBinaryArray`] from values and stride.
     ///

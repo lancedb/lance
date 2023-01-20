@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::Stream;
 use object_store::path::Path;
@@ -26,6 +26,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
+use crate::index::vector::Query;
 use crate::io::{FileReader, ObjectStore};
 use crate::{Error, Result};
 
@@ -53,6 +54,8 @@ pub struct Scanner<'a> {
 
     fragments: Vec<Fragment>,
 
+    nearest: Option<Query>,
+
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 }
@@ -65,6 +68,7 @@ impl<'a> Scanner<'a> {
             limit: None,
             offset: None,
             fragments: dataset.fragments().to_vec(),
+            nearest: None,
             with_row_id: false,
         }
     }
@@ -81,6 +85,22 @@ impl<'a> Scanner<'a> {
     pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> &mut Self {
         self.limit = Some(limit);
         self.offset = offset;
+        self
+    }
+
+    /// Find k-nearest neighbour within the vector column.
+    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> &mut Self {
+        self.nearest = Some(Query {
+            column: column.to_string(),
+            key: Arc::new(q.clone()),
+            k,
+            nprobs: 1,
+        });
+        self
+    }
+
+    pub fn nprobs(&mut self, n: usize) -> &mut Self {
+        self.nearest.as_mut().map(|q| q.nprobs = n);
         self
     }
 
