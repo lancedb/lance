@@ -235,8 +235,10 @@ impl Dataset {
                     &path,
                     fragment.id,
                     Some(self.manifest.as_ref()),
-                ).await;
-            }).await;
+                )
+                .await;
+            })
+            .await;
         todo!()
     }
 

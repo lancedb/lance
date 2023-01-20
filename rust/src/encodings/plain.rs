@@ -23,14 +23,16 @@
 use std::ops::{Range, RangeFrom, RangeTo};
 use std::sync::Arc;
 
-use arrow_array::types::*;
+use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::{
     make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
     FixedSizeListArray, UInt8Array,
 };
+use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
+use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -231,8 +233,17 @@ impl<'a> Decoder for PlainDecoder<'a> {
         self.get(0..self.length).await
     }
 
-    async fn take(&self, indices: &[i32]) -> Result<ArrayRef> {
-        todo!()
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        if indices.is_empty() {
+            return Ok(new_empty_array(self.data_type));
+        }
+
+        // TODO: optimize sparse I/O later.
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self.get(start as usize..end as usize).await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Data encodings
 //!
 
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, UInt32Array};
 use async_trait::async_trait;
 
 pub mod binary;
@@ -49,7 +49,7 @@ pub trait Decoder: Send + AsyncIndex<usize, Output = Result<ArrayRef>> {
     async fn decode(&self) -> Result<ArrayRef>;
 
     /// Take by indices.
-    async fn take(&self, indices: &[i32]) -> Result<ArrayRef>;
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef>;
 }
 
 #[async_trait]

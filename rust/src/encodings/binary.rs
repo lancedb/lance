@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::cast::as_primitive_array;
+use arrow_array::UInt32Array;
 use arrow_array::{
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
@@ -129,7 +130,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         self.get(..).await
     }
 
-    async fn take(&self, indices: &[i32]) -> Result<ArrayRef> {
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         todo!()
     }
 }
