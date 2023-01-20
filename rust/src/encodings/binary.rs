@@ -177,7 +177,6 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
             self.position,
             self.length + 1,
         )?;
-        println!("offset decoder: get: {} range={:? }\n", self.length, index);
         let positions = position_decoder.get(index.start..index.end + 1).await?;
         let int64_positions: &Int64Array = as_primitive_array(&positions);
 
