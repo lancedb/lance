@@ -231,6 +231,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
 #[async_trait]
 impl AsyncIndex<usize> for PlainDecoder<'_> {
+    // TODO: should this return a Scalar value?
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: usize) -> Self::Output {
