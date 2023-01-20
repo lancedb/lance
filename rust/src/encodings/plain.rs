@@ -230,6 +230,10 @@ impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }
+
+    async fn take(&self, indices: &[i32]) -> Result<ArrayRef> {
+        todo!()
+    }
 }
 
 #[async_trait]

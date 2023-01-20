@@ -201,6 +201,13 @@ impl<'a> FileReader<'a> {
         .await
     }
 
+    /// Take by records by indices.
+    pub async fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
+        let mut indices: Vec<usize> = Vec::from(indices);
+        indices.sort();
+        todo!();
+    }
+
     /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
     ///
     /// Currently, it only does batch based scan.

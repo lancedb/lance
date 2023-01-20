@@ -47,6 +47,9 @@ pub trait Encoder {
 #[async_trait]
 pub trait Decoder: Send + AsyncIndex<usize, Output = Result<ArrayRef>> {
     async fn decode(&self) -> Result<ArrayRef>;
+
+    /// Take by indices.
+    async fn take(&self, indices: &[i32]) -> Result<ArrayRef>;
 }
 
 #[async_trait]

@@ -128,6 +128,10 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(..).await
     }
+
+    async fn take(&self, indices: &[i32]) -> Result<ArrayRef> {
+        todo!()
+    }
 }
 
 #[async_trait]

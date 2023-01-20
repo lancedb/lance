@@ -164,6 +164,10 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
             )))
         }
     }
+
+    async fn take(&self, indices: &[i32]) -> Result<ArrayRef> {
+        todo!()
+    }
 }
 
 #[async_trait]
