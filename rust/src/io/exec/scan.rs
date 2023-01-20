@@ -100,7 +100,7 @@ impl Scan {
 
         Self {
             rx,
-            _io_thread: io_thread,  // Drop the background I/O thread with the stream.
+            _io_thread: io_thread, // Drop the background I/O thread with the stream.
         }
     }
 }
