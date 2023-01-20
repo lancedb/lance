@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use arrow_array::types::*;
 use arrow_array::{
-    make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray, FixedSizeListArray,
-    UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -244,6 +244,9 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
+        if index.len() == 0 {
+            return Ok(new_empty_array(self.data_type));
+        }
         match self.data_type {
             DataType::FixedSizeList(items, list_size) => {
                 self.decode_fixed_size_list(items, *list_size, index.start, index.end)
@@ -421,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_one_scalar_value() {
+    async fn test_decode_by_range() {
         let store = ObjectStore::memory();
         let path = Path::from("/scalar");
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
@@ -447,5 +450,17 @@ mod tests {
             decoder.get(2..).await.unwrap().as_ref(),
             &Int32Array::from_iter_values([2, 3, 4, 5])
         );
+
+        assert_eq!(
+            &decoder.get(2..2).await.unwrap(),
+            &new_empty_array(&DataType::Int32)
+        );
+
+        assert_eq!(
+            &decoder.get(5..2).await.unwrap(),
+            &new_empty_array(&DataType::Int32)
+        );
+
+        assert!(decoder.get(3..1000).await.is_err());
     }
 }

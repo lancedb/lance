@@ -1,8 +1,6 @@
 //! Data encodings
 //!
 
-use std::ops::Range;
-
 use arrow_array::{Array, ArrayRef};
 use async_trait::async_trait;
 

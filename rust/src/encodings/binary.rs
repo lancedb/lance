@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::{
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray, UInt32Array,
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
