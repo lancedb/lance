@@ -2,6 +2,7 @@
 //!
 
 use std::marker::PhantomData;
+use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
@@ -124,13 +125,58 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
 #[async_trait]
 impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
+        self.get(..).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _index: usize) -> Self::Output {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
+        self.get(index.start..self.length).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeTo<usize>) -> Self::Output {
+        self.get(0..index.end).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _: RangeFull) -> Self::Output {
+        self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: Range<usize>) -> Self::Output {
         let position_decoder = PlainDecoder::new(
             self.reader,
             &DataType::Int64,
             self.position,
             self.length + 1,
         )?;
-        let positions = position_decoder.decode().await?;
+        let positions = position_decoder.get(index.start..index.end + 1).await?;
         let int64_positions = positions.as_any().downcast_ref::<Int64Array>().unwrap();
 
         let start_position = int64_positions.value(0);
@@ -172,15 +218,6 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
-    }
-}
-
-#[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, _index: usize) -> Self::Output {
-        todo!()
     }
 }
 
