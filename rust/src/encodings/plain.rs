@@ -105,6 +105,15 @@ pub struct PlainDecoder<'a> {
     length: usize,
 }
 
+/// Calculate offset in bytes from the row offset.
+#[inline]
+fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
+    Ok(match data_type {
+        DataType::Boolean => bit_util::ceil(row_offset, 8),
+        _ => get_primitive_byte_width(data_type)? * row_offset,
+    })
+}
+
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a ObjectReader,
@@ -129,14 +138,8 @@ impl<'a> PlainDecoder<'a> {
                 start, end, self.length
             )));
         }
-        let start_offset = match self.data_type {
-            DataType::Boolean => bit_util::ceil(start, 8),
-            _ => get_primitive_byte_width(self.data_type)? * start,
-        };
-        let end_offset = match self.data_type {
-            DataType::Boolean => bit_util::ceil(end, 8),
-            _ => get_primitive_byte_width(self.data_type)? * end,
-        };
+        let start_offset = make_byte_offset(self.data_type, start)?;
+        let end_offset = make_byte_offset(self.data_type, end)?;
         let range = Range {
             start: self.position + start_offset,
             end: self.position + end_offset,
