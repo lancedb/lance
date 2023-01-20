@@ -1,0 +1,10 @@
+[project]
+name = "lance"
+dependencies = ["pyarrow>=10"]
+
+[tool.maturin]
+python-source = "python"
+
+[build-system]
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
