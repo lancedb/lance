@@ -144,7 +144,7 @@ impl<'a> Scanner<'a> {
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
-    exec_node: Box<dyn ExecNode + Unpin>,
+    exec_node: Box<dyn ExecNode + Unpin + Send>,
 }
 
 impl ScannerStream {
