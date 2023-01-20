@@ -6,6 +6,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
+use arrow_array::cast::as_primitive_array;
 use arrow_array::{
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
@@ -176,8 +177,9 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
             self.position,
             self.length + 1,
         )?;
+        println!("offset decoder: get: {} range={:? }\n", self.length, index);
         let positions = position_decoder.get(index.start..index.end + 1).await?;
-        let int64_positions = positions.as_any().downcast_ref::<Int64Array>().unwrap();
+        let int64_positions: &Int64Array = as_primitive_array(&positions);
 
         let start_position = int64_positions.value(0);
 
@@ -194,14 +196,18 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
         // Count nulls
         let mut null_buf = MutableBuffer::new_null(self.length);
         let mut null_count = 0;
-        for idx in 0..self.length {
-            if int64_positions.value(idx) == int64_positions.value(idx + 1) {
-                bit_util::unset_bit(null_buf.as_mut(), idx);
-                null_count += 1;
-            } else {
-                bit_util::set_bit(null_buf.as_mut(), idx);
-            }
-        }
+        int64_positions
+            .values()
+            .windows(2)
+            .enumerate()
+            .for_each(|(idx, w)| {
+                if w[0] == w[1] {
+                    bit_util::unset_bit(null_buf.as_mut(), idx);
+                    null_count += 1;
+                } else {
+                    bit_util::set_bit(null_buf.as_mut(), idx);
+                }
+            });
 
         let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
         let bytes = self
@@ -210,7 +216,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
             .await?;
 
         let array_data = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(self.length)
+            .len(index.len())
             .null_count(null_count)
             .null_bit_buffer(Some(null_buf.into()))
             .add_buffer(offset_data.buffers()[0].clone())
@@ -234,7 +240,7 @@ mod tests {
     use crate::io::ObjectStore;
 
     async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
-        let store = ObjectStore::new(":memory:").unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         // Write some gabage to reset "tell()".
@@ -268,5 +274,46 @@ mod tests {
             None,
         ]))
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_range_query() {
+        let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        // Write some gabage to reset "tell()".
+        object_writer.write_all(b"1234").await.unwrap();
+        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        let pos = encoder.encode(&data).await.unwrap();
+        object_writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, data.len());
+        assert_eq!(
+            decoder.decode().await.unwrap().as_ref(),
+            &StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"])
+        );
+
+        assert_eq!(
+            decoder.get(..).await.unwrap().as_ref(),
+            &StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"])
+        );
+
+        assert_eq!(
+            decoder.get(2..5).await.unwrap().as_ref(),
+            &StringArray::from_iter_values(["c", "d", "e"])
+        );
+
+        assert_eq!(
+            decoder.get(..5).await.unwrap().as_ref(),
+            &StringArray::from_iter_values(["a", "b", "c", "d", "e"])
+        );
+
+        assert_eq!(
+            decoder.get(4..).await.unwrap().as_ref(),
+            &StringArray::from_iter_values(["e", "f", "g"])
+        );
     }
 }
