@@ -16,8 +16,8 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
-use super::plain::PlainDecoder;
 use super::Encoder;
+use super::{plain::PlainDecoder, AsyncIndex};
 use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
@@ -172,6 +172,15 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _index: usize) -> Self::Output {
+        todo!()
     }
 }
 

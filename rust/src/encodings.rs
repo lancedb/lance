@@ -43,8 +43,15 @@ pub trait Encoder {
     async fn encode(&mut self, array: &dyn Array) -> Result<usize>;
 }
 
-/// Decoder - Read Arrow Array from file.
+/// Decoder - Read Arrow Data.
 #[async_trait]
-pub trait Decoder: Send {
+pub trait Decoder: Send + AsyncIndex<usize, Output = Result<ArrayRef>> {
     async fn decode(&self) -> Result<ArrayRef>;
+}
+
+#[async_trait]
+pub trait AsyncIndex<IndexType> {
+    type Output: Send + Sync;
+
+    async fn get(&self, index: IndexType) -> Self::Output;
 }

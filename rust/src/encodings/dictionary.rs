@@ -36,6 +36,7 @@ use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter};
 use crate::Error;
 
 use super::plain::PlainEncoder;
+use super::AsyncIndex;
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
@@ -162,6 +163,15 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
                 self.data_type
             )))
         }
+    }
+}
+
+#[async_trait]
+impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _index: usize) -> Self::Output {
+        todo!()
     }
 }
 

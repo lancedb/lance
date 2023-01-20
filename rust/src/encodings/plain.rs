@@ -20,14 +20,13 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::any::Any;
-use std::ops::Range;
+use std::ops::{Range, RangeFrom, RangeTo};
 use std::sync::Arc;
 
 use arrow_array::types::*;
 use arrow_array::{
-    make_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray, FixedSizeListArray,
-    UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -42,6 +41,7 @@ use crate::arrow::*;
 use crate::Error;
 
 use super::Decoder;
+use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
@@ -105,6 +105,15 @@ pub struct PlainDecoder<'a> {
     length: usize,
 }
 
+/// Calculate offset in bytes from the row offset.
+#[inline]
+fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
+    Ok(match data_type {
+        DataType::Boolean => bit_util::ceil(row_offset, 8),
+        _ => get_primitive_byte_width(data_type)? * row_offset,
+    })
+}
+
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a ObjectReader,
@@ -120,24 +129,26 @@ impl<'a> PlainDecoder<'a> {
         })
     }
 
-    pub async fn at(&self, _idx: usize) -> Result<Option<Box<dyn Any>>> {
-        todo!()
-    }
-
-    async fn decode_primitive(&self) -> Result<ArrayRef> {
-        let array_bytes = match self.data_type {
-            DataType::Boolean => bit_util::ceil(self.length, 8),
-            _ => get_primitive_byte_width(self.data_type)? * self.length,
-        };
+    /// Decode primitive values, from "offset" to "offset + length".
+    ///
+    async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
+        if end > self.length {
+            return Err(Error::IO(format!(
+                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                start, end, self.length
+            )));
+        }
+        let start_offset = make_byte_offset(self.data_type, start)?;
+        let end_offset = make_byte_offset(self.data_type, end)?;
         let range = Range {
-            start: self.position,
-            end: self.position + array_bytes,
+            start: self.position + start_offset,
+            end: self.position + end_offset,
         };
 
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
-            .len(self.length)
+            .len(end - start)
             .null_count(0)
             .add_buffer(buf)
             .build()?;
@@ -146,8 +157,10 @@ impl<'a> PlainDecoder<'a> {
 
     async fn decode_fixed_size_list(
         &self,
-        items: &Box<Field>,
-        list_size: &i32,
+        items: &Field,
+        list_size: i32,
+        start: usize,
+        end: usize,
     ) -> Result<ArrayRef> {
         if !items.data_type().is_fixed_stride() {
             return Err(Error::Schema(format!(
@@ -159,27 +172,36 @@ impl<'a> PlainDecoder<'a> {
             self.reader,
             items.data_type(),
             self.position,
-            self.length * (*list_size) as usize,
+            self.length * list_size as usize,
         )?;
-        let item_array = item_decoder.decode().await?;
-        Ok(Arc::new(FixedSizeListArray::try_new(item_array, *list_size)?) as ArrayRef)
+        let item_array = item_decoder
+            .get(start * list_size as usize..end * list_size as usize)
+            .await?;
+        Ok(Arc::new(FixedSizeListArray::try_new(item_array, list_size)?) as ArrayRef)
     }
 
-    async fn decode_fixed_size_binary(&self, stride: &i32) -> Result<ArrayRef> {
+    async fn decode_fixed_size_binary(
+        &self,
+        stride: i32,
+        start: usize,
+        end: usize,
+    ) -> Result<ArrayRef> {
         let bytes_decoder = PlainDecoder::new(
             self.reader,
             &DataType::UInt8,
             self.position,
-            self.length * (*stride) as usize,
+            self.length * stride as usize,
         )?;
-        let bytes_array = bytes_decoder.decode().await?;
+        let bytes_array = bytes_decoder
+            .get(start * stride as usize..end * stride as usize)
+            .await?;
         let values = bytes_array
             .as_any()
             .downcast_ref::<UInt8Array>()
             .ok_or_else(|| {
                 Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
             })?;
-        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, *stride)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
     }
 }
 
@@ -206,13 +228,57 @@ fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
+        self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<usize> for PlainDecoder<'_> {
+    // TODO: should this return a Scalar value?
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: usize) -> Self::Output {
+        self.get(index..index + 1).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: Range<usize>) -> Self::Output {
+        if index.len() == 0 {
+            return Ok(new_empty_array(self.data_type));
+        }
         match self.data_type {
             DataType::FixedSizeList(items, list_size) => {
-                self.decode_fixed_size_list(items, list_size).await
+                self.decode_fixed_size_list(items, *list_size, index.start, index.end)
+                    .await
             }
-            DataType::FixedSizeBinary(stride) => self.decode_fixed_size_binary(stride).await,
-            _ => self.decode_primitive().await,
+            DataType::FixedSizeBinary(stride) => {
+                self.decode_fixed_size_binary(*stride, index.start, index.end)
+                    .await
+            }
+            _ => self.decode_primitive(index.start, index.end).await,
         }
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeFrom<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
+        self.get(index.start..self.length).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, index: RangeTo<usize>) -> Self::Output {
+        self.get(0..index.end).await
     }
 }
 
@@ -358,5 +424,46 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_decode_by_range() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/scalar");
+        let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+        assert_eq!(
+            decoder.get(2..4).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([2, 3])
+        );
+
+        assert_eq!(
+            decoder.get(..4).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([0, 1, 2, 3])
+        );
+
+        assert_eq!(
+            decoder.get(2..).await.unwrap().as_ref(),
+            &Int32Array::from_iter_values([2, 3, 4, 5])
+        );
+
+        assert_eq!(
+            &decoder.get(2..2).await.unwrap(),
+            &new_empty_array(&DataType::Int32)
+        );
+
+        assert_eq!(
+            &decoder.get(5..2).await.unwrap(),
+            &new_empty_array(&DataType::Int32)
+        );
+
+        assert!(decoder.get(3..1000).await.is_err());
     }
 }
