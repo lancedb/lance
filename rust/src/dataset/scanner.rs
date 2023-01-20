@@ -21,14 +21,14 @@ use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::Stream;
 use object_store::path::Path;
-use tokio::sync::mpsc::{self, Receiver};
 
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::index::vector::Query;
-use crate::io::{FileReader, ObjectStore};
-use crate::{Error, Result};
+use crate::io::exec::{ExecNode, Scan};
+use crate::io::ObjectStore;
+use crate::Result;
 
 /// Dataset Scanner
 ///
@@ -138,8 +138,10 @@ impl<'a> Scanner<'a> {
     }
 }
 
+#[pin_project::pin_project]
 pub struct ScannerStream {
-    rx: Receiver<Result<RecordBatch>>,
+    #[pin]
+    exec_node: Box<dyn ExecNode>,
 }
 
 impl ScannerStream {
@@ -152,53 +154,17 @@ impl ScannerStream {
         schema: &Schema,
         with_row_id: bool,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(prefetch_size);
+        let exec_node = Box::new(Scan::new(
+            &object_store,
+            data_dir,
+            &fragments,
+            schema,
+            manifest.clone(),
+            prefetch_size,
+            with_row_id,
+        ));
 
-        let schema = schema.clone();
-        tokio::spawn(async move {
-            for frag in &fragments {
-                if tx.is_closed() {
-                    return;
-                }
-                let data_file = &frag.files[0];
-                let path = data_dir.child(data_file.path.clone());
-                let reader = match FileReader::try_new_with_fragment(
-                    &object_store,
-                    &path,
-                    frag.id,
-                    Some(manifest.as_ref()),
-                )
-                .await
-                {
-                    Ok(mut r) => {
-                        r.set_projection(schema.clone());
-                        r.with_row_id(with_row_id);
-                        r
-                    }
-                    Err(e) => {
-                        tx.send(Err(Error::IO(format!(
-                            "Failed to open file: {}: {}",
-                            path.to_string(),
-                            e.to_string()
-                        ))))
-                        .await
-                        .expect("Scanner sending error message");
-                        // Stop reading.
-                        break;
-                    }
-                };
-                for batch_id in 0..reader.num_batches() {
-                    if tx.is_closed() {
-                        return;
-                    }
-                    tx.send(reader.read_batch(batch_id as i32).await)
-                        .await
-                        .expect("Scanner: failed to send record batch");
-                }
-            }
-            drop(tx)
-        });
-        Self { rx }
+        Self { exec_node }
     }
 }
 
@@ -209,6 +175,9 @@ impl Stream for ScannerStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::into_inner(self).rx.poll_recv(cx)
+        std::pin::Pin::into_inner(self)
+            .exec_node
+            .as_mut()
+            .poll_recv(cx)
     }
 }
