@@ -287,7 +287,7 @@ impl<'a> FileWriter<'a> {
             field.set_dictionary_values(value_arrs);
         }
         // Write dictionary values to disk.
-        let mut manifest = Manifest::new(&schema);
+        let mut manifest = Manifest::new(&schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
 
         // Step 3. Write metadata.

@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::Stream;
+use futures::StreamExt;
 use object_store::path::Path;
 
 use super::Dataset;
@@ -52,7 +55,7 @@ pub struct Scanner<'a> {
     limit: Option<i64>,
     offset: Option<i64>,
 
-    fragments: Vec<Fragment>,
+    fragments: Arc<Vec<Fragment>>,
 
     nearest: Option<Query>,
 
@@ -67,7 +70,7 @@ impl<'a> Scanner<'a> {
             projections: dataset.schema().clone(),
             limit: None,
             offset: None,
-            fragments: dataset.fragments().to_vec(),
+            fragments: dataset.fragments().clone(),
             nearest: None,
             with_row_id: false,
         }
@@ -120,20 +123,20 @@ impl<'a> Scanner<'a> {
     /// TODO: implement as IntoStream/IntoIterator.
     pub fn into_stream(&self) -> ScannerStream {
         const PREFECTH_SIZE: usize = 8;
-        let object_store = self.dataset.object_store.clone();
 
         let data_dir = self.dataset.data_dir().clone();
-        let fragments = self.fragments.clone();
         let manifest = self.dataset.manifest.clone();
+        let with_row_id = self.with_row_id;
+        let projection = &self.projections;
 
         ScannerStream::new(
-            object_store,
+            self.dataset.object_store.clone(),
             data_dir,
-            fragments,
+            self.fragments.clone(),
             manifest,
             PREFECTH_SIZE,
-            &self.projections,
-            self.with_row_id,
+            projection,
+            with_row_id,
         )
     }
 }
@@ -141,23 +144,23 @@ impl<'a> Scanner<'a> {
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
-    exec_node: Box<dyn ExecNode>,
+    exec_node: Box<dyn ExecNode + Unpin>,
 }
 
 impl ScannerStream {
-    fn new(
+    fn new<'a>(
         object_store: Arc<ObjectStore>,
         data_dir: Path,
-        fragments: Vec<Fragment>,
+        fragments: Arc<Vec<Fragment>>,
         manifest: Arc<Manifest>,
         prefetch_size: usize,
         schema: &Schema,
         with_row_id: bool,
     ) -> Self {
         let exec_node = Box::new(Scan::new(
-            &object_store,
+            object_store,
             data_dir,
-            &fragments,
+            fragments.clone(),
             schema,
             manifest.clone(),
             prefetch_size,
@@ -171,13 +174,8 @@ impl ScannerStream {
 impl Stream for ScannerStream {
     type Item = Result<RecordBatch>;
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::into_inner(self)
-            .exec_node
-            .as_mut()
-            .poll_recv(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        this.exec_node.poll_next_unpin(cx)
     }
 }

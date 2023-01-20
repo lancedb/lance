@@ -134,14 +134,14 @@ impl Dataset {
             ));
         }
 
-        let mut manifest = Manifest::new(&schema);
         let mut fragment_id = 0;
+        let mut fragments: Vec<Fragment> = vec![];
 
         macro_rules! new_writer {
             () => {{
                 let file_path = format!("{}.lance", Uuid::new_v4());
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                manifest.fragments.push(fragment);
+                fragments.push(fragment);
                 fragment_id += 1;
                 Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
@@ -178,6 +178,7 @@ impl Dataset {
         };
         drop(writer);
 
+        let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         let manifest_file_path = object_store
             .base_path()
             .child(VERSIONS_DIR)
@@ -247,7 +248,7 @@ impl Dataset {
         &self.manifest.schema
     }
 
-    pub fn fragments(&self) -> &[Fragment] {
+    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
 }

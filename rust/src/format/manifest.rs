@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use super::Fragment;
 use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
@@ -34,15 +36,15 @@ pub struct Manifest {
     pub version: u64,
 
     /// Fragments, the pieces to build the dataset.
-    pub fragments: Vec<Fragment>,
+    pub fragments: Arc<Vec<Fragment>>,
 }
 
 impl Manifest {
-    pub fn new(schema: &Schema) -> Self {
+    pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
         Self {
             schema: schema.clone(),
             version: 1,
-            fragments: vec![],
+            fragments,
         }
     }
 }
@@ -56,7 +58,7 @@ impl From<pb::Manifest> for Manifest {
         Self {
             schema: Schema::from(&p.fields),
             version: p.version,
-            fragments: p.fragments.iter().map(Fragment::from).collect(),
+            fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
         }
     }
 }

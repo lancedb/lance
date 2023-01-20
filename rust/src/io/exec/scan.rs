@@ -23,6 +23,7 @@ use arrow_array::RecordBatch;
 use futures::stream::Stream;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
+use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
 use crate::format::Manifest;
@@ -33,24 +34,26 @@ use crate::{Error, Result};
 /// Dataset Scan Node.
 pub(crate) struct Scan {
     rx: Receiver<Result<RecordBatch>>,
+
+    _io_thread: JoinHandle<()>,
 }
 
 impl Scan {
     /// Create a new scan node.
-    pub fn new(
-        object_store: &'static ObjectStore,
+    pub fn new<'a>(
+        object_store: Arc<ObjectStore>,
         data_dir: Path,
-        fragments: &'static [Fragment],
+        fragments: Arc<Vec<Fragment>>,
         projection: &Schema,
         manifest: Arc<Manifest>,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(prefetch_size);
 
         let projection = projection.clone();
-        tokio::spawn(async move {
-            for frag in fragments {
+        let io_thread = tokio::spawn(async move {
+            for frag in fragments.as_ref() {
                 if tx.is_closed() {
                     return;
                 }
@@ -84,17 +87,21 @@ impl Scan {
                 for batch_id in 0..reader.num_batches() {
                     let batch = reader.read_batch(batch_id as i32).await;
                     if tx.is_closed() {
-                        return;
+                        break;
                     }
-                    tx.send(batch)
-                        .await
-                        .expect("Scanner: failed to send record batch");
+                    if tx.send(batch).await.is_err() {
+                        // tx closed earlier.
+                        break;
+                    }
                 }
             }
             drop(tx)
         });
 
-        Self { rx }
+        Self {
+            rx,
+            _io_thread: io_thread,  // Drop the background I/O thread with the stream.
+        }
     }
 }
 
