@@ -232,8 +232,8 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        types::GenericStringType, GenericStringArray, LargeStringArray, OffsetSizeTrait,
-        StringArray,
+        new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
+        OffsetSizeTrait, StringArray,
     };
     use object_store::path::Path;
 
@@ -315,5 +315,10 @@ mod tests {
             decoder.get(4..).await.unwrap().as_ref(),
             &StringArray::from_iter_values(["e", "f", "g"])
         );
+        assert_eq!(
+            decoder.get(2..2).await.unwrap().as_ref(),
+            &new_empty_array(&DataType::Utf8)
+        );
+        assert!(decoder.get(100..100).await.is_err());
     }
 }
