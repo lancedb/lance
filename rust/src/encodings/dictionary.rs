@@ -29,14 +29,13 @@ use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array}
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
+use super::plain::PlainEncoder;
+use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
 use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter, ReadBatchParams};
 use crate::Error;
-
-use super::plain::PlainEncoder;
-use super::AsyncIndex;
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
