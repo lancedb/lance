@@ -67,9 +67,6 @@ impl Dataset {
         limit: i64,
         offset: Option<i64>,
     ) -> PyResult<Scanner> {
-        println!("{:?}", columns);
-        println!("{:?}", limit);
-        println!("{:?}", offset);
         let scanner = Scanner::new(self.ds.clone(), columns, offset, limit, self.rt.clone());
         Ok(scanner)
     }
