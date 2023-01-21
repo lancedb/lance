@@ -15,24 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use pyo3::prelude::*;
-use pyo3::{pyclass, PyObject, PyResult};
-/// This a Scanner implementation which will being associated
-/// with a Pyarrow Scanner so duckdb can be tricked to call
-/// it's methods during scans
 use std::sync::Arc;
 
 use arrow::ffi_stream::*;
 use arrow::pyarrow::*;
 use arrow_schema::Schema as ArrowSchema;
-
-use crate::errors::ioerror;
-use crate::reader::LanceReader;
-use ::lance::dataset::scanner::Scanner as LanceScanner;
-use ::lance::dataset::Dataset as LanceDataset;
+use pyo3::prelude::*;
+use pyo3::{pyclass, PyObject, PyResult};
 use pyo3::exceptions::PyValueError;
 use tokio::runtime::Runtime;
 
+use ::lance::dataset::scanner::Scanner as LanceScanner;
+use ::lance::dataset::Dataset as LanceDataset;
+
+use crate::errors::ioerror;
+use crate::reader::LanceReader;
+
+
+/// This will be wrapped by a python class to provide
+/// additional functionality
 #[pyclass(name = "_Scanner", module = "_lib")]
 pub struct Scanner {
     dataset: Arc<LanceDataset>,

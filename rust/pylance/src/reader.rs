@@ -14,14 +14,15 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use futures::stream::StreamExt;
 use std::sync::Arc;
+
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, SchemaRef};
+use futures::stream::StreamExt;
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::scanner::{Scanner as LanceScanner, ScannerStream};
 use ::lance::error::Error;
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -37,7 +38,7 @@ impl LanceReader {
     pub fn new(scanner: LanceScanner, rt: Arc<Runtime>) -> Self {
         Self {
             schema: scanner.schema(),
-            stream: scanner.into_stream(),
+            stream: scanner.into_stream(),  // needs tokio Runtime
             rt,
         }
     }

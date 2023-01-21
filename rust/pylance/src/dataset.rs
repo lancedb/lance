@@ -14,24 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::pyarrow::*;
-use arrow_schema::Schema as ArrowSchema;
 use std::sync::Arc;
 
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::pyarrow::*;
+use arrow_schema::Schema as ArrowSchema;
+use pyo3::{pyclass, PyObject, PyResult};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::{pyclass, PyObject, PyResult};
-
+use pyo3::types::PyDict;
 use tokio::runtime::Runtime;
 
-use crate::Scanner;
-use ::lance::dataset::Dataset as LanceDataset;
-use arrow::ffi_stream::ArrowArrayStreamReader;
 use lance::dataset::{WriteMode, WriteParams};
-use pyo3::types::PyDict;
+use ::lance::dataset::Dataset as LanceDataset;
+use crate::Scanner;
 
-/// Lance Dataset that will inherit from pyarrow dataset
-/// to trick duckdb
+
+/// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
 pub struct Dataset {
     #[pyo3(get)]
