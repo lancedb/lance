@@ -18,6 +18,7 @@
 //! Lance Data File Reader
 
 // Standard
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -26,10 +27,12 @@ use arrow_array::cast::as_primitive_array;
 use arrow_array::{
     ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray, UInt64Array,
 };
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, TryStreamExt};
+use futures::StreamExt;
 use object_store::path::Path;
 use prost::Message;
 
@@ -202,10 +205,34 @@ impl<'a> FileReader<'a> {
     }
 
     /// Take by records by indices.
+    ///
+    ///
     pub async fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
         let mut indices: Vec<usize> = Vec::from(indices);
         indices.sort();
-        todo!();
+        let mut indices_per_batch: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut batch_id = 0;
+        let num_batches = self.num_batches();
+        for idx in indices.iter() {
+            while batch_id < num_batches
+                && *idx > self.metadata.batch_offsets[batch_id + 1] as usize
+            {
+                batch_id += 1;
+            }
+            indices_per_batch
+                .entry(batch_id)
+                .and_modify(|v| v.push(*idx))
+                .or_insert(vec![*idx]);
+        }
+
+        let batches = stream::iter(indices_per_batch)
+            .then(|(batch_id, mut indices)| async move {
+                indices.sort();
+                self.read_batch(batch_id as i32).await
+            })
+            .try_collect::<Vec<_>>().await?;
+        let schema = Arc::new(ArrowSchema::from(self.schema()));
+        Ok(concat_batches(&schema, &batches)?)
     }
 
     /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
