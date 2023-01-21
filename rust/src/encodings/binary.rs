@@ -9,6 +9,7 @@ use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::cast::as_primitive_array;
 use arrow_array::UInt32Array;
 use arrow_array::{
+    new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
 };
@@ -16,6 +17,7 @@ use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
+use arrow_select::take::take;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
@@ -131,7 +133,16 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     }
 
     async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        todo!()
+        if indices.is_empty() {
+            return Ok(new_empty_array(&T::DATA_TYPE));
+        }
+
+        // TODO: optimize for sparse index
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self.get(start as usize..end as usize + 1).await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
     }
 }
 
