@@ -22,7 +22,6 @@ use futures::stream::StreamExt;
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::scanner::{Scanner as LanceScanner, ScannerStream};
-use ::lance::error::Error;
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -50,15 +49,7 @@ impl Iterator for LanceReader {
     fn next(&mut self) -> Option<Self::Item> {
         let stream = &mut self.stream;
         self.rt.block_on(async {
-            stream.next().await.map(|rs| {
-                rs.map_err(|err| {
-                    match err {
-                        Error::Arrow(err) => ArrowError::IoError(err), // we lose the error type converting to LanceError
-                        Error::IO(err) => ArrowError::IoError(err),
-                        Error::Schema(err) => ArrowError::SchemaError(err),
-                    }
-                })
-            })
+            stream.next().await.map(|rs| rs.map_err(|err| ArrowError::from(err)))
         })
     }
 }

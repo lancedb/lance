@@ -80,3 +80,13 @@ impl From<object_store::path::Error> for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<Error> for ArrowError {
+    fn from(value: Error) -> Self {
+        match value {
+            Error::Arrow(err) => ArrowError::IoError(err), // we lose the error type converting to LanceError
+            Error::IO(err) => ArrowError::IoError(err),
+            Error::Schema(err) => ArrowError::SchemaError(err),
+        }
+    }
+}
