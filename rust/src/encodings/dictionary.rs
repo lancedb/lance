@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::cast::as_dictionary_array;
+use arrow_array::cast::{as_dictionary_array, as_primitive_array};
 use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
@@ -141,10 +141,7 @@ impl<'a> DictionaryDecoder<'a> {
         &self,
         index_array: ArrayRef,
     ) -> Result<ArrayRef> {
-        let keys = index_array
-            .as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .unwrap();
+        let keys: &PrimitiveArray<T> = as_primitive_array(index_array.as_ref());
         Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
     }
 }
