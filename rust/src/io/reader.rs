@@ -19,7 +19,7 @@
 
 // Standard
 use std::collections::BTreeMap;
-use std::ops::{Range, RangeFull};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -268,11 +268,10 @@ async fn read_batch(
     batch_id: i32,
     with_row_id: bool,
 ) -> Result<RecordBatch> {
-    let mut arrs = vec![];
-    for field in schema.fields.iter() {
-        let arr = read_array(reader, field, batch_id, params).await?;
-        arrs.push(arr);
-    }
+    let arrs = stream::iter(&schema.fields)
+        .then(|f| async { read_array(reader, f, batch_id, params).await })
+        .try_collect::<Vec<_>>()
+        .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
         let batch_offset = reader
