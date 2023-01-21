@@ -11,5 +11,6 @@ build-backend = "maturin"
 
 [project.optional-dependencies]
 tests = [
-    'pytest',
+    "pytest",
+    "pandas"
 ]

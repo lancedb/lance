@@ -31,11 +31,13 @@ pub(crate) mod errors;
 pub use dataset::Dataset;
 pub use scanner::Scanner;
 pub use reader::LanceReader;
+pub use dataset::write_dataset;
 
 
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_wrapped(wrap_pyfunction!(write_dataset));
     Ok(())
 }

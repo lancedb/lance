@@ -1,10 +1,11 @@
 from __future__ import annotations
-
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 import pyarrow as pa
+import pyarrow.dataset
 
-from .lance import _Dataset, _Scanner
+from .lance import _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset:
@@ -12,7 +13,9 @@ class LanceDataset:
     A dataset in Lance format where the data is stored at the given uri
     """
 
-    def __init__(self, uri: str):
+    def __init__(self, uri: Union[str, Path]):
+        if isinstance(uri, Path):
+            uri = str(uri.absolute())
         self._uri = uri
         self._ds = _Dataset(uri)
 
@@ -79,3 +82,59 @@ class LanceScanner:
         Read the data into memory and return a pyarrow Table.
         """
         return pa.Table.from_batches(self._scanner.to_reader())
+
+    def to_reader(self) -> pa.RecordBatchReader:
+        return self._scanner.to_reader()
+
+
+Readerlike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
+                   pa.RecordBatchReader, LanceDataset, LanceScanner]
+
+def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
+                  mode: str="create",
+                  max_rows_per_file: int=1024*1024,
+                  max_rows_per_group: int=1024) -> bool:
+    """
+    Write a given data_obj to the given uri
+
+    Parameters
+    ----------
+    data_obj: Reader-like
+        The data to be written. Acceptable types are:
+        - Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        - LanceDataset or LanceScanner
+    uri: str or Path
+        Where the write the dataset to (directory)
+    mode: str
+        create - create a new dataset (raises if uri already exists)
+        overwrite - create a new snapshot version
+        append - create a new version that is the concat of the input the
+                 latest version (raises if uri does not exist)
+    max_rows_per_file: int, default 1024 * 1024
+        The max number of rows to write before starting a new file
+    max_rows_per_group: int, default 1024
+        The max number of rows before starting a new group (in the same file)
+    """
+    if isinstance(data_obj, pa.Table):
+        reader = data_obj.to_reader()
+    elif isinstance(data_obj, pa.dataset.Dataset):
+        reader = pa.dataset.Scanner.from_dataset(data_obj).to_reader()
+    elif isinstance(data_obj, pa.dataset.Scanner):
+        reader = data_obj.to_reader()
+    elif isinstance(data_obj, pa.RecordBatchReader):
+        reader = data_obj
+    elif isinstance(data_obj, LanceDataset):
+        reader = data_obj.scanner().to_reader()
+    elif isinstance(data_obj, LanceScanner):
+        reader = data_obj.to_reader()
+    else:
+        raise TypeError(f"Unknown data_obj type {type(data_obj)}")
+
+    params = {
+        "mode": mode,
+        "max_rows_per_file": max_rows_per_file,
+        "max_rows_per_group": max_rows_per_group
+    }
+    if isinstance(uri, Path):
+        uri = str(uri.absolute())
+    return _write_dataset(reader, str(uri), params)

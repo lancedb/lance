@@ -20,11 +20,14 @@ use arrow_schema::Schema as ArrowSchema;
 
 use pyo3::prelude::*;
 use pyo3::{pyclass, PyObject, PyResult};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyIOError, PyValueError};
 
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::Dataset as LanceDataset;
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use lance::dataset::{WriteMode, WriteParams};
+use pyo3::types::{PyDict, PyLong};
 use crate::Scanner;
 
 
@@ -69,4 +72,30 @@ impl Dataset {
         );
         Ok(scanner)
     }
+}
+
+#[pyfunction(name="_write_dataset", module="_lib")]
+pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
+    let mut reader = ArrowArrayStreamReader::from_pyarrow(reader)?;
+    let params = if options.is_none() { None } else {
+        let mut p = WriteParams::default();
+        if let Some(mode) = options.get_item("mode") {
+            match mode.to_string().to_lowercase().as_str() {
+                "create" => Ok(WriteMode::Create),
+                "append" => Ok(WriteMode::Append),
+                "overwrite" => Ok(WriteMode::Overwrite),
+                _ => Err(PyValueError::new_err(format!("Invalid mode {mode}")))
+            }?;
+        }
+        if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
+            p.max_rows_per_file = usize::extract(maybe_nrows)?;
+        }
+        if let Some(maybe_nrows) = options.get_item("max_rows_per_group") {
+            p.max_rows_per_group = usize::extract(maybe_nrows)?;
+        }
+        Some(p)
+    };
+    Runtime::new()?.block_on(async {
+        LanceDataset::create(&mut reader, uri, params).await
+    }).map(|_| true).map_err(|err| PyIOError::new_err(err.to_string()))
 }
