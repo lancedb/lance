@@ -602,6 +602,21 @@ mod tests {
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let batch = reader.take(&[1, 15, 20, 25, 30, 48, 90]).await.unwrap();
-        println!("Batch is: {:?}", batch);
+        assert_eq!(
+            batch,
+            RecordBatch::try_new(
+                batch.schema(),
+                vec![
+                    Arc::new(Int64Array::from_iter_values([1, 15, 20, 25, 30, 48, 90])),
+                    Arc::new(Float32Array::from_iter_values([
+                        1.0, 15.0, 20.0, 25.0, 30.0, 48.0, 90.0
+                    ])),
+                    Arc::new(StringArray::from_iter_values([
+                        "str-1", "str-15", "str-20", "str-25", "str-30", "str-48", "str-90"
+                    ])),
+                ]
+            )
+            .unwrap()
+        );
     }
 }
