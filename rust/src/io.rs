@@ -109,6 +109,12 @@ impl From<&[u32]> for ReadBatchParams {
     }
 }
 
+impl From<UInt32Array> for ReadBatchParams {
+    fn from(value: UInt32Array) -> Self {
+        Self::Indices(value)
+    }
+}
+
 impl From<RangeFull> for ReadBatchParams {
     fn from(_: RangeFull) -> Self {
         Self::RangeFull

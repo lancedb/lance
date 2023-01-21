@@ -37,7 +37,7 @@ use prost::Message;
 
 use super::ReadBatchParams;
 use crate::arrow::*;
-use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
+use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
@@ -293,7 +293,7 @@ async fn read_array(
                 read_binary_array(reader, field, batch_id, params).await
             }
             Struct(_) => read_struct_array(reader, field, batch_id, params).await,
-            Dictionary(_, _) => read_dictionary_array(reader, field, batch_id).await,
+            Dictionary(_, _) => read_dictionary_array(reader, field, batch_id, params).await,
             List(_) => read_list_array(reader, field, batch_id, params).await,
             LargeList(_) => read_large_list_array(reader, field, batch_id, params).await,
             _ => {
@@ -359,6 +359,7 @@ async fn read_dictionary_array(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
+    params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
     let data_type = field.data_type();
@@ -376,7 +377,7 @@ async fn read_dictionary_array(
             .unwrap()
             .clone(),
     );
-    decoder.decode().await
+    decoder.get(params.clone()).await
 }
 
 async fn read_struct_array(
@@ -450,7 +451,10 @@ async fn read_large_list_array(
 mod tests {
     use super::*;
 
-    use arrow_array::{cast::as_primitive_array, Float32Array, Int64Array, StringArray};
+    use arrow_array::{
+        cast::as_primitive_array, types::UInt8Type, DictionaryArray, Float32Array, Int64Array,
+        StringArray, UInt8Array,
+    };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -548,6 +552,11 @@ mod tests {
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
             ArrowField::new("s", DataType::Utf8, false),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            ),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
@@ -556,8 +565,10 @@ mod tests {
 
         // Write 10 batches.
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let values = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
         for batch_id in 0..10 {
-            let value_range = batch_id * 10..batch_id * 10 + 10;
+            let value_range: Range<i64> = batch_id * 10..batch_id * 10 + 10;
+            let keys = UInt8Array::from_iter_values(value_range.clone().map(|v| (v % 7) as u8));
             let columns: Vec<ArrayRef> = vec![
                 Arc::new(Int64Array::from_iter(
                     value_range.clone().collect::<Vec<_>>(),
@@ -567,9 +578,11 @@ mod tests {
                 )),
                 Arc::new(StringArray::from_iter_values(
                     value_range
+                        .clone()
                         .map(|n| format!("str-{}", n))
                         .collect::<Vec<_>>(),
                 )),
+                Arc::new(DictionaryArray::<UInt8Type>::try_new(&keys, &values).unwrap()),
             ];
             let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
             file_writer.write(&batch).await.unwrap();
@@ -578,6 +591,7 @@ mod tests {
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let batch = reader.take(&[1, 15, 20, 25, 30, 48, 90]).await.unwrap();
+        let dict_keys = UInt8Array::from_iter_values([1, 1, 6, 4, 2, 6, 6]);
         assert_eq!(
             batch,
             RecordBatch::try_new(
@@ -590,6 +604,7 @@ mod tests {
                     Arc::new(StringArray::from_iter_values([
                         "str-1", "str-15", "str-20", "str-25", "str-30", "str-48", "str-90"
                     ])),
+                    Arc::new(DictionaryArray::try_new(&dict_keys, &values).unwrap()),
                 ]
             )
             .unwrap()

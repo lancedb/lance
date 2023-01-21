@@ -87,7 +87,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 #[derive(Debug)]
 pub struct DictionaryDecoder<'a> {
     reader: &'a ObjectReader<'a>,
-    /// The start position of the batch in the file.
+    /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
     length: usize,
@@ -115,25 +115,33 @@ impl<'a> DictionaryDecoder<'a> {
         }
     }
 
-    async fn decode_index(&self, index_type: &DataType) -> Result<ArrayRef> {
-        let index_decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
-        let index_array = index_decoder.decode().await?;
+    async fn decode_impl(&self, params: impl Into<ReadBatchParams>) -> Result<ArrayRef> {
+        let index_type = if let DataType::Dictionary(key_type, _) = &self.data_type {
+            assert!(key_type.as_ref().is_dictionary_key_type());
+            key_type.as_ref()
+        } else {
+            return Err(Error::Arrow(format!(
+                "Not a dictionary type: {}",
+                self.data_type
+            )));
+        };
+
+        let decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
+        let keys = decoder.get(params.into()).await?;
 
         match index_type {
-            DataType::Int8 => self.make_dict_array::<Int8Type>(index_array).await,
-            DataType::Int16 => self.make_dict_array::<Int16Type>(index_array).await,
-            DataType::Int32 => self.make_dict_array::<Int32Type>(index_array).await,
-            DataType::Int64 => self.make_dict_array::<Int64Type>(index_array).await,
-            DataType::UInt8 => self.make_dict_array::<UInt8Type>(index_array).await,
-            DataType::UInt16 => self.make_dict_array::<UInt16Type>(index_array).await,
-            DataType::UInt32 => self.make_dict_array::<UInt32Type>(index_array).await,
-            DataType::UInt64 => self.make_dict_array::<UInt64Type>(index_array).await,
-            _ => {
-                return Err(Error::Arrow(format!(
-                    "Dictionary encoding does not support index type: {}",
-                    index_type
-                )))
-            }
+            DataType::Int8 => self.make_dict_array::<Int8Type>(keys).await,
+            DataType::Int16 => self.make_dict_array::<Int16Type>(keys).await,
+            DataType::Int32 => self.make_dict_array::<Int32Type>(keys).await,
+            DataType::Int64 => self.make_dict_array::<Int64Type>(keys).await,
+            DataType::UInt8 => self.make_dict_array::<UInt8Type>(keys).await,
+            DataType::UInt16 => self.make_dict_array::<UInt16Type>(keys).await,
+            DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys).await,
+            DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
+            _ => Err(Error::Arrow(format!(
+                "Dictionary encoding does not support index type: {}",
+                index_type
+            ))),
         }
     }
 
@@ -149,20 +157,11 @@ impl<'a> DictionaryDecoder<'a> {
 #[async_trait]
 impl<'a> Decoder for DictionaryDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
-        use DataType::*;
-        if let Dictionary(index_type, _) = &self.data_type {
-            assert!(index_type.as_ref().is_dictionary_key_type());
-            self.decode_index(index_type).await
-        } else {
-            Err(Error::Arrow(format!(
-                "Not a dictionary type: {}",
-                self.data_type
-            )))
-        }
+        self.decode_impl(..).await
     }
 
     async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        todo!()
+        self.decode_impl(indices.clone()).await
     }
 }
 
@@ -180,7 +179,7 @@ impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
-        todo!()
+        self.decode_impl(params.clone()).await
     }
 }
 
