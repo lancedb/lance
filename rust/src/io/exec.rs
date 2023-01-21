@@ -27,6 +27,11 @@ pub(crate) use scan::Scan;
 pub enum NodeType {
     /// Dataset Scan
     Scan = 1,
+    /// Dataset Take (row_ids).
+    Take = 2,
+
+    /// KnnScan
+    KnnScan = 10,
 }
 
 /// I/O Exec Node
