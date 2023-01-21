@@ -24,20 +24,19 @@
 use pyo3::prelude::*;
 
 pub(crate) mod dataset;
-pub(crate) mod scanner;
-pub(crate) mod reader;
 pub(crate) mod errors;
+pub(crate) mod reader;
+pub(crate) mod scanner;
 
-pub use dataset::Dataset;
-pub use scanner::Scanner;
-pub use reader::LanceReader;
 pub use dataset::write_dataset;
-
+pub use dataset::Dataset;
+pub use reader::LanceReader;
+pub use scanner::Scanner;
 
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
-    m.add_wrapped(wrap_pyfunction!(write_dataset));
+    m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     Ok(())
 }

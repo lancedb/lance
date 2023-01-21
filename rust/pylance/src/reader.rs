@@ -14,14 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::sync::Arc;
 use futures::stream::StreamExt;
+use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use arrow_array::{ RecordBatch, RecordBatchReader };
-use arrow_schema::{ ArrowError, SchemaRef };
+use ::lance::dataset::scanner::{Scanner as LanceScanner, ScannerStream};
 use ::lance::error::Error;
-use ::lance::dataset::scanner::{ ScannerStream, Scanner as LanceScanner };
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::{ArrowError, SchemaRef};
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -38,7 +38,7 @@ impl LanceReader {
         Self {
             schema: scanner.schema(),
             stream: scanner.into_stream(),
-            rt
+            rt,
         }
     }
 }
@@ -48,13 +48,13 @@ impl Iterator for LanceReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let stream = &mut self.stream;
-        self.rt.block_on(async { stream.next().await
-            .map(|rs| {
+        self.rt.block_on(async {
+            stream.next().await.map(|rs| {
                 rs.map_err(|err| {
                     match err {
                         Error::Arrow(err) => ArrowError::IoError(err), // we lose the error type converting to LanceError
                         Error::IO(err) => ArrowError::IoError(err),
-                        Error::Schema(err) => ArrowError::SchemaError(err)
+                        Error::Schema(err) => ArrowError::SchemaError(err),
                     }
                 })
             })

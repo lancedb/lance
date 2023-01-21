@@ -14,31 +14,30 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::sync::Arc;
 use arrow::pyarrow::*;
 use arrow_schema::Schema as ArrowSchema;
+use std::sync::Arc;
 
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::{pyclass, PyObject, PyResult};
-use pyo3::exceptions::{PyIOError, PyValueError};
 
 use tokio::runtime::Runtime;
 
+use crate::Scanner;
 use ::lance::dataset::Dataset as LanceDataset;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use lance::dataset::{WriteMode, WriteParams};
-use pyo3::types::{PyDict, PyLong};
-use crate::Scanner;
-
+use pyo3::types::PyDict;
 
 /// Lance Dataset that will inherit from pyarrow dataset
 /// to trick duckdb
-#[pyclass(name="_Dataset", module="_lib")]
+#[pyclass(name = "_Dataset", module = "_lib")]
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
     ds: Arc<LanceDataset>,
-    rt: Arc<Runtime>
+    rt: Arc<Runtime>,
 }
 
 #[pymethods]
@@ -48,8 +47,12 @@ impl Dataset {
         let rt = Runtime::new()?;
         let dataset = rt.block_on(async { LanceDataset::open(uri.as_str()).await });
         match dataset {
-            Ok(ds) => Ok(Self { uri, ds: Arc::new(ds), rt: Arc::new(rt) }),
-            Err(err) => Err(PyValueError::new_err(err.to_string()))
+            Ok(ds) => Ok(Self {
+                uri,
+                ds: Arc::new(ds),
+                rt: Arc::new(rt),
+            }),
+            Err(err) => Err(PyValueError::new_err(err.to_string())),
         }
     }
 
@@ -59,32 +62,33 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
-    fn scanner(&self, columns: Option<Vec<String>>, limit: i64, offset: Option<i64>) -> PyResult<Scanner> {
+    fn scanner(
+        &self,
+        columns: Option<Vec<String>>,
+        limit: i64,
+        offset: Option<i64>,
+    ) -> PyResult<Scanner> {
         println!("{:?}", columns);
         println!("{:?}", limit);
         println!("{:?}", offset);
-        let scanner = Scanner::new(
-            self.ds.clone(),
-            columns,
-            offset,
-            limit,
-            self.rt.clone()
-        );
+        let scanner = Scanner::new(self.ds.clone(), columns, offset, limit, self.rt.clone());
         Ok(scanner)
     }
 }
 
-#[pyfunction(name="_write_dataset", module="_lib")]
+#[pyfunction(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let mut reader = ArrowArrayStreamReader::from_pyarrow(reader)?;
-    let params = if options.is_none() { None } else {
+    let params = if options.is_none() {
+        None
+    } else {
         let mut p = WriteParams::default();
         if let Some(mode) = options.get_item("mode") {
             match mode.to_string().to_lowercase().as_str() {
                 "create" => Ok(WriteMode::Create),
                 "append" => Ok(WriteMode::Append),
                 "overwrite" => Ok(WriteMode::Overwrite),
-                _ => Err(PyValueError::new_err(format!("Invalid mode {mode}")))
+                _ => Err(PyValueError::new_err(format!("Invalid mode {mode}"))),
             }?;
         }
         if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
@@ -95,7 +99,8 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
         }
         Some(p)
     };
-    Runtime::new()?.block_on(async {
-        LanceDataset::create(&mut reader, uri, params).await
-    }).map(|_| true).map_err(|err| PyIOError::new_err(err.to_string()))
+    Runtime::new()?
+        .block_on(async { LanceDataset::create(&mut reader, uri, params).await })
+        .map(|_| true)
+        .map_err(|err| PyIOError::new_err(err.to_string()))
 }

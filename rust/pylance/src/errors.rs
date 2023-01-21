@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use pyo3::prelude::*;
 use pyo3::exceptions::PyIOError;
+use pyo3::prelude::*;
 
 pub(crate) fn ioerror(py: Python, err: String) -> PyErr {
     PyErr::from_value(PyIOError::new_err(err).value(py))
