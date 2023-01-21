@@ -45,7 +45,7 @@ pub trait Encoder {
 
 /// Decoder - Read Arrow Data.
 #[async_trait]
-pub trait Decoder: Send + AsyncIndex<usize, Output = Result<ArrayRef>> {
+pub trait Decoder: Send {
     async fn decode(&self) -> Result<ArrayRef>;
 
     /// Take by indices.

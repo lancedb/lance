@@ -29,7 +29,8 @@ use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
-use crate::arrow::*;
+use super::ReadBatchParams;
+use crate::{arrow::*, encodings::AsyncIndex};
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
@@ -119,11 +120,12 @@ impl<'a> ObjectReader<'a> {
 
     /// Read a fixed stride array from disk.
     ///
-    pub async fn read_fixed_stride_array(
+    pub(crate) async fn read_fixed_stride_array(
         &self,
         data_type: &DataType,
         position: usize,
         length: usize,
+        params: impl Into<ReadBatchParams>,
     ) -> Result<ArrayRef> {
         if !data_type.is_fixed_stride() {
             return Err(Error::Schema(format!(
@@ -133,7 +135,7 @@ impl<'a> ObjectReader<'a> {
         }
         // TODO: support more than plain encoding here.
         let decoder = PlainDecoder::new(self, data_type, position, length)?;
-        decoder.decode().await
+        decoder.get(params.into()).await
     }
 
     pub async fn read_binary_array(

@@ -36,6 +36,7 @@ use futures::StreamExt;
 use object_store::path::Path;
 use prost::Message;
 
+use super::ReadBatchParams;
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, Decoder};
 use crate::error::{Error, Result};
@@ -79,28 +80,6 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 /// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
 fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
     (fragment_id << 32) + offset as u64
-}
-
-pub enum ReadBatchParams {
-    Range(Range<usize>),
-
-    RangeFull,
-
-    Indices(UInt64Array),
-}
-
-impl From<&[usize]> for ReadBatchParams {
-    fn from(value: &[usize]) -> Self {
-        ReadBatchParams::Indices(UInt64Array::from_iter_values(
-            value.iter().map(|v| *v as u64),
-        ))
-    }
-}
-
-impl From<RangeFull> for ReadBatchParams {
-    fn from(value: RangeFull) -> Self {
-        ReadBatchParams::RangeFull
-    }
 }
 
 /// Lance File Reader.
@@ -208,21 +187,14 @@ impl<'a> FileReader<'a> {
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
-    pub async fn read_batch(
+    pub(crate) async fn read_batch(
         &self,
         batch_id: i32,
         params: impl Into<ReadBatchParams>,
     ) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
         // let read_params = params.into();
-        read_batch(
-            &self,
-            &params.into(),
-            schema,
-            batch_id,
-            self.with_row_id,
-        )
-        .await
+        read_batch(&self, &params.into(), schema, batch_id, self.with_row_id).await
     }
 
     /// Take by records by indices within the file.
@@ -268,7 +240,6 @@ impl<'a> FileReader<'a> {
 
         // Deref a bunch.
         let schema = self.schema();
-        let page_table = &self.page_table;
         let with_row_id = self.with_row_id;
 
         stream::unfold(0_i32, move |batch_id| async move {
@@ -334,7 +305,7 @@ async fn read_array(
     use DataType::*;
 
     if data_type.is_fixed_stride() {
-        read_fixed_stride_array(&reader, field, batch_id).await
+        read_fixed_stride_array(&reader, field, batch_id, params).await
     } else {
         match data_type {
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
@@ -369,12 +340,18 @@ async fn read_fixed_stride_array(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
+    params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
     reader
         .object_reader
-        .read_fixed_stride_array(&field.data_type(), page_info.position, page_info.length)
+        .read_fixed_stride_array(
+            &field.data_type(),
+            page_info.position,
+            page_info.length,
+            params.clone(),
+        )
         .await
 }
 
@@ -441,7 +418,12 @@ async fn read_list_array(
 
     let position_arr = reader
         .object_reader
-        .read_fixed_stride_array(&DataType::Int32, page_info.position, page_info.length)
+        .read_fixed_stride_array(
+            &DataType::Int32,
+            page_info.position,
+            page_info.length,
+            params,
+        )
         .await?;
     let positions = as_primitive_array(position_arr.as_ref());
     let start_position = positions.value(0);
@@ -461,7 +443,12 @@ async fn read_large_list_array(
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
     let position_arr = reader
         .object_reader
-        .read_fixed_stride_array(&DataType::Int64, page_info.position, page_info.length)
+        .read_fixed_stride_array(
+            &DataType::Int64,
+            page_info.position,
+            page_info.length,
+            params,
+        )
         .await?;
     let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
     let start_position = positions.value(0);

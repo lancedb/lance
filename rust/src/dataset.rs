@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::Schema as ArrowSchema;
 use chrono::prelude::*;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -215,20 +216,21 @@ impl Dataset {
         row_ids: &[u64],
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let mut row_ids_per_fragment: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        let mut row_ids_per_fragment: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         row_ids.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
-            let offset = row_id - (fragment_id << 32);
+            let offset = (row_id - (fragment_id << 32)) as usize;
             row_ids_per_fragment
                 .entry(fragment_id)
                 .and_modify(|v| v.push(offset))
                 .or_insert(vec![offset]);
         });
 
+        let schema = Arc::new(ArrowSchema::from(projection));
         let object_store = &self.object_store;
-        stream::iter(self.fragments().as_ref())
+        let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
-            .for_each_concurrent(10, |fragment| async {
+            .map(|fragment| async  {
                 let path = Path::from(fragment.files[0].path.as_str());
                 let reader = FileReader::try_new_with_fragment(
                     object_store,
@@ -236,9 +238,14 @@ impl Dataset {
                     fragment.id,
                     Some(self.manifest.as_ref()),
                 )
-                .await;
+                .await?;
+                if let Some(indices) = row_ids_per_fragment.get(&fragment.id) {
+                    reader.take(indices.as_slice()).await
+                } else {
+                    Ok(RecordBatch::new_empty(schema.clone()))
+                }
             })
-            .await;
+            .collect::<Vec<_>>().await;
         todo!()
     }
 

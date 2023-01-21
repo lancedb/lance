@@ -20,7 +20,7 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::{Range, RangeFrom, RangeTo};
+use std::ops::{Range, RangeFrom, RangeTo, RangeFull};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -47,6 +47,7 @@ use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use crate::io::ReadBatchParams;
 
 /// Encoder for plain encoding.
 ///
@@ -294,6 +295,30 @@ impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
 
     async fn get(&self, index: RangeTo<usize>) -> Self::Output {
         self.get(0..index.end).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeFull> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _: RangeFull) -> Self::Output {
+        self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
+        match params {
+            ReadBatchParams::Range(r) => self.get(r),
+            ReadBatchParams::RangeFull => self.get(..),
+            ReadBatchParams::RangeTo(r) => self.get(r),
+            ReadBatchParams::RangeFrom(r) => self.get(r),
+            ReadBatchParams::Indices(_) => todo!(),
+        }.await
     }
 }
 

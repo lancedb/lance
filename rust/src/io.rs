@@ -18,7 +18,9 @@
 //! I/O utilities.
 
 use std::io::{Error, ErrorKind, Result};
+use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
+use arrow_array::UInt64Array;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
@@ -78,4 +80,62 @@ pub fn read_struct<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
 ) -> Result<T> {
     let msg: M = read_message(buf)?;
     Ok(T::from(msg))
+}
+
+/// Parameter to be used to read a batch.
+#[derive(Debug, Clone)]
+pub(crate) enum ReadBatchParams {
+    Range(Range<usize>),
+
+    RangeFull,
+
+    RangeTo(RangeTo<usize>),
+
+    RangeFrom(RangeFrom<usize>),
+
+    Indices(UInt64Array),
+}
+
+impl Default for ReadBatchParams {
+    fn default() -> Self {
+        ReadBatchParams::RangeFull
+    }
+}
+
+impl From<&[usize]> for ReadBatchParams {
+    fn from(value: &[usize]) -> Self {
+        ReadBatchParams::Indices(UInt64Array::from_iter_values(
+            value.iter().map(|v| *v as u64),
+        ))
+    }
+}
+
+impl From<RangeFull> for ReadBatchParams {
+    fn from(_: RangeFull) -> Self {
+        ReadBatchParams::RangeFull
+    }
+}
+
+impl From<Range<usize>> for ReadBatchParams {
+    fn from(r: Range<usize>) -> Self {
+        ReadBatchParams::Range(r)
+    }
+}
+
+impl From<RangeTo<usize>> for ReadBatchParams {
+    fn from(r: RangeTo<usize>) -> Self {
+        ReadBatchParams::RangeTo(r)
+    }
+}
+
+impl From<RangeFrom<usize>> for ReadBatchParams {
+    fn from(r: RangeFrom<usize>) -> Self {
+        ReadBatchParams::RangeFrom(r)
+    }
+}
+
+impl From<&ReadBatchParams> for ReadBatchParams {
+    fn from(params: &ReadBatchParams) -> Self {
+        params.clone()
+    }
 }
