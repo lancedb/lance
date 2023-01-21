@@ -216,10 +216,10 @@ impl Dataset {
         row_ids: &[u64],
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let mut row_ids_per_fragment: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         row_ids.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
-            let offset = (row_id - (fragment_id << 32)) as usize;
+            let offset = (row_id - (fragment_id << 32)) as u32;
             row_ids_per_fragment
                 .entry(fragment_id)
                 .and_modify(|v| v.push(offset))
@@ -230,7 +230,7 @@ impl Dataset {
         let object_store = &self.object_store;
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
-            .map(|fragment| async  {
+            .map(|fragment| async {
                 let path = Path::from(fragment.files[0].path.as_str());
                 let reader = FileReader::try_new_with_fragment(
                     object_store,
@@ -245,7 +245,8 @@ impl Dataset {
                     Ok(RecordBatch::new_empty(schema.clone()))
                 }
             })
-            .collect::<Vec<_>>().await;
+            .collect::<Vec<_>>()
+            .await;
         todo!()
     }
 

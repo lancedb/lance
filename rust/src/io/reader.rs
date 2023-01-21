@@ -200,15 +200,14 @@ impl<'a> FileReader<'a> {
     /// Take by records by indices within the file.
     ///
     ///
-    pub async fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
-        let mut indices: Vec<usize> = Vec::from(indices);
+    pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let mut indices = Vec::from(indices);
         indices.sort();
-        let mut indices_per_batch: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut indices_per_batch: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
         let mut batch_id = 0;
         let num_batches = self.num_batches();
         for idx in indices.iter() {
-            while batch_id < num_batches
-                && *idx > self.metadata.batch_offsets[batch_id + 1] as usize
+            while batch_id < num_batches && *idx > self.metadata.batch_offsets[batch_id + 1] as u32
             {
                 batch_id += 1;
             }

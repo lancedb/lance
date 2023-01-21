@@ -20,7 +20,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
-use arrow_array::UInt64Array;
+use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::bytes::Bytes;
@@ -93,20 +93,19 @@ pub(crate) enum ReadBatchParams {
 
     RangeFrom(RangeFrom<usize>),
 
-    Indices(UInt64Array),
+    Indices(UInt32Array),
 }
 
+/// Default of ReadBatchParams is reading the full batch.
 impl Default for ReadBatchParams {
     fn default() -> Self {
         ReadBatchParams::RangeFull
     }
 }
 
-impl From<&[usize]> for ReadBatchParams {
-    fn from(value: &[usize]) -> Self {
-        ReadBatchParams::Indices(UInt64Array::from_iter_values(
-            value.iter().map(|v| *v as u64),
-        ))
+impl From<&[u32]> for ReadBatchParams {
+    fn from(value: &[u32]) -> Self {
+        ReadBatchParams::Indices(UInt32Array::from_iter_values(value.iter().map(|v| *v)))
     }
 }
 

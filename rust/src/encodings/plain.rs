@@ -20,7 +20,7 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::{Range, RangeFrom, RangeTo, RangeFull};
+use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -313,12 +313,12 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
         match params {
-            ReadBatchParams::Range(r) => self.get(r),
-            ReadBatchParams::RangeFull => self.get(..),
-            ReadBatchParams::RangeTo(r) => self.get(r),
-            ReadBatchParams::RangeFrom(r) => self.get(r),
-            ReadBatchParams::Indices(_) => todo!(),
-        }.await
+            ReadBatchParams::Range(r) => self.get(r).await,
+            ReadBatchParams::RangeFull => self.get(..).await,
+            ReadBatchParams::RangeTo(r) => self.get(r).await,
+            ReadBatchParams::RangeFrom(r) => self.get(r).await,
+            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+        }
     }
 }
 

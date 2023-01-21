@@ -30,11 +30,11 @@ use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
 use super::ReadBatchParams;
-use crate::{arrow::*, encodings::AsyncIndex};
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
+use crate::{arrow::*, encodings::AsyncIndex};
 
 /// Object Reader
 ///
