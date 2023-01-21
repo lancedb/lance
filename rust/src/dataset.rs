@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema as ArrowSchema;
+use arrow_select::concat::concat_batches;
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -223,14 +224,14 @@ impl Dataset {
             row_ids_per_fragment
                 .entry(fragment_id)
                 .and_modify(|v| v.push(offset))
-                .or_insert(vec![offset]);
+                .or_insert_with(|| vec![offset]);
         });
 
         let schema = Arc::new(ArrowSchema::from(projection));
         let object_store = &self.object_store;
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
-            .map(|fragment| async {
+            .then(|fragment| async {
                 let path = Path::from(fragment.files[0].path.as_str());
                 let reader = FileReader::try_new_with_fragment(
                     object_store,
@@ -245,9 +246,9 @@ impl Dataset {
                     Ok(RecordBatch::new_empty(schema.clone()))
                 }
             })
-            .collect::<Vec<_>>()
-            .await;
-        todo!()
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(concat_batches(&schema, &batches)?)
     }
 
     fn versions_dir(&self) -> Path {

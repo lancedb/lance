@@ -40,7 +40,7 @@ pub(crate) struct Scan {
 
 impl Scan {
     /// Create a new scan node.
-    pub fn new<'a>(
+    pub fn new(
         object_store: Arc<ObjectStore>,
         data_dir: Path,
         fragments: Arc<Vec<Fragment>>,
@@ -75,8 +75,7 @@ impl Scan {
                     Err(e) => {
                         tx.send(Err(Error::IO(format!(
                             "Failed to open file: {}: {}",
-                            path.to_string(),
-                            e.to_string()
+                            path, e
                         ))))
                         .await
                         .expect("Scanner sending error message");
@@ -107,7 +106,7 @@ impl Scan {
 
 impl ExecNode for Scan {
     fn node_type(&self) -> NodeType {
-        NodeType::SCAN
+        NodeType::Scan
     }
 }
 

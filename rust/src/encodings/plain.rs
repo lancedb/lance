@@ -263,7 +263,7 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
-        if index.len() == 0 {
+        if index.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
         match self.data_type {
