@@ -19,7 +19,7 @@
 
 // Standard
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::ops::{Range, RangeFull};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -79,6 +79,28 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
 /// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
 fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
     (fragment_id << 32) + offset as u64
+}
+
+pub enum ReadBatchParams {
+    Range(Range<usize>),
+
+    RangeFull(RangeFull),
+
+    Indices(UInt64Array),
+}
+
+impl From<&[usize]> for ReadBatchParams {
+    fn from(value: &[usize]) -> Self {
+        ReadBatchParams::Indices(UInt64Array::from_iter_values(
+            value.iter().map(|v| *v as u64),
+        ))
+    }
+}
+
+impl From<RangeFull> for ReadBatchParams {
+    fn from(value: RangeFull) -> Self {
+        ReadBatchParams::RangeFull(value)
+    }
 }
 
 /// Lance File Reader.
@@ -186,16 +208,13 @@ impl<'a> FileReader<'a> {
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
-    pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
+    pub async fn read_batch(
+        &self,
+        batch_id: i32,
+        params: impl Into<ReadBatchParams>,
+    ) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
-        read_batch(
-            &self,
-            schema,
-            batch_id,
-            &self.page_table,
-            self.with_row_id,
-        )
-        .await
+        read_batch(&self, schema, batch_id, &self.page_table, self.with_row_id).await
     }
 
     /// Take by records by indices within the file.
@@ -222,7 +241,8 @@ impl<'a> FileReader<'a> {
         let batches = stream::iter(indices_per_batch)
             .then(|(batch_id, mut indices)| async move {
                 indices.sort();
-                self.read_batch(batch_id as i32).await
+                self.read_batch(batch_id as i32, indices.as_slice())
+                    .await
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -247,14 +267,7 @@ impl<'a> FileReader<'a> {
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
             if batch_id < num_batches {
-                let batch = read_batch(
-                    &self,
-                    schema,
-                    batch_id,
-                    page_table,
-                    with_row_id,
-                )
-                .await;
+                let batch = read_batch(&self, schema, batch_id, page_table, with_row_id).await;
                 Some((batch, batch_id + 1))
             } else {
                 None
@@ -264,9 +277,8 @@ impl<'a> FileReader<'a> {
 }
 
 /// Read within one batch.
-async fn read_batch<'a>(
-    reader: &'a FileReader<'_>,
-    // reader: &ObjectReader<'_>,
+async fn read_batch(
+    reader: &FileReader<'_>,
     schema: &Schema,
     batch_id: i32,
     page_table: &PageTable,
@@ -529,7 +541,7 @@ mod tests {
         reader.with_row_id(true);
 
         for b in 0..10 {
-            let batch = reader.read_batch(b).await.unwrap();
+            let batch = reader.read_batch(b, ..).await.unwrap();
             assert!(batch.column_with_name("_rowid").is_some());
             let row_ids_col = batch.column_with_name("_rowid").unwrap();
             // Do the same computation as `compute_row_id`.

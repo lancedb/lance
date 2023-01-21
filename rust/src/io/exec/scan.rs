@@ -85,7 +85,7 @@ impl Scan {
                     }
                 };
                 for batch_id in 0..reader.num_batches() {
-                    let batch = reader.read_batch(batch_id as i32).await;
+                    let batch = reader.read_batch(batch_id as i32, ..).await;
                     if tx.is_closed() {
                         break;
                     }
