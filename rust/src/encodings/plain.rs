@@ -241,7 +241,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
         // TODO: optimize sparse I/O later.
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
-        let array = self.get(start as usize..end as usize).await?;
+        let array = self.get(start as usize..end as usize + 1).await?;
         let adjusted_offsets = subtract_scalar(indices, start)?;
         Ok(take(&array, &adjusted_offsets, None)?)
     }
@@ -480,5 +480,29 @@ mod tests {
         );
 
         assert!(decoder.get(3..1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/takes");
+        let array = Int32Array::from_iter_values(0..100);
+
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+
+        let results = decoder
+            .take(&UInt32Array::from_iter(
+                [2, 4, 5, 20, 30, 55, 60].iter().map(|i| *i as u32),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(results.as_ref(), &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60]));
     }
 }
