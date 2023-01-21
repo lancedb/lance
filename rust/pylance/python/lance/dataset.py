@@ -81,19 +81,20 @@ class LanceScanner:
         """
         Read the data into memory and return a pyarrow Table.
         """
-        return pa.Table.from_batches(self._scanner.to_reader())
+        return self.to_reader().read_all()
 
     def to_reader(self) -> pa.RecordBatchReader:
         return self._scanner.to_reader()
 
 
-Readerlike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
+ReaderLike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
                    pa.RecordBatchReader, LanceDataset, LanceScanner]
 
+
 def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
-                  mode: str="create",
-                  max_rows_per_file: int=1024*1024,
-                  max_rows_per_group: int=1024) -> bool:
+                  mode: str = "create",
+                  max_rows_per_file: int = 1024*1024,
+                  max_rows_per_group: int = 1024) -> bool:
     """
     Write a given data_obj to the given uri
 
@@ -104,7 +105,7 @@ def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
         - Pyarrow Table, Dataset, Scanner, or RecordBatchReader
         - LanceDataset or LanceScanner
     uri: str or Path
-        Where the write the dataset to (directory)
+        Where to write the dataset to (directory)
     mode: str
         create - create a new dataset (raises if uri already exists)
         overwrite - create a new snapshot version

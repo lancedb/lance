@@ -96,7 +96,7 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
         Some(p)
     };
     Runtime::new()?
-        .block_on(async { LanceDataset::create(&mut reader, uri, params).await })
+        .block_on(async move { LanceDataset::create(&mut reader, uri, params).await })
         .map(|_| true)
         .map_err(|err| PyIOError::new_err(err.to_string()))
 }
