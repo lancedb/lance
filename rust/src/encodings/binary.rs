@@ -254,16 +254,24 @@ mod tests {
 
     use crate::io::ObjectStore;
 
-    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+    async fn write_test_data<O: OffsetSizeTrait>(
+        store: &ObjectStore,
+        path: &Path,
+        arr: &GenericStringArray<O>,
+    ) -> Result<usize> {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&arr).await.unwrap();
         object_writer.shutdown().await.unwrap();
+        Ok(pos)
+    }
 
+    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, arr).await.unwrap();
         let mut reader = store.open(&path).await.unwrap();
         let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
         let actual_arr = decoder.decode().await.unwrap();
@@ -335,5 +343,26 @@ mod tests {
             &new_empty_array(&DataType::Utf8)
         );
         assert!(decoder.get(100..100).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, &data).await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, data.len());
+
+        let actual = decoder
+            .take(&UInt32Array::from_iter_values([1, 2, 5]))
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.as_ref(),
+            &StringArray::from_iter_values(["b", "c", "f"])
+        );
     }
 }
