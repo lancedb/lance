@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
 use arrow_array::cast::as_primitive_array;
+use arrow_array::UInt32Array;
 use arrow_array::{
+    new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
 };
@@ -15,6 +17,7 @@ use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
+use arrow_select::take::take;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
@@ -24,6 +27,7 @@ use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use crate::io::ReadBatchParams;
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -128,6 +132,19 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(..).await
     }
+
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        if indices.is_empty() {
+            return Ok(new_empty_array(&T::DATA_TYPE));
+        }
+
+        // TODO: optimize for sparse index
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self.get(start as usize..end as usize + 1).await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
+    }
 }
 
 #[async_trait]
@@ -163,6 +180,21 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
 
     async fn get(&self, _: RangeFull) -> Self::Output {
         self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
+        match params {
+            ReadBatchParams::Range(r) => self.get(r).await,
+            ReadBatchParams::RangeFull => self.get(..).await,
+            ReadBatchParams::RangeTo(r) => self.get(r).await,
+            ReadBatchParams::RangeFrom(r) => self.get(r).await,
+            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+        }
     }
 }
 
@@ -238,16 +270,24 @@ mod tests {
 
     use crate::io::ObjectStore;
 
-    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+    async fn write_test_data<O: OffsetSizeTrait>(
+        store: &ObjectStore,
+        path: &Path,
+        arr: &GenericStringArray<O>,
+    ) -> Result<usize> {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&arr).await.unwrap();
         object_writer.shutdown().await.unwrap();
+        Ok(pos)
+    }
 
+    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, arr).await.unwrap();
         let mut reader = store.open(&path).await.unwrap();
         let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
         let actual_arr = decoder.decode().await.unwrap();
@@ -319,5 +359,26 @@ mod tests {
             &new_empty_array(&DataType::Utf8)
         );
         assert!(decoder.get(100..100).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, &data).await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, data.len());
+
+        let actual = decoder
+            .take(&UInt32Array::from_iter_values([1, 2, 5]))
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.as_ref(),
+            &StringArray::from_iter_values(["b", "c", "f"])
+        );
     }
 }

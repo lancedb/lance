@@ -4,8 +4,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatchReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::Schema as ArrowSchema;
+use arrow_select::concat::concat_batches;
 use chrono::prelude::*;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -16,7 +19,7 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
-use crate::io::{read_manifest, write_manifest, FileWriter};
+use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
 pub use write::*;
@@ -206,6 +209,46 @@ impl Dataset {
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(&self)
+    }
+
+    /// Take rows by the internal ROW ids.
+    pub(crate) async fn take_rows(
+        &self,
+        row_ids: &[u64],
+        projection: &Schema,
+    ) -> Result<RecordBatch> {
+        let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        row_ids.iter().for_each(|row_id| {
+            let fragment_id = row_id >> 32;
+            let offset = (row_id - (fragment_id << 32)) as u32;
+            row_ids_per_fragment
+                .entry(fragment_id)
+                .and_modify(|v| v.push(offset))
+                .or_insert_with(|| vec![offset]);
+        });
+
+        let schema = Arc::new(ArrowSchema::from(projection));
+        let object_store = &self.object_store;
+        let batches = stream::iter(self.fragments().as_ref())
+            .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
+            .then(|fragment| async {
+                let path = Path::from(fragment.files[0].path.as_str());
+                let reader = FileReader::try_new_with_fragment(
+                    object_store,
+                    &path,
+                    fragment.id,
+                    Some(self.manifest.as_ref()),
+                )
+                .await?;
+                if let Some(indices) = row_ids_per_fragment.get(&fragment.id) {
+                    reader.take(indices.as_slice()).await
+                } else {
+                    Ok(RecordBatch::new_empty(schema.clone()))
+                }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(concat_batches(&schema, &batches)?)
     }
 
     fn versions_dir(&self) -> Path {

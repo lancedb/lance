@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeMap;
+
 use crate::format::{pb, ProtoStruct};
 
 /// Data File Metadata
@@ -54,6 +56,11 @@ impl From<pb::Metadata> for Metadata {
     }
 }
 
+pub(crate) struct BatchOffsets {
+    pub batch_id: i32,
+    pub offsets: Vec<u32>,
+}
+
 impl Metadata {
     /// Get the number of batches in this file.
     pub fn num_batches(&self) -> usize {
@@ -81,6 +88,42 @@ impl Metadata {
     /// Get the starting offset of the batch.
     pub fn get_offset(&self, batch_id: i32) -> Option<i32> {
         self.batch_offsets.get(batch_id as usize).copied()
+    }
+
+    /// Group row indices into each batch.
+    ///
+    /// The indices must be sorted.
+    pub(crate) fn group_indices_to_batches(&self, indices: &[u32]) -> Vec<BatchOffsets> {
+        let mut batch_id: i32 = 0;
+        let num_batches = self.num_batches() as i32;
+        let mut indices_per_batch: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for idx in indices.iter() {
+            while batch_id < num_batches && *idx >= self.batch_offsets[batch_id as usize + 1] as u32
+            {
+                batch_id += 1;
+            }
+            indices_per_batch
+                .entry(batch_id)
+                .and_modify(|v| v.push(*idx))
+                .or_insert(vec![*idx]);
+        }
+
+        indices_per_batch
+            .iter()
+            .map(|(batch_id, indices)| {
+                let batch_offset = self.batch_offsets[*batch_id as usize];
+
+                // Adjust indices to be the in-batch offsets.
+                let in_batch_offsets = indices
+                    .iter()
+                    .map(|i| i - batch_offset as u32)
+                    .collect::<Vec<_>>();
+                BatchOffsets {
+                    batch_id: *batch_id,
+                    offsets: in_batch_offsets,
+                }
+            })
+            .collect()
     }
 }
 

@@ -20,23 +20,22 @@
 
 use std::sync::Arc;
 
-use arrow_array::cast::as_dictionary_array;
+use arrow_array::cast::{as_dictionary_array, as_primitive_array};
 use arrow_array::types::{
     ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
-use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray};
+use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
+use super::plain::PlainEncoder;
+use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter};
+use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter, ReadBatchParams};
 use crate::Error;
-
-use super::plain::PlainEncoder;
-use super::AsyncIndex;
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
@@ -142,10 +141,7 @@ impl<'a> DictionaryDecoder<'a> {
         &self,
         index_array: ArrayRef,
     ) -> Result<ArrayRef> {
-        let keys = index_array
-            .as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .unwrap();
+        let keys: &PrimitiveArray<T> = as_primitive_array(index_array.as_ref());
         Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
     }
 }
@@ -164,6 +160,10 @@ impl<'a> Decoder for DictionaryDecoder<'a> {
             )))
         }
     }
+
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        todo!()
+    }
 }
 
 #[async_trait]
@@ -171,6 +171,15 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
         todo!()
     }
 }

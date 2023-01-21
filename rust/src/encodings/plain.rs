@@ -20,17 +20,19 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::{Range, RangeFrom, RangeTo};
+use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
-use arrow_array::types::*;
+use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::{
     make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
     FixedSizeListArray, UInt8Array,
 };
+use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
+use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -45,6 +47,7 @@ use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use crate::io::ReadBatchParams;
 
 /// Encoder for plain encoding.
 ///
@@ -230,6 +233,19 @@ impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }
+
+    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        if indices.is_empty() {
+            return Ok(new_empty_array(self.data_type));
+        }
+
+        // TODO: optimize read for sparse indices later.
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self.get(start as usize..end as usize + 1).await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
+    }
 }
 
 #[async_trait]
@@ -247,7 +263,7 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
-        if index.len() == 0 {
+        if index.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
         match self.data_type {
@@ -279,6 +295,30 @@ impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
 
     async fn get(&self, index: RangeTo<usize>) -> Self::Output {
         self.get(0..index.end).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<RangeFull> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, _: RangeFull) -> Self::Output {
+        self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
+        match params {
+            ReadBatchParams::Range(r) => self.get(r).await,
+            ReadBatchParams::RangeFull => self.get(..).await,
+            ReadBatchParams::RangeTo(r) => self.get(r).await,
+            ReadBatchParams::RangeFrom(r) => self.get(r).await,
+            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+        }
     }
 }
 
@@ -465,5 +505,32 @@ mod tests {
         );
 
         assert!(decoder.get(3..1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/takes");
+        let array = Int32Array::from_iter_values(0..100);
+
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        writer.shutdown().await.unwrap();
+
+        let mut reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+
+        let results = decoder
+            .take(&UInt32Array::from_iter(
+                [2, 4, 5, 20, 30, 55, 60].iter().map(|i| *i as u32),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            results.as_ref(),
+            &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
+        );
     }
 }

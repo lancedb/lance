@@ -26,7 +26,7 @@ pub(crate) use scan::Scan;
 #[derive(Debug)]
 pub enum NodeType {
     /// Dataset Scan
-    SCAN = 1,
+    Scan = 1,
 }
 
 /// I/O Exec Node

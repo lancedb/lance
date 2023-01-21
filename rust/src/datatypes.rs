@@ -358,6 +358,7 @@ impl Field {
                                     value_type.as_ref(),
                                     dict_info.offset,
                                     dict_info.length,
+                                    ..,
                                 )
                                 .await?,
                         );
@@ -369,6 +370,7 @@ impl Field {
                                     value_type.as_ref(),
                                     dict_info.offset,
                                     dict_info.length,
+                                    ..,
                                 )
                                 .await?,
                         );
