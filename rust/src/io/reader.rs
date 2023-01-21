@@ -188,23 +188,17 @@ impl<'a> FileReader<'a> {
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
     pub async fn read_batch(&self, batch_id: i32) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
-        let batch_offset = self
-            .metadata
-            .get_offset(batch_id)
-            .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))?;
         read_batch(
-            &self.object_reader,
+            &self,
             schema,
             batch_id,
             &self.page_table,
-            self.fragment_id,
-            batch_offset,
             self.with_row_id,
         )
         .await
     }
 
-    /// Take by records by indices.
+    /// Take by records by indices within the file.
     ///
     ///
     pub async fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
@@ -230,7 +224,8 @@ impl<'a> FileReader<'a> {
                 indices.sort();
                 self.read_batch(batch_id as i32).await
             })
-            .try_collect::<Vec<_>>().await?;
+            .try_collect::<Vec<_>>()
+            .await?;
         let schema = Arc::new(ArrowSchema::from(self.schema()));
         Ok(concat_batches(&schema, &batches)?)
     }
@@ -245,30 +240,18 @@ impl<'a> FileReader<'a> {
         let num_batches = self.num_batches() as i32;
 
         // Deref a bunch.
-        let object_reader = &self.object_reader;
         let schema = self.schema();
         let page_table = &self.page_table;
-        let fragment_id = self.fragment_id;
         let with_row_id = self.with_row_id;
 
         stream::unfold(0_i32, move |batch_id| async move {
             let num_batches = num_batches;
-            let batch_offset = match self
-                .metadata
-                .get_offset(batch_id)
-                .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))
-            {
-                Ok(o) => o,
-                Err(e) => return Some((Err(e), batch_id + 1)),
-            };
             if batch_id < num_batches {
                 let batch = read_batch(
-                    object_reader,
+                    &self,
                     schema,
                     batch_id,
                     page_table,
-                    fragment_id,
-                    batch_offset,
                     with_row_id,
                 )
                 .await;
@@ -280,25 +263,29 @@ impl<'a> FileReader<'a> {
     }
 }
 
-async fn read_batch(
-    reader: &ObjectReader<'_>,
+/// Read within one batch.
+async fn read_batch<'a>(
+    reader: &'a FileReader<'_>,
+    // reader: &ObjectReader<'_>,
     schema: &Schema,
     batch_id: i32,
     page_table: &PageTable,
-    fragment_id: u64,
-    batch_offset: i32,
     with_row_id: bool,
 ) -> Result<RecordBatch> {
     let mut arrs = vec![];
     for field in schema.fields.iter() {
-        let arr = read_array(reader, field, batch_id, page_table).await?;
+        let arr = read_array(&reader.object_reader, field, batch_id, page_table).await?;
         arrs.push(arr);
     }
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
+        let batch_offset = reader
+            .metadata
+            .get_offset(batch_id)
+            .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
             (batch_offset..(batch_offset + batch.num_rows() as i32))
-                .map(|o| compute_row_id(fragment_id, o))
+                .map(|o| compute_row_id(reader.fragment_id, o))
                 .collect::<Vec<_>>(),
         ));
         batch = batch.try_with_column(
