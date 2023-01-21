@@ -99,42 +99,42 @@ pub(crate) enum ReadBatchParams {
 /// Default of ReadBatchParams is reading the full batch.
 impl Default for ReadBatchParams {
     fn default() -> Self {
-        ReadBatchParams::RangeFull
+        Self::RangeFull
     }
 }
 
 impl From<&[u32]> for ReadBatchParams {
     fn from(value: &[u32]) -> Self {
-        ReadBatchParams::Indices(UInt32Array::from_iter_values(value.iter().map(|v| *v)))
+        Self::Indices(UInt32Array::from_iter_values(value.iter().copied()))
     }
 }
 
 impl From<RangeFull> for ReadBatchParams {
     fn from(_: RangeFull) -> Self {
-        ReadBatchParams::RangeFull
+        Self::RangeFull
     }
 }
 
 impl From<Range<usize>> for ReadBatchParams {
     fn from(r: Range<usize>) -> Self {
-        ReadBatchParams::Range(r)
+        Self::Range(r)
     }
 }
 
 impl From<RangeTo<usize>> for ReadBatchParams {
     fn from(r: RangeTo<usize>) -> Self {
-        ReadBatchParams::RangeTo(r)
+        Self::RangeTo(r)
     }
 }
 
 impl From<RangeFrom<usize>> for ReadBatchParams {
     fn from(r: RangeFrom<usize>) -> Self {
-        ReadBatchParams::RangeFrom(r)
+        Self::RangeFrom(r)
     }
 }
 
-impl From<&ReadBatchParams> for ReadBatchParams {
-    fn from(params: &ReadBatchParams) -> Self {
+impl From<&Self> for ReadBatchParams {
+    fn from(params: &Self) -> Self {
         params.clone()
     }
 }

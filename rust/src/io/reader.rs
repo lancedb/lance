@@ -193,8 +193,7 @@ impl<'a> FileReader<'a> {
         params: impl Into<ReadBatchParams>,
     ) -> Result<RecordBatch> {
         let schema = self.projection.as_ref().unwrap();
-        // let read_params = params.into();
-        read_batch(&self, &params.into(), schema, batch_id, self.with_row_id).await
+        read_batch(self, &params.into(), schema, batch_id, self.with_row_id).await
     }
 
     /// Take by records by indices within the file.
@@ -207,7 +206,7 @@ impl<'a> FileReader<'a> {
         let mut batch_id = 0;
         let num_batches = self.num_batches();
         for idx in indices.iter() {
-            while batch_id < num_batches && *idx > self.metadata.batch_offsets[batch_id + 1] as u32
+            while batch_id < num_batches && *idx >= self.metadata.batch_offsets[batch_id + 1] as u32
             {
                 batch_id += 1;
             }
@@ -220,7 +219,15 @@ impl<'a> FileReader<'a> {
         let batches = stream::iter(indices_per_batch)
             .then(|(batch_id, mut indices)| async move {
                 indices.sort();
-                self.read_batch(batch_id as i32, indices.as_slice()).await
+                let batch_offset = self.metadata.batch_offsets[batch_id];
+
+                // Adjust indices to be the in-batch offsets.
+                let in_batch_offsets = indices
+                    .iter()
+                    .map(|i| i - batch_offset as u32)
+                    .collect::<Vec<_>>();
+                self.read_batch(batch_id as i32, in_batch_offsets.as_slice())
+                    .await
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -245,7 +252,7 @@ impl<'a> FileReader<'a> {
             let num_batches = num_batches;
             if batch_id < num_batches {
                 let batch = read_batch(
-                    &self,
+                    self,
                     &ReadBatchParams::RangeFull,
                     schema,
                     batch_id,
@@ -303,16 +310,16 @@ async fn read_array(
     use DataType::*;
 
     if data_type.is_fixed_stride() {
-        read_fixed_stride_array(&reader, field, batch_id, params).await
+        read_fixed_stride_array(reader, field, batch_id, params).await
     } else {
         match data_type {
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
-                read_binary_array(reader, field, batch_id).await
+                read_binary_array(reader, field, batch_id, params).await
             }
-            Struct(_) => read_struct_array(&reader, field, batch_id, params).await,
-            Dictionary(_, _) => read_dictionary_array(&reader, field, batch_id).await,
-            List(_) => read_list_array(&reader, field, batch_id, params).await,
-            LargeList(_) => read_large_list_array(&reader, field, batch_id, params).await,
+            Struct(_) => read_struct_array(reader, field, batch_id, params).await,
+            Dictionary(_, _) => read_dictionary_array(reader, field, batch_id).await,
+            List(_) => read_list_array(reader, field, batch_id, params).await,
+            LargeList(_) => read_large_list_array(reader, field, batch_id, params).await,
             _ => {
                 unimplemented!("{}", format!("No support for {data_type} yet"));
             }
@@ -357,6 +364,7 @@ async fn read_binary_array(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
+    params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
@@ -461,7 +469,7 @@ async fn read_large_list_array(
 mod tests {
     use super::*;
 
-    use arrow_array::{cast::as_primitive_array, Float32Array, Int64Array};
+    use arrow_array::{cast::as_primitive_array, Float32Array, Int64Array, StringArray};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -551,5 +559,42 @@ mod tests {
                 as_primitive_array(row_ids_col)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+            ArrowField::new("s", DataType::Utf8, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/take_test");
+
+        // Write 10 batches.
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        for batch_id in 0..10 {
+            let value_range = batch_id * 10..batch_id * 10 + 10;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(
+                    value_range.clone().collect::<Vec<_>>(),
+                )),
+                Arc::new(Float32Array::from_iter(
+                    value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    value_range.map(|n| format!("str-{}", n)).collect::<Vec<_>>(),
+                )),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+            file_writer.write(&batch).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let batch = reader.take(&[1, 15, 20, 25, 30, 48, 90]).await.unwrap();
+        println!("Batch is: {:?}", batch);
     }
 }
