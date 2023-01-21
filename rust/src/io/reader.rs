@@ -370,7 +370,12 @@ async fn read_binary_array(
 
     reader
         .object_reader
-        .read_binary_array(&field.data_type(), page_info.position, page_info.length)
+        .read_binary_array(
+            &field.data_type(),
+            page_info.position,
+            page_info.length,
+            params,
+        )
         .await
 }
 
@@ -585,7 +590,9 @@ mod tests {
                     value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from_iter_values(
-                    value_range.map(|n| format!("str-{}", n)).collect::<Vec<_>>(),
+                    value_range
+                        .map(|n| format!("str-{}", n))
+                        .collect::<Vec<_>>(),
                 )),
             ];
             let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();

@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter};
+use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter, ReadBatchParams};
 use crate::Error;
 
 use super::plain::PlainEncoder;
@@ -175,6 +175,15 @@ impl<'a> AsyncIndex<usize> for DictionaryDecoder<'a> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _index: usize) -> Self::Output {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl<'a> AsyncIndex<ReadBatchParams> for DictionaryDecoder<'a> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
         todo!()
     }
 }

@@ -27,6 +27,7 @@ use crate::encodings::Decoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
+use crate::io::ReadBatchParams;
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -179,6 +180,21 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
 
     async fn get(&self, _: RangeFull) -> Self::Output {
         self.get(0..self.length).await
+    }
+}
+
+#[async_trait]
+impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> {
+    type Output = Result<ArrayRef>;
+
+    async fn get(&self, params: ReadBatchParams) -> Self::Output {
+        match params {
+            ReadBatchParams::Range(r) => self.get(r).await,
+            ReadBatchParams::RangeFull => self.get(..).await,
+            ReadBatchParams::RangeTo(r) => self.get(r).await,
+            ReadBatchParams::RangeFrom(r) => self.get(r).await,
+            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+        }
     }
 }
 

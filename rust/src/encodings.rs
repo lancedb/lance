@@ -11,6 +11,7 @@ pub mod rle;
 
 use crate::error::Result;
 use crate::format::pb;
+use crate::io::ReadBatchParams;
 
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +46,7 @@ pub trait Encoder {
 
 /// Decoder - Read Arrow Data.
 #[async_trait]
-pub trait Decoder: Send {
+pub(crate) trait Decoder: Send + AsyncIndex<ReadBatchParams> {
     async fn decode(&self) -> Result<ArrayRef>;
 
     /// Take by indices.

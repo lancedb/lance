@@ -30,11 +30,11 @@ use object_store::{path::Path, ObjectMeta};
 use prost::Message;
 
 use super::ReadBatchParams;
-use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, Decoder};
+use crate::arrow::*;
+use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
-use crate::{arrow::*, encodings::AsyncIndex};
 
 /// Object Reader
 ///
@@ -138,14 +138,15 @@ impl<'a> ObjectReader<'a> {
         decoder.get(params.into()).await
     }
 
-    pub async fn read_binary_array(
+    pub(crate) async fn read_binary_array(
         &self,
         data_type: &DataType,
         position: usize,
         length: usize,
+        params: impl Into<ReadBatchParams>,
     ) -> Result<ArrayRef> {
         use arrow_schema::DataType::*;
-        let decoder: Box<dyn Decoder + Send> = match data_type {
+        let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
             Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(self, position, length)),
             Binary => Box::new(BinaryDecoder::<BinaryType>::new(self, position, length)),
             LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(self, position, length)),
@@ -158,7 +159,7 @@ impl<'a> ObjectReader<'a> {
                 ))
             }
         };
-        let fut = decoder.decode();
+        let fut = decoder.as_ref().get(params.into());
         fut.await
     }
 }

@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUni
 use async_recursion::async_recursion;
 
 use crate::arrow::DataTypeExt;
-use crate::encodings::Encoding;
+use crate::encodings::{Encoding, AsyncIndex};
 use crate::format::pb;
 use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
@@ -358,6 +358,7 @@ impl Field {
                                     value_type.as_ref(),
                                     dict_info.offset,
                                     dict_info.length,
+                                    ..
                                 )
                                 .await?,
                         );
