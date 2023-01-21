@@ -238,7 +238,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
             return Ok(new_empty_array(self.data_type));
         }
 
-        // TODO: optimize sparse I/O later.
+        // TODO: optimize read for sparse indices later.
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
         let array = self.get(start as usize..end as usize + 1).await?;
@@ -503,6 +503,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(results.as_ref(), &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60]));
+        assert_eq!(
+            results.as_ref(),
+            &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
+        );
     }
 }
