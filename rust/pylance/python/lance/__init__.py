@@ -1,6 +1,6 @@
-from .dataset import FileSystemDataset
+from .dataset import LanceDataset
 
 
-def dataset(uri: str) -> FileSystemDataset:
-    return FileSystemDataset(uri)
+def dataset(uri: str) -> LanceDataset:
+    return LanceDataset(uri)
 

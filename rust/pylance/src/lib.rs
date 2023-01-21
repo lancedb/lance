@@ -35,9 +35,7 @@ pub use reader::LanceReader;
 
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
-    // lance._lib.Scanner
     m.add_class::<Scanner>()?;
-    // lance._lib._Dataset
     m.add_class::<Dataset>()?;
     Ok(())
 }

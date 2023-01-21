@@ -30,7 +30,7 @@ use crate::Scanner;
 
 /// Lance Dataset that will inherit from pyarrow dataset
 /// to trick duckdb
-#[pyclass(name="_Dataset")]
+#[pyclass(name="_Dataset", module="_lib")]
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
@@ -56,8 +56,17 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
-    fn scanner(&self) -> PyResult<Scanner> {
-        let scanner = Scanner::new(self.ds.clone(), self.rt.clone());
+    fn scanner(&self, columns: Option<Vec<String>>, limit: i64, offset: Option<i64>) -> PyResult<Scanner> {
+        println!("{:?}", columns);
+        println!("{:?}", limit);
+        println!("{:?}", offset);
+        let scanner = Scanner::new(
+            self.ds.clone(),
+            columns,
+            offset,
+            limit,
+            self.rt.clone()
+        );
         Ok(scanner)
     }
 }

@@ -28,19 +28,27 @@ use arrow_schema::Schema as ArrowSchema;
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 use ::lance::dataset::Dataset as LanceDataset;
+use pyo3::exceptions::PyValueError;
 use tokio::runtime::Runtime;
 use crate::errors::ioerror;
 use crate::reader::LanceReader;
 
-#[pyclass(name="_Scanner")]
+#[pyclass(name="_Scanner", module="_lib")]
 pub struct Scanner {
     dataset: Arc<LanceDataset>,
+    columns: Option<Vec<String>>,
+    offset: Option<i64>,
+    limit: i64,
     rt: Arc<Runtime>
 }
 
 impl Scanner {
-    pub fn new(dataset: Arc<LanceDataset>, rt: Arc<Runtime>) -> Self {
-        Self { dataset, rt }
+    pub fn new(dataset: Arc<LanceDataset>,
+               columns: Option<Vec<String>>,
+               offset: Option<i64>,
+               limit: i64,
+               rt: Arc<Runtime>) -> Self {
+        Self { dataset, columns, offset, limit, rt }
     }
 }
 
@@ -53,7 +61,12 @@ impl Scanner {
 
     fn to_reader(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         self_.rt.block_on(async {
-            let scanner: LanceScanner = self_.dataset.scan();
+            let mut scanner: LanceScanner = self_.dataset.scan();
+            if let Some(c) = &self_.columns {
+                let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
+                scanner.project(&proj).map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            scanner.limit(self_.limit, self_.offset);
             let reader = LanceReader::new(scanner, self_.rt.clone());
             // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
             let stream = Arc::new(FFI_ArrowArrayStream::empty());
