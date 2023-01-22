@@ -56,7 +56,7 @@ impl Take {
                     let row_id_arr = batch.column_by_name("_rowid").unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let rows = dataset.take_rows(row_ids.values(), &schema).await?;
-                    rows.merge(&batch)
+                    rows.merge(&batch)?.drop_column("_rowid")
                 })
                 .try_for_each(|b| async {
                     if tx.is_closed() {

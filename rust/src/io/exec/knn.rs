@@ -154,7 +154,6 @@ mod tests {
             .nearest("vector", as_primitive_array(&q), 10)
             .into_stream();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
-        println!("Tell me results: {:?}", results);
         println!("Schema: {:?}\n", results[0].schema());
 
         assert!(results[0].schema().column_with_name("score").is_some());

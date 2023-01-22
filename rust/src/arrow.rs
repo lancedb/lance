@@ -301,6 +301,11 @@ pub trait RecordBatchExt {
     ///
     /// TODO: add merge nested fields support.
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch>;
+
+    /// Drop one column specified with the name and return the new [`RecordBatch`].
+    ///
+    /// If the named column does not exist, it returns a copy of this [`RecordBatch`].
+    fn drop_column(&self, name: &str) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -345,5 +350,23 @@ impl RecordBatchExt for RecordBatch {
             }
         }
         Ok(Self::try_new(Arc::new(Schema::new(fields)), columns)?)
+    }
+
+    fn drop_column(&self, name: &str) -> Result<RecordBatch> {
+        let mut fields = vec![];
+        let mut columns = vec![];
+        for i in 0..self.schema().fields.len() {
+            if self.schema().field(i).name() != name {
+                fields.push(self.schema().field(i).clone());
+                columns.push(self.column(i).clone());
+            }
+        }
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                self.schema().metadata().clone(),
+            )),
+            columns,
+        )?)
     }
 }
