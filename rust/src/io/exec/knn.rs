@@ -161,7 +161,7 @@ mod tests {
                 })
                 .collect(),
         );
-        println!("Batches: {:?}", batches);
+        // println!("Batches: {:?}", batches);
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
