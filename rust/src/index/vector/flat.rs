@@ -117,47 +117,6 @@ impl VectorIndex for FlatIndex<'_> {
             .project(&[&self.column])?
             .with_row_id()
             .into_stream();
-
-        let score_and_row_ids = stream
-            .and_then(|batch| async move {
-                let k = params.key.clone();
-                let batch = batch.clone();
-                let vectors = batch
-                    .column_by_name(&params.column)
-                    .ok_or_else(|| {
-                        Error::Schema(format!("column {} does not exist in dataset", self.column,))
-                    })?
-                    .clone();
-                let scores = tokio::task::spawn_blocking(move || {
-                    l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
-                })
-                .await?;
-                // TODO: only pick top-k in each batch first.
-                let row_id_array = batch["_rowid"].clone();
-                Ok((scores as ArrayRef, row_id_array))
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let scores_arrays = score_and_row_ids
-            .iter()
-            .map(|(score, _)| score.as_ref())
-            .collect::<Vec<_>>();
-        let row_ids_arrays = score_and_row_ids
-            .iter()
-            .map(|(_, row_id)| row_id.as_ref())
-            .collect::<Vec<_>>();
-        let scores = concat(&scores_arrays)?;
-        let row_ids = concat(&row_ids_arrays)?;
-
-        let indices = sort_to_indices(&scores, None, Some(params.k))?;
-
-        let struct_arr = StructArray::try_from(vec![
-            (ArrowField::new("_rowid", DataType::UInt64, false), row_ids),
-            (ArrowField::new("score", DataType::Float32, false), scores),
-        ])
-        .map_err(|e| Error::IO(format!("Can not build struct array: {}", e.to_string())))?;
-        let taken_scores = take(&struct_arr, &indices, None)?;
-        Ok(as_struct_array(&taken_scores).into())
+        flat_search(stream, params).await
     }
 }
