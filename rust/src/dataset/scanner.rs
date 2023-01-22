@@ -130,7 +130,7 @@ impl<'a> Scanner {
         let projection = &self.projections;
 
         let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
-            let scan_node = Box::new(Scan::new(
+            let scan_node = Scan::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),
@@ -138,7 +138,7 @@ impl<'a> Scanner {
                 manifest.clone(),
                 PREFECTH_SIZE,
                 true,
-            ));
+            );
             let flat_knn_node: Box<dyn ExecNode + Unpin + Send> =
                 Box::new(KNNFlat::new(scan_node, q));
             Box::new(Take::new(

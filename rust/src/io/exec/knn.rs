@@ -16,28 +16,54 @@
 // under the License.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::RecordBatch;
-use futures::stream::Stream;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_ord::sort::sort_to_indices;
+use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
+use tokio::sync::mpsc::{error::TryRecvError, Receiver};
+use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
+use crate::arrow::*;
 use crate::index::vector::Query;
-use crate::Result;
+use crate::utils::distance::l2_distance;
+use crate::{Error, Result};
 
 /// KNN node for post-filtering.
+// #[pin_project::pin_project]
 pub struct KNNFlat {
-    child: Box<dyn ExecNode + Unpin + Send>,
+    rx: Receiver<Result<RecordBatch>>,
 
-    query: Query,
+    _bg_thread: JoinHandle<()>,
 }
 
 impl KNNFlat {
-    pub(crate) fn new(child: Box<dyn ExecNode + Unpin + Send>, query: &Query) -> Self {
-        // assert_eq!(child.node_type(), NodeType::Scan, "")
+    pub(crate) fn new(
+        child: impl Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static,
+        query: &Query,
+    ) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+
+        let column = query.column.clone();
+        let q = query.clone();
+        let bg_thread = tokio::spawn(async move {
+            let column = q.column.clone();
+            let k = q.key.clone();
+            let batches = child
+                .and_then(|batch| async move {
+                    Ok([0])
+                })
+                .try_collect::<Vec<_>>()
+                .await;
+
+            drop(tx);
+        });
+
         Self {
-            child,
-            query: query.clone(),
+            rx,
+            _bg_thread: bg_thread,
         }
     }
 }
@@ -52,8 +78,7 @@ impl Stream for KNNFlat {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        //Pin::into_inner(self).rx.poll_recv(cx)
-        todo!()
+        Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
 
@@ -63,21 +88,18 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, StringArray};
+    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use object_store::path::Path;
+    use futures::TryStreamExt;
     use tempfile::tempdir;
 
+    use crate::arrow::RecordBatchBuffer;
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::testing::generate_random_array;
-    use crate::{arrow::RecordBatchBuffer, io::ObjectStore};
 
     #[tokio::test]
     async fn knn_flat_search() {
-        let store = ObjectStore::memory();
-        let path = Path::from("/flat");
-
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("key", DataType::Int32, false),
             ArrowField::new(
@@ -122,5 +144,15 @@ mod tests {
         Dataset::create(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
+        let q = as_fixed_size_list_array(&vector_arr).value(5);
+        let stream = dataset
+            .scan()
+            .nearest("vector", as_primitive_array(&q), 10)
+            .into_stream();
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        println!("Tell me results: {:?}", results);
     }
 }
