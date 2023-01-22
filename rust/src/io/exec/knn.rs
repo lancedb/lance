@@ -76,7 +76,7 @@ impl KNNFlat {
 
             let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
             let scores = batch.column_by_name("score").unwrap();
-            let indices = sort_to_indices(&scores, None, Some(q.k)).unwrap();
+            let indices = sort_to_indices(scores, None, Some(q.k)).unwrap();
 
             let struct_arr = StructArray::from(batch);
             let selected_arr = take(&struct_arr, &indices, None).unwrap();
