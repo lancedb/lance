@@ -25,12 +25,15 @@ use super::{ExecNode, NodeType};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::Result;
+use crate::index::vector::Query;
 
 /// KNN node
 pub struct KNN {
     child: Box<dyn ExecNode + Unpin + Send>,
 
     vector_column: String,
+
+    query: Query,
 }
 
 impl ExecNode for Take<'_> {
