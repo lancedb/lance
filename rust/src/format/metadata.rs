@@ -114,7 +114,7 @@ impl Metadata {
         }
 
         indices_per_batch
-            .iter_mut()
+            .iter()
             .map(|(batch_id, indices)| {
                 let batch_offset = self.batch_offsets[*batch_id as usize];
                 // Adjust indices to be the in-batch offsets.

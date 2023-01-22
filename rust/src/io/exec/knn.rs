@@ -18,20 +18,14 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arrow_array::cast::as_struct_array;
-use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField};
-use arrow_select::concat::concat_batches;
-use arrow_select::take::take;
-use futures::stream::{Stream, StreamExt, TryStreamExt};
+use arrow_array::RecordBatch;
+use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
-use crate::arrow::*;
+use crate::index::vector::flat::flat_search;
 use crate::index::vector::Query;
-use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
@@ -49,32 +43,9 @@ impl KNNFlat {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
-        let score_column = "score";
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batches = match child
-                .then(|batch| async {
-                    let key = q.key.clone();
-                    let batch = batch?;
-                    let vectors = batch.column_with_name(&q.column).unwrap().clone();
-                    let scores = tokio::task::spawn_blocking(move || {
-                        l2_distance(&key, as_fixed_size_list_array(&vectors)).unwrap()
-                    })
-                    .await? as ArrayRef;
-
-                    // TODO: use heap
-                    let indices = sort_to_indices(&scores, None, Some(q.k))?;
-                    let batch_with_score = batch.try_with_column(
-                        ArrowField::new(score_column, DataType::Float32, false),
-                        scores,
-                    )?;
-                    let struct_arr = StructArray::from(batch_with_score);
-                    let selected_arr = take(&struct_arr, &indices, None)?;
-                    Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
-                })
-                .try_collect::<Vec<_>>()
-                .await
-            {
+            let result = match flat_search(child, &q).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(Error::IO(format!("Failed to compute scores: {}", e))))
@@ -84,15 +55,8 @@ impl KNNFlat {
                 }
             };
 
-            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
-            let scores = batch.column_by_name(score_column).unwrap();
-            let indices = sort_to_indices(scores, None, Some(q.k)).unwrap();
-
-            let struct_arr = StructArray::from(batch);
-            let selected_arr = take(&struct_arr, &indices, None).unwrap();
-
             if !tx.is_closed() {
-                if let Err(e) = tx.send(Ok(as_struct_array(&selected_arr).into())).await {
+                if let Err(e) = tx.send(Ok(result)).await {
                     eprintln!("KNNFlat tx.send error: {}", e)
                 };
             }
@@ -131,7 +95,7 @@ mod tests {
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
-    use crate::arrow::RecordBatchBuffer;
+    use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::testing::generate_random_array;
 
@@ -191,5 +155,7 @@ mod tests {
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
         println!("Tell me results: {:?}", results);
         println!("Schema: {:?}\n", results[0].schema());
+
+        assert_eq!(results.len(), 1);
     }
 }
