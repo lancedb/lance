@@ -18,8 +18,12 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
+use arrow_array::cast::as_struct_array;
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, StructArray, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
+use arrow_schema::{DataType, Field as ArrowField};
+use arrow_select::concat::concat_batches;
+use arrow_select::take::take;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -47,22 +51,39 @@ impl KNNFlat {
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
             let batches = child
-                .zip(stream::repeat_with(|| (q.key.clone(), q.column.clone())))
-                .then(|(batch, (key, column))| async move {
+                .zip(stream::repeat_with(|| q.clone()))
+                .then(|(batch, q)| async move {
                     let batch = batch?;
-                    let vectors = batch.column_with_name(&column).unwrap().clone();
+                    let vectors = batch.column_with_name(&q.column).unwrap().clone();
                     let scores = tokio::task::spawn_blocking(move || {
-                        l2_distance(&key, as_fixed_size_list_array(&vectors)).unwrap()
+                        l2_distance(&q.key, as_fixed_size_list_array(&vectors)).unwrap()
                     })
-                    .await?;
-                    // TODO: only pick top-k in each batch first.
-                    let row_id_array = batch.column_with_name("_rowid").unwrap().clone();
-                    Ok::<(ArrayRef, ArrayRef), Error>((scores as ArrayRef, row_id_array))
+                    .await? as ArrayRef;
+
+                    // TODO: use heap
+                    let batch_with_score = batch.try_with_column(
+                        ArrowField::new("score", DataType::Float32, false),
+                        scores.clone(),
+                    )?;
+                    let indices = sort_to_indices(&scores, None, Some(q.k))?;
+                    let struct_arr = StructArray::from(batch_with_score);
+                    let selected_arr = take(&struct_arr, &indices, None)?;
+                    Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
                 })
                 .try_collect::<Vec<_>>()
-                .await.unwrap();
+                .await
+                .unwrap();
 
+            let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+            let scores = batch.column_by_name("score").unwrap();
+            let indices = sort_to_indices(&scores, None, Some(q.k)).unwrap();
 
+            let struct_arr = StructArray::from(batch);
+            let selected_arr = take(&struct_arr, &indices, None).unwrap();
+
+            if !tx.is_closed() {
+                tx.send(Ok(as_struct_array(&selected_arr).into()));
+            }
             drop(tx);
         });
 
