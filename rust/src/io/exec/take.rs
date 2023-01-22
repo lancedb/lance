@@ -26,6 +26,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
+use crate::arrow::RecordBatchExt;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::{Error, Result};
@@ -55,7 +56,7 @@ impl Take {
                     let row_id_arr = batch.column_by_name("_rowid").unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let rows = dataset.take_rows(row_ids.values(), &schema).await?;
-                    Ok(rows)
+                    rows.merge(&batch)
                 })
                 .try_for_each(|b| async {
                     if tx.is_closed() {

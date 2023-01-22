@@ -68,7 +68,7 @@ pub async fn flat_search(
             let k = query.key.clone();
             let batch = batch.clone();
             let vectors = batch
-                .column_with_name(&query.column)
+                .column_by_name(&query.column)
                 .ok_or(Error::Schema(format!(
                     "column {} does not exist in dataset",
                     query.column,

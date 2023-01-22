@@ -97,7 +97,6 @@ mod tests {
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
-    use crate::datatypes::Schema;
     use crate::utils::testing::generate_random_array;
 
     #[tokio::test]
