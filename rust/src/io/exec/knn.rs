@@ -16,13 +16,12 @@
 // under the License.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
-use tokio::sync::mpsc::{error::TryRecvError, Receiver};
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
@@ -32,7 +31,6 @@ use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
-// #[pin_project::pin_project]
 pub struct KNNFlat {
     rx: Receiver<Result<RecordBatch>>,
 
@@ -46,29 +44,24 @@ impl KNNFlat {
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
-        let column = query.column.clone();
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let column = q.column.clone();
-            let k = q.key.clone();
             let batches = child
-                .and_then(|batch| async move {
-                    let vectors = batch
-                        .column_with_name(&column)
-                        .ok_or(Error::Schema(format!(
-                            "column {} does not exist in dataset",
-                            column,
-                        )))?
-                        .clone();
-
+                .zip(stream::repeat_with(|| (q.key.clone(), q.column.clone())))
+                .then(|(batch, (key, column))| async move {
+                    let batch = batch?;
+                    let vectors = batch.column_with_name(&column).unwrap().clone();
                     let scores = tokio::task::spawn_blocking(move || {
-                        l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
+                        l2_distance(&key, as_fixed_size_list_array(&vectors)).unwrap()
                     })
                     .await?;
-                    Ok([0])
+                    // TODO: only pick top-k in each batch first.
+                    let row_id_array = batch.column_with_name("_rowid").unwrap().clone();
+                    Ok::<(ArrayRef, ArrayRef), Error>((scores as ArrayRef, row_id_array))
                 })
                 .try_collect::<Vec<_>>()
-                .await;
+                .await.unwrap();
+
 
             drop(tx);
         });
