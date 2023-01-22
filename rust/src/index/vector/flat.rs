@@ -17,10 +17,7 @@
 
 //! Flat Vector Index.
 
-use std::sync::Arc;
-
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
-use arrow_array::{FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat, take::take};

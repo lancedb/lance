@@ -24,7 +24,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
-use crate::datatypes::{self, Schema};
+use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
@@ -139,7 +139,7 @@ impl<'a> Scanner {
                 PREFECTH_SIZE,
                 true,
             );
-            let flat_knn_node  = KNNFlat::new(scan_node, q);
+            let flat_knn_node = KNNFlat::new(scan_node, q);
             Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),

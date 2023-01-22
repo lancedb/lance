@@ -24,7 +24,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -42,40 +42,50 @@ pub struct KNNFlat {
 }
 
 impl KNNFlat {
+    /// Construct a [KNNFlat] node.
     pub(crate) fn new(
         child: impl Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static,
         query: &Query,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
+        let score_column = "score";
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batches = child
-                .zip(stream::repeat_with(|| q.clone()))
-                .then(|(batch, q)| async move {
+            let batches = match child
+                .then(|batch| async {
+                    let key = q.key.clone();
                     let batch = batch?;
                     let vectors = batch.column_with_name(&q.column).unwrap().clone();
                     let scores = tokio::task::spawn_blocking(move || {
-                        l2_distance(&q.key, as_fixed_size_list_array(&vectors)).unwrap()
+                        l2_distance(&key, as_fixed_size_list_array(&vectors)).unwrap()
                     })
                     .await? as ArrayRef;
 
                     // TODO: use heap
-                    let batch_with_score = batch.try_with_column(
-                        ArrowField::new("score", DataType::Float32, false),
-                        scores.clone(),
-                    )?;
                     let indices = sort_to_indices(&scores, None, Some(q.k))?;
+                    let batch_with_score = batch.try_with_column(
+                        ArrowField::new(score_column, DataType::Float32, false),
+                        scores,
+                    )?;
                     let struct_arr = StructArray::from(batch_with_score);
                     let selected_arr = take(&struct_arr, &indices, None)?;
                     Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
                 })
                 .try_collect::<Vec<_>>()
                 .await
-                .unwrap();
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tx.send(Err(Error::IO(format!("Failed to compute scores: {}", e))))
+                        .await
+                        .expect("KNNFlat failed to send message");
+                    return;
+                }
+            };
 
             let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
-            let scores = batch.column_by_name("score").unwrap();
+            let scores = batch.column_by_name(score_column).unwrap();
             let indices = sort_to_indices(scores, None, Some(q.k)).unwrap();
 
             let struct_arr = StructArray::from(batch);
@@ -122,7 +132,6 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::arrow::RecordBatchBuffer;
-    use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::testing::generate_random_array;
 
@@ -161,7 +170,6 @@ mod tests {
                 })
                 .collect(),
         );
-        // println!("Batches: {:?}", batches);
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -182,5 +190,6 @@ mod tests {
             .into_stream();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
         println!("Tell me results: {:?}", results);
+        println!("Schema: {:?}\n", results[0].schema());
     }
 }
