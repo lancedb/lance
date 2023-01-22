@@ -53,6 +53,18 @@ impl KNNFlat {
             let k = q.key.clone();
             let batches = child
                 .and_then(|batch| async move {
+                    let vectors = batch
+                        .column_with_name(&column)
+                        .ok_or(Error::Schema(format!(
+                            "column {} does not exist in dataset",
+                            column,
+                        )))?
+                        .clone();
+
+                    let scores = tokio::task::spawn_blocking(move || {
+                        l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
+                    })
+                    .await?;
                     Ok([0])
                 })
                 .try_collect::<Vec<_>>()
