@@ -78,10 +78,9 @@ impl VectorIndex for FlatIndex<'_> {
                 let batch = batch.clone();
                 let vectors = batch
                     .column_by_name(&params.column)
-                    .ok_or(Error::Schema(format!(
-                        "column {} does not exist in dataset",
-                        self.column,
-                    )))?
+                    .ok_or_else(|| {
+                        Error::Schema(format!("column {} does not exist in dataset", self.column,))
+                    })?
                     .clone();
                 let scores = tokio::task::spawn_blocking(move || {
                     l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()

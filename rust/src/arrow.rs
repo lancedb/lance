@@ -69,33 +69,34 @@ impl DataTypeExt for DataType {
     }
 
     fn is_struct(&self) -> bool {
-        matches!(self, DataType::Struct(_))
+        matches!(self, Self::Struct(_))
     }
 
     fn is_fixed_stride(&self) -> bool {
-        match self {
-            DataType::Boolean
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::FixedSizeList(_, _)
-            | DataType::FixedSizeBinary(_) => true,
-            _ => false,
-        }
+        use DataType::*;
+        matches!(
+            self,
+            Boolean
+                | UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Int8
+                | Int16
+                | Int32
+                | Int64
+                | Float16
+                | Float32
+                | Float64
+                | Decimal128(_, _)
+                | Decimal256(_, _)
+                | FixedSizeList(_, _)
+                | FixedSizeBinary(_)
+        )
     }
 
     fn is_dictionary(&self) -> bool {
-        matches!(self, DataType::Dictionary(_, _))
+        matches!(self, Self::Dictionary(_, _))
     }
 }
 
@@ -129,7 +130,7 @@ impl ListArrayExt for ListArray {
         ))))
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data().clone())
+        .add_child_data(values.into_data())
         .build()?;
 
         Ok(Self::from(data))
@@ -150,7 +151,7 @@ impl LargeListArrayExt for LargeListArray {
         ))))
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data().clone())
+        .add_child_data(values.into_data())
         .build()?;
 
         Ok(Self::from(data))
@@ -312,7 +313,7 @@ impl RecordBatchExt for RecordBatch {
         ));
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
-        Ok(RecordBatch::try_new(new_schema, new_columns)?)
+        Ok(Self::try_new(new_schema, new_columns)?)
     }
 
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
@@ -325,23 +326,25 @@ impl RecordBatchExt for RecordBatch {
         }
 
         let mut fields = self.schema().fields.clone();
-        let mut columns = Vec::from(self.columns().clone());
+        let mut columns = Vec::from(self.columns());
         for field in other.schema().fields.as_slice() {
             if !fields.iter().any(|f| f.name() == field.name()) {
                 fields.push(field.clone());
                 columns.push(
                     other
                         .column_by_name(field.name())
-                        .ok_or(Error::Arrow(format!(
-                            "Column {} does not exist: schema={}",
-                            field.name(),
-                            other.schema()
-                        )))?
+                        .ok_or_else(|| {
+                            Error::Arrow(format!(
+                                "Column {} does not exist: schema={}",
+                                field.name(),
+                                other.schema()
+                            ))
+                        })?
                         .clone(),
                 );
             }
         }
-        Ok(RecordBatch::try_new(
+        Ok(Self::try_new(
             Arc::new(Schema::new(fields)),
             columns,
         )?)
