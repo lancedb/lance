@@ -97,6 +97,7 @@ mod tests {
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
+    use crate::datatypes::Schema;
     use crate::utils::testing::generate_random_array;
 
     #[tokio::test]
@@ -155,6 +156,8 @@ mod tests {
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
         println!("Tell me results: {:?}", results);
         println!("Schema: {:?}\n", results[0].schema());
+
+        assert!(results[0].schema().column_with_name("score").is_some());
 
         assert_eq!(results.len(), 1);
     }
