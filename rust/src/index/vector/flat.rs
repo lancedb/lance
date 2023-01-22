@@ -76,19 +76,14 @@ impl VectorIndex for FlatIndex<'_> {
             .and_then(|batch| async move {
                 let k = params.key.clone();
                 let batch = batch.clone();
-                let vectors = batch
-                    .column_with_name(&self.column)
-                    .ok_or(Error::Schema(format!(
-                        "column {} does not exist in dataset",
-                        self.column,
-                    )))?
+                let vectors = batch[&self.column]
                     .clone();
                 let scores = tokio::task::spawn_blocking(move || {
                     l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
                 })
                 .await?;
                 // TODO: only pick top-k in each batch first.
-                let row_id_array = batch.column_with_name("_rowid").unwrap().clone();
+                let row_id_array = batch["_rowid"].clone();
                 Ok((scores as ArrayRef, row_id_array))
             })
             .try_collect::<Vec<_>>()

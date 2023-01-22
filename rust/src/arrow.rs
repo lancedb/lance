@@ -235,11 +235,6 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
 
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
-    /// Get a column by its name.
-    ///
-    /// Returns None if the column does not exist.
-    fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
-
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
     ///
     /// ```
@@ -270,16 +265,13 @@ pub trait RecordBatchExt {
     /// )
     /// ```
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
+
+    /// Merge with another [`RecordBatch`] and returns a new one.
+    ///
+    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
-    fn column_with_name(&self, name: &str) -> Option<&ArrayRef> {
-        self.schema()
-            .index_of(name)
-            .ok()
-            .map(|idx| self.column(idx))
-    }
-
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
         let mut new_fields = self.schema().fields.clone();
         new_fields.push(field);
@@ -290,5 +282,9 @@ impl RecordBatchExt for RecordBatch {
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
         Ok(RecordBatch::try_new(new_schema, new_columns)?)
+    }
+
+    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
+        todo!()
     }
 }
