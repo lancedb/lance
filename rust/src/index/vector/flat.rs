@@ -20,10 +20,7 @@
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
-use arrow_select::{
-    concat::{concat, concat_batches},
-    take::take,
-};
+use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::stream::{Stream, TryStreamExt};
 
@@ -47,9 +44,6 @@ use crate::{Error, Result};
 pub struct FlatIndex<'a> {
     dataset: &'a Dataset,
 
-    /// Index name.
-    name: String,
-
     /// Vector column to search for.
     column: String,
 }
@@ -58,7 +52,6 @@ impl<'a> FlatIndex<'a> {
     pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
         Ok(Self {
             dataset,
-            name: name.to_string(),
             column: name.to_string(),
         })
     }
