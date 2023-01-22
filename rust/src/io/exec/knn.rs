@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use arrow_array::cast::as_struct_array;
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, StructArray, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::concat::concat_batches;

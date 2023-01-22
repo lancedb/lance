@@ -56,6 +56,7 @@ impl From<pb::Metadata> for Metadata {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct BatchOffsets {
     pub batch_id: i32,
     pub offsets: Vec<u32>,

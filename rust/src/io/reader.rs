@@ -202,6 +202,7 @@ impl<'a> FileReader<'a> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
         let batches = stream::iter(indices_in_batches)
             .then(|batch| async move {
+                println!("Read batch: {:?}", batch);
                 self.read_batch(batch.batch_id, batch.offsets.as_slice())
                     .await
             })
