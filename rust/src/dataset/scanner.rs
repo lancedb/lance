@@ -139,8 +139,7 @@ impl<'a> Scanner {
                 PREFECTH_SIZE,
                 true,
             );
-            let flat_knn_node: Box<dyn ExecNode + Unpin + Send> =
-                Box::new(KNNFlat::new(scan_node, q));
+            let flat_knn_node  = KNNFlat::new(scan_node, q);
             Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),

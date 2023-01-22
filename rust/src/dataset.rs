@@ -232,7 +232,7 @@ impl Dataset {
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
             .then(|fragment| async {
-                let path = Path::from(fragment.files[0].path.as_str());
+                let path = self.data_dir().child(fragment.files[0].path.as_str());
                 let reader = FileReader::try_new_with_fragment(
                     object_store,
                     &path,
