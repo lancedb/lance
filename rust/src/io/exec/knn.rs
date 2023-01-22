@@ -82,7 +82,9 @@ impl KNNFlat {
             let selected_arr = take(&struct_arr, &indices, None).unwrap();
 
             if !tx.is_closed() {
-                tx.send(Ok(as_struct_array(&selected_arr).into()));
+                if let Err(e) = tx.send(Ok(as_struct_array(&selected_arr).into())).await {
+                    eprintln!("KNNFlat tx.send error: {}", e)
+                };
             }
             drop(tx);
         });
