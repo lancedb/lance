@@ -344,9 +344,6 @@ impl RecordBatchExt for RecordBatch {
                 );
             }
         }
-        Ok(Self::try_new(
-            Arc::new(Schema::new(fields)),
-            columns,
-        )?)
+        Ok(Self::try_new(Arc::new(Schema::new(fields)), columns)?)
     }
 }
