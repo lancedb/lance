@@ -24,7 +24,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
-use crate::datatypes::{Schema, self};
+use crate::datatypes::{self, Schema};
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
@@ -182,11 +182,4 @@ impl Stream for ScannerStream {
         let mut this = self.project();
         this.exec_node.poll_next_unpin(cx)
     }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn knn_flat_search() {}
 }

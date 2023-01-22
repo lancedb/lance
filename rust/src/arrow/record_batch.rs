@@ -24,6 +24,7 @@ use arrow_select::concat::concat_batches;
 
 use crate::Result;
 
+#[derive(Debug)]
 pub struct RecordBatchBuffer {
     pub batches: Vec<RecordBatch>,
     idx: usize,
