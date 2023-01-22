@@ -130,11 +130,13 @@ impl<'a> Scanner {
         let projection = &self.projections;
 
         let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
+            let vector_scan_projection =
+                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = Scan::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),
-                projection,
+                &vector_scan_projection,
                 manifest.clone(),
                 PREFECTH_SIZE,
                 true,

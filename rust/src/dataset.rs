@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::cast::as_struct_array;
-use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, StructArray};
+use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;

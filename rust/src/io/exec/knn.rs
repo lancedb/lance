@@ -92,7 +92,6 @@ mod tests {
 
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
