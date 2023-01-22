@@ -22,26 +22,41 @@ use arrow_array::RecordBatch;
 use futures::stream::Stream;
 
 use super::{ExecNode, NodeType};
-use crate::dataset::Dataset;
-use crate::datatypes::Schema;
-use crate::Result;
 use crate::index::vector::Query;
+use crate::Result;
 
-/// KNN node
+/// KNN node for post-filtering.
 pub struct KNN {
     child: Box<dyn ExecNode + Unpin + Send>,
 
-    vector_column: String,
+    /// Column to search.
+    column: String,
 
     query: Query,
 }
 
-impl ExecNode for Take<'_> {
-    fn node_type(&self) -> NodeType {
-        NodeType::KNN
+impl KNN {
+    pub(crate) fn new(child: Box<dyn ExecNode + Unpin + Send>, column: &str, query: Query) -> Self {
+        // assert_eq!(child.node_type(), NodeType::Scan, "")
+        Self {
+            child,
+            column: column.to_string(),
+            query,
+        }
     }
+}
 
-    fn schema(&self) -> &Arc<Schema> {
-        &self.schema
+impl ExecNode for KNN {
+    fn node_type(&self) -> NodeType {
+        NodeType::KnnFlat
+    }
+}
+
+impl Stream for KNN {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        //Pin::into_inner(self).rx.poll_recv(cx)
+        todo!()
     }
 }

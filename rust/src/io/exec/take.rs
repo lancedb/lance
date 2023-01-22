@@ -57,10 +57,6 @@ impl ExecNode for Take<'_> {
     fn node_type(&self) -> NodeType {
         NodeType::Take
     }
-
-    fn schema(&self) -> &Arc<Schema> {
-        &self.schema
-    }
 }
 
 impl Stream for Take<'_> {
