@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
-use crate::datatypes::Schema;
+use crate::datatypes::{Schema, self};
 use crate::format::Fragment;
 use crate::index::vector::Query;
-use crate::io::exec::Scan;
+
+use crate::io::exec::{ExecNode, KNNFlat, Scan, Take};
 use crate::Result;
 
 /// Dataset Scanner
@@ -41,8 +44,8 @@ use crate::Result;
 ///   .buffered(16)
 ///   .sum()
 /// ```
-pub struct Scanner<'a> {
-    dataset: &'a Dataset,
+pub struct Scanner {
+    dataset: Arc<Dataset>,
 
     projections: Schema,
 
@@ -58,14 +61,16 @@ pub struct Scanner<'a> {
     with_row_id: bool,
 }
 
-impl<'a> Scanner<'a> {
-    pub fn new(dataset: &'a Dataset) -> Self {
+impl<'a> Scanner {
+    pub fn new(dataset: Arc<Dataset>) -> Self {
+        let projection = dataset.schema().clone();
+        let fragments = dataset.fragments().clone();
         Self {
             dataset,
-            projections: dataset.schema().clone(),
+            projections: projection,
             limit: None,
             offset: None,
-            fragments: dataset.fragments().clone(),
+            fragments,
             nearest: None,
             with_row_id: false,
         }
@@ -116,7 +121,7 @@ impl<'a> Scanner<'a> {
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub fn into_stream(&self) -> impl Stream<Item = Result<RecordBatch>> {
+    pub fn into_stream(&self) -> ScannerStream {
         const PREFECTH_SIZE: usize = 8;
 
         let data_dir = self.dataset.data_dir().clone();
@@ -124,19 +129,64 @@ impl<'a> Scanner<'a> {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        let mut exec_node = Scan::new(
-            self.dataset.object_store.clone(),
-            data_dir,
-            self.fragments.clone(),
-            projection,
-            manifest,
-            PREFECTH_SIZE,
-            with_row_id,
-        );
-        if let Some(q) = self.nearest.as_ref() {
+        let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
+            let scan_node = Box::new(Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                true,
+            ));
+            let flat_knn_node: Box<dyn ExecNode + Unpin + Send> =
+                Box::new(KNNFlat::new(scan_node, q));
+            Box::new(Take::new(
+                self.dataset.clone(),
+                Arc::new(projection.clone()),
+                flat_knn_node,
+            ))
+        } else {
+            Box::new(Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                with_row_id,
+            ))
+        };
 
-        }
-
-        exec_node
+        ScannerStream::new(exec_node)
     }
+}
+
+/// ScannerStream is a container to wrap different types of ExecNode.
+#[pin_project::pin_project]
+pub struct ScannerStream {
+    #[pin]
+    exec_node: Box<dyn ExecNode + Unpin + Send>,
+}
+
+impl ScannerStream {
+    fn new<'a>(exec_node: Box<dyn ExecNode + Unpin + Send>) -> Self {
+        Self { exec_node }
+    }
+}
+
+impl Stream for ScannerStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        this.exec_node.poll_next_unpin(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn knn_flat_search() {}
 }

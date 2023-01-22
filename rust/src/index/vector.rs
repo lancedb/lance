@@ -28,6 +28,7 @@ pub mod flat;
 use crate::Result;
 
 /// Query parameters for the vector indices
+#[derive(Debug, Clone)]
 pub struct Query {
     pub column: String,
     /// The vector to be searched.

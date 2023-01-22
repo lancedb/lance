@@ -23,7 +23,9 @@ mod scan;
 mod take;
 
 use crate::Result;
+pub(crate) use knn::KNNFlat;
 pub(crate) use scan::Scan;
+pub(crate) use take::Take;
 
 #[derive(Debug)]
 pub enum NodeType {

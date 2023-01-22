@@ -31,17 +31,17 @@ use crate::Result;
 ///
 /// [Take] node takes the filtered batch from the child node.
 /// It uses the `_rowid` to random access on [Dataset] to gather the final results.
-pub(crate) struct Take<'a> {
-    dataset: &'a Dataset,
+pub(crate) struct Take {
+    dataset: Arc<Dataset>,
 
     schema: Arc<Schema>,
 
     child: Box<dyn ExecNode + Unpin + Send>,
 }
 
-impl<'a> Take<'a> {
+impl Take {
     pub fn new(
-        dataset: &'a Dataset,
+        dataset: Arc<Dataset>,
         schema: Arc<Schema>,
         child: Box<dyn ExecNode + Unpin + Send>,
     ) -> Self {
@@ -53,13 +53,13 @@ impl<'a> Take<'a> {
     }
 }
 
-impl ExecNode for Take<'_> {
+impl ExecNode for Take {
     fn node_type(&self) -> NodeType {
         NodeType::Take
     }
 }
 
-impl Stream for Take<'_> {
+impl Stream for Take {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

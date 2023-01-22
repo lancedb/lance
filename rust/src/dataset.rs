@@ -34,7 +34,7 @@ fn latest_manifest_path(base: &Path) -> Path {
 }
 
 /// Lance Dataset
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Dataset {
     object_store: Arc<ObjectStore>,
     base: Path,
@@ -208,7 +208,7 @@ impl Dataset {
 
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
-        Scanner::new(&self)
+        Scanner::new(Arc::new(self.clone()))
     }
 
     /// Take rows by the internal ROW ids.

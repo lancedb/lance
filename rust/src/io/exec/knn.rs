@@ -26,33 +26,29 @@ use crate::index::vector::Query;
 use crate::Result;
 
 /// KNN node for post-filtering.
-pub struct KNN {
+pub struct KNNFlat {
     child: Box<dyn ExecNode + Unpin + Send>,
-
-    /// Column to search.
-    column: String,
 
     query: Query,
 }
 
-impl KNN {
-    pub(crate) fn new(child: Box<dyn ExecNode + Unpin + Send>, column: &str, query: Query) -> Self {
+impl KNNFlat {
+    pub(crate) fn new(child: Box<dyn ExecNode + Unpin + Send>, query: &Query) -> Self {
         // assert_eq!(child.node_type(), NodeType::Scan, "")
         Self {
             child,
-            column: column.to_string(),
-            query,
+            query: query.clone(),
         }
     }
 }
 
-impl ExecNode for KNN {
+impl ExecNode for KNNFlat {
     fn node_type(&self) -> NodeType {
         NodeType::KnnFlat
     }
 }
 
-impl Stream for KNN {
+impl Stream for KNNFlat {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
