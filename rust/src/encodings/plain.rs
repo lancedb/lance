@@ -243,7 +243,6 @@ impl<'a> Decoder for PlainDecoder<'a> {
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
         let array = self.get(start as usize..end as usize + 1).await?;
-        println!("Indices - start: {:?} - {:?}, array: {:?}", indices, start, array);
         let adjusted_offsets = subtract_scalar(indices, start)?;
         Ok(take(&array, &adjusted_offsets, None)?)
     }

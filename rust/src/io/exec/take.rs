@@ -67,7 +67,9 @@ impl Take {
                         return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
                     }
                     Ok(())
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
             drop(tx)
         });
 
