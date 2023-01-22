@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 mod kernels;
 mod record_batch;
-use crate::error::Result;
+use crate::error::{Error, Result};
 pub use kernels::*;
 pub use record_batch::*;
 
@@ -268,6 +268,37 @@ pub trait RecordBatchExt {
 
     /// Merge with another [`RecordBatch`] and returns a new one.
     ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_array::*;
+    /// use arrow_schema::{Schema, Field, DataType};
+    /// use lance::arrow::*;
+    ///
+    /// let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+    /// let int_arr = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+    /// let left = RecordBatch::try_new(left_schema, vec![int_arr.clone()]).unwrap();
+    ///
+    /// let right_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    /// let str_arr = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
+    /// let right = RecordBatch::try_new(right_schema, vec![str_arr.clone()]).unwrap();
+    ///
+    /// let new_record_batch = left.merge(&right).unwrap();
+    ///
+    /// assert_eq!(
+    ///     new_record_batch,
+    ///     RecordBatch::try_new(
+    ///         Arc::new(Schema::new(
+    ///             vec![
+    ///                 Field::new("a", DataType::Int32, true),
+    ///                 Field::new("s", DataType::Utf8, true)
+    ///             ])
+    ///         ),
+    ///         vec![int_arr, str_arr],
+    ///     ).unwrap()
+    /// )
+    /// ```
+    ///
+    /// TODO: add merge nested fields support.
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch>;
 }
 
@@ -285,6 +316,34 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
-        todo!()
+        if self.num_rows() != other.num_rows() {
+            return Err(Error::Arrow(format!(
+                "Attempt to merge two RecordBatch with different sizes: {} != {}",
+                self.num_rows(),
+                other.num_rows()
+            )));
+        }
+
+        let mut fields = self.schema().fields.clone();
+        let mut columns = Vec::from(self.columns().clone());
+        for field in other.schema().fields.as_slice() {
+            if !fields.iter().any(|f| f.name() == field.name()) {
+                fields.push(field.clone());
+                columns.push(
+                    other
+                        .column_by_name(field.name())
+                        .ok_or(Error::Arrow(format!(
+                            "Column {} does not exist: schema={}",
+                            field.name(),
+                            other.schema()
+                        )))?
+                        .clone(),
+                );
+            }
+        }
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
     }
 }
