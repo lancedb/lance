@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 mod kernels;
 mod record_batch;
-use crate::error::Result;
+use crate::error::{Error, Result};
 pub use kernels::*;
 pub use record_batch::*;
 
@@ -69,33 +69,34 @@ impl DataTypeExt for DataType {
     }
 
     fn is_struct(&self) -> bool {
-        matches!(self, DataType::Struct(_))
+        matches!(self, Self::Struct(_))
     }
 
     fn is_fixed_stride(&self) -> bool {
-        match self {
-            DataType::Boolean
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::FixedSizeList(_, _)
-            | DataType::FixedSizeBinary(_) => true,
-            _ => false,
-        }
+        use DataType::*;
+        matches!(
+            self,
+            Boolean
+                | UInt8
+                | UInt16
+                | UInt32
+                | UInt64
+                | Int8
+                | Int16
+                | Int32
+                | Int64
+                | Float16
+                | Float32
+                | Float64
+                | Decimal128(_, _)
+                | Decimal256(_, _)
+                | FixedSizeList(_, _)
+                | FixedSizeBinary(_)
+        )
     }
 
     fn is_dictionary(&self) -> bool {
-        matches!(self, DataType::Dictionary(_, _))
+        matches!(self, Self::Dictionary(_, _))
     }
 }
 
@@ -129,7 +130,7 @@ impl ListArrayExt for ListArray {
         ))))
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data().clone())
+        .add_child_data(values.into_data())
         .build()?;
 
         Ok(Self::from(data))
@@ -150,7 +151,7 @@ impl LargeListArrayExt for LargeListArray {
         ))))
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data().clone())
+        .add_child_data(values.into_data())
         .build()?;
 
         Ok(Self::from(data))
@@ -235,11 +236,6 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
 
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
-    /// Get a column by its name.
-    ///
-    /// Returns None if the column does not exist.
-    fn column_with_name(&self, name: &str) -> Option<&ArrayRef>;
-
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
     ///
     /// ```
@@ -270,16 +266,44 @@ pub trait RecordBatchExt {
     /// )
     /// ```
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<RecordBatch>;
+
+    /// Merge with another [`RecordBatch`] and returns a new one.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_array::*;
+    /// use arrow_schema::{Schema, Field, DataType};
+    /// use lance::arrow::*;
+    ///
+    /// let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+    /// let int_arr = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
+    /// let left = RecordBatch::try_new(left_schema, vec![int_arr.clone()]).unwrap();
+    ///
+    /// let right_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+    /// let str_arr = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
+    /// let right = RecordBatch::try_new(right_schema, vec![str_arr.clone()]).unwrap();
+    ///
+    /// let new_record_batch = left.merge(&right).unwrap();
+    ///
+    /// assert_eq!(
+    ///     new_record_batch,
+    ///     RecordBatch::try_new(
+    ///         Arc::new(Schema::new(
+    ///             vec![
+    ///                 Field::new("a", DataType::Int32, true),
+    ///                 Field::new("s", DataType::Utf8, true)
+    ///             ])
+    ///         ),
+    ///         vec![int_arr, str_arr],
+    ///     ).unwrap()
+    /// )
+    /// ```
+    ///
+    /// TODO: add merge nested fields support.
+    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
-    fn column_with_name(&self, name: &str) -> Option<&ArrayRef> {
-        self.schema()
-            .index_of(name)
-            .ok()
-            .map(|idx| self.column(idx))
-    }
-
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
         let mut new_fields = self.schema().fields.clone();
         new_fields.push(field);
@@ -289,6 +313,37 @@ impl RecordBatchExt for RecordBatch {
         ));
         let mut new_columns = self.columns().to_vec();
         new_columns.push(arr);
-        Ok(RecordBatch::try_new(new_schema, new_columns)?)
+        Ok(Self::try_new(new_schema, new_columns)?)
+    }
+
+    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
+        if self.num_rows() != other.num_rows() {
+            return Err(Error::Arrow(format!(
+                "Attempt to merge two RecordBatch with different sizes: {} != {}",
+                self.num_rows(),
+                other.num_rows()
+            )));
+        }
+
+        let mut fields = self.schema().fields.clone();
+        let mut columns = Vec::from(self.columns());
+        for field in other.schema().fields.as_slice() {
+            if !fields.iter().any(|f| f.name() == field.name()) {
+                fields.push(field.clone());
+                columns.push(
+                    other
+                        .column_by_name(field.name())
+                        .ok_or_else(|| {
+                            Error::Arrow(format!(
+                                "Column {} does not exist: schema={}",
+                                field.name(),
+                                other.schema()
+                            ))
+                        })?
+                        .clone(),
+                );
+            }
+        }
+        Ok(Self::try_new(Arc::new(Schema::new(fields)), columns)?)
     }
 }

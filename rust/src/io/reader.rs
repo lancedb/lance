@@ -534,8 +534,7 @@ mod tests {
 
         for b in 0..10 {
             let batch = reader.read_batch(b, ..).await.unwrap();
-            assert!(batch.column_with_name("_rowid").is_some());
-            let row_ids_col = batch.column_with_name("_rowid").unwrap();
+            let row_ids_col = &batch["_rowid"];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) as u64 + 10 * b as u64;
 
