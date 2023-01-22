@@ -92,6 +92,7 @@ mod tests {
 
     use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -159,5 +160,20 @@ mod tests {
         assert!(results[0].schema().column_with_name("score").is_some());
 
         assert_eq!(results.len(), 1);
+
+        let stream = dataset.scan().into_stream();
+        let expected = flat_search(
+            stream,
+            &Query {
+                column: "vector".to_string(),
+                key: Arc::new(as_primitive_array(&q).clone()),
+                k: 10,
+                nprobs: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(expected, results[0]);
     }
 }
