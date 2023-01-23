@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::num;
+
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::Result;
+use lance::datatypes::Schema;
+use lance::{Error, Result};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -50,7 +54,7 @@ enum Commands {
         n: i64,
     },
 
-    /// Manipulate indices
+    /// Index operations
     Index {
         /// Actions on index
         #[arg(value_enum)]
@@ -63,14 +67,19 @@ enum Commands {
         #[arg(short, long, value_name = "NAME")]
         column: Option<String>,
 
+        /// Index name.
+        #[arg(short, long)]
+        name: Option<String>,
+
         /// Set index type
         #[arg(short = 't', long = "type", value_enum, value_name = "TYPE")]
-        index_type: IndexType,
+        index_type: Option<IndexType>,
 
         /// Nunber of IVF partitions. Only useful when the index type is 'ivf-pq'.
         #[arg(short = 'p', long, default_value_t = 64, value_name = "NUM")]
         num_partitions: u32,
 
+        /// Number of sub-vectors in Product Quantizer
         #[arg(short = 's', long, default_value_t = 8, value_name = "NUM")]
         num_sub_vectors: u32,
     },
@@ -87,7 +96,7 @@ enum IndexType {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
@@ -99,7 +108,9 @@ async fn main() {
                 dataset.version().version,
                 dataset.versions().await.unwrap().len()
             );
-            println!("Schema:\n{}", dataset.schema())
+            println!("Schema:\n{}", dataset.schema());
+
+            Ok(())
         }
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
@@ -108,16 +119,55 @@ async fn main() {
             let stream = scanner.into_stream();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
             println!("{:?}", batch);
+
+            Ok(())
         }
         Commands::Index {
             action,
             uri,
             column,
+            name,
             index_type,
             num_partitions,
             num_sub_vectors,
         } => {
             let dataset = Dataset::open(uri).await.unwrap();
+            match action {
+                IndexAction::Create => {
+                    create_index(
+                        &dataset,
+                        name,
+                        column,
+                        index_type,
+                        num_partitions,
+                        num_sub_vectors,
+                    )
+                    .await
+                }
+            }
         }
     }
+}
+
+async fn create_index(
+    dataset: &Dataset,
+    name: &Option<String>,
+    column: &Option<String>,
+    index_type: &Option<IndexType>,
+    num_partitions: &u32,
+    num_sub_vectors: &u32,
+) -> Result<()> {
+    let col = column
+        .as_ref()
+        .ok_or_else(|| Error::IO("Must specify column".to_string()))?;
+    let schema = dataset.schema();
+    let field = schema
+        .field(col)
+        .ok_or_else(|| Error::IO(format!("Column {} does not exist in dataset", col)))?;
+    if matches!(field.data_type(), DataType::FixedSizeList(elem_type, _)) {
+
+    } else {
+        return Err(Error::IO(format!("Column '{}' is not a vector column: {}", col, field)));
+    }
+    todo!()
 }
