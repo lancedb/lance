@@ -28,7 +28,6 @@ use crate::index::vector::flat::flat_search;
 use crate::index::vector::Query;
 use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
-use crate::io::exec::ExecNodeBox;
 
 /// KNN node for post-filtering.
 pub struct KNNFlat {
