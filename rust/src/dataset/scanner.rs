@@ -28,7 +28,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
-use crate::io::exec::{ExecNode, KNNFlat, Limit, Scan, Take};
+use crate::io::exec::{KNNFlat, Limit, Scan, Take, ExecNodeBox};
 use crate::Result;
 
 /// Dataset Scanner
@@ -129,7 +129,7 @@ impl<'a> Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        let mut exec_node: Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send> =
+        let mut exec_node: ExecNodeBox =
             if let Some(q) = self.nearest.as_ref() {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
@@ -172,11 +172,11 @@ impl<'a> Scanner {
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
-    exec_node: Box<dyn ExecNode + Unpin + Send>,
+    exec_node: ExecNodeBox,
 }
 
 impl ScannerStream {
-    fn new<'a>(exec_node: Box<dyn ExecNode + Unpin + Send>) -> Self {
+    fn new<'a>(exec_node: ExecNodeBox) -> Self {
         Self { exec_node }
     }
 }

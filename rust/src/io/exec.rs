@@ -45,3 +45,5 @@ pub enum NodeType {
 pub(crate) trait ExecNode: Stream<Item = Result<RecordBatch>> {
     fn node_type(&self) -> NodeType;
 }
+
+pub(crate) type ExecNodeBox = Box<dyn ExecNode<Item=Result<RecordBatch>> + Unpin + Send>;

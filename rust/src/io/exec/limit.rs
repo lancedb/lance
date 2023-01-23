@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
 use crate::{Error, Result};
+use crate::io::exec::ExecNodeBox;
 
 /// Dataset Scan Node.
 pub(crate) struct Limit {
@@ -35,7 +36,7 @@ pub(crate) struct Limit {
 impl Limit {
     /// Create a new execution node to handle limit offset.
     pub fn new(
-        child: Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
+        child: ExecNodeBox,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Self {

@@ -30,6 +30,7 @@ use crate::arrow::RecordBatchExt;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::{Error, Result};
+use crate::io::exec::ExecNodeBox;
 
 /// Dataset Take Node.
 ///
@@ -44,7 +45,7 @@ impl Take {
     pub fn new(
         dataset: Arc<Dataset>,
         schema: Arc<Schema>,
-        child: Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
+        child: ExecNodeBox,
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
