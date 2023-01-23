@@ -23,9 +23,135 @@ use arrow_array::{
 use arrow_ord::sort::sort_to_indices;
 
 use crate::arrow::*;
+use crate::dataset::Dataset;
 use crate::index::pb;
+use crate::io::{read_message, read_metadata_offset, ObjectStore};
 use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
+
+const INDEX_FILE_NAME: &str = "index.idx";
+
+/// IVF PQ Index.
+#[derive(Debug)]
+pub struct IvfPQIndex<'a> {
+    /// Object store to read the indices.
+    object_store: &'a ObjectStore,
+
+    /// Index name.
+    name: String,
+
+    /// Ivf file.
+    ivf: Ivf,
+
+    /// Number of bits used for product quantlization centroids.
+    num_bits: u32,
+    num_sub_vectors: u32,
+}
+
+impl<'a> IvfPQIndex<'a> {
+    /// Open the IvfPQ index on dataset, specified by the index `name`.
+    async fn new(dataset: &'a Dataset, name: &str) -> Result<IvfPQIndex<'a>> {
+        let index_dir = dataset.indices_dir().child(name);
+        let index_file = index_dir.child(INDEX_FILE_NAME);
+
+        let object_store = dataset.object_store();
+        let mut reader = object_store.open(&index_file).await?;
+
+        let file_size = reader.size().await?;
+        let prefetch_size = object_store.prefetch_size();
+        let begin = if file_size < prefetch_size {
+            0
+        } else {
+            file_size - prefetch_size
+        };
+        let tail_bytes = reader.get_range(begin..file_size).await?;
+        let metadata_pos = read_metadata_offset(&tail_bytes)?;
+        let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
+            // We have not read the metadata bytes yet.
+            reader.read_message(metadata_pos).await?
+        } else {
+            let offset = tail_bytes.len() - (file_size - metadata_pos);
+            read_message(&tail_bytes.slice(offset..))?
+        };
+        let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
+        todo!()
+    }
+}
+
+/// Ivf PQ index metadata.
+///
+#[derive(Debug)]
+pub struct IvfPQIndexMetadata {
+    /// Index name
+    name: String,
+
+    /// The column to build the index for.
+    column: String,
+
+    /// The version of dataset where this index was built.
+    dataset_version: u64,
+
+    // Ivf related
+    ivf: Ivf,
+
+    // PQ configurations.
+    num_bits: u32,
+    num_sub_vectors: u32,
+}
+
+/// Convert a IvfPQIndex to protobuf payload
+impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
+    type Error = Error;
+
+    fn try_from(idx: &IvfPQIndexMetadata) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            name: idx.name.clone(),
+            columns: vec![idx.column.clone()],
+            dataset_version: idx.dataset_version,
+            index_type: pb::IndexType::VectorIvfPq.into(),
+
+            implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
+                spec_version: 1,
+                pq: Some(pb::ProductQuantilizationInfo {
+                    num_bits: idx.num_bits,
+                    num_subvectors: idx.num_sub_vectors,
+                }),
+                ivf: Some(pb::Ivf::try_from(&idx.ivf)?),
+            })),
+        })
+    }
+}
+
+impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
+    type Error = Error;
+
+    fn try_from(idx: &pb::Index) -> Result<Self> {
+        if idx.columns.len() != 1 {
+            return Err(Error::Schema("IVF_PQ only supports 1 column".to_string()));
+        }
+        assert_eq!(idx.index_type, pb::IndexType::VectorIvfPq as i32);
+
+        let metadata = if let Some(idx_impl) = idx.implementation.as_ref() {
+            match idx_impl {
+                pb::index::Implementation::VectorIndex(vidx) => Self {
+                    name: idx.name.clone(),
+                    column: idx.columns[0].to_string(),
+                    dataset_version: idx.dataset_version,
+                    ivf: vidx
+                        .ivf
+                        .as_ref()
+                        .map(|ivf| Ivf::try_from(ivf).unwrap())
+                        .ok_or_else(|| Error::IO("Could not read IVF metadata".to_string()))?,
+                    num_bits: vidx.pq.as_ref().map(|pq| pq.num_bits).unwrap_or(8),
+                    num_sub_vectors: vidx.pq.as_ref().map(|pq| pq.num_subvectors).unwrap(),
+                },
+            }
+        } else {
+            return Err(Error::IO("Invalid protobuf".to_string()));
+        };
+        Ok(metadata)
+    }
+}
 
 /// Ivf Model
 #[derive(Debug)]

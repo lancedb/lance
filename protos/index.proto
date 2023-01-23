@@ -43,16 +43,41 @@ message Index {
 
   // The [`IndexType`] of the index.
   IndexType index_type = 4;
+
+  oneof implementation {
+    VectorIndex vector_index = 5;
+  }
 }
 
 // Inverted Index File Metadata.
 message IVF {
-    // Centroids of parittions. `dimension * num_partitions` of float32s.
-    repeated float centroids = 1;
+  // Centroids of parittions. `dimension * num_partitions` of float32s.
+  repeated float centroids = 1;
 
-    // File offset of each partition.
-    repeated uint64 offsets = 2;
+  // File offset of each partition.
+  repeated uint64 offsets = 2;
 
-    // Number of records in the partition.
-    repeated uint32 lengths = 3;
-  }
+  // Number of records in the partition.
+  repeated uint32 lengths = 3;
+}
+
+// Metadata of Product Quantilization.
+message ProductQuantilizationInfo {
+  // The number of bits to present a centroid.
+  uint32 num_bits = 1;
+
+  // Number of subvectors.
+  uint32 num_subvectors = 2;
+}
+
+// Vertor Index Metadata
+message VectorIndex {
+  // Index specificdation version.
+  uint32 spec_version = 1;
+
+  // Invert file index info.
+  IVF ivf = 2;
+
+  // Product quantilization info.
+  ProductQuantilizationInfo pq = 3;
+}
