@@ -43,41 +43,45 @@ impl Limit {
         let limit = limit.unwrap_or(0).clone();
         let offset = offset.unwrap_or(0).clone();
         let io_thread = tokio::spawn(async move {
-            child.try_fold((offset, limit, tx), |(mut off, mut lim, tx), mut b: RecordBatch | async move {
-                let nrows = b.num_rows() as i64;
-                if off > 0 {
-                    if off > nrows {
-                        // skip this batch if offset is more than num rows
-                        off -= nrows;
-                        return Ok((off, lim, tx));
-                    } else {
-                        // otherwise slice the batch starting from the offset
-                        b = b.slice(off as usize, (nrows - off) as usize);
-                        off = 0;
-                    }
-                }
+            child
+                .try_fold(
+                    (offset, limit, tx),
+                    |(mut off, mut lim, tx), mut b: RecordBatch| async move {
+                        let nrows = b.num_rows() as i64;
+                        if off > 0 {
+                            if off > nrows {
+                                // skip this batch if offset is more than num rows
+                                off -= nrows;
+                                return Ok((off, lim, tx));
+                            } else {
+                                // otherwise slice the batch starting from the offset
+                                b = b.slice(off as usize, (nrows - off) as usize);
+                                off = 0;
+                            }
+                        }
 
-                if lim > 0 {
-                    if lim > nrows {
-                        lim -= nrows;
-                    } else {
-                        // if this batch is longer than remaining limit
-                        // then slice up to the remaining limit
-                        b = b.slice(0, lim as usize);
-                        lim = 0;
-                    }
-                }
+                        if lim > 0 {
+                            if lim > nrows {
+                                lim -= nrows;
+                            } else {
+                                // if this batch is longer than remaining limit
+                                // then slice up to the remaining limit
+                                b = b.slice(0, lim as usize);
+                                lim = 0;
+                            }
+                        }
 
-                if tx.is_closed() {
-                    eprintln!("ExecNode(Take): channel closed");
-                    return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
-                }
-                if let Err(e) = tx.send(Ok(b)).await {
-                    eprintln!("ExecNode(Take): {}", e);
-                    return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
-                }
-                Ok((off, lim, tx))
-            })
+                        if tx.is_closed() {
+                            eprintln!("ExecNode(Take): channel closed");
+                            return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
+                        }
+                        if let Err(e) = tx.send(Ok(b)).await {
+                            eprintln!("ExecNode(Take): {}", e);
+                            return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
+                        }
+                        Ok((off, lim, tx))
+                    },
+                )
                 .await
                 .and_then(|(_off, _lim, tx)| {
                     drop(tx);
@@ -106,5 +110,3 @@ impl Stream for Limit {
         Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
-
-
