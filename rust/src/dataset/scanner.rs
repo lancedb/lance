@@ -28,7 +28,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
-use crate::io::exec::{ExecNode, KNNFlat, Scan, Take, Limit};
+use crate::io::exec::{ExecNode, KNNFlat, Limit, Scan, Take};
 use crate::Result;
 
 /// Dataset Scanner
@@ -129,7 +129,6 @@ impl<'a> Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-<<<<<<< HEAD
         let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
@@ -156,7 +155,7 @@ impl<'a> Scanner {
                 &self.projections,
                 manifest.clone(),
                 PREFECTH_SIZE,
-                true,
+                with_row_id,
             );
             Box::new(Limit::new(scan_node, self.limit, self.offset))
         } else {
@@ -172,19 +171,6 @@ impl<'a> Scanner {
         };
 
         ScannerStream::new(exec_node)
-=======
-        ScannerStream::new(
-            self.dataset.object_store.clone(),
-            data_dir,
-            self.fragments.clone(),
-            manifest,
-            PREFECTH_SIZE,
-            projection,
-            with_row_id,
-            self.limit,
-            self.offset,
-        )
->>>>>>> e97eb6d3 (fmt)
     }
 }
 
@@ -196,41 +182,8 @@ pub struct ScannerStream {
 }
 
 impl ScannerStream {
-<<<<<<< HEAD
     fn new<'a>(exec_node: Box<dyn ExecNode + Unpin + Send>) -> Self {
         Self { exec_node }
-=======
-    fn new<'a>(
-        object_store: Arc<ObjectStore>,
-        data_dir: Path,
-        fragments: Arc<Vec<Fragment>>,
-        manifest: Arc<Manifest>,
-        prefetch_size: usize,
-        schema: &Schema,
-        with_row_id: bool,
-        limit: Option<i64>,
-        offset: Option<i64>,
-    ) -> Self {
-        let exec_node = Scan::new(
-            object_store,
-            data_dir,
-            fragments.clone(),
-            schema,
-            manifest.clone(),
-            prefetch_size,
-            with_row_id,
-        );
-
-        if limit.is_some() || offset.is_some() {
-            Self {
-                exec_node: Box::new(Limit::new(exec_node, limit, offset)),
-            }
-        } else {
-            Self {
-                exec_node: Box::new(exec_node),
-            }
-        }
->>>>>>> e97eb6d3 (fmt)
     }
 }
 
