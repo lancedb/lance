@@ -116,6 +116,8 @@ async fn main() {
             index_type,
             num_partitions,
             num_sub_vectors,
-        } => {}
+        } => {
+            let dataset = Dataset::open(uri).await.unwrap();
+        }
     }
 }
