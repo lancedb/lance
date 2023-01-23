@@ -164,12 +164,21 @@ async fn create_index(
     let field = schema
         .field(col)
         .ok_or_else(|| Error::IO(format!("Column {} does not exist in dataset", col)))?;
-    if matches!(field.data_type(), DataType::FixedSizeList(elem_type, _)) {
-    } else {
-        return Err(Error::IO(format!(
-            "Column '{}' is not a vector column: {}",
-            col, field
-        )));
+    match field.data_type() {
+        DataType::FixedSizeList(elem_type, _) => {
+            if !matches!(elem_type.as_ref(), &DataType::Float32) {
+                return Err(Error::IO(format!(
+                    "Only support to create vector index on f32 vector, but got {}",
+                    elem_type.as_ref()
+                )));
+            }
+        }
+        _ => {
+            return Err(Error::IO(format!(
+                "Column '{}' is not a vector column: {}",
+                col, field
+            )))
+        }
     }
     todo!()
 }
