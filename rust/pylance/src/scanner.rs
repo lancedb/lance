@@ -34,50 +34,35 @@ use crate::reader::LanceReader;
 /// This will be wrapped by a python class to provide
 /// additional functionality
 #[pyclass(name = "_Scanner", module = "_lib")]
+#[derive(Clone)]
 pub struct Scanner {
-    dataset: Arc<LanceDataset>,
-    columns: Option<Vec<String>>,
-    offset: Option<i64>,
-    limit: i64,
+    scanner: Arc<LanceScanner>,
     rt: Arc<Runtime>,
 }
 
 impl Scanner {
     pub fn new(
-        dataset: Arc<LanceDataset>,
-        columns: Option<Vec<String>>,
-        offset: Option<i64>,
-        limit: i64,
+        scanner: Arc<LanceScanner>,
         rt: Arc<Runtime>,
     ) -> Self {
-        Self {
-            dataset,
-            columns,
-            offset,
-            limit,
-            rt,
-        }
+        Self { scanner, rt }
+    }
+
+    pub(crate) fn to_reader(&self) -> LanceReader {
+        LanceReader::new(self.scanner.clone(), self.rt.clone())
     }
 }
 
 #[pymethods]
 impl Scanner {
-    #[getter(dataset_schema)]
-    fn dataset_schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        ArrowSchema::from(self_.dataset.schema()).to_pyarrow(self_.py())
+    #[getter(schema)]
+    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        self_.scanner.schema().to_pyarrow(self_.py())
     }
 
-    fn to_reader(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+    fn to_pyarrow(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         self_.rt.block_on(async {
-            let mut scanner: LanceScanner = self_.dataset.scan();
-            if let Some(c) = &self_.columns {
-                let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
-                scanner
-                    .project(&proj)
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
-            }
-            scanner.limit(self_.limit, self_.offset);
-            let reader = LanceReader::new(scanner, self_.rt.clone());
+            let reader = self_.to_reader();
             // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
             let stream = Arc::new(FFI_ArrowArrayStream::empty());
             let stream_ptr = Arc::into_raw(stream) as *mut FFI_ArrowArrayStream;

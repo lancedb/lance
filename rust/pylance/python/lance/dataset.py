@@ -84,7 +84,7 @@ class LanceScanner:
         return self.to_reader().read_all()
 
     def to_reader(self) -> pa.RecordBatchReader:
-        return self._scanner.to_reader()
+        return self._scanner.to_pyarrow()
 
 
 ReaderLike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
@@ -125,9 +125,9 @@ def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
     elif isinstance(data_obj, pa.RecordBatchReader):
         reader = data_obj
     elif isinstance(data_obj, LanceDataset):
-        reader = data_obj.scanner().to_reader()
+        reader = data_obj.scanner()
     elif isinstance(data_obj, LanceScanner):
-        reader = data_obj.to_reader()
+        reader = data_obj
     else:
         raise TypeError(f"Unknown data_obj type {type(data_obj)}")
 

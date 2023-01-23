@@ -110,7 +110,7 @@ impl Dataset {
     ///
     /// Returns [Error] if the dataset already exists.
     pub async fn create(
-        batches: &mut dyn RecordBatchReader,
+        batches: &mut Box<dyn RecordBatchReader>,
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
@@ -351,7 +351,8 @@ mod tests {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        Dataset::create(&mut batches, test_uri, Some(write_params))
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::create(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
 

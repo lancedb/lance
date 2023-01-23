@@ -34,7 +34,7 @@ pub struct LanceReader {
 }
 
 impl LanceReader {
-    pub fn new(scanner: LanceScanner, rt: Arc<Runtime>) -> Self {
+    pub fn new(scanner: Arc<LanceScanner>, rt: Arc<Runtime>) -> Self {
         Self {
             schema: scanner.schema(),
             stream: scanner.into_stream(), // needs tokio Runtime

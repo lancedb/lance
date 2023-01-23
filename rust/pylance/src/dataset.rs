@@ -17,9 +17,11 @@
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_schema::ArrowError;
 use arrow::pyarrow::*;
 use arrow_schema::Schema as ArrowSchema;
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::{pyclass, PyObject, PyResult};
@@ -27,10 +29,13 @@ use tokio::runtime::Runtime;
 
 use crate::Scanner;
 use ::lance::dataset::Dataset as LanceDataset;
+use ::lance::dataset::scanner::Scanner as LanceScanner;
+use futures::{StreamExt, TryStreamExt};
 use lance::dataset::{WriteMode, WriteParams};
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
+#[derive(Clone)]
 pub struct Dataset {
     #[pyo3(get)]
     uri: String,
@@ -66,14 +71,35 @@ impl Dataset {
         limit: i64,
         offset: Option<i64>,
     ) -> PyResult<Scanner> {
-        let scanner = Scanner::new(self.ds.clone(), columns, offset, limit, self.rt.clone());
-        Ok(scanner)
+        let mut scanner: LanceScanner = self.ds.scan();
+        if let Some(c) = columns {
+            let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
+            scanner
+                .project(&proj)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        scanner.limit(limit, offset);
+        Ok(Scanner::new(Arc::new(scanner), self.rt.clone()))
     }
 }
 
 #[pyfunction(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
-    let mut reader = ArrowArrayStreamReader::from_pyarrow(reader)?;
+    let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+        let scanner: Scanner = reader.extract()?;
+        Box::new(scanner.to_reader())
+    } else {
+        Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
+    };
+
+    let params = get_write_params(options)?;
+    Runtime::new()?
+        .block_on(async move { LanceDataset::create(&mut batches, uri, params).await })
+        .map(|_| true)
+        .map_err(|err| PyIOError::new_err(err.to_string()))
+}
+
+fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -94,8 +120,7 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
         }
         Some(p)
     };
-    Runtime::new()?
-        .block_on(async move { LanceDataset::create(&mut reader, uri, params).await })
-        .map(|_| true)
-        .map_err(|err| PyIOError::new_err(err.to_string()))
+    Ok(params)
 }
+
+

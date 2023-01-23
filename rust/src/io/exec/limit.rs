@@ -118,7 +118,7 @@ mod tests {
 
     use crate::arrow::RecordBatchBuffer;
     use crate::dataset::{Dataset, WriteParams};
-    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatchReader};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use arrow_select::concat::concat_batches;
     use futures::StreamExt;
@@ -172,7 +172,8 @@ mod tests {
         let mut batches = RecordBatchBuffer::new(expected_batches.clone());
         let mut params = WriteParams::default();
         params.max_rows_per_group = 10;
-        Dataset::create(&mut batches, path, Some(params))
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::create(&mut reader, path, Some(params))
             .await
             .unwrap();
         expected_batches
