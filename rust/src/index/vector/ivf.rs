@@ -55,8 +55,20 @@ impl Ivf {
         })
     }
 
-    /// Use the query vector to find `nprobes` closes partition.
-    fn locate_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
+    /// Ivf model dimension.
+    fn dimension(&self) -> usize {
+        self.centroids.value_length() as usize
+    }
+
+    /// Use the query vector to find `nprobes` closest partitions.
+    fn find_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
+        if query.len() != self.dimension() {
+            return Err(Error::IO(format!(
+                "Ivf::find_partition: dimension mismatch: {} != {}",
+                query.len(),
+                self.dimension()
+            )));
+        }
         let distances = l2_distance(query, &self.centroids)? as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
