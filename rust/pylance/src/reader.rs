@@ -37,7 +37,7 @@ impl LanceReader {
     pub fn new(scanner: LanceScanner, rt: Arc<Runtime>) -> Self {
         Self {
             schema: scanner.schema(),
-            stream: scanner.into_stream(),  // needs tokio Runtime
+            stream: scanner.into_stream(), // needs tokio Runtime
             rt,
         }
     }
@@ -49,7 +49,10 @@ impl Iterator for LanceReader {
     fn next(&mut self) -> Option<Self::Item> {
         let stream = &mut self.stream;
         self.rt.block_on(async {
-            stream.next().await.map(|rs| rs.map_err(|err| ArrowError::from(err)))
+            stream
+                .next()
+                .await
+                .map(|rs| rs.map_err(|err| ArrowError::from(err)))
         })
     }
 }

@@ -19,16 +19,15 @@ use std::sync::Arc;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_schema::Schema as ArrowSchema;
-use pyo3::{pyclass, PyObject, PyResult};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
-use lance::dataset::{WriteMode, WriteParams};
-use ::lance::dataset::Dataset as LanceDataset;
 use crate::Scanner;
-
+use ::lance::dataset::Dataset as LanceDataset;
+use lance::dataset::{WriteMode, WriteParams};
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
