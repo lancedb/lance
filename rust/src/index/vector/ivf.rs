@@ -15,24 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array};
+//! IVF - Inverted File index.
+
+use arrow_array::{
+    cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array,
+};
+use arrow_ord::sort::sort_to_indices;
 
 use crate::arrow::*;
 use crate::index::pb;
+use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
 
 /// Ivf Model
 #[derive(Debug)]
 struct Ivf {
-    // A 2-D (num_partitions * dimension) of float32 array.
-    // It is 64-bit aligned via Arrow.
+    /// Centroids of each partition.
+    ///
+    /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow
+    /// memory allocator.
     centroids: FixedSizeListArray,
 
-    // Offset of each partition in the file.
+    /// Offset of each partition in the file.
     offsets: Vec<usize>,
 
-    // Number of vectors in each partition.
+    /// Number of vectors in each partition.
     lengths: Vec<u32>,
+}
+
+impl Ivf {
+    /// Create an IVF model.
+    fn try_new(centroids: &[f32], dimension: u32) -> Result<Self> {
+        let centorids =
+            FixedSizeListArray::try_new(Float32Array::from(centroids.to_vec()), dimension as i32)?;
+        Ok(Self {
+            centroids: centorids,
+            offsets: vec![],
+            lengths: vec![],
+        })
+    }
+
+    /// Use the query vector to find `nprobes` closes partition.
+    fn locate_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
+        let distances = l2_distance(query, &self.centroids)? as ArrayRef;
+        let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
+        Ok(top_k_partitions)
+    }
 }
 
 /// Convert IvfModel to protobuf.
