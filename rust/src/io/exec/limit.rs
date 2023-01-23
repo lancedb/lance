@@ -24,8 +24,8 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
-use crate::{Error, Result};
 use crate::io::exec::ExecNodeBox;
+use crate::{Error, Result};
 
 /// Dataset Scan Node.
 pub(crate) struct Limit {
@@ -35,11 +35,7 @@ pub(crate) struct Limit {
 
 impl Limit {
     /// Create a new execution node to handle limit offset.
-    pub fn new(
-        child: ExecNodeBox,
-        limit: Option<i64>,
-        offset: Option<i64>,
-    ) -> Self {
+    pub fn new(child: ExecNodeBox, limit: Option<i64>, offset: Option<i64>) -> Self {
         let (tx, rx) = mpsc::channel(4);
         let limit = limit.unwrap_or(0).clone();
         let offset = offset.unwrap_or(0).clone();

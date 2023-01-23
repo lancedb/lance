@@ -28,7 +28,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
-use crate::io::exec::{KNNFlat, Limit, Scan, Take, ExecNodeBox};
+use crate::io::exec::{ExecNodeBox, KNNFlat, Limit, Scan, Take};
 use crate::Result;
 
 /// Dataset Scanner
@@ -129,36 +129,35 @@ impl<'a> Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        let mut exec_node: ExecNodeBox =
-            if let Some(q) = self.nearest.as_ref() {
-                let vector_scan_projection =
-                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node = Box::new(Scan::new(
-                    self.dataset.object_store.clone(),
-                    data_dir.clone(),
-                    self.fragments.clone(),
-                    &vector_scan_projection,
-                    manifest.clone(),
-                    PREFECTH_SIZE,
-                    true,
-                ));
-                let flat_knn_node = Box::new(KNNFlat::new(scan_node, q));
-                Box::new(Take::new(
-                    self.dataset.clone(),
-                    Arc::new(projection.clone()),
-                    flat_knn_node,
-                ))
-            } else {
-                Box::new(Scan::new(
-                    self.dataset.object_store.clone(),
-                    data_dir.clone(),
-                    self.fragments.clone(),
-                    projection,
-                    manifest.clone(),
-                    PREFECTH_SIZE,
-                    with_row_id,
-                ))
-            };
+        let mut exec_node: ExecNodeBox = if let Some(q) = self.nearest.as_ref() {
+            let vector_scan_projection =
+                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+            let scan_node = Box::new(Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                &vector_scan_projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                true,
+            ));
+            let flat_knn_node = Box::new(KNNFlat::new(scan_node, q));
+            Box::new(Take::new(
+                self.dataset.clone(),
+                Arc::new(projection.clone()),
+                flat_knn_node,
+            ))
+        } else {
+            Box::new(Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                with_row_id,
+            ))
+        };
 
         if self.limit.is_some() || self.offset.is_some() {
             exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
