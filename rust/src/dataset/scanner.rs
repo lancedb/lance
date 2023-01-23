@@ -158,7 +158,7 @@ impl<'a> Scanner {
                 &self.projections,
                 manifest.clone(),
                 PREFECTH_SIZE,
-                true,
+                with_row_id,
             );
             Box::new(Limit::new(scan_node, self.limit, self.offset))
         } else {
