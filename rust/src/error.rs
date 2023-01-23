@@ -73,4 +73,10 @@ impl From<tokio::task::JoinError> for Error {
     }
 }
 
+impl From<object_store::path::Error> for Error {
+    fn from(e: object_store::path::Error) -> Self {
+        Self::IO(e.to_string())
+    }
+}
+
 impl std::error::Error for Error {}

@@ -17,6 +17,7 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
+use std::fs;
 use std::sync::Arc;
 
 use ::object_store::{
@@ -55,10 +56,11 @@ impl ObjectStore {
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
             Err(ParseError::RelativeUrlWithoutBase) => {
+                let absolute_path = fs::canonicalize(uri)?;
                 return Ok(Self {
                     inner: Arc::new(LocalFileSystem::new()),
                     scheme: String::from("file"),
-                    base_path: Path::from(uri),
+                    base_path: Path::from_absolute_path(absolute_path)?,
                     prefetch_size: 4 * 1024,
                 });
             }
