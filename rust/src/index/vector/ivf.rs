@@ -44,9 +44,6 @@ const INDEX_FILE_NAME: &str = "index.idx";
 /// IVF PQ Index.
 #[derive(Debug)]
 pub struct IvfPQIndex<'a> {
-    /// Object store to read the indices.
-    object_store: &'a ObjectStore,
-
     reader: ObjectReader<'a>,
 
     /// Index name.
@@ -94,7 +91,6 @@ impl<'a> IvfPQIndex<'a> {
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
         Ok(Self {
-            object_store,
             reader,
             name: name.to_string(),
             column: index_metadata.column.clone(),
@@ -291,17 +287,6 @@ struct Ivf {
 }
 
 impl Ivf {
-    /// Create an IVF model.
-    fn try_new(centroids: &[f32], dimension: u32) -> Result<Self> {
-        let centorids =
-            FixedSizeListArray::try_new(Float32Array::from(centroids.to_vec()), dimension as i32)?;
-        Ok(Self {
-            centroids: centorids,
-            offsets: vec![],
-            lengths: vec![],
-        })
-    }
-
     /// Ivf model dimension.
     fn dimension(&self) -> usize {
         self.centroids.value_length() as usize
