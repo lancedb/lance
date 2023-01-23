@@ -40,6 +40,9 @@ pub struct IvfPQIndex<'a> {
     /// Index name.
     name: String,
 
+    /// The column to build the indices.
+    column: String,
+
     /// Ivf file.
     ivf: Ivf,
 
@@ -74,12 +77,21 @@ impl<'a> IvfPQIndex<'a> {
             read_message(&tail_bytes.slice(offset..))?
         };
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
-        todo!()
+
+        Ok(Self {
+            object_store,
+            name: name.to_string(),
+            column: index_metadata.column.clone(),
+            ivf: index_metadata.ivf,
+            num_bits: index_metadata.num_bits,
+            num_sub_vectors: index_metadata.num_sub_vectors,
+        })
     }
 }
 
 /// Ivf PQ index metadata.
 ///
+/// It contains the on-disk data for a IVF PQ index.
 #[derive(Debug)]
 pub struct IvfPQIndexMetadata {
     /// Index name
