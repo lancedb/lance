@@ -17,11 +17,21 @@
 
 //! IVF - Inverted File index.
 
+use std::sync::Arc;
+
+use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
-    cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array,
+    cast::{as_primitive_array, as_struct_array},
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
+use arrow_schema::DataType;
+use arrow_select::take::take;
+use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 
+use super::{pq::ProductQuantizer, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::index::pb;
@@ -42,6 +52,9 @@ pub struct IvfPQIndex<'a> {
 
     /// The column to build the indices.
     column: String,
+
+    /// Vector dimension.
+    dimension: u32,
 
     /// Ivf file.
     ivf: Ivf,
@@ -82,10 +95,94 @@ impl<'a> IvfPQIndex<'a> {
             object_store,
             name: name.to_string(),
             column: index_metadata.column.clone(),
+            dimension: index_metadata.dimension,
             ivf: index_metadata.ivf,
             num_bits: index_metadata.num_bits,
             num_sub_vectors: index_metadata.num_sub_vectors,
         })
+    }
+
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        key: &Float32Array,
+        k: usize,
+    ) -> Result<RecordBatch> {
+        let offset = self.ivf.offsets[partition_id];
+        let length = self.ivf.lengths[partition_id] as usize;
+        let partition_centroids = self.ivf.centroids.value(partition_id);
+        let resi_key = subtract_dyn(key, &partition_centroids)?;
+        let residual_key: &Float32Array = as_primitive_array(&resi_key);
+
+        // TODO: read code book, PQ code and row_ids in parallel.
+        let code_book_length = ProductQuantizer::codebook_length(self.num_bits, self.dimension);
+        let codebook = self
+            .reader
+            .read_fixed_stride_array(&DataType::Float32, offset, code_book_length as usize)
+            .await?;
+
+        let pq_code_offset = offset + code_book_length as usize * 4;
+        let pq_code_length = self.num_sub_vectors as usize * length;
+        let pq_code = self
+            .reader
+            .read_fixed_stride_array(&DataType::UInt8, pq_code_offset, pq_code_length)
+            .await?;
+
+        let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
+        let row_ids = self
+            .reader
+            .read_fixed_stride_array(&DataType::UInt64, row_id_offset, length)
+            .await?;
+
+        let centroids: &Float32Array = as_primitive_array(codebook.as_ref());
+        let pq = ProductQuantizer::new_with_centroids(
+            self.num_bits,
+            self.num_sub_vectors,
+            Arc::new(centroids.clone()),
+        );
+        let pq_code_arr: &UInt8Array = as_primitive_array(&pq_code);
+        let distances = pq.search(
+            pq_code_arr.data_ref().buffers()[0].typed_data(),
+            residual_key,
+        ) as ArrayRef;
+
+        let top_k_indices = sort_to_indices(&distances, None, Some(k))?;
+
+        let scores = take(&distances, &top_k_indices, None)?;
+        let best_row_ids = take(&row_ids, &top_k_indices, None)?;
+        Ok(RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("score", DataType::Float32, false),
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ])),
+            vec![scores, best_row_ids],
+        )?)
+    }
+}
+
+#[async_trait]
+impl VectorIndex for IvfPQIndex<'_> {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let partition_ids = self.ivf.find_partitions(&query.key, query.nprobs)?;
+        let candidates = stream::iter(partition_ids.values())
+            .then(|part_id| async move {
+                self.search_in_partition(*part_id as usize, &query.key, query.k)
+                    .await
+            })
+            .collect::<Vec<_>>()
+            .await;
+        let mut batches = vec![];
+        for b in candidates {
+            batches.push(b?);
+        }
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+
+        let score_col = batch.column_with_name("score").unwrap();
+        let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
+
+        let struct_arr = StructArray::from(batch);
+        let taken_scores = take(&struct_arr, &refined_index, None)?;
+        Ok(as_struct_array(&taken_scores).into())
     }
 }
 
@@ -99,6 +196,8 @@ pub struct IvfPQIndexMetadata {
 
     /// The column to build the index for.
     column: String,
+
+    dimension: u32,
 
     /// The version of dataset where this index was built.
     dataset_version: u64,
@@ -124,6 +223,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
 
             implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
                 spec_version: 1,
+                dimension: idx.dimension,
                 pq: Some(pb::ProductQuantilizationInfo {
                     num_bits: idx.num_bits,
                     num_subvectors: idx.num_sub_vectors,
@@ -148,6 +248,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                 pb::index::Implementation::VectorIndex(vidx) => Self {
                     name: idx.name.clone(),
                     column: idx.columns[0].to_string(),
+                    dimension: vidx.dimension,
                     dataset_version: idx.dataset_version,
                     ivf: vidx
                         .ivf

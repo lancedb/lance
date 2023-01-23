@@ -75,9 +75,12 @@ message VectorIndex {
   // Index specificdation version.
   uint32 spec_version = 1;
 
+  /// Vector dimension;
+  uint32 dimension = 2;
+
   // Invert file index info.
-  IVF ivf = 2;
+  IVF ivf = 3;
 
   // Product quantilization info.
-  ProductQuantilizationInfo pq = 3;
+  ProductQuantilizationInfo pq = 4;
 }
