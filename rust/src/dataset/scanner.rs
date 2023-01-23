@@ -28,7 +28,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
-use crate::io::exec::{ExecNode, KNNFlat, Scan, Take};
+use crate::io::exec::{ExecNode, KNNFlat, Scan, Take, Limit};
 use crate::Result;
 
 /// Dataset Scanner
@@ -147,6 +147,17 @@ impl<'a> Scanner {
                 Arc::new(projection.clone()),
                 flat_knn_node,
             ))
+        } else if self.limit.is_some() || self.offset.is_some() {
+            let scan_node = Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                &self.projections,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                true,
+            );
+            Box::new(Limit::new(scan_node, self.limit, self.offset))
         } else {
             Box::new(Scan::new(
                 self.dataset.object_store.clone(),

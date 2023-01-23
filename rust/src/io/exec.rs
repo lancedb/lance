@@ -21,11 +21,13 @@ use futures::stream::Stream;
 mod knn;
 mod scan;
 mod take;
+mod limit;
 
 use crate::Result;
 pub(crate) use knn::KNNFlat;
 pub(crate) use scan::Scan;
 pub(crate) use take::Take;
+pub(crate) use limit::Limit;
 
 #[derive(Debug)]
 pub enum NodeType {
@@ -33,7 +35,8 @@ pub enum NodeType {
     Scan = 1,
     /// Dataset Take (row_ids).
     Take = 2,
-
+    /// Limit / offset
+    Limit = 4,  // Filter can be 3
     /// Knn Flat Scan
     KnnFlat = 10,
 }
