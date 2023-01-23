@@ -26,8 +26,8 @@ use arrow_array::{
     UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
-use arrow_select::take::take;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
@@ -35,7 +35,7 @@ use super::{pq::ProductQuantizer, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::index::pb;
-use crate::io::{read_message, read_metadata_offset, ObjectStore};
+use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset, ObjectStore};
 use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
 
@@ -46,6 +46,8 @@ const INDEX_FILE_NAME: &str = "index.idx";
 pub struct IvfPQIndex<'a> {
     /// Object store to read the indices.
     object_store: &'a ObjectStore,
+
+    reader: ObjectReader<'a>,
 
     /// Index name.
     name: String,
@@ -93,6 +95,7 @@ impl<'a> IvfPQIndex<'a> {
 
         Ok(Self {
             object_store,
+            reader,
             name: name.to_string(),
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension,
@@ -118,20 +121,20 @@ impl<'a> IvfPQIndex<'a> {
         let code_book_length = ProductQuantizer::codebook_length(self.num_bits, self.dimension);
         let codebook = self
             .reader
-            .read_fixed_stride_array(&DataType::Float32, offset, code_book_length as usize)
+            .read_fixed_stride_array(&DataType::Float32, offset, code_book_length as usize, ..)
             .await?;
 
         let pq_code_offset = offset + code_book_length as usize * 4;
         let pq_code_length = self.num_sub_vectors as usize * length;
         let pq_code = self
             .reader
-            .read_fixed_stride_array(&DataType::UInt8, pq_code_offset, pq_code_length)
+            .read_fixed_stride_array(&DataType::UInt8, pq_code_offset, pq_code_length, ..)
             .await?;
 
         let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
         let row_ids = self
             .reader
-            .read_fixed_stride_array(&DataType::UInt64, row_id_offset, length)
+            .read_fixed_stride_array(&DataType::UInt64, row_id_offset, length, ..)
             .await?;
 
         let centroids: &Float32Array = as_primitive_array(codebook.as_ref());
@@ -153,7 +156,7 @@ impl<'a> IvfPQIndex<'a> {
         Ok(RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("score", DataType::Float32, false),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new("_rowid", DataType::UInt64, false),
             ])),
             vec![scores, best_row_ids],
         )?)
@@ -177,7 +180,12 @@ impl VectorIndex for IvfPQIndex<'_> {
         }
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let score_col = batch.column_with_name("score").unwrap();
+        let score_col = batch.column_by_name("score").ok_or_else(|| {
+            Error::IO(format!(
+                "score column does not exist in batch: {}",
+                batch.schema()
+            ))
+        })?;
         let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
 
         let struct_arr = StructArray::from(batch);
