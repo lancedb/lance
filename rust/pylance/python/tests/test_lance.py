@@ -18,11 +18,11 @@ def test_table_roundtrip(tmp_path):
 
     one_col = dataset.to_table(columns=['a'])
     assert one_col == tbl.select(['a'])
-    # TODO enable offset limit in Scan ExecNode
+
     table = dataset.to_table(columns=['a'], limit=20)
-    # assert len(table) == 20
-    # with_offset = dataset.to_table(columns=['a'], offset=10, limit=10)
-    # assert with_offset == table[10:]
+    assert len(table) == 20
+    with_offset = dataset.to_table(columns=['a'], offset=10, limit=10)
+    assert with_offset == table[10:]
 
 
 def test_input_types(tmp_path):
