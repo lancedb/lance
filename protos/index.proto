@@ -22,25 +22,37 @@ package lance.index.pb;
 
 // The type of an index.
 enum IndexType {
-NONE = 0;
+  NONE = 0;
 
-// Flat index
-VECTOR_FLAT = 100;
+  // Flat index
+  VECTOR_FLAT = 100;
 
-// IVF + PQ index
-VECTOR_IVF_PQ = 101;
+  // IVF + PQ index
+  VECTOR_IVF_PQ = 101;
 }
 
 message Index {
-    // The unique index name in the dataset.
-    string name = 1;
+  // The unique index name in the dataset.
+  string name = 1;
 
-    // Columns to be used to build the columns.
-    repeated string columns = 2;
+  // Columns to be used to build the columns.
+  repeated string columns = 2;
 
-    // The version of the dataset this index was built from.
-    uint64 dataset_version = 3;
+  // The version of the dataset this index was built from.
+  uint64 dataset_version = 3;
 
-    // The [`IndexType`] of the index.
-    IndexType index_type = 4;
+  // The [`IndexType`] of the index.
+  IndexType index_type = 4;
 }
+
+// Inverted Index File Metadata.
+message IVF {
+    // Centroids of parittions. `dimension * num_partitions` of float32s.
+    repeated float centroids = 1;
+
+    // File offset of each partition.
+    repeated uint64 offsets = 2;
+
+    // Number of records in the partition.
+    repeated uint32 lengths = 3;
+  }
