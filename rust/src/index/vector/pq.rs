@@ -18,14 +18,97 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array};
+use arrow_array::{UInt64Array, UInt8Array};
+use arrow_schema::DataType;
 
+use crate::io::object_reader::ObjectReader;
+use crate::Result;
 use crate::{arrow::*, utils::distance::l2_distance};
 
-/// Product Quantization, optimized for [Apache Arrow].
+/// Product Quantization Index.
+///
+pub struct PQ {
+    /// Number of bits for the centroids.
+    ///
+    /// Only support 8, as one of `u8` byte now.
+    pub nbits: u32,
+
+    /// Number of sub-vectors.
+    pub num_sub_sectors: u32,
+
+    /// Vector dimension.
+    pub dimension: u32,
+
+    /// PQ codebook
+    ///
+    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
+    ///
+    /// Use a layout that is cache / SIMD friendly to compute centroid.
+    /// But not sure how to make distance lookup via PQ code lookup
+    /// be cache friendly tho.
+    ///
+    /// Layout:
+    ///
+    ///  - *row*: all centroids for the same sub-vector.
+    ///  - *column*: the centroid value of the n-th sub-vector.
+    ///
+    /// ```text
+    /// // Centroids for a sub-vector.
+    /// Codebook[sub_vector_id][pq_code]
+    /// ```
+    pub codebook: Arc<Float32Array>,
+
+    /// PQ code
+    pub code: Arc<UInt8Array>,
+
+    /// ROW Id used to refer to the actual row in dataset.
+    pub row_ids: Arc<UInt64Array>,
+}
+
+impl PQ {
+    /// Load a PQ index (page) from the disk.
+    pub async fn load(
+        reader: &ObjectReader<'_>,
+        pq: &ProductQuantizer,
+        offset: usize,
+        length: usize,
+    ) -> Result<PQ> {
+        // TODO: read code book, PQ code and row_ids in parallel.
+        let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
+        let codebook = reader
+            .read_fixed_stride_array(&DataType::Float32, offset, code_book_length as usize, ..)
+            .await?;
+
+        let pq_code_offset = offset + code_book_length as usize * 4;
+        let pq_code_length = pq.num_sub_vectors as usize * length;
+        let pq_code = reader
+            .read_fixed_stride_array(&DataType::UInt8, pq_code_offset, pq_code_length, ..)
+            .await?;
+
+        let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
+        let row_ids = reader
+            .read_fixed_stride_array(&DataType::UInt64, row_id_offset, length, ..)
+            .await?;
+
+        Ok(Self {
+            nbits: pq.nbits,
+            num_sub_sectors: pq.num_sub_vectors as u32,
+            dimension: pq.dimension,
+            // TODO: reader returns typed array to avoid one array copy.
+            codebook: Arc::new(as_primitive_array(&codebook).clone()),
+            code: Arc::new(as_primitive_array(&pq_code).clone()),
+            row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+        })
+    }
+}
+
+/// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
+///
+#[derive(Debug)]
 pub struct ProductQuantizer {
     /// Number of bits for the centroids.
     ///
-    /// Only support 8, as one of `u8` byte, for now.
+    /// Only support 8, as one of `u8` byte now.
     pub nbits: u32,
 
     /// Number of sub-vectors.
@@ -36,7 +119,7 @@ pub struct ProductQuantizer {
 
     /// PQ codebook
     ///
-    /// ```((2 ^ nbits) * num_subvectors)``` of `f32`
+    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
     ///
     /// Use a layout that is cache / SIMD friendly to compute centroid.
     /// But not sure how to make distance lookup via PQ code lookup
@@ -66,7 +149,7 @@ impl ProductQuantizer {
         }
     }
 
-    /// Re-construct ProductQuantizer with the centroids.
+    /// Re-construct [`ProductQuantizer`] with the centroids.
     pub fn new_with_centroids(
         num_bits: u32,
         num_sub_vectors: u32,

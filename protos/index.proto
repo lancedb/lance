@@ -22,20 +22,15 @@ package lance.index.pb;
 
 // The type of an index.
 enum IndexType {
-  NONE = 0;
-
-  // Flat index
-  VECTOR_FLAT = 100;
-
-  // IVF + PQ index
-  VECTOR_IVF_PQ = 101;
+  // Vector index
+  VECTOR = 0;
 }
 
 message Index {
   // The unique index name in the dataset.
   string name = 1;
 
-  // Columns to be used to build the columns.
+  // Columns to be used to build the index.
   repeated string columns = 2;
 
   // The version of the dataset this index was built from.
@@ -44,6 +39,7 @@ message Index {
   // The [`IndexType`] of the index.
   IndexType index_type = 4;
 
+  /// Index implementation details.
   oneof implementation {
     VectorIndex vector_index = 5;
   }
@@ -51,7 +47,7 @@ message Index {
 
 // Inverted Index File Metadata.
 message IVF {
-  // Centroids of parittions. `dimension * num_partitions` of float32s.
+  // Centroids of partitions. `dimension * num_partitions` of float32s.
   repeated float centroids = 1;
 
   // File offset of each partition.
@@ -61,26 +57,41 @@ message IVF {
   repeated uint32 lengths = 3;
 }
 
-// Metadata of Product Quantilization.
-message ProductQuantilizationInfo {
+// Product Quantization.
+message PQ {
   // The number of bits to present a centroid.
   uint32 num_bits = 1;
 
-  // Number of subvectors.
-  uint32 num_subvectors = 2;
+  // Number of sub vectors.
+  uint32 num_sub_vectors = 2;
 }
 
-// Vertor Index Metadata
+// Flat Index
+message Flat {}
+
+// One stage in the vector index pipeline.
+message VectorIndexStage {
+    oneof stage {
+        Flat flat = 1;
+        IVF ivf = 2;
+        PQ pq = 3;
+    }
+}
+
+// Vector Index Metadata
 message VectorIndex {
-  // Index specificdation version.
+  // Index specification version.
   uint32 spec_version = 1;
 
-  /// Vector dimension;
+  // Vector dimension;
   uint32 dimension = 2;
 
-  // Invert file index info.
-  IVF ivf = 3;
-
-  // Product quantilization info.
-  ProductQuantilizationInfo pq = 4;
+  // Composed vector index stages.
+  //
+  // For example, `IVF_PQ` index type can be expressed as:
+  //
+  // ```no_run
+  // stages = vec![Ivf{}, PQ{}]
+  // ```
+  repeated VectorIndexStage stages = 3;
 }

@@ -35,7 +35,7 @@ use super::{pq::ProductQuantizer, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::index::pb;
-use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset, ObjectStore};
+use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{Error, Result};
 
@@ -201,6 +201,7 @@ pub struct IvfPQIndexMetadata {
     /// The column to build the index for.
     column: String,
 
+    /// Vector dimension.
     dimension: u32,
 
     /// The version of dataset where this index was built.
@@ -223,16 +224,23 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
             name: idx.name.clone(),
             columns: vec![idx.column.clone()],
             dataset_version: idx.dataset_version,
-            index_type: pb::IndexType::VectorIvfPq.into(),
-
+            index_type: pb::IndexType::Vector.into(),
             implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
                 spec_version: 1,
                 dimension: idx.dimension,
-                pq: Some(pb::ProductQuantilizationInfo {
-                    num_bits: idx.num_bits,
-                    num_subvectors: idx.num_sub_vectors,
-                }),
-                ivf: Some(pb::Ivf::try_from(&idx.ivf)?),
+                stages: vec![
+                    pb::VectorIndexStage {
+                        stage: Some(pb::vector_index_stage::Stage::Ivf(pb::Ivf::try_from(
+                            &idx.ivf,
+                        )?)),
+                    },
+                    pb::VectorIndexStage {
+                        stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq {
+                            num_bits: idx.num_bits,
+                            num_sub_vectors: idx.num_sub_vectors,
+                        })),
+                    },
+                ],
             })),
         })
     }
@@ -245,7 +253,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
         if idx.columns.len() != 1 {
             return Err(Error::Schema("IVF_PQ only supports 1 column".to_string()));
         }
-        assert_eq!(idx.index_type, pb::IndexType::VectorIvfPq as i32);
+        assert_eq!(idx.index_type, pb::IndexType::Vector as i32);
 
         let metadata = if let Some(idx_impl) = idx.implementation.as_ref() {
             match idx_impl {
@@ -330,7 +338,6 @@ impl TryFrom<&pb::Ivf> for Ivf {
     type Error = Error;
 
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
-        // let centroids_arr = proto.centroids.values();
         let f32_centroids: Float32Array = Float32Array::from(proto.centroids.clone());
         let dimension = f32_centroids.len() / proto.offsets.len();
         let centroids = FixedSizeListArray::try_new(f32_centroids, dimension as i32)?;
