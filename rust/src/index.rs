@@ -18,6 +18,8 @@
 //! Secondary Index
 //!
 
+use async_trait::async_trait;
+
 /// Protobuf definitions for the index on-disk format.
 #[allow(clippy::all)]
 pub mod pb {
@@ -25,3 +27,22 @@ pub mod pb {
 }
 
 pub mod vector;
+
+use crate::Result;
+
+/// Index Type
+pub enum IndexType {
+    // Preserve 0-100 for simple indices.
+
+    // 100+ and up for vector index.
+    /// Flat vector index.
+    Vector = 100,
+}
+
+/// Builds index.
+#[async_trait]
+pub trait IndexBuilder {
+    fn index_type() -> IndexType;
+
+    async fn build(&self) -> Result<()>;
+}

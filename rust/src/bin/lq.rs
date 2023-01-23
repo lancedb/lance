@@ -166,7 +166,7 @@ async fn create_index(
         .ok_or_else(|| Error::IO(format!("Column {} does not exist in dataset", col)))?;
     match field.data_type() {
         DataType::FixedSizeList(elem_type, _) => {
-            if !matches!(elem_type.as_ref(), &DataType::Float32) {
+            if !matches!(elem_type.as_ref().data_type(), &DataType::Float32) {
                 return Err(Error::IO(format!(
                     "Only support to create vector index on f32 vector, but got {}",
                     elem_type.as_ref()

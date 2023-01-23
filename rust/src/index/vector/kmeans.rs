@@ -14,3 +14,34 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+use arrow_array::Float32Array;
+
+use crate::Result;
+
+#[cfg(feature = "faiss")]
+fn train_kmeans_faiss(
+    array: &Float32Array,
+    dimension: usize,
+    num_clusters: u32,
+    max_iters: u32,
+) -> Result<Vec<f32>> {
+    use faiss::cluster::kmeans_clustering;
+
+    let model = kmeans_clustering(dimension as u32, num_clusters, array.values()).unwrap();
+    Ok(model.centroids)
+}
+
+/// Train kmean models and returns the centroids.
+pub fn train_kmeans(
+    array: &Float32Array,
+    dimension: usize,
+    num_clusters: u32,
+    max_iterations: u32,
+) -> Result<Vec<f32>> {
+    #[cfg(feature = "faiss")]
+    return train_kmeans(array, dimension, num_clusters, max_iterations);
+
+    #[cfg(not(feature = "faiss"))]
+    Ok(vec![])
+}
