@@ -32,11 +32,11 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
 use super::{pq::ProductQuantizer, Query, VectorIndex};
-use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::index::pb;
 use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
+use crate::{arrow::*, index::pb::vector_index_stage::Stage};
 use crate::{Error, Result};
 
 const INDEX_FILE_NAME: &str = "index.idx";
@@ -58,7 +58,7 @@ pub struct IvfPQIndex<'a> {
     /// Ivf file.
     ivf: Ivf,
 
-    /// Number of bits used for product quantlization centroids.
+    /// Number of bits used for product quantization centroids.
     num_bits: u32,
     num_sub_vectors: u32,
 }
@@ -96,8 +96,8 @@ impl<'a> IvfPQIndex<'a> {
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension,
             ivf: index_metadata.ivf,
-            num_bits: index_metadata.num_bits,
-            num_sub_vectors: index_metadata.num_sub_vectors,
+            num_bits: index_metadata.partition_quantizer.nbits,
+            num_sub_vectors: index_metadata.partition_quantizer.num_sub_vectors as u32,
         })
     }
 
@@ -211,8 +211,7 @@ pub struct IvfPQIndexMetadata {
     ivf: Ivf,
 
     // PQ configurations.
-    num_bits: u32,
-    num_sub_vectors: u32,
+    partition_quantizer: ProductQuantizer,
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -236,8 +235,8 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                     },
                     pb::VectorIndexStage {
                         stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq {
-                            num_bits: idx.num_bits,
-                            num_sub_vectors: idx.num_sub_vectors,
+                            num_bits: idx.partition_quantizer.nbits,
+                            num_sub_vectors: idx.partition_quantizer.num_sub_vectors as u32,
                         })),
                     },
                 ],
@@ -257,20 +256,22 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
 
         let metadata = if let Some(idx_impl) = idx.implementation.as_ref() {
             match idx_impl {
-                pb::index::Implementation::VectorIndex(vidx) => Self {
+                pb::index::Implementation::VectorIndex(vidx) => Ok(Self {
                     name: idx.name.clone(),
                     column: idx.columns[0].to_string(),
                     dimension: vidx.dimension,
                     dataset_version: idx.dataset_version,
-                    ivf: vidx
-                        .ivf
-                        .as_ref()
-                        .map(|ivf| Ivf::try_from(ivf).unwrap())
+                    ivf: vidx.stages[0]
+                        .stage
+                        .map(|stage| match stage {
+                            Stage::Ivf(i) => Ivf::try_from(&i),
+                            _ => panic!(),
+                        })
                         .ok_or_else(|| Error::IO("Could not read IVF metadata".to_string()))?,
                     num_bits: vidx.pq.as_ref().map(|pq| pq.num_bits).unwrap_or(8),
                     num_sub_vectors: vidx.pq.as_ref().map(|pq| pq.num_subvectors).unwrap(),
-                },
-            }
+                }),
+            }?
         } else {
             return Err(Error::IO("Invalid protobuf".to_string()));
         };

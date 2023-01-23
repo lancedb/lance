@@ -71,11 +71,14 @@ message Flat {}
 
 // One stage in the vector index pipeline.
 message VectorIndexStage {
-    oneof stage {
-        Flat flat = 1;
-        IVF ivf = 2;
-        PQ pq = 3;
-    }
+  oneof stage {
+    // Flat index
+    Flat flat = 1;
+    // `IVF` - Inverted File
+    IVF ivf = 2;
+    // Product Quantization
+    PQ pq = 3;
+  }
 }
 
 // Vector Index Metadata

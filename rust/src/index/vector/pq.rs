@@ -17,9 +17,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array};
-use arrow_array::{UInt64Array, UInt8Array};
-use arrow_schema::DataType;
+use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
+use arrow_ord::sort::sort_to_indices;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_select::take::take;
 
 use crate::io::object_reader::ObjectReader;
 use crate::Result;
@@ -27,17 +29,17 @@ use crate::{arrow::*, utils::distance::l2_distance};
 
 /// Product Quantization Index.
 ///
-pub struct PQ {
+pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
     pub nbits: u32,
 
     /// Number of sub-vectors.
-    pub num_sub_sectors: u32,
+    pub num_sub_vectors: usize,
 
     /// Vector dimension.
-    pub dimension: u32,
+    pub dimension: usize,
 
     /// PQ codebook
     ///
@@ -65,14 +67,14 @@ pub struct PQ {
     pub row_ids: Arc<UInt64Array>,
 }
 
-impl PQ {
+impl PQIndex {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
         reader: &ObjectReader<'_>,
         pq: &ProductQuantizer,
         offset: usize,
         length: usize,
-    ) -> Result<PQ> {
+    ) -> Result<PQIndex> {
         // TODO: read code book, PQ code and row_ids in parallel.
         let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
         let codebook = reader
@@ -92,13 +94,68 @@ impl PQ {
 
         Ok(Self {
             nbits: pq.nbits,
-            num_sub_sectors: pq.num_sub_vectors as u32,
+            num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            // TODO: reader returns typed array to avoid one array copy.
+            // TODO: make reader returns typed array to avoid one array copy.
             codebook: Arc::new(as_primitive_array(&codebook).clone()),
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
         })
+    }
+
+    /// Get the centroids for one sub-vector.
+    pub fn centroids(&self, sub_vector_idx: usize) -> FixedSizeListArray {
+        assert!(sub_vector_idx < self.num_sub_vectors as usize);
+
+        let arr = self.codebook.slice(
+            sub_vector_idx * self.dimension as usize,
+            self.dimension as usize,
+        );
+        let f32_arr: &Float32Array = as_primitive_array(&arr);
+        FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
+            .unwrap()
+    }
+
+    /// Search top-k nearest neighbors for `key` within one PQ partition.
+    ///
+    pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
+        assert_eq!(self.code.len() % self.num_sub_vectors as usize, 0);
+
+        // Build distance table for each sub-centroid to the query key.
+        //
+        // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        let mut distance_table: Vec<f32> = vec![];
+
+        let sub_vector_length = self.dimension / self.num_sub_vectors;
+        for i in 0..self.num_sub_vectors {
+            let from = key.slice(i * sub_vector_length, sub_vector_length).clone();
+            let subvec_centroids = self.centroids(i);
+            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids).unwrap();
+            distance_table.extend(distances.iter().map(|d| d.unwrap_or(0.0)));
+        }
+
+        let scores = Arc::new(Float32Array::from_iter(
+            self.code
+                .values()
+                .chunks_exact(self.num_sub_vectors as usize)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            distance_table[sub_vec_idx * self.num_sub_vectors + *centroid as usize]
+                        })
+                        .sum::<f32>()
+                }),
+        )) as ArrayRef;
+        let indices = sort_to_indices(&scores, None, Some(k))?;
+        let scores = take(&scores, &indices, None)?;
+        let row_ids = take(self.row_ids.as_ref(), &indices, None)?;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("score", DataType::Float32, false),
+            ArrowField::new("_rowid", DataType::UInt64, false),
+        ]));
+        Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
     }
 }
 
@@ -185,34 +242,5 @@ impl ProductQuantizer {
         let f32_arr: &Float32Array = as_primitive_array(&arr);
         FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
             .unwrap()
-    }
-
-    /// Search a Residual vector `key`.
-    ///
-    pub fn search(&self, code: &[u8], key: &Float32Array) -> Arc<Float32Array> {
-        assert_eq!(code.len() % self.num_sub_vectors as usize, 0);
-        // Build distance table for each sub-centroid to the query key.
-        //
-        // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
-        let mut distance_table: Vec<f32> = vec![];
-
-        let sub_vector_length = self.dimension as usize / self.num_sub_vectors;
-        for i in 0..self.num_sub_vectors {
-            let from = key.slice(i * sub_vector_length, sub_vector_length).clone();
-            let subvec_centroids = self.centroids(i);
-            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids).unwrap();
-            distance_table.extend(distances.iter().map(|d| d.unwrap_or(0.0)));
-        }
-
-        let distances_per_code =
-            Float32Array::from_iter(code.chunks_exact(self.num_sub_vectors as usize).map(|c| {
-                c.iter()
-                    .enumerate()
-                    .map(|(sub_vec_idx, centroid)| {
-                        distance_table[sub_vec_idx * self.num_sub_vectors + *centroid as usize]
-                    })
-                    .sum::<f32>()
-            }));
-        Arc::new(distances_per_code)
     }
 }
