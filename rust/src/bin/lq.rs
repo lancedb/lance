@@ -165,9 +165,11 @@ async fn create_index(
         .field(col)
         .ok_or_else(|| Error::IO(format!("Column {} does not exist in dataset", col)))?;
     if matches!(field.data_type(), DataType::FixedSizeList(elem_type, _)) {
-
     } else {
-        return Err(Error::IO(format!("Column '{}' is not a vector column: {}", col, field)));
+        return Err(Error::IO(format!(
+            "Column '{}' is not a vector column: {}",
+            col, field
+        )));
     }
     todo!()
 }
