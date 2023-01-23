@@ -22,12 +22,14 @@ mod knn;
 mod limit;
 mod scan;
 mod take;
+mod limit;
 
 use crate::Result;
 pub(crate) use knn::KNNFlat;
 pub(crate) use limit::Limit;
 pub(crate) use scan::Scan;
 pub(crate) use take::Take;
+pub(crate) use limit::Limit;
 
 #[derive(Debug)]
 pub enum NodeType {
