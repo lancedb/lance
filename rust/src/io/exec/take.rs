@@ -44,7 +44,7 @@ impl Take {
     pub fn new(
         dataset: Arc<Dataset>,
         schema: Arc<Schema>,
-        child: impl ExecNode + Unpin + Send + 'static,
+        child: Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 

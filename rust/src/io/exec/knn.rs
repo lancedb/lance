@@ -38,7 +38,7 @@ pub struct KNNFlat {
 impl KNNFlat {
     /// Construct a [KNNFlat] node.
     pub(crate) fn new(
-        child: impl Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static,
+        child: Box<dyn Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
         query: &Query,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);

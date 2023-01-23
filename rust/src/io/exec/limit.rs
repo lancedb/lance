@@ -35,7 +35,7 @@ pub(crate) struct Limit {
 impl Limit {
     /// Create a new execution node to handle limit offset.
     pub fn new(
-        child: impl ExecNode + Unpin + Send + 'static,
+        child: Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send + 'static>,
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Self {
