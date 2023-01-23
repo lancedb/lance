@@ -172,7 +172,7 @@ pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
 
     /// Vector dimension.
-    dimension: u32,
+    dimension: usize,
 
     /// PQ codebook
     ///
@@ -196,7 +196,7 @@ pub struct ProductQuantizer {
 
 impl ProductQuantizer {
     /// Build a Product quantizer with `m` sub-vectors, and `nbits` to present centroids.
-    pub fn new(m: u32, nbits: u32, dimension: u32) -> Self {
+    pub fn new(m: usize, nbits: u32, dimension: usize) -> Self {
         assert!(nbits == 8, "nbits can only be 8");
         Self {
             nbits,
@@ -206,27 +206,13 @@ impl ProductQuantizer {
         }
     }
 
-    /// Re-construct [`ProductQuantizer`] with the centroids.
-    pub fn new_with_centroids(
-        num_bits: u32,
-        num_sub_vectors: u32,
-        centroids: Arc<Float32Array>,
-    ) -> Self {
-        Self {
-            nbits: num_bits,
-            num_sub_vectors: num_sub_vectors as usize,
-            dimension: centroids.len() as u32 / ProductQuantizer::num_centorids(num_bits),
-            codebook: Some(centroids),
-        }
-    }
-
-    pub fn num_centorids(num_bits: u32) -> u32 {
-        2_u32.pow(num_bits)
+    pub fn num_centroids(num_bits: u32) -> usize {
+        2_usize.pow(num_bits)
     }
 
     /// Calculate codebook length.
-    pub fn codebook_length(num_bits: u32, num_sub_vectors: u32) -> u32 {
-        ProductQuantizer::num_centorids(num_bits) * num_sub_vectors
+    pub fn codebook_length(num_bits: u32, num_sub_vectors: usize) -> usize {
+        ProductQuantizer::num_centroids(num_bits) * num_sub_vectors
     }
 
     /// Get the centroids for one sub-vector.
