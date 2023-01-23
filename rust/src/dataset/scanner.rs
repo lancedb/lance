@@ -28,7 +28,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 
-use crate::io::exec::{ExecNode, KNNFlat, Scan, Take};
+use crate::io::exec::{ExecNodeBox, KNNFlat, Limit, Scan, Take};
 use crate::Result;
 
 /// Dataset Scanner
@@ -129,10 +129,10 @@ impl<'a> Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
+        let mut exec_node: ExecNodeBox = if let Some(q) = self.nearest.as_ref() {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-            let scan_node = Scan::new(
+            let scan_node = Box::new(Scan::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),
@@ -140,8 +140,8 @@ impl<'a> Scanner {
                 manifest.clone(),
                 PREFECTH_SIZE,
                 true,
-            );
-            let flat_knn_node = KNNFlat::new(scan_node, q);
+            ));
+            let flat_knn_node = Box::new(KNNFlat::new(scan_node, q));
             Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),
@@ -159,6 +159,10 @@ impl<'a> Scanner {
             ))
         };
 
+        if self.limit.is_some() || self.offset.is_some() {
+            exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
+        }
+
         ScannerStream::new(exec_node)
     }
 }
@@ -167,11 +171,11 @@ impl<'a> Scanner {
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
-    exec_node: Box<dyn ExecNode + Unpin + Send>,
+    exec_node: ExecNodeBox,
 }
 
 impl ScannerStream {
-    fn new<'a>(exec_node: Box<dyn ExecNode + Unpin + Send>) -> Self {
+    fn new<'a>(exec_node: ExecNodeBox) -> Self {
         Self { exec_node }
     }
 }

@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use super::{ExecNode, NodeType};
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::Query;
+use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
@@ -37,10 +38,7 @@ pub struct KNNFlat {
 
 impl KNNFlat {
     /// Construct a [KNNFlat] node.
-    pub(crate) fn new(
-        child: impl Stream<Item = Result<RecordBatch>> + Unpin + Send + 'static,
-        query: &Query,
-    ) -> Self {
+    pub(crate) fn new(child: ExecNodeBox, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();

@@ -19,11 +19,13 @@ use arrow_array::RecordBatch;
 use futures::stream::Stream;
 
 mod knn;
+mod limit;
 mod scan;
 mod take;
 
 use crate::Result;
 pub(crate) use knn::KNNFlat;
+pub(crate) use limit::Limit;
 pub(crate) use scan::Scan;
 pub(crate) use take::Take;
 
@@ -33,7 +35,8 @@ pub enum NodeType {
     Scan = 1,
     /// Dataset Take (row_ids).
     Take = 2,
-
+    /// Limit / offset
+    Limit = 4, // Filter can be 3
     /// Knn Flat Scan
     KnnFlat = 10,
 }
@@ -42,3 +45,5 @@ pub enum NodeType {
 pub(crate) trait ExecNode: Stream<Item = Result<RecordBatch>> {
     fn node_type(&self) -> NodeType;
 }
+
+pub(crate) type ExecNodeBox = Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send>;

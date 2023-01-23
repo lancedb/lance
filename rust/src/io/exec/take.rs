@@ -29,6 +29,7 @@ use super::{ExecNode, NodeType};
 use crate::arrow::RecordBatchExt;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
+use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
 
 /// Dataset Take Node.
@@ -41,11 +42,7 @@ pub(crate) struct Take {
 }
 
 impl Take {
-    pub fn new(
-        dataset: Arc<Dataset>,
-        schema: Arc<Schema>,
-        child: impl ExecNode + Unpin + Send + 'static,
-    ) -> Self {
+    pub fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: ExecNodeBox) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
         let bg_thread = tokio::spawn(async move {
