@@ -72,12 +72,12 @@ impl Limit {
                         }
 
                         if tx.is_closed() {
-                            eprintln!("ExecNode(Take): channel closed");
-                            return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
+                            eprintln!("ExecNode(Limit): channel closed");
+                            return Err(Error::IO("ExecNode(Limit): channel closed".to_string()));
                         }
                         if let Err(e) = tx.send(Ok(b)).await {
-                            eprintln!("ExecNode(Take): {}", e);
-                            return Err(Error::IO("ExecNode(Take): channel closed".to_string()));
+                            eprintln!("ExecNode(Limit): {}", e);
+                            return Err(Error::IO("ExecNode(Limit): channel closed".to_string()));
                         }
                         Ok((off, lim, tx))
                     },
@@ -108,5 +108,68 @@ impl Stream for Limit {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::Range;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::arrow::RecordBatchBuffer;
+    use crate::dataset::Dataset;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+    use arrow_select::concat::concat_batches;
+    use futures::StreamExt;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_limit() {
+        // TODO setting up a unit test for an ExecNode isn't simple.
+        //      consider changing the interface to a stream of RecordBatch
+        //      so for unit testing it's easy to setup the child node
+        let temp = TempDir::new().unwrap();
+        let mut file_path = PathBuf::from(temp.as_ref());
+        file_path.push("limit_test.lance");
+        let path = file_path.to_str().unwrap();
+        let expected_batches = write_data(path).await;
+        let expected_combined =
+            concat_batches(&expected_batches[0].schema(), &expected_batches).unwrap();
+
+        let dataset = Dataset::open(path).await.unwrap();
+        let scanner = dataset.scan();
+        let actual_batches: Vec<RecordBatch> = scanner
+            .into_stream()
+            .map(|b| b.unwrap())
+            .collect::<Vec<RecordBatch>>()
+            .await;
+        let actual_combined = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+
+        assert_eq!(expected_combined, actual_combined);
+    }
+
+    async fn write_data(path: &str) -> Vec<RecordBatch> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int64,
+            true,
+        )])) as SchemaRef;
+
+        // Write 3 batches.
+        let expected_batches: Vec<RecordBatch> = (0..3)
+            .map(|batch_id| {
+                let value_range: Range<i64> = batch_id * 10..batch_id * 10 + 10;
+                let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter(
+                    value_range.clone().collect::<Vec<_>>(),
+                ))];
+                RecordBatch::try_new(schema.clone(), columns).unwrap()
+            })
+            .collect();
+        let mut batches = RecordBatchBuffer::new(expected_batches.clone());
+        Dataset::create(&mut batches, path, None).await.unwrap();
+        expected_batches
     }
 }

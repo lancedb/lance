@@ -211,7 +211,7 @@ impl ScannerStream {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Self {
-        let mut exec_node = Scan::new(
+        let exec_node = Scan::new(
             object_store,
             data_dir,
             fragments.clone(),
