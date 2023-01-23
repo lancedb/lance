@@ -18,15 +18,24 @@
 use arrow_array::RecordBatch;
 use futures::stream::Stream;
 
+mod knn;
 mod scan;
+mod take;
 
 use crate::Result;
+pub(crate) use knn::KNNFlat;
 pub(crate) use scan::Scan;
+pub(crate) use take::Take;
 
 #[derive(Debug)]
 pub enum NodeType {
     /// Dataset Scan
     Scan = 1,
+    /// Dataset Take (row_ids).
+    Take = 2,
+
+    /// Knn Flat Scan
+    KnnFlat = 10,
 }
 
 /// I/O Exec Node

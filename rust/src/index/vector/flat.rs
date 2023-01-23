@@ -20,9 +20,9 @@
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
-use arrow_select::{concat::concat, take::take};
+use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::stream::{Stream, TryStreamExt};
 
 use super::{Query, VectorIndex};
 use crate::arrow::*;
@@ -44,9 +44,6 @@ use crate::{Error, Result};
 pub struct FlatIndex<'a> {
     dataset: &'a Dataset,
 
-    /// Index name.
-    name: String,
-
     /// Vector column to search for.
     column: String,
 }
@@ -55,10 +52,51 @@ impl<'a> FlatIndex<'a> {
     pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
         Ok(Self {
             dataset,
-            name: name.to_string(),
             column: name.to_string(),
         })
     }
+}
+
+pub async fn flat_search(
+    stream: impl Stream<Item = Result<RecordBatch>>,
+    query: &Query,
+) -> Result<RecordBatch> {
+    let score_column = "score";
+
+    let batches = stream
+        .and_then(|batch| async move {
+            let k = query.key.clone();
+            let batch = batch.clone();
+            let vectors = batch
+                .column_by_name(&query.column)
+                .ok_or_else(|| {
+                    Error::Schema(format!("column {} does not exist in dataset", query.column,))
+                })?
+                .clone();
+            let scores = tokio::task::spawn_blocking(move || {
+                l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
+            })
+            .await? as ArrayRef;
+
+            // TODO: use heap
+            let indices = sort_to_indices(&scores, None, Some(query.k))?;
+            let batch_with_score = batch.try_with_column(
+                ArrowField::new(score_column, DataType::Float32, false),
+                scores,
+            )?;
+            let struct_arr = StructArray::from(batch_with_score);
+            let selected_arr = take(&struct_arr, &indices, None)?;
+            Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
+        })
+        .try_collect::<Vec<_>>()
+        .await?;
+    let batch = concat_batches(&batches[0].schema(), &batches)?;
+    let scores = batch.column_by_name(score_column).unwrap();
+    let indices = sort_to_indices(scores, None, Some(query.k))?;
+
+    let struct_arr = StructArray::from(batch);
+    let selected_arr = take(&struct_arr, &indices, None)?;
+    Ok(as_struct_array(&selected_arr).into())
 }
 
 #[async_trait]
@@ -71,47 +109,6 @@ impl VectorIndex for FlatIndex<'_> {
             .project(&[&self.column])?
             .with_row_id()
             .into_stream();
-
-        let score_and_row_ids = stream
-            .and_then(|batch| async move {
-                let k = params.key.clone();
-                let batch = batch.clone();
-                let vectors = batch
-                    .column_by_name(&params.column)
-                    .ok_or_else(|| {
-                        Error::Schema(format!("column {} does not exist in dataset", self.column,))
-                    })?
-                    .clone();
-                let scores = tokio::task::spawn_blocking(move || {
-                    l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
-                })
-                .await?;
-                // TODO: only pick top-k in each batch first.
-                let row_id_array = batch["_rowid"].clone();
-                Ok((scores as ArrayRef, row_id_array))
-            })
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let scores_arrays = score_and_row_ids
-            .iter()
-            .map(|(score, _)| score.as_ref())
-            .collect::<Vec<_>>();
-        let row_ids_arrays = score_and_row_ids
-            .iter()
-            .map(|(_, row_id)| row_id.as_ref())
-            .collect::<Vec<_>>();
-        let scores = concat(&scores_arrays)?;
-        let row_ids = concat(&row_ids_arrays)?;
-
-        let indices = sort_to_indices(&scores, None, Some(params.k))?;
-
-        let struct_arr = StructArray::try_from(vec![
-            (ArrowField::new("_rowid", DataType::UInt64, false), row_ids),
-            (ArrowField::new("score", DataType::Float32, false), scores),
-        ])
-        .map_err(|e| Error::IO(format!("Can not build struct array: {}", e.to_string())))?;
-        let taken_scores = take(&struct_arr, &indices, None)?;
-        Ok(as_struct_array(&taken_scores).into())
+        flat_search(stream, params).await
     }
 }

@@ -21,16 +21,14 @@ use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::stream::Stream;
-use futures::StreamExt;
-use object_store::path::Path;
+use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Manifest};
+use crate::format::Fragment;
 use crate::index::vector::Query;
-use crate::io::exec::{ExecNode, Scan};
-use crate::io::ObjectStore;
+
+use crate::io::exec::{ExecNode, KNNFlat, Scan, Take};
 use crate::Result;
 
 /// Dataset Scanner
@@ -46,8 +44,8 @@ use crate::Result;
 ///   .buffered(16)
 ///   .sum()
 /// ```
-pub struct Scanner<'a> {
-    dataset: &'a Dataset,
+pub struct Scanner {
+    dataset: Arc<Dataset>,
 
     projections: Schema,
 
@@ -63,14 +61,16 @@ pub struct Scanner<'a> {
     with_row_id: bool,
 }
 
-impl<'a> Scanner<'a> {
-    pub fn new(dataset: &'a Dataset) -> Self {
+impl<'a> Scanner {
+    pub fn new(dataset: Arc<Dataset>) -> Self {
+        let projection = dataset.schema().clone();
+        let fragments = dataset.fragments().clone();
         Self {
             dataset,
-            projections: dataset.schema().clone(),
+            projections: projection,
             limit: None,
             offset: None,
-            fragments: dataset.fragments().clone(),
+            fragments,
             nearest: None,
             with_row_id: false,
         }
@@ -129,18 +129,41 @@ impl<'a> Scanner<'a> {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        ScannerStream::new(
-            self.dataset.object_store.clone(),
-            data_dir,
-            self.fragments.clone(),
-            manifest,
-            PREFECTH_SIZE,
-            projection,
-            with_row_id,
-        )
+        let exec_node: Box<dyn ExecNode + Unpin + Send> = if let Some(q) = self.nearest.as_ref() {
+            let vector_scan_projection =
+                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+            let scan_node = Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                &vector_scan_projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                true,
+            );
+            let flat_knn_node = KNNFlat::new(scan_node, q);
+            Box::new(Take::new(
+                self.dataset.clone(),
+                Arc::new(projection.clone()),
+                flat_knn_node,
+            ))
+        } else {
+            Box::new(Scan::new(
+                self.dataset.object_store.clone(),
+                data_dir.clone(),
+                self.fragments.clone(),
+                projection,
+                manifest.clone(),
+                PREFECTH_SIZE,
+                with_row_id,
+            ))
+        };
+
+        ScannerStream::new(exec_node)
     }
 }
 
+/// ScannerStream is a container to wrap different types of ExecNode.
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
@@ -148,25 +171,7 @@ pub struct ScannerStream {
 }
 
 impl ScannerStream {
-    fn new<'a>(
-        object_store: Arc<ObjectStore>,
-        data_dir: Path,
-        fragments: Arc<Vec<Fragment>>,
-        manifest: Arc<Manifest>,
-        prefetch_size: usize,
-        schema: &Schema,
-        with_row_id: bool,
-    ) -> Self {
-        let exec_node = Box::new(Scan::new(
-            object_store,
-            data_dir,
-            fragments.clone(),
-            schema,
-            manifest.clone(),
-            prefetch_size,
-            with_row_id,
-        ));
-
+    fn new<'a>(exec_node: Box<dyn ExecNode + Unpin + Send>) -> Self {
         Self { exec_node }
     }
 }

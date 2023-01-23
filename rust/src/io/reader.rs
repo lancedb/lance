@@ -201,10 +201,11 @@ impl<'a> FileReader<'a> {
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
         let batches = stream::iter(indices_in_batches)
-            .then(|batch| async move {
+            .map(|batch| async move {
                 self.read_batch(batch.batch_id, batch.offsets.as_slice())
                     .await
             })
+            .buffered(8)
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(ArrowSchema::from(self.schema()));

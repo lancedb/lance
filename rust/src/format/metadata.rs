@@ -56,6 +56,7 @@ impl From<pb::Metadata> for Metadata {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) struct BatchOffsets {
     pub batch_id: i32,
     pub offsets: Vec<u32>,
@@ -97,6 +98,10 @@ impl Metadata {
         let mut batch_id: i32 = 0;
         let num_batches = self.num_batches() as i32;
         let mut indices_per_batch: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+
+        let mut indices = Vec::from(indices);
+        indices.sort();
+
         for idx in indices.iter() {
             while batch_id < num_batches && *idx >= self.batch_offsets[batch_id as usize + 1] as u32
             {
@@ -112,7 +117,6 @@ impl Metadata {
             .iter()
             .map(|(batch_id, indices)| {
                 let batch_offset = self.batch_offsets[*batch_id as usize];
-
                 // Adjust indices to be the in-batch offsets.
                 let in_batch_offsets = indices
                     .iter()
@@ -128,4 +132,29 @@ impl Metadata {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_group_indices_to_batch() {
+        let mut metadata = Metadata::default();
+        metadata.push_batch_length(20);
+        metadata.push_batch_length(20);
+
+        let batches = metadata.group_indices_to_batches(&[6, 24]);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches,
+            vec![
+                BatchOffsets {
+                    batch_id: 0,
+                    offsets: vec![6]
+                },
+                BatchOffsets {
+                    batch_id: 1,
+                    offsets: vec![4]
+                }
+            ]
+        );
+    }
+}

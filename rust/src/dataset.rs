@@ -4,9 +4,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::cast::as_struct_array;
+use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
-use arrow_select::concat::concat_batches;
+use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
@@ -34,7 +35,7 @@ fn latest_manifest_path(base: &Path) -> Path {
 }
 
 /// Lance Dataset
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Dataset {
     object_store: Arc<ObjectStore>,
     base: Path,
@@ -208,7 +209,7 @@ impl Dataset {
 
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
-        Scanner::new(&self)
+        Scanner::new(Arc::new(self.clone()))
     }
 
     /// Take rows by the internal ROW ids.
@@ -217,8 +218,11 @@ impl Dataset {
         row_ids: &[u64],
         projection: &Schema,
     ) -> Result<RecordBatch> {
+        let mut sorted_row_ids = Vec::from(row_ids);
+        sorted_row_ids.sort();
+
         let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        row_ids.iter().for_each(|row_id| {
+        sorted_row_ids.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
             let offset = (row_id - (fragment_id << 32)) as u32;
             row_ids_per_fragment
@@ -232,7 +236,7 @@ impl Dataset {
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
             .then(|fragment| async {
-                let path = Path::from(fragment.files[0].path.as_str());
+                let path = self.data_dir().child(fragment.files[0].path.as_str());
                 let reader = FileReader::try_new_with_fragment(
                     object_store,
                     &path,
@@ -248,7 +252,20 @@ impl Dataset {
             })
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(concat_batches(&schema, &batches)?)
+        let one_batch = concat_batches(&schema, &batches)?;
+
+        let original_indices: UInt64Array = row_ids
+            .iter()
+            .map(|o| {
+                sorted_row_ids
+                    .iter()
+                    .position(|sorted_id| sorted_id == o)
+                    .unwrap() as u64
+            })
+            .collect();
+        let struct_arr: StructArray = one_batch.into();
+        let reordered = take(&struct_arr, &original_indices, None)?;
+        Ok(as_struct_array(&reordered).into())
     }
 
     fn versions_dir(&self) -> Path {
