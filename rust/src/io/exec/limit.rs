@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use super::{ExecNode, NodeType};
 use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
+use crate::io::exec::ExecNodeBox;
 
 /// Dataset Scan Node.
 pub(crate) struct Limit {
