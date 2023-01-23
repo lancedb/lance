@@ -56,18 +56,34 @@ enum Commands {
         #[arg(value_enum)]
         action: IndexAction,
 
-        // Dataset URI.
+        /// Dataset URI.
         uri: String,
 
         /// The column to build index on.
-        #[arg(short, long)]
+        #[arg(short, long, value_name = "NAME")]
         column: Option<String>,
+
+        /// Set index type
+        #[arg(short = 't', long = "type", value_enum, value_name = "TYPE")]
+        index_type: IndexType,
+
+        /// Nunber of IVF partitions. Only useful when the index type is 'ivf-pq'.
+        #[arg(short = 'p', long, default_value_t = 64, value_name = "NUM")]
+        num_partitions: u32,
+
+        #[arg(short = 's', long, default_value_t = 8, value_name = "NUM")]
+        num_sub_vectors: u32,
     },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum IndexAction {
     Create,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum IndexType {
+    IvfPQ,
 }
 
 #[tokio::main]
@@ -97,6 +113,9 @@ async fn main() {
             action,
             uri,
             column,
+            index_type,
+            num_partitions,
+            num_sub_vectors,
         } => {}
     }
 }
