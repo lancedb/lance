@@ -47,7 +47,7 @@ impl Limit {
                 .try_fold(
                     (offset, limit, tx),
                     |(mut off, mut lim, tx), mut b: RecordBatch| async move {
-                        let nrows = b.num_rows() as i64;
+                        let mut nrows = b.num_rows() as i64;
                         if off > 0 {
                             if off > nrows {
                                 // skip this batch if offset is more than num rows
@@ -56,6 +56,7 @@ impl Limit {
                             } else {
                                 // otherwise slice the batch starting from the offset
                                 b = b.slice(off as usize, (nrows - off) as usize);
+                                nrows = b.num_rows() as i64;
                                 off = 0;
                             }
                         }
@@ -119,7 +120,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::arrow::RecordBatchBuffer;
-    use crate::dataset::Dataset;
+    use crate::dataset::{Dataset, WriteParams};
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
     use arrow_select::concat::concat_batches;
@@ -140,7 +141,8 @@ mod tests {
             concat_batches(&expected_batches[0].schema(), &expected_batches).unwrap();
 
         let dataset = Dataset::open(path).await.unwrap();
-        let scanner = dataset.scan();
+        let mut scanner = dataset.scan();
+        scanner.limit(2, Some(19));
         let actual_batches: Vec<RecordBatch> = scanner
             .into_stream()
             .map(|b| b.unwrap())
@@ -148,7 +150,9 @@ mod tests {
             .await;
         let actual_combined = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
 
-        assert_eq!(expected_combined, actual_combined);
+        assert_eq!(expected_combined.slice(19, 2), actual_combined);
+        // skipped 1 batch
+        assert_eq!(actual_batches.len(), 2);
     }
 
     async fn write_data(path: &str) -> Vec<RecordBatch> {
@@ -169,7 +173,11 @@ mod tests {
             })
             .collect();
         let mut batches = RecordBatchBuffer::new(expected_batches.clone());
-        Dataset::create(&mut batches, path, None).await.unwrap();
+        let mut params = WriteParams::default();
+        params.max_rows_per_group = 10;
+        Dataset::create(&mut batches, path, Some(params))
+            .await
+            .unwrap();
         expected_batches
     }
 }
