@@ -24,6 +24,8 @@ use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
 
 pub mod flat;
+pub mod ivf;
+mod pq;
 
 use crate::Result;
 

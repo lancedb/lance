@@ -268,6 +268,10 @@ impl Dataset {
         Ok(as_struct_array(&reordered).into())
     }
 
+    pub(crate) fn object_store(&self) -> &ObjectStore {
+        &self.object_store
+    }
+
     fn versions_dir(&self) -> Path {
         self.base.child(VERSIONS_DIR)
     }
@@ -276,7 +280,7 @@ impl Dataset {
         self.base.child(DATA_DIR)
     }
 
-    fn indices_dir(&self) -> Path {
+    pub(crate) fn indices_dir(&self) -> Path {
         self.base.child(INDICES_DIR)
     }
 

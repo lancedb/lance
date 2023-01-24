@@ -22,25 +22,79 @@ package lance.index.pb;
 
 // The type of an index.
 enum IndexType {
-NONE = 0;
-
-// Flat index
-VECTOR_FLAT = 100;
-
-// IVF + PQ index
-VECTOR_IVF_PQ = 101;
+  // Vector index
+  VECTOR = 0;
 }
 
 message Index {
-    // The unique index name in the dataset.
-    string name = 1;
+  // The unique index name in the dataset.
+  string name = 1;
 
-    // Columns to be used to build the columns.
-    repeated string columns = 2;
+  // Columns to be used to build the index.
+  repeated string columns = 2;
 
-    // The version of the dataset this index was built from.
-    uint64 dataset_version = 3;
+  // The version of the dataset this index was built from.
+  uint64 dataset_version = 3;
 
-    // The [`IndexType`] of the index.
-    IndexType index_type = 4;
+  // The [`IndexType`] of the index.
+  IndexType index_type = 4;
+
+  /// Index implementation details.
+  oneof implementation {
+    VectorIndex vector_index = 5;
+  }
+}
+
+// Inverted Index File Metadata.
+message IVF {
+  // Centroids of partitions. `dimension * num_partitions` of float32s.
+  repeated float centroids = 1;
+
+  // File offset of each partition.
+  repeated uint64 offsets = 2;
+
+  // Number of records in the partition.
+  repeated uint32 lengths = 3;
+}
+
+// Product Quantization.
+message PQ {
+  // The number of bits to present a centroid.
+  uint32 num_bits = 1;
+
+  // Number of sub vectors.
+  uint32 num_sub_vectors = 2;
+}
+
+// Flat Index
+message Flat {}
+
+// One stage in the vector index pipeline.
+message VectorIndexStage {
+  oneof stage {
+    // Flat index
+    Flat flat = 1;
+    // `IVF` - Inverted File
+    IVF ivf = 2;
+    // Product Quantization
+    PQ pq = 3;
+  }
+}
+
+// Vector Index Metadata
+message VectorIndex {
+  // Index specification version.
+  uint32 spec_version = 1;
+
+  // Vector dimension;
+  uint32 dimension = 2;
+
+  // Composed vector index stages.
+  //
+  // For example, `IVF_PQ` index type can be expressed as:
+  //
+  // ```no_run,ignore
+  // let stages = vec![Ivf{}, PQ{num_bits: 8, num_sub_vectors: 16}]
+  // ```
+  repeated VectorIndexStage stages = 3;
 }
