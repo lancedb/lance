@@ -533,6 +533,11 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
 
     /// Build the IVF_PQ index
     async fn build(&self) -> Result<()> {
+        println!(
+            "Building vector index: IVF{},PQ{}",
+            self.num_partitions, self.num_sub_vectors
+        );
+
         // Step 1. Sanity check
         let schema = self.dataset.schema().field(&self.column);
         if schema.is_none() {
