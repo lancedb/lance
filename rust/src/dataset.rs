@@ -123,8 +123,6 @@ impl Dataset {
             Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
             Err(e) => return Err(Error::from(e)),
         }
-        println!("After check manifest path exist");
-
         let params = params.unwrap_or_default();
 
         let mut peekable = batches.peekable();
