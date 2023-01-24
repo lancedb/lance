@@ -89,8 +89,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        cast::as_primitive_array, FixedSizeListArray, Int32Array,
-        RecordBatchReader, StringArray,
+        cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;

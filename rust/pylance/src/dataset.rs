@@ -78,7 +78,8 @@ impl Dataset {
                 .project(&proj)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        scanner.limit(limit, offset)
+        scanner
+            .limit(limit, offset)
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         if let Some(nearest) = nearest {
             let column = nearest
@@ -101,7 +102,8 @@ impl Dataset {
             } else {
                 10
             };
-            scanner.nearest(column.as_str(), &q, k)
+            scanner
+                .nearest(column.as_str(), &q, k)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
