@@ -116,12 +116,14 @@ impl Dataset {
         // 1. check the directory does not exist.
         let object_store = Arc::new(ObjectStore::new(uri)?);
 
+        println!("After creating object store");
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
         match object_store.inner.head(&latest_manifest_path).await {
             Ok(_) => return Err(Error::IO(format!("Dataset already exists: {}", uri))),
             Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
             Err(e) => return Err(Error::from(e)),
         }
+        println!("After check manifest path exist");
 
         let params = params.unwrap_or_default();
 
@@ -148,6 +150,7 @@ impl Dataset {
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                 fragments.push(fragment);
                 fragment_id += 1;
+                println!("Try to open file: {}\n", file_path);
                 Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
         }

@@ -25,6 +25,7 @@ use ::object_store::{
 };
 use object_store::local::LocalFileSystem;
 use url::{ParseError, Url};
+use path_absolutize::*;
 
 use crate::error::{Error, Result};
 use crate::io::object_reader::ObjectReader;
@@ -56,16 +57,17 @@ impl ObjectStore {
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
             Err(ParseError::RelativeUrlWithoutBase) => {
-                let absolute_path = fs::canonicalize(uri)?;
+                let path = std::path::Path::new(uri);
                 return Ok(Self {
                     inner: Arc::new(LocalFileSystem::new()),
                     scheme: String::from("file"),
-                    base_path: Path::from_absolute_path(absolute_path)?,
+                    base_path: Path::from(path.absolutize()?.to_str().unwrap()),
                     prefetch_size: 4 * 1024,
                 });
             }
             Err(e) => {
-                return Err(Error::IO(e.to_string()));
+                println!("Parse err: {}", e);
+                return Err(Error::IO(format!("URI parse error: {}", e.to_string())));
             }
         };
 

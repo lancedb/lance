@@ -595,7 +595,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 .await?;
         }
 
-        let metadata = IvfPQIndexMetadata{
+        let metadata = IvfPQIndexMetadata {
             name: self.name.clone(),
             column: self.column.clone(),
             dimension: self.dimension as u32,

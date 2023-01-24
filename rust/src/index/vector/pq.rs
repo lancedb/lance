@@ -234,8 +234,8 @@ impl ProductQuantizer {
             .unwrap()
     }
 
-     /// Transform the vector array to PQ code array.
-     fn transform(&self, sub_vectors: &[FixedSizeListArray]) -> FixedSizeListArray {
+    /// Transform the vector array to PQ code array.
+    fn transform(&self, sub_vectors: &[FixedSizeListArray]) -> FixedSizeListArray {
         assert_eq!(sub_vectors.len(), self.num_sub_vectors as usize);
 
         let capacity = sub_vectors.len() * sub_vectors[0].len();
@@ -246,8 +246,7 @@ impl ProductQuantizer {
             for i in 0..vec.len() {
                 let value = vec.value(i);
                 let vector: &Float32Array = as_primitive_array(value.as_ref());
-                let id =
-                    argmin(l2_distance(vector, &centroids).unwrap().as_ref()).unwrap() as u8;
+                let id = argmin(l2_distance(vector, &centroids).unwrap().as_ref()).unwrap() as u8;
                 pg_codebook_builder[i * self.num_sub_vectors as usize + idx] = id;
             }
         }
@@ -272,8 +271,7 @@ impl ProductQuantizer {
             // Centroids for one sub vector.
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
-            let centroids =
-                train_kmeans(flatten_array, dimension, num_centorids, 100)?;
+            let centroids = train_kmeans(flatten_array, dimension, num_centorids, 100)?;
             // TODO: COPIED COPIED COPIED
             unsafe {
                 codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
