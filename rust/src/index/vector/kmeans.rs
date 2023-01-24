@@ -45,7 +45,7 @@ pub fn train_kmeans(
     max_iterations: u32,
 ) -> Result<Float32Array> {
     #[cfg(feature = "faiss")]
-    return train_kmeans(array, dimension, num_clusters, max_iterations);
+    return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
     train_kmeans_fallback()
