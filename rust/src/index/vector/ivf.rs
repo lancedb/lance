@@ -17,30 +17,37 @@
 
 //! IVF - Inverted File index.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arrow_arith::aggregate::{max, min};
 use arrow_arith::arithmetic::subtract_dyn;
+use arrow_array::BooleanArray;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::DataType;
+use arrow_select::filter::filter_record_batch;
 use arrow_select::{
     concat::{concat, concat_batches},
     take::take,
 };
 use async_trait::async_trait;
-use futures::{stream::{self, StreamExt}, TryStreamExt};
+use futures::{
+    stream::{self, StreamExt},
+    TryStreamExt,
+};
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::{index::pb, dataset::scanner::Scanner};
 use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
+use crate::{dataset::scanner::Scanner, index::pb};
 use crate::{
     dataset::{Dataset, ROW_ID},
     index::{IndexBuilder, IndexType},
@@ -273,7 +280,7 @@ struct Ivf {
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
- 
+
     /// Number of vectors in each partition.
     lengths: Vec<u32>,
 }
@@ -304,6 +311,76 @@ impl Ivf {
         let distances = l2_distance(query, &self.centroids)? as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
+    }
+
+    /// Scan the dataset, and partition the batches based on the IVF partitions / Voronois.
+    ///
+    /// Currently, it keeps all partitioned batches in memory.
+    async fn partition(&self, scanner: &Scanner) -> Result<BTreeMap<u32, RecordBatch>> {
+        const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
+
+        let schema = scanner.schema();
+        let column_name = schema.field(0).name();
+        let partitions_with_id = scanner
+            .into_stream()
+            .and_then(|b| async move {
+                let arr = b.column_by_name(column_name).ok_or_else(|| {
+                    Error::IO(format!("Dataset does not have column {}", column_name))
+                })?;
+                let vectors: &FixedSizeListArray = arr.as_any().downcast_ref().unwrap();
+                let vec = vectors.clone();
+                let centroids = self.centroids.clone();
+                let partition_ids = tokio::task::spawn_blocking(move || {
+                    (0..vec.len())
+                        .map(|idx| {
+                            let arr = vec.value(idx);
+                            let f: &Float32Array = as_primitive_array(&arr);
+                            Ok(argmin(l2_distance(f, &centroids)?.as_ref()).unwrap())
+                        })
+                        .collect::<Result<Vec<u32>>>()
+                })
+                .await??;
+                let partition_column = Arc::new(UInt32Array::from(partition_ids));
+                let batch_with_part_id = b.try_with_column(
+                    ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
+                    partition_column,
+                )?;
+                let partitioned = partition(&batch_with_part_id, PARTITION_ID_COLUMN)?;
+                Ok(partitioned)
+            })
+            .try_fold(
+                BTreeMap::<u32, Vec<RecordBatch>>::new(),
+                |mut builder, partitions| async move {
+                    for (id, batch) in partitions {
+                        builder.entry(id).or_insert(vec![]);
+                        if let Some(batches) = builder.get_mut(&id) {
+                            batches.push(batch);
+                        }
+                    }
+                    Ok(builder)
+                },
+            )
+            .await?;
+        let mut partitions = BTreeMap::<u32, RecordBatch>::new();
+        for (key, value) in partitions_with_id.iter() {
+            let batch = concat_batches(&value[0].schema(), value)?;
+            let arr = self.centroids.value(key.clone() as usize);
+            let centroids: &Float32Array = as_primitive_array(&arr);
+            let column = batch.column_with_name(column_name).unwrap();
+            let vectors = as_fixed_size_list_array(column);
+            let residual = compute_residual(vectors, centroids)?;
+            let residual_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("_vector", residual.data_type().clone(), false),
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                residual_schema,
+                vec![residual, batch.column_with_name(ROW_ID).unwrap().clone()],
+            )?;
+
+            partitions.insert(*key, batch);
+        }
+        Ok(partitions)
     }
 }
 
@@ -363,6 +440,29 @@ fn compute_residual(
         f32_values,
         centroids.len() as i32,
     )?))
+}
+
+/// Partition one [`RecordBatch`] based on the partition column(s) value.
+///
+/// Currently, it only supports partitioning over one column.
+fn partition(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, RecordBatch>> {
+    let part_col = batch
+        .column_by_name(col)
+        .ok_or_else(|| Err(Error::IO(format!("Column {} does not exist", col))))?;
+    let partition_ids: &UInt32Array = as_primitive_array(part_col);
+    let min_id = min(partition_ids).unwrap_or(0);
+    let max_id = max(partition_ids).unwrap_or(1024 * 1024);
+
+    let mut partitions = BTreeMap::<u32, RecordBatch>::new();
+    // Reconstruct the results.
+    for part_id in min_id..max_id + 1 {
+        let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
+        let parted_batch = filter_record_batch(batch, &predicates)?;
+        if parted_batch.num_rows() > 0 {
+            partitions.insert(part_id, parted_batch);
+        }
+    }
+    Ok(partitions)
 }
 
 pub struct IvfPqIndexBuilder<'a> {
@@ -457,8 +557,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 self.kmean_max_iters,
             )
             .await?,
-            self.dimension,
-        )?;
+        );
 
         scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
@@ -476,7 +575,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             let row_id_column = batch.column_with_name(ROW_ID).unwrap();
             ivf_model.add_partition(writer.tell(), data.len() as u32);
             writer
-                .write_plain_encoded_array(pq.codebook.as_ref().unwrap())
+                .write_plain_encoded_array(pq.codebook.as_ref())
                 .await?;
             writer
                 .write_plain_encoded_array(code.values().as_ref())
@@ -525,9 +624,5 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids =
-        super::kmeans::train_kmeans(values, dimension, nclusters, max_iterations)
-            .unwrap();
-
-    Ok(centroids)
+    super::kmeans::train_kmeans(values, dimension, nclusters, max_iterations)
 }

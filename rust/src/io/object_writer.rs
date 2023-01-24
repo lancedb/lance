@@ -79,7 +79,9 @@ impl ObjectWriter {
         self.write_protobuf(&msg).await
     }
 
-    /// Write array using plain encoding.
+    /// Write an array using plain encoding.
+    ///
+    /// Returns the file position if success.
     pub async fn write_plain_encoded_array(&mut self, array: &dyn Array) -> Result<usize> {
         let mut encoder = PlainEncoder::new(self, array.data_type());
         encoder.encode(array).await
