@@ -84,7 +84,8 @@ impl Dataset {
     pub async fn open(uri: &str) -> Result<Self> {
         let object_store = Arc::new(ObjectStore::new(uri)?);
 
-        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let base_path = object_store.base_path().clone();
+        let latest_manifest_path = latest_manifest_path(&base_path);
 
         let mut object_reader = object_store.open(&latest_manifest_path).await?;
         let bytes = object_store
@@ -98,7 +99,7 @@ impl Dataset {
         manifest.schema.load_dictionary(&object_reader).await?;
         Ok(Self {
             object_store,
-            base: Path::from(uri),
+            base: base_path,
             manifest: Arc::new(manifest),
         })
     }
@@ -116,7 +117,6 @@ impl Dataset {
         // 1. check the directory does not exist.
         let object_store = Arc::new(ObjectStore::new(uri)?);
 
-        println!("After creating object store");
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
         match object_store.inner.head(&latest_manifest_path).await {
             Ok(_) => return Err(Error::IO(format!("Dataset already exists: {}", uri))),

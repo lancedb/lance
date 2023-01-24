@@ -17,7 +17,6 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
-use std::fs;
 use std::sync::Arc;
 
 use ::object_store::{

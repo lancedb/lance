@@ -29,7 +29,7 @@ fn train_kmeans_faiss(
     use faiss::cluster::kmeans_clustering;
 
     let model = kmeans_clustering(dimension as u32, num_clusters, array.values()).unwrap();
-    Ok(model.centroids)
+    Ok(model.centroids.into())
 }
 
 /// Fallback implementation of KMeans.

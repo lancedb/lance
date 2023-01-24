@@ -549,7 +549,8 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let path = self
             .dataset
             .indices_dir()
-            .child(format!("{}.idx", self.column));
+            .child(self.name.as_str())
+            .child(INDEX_FILE_NAME);
         let mut writer = object_store.create(&path).await?;
 
         // First, scan the dataset to train IVF models.
