@@ -552,6 +552,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             .child(format!("{}.idx", self.column));
         let mut writer = object_store.create(&path).await?;
 
+        // First, scan the dataset to train IVF models.
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
 
@@ -565,6 +566,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             .await?,
         );
 
+        // A new scanner, with row id to build inverted index.
         scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
