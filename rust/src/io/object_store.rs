@@ -24,8 +24,8 @@ use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
 use object_store::local::LocalFileSystem;
-use url::{ParseError, Url};
 use path_absolutize::*;
+use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
 use crate::io::object_reader::ObjectReader;
