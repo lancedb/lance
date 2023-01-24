@@ -28,7 +28,7 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::filter::filter_record_batch;
 use arrow_select::{
     concat::{concat, concat_batches},
@@ -313,6 +313,12 @@ impl Ivf {
         Ok(top_k_partitions)
     }
 
+    /// Add the offset and length of one partition.
+    fn add_partition(&mut self, offset: usize, len: u32) {
+        self.offsets.push(offset);
+        self.lengths.push(len);
+    }
+
     /// Scan the dataset, and partition the batches based on the IVF partitions / Voronois.
     ///
     /// Currently, it keeps all partitioned batches in memory.
@@ -345,7 +351,7 @@ impl Ivf {
                     ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                     partition_column,
                 )?;
-                let partitioned = partition(&batch_with_part_id, PARTITION_ID_COLUMN)?;
+                let partitioned = partition_batch(&batch_with_part_id, PARTITION_ID_COLUMN)?;
                 Ok(partitioned)
             })
             .try_fold(
@@ -366,7 +372,7 @@ impl Ivf {
             let batch = concat_batches(&value[0].schema(), value)?;
             let arr = self.centroids.value(key.clone() as usize);
             let centroids: &Float32Array = as_primitive_array(&arr);
-            let column = batch.column_with_name(column_name).unwrap();
+            let column = batch.column_by_name(column_name).unwrap();
             let vectors = as_fixed_size_list_array(column);
             let residual = compute_residual(vectors, centroids)?;
             let residual_schema = Arc::new(ArrowSchema::new(vec![
@@ -375,7 +381,7 @@ impl Ivf {
             ]));
             let batch = RecordBatch::try_new(
                 residual_schema,
-                vec![residual, batch.column_with_name(ROW_ID).unwrap().clone()],
+                vec![residual, batch.column_by_name(ROW_ID).unwrap().clone()],
             )?;
 
             partitions.insert(*key, batch);
@@ -445,10 +451,10 @@ fn compute_residual(
 /// Partition one [`RecordBatch`] based on the partition column(s) value.
 ///
 /// Currently, it only supports partitioning over one column.
-fn partition(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, RecordBatch>> {
+fn partition_batch(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, RecordBatch>> {
     let part_col = batch
         .column_by_name(col)
-        .ok_or_else(|| Err(Error::IO(format!("Column {} does not exist", col))))?;
+        .ok_or_else(|| Error::IO(format!("Column {} does not exist", col)))?;
     let partition_ids: &UInt32Array = as_primitive_array(part_col);
     let min_id = min(partition_ids).unwrap_or(0);
     let max_id = max(partition_ids).unwrap_or(1024 * 1024);
@@ -550,7 +556,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
 
         let mut ivf_model = Ivf::new(
-            &train_kmean_model(
+            train_kmean_model(
                 &scanner,
                 self.dimension,
                 self.num_partitions,
@@ -565,17 +571,20 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let partitioned_batches = ivf_model.partition(&scanner).await?;
 
         for (key, batch) in partitioned_batches.iter() {
-            let arr = batch.column_with_name("_vector").unwrap();
+            let arr = batch.column_by_name("_vector").unwrap();
             let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
             let now = std::time::Instant::now();
-            let mut pq =
-                ProductQuantizer::new(self.num_sub_vectors, self.nbits, data.value_length() as u32);
+            let mut pq = ProductQuantizer::new(
+                self.num_sub_vectors as usize,
+                self.nbits,
+                data.value_length() as usize,
+            );
             let code = pq.fit_transform(data)?;
-            let row_id_column = batch.column_with_name(ROW_ID).unwrap();
+            let row_id_column = batch[ROW_ID];
             ivf_model.add_partition(writer.tell(), data.len() as u32);
             writer
-                .write_plain_encoded_array(pq.codebook.as_ref())
+                .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
                 .await?;
             writer
                 .write_plain_encoded_array(code.values().as_ref())
@@ -606,7 +615,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
 async fn train_kmean_model(
     scanner: &Scanner,
     dimension: usize,
-    nclusters: u32,
+    k: u32,
     max_iterations: u32,
 ) -> Result<FixedSizeListArray> {
     let schema = scanner.schema();
@@ -624,5 +633,5 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    super::kmeans::train_kmeans(values, dimension, nclusters, max_iterations)
+    super::kmeans::train_kmeans(values, dimension, k, max_iterations)
 }

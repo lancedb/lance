@@ -25,13 +25,14 @@ fn train_kmeans_faiss(
     dimension: usize,
     num_clusters: u32,
     max_iters: u32,
-) -> Result<Vec<f32>> {
+) -> Result<Float32Array> {
     use faiss::cluster::kmeans_clustering;
 
     let model = kmeans_clustering(dimension as u32, num_clusters, array.values()).unwrap();
     Ok(model.centroids)
 }
 
+/// Fallback implementation of KMeans.
 fn train_kmeans_fallback() -> Result<Float32Array> {
     todo!()
 }
