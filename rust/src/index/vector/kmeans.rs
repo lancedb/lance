@@ -32,16 +32,20 @@ fn train_kmeans_faiss(
     Ok(model.centroids)
 }
 
-/// Train kmean models and returns the centroids.
+fn train_kmeans_fallback() -> Result<Float32Array> {
+    todo!()
+}
+
+/// Train kmean model and returns the centroids of each cluster.
 pub fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
     num_clusters: u32,
     max_iterations: u32,
-) -> Result<Vec<f32>> {
+) -> Result<Float32Array> {
     #[cfg(feature = "faiss")]
     return train_kmeans(array, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    Ok(vec![])
+    train_kmeans_fallback()
 }
