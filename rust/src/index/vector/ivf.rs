@@ -31,13 +31,13 @@ use arrow_select::{
     take::take,
 };
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt};
+use futures::{stream::{self, StreamExt}, TryStreamExt};
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::index::pb;
+use crate::{index::pb, dataset::scanner::Scanner};
 use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
@@ -273,12 +273,20 @@ struct Ivf {
 
     /// Offset of each partition in the file.
     offsets: Vec<usize>,
-
+ 
     /// Number of vectors in each partition.
     lengths: Vec<u32>,
 }
 
 impl Ivf {
+    fn new(centroids: FixedSizeListArray) -> Self {
+        Self {
+            centroids,
+            offsets: vec![],
+            lengths: vec![],
+        }
+    }
+
     /// Ivf model dimension.
     fn dimension(&self) -> usize {
         self.centroids.value_length() as usize
@@ -441,8 +449,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
 
-        let now = std::time::Instant::now();
-        let mut ivf_model = Ivf::try_new(
+        let mut ivf_model = Ivf::new(
             &train_kmean_model(
                 &scanner,
                 self.dimension,
@@ -450,7 +457,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 self.kmean_max_iters,
             )
             .await?,
-            self.dimension as u32,
+            self.dimension,
         )?;
 
         scanner = self.dataset.scan();
@@ -495,4 +502,32 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
 
         Ok(())
     }
+}
+
+async fn train_kmean_model(
+    scanner: &Scanner,
+    dimension: usize,
+    nclusters: u32,
+    max_iterations: u32,
+) -> Result<FixedSizeListArray> {
+    let schema = scanner.schema();
+    assert_eq!(schema.fields.len(), 1);
+    // Copy all to memory for now, optimize later.
+    let batches = scanner.into_stream().try_collect::<Vec<_>>().await?;
+    let mut arr_list = vec![];
+    for batch in batches {
+        let arr = batch.column_by_name("vector").unwrap();
+        let list_arr = as_fixed_size_list_array(&arr);
+        arr_list.push(list_arr.values().clone());
+    }
+
+    let arrays = arr_list.iter().map(|l| l.as_ref()).collect::<Vec<_>>();
+
+    let all_vectors = concat(&arrays)?;
+    let values: &Float32Array = as_primitive_array(&all_vectors);
+    let centroids =
+        super::kmeans::train_kmeans(values, dimension, nclusters, max_iterations)
+            .unwrap();
+
+    Ok(centroids)
 }
