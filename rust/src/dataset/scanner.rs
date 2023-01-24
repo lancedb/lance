@@ -96,6 +96,7 @@ impl<'a> Scanner {
 
     /// Find k-nearest neighbour within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> &mut Self {
+        println!("{}, {:?}, {}", column, q, k);
         self.nearest = Some(Query {
             column: column.to_string(),
             key: Arc::new(q.clone()),
@@ -133,8 +134,11 @@ impl<'a> Scanner {
         let projection = &self.projections;
 
         let mut exec_node: ExecNodeBox = if let Some(q) = self.nearest.as_ref() {
+            println!("nearest");
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+            println!("{:?}", vector_scan_projection);
+            println!("{:?}", q);
             let scan_node = Box::new(Scan::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
@@ -162,10 +166,9 @@ impl<'a> Scanner {
             ))
         };
 
-        if self.limit.is_some() || self.offset.is_some() {
+        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
         }
-
         ScannerStream::new(exec_node)
     }
 }

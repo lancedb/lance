@@ -17,13 +17,14 @@
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::{Array, Float32Array, RecordBatch, RecordBatchReader};
+use arrow_data::ArrayData;
 use arrow_schema::ArrowError;
 use arrow::pyarrow::*;
 use arrow_schema::Schema as ArrowSchema;
-use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -66,12 +67,13 @@ impl Dataset {
     }
 
     fn scanner(
-        &self,
+        self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
         limit: i64,
         offset: Option<i64>,
+        nearest: Option<&PyDict>,
     ) -> PyResult<Scanner> {
-        let mut scanner: LanceScanner = self.ds.scan();
+        let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
             let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
             scanner
@@ -79,7 +81,30 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         scanner.limit(limit, offset);
-        Ok(Scanner::new(Arc::new(scanner), self.rt.clone()))
+        if let Some(nearest) = nearest {
+            let column = nearest.get_item("column")
+                .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
+                .to_string();
+
+            let qval = nearest.get_item("q")
+                .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
+            let data = ArrayData::from_pyarrow(qval)?;
+            let q = Float32Array::from(data);
+
+            let k: usize = if let Some(k) = nearest.get_item("k") {
+                if k.is_none() {
+                    10
+                } else {
+                    PyAny::downcast::<PyLong>(k)?.extract()?
+                }
+            } else {
+                10
+            };
+            scanner.nearest(column.as_str(), &q, k);
+        }
+
+        let scn = Arc::new(scanner);
+        Ok(Scanner::new(scn.clone(), self_.rt.clone()))
     }
 }
 

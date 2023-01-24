@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=10"]
+dependencies = ["pyarrow>=10", "pandas", "numpy"]
 
 [tool.maturin]
 python-source = "python"
@@ -12,5 +12,4 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "pytest",
-    "pandas"
 ]

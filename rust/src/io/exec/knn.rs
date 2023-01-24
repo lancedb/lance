@@ -88,7 +88,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray};
+    use arrow_array::{Array, cast::as_primitive_array, FixedSizeListArray, Float32Array, Int32Array, RecordBatchReader, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
@@ -173,5 +173,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(expected, results[0]);
+    }
+
+
+    #[tokio::test]
+    async fn test_segfault() {
+        let test_uri = "/tmp/nearest.lance";
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        let stream = dataset
+            .scan()
+            .into_stream();
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        let q = results[0].column(0).as_any().downcast_ref::<FixedSizeListArray>().unwrap().value(0);
+        let stream = dataset
+            .scan()
+            .nearest("emb", as_primitive_array(&q), 10)
+            .into_stream();
+        let results = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert!(results.len() > 0);
+        for x in results {
+            assert!(x.num_rows() > 0);
+        }
     }
 }

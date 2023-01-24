@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
@@ -44,7 +45,7 @@ def test_input_types(tmp_path):
     reader = scanner.to_reader()
     _check_roundtrip(reader, uri / "reader.lance", tbl)
 
-    # TODO tokio runtime error
+    # TODO allow Dataset::create to take both async and also RecordBatchReader
     # lance_dataset = lance.dataset(uri / "table.lance")
     # _check_roundtrip(lance_dataset, uri / "lance_dataset.lance", tbl)
     
@@ -56,3 +57,20 @@ def _check_roundtrip(data_obj, uri, expected):
     lance.write_dataset(data_obj, uri)
     assert expected == lance.dataset(uri).to_table()
 
+
+def test_nearest(tmp_path):
+    # uri = tmp_path
+    uri = "/tmp/nearest.lance"
+
+    schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
+    values = pa.array(np.random.rand(32 * 100), type=pa.float32())
+    arr = pa.FixedSizeListArray.from_arrays(values, 32)
+    tbl = pa.Table.from_arrays([arr], schema=schema)
+    lance.write_dataset(tbl, uri)
+
+    dataset = lance.dataset(uri)
+    tbl = dataset.to_table()
+    arr = tbl["emb"]
+    top10 = dataset.to_table(nearest={"column": "emb", "q": arr[0].values, "k": 10})
+
+    assert tbl == top10

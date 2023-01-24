@@ -2,6 +2,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 
@@ -27,11 +29,10 @@ class LanceDataset:
         return self._uri
 
     def scanner(self, columns: Optional[list[str]] = None,
-                limit: int = 0, offset: Optional[int] = None) -> LanceScanner:
+                limit: int = 0, offset: Optional[int] = None,
+                nearest: Optional[dict] = None) -> LanceScanner:
         """
-        Create a new dataset scanner to read the data
-        (but doesn't actually read the data yet).
-        Optionally with project and limit/offset pushdown
+        Return a Scanner that can support various pushdowns
 
         Parameters
         ----------
@@ -42,8 +43,20 @@ class LanceDataset:
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
+        nearest: dict, default None
+            Get the rows corresponding to the K most similar vectors
+            nearest should look like {
+              "columns": <embedding col name>,
+              "q": <query vector as pa.Float32Array>,
+              "k": 10
+            }
         """
-        return LanceScanner(self._ds.scanner(columns, limit, offset))
+        return (ScannerBuilder(self)
+                .columns(columns)
+                .limit(limit)
+                .offset(offset)
+                .nearest(**(nearest or {}))
+                .to_scanner())
 
     @property
     def schema(self) -> pa.Schema:
@@ -53,7 +66,8 @@ class LanceDataset:
         return self._ds.schema
 
     def to_table(self, columns: Optional[list[str]] = None,
-                 limit: int = 0, offset: Optional[int] = None) -> pa.Table:
+                 limit: int = 0, offset: Optional[int] = None,
+                 nearest: Optional[dict] = None) -> pa.Table:
         """
         Read the data into memory and return a pyarrow Table.
 
@@ -66,10 +80,69 @@ class LanceDataset:
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
+        nearest: dict, default None
+            Get the rows corresponding to the K most similar vectors
+            nearest should look like {
+              "columns": <embedding col name>,
+              "q": <query vector as pa.Float32Array>,
+              "k": 10
+            }
         """
         return self.scanner(
-            columns=columns, limit=limit, offset=offset
+            columns=columns, limit=limit, offset=offset, nearest=nearest
         ).to_table()
+
+
+class ScannerBuilder:
+
+    def __init__(self, ds: LanceDataset):
+        self.ds = ds
+        self._limit = 0
+        self._offset = None
+        self._columns = None
+        self._nearest = None
+
+    def limit(self, n: int = 0) -> ScannerBuilder:
+        if int(n) < 0:
+            raise ValueError("Limit must be non-negative")
+        self._limit = n
+        return self
+
+    def offset(self, n: Optional[int] = None) -> ScannerBuilder:
+        if n is not None and int(n) < 0:
+            raise ValueError("Offset must be non-negative")
+        self._offset = n
+        return self
+
+    def columns(self, cols: Optional[list[str]] = None) -> ScannerBuilder:
+        if cols is not None and len(cols) == 0:
+            cols = None
+        self._columns = cols
+        return self
+
+    def nearest(self, column: Optional[str] = None,
+                q: Optional[pa.Float32Array] = None,
+                k: Optional[int] = None) -> ScannerBuilder:
+        if column is None or q is None:
+            self._nearest = None
+            return self
+
+        if self.ds.schema.get_field_index(column) < 0:
+            raise ValueError(f"Embedding column {column} not in dataset")
+        if isinstance(q, (np.ndarray, list, tuple)):
+            q = pa.Float32Array.from_pandas(q)
+        if k is not None and int(k) <= 0:
+            raise ValueError(f"Nearest-K must be > 0 but got {k}")
+        self._nearest = {
+            "column": column,
+            "q": q,
+            "k": k
+        }
+        return self
+
+    def to_scanner(self) -> LanceScanner:
+        scanner = self.ds._ds.scanner(self._columns, self._limit, self._offset, self._nearest)
+        return LanceScanner(scanner)
 
 
 class LanceScanner:
@@ -124,12 +197,9 @@ def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
         reader = data_obj.to_reader()
     elif isinstance(data_obj, pa.RecordBatchReader):
         reader = data_obj
-    elif isinstance(data_obj, LanceDataset):
-        reader = data_obj.scanner()
-    elif isinstance(data_obj, LanceScanner):
-        reader = data_obj
     else:
         raise TypeError(f"Unknown data_obj type {type(data_obj)}")
+    # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
         "mode": mode,
