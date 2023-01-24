@@ -19,7 +19,9 @@ def generate_embeddings(col: pd.Series, **hyper_params) -> pd.Series:
         sentences.append(s)
     model = Word2Vec(sentences, **hyper_params)
     print(f"Vector space size: {len(model.wv.index_to_key)}")
-    print(model.wv[sentences[0]])
+    embeddings = model.wv(sentences)
+    print(embeddings)
+    return embeddings
 
 
 def main():
@@ -29,6 +31,9 @@ def main():
     df.columns = df.columns.str.replace("name", "")
     df.columns = df.columns.str.replace(" ", "")
     print(df)
+    print(f"Value counts: {df.nunique(axis=0)}")
+    for col in df.columns:
+        df[col] = df[col].astype("category")
 
     # Hyper parameters from https://outerbounds.com/docs/recsys-tutorial-L4/
     embeddings = generate_embeddings(
@@ -42,9 +47,19 @@ def main():
     )
     df["embeddings"] = embeddings
     print(embeddings)
-    table = pa.Table.from_pandas(df)
 
-    # lance.write_dataset(table, "spotify.lance")
+    schema = pa.schema(
+        [
+            pa.field("user_id", pa.dictionary(pa.uint16(), pa.utf8())),
+            pa.field("artist", pa.dictionary(pa.uint32(), pa.utf8())),
+            pa.field("track", pa.dictionary(pa.uint32(), pa.utf8())),
+            pa.field("playlist", pa.dictionary(pa.uint32(), pa.utf8())),
+            pa.field("embeddings", pa.list_(pa.float32(), 48))
+        ]
+    )
+    table = pa.Table.from_pandas(df, schema=schema)
+
+    lance.write_dataset(table, "spotify.lance")
 
 
 if __name__ == "__main__":
