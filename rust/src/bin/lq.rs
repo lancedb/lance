@@ -25,6 +25,7 @@ use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
 use lance::datatypes::Schema;
+use lance::index::vector::ivf::IvfPqIndexBuilder;
 use lance::{Error, Result};
 
 #[derive(Parser)]
@@ -180,5 +181,16 @@ async fn create_index(
             )))
         }
     }
-    todo!()
+
+    let index_type =
+        index_type.ok_or_else(|| Err(Error::IO("Must specify index type".to_string())))?;
+
+    match index_type {
+        IndexType::IvfPQ => {
+            let builder =
+                IvfPqIndexBuilder::try_new(dataset, column, num_partitions, num_sub_vectors)?;
+
+            Ok(())
+        }
+    }
 }

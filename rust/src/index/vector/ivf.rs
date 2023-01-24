@@ -17,13 +17,19 @@
 
 //! IVF - Inverted File index.
 
+use std::sync::Arc;
+
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_select::{concat::concat_batches, take::take};
+use arrow_schema::DataType;
+use arrow_select::{
+    concat::{concat, concat_batches},
+    take::take,
+};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
@@ -31,11 +37,14 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::dataset::Dataset;
 use crate::index::pb;
 use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
+use crate::{
+    dataset::{Dataset, ROW_ID},
+    index::{IndexBuilder, IndexType},
+};
 use crate::{Error, Result};
 
 const INDEX_FILE_NAME: &str = "index.idx";
@@ -321,5 +330,169 @@ impl TryFrom<&pb::Ivf> for Ivf {
             offsets: proto.offsets.iter().map(|o| *o as usize).collect(),
             lengths: proto.lengths.clone(),
         })
+    }
+}
+
+/// Computer the residual array from the centroids.
+///
+/// TODO: not optimized. only occurred in write path.
+fn compute_residual(
+    vectors: &FixedSizeListArray,
+    centroids: &Float32Array,
+) -> Result<Arc<FixedSizeListArray>> {
+    assert_eq!(vectors.value_length() as usize, centroids.len());
+    let mut residual_vectors = vec![];
+    for idx in 0..vectors.len() {
+        let val = vectors.value(idx);
+        let residual = subtract_dyn(val.as_ref(), centroids)?;
+        residual_vectors.push(residual);
+    }
+    let residual_refs: Vec<&dyn Array> = residual_vectors.iter().map(|r| r.as_ref()).collect();
+
+    let values = concat(&residual_refs)?;
+    let f32_values: &Float32Array = as_primitive_array(values.as_ref());
+    Ok(Arc::new(FixedSizeListArray::try_new(
+        f32_values,
+        centroids.len() as i32,
+    )?))
+}
+
+pub struct IvfPqIndexBuilder<'a> {
+    dataset: &'a Dataset,
+
+    /// Index name
+    name: String,
+
+    /// Vector column to search for.
+    column: String,
+
+    dimension: usize,
+
+    /// Number of IVF partitions.
+    num_partitions: u32,
+
+    // PQ parameters
+    nbits: u32,
+
+    num_sub_vectors: u32,
+
+    /// Max iterations to train a k-mean model.
+    kmean_max_iters: u32,
+}
+
+impl<'a> IvfPqIndexBuilder<'a> {
+    pub fn try_new(
+        dataset: &'a Dataset,
+        name: &str,
+        column: &str,
+        num_partitions: u32,
+        num_sub_vectors: u32,
+    ) -> Result<Self> {
+        let field = dataset.schema().field(column).ok_or(Error::IO(format!(
+            "Column {} does not exist in the dataset",
+            column
+        )))?;
+        let dimension = match field.data_type() {
+            DataType::FixedSizeList(_, d) => d,
+            _ => {
+                return Err(Error::IO(format!("Column {} is not a vector type", column)));
+            }
+        };
+        Ok(Self {
+            dataset,
+            name: name.to_string(),
+            column: column.to_string(),
+            dimension: dimension as usize,
+            num_partitions,
+            num_sub_vectors,
+            nbits: 8,
+            kmean_max_iters: 100,
+        })
+    }
+}
+
+#[async_trait]
+impl IndexBuilder for IvfPqIndexBuilder<'_> {
+    fn index_type() -> IndexType {
+        IndexType::Vector
+    }
+
+    /// Build the IVF_PQ index
+    async fn build(&self) -> Result<()> {
+        // Step 1. Sanity check
+        let schema = self.dataset.schema().field(&self.column);
+        if schema.is_none() {
+            return Err(Error::IO(format!(
+                "Building index: column {} does not exist in dataset: {:?}",
+                self.column, self.dataset
+            )));
+        }
+
+        let object_store = self.dataset.object_store();
+
+        // object_store.
+        // Just use column.idx for POC
+        let path = self
+            .dataset
+            .indices_dir()
+            .child(format!("{}.idx", self.column));
+        let mut writer = object_store.create(&path).await?;
+
+        let mut scanner = self.dataset.scan();
+        scanner.project(&[&self.column])?;
+
+        let now = std::time::Instant::now();
+        let mut ivf_model = Ivf::try_new(
+            &train_kmean_model(
+                &scanner,
+                self.dimension,
+                self.num_partitions,
+                self.kmean_max_iters,
+            )
+            .await?,
+            self.dimension as u32,
+        )?;
+
+        scanner = self.dataset.scan();
+        scanner.project(&[&self.column])?;
+        scanner.with_row_id();
+        let partitioned_batches = ivf_model.partition(&scanner).await?;
+
+        for (key, batch) in partitioned_batches.iter() {
+            let arr = batch.column_with_name("_vector").unwrap();
+            let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+
+            let now = std::time::Instant::now();
+            let mut pq =
+                ProductQuantizer::new(self.num_sub_vectors, self.nbits, data.value_length() as u32);
+            let code = pq.fit_transform(data)?;
+            let row_id_column = batch.column_with_name(ROW_ID).unwrap();
+            ivf_model.add_partition(writer.tell(), data.len() as u32);
+            writer
+                .write_plain_encoded_array(pq.codebook.as_ref().unwrap())
+                .await?;
+            writer
+                .write_plain_encoded_array(code.values().as_ref())
+                .await?;
+            writer
+                .write_plain_encoded_array(row_id_column.as_ref())
+                .await?;
+        }
+
+        let metadata = IvfPQIndexMetadata::new(
+            self.dataset,
+            &self.column,
+            &self.column,
+            ivf_model,
+            self.nbits,
+            self.num_sub_vectors,
+        );
+
+        let metadata = pb::Index::try_from(&metadata)?;
+        let pos = writer.write_protobuf(&metadata).await?;
+        writer.write_magics(pos).await?;
+        writer.shutdown().await?;
+
+        Ok(())
     }
 }

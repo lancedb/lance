@@ -17,7 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, Array, FixedSizeListArray, Float32Array,
+    RecordBatch,
+};
 use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -229,4 +232,35 @@ impl ProductQuantizer {
         FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
             .unwrap()
     }
+}
+
+/// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
+///
+/// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
+/// the matrix into  `[128x1M; 8]` vector of matrix.
+fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<FixedSizeListArray> {
+    assert!(!array.is_empty());
+
+    let sub_vector_length = (array.value_length() / m) as usize;
+    let capacity = array.len() * sub_vector_length;
+    let mut subarrays = vec![];
+
+    // TODO: very intensive memory copy involved!!! But this is on the write path.
+    // Optimize for memory copy later.
+    for i in 0..m as usize {
+        let mut builder = Float32Builder::with_capacity(capacity);
+        for j in 0..array.len() {
+            let arr = array.value(j);
+            let row: &Float32Array = as_primitive_array(&arr);
+            let start = i * sub_vector_length;
+
+            for k in start..start + sub_vector_length {
+                builder.append_value(row.value(k));
+            }
+        }
+        let values = builder.finish();
+        let sub_array = FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap();
+        subarrays.push(sub_array);
+    }
+    subarrays
 }

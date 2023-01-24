@@ -31,6 +31,9 @@ use crate::index::vector::Query;
 use crate::io::exec::{ExecNodeBox, KNNFlat, Limit, Scan, Take};
 use crate::Result;
 
+/// Column name for the meta row ID.
+pub const ROW_ID: &str = "_rowid";
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore

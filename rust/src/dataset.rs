@@ -24,6 +24,7 @@ use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
 pub use write::*;
+pub use scanner::ROW_ID;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
