@@ -110,7 +110,7 @@ impl Dataset {
     ///
     /// Returns [Error] if the dataset already exists.
     pub async fn create(
-        batches: &mut dyn RecordBatchReader,
+        batches: &mut Box<dyn RecordBatchReader>,
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
@@ -334,7 +334,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
-        let mut batches = RecordBatchBuffer::new(
+        let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
@@ -345,13 +345,15 @@ mod tests {
                 })
                 .collect(),
         );
+        let expected_batches = batches.batches.clone();
 
         let test_uri = test_dir.path().to_str().unwrap();
 
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        Dataset::create(&mut batches, test_uri, Some(write_params))
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::create(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -366,7 +368,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.batches, actual_batches);
+        assert_eq!(expected_batches, actual_batches);
 
         // Each fragments has different fragment ID
         assert_eq!(

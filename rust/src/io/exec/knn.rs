@@ -88,7 +88,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
+    use arrow_array::{
+        cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
@@ -112,7 +114,7 @@ mod tests {
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
 
-        let mut batches = RecordBatchBuffer::new(
+        let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
@@ -139,19 +141,21 @@ mod tests {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        Dataset::create(&mut batches, test_uri, Some(write_params))
+        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
+        let q = as_fixed_size_list_array(&vector_arr).value(5);
+
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::create(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
-        let q = as_fixed_size_list_array(&vector_arr).value(5);
         let stream = dataset
             .scan()
             .nearest("vector", as_primitive_array(&q), 10)
+            .unwrap()
             .into_stream();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
-        println!("Schema: {:?}\n", results[0].schema());
 
         assert!(results[0].schema().column_with_name("score").is_some());
 

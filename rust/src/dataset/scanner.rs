@@ -20,13 +20,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::DataType::Float32;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
+use crate::Error::IO;
 
 use crate::io::exec::{ExecNodeBox, KNNFlat, Limit, Scan, Take};
 use crate::Result;
@@ -88,21 +90,37 @@ impl<'a> Scanner {
     }
 
     /// Set limit and offset.
-    pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> &mut Self {
+    pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> Result<&mut Self> {
+        if limit < 0 {
+            return Err(IO("Limit must be non-negative".to_string()));
+        }
+        if let Some(off) = offset {
+            if off < 0 {
+                return Err(IO("Offset must be non-negative".to_string()));
+            }
+        }
         self.limit = Some(limit);
         self.offset = offset;
-        self
+        Ok(self)
     }
 
     /// Find k-nearest neighbour within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> &mut Self {
+    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+        if k <= 0 {
+            return Err(IO("k must be positive".to_string()));
+        }
+        if q.is_empty() {
+            return Err(IO("Query vector must have non-zero length".to_string()));
+        }
+        // make sure the field exists
+        self.dataset.schema().project(&[column])?;
         self.nearest = Some(Query {
             column: column.to_string(),
             key: Arc::new(q.clone()),
             k,
             nprobs: 1,
         });
-        self
+        Ok(self)
     }
 
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
@@ -118,7 +136,15 @@ impl<'a> Scanner {
 
     /// The schema of the output, a.k.a, projection schema.
     pub fn schema(&self) -> SchemaRef {
-        Arc::new(ArrowSchema::from(&self.projections))
+        if self.nearest.as_ref().is_some() {
+            let score = ArrowField::new("score", Float32, false);
+            let score_schema = ArrowSchema::new(vec![score]);
+            let to_merge = &Schema::try_from(&score_schema).unwrap();
+            let merged = self.projections.merge(to_merge);
+            SchemaRef::new(ArrowSchema::from(&merged))
+        } else {
+            Arc::new(ArrowSchema::from(&self.projections))
+        }
     }
 
     /// Create a stream of this Scanner.
@@ -162,10 +188,9 @@ impl<'a> Scanner {
             ))
         };
 
-        if self.limit.is_some() || self.offset.is_some() {
+        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
         }
-
         ScannerStream::new(exec_node)
     }
 }
