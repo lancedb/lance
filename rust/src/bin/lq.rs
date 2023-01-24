@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::num;
-
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use clap::{Parser, Subcommand, ValueEnum};
-use futures::stream::{Stream, StreamExt};
+use futures::stream::StreamExt;
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::datatypes::Schema;
 use lance::index::vector::ivf::IvfPqIndexBuilder;
 use lance::index::IndexBuilder;
 use lance::{Error, Result};
@@ -183,14 +180,18 @@ async fn create_index(
         }
     }
 
-    let index_type =
-        index_type.ok_or_else(|| Err(Error::IO("Must specify index type".to_string())))?;
+    let index_type = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
 
     match index_type {
         IndexType::IvfPQ => {
-            let builder =
-                IvfPqIndexBuilder::try_new(dataset, name, column, num_partitions, num_sub_vectors)?;
-            builder.build()
+            let builder = IvfPqIndexBuilder::try_new(
+                dataset,
+                name.as_ref().unwrap(),
+                column.as_ref().unwrap(),
+                *num_partitions,
+                *num_sub_vectors,
+            )?;
+            builder.build().await
         }
     }
 }

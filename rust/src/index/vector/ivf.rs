@@ -572,18 +572,17 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.with_row_id();
         let partitioned_batches = ivf_model.partition(&scanner).await?;
 
-        for (key, batch) in partitioned_batches.iter() {
+        for (_, batch) in partitioned_batches.iter() {
             let arr = batch.column_by_name("_vector").unwrap();
             let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
-            let now = std::time::Instant::now();
             let mut pq = ProductQuantizer::new(
                 self.num_sub_vectors as usize,
                 self.nbits,
                 data.value_length() as usize,
             );
             let code = pq.fit_transform(data)?;
-            let row_id_column = batch[ROW_ID];
+            let row_id_column = &batch[ROW_ID];
             ivf_model.add_partition(writer.tell(), data.len() as u32);
             writer
                 .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
@@ -596,14 +595,14 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 .await?;
         }
 
-        let metadata = IvfPQIndexMetadata::new(
-            self.dataset,
-            &self.column,
-            &self.column,
-            ivf_model,
-            self.nbits,
-            self.num_sub_vectors,
-        );
+        let metadata = IvfPQIndexMetadata{
+            name: self.name.clone(),
+            column: self.column.clone(),
+            dimension: self.dimension as u32,
+            dataset_version: self.dataset.version().version,
+            ivf: ivf_model,
+            pq: ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension),
+        };
 
         let metadata = pb::Index::try_from(&metadata)?;
         let pos = writer.write_protobuf(&metadata).await?;
@@ -635,5 +634,6 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    super::kmeans::train_kmeans(values, dimension, k, max_iterations)
+    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations)?;
+    FixedSizeListArray::try_new(centroids, dimension as i32)
 }
