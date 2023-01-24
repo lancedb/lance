@@ -169,7 +169,7 @@ mod tests {
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
             })
             .collect();
-        let mut batches = RecordBatchBuffer::new(expected_batches.clone());
+        let batches = RecordBatchBuffer::new(expected_batches.clone());
         let mut params = WriteParams::default();
         params.max_rows_per_group = 10;
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);

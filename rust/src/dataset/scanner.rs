@@ -166,10 +166,6 @@ impl<'a> Scanner {
             exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
         }
 
-        if self.limit.is_some() || self.offset.is_some() {
-            exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
-        }
-
         ScannerStream::new(exec_node)
     }
 }

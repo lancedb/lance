@@ -112,7 +112,7 @@ mod tests {
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
 
-        let mut batches = RecordBatchBuffer::new(
+        let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
@@ -139,14 +139,15 @@ mod tests {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
+        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
+        let q = as_fixed_size_list_array(&vector_arr).value(5);
+
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::create(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
-        let q = as_fixed_size_list_array(&vector_arr).value(5);
         let stream = dataset
             .scan()
             .nearest("vector", as_primitive_array(&q), 10)

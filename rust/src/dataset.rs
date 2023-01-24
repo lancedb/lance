@@ -334,7 +334,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
-        let mut batches = RecordBatchBuffer::new(
+        let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
@@ -345,6 +345,7 @@ mod tests {
                 })
                 .collect(),
         );
+        let expected_batches = batches.batches.clone();
 
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -367,7 +368,7 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(batches.batches, actual_batches);
+        assert_eq!(expected_batches, actual_batches);
 
         // Each fragments has different fragment ID
         assert_eq!(
