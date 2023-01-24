@@ -17,12 +17,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::as_primitive_array, Array, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, Array, FixedSizeListArray, Float32Array,
+    RecordBatch,
+};
 use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 
+use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::ObjectReader;
 use crate::Result;
 use crate::{arrow::*, utils::distance::l2_distance};
@@ -228,5 +232,118 @@ impl ProductQuantizer {
         let f32_arr: &Float32Array = as_primitive_array(&arr);
         FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
             .unwrap()
+    }
+
+    /// Transform the vector array to PQ code array.
+    fn transform(&self, sub_vectors: &[FixedSizeListArray]) -> FixedSizeListArray {
+        assert_eq!(sub_vectors.len(), self.num_sub_vectors as usize);
+
+        let capacity = sub_vectors.len() * sub_vectors[0].len();
+        let mut pg_codebook_builder: Vec<u8> = vec![0; capacity];
+        for (idx, vec) in sub_vectors.iter().enumerate() {
+            // Centroids for sub-vector.
+            let centroids = self.centroids(idx);
+            for i in 0..vec.len() {
+                let value = vec.value(i);
+                let vector: &Float32Array = as_primitive_array(value.as_ref());
+                let id = argmin(l2_distance(vector, &centroids).unwrap().as_ref()).unwrap() as u8;
+                pg_codebook_builder[i * self.num_sub_vectors as usize + idx] = id;
+            }
+        }
+        let values = UInt8Array::from_iter(pg_codebook_builder);
+        FixedSizeListArray::try_new(values, self.num_sub_vectors as i32).unwrap()
+    }
+
+    /// Train a [ProductQuantizer] using an array of vectors.
+    pub fn fit_transform(&mut self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+        assert!(data.value_length() % self.num_sub_vectors as i32 == 0);
+        assert_eq!(data.value_type(), DataType::Float32);
+        assert_eq!(data.null_count(), 0);
+
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
+        let num_centorids = 2_u32.pow(self.nbits);
+        let dimension = data.value_length() as usize / self.num_sub_vectors;
+
+        let mut codebook_builder =
+            Float32Builder::with_capacity(num_centorids as usize * data.value_length() as usize);
+        // TODO: parallel training.
+        for sub_vec in &sub_vectors {
+            // Centroids for one sub vector.
+            let values = sub_vec.values();
+            let flatten_array: &Float32Array = as_primitive_array(&values);
+            let centroids = train_kmeans(flatten_array, dimension, num_centorids, 100)?;
+            // TODO: COPIED COPIED COPIED
+            unsafe {
+                codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
+            }
+        }
+        let pd_centroids = codebook_builder.finish();
+        self.codebook = Some(Arc::new(pd_centroids));
+        Ok(self.transform(&sub_vectors))
+    }
+}
+
+/// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
+///
+/// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
+/// the matrix into  `[128x1M; 8]` vector of matrix.
+fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<FixedSizeListArray> {
+    assert!(!array.is_empty());
+
+    let sub_vector_length = (array.value_length() / m) as usize;
+    let capacity = array.len() * sub_vector_length;
+    let mut subarrays = vec![];
+
+    // TODO: very intensive memory copy involved!!! But this is on the write path.
+    // Optimize for memory copy later.
+    for i in 0..m as usize {
+        let mut builder = Float32Builder::with_capacity(capacity);
+        for j in 0..array.len() {
+            let arr = array.value(j);
+            let row: &Float32Array = as_primitive_array(&arr);
+            let start = i * sub_vector_length;
+
+            for k in start..start + sub_vector_length {
+                builder.append_value(row.value(k));
+            }
+        }
+        let values = builder.finish();
+        let sub_array = FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap();
+        subarrays.push(sub_array);
+    }
+    subarrays
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use arrow_array::types::Float32Type;
+
+    #[test]
+    fn test_divide_to_subvectors() {
+        let values = Float32Array::from_iter((0..320).map(|v| v as f32));
+        // A [10, 32] array.
+        let mat = FixedSizeListArray::try_new(values, 32).unwrap();
+        let sub_vectors = divide_to_subvectors(&mat, 4);
+        assert_eq!(sub_vectors.len(), 4);
+        assert_eq!(sub_vectors[0].len(), 10);
+        assert_eq!(sub_vectors[0].value_length(), 8);
+
+        assert_eq!(
+            sub_vectors[0],
+            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                (0..10)
+                    .map(|i| {
+                        Some(
+                            (i * 32..i * 32 + 8)
+                                .map(|v| Some(v as f32))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                8
+            )
+        );
     }
 }

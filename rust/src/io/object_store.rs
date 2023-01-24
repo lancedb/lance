@@ -23,6 +23,7 @@ use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
 use object_store::local::LocalFileSystem;
+use path_absolutize::*;
 use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
@@ -55,15 +56,17 @@ impl ObjectStore {
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
             Err(ParseError::RelativeUrlWithoutBase) => {
+                let path = std::path::Path::new(uri);
                 return Ok(Self {
                     inner: Arc::new(LocalFileSystem::new()),
                     scheme: String::from("file"),
-                    base_path: Path::from(uri),
+                    base_path: Path::from(path.absolutize()?.to_str().unwrap()),
                     prefetch_size: 4 * 1024,
                 });
             }
             Err(e) => {
-                return Err(Error::IO(e.to_string()));
+                println!("Parse err: {}", e);
+                return Err(Error::IO(format!("URI parse error: {}", e.to_string())));
             }
         };
 

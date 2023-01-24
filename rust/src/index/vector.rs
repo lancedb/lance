@@ -25,6 +25,7 @@ use async_trait::async_trait;
 
 pub mod flat;
 pub mod ivf;
+mod kmeans;
 mod pq;
 
 use crate::Result;

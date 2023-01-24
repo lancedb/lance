@@ -23,6 +23,7 @@ use crate::format::{Fragment, Manifest};
 use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
+pub use scanner::ROW_ID;
 pub use write::*;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
@@ -83,7 +84,8 @@ impl Dataset {
     pub async fn open(uri: &str) -> Result<Self> {
         let object_store = Arc::new(ObjectStore::new(uri)?);
 
-        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let base_path = object_store.base_path().clone();
+        let latest_manifest_path = latest_manifest_path(&base_path);
 
         let mut object_reader = object_store.open(&latest_manifest_path).await?;
         let bytes = object_store
@@ -97,7 +99,7 @@ impl Dataset {
         manifest.schema.load_dictionary(&object_reader).await?;
         Ok(Self {
             object_store,
-            base: Path::from(uri),
+            base: base_path,
             manifest: Arc::new(manifest),
         })
     }
@@ -121,7 +123,6 @@ impl Dataset {
             Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
             Err(e) => return Err(Error::from(e)),
         }
-
         let params = params.unwrap_or_default();
 
         let mut peekable = batches.peekable();
@@ -147,6 +148,7 @@ impl Dataset {
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                 fragments.push(fragment);
                 fragment_id += 1;
+                println!("Try to open file: {}\n", file_path);
                 Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
         }
