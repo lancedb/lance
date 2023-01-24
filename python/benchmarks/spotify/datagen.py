@@ -9,8 +9,6 @@ def main():
         for user_id, artist, track, playlist in reader:
             print(user_id, artist, track, playlist)
             break
-        print(next(reader))
-    pass
-
+        #print(next(reader))
 if __name__ == "__main__":
     main()
