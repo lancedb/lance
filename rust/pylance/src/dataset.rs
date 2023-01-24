@@ -17,21 +17,19 @@
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow_array::{Array, Float32Array, RecordBatch, RecordBatchReader};
-use arrow_data::ArrayData;
-use arrow_schema::ArrowError;
 use arrow::pyarrow::*;
+use arrow_array::{Float32Array, RecordBatchReader};
+use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
-use pyo3::exceptions::{PyIOError, PyKeyError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
-use ::lance::dataset::Dataset as LanceDataset;
 use ::lance::dataset::scanner::Scanner as LanceScanner;
-use futures::{StreamExt, TryStreamExt};
+use ::lance::dataset::Dataset as LanceDataset;
 use lance::dataset::{WriteMode, WriteParams};
 
 /// Lance Dataset that will be wrapped by another class in Python
@@ -80,13 +78,16 @@ impl Dataset {
                 .project(&proj)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        scanner.limit(limit, offset);
+        scanner.limit(limit, offset)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         if let Some(nearest) = nearest {
-            let column = nearest.get_item("column")
+            let column = nearest
+                .get_item("column")
                 .ok_or_else(|| PyKeyError::new_err("Need column for nearest"))?
                 .to_string();
 
-            let qval = nearest.get_item("q")
+            let qval = nearest
+                .get_item("q")
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
             let data = ArrayData::from_pyarrow(qval)?;
             let q = Float32Array::from(data);
@@ -100,7 +101,8 @@ impl Dataset {
             } else {
                 10
             };
-            scanner.nearest(column.as_str(), &q, k);
+            scanner.nearest(column.as_str(), &q, k)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
         let scn = Arc::new(scanner);
@@ -147,5 +149,3 @@ fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     };
     Ok(params)
 }
-
-

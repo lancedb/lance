@@ -19,14 +19,11 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::*;
 use arrow::pyarrow::*;
-use arrow_schema::Schema as ArrowSchema;
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
-use ::lance::dataset::Dataset as LanceDataset;
 
 use crate::errors::ioerror;
 use crate::reader::LanceReader;
@@ -41,10 +38,7 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    pub fn new(
-        scanner: Arc<LanceScanner>,
-        rt: Arc<Runtime>,
-    ) -> Self {
+    pub fn new(scanner: Arc<LanceScanner>, rt: Arc<Runtime>) -> Self {
         Self { scanner, rt }
     }
 

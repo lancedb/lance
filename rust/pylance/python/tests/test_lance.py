@@ -59,18 +59,22 @@ def _check_roundtrip(data_obj, uri, expected):
 
 
 def test_nearest(tmp_path):
-    # uri = tmp_path
-    uri = "/tmp/nearest.lance"
+    uri = tmp_path
 
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
-    values = pa.array(np.random.rand(32 * 100), type=pa.float32())
+    npvals = np.random.rand(32 * 100)
+    values = pa.array(npvals, type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
     lance.write_dataset(tbl, uri)
 
     dataset = lance.dataset(uri)
-    tbl = dataset.to_table()
-    arr = tbl["emb"]
     top10 = dataset.to_table(nearest={"column": "emb", "q": arr[0].values, "k": 10})
+    scores = l2sq(arr[0].values, npvals.reshape((100, 32)))
+    indices = np.argsort(scores)
+    assert tbl.take(indices[:10]).to_pandas().equals(top10.to_pandas()[["emb"]])
+    assert np.allclose(scores[indices[:10]], top10.to_pandas().score.values)
 
-    assert tbl == top10
+
+def l2sq(vec, mat):
+    return np.sum((mat - vec)**2, axis=1)

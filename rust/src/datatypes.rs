@@ -588,6 +588,20 @@ impl Schema {
             .iter_mut()
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
+
+    pub fn merge(&self, other: &Schema) -> Schema {
+        let mut fields = self.fields.clone();
+        for field in other.fields.as_slice() {
+            if !fields.iter().any(|f| f.name == field.name) {
+                fields.push(field.clone());
+            }
+        }
+        let mut metadata = other.metadata.clone();
+        self.metadata.iter().for_each(|(k, v)| {
+            metadata.insert(k.to_string(), v.to_string());
+        });
+        Self { fields, metadata }
+    }
 }
 
 impl fmt::Display for Schema {

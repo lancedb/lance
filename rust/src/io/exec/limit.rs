@@ -139,7 +139,7 @@ mod tests {
 
         let dataset = Dataset::open(path).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner.limit(2, Some(19));
+        scanner.limit(2, Some(19)).unwrap();
         let actual_batches: Vec<RecordBatch> = scanner
             .into_stream()
             .map(|b| b.unwrap())
