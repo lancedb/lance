@@ -1,16 +1,18 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Union, Iterator
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
+from pyarrow import RecordBatch, Schema
+from pyarrow._compute import Expression
 
 from .lance import _Dataset, _Scanner, _write_dataset
 
 
-class LanceDataset:
+class LanceDataset(pa.dataset.Dataset):
     """
     A dataset in Lance format where the data is stored at the given uri
     """
@@ -92,6 +94,155 @@ class LanceDataset:
             columns=columns, limit=limit, offset=offset, nearest=nearest
         ).to_table()
 
+    @property
+    def partition_expression(self):
+        """
+        An Expression which evaluates to true for all data viewed by this
+        Dataset.
+        """
+        raise NotImplementedError("partitioning not yet supported")
+
+    def replace_schema(self, schema: Schema):
+        """
+        Return a copy of this Dataset with a different schema.
+
+        The copy will view the same Fragments. If the new schema is not
+        compatible with the original dataset's schema then an error will
+        be raised.
+
+        Parameters
+        ----------
+        schema : Schema
+            The new dataset schema.
+        """
+        raise NotImplementedError("not changing schemas yet")
+
+    def get_fragments(self, filter: Expression=None):
+        """Returns an iterator over the fragments in this dataset.
+
+        Parameters
+        ----------
+        filter : Expression, default None
+            Return fragments matching the optional filter, either using the
+            partition_expression or internal information like Parquet's
+            statistics.
+
+        Returns
+        -------
+        fragments : iterator of Fragment
+        """
+        raise NotImplementedError("Rust Fragments not yet exposed")
+
+    def to_batches(self, **kwargs):
+        """
+        Read the dataset as materialized record batches.
+
+        Parameters
+        ----------
+        **kwargs : dict, optional
+            Arguments for `Scanner.from_dataset`.
+
+        Returns
+        -------
+        record_batches : iterator of RecordBatch
+        """
+        return self.scanner(**kwargs).to_batches()
+
+    def take(self, indices, **kwargs):
+        """
+        Select rows of data by index.
+
+        Parameters
+        ----------
+        indices : Array or array-like
+            indices of rows to select in the dataset.
+        **kwargs : dict, optional
+            See scanner() method for full parameter description.
+
+        Returns
+        -------
+        table : Table
+        """
+        # TODO expose take from Rust
+        # kwargs['take'] = indices
+        return self.scanner(**kwargs).to_table().take(indices)
+
+    def head(self, num_rows, **kwargs):
+        """
+        Load the first N rows of the dataset.
+
+        Parameters
+        ----------
+        num_rows : int
+            The number of rows to load.
+        **kwargs : dict, optional
+            See scanner() method for full parameter description.
+
+        Returns
+        -------
+        table : Table
+        """
+        kwargs['limit'] = num_rows
+        return self.scanner(**kwargs).to_table()
+
+    def count_rows(self, **kwargs):
+        """
+        Count rows matching the scanner filter.
+
+        Parameters
+        ----------
+        **kwargs : dict, optional
+            See scanner() method for full parameter description.
+
+        Returns
+        -------
+        count : int
+        """
+        raise NotImplementedError("Count rows")
+
+    def join(self, right_dataset, keys, right_keys=None, join_type="left outer",
+             left_suffix=None, right_suffix=None, coalesce_keys=True,
+             use_threads=True):
+        """
+        Perform a join between this dataset and another one.
+
+        Result of the join will be a new dataset, where further
+        operations can be applied.
+
+        Parameters
+        ----------
+        right_dataset : dataset
+            The dataset to join to the current one, acting as the right dataset
+            in the join operation.
+        keys : str or list[str]
+            The columns from current dataset that should be used as keys
+            of the join operation left side.
+        right_keys : str or list[str], default None
+            The columns from the right_dataset that should be used as keys
+            on the join operation right side.
+            When ``None`` use the same key names as the left dataset.
+        join_type : str, default "left outer"
+            The kind of join that should be performed, one of
+            ("left semi", "right semi", "left anti", "right anti",
+            "inner", "left outer", "right outer", "full outer")
+        left_suffix : str, default None
+            Which suffix to add to right column names. This prevents confusion
+            when the columns in left and right datasets have colliding names.
+        right_suffix : str, default None
+            Which suffic to add to the left column names. This prevents confusion
+            when the columns in left and right datasets have colliding names.
+        coalesce_keys : bool, default True
+            If the duplicated keys should be omitted from one of the sides
+            in the join result.
+        use_threads : bool, default True
+            Whenever to use multithreading or not.
+
+        Returns
+        -------
+        InMemoryDataset
+        """
+        raise NotImplementedError("Versioning not yet supported in Rust")
+
 
 class ScannerBuilder:
 
@@ -142,13 +293,14 @@ class ScannerBuilder:
 
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(self._columns, self._limit, self._offset, self._nearest)
-        return LanceScanner(scanner)
+        return LanceScanner(scanner, self.ds)
 
 
-class LanceScanner:
+class LanceScanner(pa.dataset.Scanner):
 
-    def __init__(self, scanner: _Scanner):
+    def __init__(self, scanner: _Scanner, dataset: LanceDataset):
         self._scanner = scanner
+        self._ds = dataset
 
     def to_table(self) -> pa.Table:
         """
@@ -158,6 +310,242 @@ class LanceScanner:
 
     def to_reader(self) -> pa.RecordBatchReader:
         return self._scanner.to_pyarrow()
+
+    def to_batches(self) -> Iterator[RecordBatch]:
+        def _iterator(batch_iter):
+            for batch in batch_iter:
+                yield batch.record_batch
+        # Don't make ourselves a generator so errors are raised immediately
+        return _iterator(self.to_reader())
+
+    @property
+    def projected_schema(self) -> Schema:
+        return self._scanner.schema
+
+    @staticmethod
+    def from_dataset(*args, **kwargs):
+        """
+        Create Scanner from Dataset,
+
+        Parameters
+        ----------
+        dataset : Dataset
+            Dataset to scan.
+        columns : list of str, default None
+            The columns to project. This can be a list of column names to
+            include (order and duplicates will be preserved), or a dictionary
+            with {new_column_name: expression} values for more advanced
+            projections.
+
+            The list of columns or expressions may use the special fields
+            `__batch_index` (the index of the batch within the fragment),
+            `__fragment_index` (the index of the fragment within the dataset),
+            `__last_in_fragment` (whether the batch is last in fragment), and
+            `__filename` (the name of the source file or a description of the
+            source fragment).
+
+            The columns will be passed down to Datasets and corresponding data
+            fragments to avoid loading, copying, and deserializing columns
+            that will not be required further down the compute chain.
+            By default all of the available columns are projected. Raises
+            an exception if any of the referenced column names does not exist
+            in the dataset's Schema.
+        filter : Expression, default None
+            Scan will return only the rows matching the filter.
+            If possible the predicate will be pushed down to exploit the
+            partition information or internal metadata found in the data
+            source, e.g. Parquet statistics. Otherwise filters the loaded
+            RecordBatches before yielding them.
+        batch_size : int, default 128Ki
+            The maximum row count for scanned record batches. If scanned
+            record batches are overflowing memory then this method can be
+            called to reduce their size.
+        batch_readahead : int, default 16
+            The number of batches to read ahead in a file. This might not work
+            for all file formats. Increasing this number will increase
+            RAM usage but could also improve IO utilization.
+        fragment_readahead : int, default 4
+            The number of files to read ahead. Increasing this number will increase
+            RAM usage but could also improve IO utilization.
+        use_threads : bool, default True
+            If enabled, then maximum parallelism will be used determined by
+            the number of available CPU cores.
+        use_async : bool, default True
+            This flag is deprecated and is being kept for this release for
+            backwards compatibility.  It will be removed in the next
+            release.
+        memory_pool : MemoryPool, default None
+            For memory allocations, if required. If not specified, uses the
+            default pool.
+        fragment_scan_options : FragmentScanOptions, default None
+            Options specific to a particular scan and fragment type, which
+            can change between different scans of the same dataset.
+        """
+        raise NotImplementedError("from dataset")
+
+    @staticmethod
+    def from_fragment(*args, **kwargs):
+        """
+        Create Scanner from Fragment,
+
+        Parameters
+        ----------
+        fragment : Fragment
+            fragment to scan.
+        schema : Schema, optional
+            The schema of the fragment.
+        columns : list of str, default None
+            The columns to project. This can be a list of column names to
+            include (order and duplicates will be preserved), or a dictionary
+            with {new_column_name: expression} values for more advanced
+            projections.
+
+            The list of columns or expressions may use the special fields
+            `__batch_index` (the index of the batch within the fragment),
+            `__fragment_index` (the index of the fragment within the dataset),
+            `__last_in_fragment` (whether the batch is last in fragment), and
+            `__filename` (the name of the source file or a description of the
+            source fragment).
+
+            The columns will be passed down to Datasets and corresponding data
+            fragments to avoid loading, copying, and deserializing columns
+            that will not be required further down the compute chain.
+            By default all of the available columns are projected. Raises
+            an exception if any of the referenced column names does not exist
+            in the dataset's Schema.
+        filter : Expression, default None
+            Scan will return only the rows matching the filter.
+            If possible the predicate will be pushed down to exploit the
+            partition information or internal metadata found in the data
+            source, e.g. Parquet statistics. Otherwise filters the loaded
+            RecordBatches before yielding them.
+        batch_size : int, default 128Ki
+            The maximum row count for scanned record batches. If scanned
+            record batches are overflowing memory then this method can be
+            called to reduce their size.
+        batch_readahead : int, default 16
+            The number of batches to read ahead in a file. This might not work
+            for all file formats. Increasing this number will increase
+            RAM usage but could also improve IO utilization.
+        use_threads : bool, default True
+            If enabled, then maximum parallelism will be used determined by
+            the number of available CPU cores.
+        use_async : bool, default True
+            This flag is deprecated and is being kept for this release for
+            backwards compatibility.  It will be removed in the next
+            release.
+        memory_pool : MemoryPool, default None
+            For memory allocations, if required. If not specified, uses the
+            default pool.
+        fragment_scan_options : FragmentScanOptions, default None
+            Options specific to a particular scan and fragment type, which
+            can change between different scans of the same dataset.
+        """
+        raise NotImplementedError("from fragment")
+
+    @staticmethod
+    def from_batches(*args, **kwargs):
+        """
+        Create a Scanner from an iterator of batches.
+
+        This creates a scanner which can be used only once. It is
+        intended to support writing a dataset (which takes a scanner)
+        from a source which can be read only once (e.g. a
+        RecordBatchReader or generator).
+
+        Parameters
+        ----------
+        source : Iterator
+            The iterator of Batches.
+        schema : Schema
+            The schema of the batches.
+        columns : list of str or dict, default None
+                The columns to project.
+        filter : Expression, default None
+            Scan will return only the rows matching the filter.
+        batch_size : int, default 128Ki
+            The maximum row count for scanned record batches.
+        use_threads : bool, default True
+            If enabled, then maximum parallelism will be used determined by
+            the number of available CPU cores.
+        use_async : bool, default True
+            This flag is deprecated and is being kept for this release for
+            backwards compatibility.  It will be removed in the next
+            release.
+        memory_pool : MemoryPool, default None
+            For memory allocations, if required. If not specified, uses the
+            default pool.
+        fragment_scan_options : FragmentScanOptions
+            The fragment scan options.
+        """
+        raise NotImplementedError("from batches")
+
+    @property
+    def dataset_schema(self):
+        """The schema with which batches will be read from fragments."""
+        raise NotImplementedError("")
+
+    def scan_batches(self):
+        """
+        Consume a Scanner in record batches with corresponding fragments.
+
+        Returns
+        -------
+        record_batches : iterator of TaggedRecordBatch
+        """
+        lst = []
+        reader = self.to_reader()
+        while True:
+            batch = reader.read_next_batch()
+            if batch is None:
+                reader.close()
+                break
+            lst.append(batch)
+        return lst
+
+    def take(self, indices):
+        """
+        Select rows of data by index.
+
+        Will only consume as many batches of the underlying dataset as
+        needed. Otherwise, this is equivalent to
+        ``to_table().take(indices)``.
+
+        Parameters
+        ----------
+        indices : Array or array-like
+            indices of rows to select in the dataset.
+
+        Returns
+        -------
+        Table
+        """
+        raise NotImplementedError("take")
+
+    def head(self, num_rows):
+        """
+        Load the first N rows of the dataset.
+
+        Parameters
+        ----------
+        num_rows : int
+            The number of rows to load.
+
+        Returns
+        -------
+        Table
+        """
+        return self.to_table()[:num_rows]
+
+    def count_rows(self):
+        """
+        Count rows matching the scanner filter.
+
+        Returns
+        -------
+        count : int
+        """
+        raise NotImplementedError("count_rows")
 
 
 ReaderLike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
