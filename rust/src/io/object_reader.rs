@@ -49,21 +49,21 @@ pub trait ObjectReader: Send + Sync {
 ///
 /// Object Store + Base Path
 #[derive(Debug)]
-pub struct CloudObjectReader<'a> {
+pub struct CloudObjectReader {
     // Object Store.
     // TODO: can we use reference instead?
-    pub object_store: &'a ObjectStore,
+    pub object_store: ObjectStore,
     // File path
     pub path: Path,
 
     _prefetch_size: usize,
 }
 
-impl<'a> CloudObjectReader<'a> {
+impl<'a> CloudObjectReader {
     /// Create an ObjectReader from URI
     pub fn new(object_store: &'a ObjectStore, path: Path, prefetch_size: usize) -> Result<Self> {
         Ok(Self {
-            object_store,
+            object_store: object_store.clone(),
             path,
             _prefetch_size: prefetch_size,
         })
@@ -71,7 +71,7 @@ impl<'a> CloudObjectReader<'a> {
 }
 
 #[async_trait]
-impl ObjectReader for CloudObjectReader<'_> {
+impl ObjectReader for CloudObjectReader {
     /// Object/File Size.
     async fn size(&self) -> Result<usize> {
         Ok(self.object_store.inner.head(&self.path).await?.size)

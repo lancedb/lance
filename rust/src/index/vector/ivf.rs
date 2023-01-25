@@ -99,7 +99,7 @@ impl<'a> IvfPQIndex<'a> {
         let metadata_pos = read_metadata_offset(&tail_bytes)?;
         let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
-            read_message(&reader, metadata_pos).await?
+            read_message(reader.as_ref(), metadata_pos).await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
             read_message_from_buf(&tail_bytes.slice(offset..))?
@@ -107,7 +107,7 @@ impl<'a> IvfPQIndex<'a> {
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
         Ok(Self {
-            reader: Box::new(reader),
+            reader: reader,
             name: name.to_string(),
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension as usize,

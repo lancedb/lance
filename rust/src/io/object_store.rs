@@ -30,6 +30,8 @@ use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
+use super::object_reader::ObjectReader;
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
@@ -120,11 +122,12 @@ impl ObjectStore {
         &self.base_path
     }
 
-    pub async fn open(&self, path: &Path) -> Result<CloudObjectReader> {
-        match CloudObjectReader::new(self, path.clone(), self.prefetch_size) {
-            Ok(r) => Ok(r),
-            Err(e) => Err(e),
-        }
+    pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
+        Ok(Box::new(CloudObjectReader::new(
+            self,
+            path.clone(),
+            self.prefetch_size,
+        )?))
     }
 
     /// Create a new file.

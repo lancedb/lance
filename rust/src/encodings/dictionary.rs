@@ -222,7 +222,7 @@ mod tests {
 
         let reader = store.open(&path).await.unwrap();
         let decoder = DictionaryDecoder::new(
-            &reader,
+            reader.as_ref(),
             pos,
             arr.len(),
             arr.data_type(),
