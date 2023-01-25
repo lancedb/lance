@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::fmt::{self};
 
-use arrow_array::ArrayRef;
+use arrow_array::types::{Int16Type, Int32Type, Int8Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
+use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -260,7 +261,7 @@ impl Field {
         self.children.iter_mut().find(|f| f.name == name)
     }
 
-    /// Recursively attach Dictionary's value array to the field, so we can later serialize
+    /// Attach the Dictionary's value array, so that we can later serialize
     /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
         assert!(self.data_type().is_dictionary());
@@ -269,6 +270,44 @@ impl Field {
             length: 0,
             values: Some(arr.clone()),
         });
+    }
+
+    fn set_dictionary(&mut self, arr: &ArrayRef) {
+        let data_type = self.data_type();
+        match data_type {
+            DataType::Dictionary(key_type, _) => match key_type.as_ref() {
+                DataType::Int8 => {
+                    self.set_dictionary_values(as_dictionary_array::<Int8Type>(arr).values())
+                }
+                DataType::Int16 => {
+                    self.set_dictionary_values(as_dictionary_array::<Int16Type>(arr).values())
+                }
+                DataType::Int32 => {
+                    self.set_dictionary_values(as_dictionary_array::<Int32Type>(arr).values())
+                }
+                DataType::Int64 => {
+                    self.set_dictionary_values(as_dictionary_array::<Int64Type>(arr).values())
+                },
+                DataType::UInt8 => {
+                    self.set_dictionary_values(as_dictionary_array::<UInt8Type>(arr).values())
+                },
+                DataType::UInt16 => {
+                    self.set_dictionary_values(as_dictionary_array::<UInt16Type>(arr).values())
+                },
+                DataType::UInt32 => {
+                    self.set_dictionary_values(as_dictionary_array::<UInt32Type>(arr).values())
+                },
+                DataType::UInt64 => {
+                    self.set_dictionary_values(as_dictionary_array::<UInt64Type>(arr).values())
+                },
+                _ => {
+                    panic!("Unsupported dictionary key type: {}", key_type);
+                }
+            },
+            _ => {
+                // Add nested struct support.
+            }
+        }
     }
 
     fn project(&self, path_components: &[&str]) -> Result<Self> {
@@ -578,6 +617,20 @@ impl Schema {
     pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
+        }
+        Ok(())
+    }
+
+    /// Recursively attach set up dictionary values to the dictionary fields.
+    pub(crate) fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
+        for field in self.fields.as_mut_slice() {
+                let column = batch.column_by_name(&field.name).ok_or_else(|| {
+                    Error::Schema(format!(
+                        "column '{}' does not exist in the record batch",
+                        field.name
+                    ))
+                })?;
+            field.set_dictionary(&column);
         }
         Ok(())
     }

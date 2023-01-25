@@ -124,10 +124,11 @@ impl Dataset {
         let params = params.unwrap_or_default();
 
         let mut peekable = batches.peekable();
-        let schema: Schema;
+        let mut schema: Schema;
         if let Some(batch) = peekable.peek() {
             if let Ok(b) = batch {
                 schema = Schema::try_from(b.schema().as_ref())?;
+                schema.set_dictionary(b)?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
@@ -156,7 +157,7 @@ impl Dataset {
             let batch = batch_result?;
             buffer.batches.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
-                // TODO: the max rows per group boundry is not accurately calculated yet.
+                // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
                     writer = new_writer!();
                 };
@@ -177,9 +178,10 @@ impl Dataset {
             writer.as_mut().unwrap().write(&buffer.finish()?).await?;
         }
         if let Some(w) = writer.as_mut() {
+            // Drop the last writer.
             w.finish().await?;
+            drop(writer);
         };
-        drop(writer);
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         let manifest_file_path = object_store
@@ -350,10 +352,13 @@ mod tests {
                         schema.clone(),
                         vec![
                             Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(DictionaryArray::try_new(
-                                &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
-                                &dict_values,
-                            ).unwrap()),
+                            Arc::new(
+                                DictionaryArray::try_new(
+                                    &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                    &dict_values,
+                                )
+                                .unwrap(),
+                            ),
                         ],
                     )
                     .unwrap()
