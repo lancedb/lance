@@ -19,7 +19,7 @@ def generate_embeddings(col: pd.Series, **hyper_params) -> pd.Series:
         sentences.append(s)
     model = Word2Vec(sentences, **hyper_params)
     print(f"Vector space size: {len(model.wv.index_to_key)}")
-    embeddings = model.wv(sentences)
+    embeddings = model.wv[sentences]
     print(embeddings)
     return embeddings
 
@@ -59,7 +59,7 @@ def main():
     )
     table = pa.Table.from_pandas(df, schema=schema)
 
-    lance.write_dataset(table, "spotify.lance")
+    lance.write_dataset(table, "spotify.lance", max_rows_per_group=8192)
 
 
 if __name__ == "__main__":
