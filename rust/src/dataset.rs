@@ -104,11 +104,9 @@ impl Dataset {
         })
     }
 
-    /// Create a new dataset with RecordBatch.
+    /// Create a new dataset with a stream of [RecordBatch]s.
     ///
-    /// Returns the newly created dataset.
-    ///
-    /// Returns [Error] if the dataset already exists.
+    /// Returns the newly created [`Dataset`]. Returns [Error] if the dataset already exists.
     pub async fn create(
         batches: &mut Box<dyn RecordBatchReader>,
         uri: &str,

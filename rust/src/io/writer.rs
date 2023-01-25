@@ -149,6 +149,10 @@ impl<'a> FileWriter<'a> {
         self.metadata.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     #[async_recursion]
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let data_type = array.data_type();

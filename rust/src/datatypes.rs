@@ -252,11 +252,11 @@ impl Field {
         }
     }
 
-    pub fn child(&self, name: &str) -> Option<&Field> {
+    pub fn child(&self, name: &str) -> Option<&Self> {
         self.children.iter().find(|f| f.name == name)
     }
 
-    pub fn child_mut(&mut self, name: &str) -> Option<&mut Field> {
+    pub fn child_mut(&mut self, name: &str) -> Option<&mut Self> {
         self.children.iter_mut().find(|f| f.name == name)
     }
 
