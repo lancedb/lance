@@ -76,7 +76,7 @@ async fn new_file_writer<'a>(
         .base_path()
         .child(DATA_DIR)
         .child(data_file_path);
-    Ok(FileWriter::try_new(&object_store, &full_path, schema).await?)
+    FileWriter::try_new(object_store, &full_path, schema).await
 }
 
 impl Dataset {
@@ -203,7 +203,7 @@ impl Dataset {
             .await?;
 
         let base = object_store.base_path().clone();
-        Ok(Dataset {
+        Ok(Self {
             object_store,
             base,
             manifest: Arc::new(manifest.clone()),

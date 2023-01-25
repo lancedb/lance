@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::fmt::{self};
 
-use arrow_array::types::{Int16Type, Int32Type, Int8Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type};
+use arrow_array::types::{
+    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+};
 use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
@@ -181,8 +183,8 @@ impl TryFrom<&LogicalType> for DataType {
                     if splits.len() != 4 {
                         Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
                     } else {
-                        let value_type: DataType = (&LogicalType::from(splits[1])).try_into()?;
-                        let index_type: DataType = (&LogicalType::from(splits[2])).try_into()?;
+                        let value_type: Self = (&LogicalType::from(splits[1])).try_into()?;
+                        let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
                     }
                 }
@@ -287,19 +289,19 @@ impl Field {
                 }
                 DataType::Int64 => {
                     self.set_dictionary_values(as_dictionary_array::<Int64Type>(arr).values())
-                },
+                }
                 DataType::UInt8 => {
                     self.set_dictionary_values(as_dictionary_array::<UInt8Type>(arr).values())
-                },
+                }
                 DataType::UInt16 => {
                     self.set_dictionary_values(as_dictionary_array::<UInt16Type>(arr).values())
-                },
+                }
                 DataType::UInt32 => {
                     self.set_dictionary_values(as_dictionary_array::<UInt32Type>(arr).values())
-                },
+                }
                 DataType::UInt64 => {
                     self.set_dictionary_values(as_dictionary_array::<UInt64Type>(arr).values())
-                },
+                }
                 _ => {
                     panic!("Unsupported dictionary key type: {}", key_type);
                 }
@@ -371,7 +373,7 @@ impl Field {
     }
 
     // Find any nested child with a specific field id
-    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Field> {
+    fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Self> {
         for child in self.children.as_mut_slice() {
             if child.id == id {
                 return Some(child);
@@ -624,13 +626,13 @@ impl Schema {
     /// Recursively attach set up dictionary values to the dictionary fields.
     pub(crate) fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.fields.as_mut_slice() {
-                let column = batch.column_by_name(&field.name).ok_or_else(|| {
-                    Error::Schema(format!(
-                        "column '{}' does not exist in the record batch",
-                        field.name
-                    ))
-                })?;
-            field.set_dictionary(&column);
+            let column = batch.column_by_name(&field.name).ok_or_else(|| {
+                Error::Schema(format!(
+                    "column '{}' does not exist in the record batch",
+                    field.name
+                ))
+            })?;
+            field.set_dictionary(column);
         }
         Ok(())
     }
@@ -642,7 +644,7 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
-    pub fn merge(&self, other: &Schema) -> Schema {
+    pub fn merge(&self, other: &Self) -> Self {
         let mut fields = self.fields.clone();
         for field in other.fields.as_slice() {
             if !fields.iter().any(|f| f.name == field.name) {

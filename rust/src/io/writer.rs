@@ -285,7 +285,7 @@ impl<'a> FileWriter<'a> {
         // Populate schema
         // let mut schema = self.schema.clone();
         // Write dictionary values to disk.
-        let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(self.schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
 
         // Step 3. Write metadata.
