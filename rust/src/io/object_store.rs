@@ -66,7 +66,7 @@ impl ObjectStore {
             }
             Err(e) => {
                 println!("Parse err: {}", e);
-                return Err(Error::IO(format!("URI parse error: {}", e.to_string())));
+                return Err(Error::IO(format!("URI parse error: {}", e)));
             }
         };
 

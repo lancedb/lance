@@ -18,7 +18,7 @@
 |-------------------|------|-------|------|
 | Plain             | Yes  | Yes   | No   |
 | Var-length Binary | Yes  | Yes   | Yes  |
-| Dictionary        | Yes  | No    | No   |
+| Dictionary        | Yes  | Yes   | No   |
 | RLE               | No   | No    | No   |
 
 

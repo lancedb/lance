@@ -66,7 +66,7 @@ pub struct Scanner {
     with_row_id: bool,
 }
 
-impl<'a> Scanner {
+impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
         let fragments = dataset.fragments().clone();
@@ -106,7 +106,7 @@ impl<'a> Scanner {
 
     /// Find k-nearest neighbour within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
-        if k <= 0 {
+        if k == 0 {
             return Err(IO("k must be positive".to_string()));
         }
         if q.is_empty() {
@@ -153,7 +153,7 @@ impl<'a> Scanner {
     pub fn into_stream(&self) -> ScannerStream {
         const PREFECTH_SIZE: usize = 8;
 
-        let data_dir = self.dataset.data_dir().clone();
+        let data_dir = self.dataset.data_dir();
         let manifest = self.dataset.manifest.clone();
         let with_row_id = self.with_row_id;
         let projection = &self.projections;

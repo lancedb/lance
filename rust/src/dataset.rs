@@ -76,7 +76,7 @@ async fn new_file_writer<'a>(
         .base_path()
         .child(DATA_DIR)
         .child(data_file_path);
-    Ok(FileWriter::try_new(&object_store, &full_path, schema).await?)
+    FileWriter::try_new(object_store, &full_path, schema).await
 }
 
 impl Dataset {
@@ -104,11 +104,9 @@ impl Dataset {
         })
     }
 
-    /// Create a new dataset with RecordBatch.
+    /// Create a new dataset with a stream of [RecordBatch]s.
     ///
-    /// Returns the newly created dataset.
-    ///
-    /// Returns [Error] if the dataset already exists.
+    /// Returns the newly created [`Dataset`]. Returns [Error] if the dataset already exists.
     pub async fn create(
         batches: &mut Box<dyn RecordBatchReader>,
         uri: &str,
@@ -126,10 +124,11 @@ impl Dataset {
         let params = params.unwrap_or_default();
 
         let mut peekable = batches.peekable();
-        let schema: Schema;
+        let mut schema: Schema;
         if let Some(batch) = peekable.peek() {
             if let Ok(b) = batch {
                 schema = Schema::try_from(b.schema().as_ref())?;
+                schema.set_dictionary(b)?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
@@ -148,7 +147,6 @@ impl Dataset {
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                 fragments.push(fragment);
                 fragment_id += 1;
-                println!("Try to open file: {}\n", file_path);
                 Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
         }
@@ -159,7 +157,7 @@ impl Dataset {
             let batch = batch_result?;
             buffer.batches.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
-                // TODO: the max rows per group boundry is not accurately calculated yet.
+                // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
                     writer = new_writer!();
                 };
@@ -180,9 +178,10 @@ impl Dataset {
             writer.as_mut().unwrap().write(&buffer.finish()?).await?;
         }
         if let Some(w) = writer.as_mut() {
+            // Drop the last writer.
             w.finish().await?;
+            drop(writer);
         };
-        drop(writer);
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         let manifest_file_path = object_store
@@ -202,7 +201,7 @@ impl Dataset {
             .await?;
 
         let base = object_store.base_path().clone();
-        Ok(Dataset {
+        Ok(Self {
             object_store,
             base,
             manifest: Arc::new(manifest.clone()),
@@ -323,7 +322,9 @@ impl Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{
+        types::UInt16Type, DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
 
@@ -333,13 +334,30 @@ mod tests {
     async fn create_dataset() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let dict_values = StringArray::from_iter_values(["a", "b", "c", "d", "e"]);
         let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
                         schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(
+                                DictionaryArray::try_new(
+                                    &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                    &dict_values,
+                                )
+                                .unwrap(),
+                            ),
+                        ],
                     )
                     .unwrap()
                 })
