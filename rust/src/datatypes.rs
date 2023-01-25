@@ -105,7 +105,7 @@ impl TryFrom<&DataType> for LogicalType {
             },
             DataType::FixedSizeList(dt, len) => format!(
                 "fixed_size_list:{}:{}",
-                LogicalType::try_from(dt.data_type())?.0,
+                Self::try_from(dt.data_type())?.0,
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
@@ -341,7 +341,7 @@ impl Field {
     }
 
     /// Merge the children of other field into this one.
-    fn merge(&mut self, other: &Field) -> Result<()> {
+    fn merge(&mut self, other: &Self) -> Result<()> {
         for other_child in other.children.as_slice() {
             if let Some(field) = self.child_mut(&other_child.name) {
                 field.merge(other_child)?;
