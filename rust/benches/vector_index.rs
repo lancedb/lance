@@ -48,7 +48,7 @@ fn bench_flat_index(c: &mut Criterion) {
 
     c.bench_function(format!("Flat_Index(d={})", q.len()).as_str(), |b| {
         b.to_async(&rt).iter(|| async {
-            let count = dataset
+            let results = dataset
                 .scan()
                 .nearest("vector", q, 10)
                 .unwrap()
@@ -56,7 +56,7 @@ fn bench_flat_index(c: &mut Criterion) {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
-            assert!(count.len() >= 1);
+            assert!(results.len() >= 1);
         })
     });
 }
