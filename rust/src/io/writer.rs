@@ -283,15 +283,9 @@ impl<'a> FileWriter<'a> {
 
         // Step 2. Write manifest and dictionary values.
         // Populate schema
-        let mut schema = self.schema.clone();
-        for (field_id, value_arrs) in &self.dictionary_value_arrs {
-            let field = schema
-                .mut_field_by_id(*field_id)
-                .ok_or_else(|| Error::IO("Schema mismatch".to_string()))?;
-            field.set_dictionary_values(value_arrs);
-        }
+        // let mut schema = self.schema.clone();
         // Write dictionary values to disk.
-        let mut manifest = Manifest::new(&schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
 
         // Step 3. Write metadata.
@@ -358,7 +352,7 @@ mod tests {
                 true,
             ),
         ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
         let dict_vec = (0..100)
             .into_iter()
@@ -417,6 +411,7 @@ mod tests {
             ])),
         ];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+        schema.set_dictionary(&batch).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");

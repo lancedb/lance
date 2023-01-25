@@ -558,14 +558,14 @@ mod tests {
                 false,
             ),
         ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/take_test");
 
         // Write 10 batches.
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         let values = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
+        let mut batches = vec![];
         for batch_id in 0..10 {
             let value_range: Range<i64> = batch_id * 10..batch_id * 10 + 10;
             let keys = UInt8Array::from_iter_values(value_range.clone().map(|v| (v % 7) as u8));
@@ -584,7 +584,12 @@ mod tests {
                 )),
                 Arc::new(DictionaryArray::<UInt8Type>::try_new(&keys, &values).unwrap()),
             ];
-            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+            batches.push(RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap());
+        }
+        schema.set_dictionary(&batches[0]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        for batch in batches.iter() {
             file_writer.write(&batch).await.unwrap();
         }
         file_writer.finish().await.unwrap();
