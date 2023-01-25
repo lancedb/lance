@@ -69,3 +69,7 @@ required-features = ["cli"]
 [[bench]]
 name = "distance"
 harness = false
+
+[[bench]]
+name = "scan"
+harness = false
