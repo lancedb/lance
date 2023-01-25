@@ -15,7 +15,7 @@ use async_recursion::async_recursion;
 use crate::arrow::DataTypeExt;
 use crate::encodings::Encoding;
 use crate::format::pb;
-use crate::io::object_reader::{read_fixed_stride_array, ObjectReader, read_binary_array};
+use crate::io::object_reader::{read_binary_array, read_fixed_stride_array, ObjectReader};
 use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.

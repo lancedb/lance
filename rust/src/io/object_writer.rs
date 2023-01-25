@@ -129,7 +129,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use crate::format::Metadata;
-    use crate::io::object_reader::{CloudObjectReader, read_struct};
+    use crate::io::object_reader::{read_struct, CloudObjectReader};
     use crate::io::ObjectStore;
 
     use super::*;

@@ -45,7 +45,7 @@ use super::{
     Query, VectorIndex,
 };
 use crate::io::{
-    object_reader::{read_message, CloudObjectReader, ObjectReader},
+    object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
 };
 use crate::utils::distance::l2_distance;
@@ -60,9 +60,8 @@ use crate::{Error, Result};
 const INDEX_FILE_NAME: &str = "index.idx";
 
 /// IVF PQ Index.
-#[derive(Debug)]
 pub struct IvfPQIndex<'a> {
-    reader: CloudObjectReader<'a>,
+    reader: Box<dyn ObjectReader + 'a>,
 
     /// Index name.
     name: String,
@@ -108,7 +107,7 @@ impl<'a> IvfPQIndex<'a> {
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
         Ok(Self {
-            reader,
+            reader: Box::new(reader),
             name: name.to_string(),
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension as usize,
@@ -129,7 +128,7 @@ impl<'a> IvfPQIndex<'a> {
         let residual_key = subtract_dyn(key, &partition_centroids)?;
 
         // TODO: Keep PQ index in LRU
-        let pq_index = PQIndex::load(&self.reader, &self.pq, offset, length).await?;
+        let pq_index = PQIndex::load(self.reader.as_ref(), &self.pq, offset, length).await?;
         pq_index.search(as_primitive_array(&residual_key), k)
     }
 }
