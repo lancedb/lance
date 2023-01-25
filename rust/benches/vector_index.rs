@@ -31,8 +31,6 @@ fn bench_flat_index(c: &mut Criterion) {
     let first_batch = rt.block_on(async {
         dataset
             .scan()
-            .limit(100, None)
-            .unwrap()
             .into_stream()
             .try_next()
             .await
@@ -46,7 +44,7 @@ fn bench_flat_index(c: &mut Criterion) {
         as_fixed_size_list_array(&vector_column).value(rng.gen_range(0..vector_column.len()));
     let q: &Float32Array = as_primitive_array(&value);
 
-    c.bench_function(format!("Flat_Index(d={})", q.len()).as_str(), |b| {
+    c.bench_function(format!("Flat_Index(d={},top_k=10)", q.len()).as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let results = dataset
                 .scan()
