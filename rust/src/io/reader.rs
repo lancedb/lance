@@ -41,7 +41,7 @@ use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
-use crate::io::object_reader::CloudObjectReader;
+use crate::io::object_reader::{CloudObjectReader, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct};
 use crate::{
     datatypes::{Field, Schema},

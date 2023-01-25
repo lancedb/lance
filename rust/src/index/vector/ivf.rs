@@ -44,7 +44,10 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::io::{object_reader::{ObjectReader, CloudObjectReader}, read_message, read_metadata_offset};
+use crate::io::{
+    object_reader::{read_message, CloudObjectReader, ObjectReader},
+    read_message as read_message_from_buf, read_metadata_offset,
+};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
 use crate::{dataset::scanner::Scanner, index::pb};
@@ -84,7 +87,7 @@ impl<'a> IvfPQIndex<'a> {
         let index_file = index_dir.child(INDEX_FILE_NAME);
 
         let object_store = dataset.object_store();
-        let mut reader = object_store.open(&index_file).await?;
+        let reader = object_store.open(&index_file).await?;
 
         let file_size = reader.size().await?;
         let prefetch_size = object_store.prefetch_size();
@@ -97,10 +100,10 @@ impl<'a> IvfPQIndex<'a> {
         let metadata_pos = read_metadata_offset(&tail_bytes)?;
         let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
-            reader.read_message(metadata_pos).await?
+            read_message(&reader, metadata_pos).await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_message(&tail_bytes.slice(offset..))?
+            read_message_from_buf(&tail_bytes.slice(offset..))?
         };
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 

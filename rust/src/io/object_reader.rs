@@ -27,7 +27,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use object_store::{path::Path, ObjectMeta};
+use object_store::path::Path;
 use prost::Message;
 
 use super::ReadBatchParams;
@@ -39,6 +39,9 @@ use crate::io::ObjectStore;
 
 #[async_trait]
 pub trait ObjectReader: Send + Sync {
+    /// Object/File Size.
+    async fn size(&self) -> Result<usize>;
+
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
 }
 
@@ -52,7 +55,7 @@ pub struct CloudObjectReader<'a> {
     pub object_store: &'a ObjectStore,
     // File path
     pub path: Path,
-    cached_metadata: Option<ObjectMeta>,
+
     prefetch_size: usize,
 }
 
@@ -62,17 +65,8 @@ impl<'a> CloudObjectReader<'a> {
         Ok(Self {
             object_store,
             path,
-            cached_metadata: None,
             prefetch_size,
         })
-    }
-
-    /// Object/File Size.
-    pub async fn size(&mut self) -> Result<usize> {
-        if self.cached_metadata.is_none() {
-            self.cached_metadata = Some(self.object_store.inner.head(&self.path).await?);
-        };
-        Ok(self.cached_metadata.as_ref().map_or(0, |m| m.size))
     }
 
     /// Read a Protobuf-backed struct at file position: `pos`.
@@ -84,39 +78,9 @@ impl<'a> CloudObjectReader<'a> {
         &mut self,
         pos: usize,
     ) -> Result<T> {
-        let msg = self.read_message::<M>(pos).await?;
+        let msg = read_message::<M>(self, pos).await?;
         let obj = T::from(msg);
         Ok(obj)
-    }
-
-    /// Read a protobuf message at position `pos`.
-    pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
-        let file_size = self.size().await?;
-        if pos > file_size {
-            return Err(Error::IO("file size is too small".to_string()));
-        }
-
-        let range = pos..min(pos + self.prefetch_size, file_size);
-        let buf = self
-            .object_store
-            .inner
-            .get_range(&self.path, range.clone())
-            .await?;
-        let msg_len = LittleEndian::read_u32(&buf) as usize;
-
-        if msg_len + 4 > buf.len() {
-            let remaining_range = range.end..min(4 + pos + msg_len, file_size);
-            let remaining_bytes = self
-                .object_store
-                .inner
-                .get_range(&self.path, remaining_range)
-                .await?;
-            let buf = [buf, remaining_bytes].concat();
-            assert!(buf.len() >= msg_len + 4);
-            Ok(M::decode(&buf[4..4 + msg_len])?)
-        } else {
-            Ok(M::decode(&buf[4..4 + msg_len])?)
-        }
     }
 
     /// Read a fixed stride array from disk.
@@ -167,8 +131,38 @@ impl<'a> CloudObjectReader<'a> {
 
 #[async_trait]
 impl ObjectReader for CloudObjectReader<'_> {
+    /// Object/File Size.
+    async fn size(&self) -> Result<usize> {
+        Ok(self.object_store.inner.head(&self.path).await?.size)
+    }
+
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         Ok(self.object_store.inner.get_range(&self.path, range).await?)
+    }
+}
+
+/// Read a protobuf message at file position 'pos'.
+pub async fn read_message<M: Message + Default>(
+    reader: &dyn ObjectReader,
+    pos: usize,
+) -> Result<M> {
+    let file_size = reader.size().await?;
+    if pos > file_size {
+        return Err(Error::IO("file size is too small".to_string()));
+    }
+
+    let range = pos..min(pos + 4096, file_size);
+    let buf = reader.get_range(range.clone()).await?;
+    let msg_len = LittleEndian::read_u32(&buf) as usize;
+
+    if msg_len + 4 > buf.len() {
+        let remaining_range = range.end..min(4 + pos + msg_len, file_size);
+        let remaining_bytes = reader.get_range(remaining_range).await?;
+        let buf = [buf, remaining_bytes].concat();
+        assert!(buf.len() >= msg_len + 4);
+        Ok(M::decode(&buf[4..4 + msg_len])?)
+    } else {
+        Ok(M::decode(&buf[4..4 + msg_len])?)
     }
 }
 
