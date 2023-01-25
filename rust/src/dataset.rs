@@ -189,12 +189,10 @@ impl Dataset {
             .child(VERSIONS_DIR)
             .child(format!("{}.manifest", manifest.version));
         {
-            println!("Write manifest\n");
             let mut object_writer = object_store.create(&manifest_file_path).await?;
             let pos = write_manifest(&mut object_writer, &mut manifest).await?;
             object_writer.write_magics(pos).await?;
             object_writer.shutdown().await?;
-            println!("Done Write manifest\n");
         }
         let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
         object_store
