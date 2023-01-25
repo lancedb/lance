@@ -24,9 +24,10 @@ use arrow_array::{
     ArrayRef,
 };
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use object_store::{path::Path, ObjectMeta};
+use object_store::path::Path;
 use prost::Message;
 
 use super::ReadBatchParams;
@@ -36,132 +37,135 @@ use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
 
+#[async_trait]
+pub trait ObjectReader: Send + Sync {
+    /// Object/File Size.
+    async fn size(&self) -> Result<usize>;
+
+    async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
+}
+
 /// Object Reader
 ///
 /// Object Store + Base Path
 #[derive(Debug)]
-pub struct ObjectReader<'a> {
+pub struct CloudObjectReader {
     // Object Store.
     // TODO: can we use reference instead?
-    pub object_store: &'a ObjectStore,
+    pub object_store: ObjectStore,
     // File path
     pub path: Path,
-    cached_metadata: Option<ObjectMeta>,
-    prefetch_size: usize,
+
+    _prefetch_size: usize,
 }
 
-impl<'a> ObjectReader<'a> {
+impl<'a> CloudObjectReader {
     /// Create an ObjectReader from URI
     pub fn new(object_store: &'a ObjectStore, path: Path, prefetch_size: usize) -> Result<Self> {
         Ok(Self {
-            object_store,
+            object_store: object_store.clone(),
             path,
-            cached_metadata: None,
-            prefetch_size,
+            _prefetch_size: prefetch_size,
         })
     }
+}
 
+#[async_trait]
+impl ObjectReader for CloudObjectReader {
     /// Object/File Size.
-    pub async fn size(&mut self) -> Result<usize> {
-        if self.cached_metadata.is_none() {
-            self.cached_metadata = Some(self.object_store.inner.head(&self.path).await?);
-        };
-        Ok(self.cached_metadata.as_ref().map_or(0, |m| m.size))
+    async fn size(&self) -> Result<usize> {
+        Ok(self.object_store.inner.head(&self.path).await?.size)
     }
 
-    /// Read a Protobuf-backed struct at file position: `pos`.
-    pub async fn read_struct<
-        'm,
-        M: Message + Default + 'static,
-        T: ProtoStruct<Proto = M> + From<M>,
-    >(
-        &mut self,
-        pos: usize,
-    ) -> Result<T> {
-        let msg = self.read_message::<M>(pos).await?;
-        let obj = T::from(msg);
-        Ok(obj)
+    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+        Ok(self.object_store.inner.get_range(&self.path, range).await?)
+    }
+}
+
+/// Read a protobuf message at file position 'pos'.
+pub(crate) async fn read_message<M: Message + Default>(
+    reader: &dyn ObjectReader,
+    pos: usize,
+) -> Result<M> {
+    let file_size = reader.size().await?;
+    if pos > file_size {
+        return Err(Error::IO("file size is too small".to_string()));
     }
 
-    /// Read a protobuf message at position `pos`.
-    pub async fn read_message<M: Message + Default>(&mut self, pos: usize) -> Result<M> {
-        let file_size = self.size().await?;
-        if pos > file_size {
-            return Err(Error::IO("file size is too small".to_string()));
+    let range = pos..min(pos + 4096, file_size);
+    let buf = reader.get_range(range.clone()).await?;
+    let msg_len = LittleEndian::read_u32(&buf) as usize;
+
+    if msg_len + 4 > buf.len() {
+        let remaining_range = range.end..min(4 + pos + msg_len, file_size);
+        let remaining_bytes = reader.get_range(remaining_range).await?;
+        let buf = [buf, remaining_bytes].concat();
+        assert!(buf.len() >= msg_len + 4);
+        Ok(M::decode(&buf[4..4 + msg_len])?)
+    } else {
+        Ok(M::decode(&buf[4..4 + msg_len])?)
+    }
+}
+
+/// Read a Protobuf-backed struct at file position: `pos`.
+pub(crate) async fn read_struct<
+    'm,
+    M: Message + Default + 'static,
+    T: ProtoStruct<Proto = M> + From<M>,
+>(
+    reader: &dyn ObjectReader,
+    pos: usize,
+) -> Result<T> {
+    let msg = read_message::<M>(reader, pos).await?;
+    let obj = T::from(msg);
+    Ok(obj)
+}
+
+/// Read a fixed stride array from disk.
+///
+pub(crate) async fn read_fixed_stride_array(
+    reader: &dyn ObjectReader,
+    data_type: &DataType,
+    position: usize,
+    length: usize,
+    params: impl Into<ReadBatchParams>,
+) -> Result<ArrayRef> {
+    if !data_type.is_fixed_stride() {
+        return Err(Error::Schema(format!(
+            "{} is not a fixed stride type",
+            data_type
+        )));
+    }
+    // TODO: support more than plain encoding here.
+    let decoder = PlainDecoder::new(reader, data_type, position, length)?;
+    decoder.get(params.into()).await
+}
+
+pub(crate) async fn read_binary_array(
+    reader: &dyn ObjectReader,
+    data_type: &DataType,
+    position: usize,
+    length: usize,
+    params: impl Into<ReadBatchParams>,
+) -> Result<ArrayRef> {
+    use arrow_schema::DataType::*;
+    let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
+        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(reader, position, length)),
+        Binary => Box::new(BinaryDecoder::<BinaryType>::new(reader, position, length)),
+        LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(
+            reader, position, length,
+        )),
+        LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
+            reader, position, length,
+        )),
+        _ => {
+            return Err(Error::IO(
+                format!("Unsupported binary type: {}", data_type,),
+            ))
         }
-
-        let range = pos..min(pos + self.prefetch_size, file_size);
-        let buf = self
-            .object_store
-            .inner
-            .get_range(&self.path, range.clone())
-            .await?;
-        let msg_len = LittleEndian::read_u32(&buf) as usize;
-
-        if msg_len + 4 > buf.len() {
-            let remaining_range = range.end..min(4 + pos + msg_len, file_size);
-            let remaining_bytes = self
-                .object_store
-                .inner
-                .get_range(&self.path, remaining_range)
-                .await?;
-            let buf = [buf, remaining_bytes].concat();
-            assert!(buf.len() >= msg_len + 4);
-            Ok(M::decode(&buf[4..4 + msg_len])?)
-        } else {
-            Ok(M::decode(&buf[4..4 + msg_len])?)
-        }
-    }
-
-    pub async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        let bytes = self.object_store.inner.get_range(&self.path, range).await?;
-        Ok(bytes)
-    }
-
-    /// Read a fixed stride array from disk.
-    ///
-    pub(crate) async fn read_fixed_stride_array(
-        &self,
-        data_type: &DataType,
-        position: usize,
-        length: usize,
-        params: impl Into<ReadBatchParams>,
-    ) -> Result<ArrayRef> {
-        if !data_type.is_fixed_stride() {
-            return Err(Error::Schema(format!(
-                "{} is not a fixed stride type",
-                data_type
-            )));
-        }
-        // TODO: support more than plain encoding here.
-        let decoder = PlainDecoder::new(self, data_type, position, length)?;
-        decoder.get(params.into()).await
-    }
-
-    pub(crate) async fn read_binary_array(
-        &self,
-        data_type: &DataType,
-        position: usize,
-        length: usize,
-        params: impl Into<ReadBatchParams>,
-    ) -> Result<ArrayRef> {
-        use arrow_schema::DataType::*;
-        let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
-            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(self, position, length)),
-            Binary => Box::new(BinaryDecoder::<BinaryType>::new(self, position, length)),
-            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(self, position, length)),
-            LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-                self, position, length,
-            )),
-            _ => {
-                return Err(Error::IO(
-                    format!("Unsupported binary type: {}", data_type,),
-                ))
-            }
-        };
-        let fut = decoder.as_ref().get(params.into());
-        fut.await
-    }
+    };
+    let fut = decoder.as_ref().get(params.into());
+    fut.await
 }
 
 #[cfg(test)]

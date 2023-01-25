@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 
 use crate::index::vector::kmeans::train_kmeans;
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::Result;
 use crate::{arrow::*, utils::distance::l2_distance};
 
@@ -74,27 +74,31 @@ pub struct PQIndex {
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
-        reader: &ObjectReader<'_>,
+        reader: &dyn ObjectReader,
         pq: &ProductQuantizer,
         offset: usize,
         length: usize,
     ) -> Result<PQIndex> {
         // TODO: read code book, PQ code and row_ids in parallel.
         let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
-        let codebook = reader
-            .read_fixed_stride_array(&DataType::Float32, offset, code_book_length as usize, ..)
-            .await?;
+        let codebook = read_fixed_stride_array(
+            reader,
+            &DataType::Float32,
+            offset,
+            code_book_length as usize,
+            ..,
+        )
+        .await?;
 
         let pq_code_offset = offset + code_book_length as usize * 4;
         let pq_code_length = pq.num_sub_vectors as usize * length;
-        let pq_code = reader
-            .read_fixed_stride_array(&DataType::UInt8, pq_code_offset, pq_code_length, ..)
-            .await?;
+        let pq_code =
+            read_fixed_stride_array(reader, &DataType::UInt8, pq_code_offset, pq_code_length, ..)
+                .await?;
 
         let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
-        let row_ids = reader
-            .read_fixed_stride_array(&DataType::UInt64, row_id_offset, length, ..)
-            .await?;
+        let row_ids =
+            read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
         Ok(Self {
             nbits: pq.nbits,

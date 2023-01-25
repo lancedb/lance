@@ -50,7 +50,7 @@ pub struct PageTable {
 impl PageTable {
     /// Load [PageTable] from disk.
     pub async fn load<'a>(
-        reader: &'a ObjectReader<'_>,
+        reader: &dyn ObjectReader,
         position: usize,
         num_columns: i32,
         num_batches: i32,

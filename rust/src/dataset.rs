@@ -20,8 +20,8 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
+use crate::io::{object_reader::read_struct, read_metadata_offset, ObjectStore};
 use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
-use crate::io::{read_metadata_offset, ObjectStore};
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -87,7 +87,7 @@ impl Dataset {
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
 
-        let mut object_reader = object_store.open(&latest_manifest_path).await?;
+        let object_reader = object_store.open(&latest_manifest_path).await?;
         let bytes = object_store
             .inner
             .get(&latest_manifest_path)
@@ -95,8 +95,11 @@ impl Dataset {
             .bytes()
             .await?;
         let offset = read_metadata_offset(&bytes)?;
-        let mut manifest: Manifest = object_reader.read_struct(offset).await?;
-        manifest.schema.load_dictionary(&object_reader).await?;
+        let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+        manifest
+            .schema
+            .load_dictionary(object_reader.as_ref())
+            .await?;
         Ok(Self {
             object_store,
             base: base_path,

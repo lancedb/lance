@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Dictinary encoding.
+//! Dictionary encoding.
 //!
 
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::cast::{as_dictionary_array, as_primitive_array};
@@ -84,9 +85,8 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 }
 
 /// Decoder for Dictionary encoding.
-#[derive(Debug)]
 pub struct DictionaryDecoder<'a> {
-    reader: &'a ObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
     /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
@@ -97,9 +97,20 @@ pub struct DictionaryDecoder<'a> {
     value_arr: ArrayRef,
 }
 
+impl fmt::Debug for DictionaryDecoder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DictionaryDecoder")
+            .field("position", &self.position)
+            .field("length", &self.length)
+            .field("data_type", &self.data_type)
+            .field("value_arr", &self.value_arr)
+            .finish()
+    }
+}
+
 impl<'a> DictionaryDecoder<'a> {
     pub fn new(
-        reader: &'a ObjectReader<'a>,
+        reader: &'a dyn ObjectReader,
         position: usize,
         length: usize,
         data_type: &'a DataType,
@@ -211,7 +222,7 @@ mod tests {
 
         let reader = store.open(&path).await.unwrap();
         let decoder = DictionaryDecoder::new(
-            &reader,
+            reader.as_ref(),
             pos,
             arr.len(),
             arr.data_type(),

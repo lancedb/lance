@@ -100,7 +100,7 @@ impl<'a> PlainEncoder<'a> {
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
-    reader: &'a ObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
     data_type: &'a DataType,
     /// The start position of the batch in the file.
     position: usize,
@@ -119,7 +119,7 @@ fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
 
 impl<'a> PlainDecoder<'a> {
     pub fn new(
-        reader: &'a ObjectReader,
+        reader: &'a dyn ObjectReader,
         data_type: &'a DataType,
         position: usize,
         length: usize,
@@ -373,9 +373,9 @@ mod tests {
         assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
         object_writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, &data_type, 0, expected.len()).unwrap();
+        let decoder = PlainDecoder::new(reader.as_ref(), &data_type, 0, expected.len()).unwrap();
         let arr = decoder.decode().await.unwrap();
         let actual = arr.as_ref();
         assert_eq!(expected.as_ref(), actual);
@@ -476,9 +476,10 @@ mod tests {
         assert_eq!(encoder.encode(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+        let decoder =
+            PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
         assert_eq!(
             decoder.get(2..4).await.unwrap().as_ref(),
             &Int32Array::from_iter_values([2, 3])
@@ -518,9 +519,10 @@ mod tests {
         assert_eq!(encoder.encode(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
+        let decoder =
+            PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
 
         let results = decoder
             .take(&UInt32Array::from_iter(

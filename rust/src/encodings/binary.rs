@@ -85,7 +85,7 @@ impl<'a> Encoder for BinaryEncoder<'a> {
 
 /// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
-    reader: &'a ObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
 
     position: usize,
 
@@ -114,10 +114,10 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///     let object_store = ObjectStore::new(":memory:").unwrap();
     ///     let path = Path::from("/data.lance");
     ///     let reader = object_store.open(&path).await.unwrap();
-    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(&reader, 100, 1024);
+    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024);
     /// };
     /// ```
-    pub fn new(reader: &'a ObjectReader, position: usize, length: usize) -> Self {
+    pub fn new(reader: &'a dyn ObjectReader, position: usize, length: usize) -> Self {
         Self {
             reader,
             position,
@@ -288,8 +288,8 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, arr).await.unwrap();
-        let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<GenericStringType<O>>::new(&mut reader, pos, arr.len());
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, arr.len());
         let actual_arr = decoder.decode().await.unwrap();
         assert_eq!(
             actual_arr
@@ -328,8 +328,8 @@ mod tests {
         let pos = encoder.encode(&data).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, data.len());
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len());
         assert_eq!(
             decoder.decode().await.unwrap().as_ref(),
             &StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"])
@@ -369,8 +369,8 @@ mod tests {
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, &data).await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(&mut reader, pos, data.len());
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len());
 
         let actual = decoder
             .take(&UInt32Array::from_iter_values([1, 2, 5]))
