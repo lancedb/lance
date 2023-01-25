@@ -15,17 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::cast::{as_dictionary_array, as_large_list_array, as_list_array, as_struct_array};
-use arrow_array::{
-    types::{
-        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    },
-    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray,
-};
+use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use object_store::path::Path;
@@ -101,11 +95,6 @@ pub struct FileWriter<'a> {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
-
-    // Lazily loaded dictionary value arrays, <field_id, value_arr>.
-    // It is populated during the write() process, and later will be
-    // serialized to the manifest.
-    dictionary_value_arrs: HashMap<i32, ArrayRef>,
 }
 
 impl<'a> FileWriter<'a> {
@@ -121,7 +110,6 @@ impl<'a> FileWriter<'a> {
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
-            dictionary_value_arrs: HashMap::default(),
         })
     }
 
@@ -208,29 +196,6 @@ impl<'a> FileWriter<'a> {
     ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
 
-        if self.batch_id == 0 {
-            // Only load value arrays for the first batch.
-            assert!(!self.dictionary_value_arrs.contains_key(&field.id));
-            use DataType::*;
-            let values = match key_type {
-                UInt8 => as_dictionary_array::<UInt8Type>(array).values(),
-                UInt16 => as_dictionary_array::<UInt16Type>(array).values(),
-                UInt32 => as_dictionary_array::<UInt32Type>(array).values(),
-                UInt64 => as_dictionary_array::<UInt64Type>(array).values(),
-                Int8 => as_dictionary_array::<Int8Type>(array).values(),
-                Int16 => as_dictionary_array::<Int16Type>(array).values(),
-                Int32 => as_dictionary_array::<Int32Type>(array).values(),
-                Int64 => as_dictionary_array::<Int64Type>(array).values(),
-                _ => {
-                    return Err(Error::Schema(format!(
-                        "DictionaryEncoder: unsupported key type: {:?}",
-                        key_type,
-                    )))
-                }
-            };
-            self.dictionary_value_arrs.insert(field.id, values.clone());
-        };
-
         // Write the dictionary keys.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
         let pos = encoder.encode(array).await?;
@@ -282,9 +247,6 @@ impl<'a> FileWriter<'a> {
         self.metadata.page_table_position = pos;
 
         // Step 2. Write manifest and dictionary values.
-        // Populate schema
-        // let mut schema = self.schema.clone();
-        // Write dictionary values to disk.
         let mut manifest = Manifest::new(self.schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
 
