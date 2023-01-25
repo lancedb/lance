@@ -148,7 +148,6 @@ impl Dataset {
                 let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                 fragments.push(fragment);
                 fragment_id += 1;
-                println!("Try to open file: {}\n", file_path);
                 Some(new_file_writer(&object_store, &file_path, &schema).await?)
             }};
         }
@@ -190,10 +189,12 @@ impl Dataset {
             .child(VERSIONS_DIR)
             .child(format!("{}.manifest", manifest.version));
         {
+            println!("Write manifest\n");
             let mut object_writer = object_store.create(&manifest_file_path).await?;
             let pos = write_manifest(&mut object_writer, &mut manifest).await?;
             object_writer.write_magics(pos).await?;
             object_writer.shutdown().await?;
+            println!("Done Write manifest\n");
         }
         let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
         object_store
@@ -323,7 +324,9 @@ impl Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{
+        types::UInt16Type, DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
 
@@ -333,13 +336,27 @@ mod tests {
     async fn create_dataset() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new(
+                "dict",
+                DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+        let dict_values = StringArray::from_iter_values(["a", "b", "c", "d", "e"]);
         let batches = RecordBatchBuffer::new(
             (0..20)
                 .map(|i| {
                     RecordBatch::try_new(
                         schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(DictionaryArray::try_new(
+                                &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                &dict_values,
+                            ).unwrap()),
+                        ],
                     )
                     .unwrap()
                 })

@@ -102,8 +102,8 @@ pub struct FileWriter<'a> {
     page_table: PageTable,
     metadata: Metadata,
 
-    // Lazily loaded dictoinary value arrays, <field_id, value_arr>.
-    // It is populared during the write() process, and later will be
+    // Lazily loaded dictionary value arrays, <field_id, value_arr>.
+    // It is populated during the write() process, and later will be
     // serialized to the manifest.
     dictionary_value_arrs: HashMap<i32, ArrayRef>,
 }
@@ -219,7 +219,7 @@ impl<'a> FileWriter<'a> {
                 Int64 => as_dictionary_array::<Int64Type>(array).values(),
                 _ => {
                     return Err(Error::Schema(format!(
-                        "DictionaryEncoder: unsurpported key type: {:?}",
+                        "DictionaryEncoder: unsupported key type: {:?}",
                         key_type,
                     )))
                 }
@@ -227,7 +227,7 @@ impl<'a> FileWriter<'a> {
             self.dictionary_value_arrs.insert(field.id, values.clone());
         };
 
-        // Write data.
+        // Write the dictionary keys.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
