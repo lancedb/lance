@@ -129,7 +129,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use crate::format::Metadata;
-    use crate::io::object_reader::ObjectReader;
+    use crate::io::object_reader::{read_struct, CloudObjectReader};
     use crate::io::ObjectStore;
 
     use super::*;
@@ -173,8 +173,8 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let mut object_reader = ObjectReader::new(&store, path, 1024).unwrap();
-        let actual: Metadata = object_reader.read_struct(pos).await.unwrap();
+        let object_reader = CloudObjectReader::new(&store, path, 1024).unwrap();
+        let actual: Metadata = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(metadata, actual);
     }
 }

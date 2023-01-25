@@ -69,16 +69,16 @@ pub fn read_metadata_offset(bytes: &Bytes) -> Result<usize> {
 }
 
 /// Read protobuf from a buffer.
-pub fn read_message<M: Message + Default>(buf: &Bytes) -> Result<M> {
+pub fn read_message_from_buf<M: Message + Default>(buf: &Bytes) -> Result<M> {
     let msg_len = LittleEndian::read_u32(buf) as usize;
     Ok(M::decode(&buf[4..4 + msg_len])?)
 }
 
 /// Read a Protobuf-backed struct from a buffer.
-pub fn read_struct<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
+pub fn read_struct_from_buf<M: Message + Default, T: ProtoStruct<Proto = M> + From<M>>(
     buf: &Bytes,
 ) -> Result<T> {
-    let msg: M = read_message(buf)?;
+    let msg: M = read_message_from_buf(buf)?;
     Ok(T::from(msg))
 }
 

@@ -15,7 +15,7 @@ use async_recursion::async_recursion;
 use crate::arrow::DataTypeExt;
 use crate::encodings::Encoding;
 use crate::format::pb;
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::{read_binary_array, read_fixed_stride_array, ObjectReader};
 use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
@@ -386,7 +386,7 @@ impl Field {
     }
 
     #[async_recursion]
-    async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+    async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
         if let DataType::Dictionary(_, value_type) = self.data_type() {
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {
@@ -394,26 +394,26 @@ impl Field {
                 match value_type.as_ref() {
                     Utf8 | Binary => {
                         dict_info.values = Some(
-                            reader
-                                .read_binary_array(
-                                    value_type.as_ref(),
-                                    dict_info.offset,
-                                    dict_info.length,
-                                    ..,
-                                )
-                                .await?,
+                            read_binary_array(
+                                reader,
+                                value_type.as_ref(),
+                                dict_info.offset,
+                                dict_info.length,
+                                ..,
+                            )
+                            .await?,
                         );
                     }
                     Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
                         dict_info.values = Some(
-                            reader
-                                .read_fixed_stride_array(
-                                    value_type.as_ref(),
-                                    dict_info.offset,
-                                    dict_info.length,
-                                    ..,
-                                )
-                                .await?,
+                            read_fixed_stride_array(
+                                reader,
+                                value_type.as_ref(),
+                                dict_info.offset,
+                                dict_info.length,
+                                ..,
+                            )
+                            .await?,
                         );
                     }
                     _ => {
@@ -616,7 +616,7 @@ impl Schema {
     }
 
     /// Load dictionary value array from manifest files.
-    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
         }
