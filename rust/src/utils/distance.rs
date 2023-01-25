@@ -18,7 +18,7 @@
 //! Compute distance
 //!
 
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use arrow_arith::{aggregate::sum, arity::binary};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
@@ -73,14 +73,13 @@ pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
     d
 }
 
-
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn _l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     let len = from.len();
-    let buf = [0.0_f32;4];
+    let buf = [0.0_f32; 4];
     let mut sum = vld1q_f32(buf.as_ptr());
     for i in (0..len).step_by(4) {
         let left = vld1q_f32(from.as_ptr().add(i));
@@ -89,7 +88,6 @@ unsafe fn _l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
         sum = vfmaq_laneq_f32(sum, sub, sub, 1);
     }
     vaddvq_f32(sum)
-
 }
 
 #[cfg(all(target_arch = "aarch64"))]
@@ -105,10 +103,7 @@ pub fn l2_distance_neon(from: &Float32Array, to: &FixedSizeListArray) -> Result<
         Float32Array::from_trusted_len_iter(
             (0..to.len())
                 .map(|idx| {
-                    _l2_distance_neon(
-                        from_vector,
-                        &buffer[idx * dimension..(idx + 1) * dimension],
-                    )
+                    _l2_distance_neon(from_vector, &buffer[idx * dimension..(idx + 1) * dimension])
                 })
                 .map(Some),
         )
@@ -188,10 +183,11 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         return l2_distance_blas(from, to);
     }
 
-    #[cfg(any(target_arch = "aarch64"))] {
+    #[cfg(any(target_arch = "aarch64"))]
+    {
         use std::arch::is_aarch64_feature_detected;
         if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-            return l2_distance_neon(from, to)
+            return l2_distance_neon(from, to);
         }
     }
 
