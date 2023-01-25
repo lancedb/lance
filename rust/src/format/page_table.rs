@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::Decoder;
 use crate::error::Result;
-use crate::io::object_reader::CloudObjectReader;
+use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -50,7 +50,7 @@ pub struct PageTable {
 impl PageTable {
     /// Load [PageTable] from disk.
     pub async fn load<'a>(
-        reader: &'a CloudObjectReader<'_>,
+        reader: &dyn ObjectReader,
         position: usize,
         num_columns: i32,
         num_batches: i32,
