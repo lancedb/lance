@@ -76,7 +76,7 @@ pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn _l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
+unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     let len = from.len();
     let buf = [0.0_f32; 4];
@@ -88,27 +88,6 @@ unsafe fn _l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
         sum = vfmaq_laneq_f32(sum, sub, sub, 1);
     }
     vaddvq_f32(sum)
-}
-
-#[cfg(all(target_arch = "aarch64"))]
-pub fn l2_distance_neon(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
-    use arrow_array::{cast::as_primitive_array, types::Float32Type};
-
-    let inner_array = to.values();
-    let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
-    let dimension = from.len();
-    let from_vector = from.values();
-
-    let scores: Float32Array = unsafe {
-        Float32Array::from_trusted_len_iter(
-            (0..to.len())
-                .map(|idx| {
-                    _l2_distance_neon(from_vector, &buffer[idx * dimension..(idx + 1) * dimension])
-                })
-                .map(Some),
-        )
-    };
-    Ok(Arc::new(scores))
 }
 
 #[cfg(feature = "blas")]
@@ -138,8 +117,7 @@ pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<
     Ok(Arc::new(scores))
 }
 
-#[cfg(any(target_arch = "x86_64"))]
-fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
+fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
 
     let inner_array = to.values();
@@ -151,10 +129,21 @@ fn l2_distance_x86_64(from: &Float32Array, to: &FixedSizeListArray) -> Result<Ar
         Float32Array::from_trusted_len_iter(
             (0..to.len())
                 .map(|idx| {
-                    euclidean_distance_fma(
-                        from_vector,
-                        &buffer[idx * dimension..(idx + 1) * dimension],
-                    )
+                    #[cfg(any(target_arch = "x86_64"))]
+                    {
+                        return euclidean_distance_fma(
+                            from_vector,
+                            &buffer[idx * dimension..(idx + 1) * dimension],
+                        );
+                    }
+
+                    #[cfg(any(target_arch = "aarch64"))]
+                    {
+                        return l2_distance_neon(
+                            from_vector,
+                            &buffer[idx * dimension..(idx + 1) * dimension],
+                        );
+                    }
                 })
                 .map(Some),
         )
@@ -170,7 +159,7 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
     #[cfg(any(target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
-            return l2_distance_x86_64(from, to);
+            return l2_distance_simd(from, to);
         }
     }
 
@@ -187,7 +176,7 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
     {
         use std::arch::is_aarch64_feature_detected;
         if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-            return l2_distance_neon(from, to);
+            return l2_distance_simd(from, to);
         }
     }
 
