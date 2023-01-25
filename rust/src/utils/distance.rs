@@ -94,6 +94,7 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
 pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
 
+    #[cfg(target_os = "macos")]
     use accelerate_src;
     use cblas::*;
 
