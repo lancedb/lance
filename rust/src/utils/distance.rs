@@ -56,6 +56,16 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     results[7]
 }
 
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    let mut d = 0.0;
+    let l = a.len();
+    for i in 0..l {
+        let s = a[i] - b[i];
+        d += s * s;
+    }
+    d
+}
+
 /// Calculate L2 distance directly using Arrow compute kernels.
 ///
 #[inline]
@@ -63,8 +73,10 @@ pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
     let a = from.values();
     let b = to.values();
     let mut d = 0.0;
-    for i in 0..a.len() {
-        d += (a[i] - b[i]).powf(2.0)
+    let l = a.len();
+    for i in 0..l {
+        let s = a[i] - b[i];
+        d += s * s;
     }
     d
 }
