@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Optimized local I/Os
+
 use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
@@ -28,11 +30,13 @@ use object_store::path::Path;
 use super::object_reader::ObjectReader;
 use crate::Result;
 
+/// ObjectReader for local file system.
 pub struct LocalObjectReader {
     file: Arc<File>,
 }
 
 impl LocalObjectReader {
+    /// Open a local object reader.
     pub fn open(path: &Path) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{}", path.to_string());
         Ok(Box::new(Self {
