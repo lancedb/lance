@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(encoder.encode(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
         assert_eq!(
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(encoder.encode(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let mut reader = store.open(&path).await.unwrap();
+        let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder = PlainDecoder::new(&reader, array.data_type(), 0, array.len()).unwrap();
 

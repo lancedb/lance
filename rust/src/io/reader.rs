@@ -41,7 +41,9 @@ use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
-use crate::io::object_reader::{read_struct, CloudObjectReader, ObjectReader};
+use crate::io::object_reader::{
+    read_fixed_stride_array, read_struct, CloudObjectReader, ObjectReader,
+};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::{
     datatypes::{Field, Schema},
@@ -286,7 +288,7 @@ async fn read_array(
     use DataType::*;
 
     if data_type.is_fixed_stride() {
-        read_fixed_stride_array(reader, field, batch_id, params).await
+        _read_fixed_stride_array(reader, field, batch_id, params).await
     } else {
         match data_type {
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
@@ -317,7 +319,7 @@ fn get_page_info<'a>(
 }
 
 /// Read primitive array for batch `batch_idx`.
-async fn read_fixed_stride_array(
+async fn _read_fixed_stride_array(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
@@ -325,15 +327,14 @@ async fn read_fixed_stride_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
-    reader
-        .object_reader
-        .read_fixed_stride_array(
-            &field.data_type(),
-            page_info.position,
-            page_info.length,
-            params.clone(),
-        )
-        .await
+    read_fixed_stride_array(
+        &reader.object_reader,
+        &field.data_type(),
+        page_info.position,
+        page_info.length,
+        params.clone(),
+    )
+    .await
 }
 
 async fn read_binary_array(
@@ -344,15 +345,15 @@ async fn read_binary_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
-    reader
-        .object_reader
-        .read_binary_array(
-            &field.data_type(),
-            page_info.position,
-            page_info.length,
-            params,
-        )
-        .await
+    use crate::io::object_reader::read_binary_array;
+    read_binary_array(
+        &reader.object_reader,
+        &field.data_type(),
+        page_info.position,
+        page_info.length,
+        params,
+    )
+    .await
 }
 
 async fn read_dictionary_array(
@@ -404,15 +405,14 @@ async fn read_list_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
-    let position_arr = reader
-        .object_reader
-        .read_fixed_stride_array(
-            &DataType::Int32,
-            page_info.position,
-            page_info.length,
-            params,
-        )
-        .await?;
+    let position_arr = read_fixed_stride_array(
+        &reader.object_reader,
+        &DataType::Int32,
+        page_info.position,
+        page_info.length,
+        params,
+    )
+    .await?;
     let positions = as_primitive_array(position_arr.as_ref());
     let start_position = positions.value(0);
     // Compute offsets
@@ -429,15 +429,14 @@ async fn read_large_list_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    let position_arr = reader
-        .object_reader
-        .read_fixed_stride_array(
-            &DataType::Int64,
-            page_info.position,
-            page_info.length,
-            params,
-        )
-        .await?;
+    let position_arr = read_fixed_stride_array(
+        &reader.object_reader,
+        &DataType::Int64,
+        page_info.position,
+        page_info.length,
+        params,
+    )
+    .await?;
     let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
     let start_position = positions.value(0);
     // Compute offsets

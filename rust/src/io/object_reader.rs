@@ -56,7 +56,7 @@ pub struct CloudObjectReader<'a> {
     // File path
     pub path: Path,
 
-    prefetch_size: usize,
+    _prefetch_size: usize,
 }
 
 impl<'a> CloudObjectReader<'a> {
@@ -65,53 +65,8 @@ impl<'a> CloudObjectReader<'a> {
         Ok(Self {
             object_store,
             path,
-            prefetch_size,
+            _prefetch_size: prefetch_size,
         })
-    }
-
-    /// Read a fixed stride array from disk.
-    ///
-    pub(crate) async fn read_fixed_stride_array(
-        &self,
-        data_type: &DataType,
-        position: usize,
-        length: usize,
-        params: impl Into<ReadBatchParams>,
-    ) -> Result<ArrayRef> {
-        if !data_type.is_fixed_stride() {
-            return Err(Error::Schema(format!(
-                "{} is not a fixed stride type",
-                data_type
-            )));
-        }
-        // TODO: support more than plain encoding here.
-        let decoder = PlainDecoder::new(self, data_type, position, length)?;
-        decoder.get(params.into()).await
-    }
-
-    pub(crate) async fn read_binary_array(
-        &self,
-        data_type: &DataType,
-        position: usize,
-        length: usize,
-        params: impl Into<ReadBatchParams>,
-    ) -> Result<ArrayRef> {
-        use arrow_schema::DataType::*;
-        let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
-            Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(self, position, length)),
-            Binary => Box::new(BinaryDecoder::<BinaryType>::new(self, position, length)),
-            LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(self, position, length)),
-            LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-                self, position, length,
-            )),
-            _ => {
-                return Err(Error::IO(
-                    format!("Unsupported binary type: {}", data_type,),
-                ))
-            }
-        };
-        let fut = decoder.as_ref().get(params.into());
-        fut.await
     }
 }
 
@@ -128,7 +83,7 @@ impl ObjectReader for CloudObjectReader<'_> {
 }
 
 /// Read a protobuf message at file position 'pos'.
-pub async fn read_message<M: Message + Default>(
+pub(crate) async fn read_message<M: Message + Default>(
     reader: &dyn ObjectReader,
     pos: usize,
 ) -> Result<M> {
@@ -153,7 +108,7 @@ pub async fn read_message<M: Message + Default>(
 }
 
 /// Read a Protobuf-backed struct at file position: `pos`.
-pub async fn read_struct<
+pub(crate) async fn read_struct<
     'm,
     M: Message + Default + 'static,
     T: ProtoStruct<Proto = M> + From<M>,
@@ -164,6 +119,53 @@ pub async fn read_struct<
     let msg = read_message::<M>(reader, pos).await?;
     let obj = T::from(msg);
     Ok(obj)
+}
+
+/// Read a fixed stride array from disk.
+///
+pub(crate) async fn read_fixed_stride_array(
+    reader: &dyn ObjectReader,
+    data_type: &DataType,
+    position: usize,
+    length: usize,
+    params: impl Into<ReadBatchParams>,
+) -> Result<ArrayRef> {
+    if !data_type.is_fixed_stride() {
+        return Err(Error::Schema(format!(
+            "{} is not a fixed stride type",
+            data_type
+        )));
+    }
+    // TODO: support more than plain encoding here.
+    let decoder = PlainDecoder::new(reader, data_type, position, length)?;
+    decoder.get(params.into()).await
+}
+
+pub(crate) async fn read_binary_array(
+    reader: &dyn ObjectReader,
+    data_type: &DataType,
+    position: usize,
+    length: usize,
+    params: impl Into<ReadBatchParams>,
+) -> Result<ArrayRef> {
+    use arrow_schema::DataType::*;
+    let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
+        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(reader, position, length)),
+        Binary => Box::new(BinaryDecoder::<BinaryType>::new(reader, position, length)),
+        LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(
+            reader, position, length,
+        )),
+        LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
+            reader, position, length,
+        )),
+        _ => {
+            return Err(Error::IO(
+                format!("Unsupported binary type: {}", data_type,),
+            ))
+        }
+    };
+    let fut = decoder.as_ref().get(params.into());
+    fut.await
 }
 
 #[cfg(test)]
