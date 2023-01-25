@@ -44,7 +44,7 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::io::{object_reader::CloudObjectReader, read_message, read_metadata_offset};
+use crate::io::{object_reader::{ObjectReader, CloudObjectReader}, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
 use crate::{dataset::scanner::Scanner, index::pb};

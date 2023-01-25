@@ -38,7 +38,7 @@ use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
 
 #[async_trait]
-pub trait ObjectReader {
+pub trait ObjectReader: Send + Sync {
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
 }
 
@@ -119,11 +119,6 @@ impl<'a> CloudObjectReader<'a> {
         }
     }
 
-    pub async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        let bytes = self.object_store.inner.get_range(&self.path, range).await?;
-        Ok(bytes)
-    }
-
     /// Read a fixed stride array from disk.
     ///
     pub(crate) async fn read_fixed_stride_array(
@@ -167,6 +162,13 @@ impl<'a> CloudObjectReader<'a> {
         };
         let fut = decoder.as_ref().get(params.into());
         fut.await
+    }
+}
+
+#[async_trait]
+impl ObjectReader for CloudObjectReader<'_> {
+    async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
+        Ok(self.object_store.inner.get_range(&self.path, range).await?)
     }
 }
 

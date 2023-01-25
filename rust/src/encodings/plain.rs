@@ -45,7 +45,7 @@ use crate::Error;
 use super::Decoder;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
-use crate::io::object_reader::CloudObjectReader;
+use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
 
@@ -100,7 +100,7 @@ impl<'a> PlainEncoder<'a> {
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {
-    reader: &'a CloudObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
     data_type: &'a DataType,
     /// The start position of the batch in the file.
     position: usize,
@@ -119,7 +119,7 @@ fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
 
 impl<'a> PlainDecoder<'a> {
     pub fn new(
-        reader: &'a CloudObjectReader,
+        reader: &'a dyn ObjectReader,
         data_type: &'a DataType,
         position: usize,
         length: usize,

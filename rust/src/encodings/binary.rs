@@ -25,7 +25,7 @@ use super::Encoder;
 use super::{plain::PlainDecoder, AsyncIndex};
 use crate::encodings::Decoder;
 use crate::error::Result;
-use crate::io::object_reader::CloudObjectReader;
+use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
 
@@ -85,7 +85,7 @@ impl<'a> Encoder for BinaryEncoder<'a> {
 
 /// Var-binary encoding decoder.
 pub struct BinaryDecoder<'a, T: ByteArrayType> {
-    reader: &'a CloudObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
 
     position: usize,
 
@@ -117,7 +117,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(&reader, 100, 1024);
     /// };
     /// ```
-    pub fn new(reader: &'a CloudObjectReader, position: usize, length: usize) -> Self {
+    pub fn new(reader: &'a dyn ObjectReader, position: usize, length: usize) -> Self {
         Self {
             reader,
             position,

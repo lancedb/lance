@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Dictinary encoding.
+//! Dictionary encoding.
 //!
 
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::cast::{as_dictionary_array, as_primitive_array};
@@ -34,7 +35,7 @@ use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::CloudObjectReader, object_writer::ObjectWriter, ReadBatchParams};
+use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter, ReadBatchParams};
 use crate::Error;
 
 /// Encoder for Dictionary encoding.
@@ -84,9 +85,8 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 }
 
 /// Decoder for Dictionary encoding.
-#[derive(Debug)]
 pub struct DictionaryDecoder<'a> {
-    reader: &'a CloudObjectReader<'a>,
+    reader: &'a dyn ObjectReader,
     /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
@@ -97,9 +97,20 @@ pub struct DictionaryDecoder<'a> {
     value_arr: ArrayRef,
 }
 
+impl fmt::Debug for DictionaryDecoder<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DictionaryDecoder")
+            .field("position", &self.position)
+            .field("length", &self.length)
+            .field("data_type", &self.data_type)
+            .field("value_arr", &self.value_arr)
+            .finish()
+    }
+}
+
 impl<'a> DictionaryDecoder<'a> {
     pub fn new(
-        reader: &'a CloudObjectReader<'a>,
+        reader: &'a dyn ObjectReader,
         position: usize,
         length: usize,
         data_type: &'a DataType,
