@@ -27,7 +27,7 @@ use path_absolutize::*;
 use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
@@ -120,8 +120,8 @@ impl ObjectStore {
         &self.base_path
     }
 
-    pub async fn open(&self, path: &Path) -> Result<ObjectReader> {
-        match ObjectReader::new(self, path.clone(), self.prefetch_size) {
+    pub async fn open(&self, path: &Path) -> Result<CloudObjectReader> {
+        match CloudObjectReader::new(self, path.clone(), self.prefetch_size) {
             Ok(r) => Ok(r),
             Err(e) => Err(e),
         }

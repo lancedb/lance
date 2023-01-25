@@ -34,7 +34,7 @@ use super::AsyncIndex;
 use crate::encodings::plain::PlainDecoder;
 use crate::encodings::{Decoder, Encoder};
 use crate::error::Result;
-use crate::io::{object_reader::ObjectReader, object_writer::ObjectWriter, ReadBatchParams};
+use crate::io::{object_reader::CloudObjectReader, object_writer::ObjectWriter, ReadBatchParams};
 use crate::Error;
 
 /// Encoder for Dictionary encoding.
@@ -86,7 +86,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
 /// Decoder for Dictionary encoding.
 #[derive(Debug)]
 pub struct DictionaryDecoder<'a> {
-    reader: &'a ObjectReader<'a>,
+    reader: &'a CloudObjectReader<'a>,
     /// The start position of the key array in the file.
     position: usize,
     /// Number of the rows in this batch.
@@ -99,7 +99,7 @@ pub struct DictionaryDecoder<'a> {
 
 impl<'a> DictionaryDecoder<'a> {
     pub fn new(
-        reader: &'a ObjectReader<'a>,
+        reader: &'a CloudObjectReader<'a>,
         position: usize,
         length: usize,
         data_type: &'a DataType,

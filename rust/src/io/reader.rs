@@ -41,7 +41,7 @@ use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::CloudObjectReader;
 use crate::io::{read_metadata_offset, read_struct};
 use crate::{
     datatypes::{Field, Schema},
@@ -85,7 +85,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 ///
 /// It reads arrow data from one data file.
 pub struct FileReader<'a> {
-    object_reader: ObjectReader<'a>,
+    object_reader: CloudObjectReader<'a>,
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
@@ -108,7 +108,7 @@ impl<'a> FileReader<'a> {
         manifest: Option<&Manifest>,
     ) -> Result<FileReader<'a>> {
         let mut object_reader =
-            ObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
+            CloudObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
 
         let file_size = object_reader.size().await?;
         let begin = if file_size < object_store.prefetch_size() {

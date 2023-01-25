@@ -24,6 +24,7 @@ use arrow_array::{
     ArrayRef,
 };
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use object_store::{path::Path, ObjectMeta};
@@ -36,11 +37,16 @@ use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
 
+#[async_trait]
+pub trait ObjectReader {
+    async fn get_range(&self, range: Range<usize>) -> Result<Bytes>;
+}
+
 /// Object Reader
 ///
 /// Object Store + Base Path
 #[derive(Debug)]
-pub struct ObjectReader<'a> {
+pub struct CloudObjectReader<'a> {
     // Object Store.
     // TODO: can we use reference instead?
     pub object_store: &'a ObjectStore,
@@ -50,7 +56,7 @@ pub struct ObjectReader<'a> {
     prefetch_size: usize,
 }
 
-impl<'a> ObjectReader<'a> {
+impl<'a> CloudObjectReader<'a> {
     /// Create an ObjectReader from URI
     pub fn new(object_store: &'a ObjectStore, path: Path, prefetch_size: usize) -> Result<Self> {
         Ok(Self {

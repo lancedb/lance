@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 
 use crate::index::vector::kmeans::train_kmeans;
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::CloudObjectReader;
 use crate::Result;
 use crate::{arrow::*, utils::distance::l2_distance};
 
@@ -74,7 +74,7 @@ pub struct PQIndex {
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
-        reader: &ObjectReader<'_>,
+        reader: &CloudObjectReader<'_>,
         pq: &ProductQuantizer,
         offset: usize,
         length: usize,

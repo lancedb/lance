@@ -44,7 +44,7 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     Query, VectorIndex,
 };
-use crate::io::{object_reader::ObjectReader, read_message, read_metadata_offset};
+use crate::io::{object_reader::CloudObjectReader, read_message, read_metadata_offset};
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
 use crate::{dataset::scanner::Scanner, index::pb};
@@ -59,7 +59,7 @@ const INDEX_FILE_NAME: &str = "index.idx";
 /// IVF PQ Index.
 #[derive(Debug)]
 pub struct IvfPQIndex<'a> {
-    reader: ObjectReader<'a>,
+    reader: CloudObjectReader<'a>,
 
     /// Index name.
     name: String,

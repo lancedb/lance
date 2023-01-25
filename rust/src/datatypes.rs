@@ -15,7 +15,7 @@ use async_recursion::async_recursion;
 use crate::arrow::DataTypeExt;
 use crate::encodings::Encoding;
 use crate::format::pb;
-use crate::io::object_reader::ObjectReader;
+use crate::io::object_reader::CloudObjectReader;
 use crate::{Error, Result};
 
 /// LogicalType is a string presentation of arrow type.
@@ -386,7 +386,7 @@ impl Field {
     }
 
     #[async_recursion]
-    async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+    async fn load_dictionary<'a>(&mut self, reader: &'a CloudObjectReader<'_>) -> Result<()> {
         if let DataType::Dictionary(_, value_type) = self.data_type() {
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {
@@ -616,7 +616,7 @@ impl Schema {
     }
 
     /// Load dictionary value array from manifest files.
-    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a ObjectReader<'_>) -> Result<()> {
+    pub(crate) async fn load_dictionary<'a>(&mut self, reader: &'a CloudObjectReader<'_>) -> Result<()> {
         for field in self.fields.as_mut_slice() {
             field.load_dictionary(reader).await?;
         }
