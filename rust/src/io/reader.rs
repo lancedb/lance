@@ -41,8 +41,8 @@ use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
 use crate::error::{Error, Result};
 use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
-use crate::io::object_reader::{CloudObjectReader, ObjectReader};
-use crate::io::{read_metadata_offset, read_struct};
+use crate::io::object_reader::{read_struct, CloudObjectReader, ObjectReader};
+use crate::io::{read_metadata_offset, read_struct_from_buf};
 use crate::{
     datatypes::{Field, Schema},
     format::PageInfo,
@@ -107,7 +107,7 @@ impl<'a> FileReader<'a> {
         fragment_id: u64,
         manifest: Option<&Manifest>,
     ) -> Result<FileReader<'a>> {
-        let mut object_reader =
+        let object_reader =
             CloudObjectReader::new(object_store, path.clone(), object_store.prefetch_size())?;
 
         let file_size = object_reader.size().await?;
@@ -125,18 +125,17 @@ impl<'a> FileReader<'a> {
 
         let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
             // We have not read the metadata bytes yet.
-            object_reader.read_struct(metadata_pos).await?
+            read_struct(&object_reader, metadata_pos).await?
         } else {
             let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_struct(&tail_bytes.slice(offset..))?
+            read_struct_from_buf(&tail_bytes.slice(offset..))?
         };
 
         let (projection, num_columns) = if let Some(m) = manifest {
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         } else {
-            let mut m: Manifest = object_reader
-                .read_struct(metadata.manifest_position.unwrap())
-                .await?;
+            let mut m: Manifest =
+                read_struct(&object_reader, metadata.manifest_position.unwrap()).await?;
             m.schema.load_dictionary(&object_reader).await?;
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         };

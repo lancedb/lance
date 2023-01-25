@@ -46,7 +46,7 @@ use super::{
 };
 use crate::io::{
     object_reader::{read_message, CloudObjectReader, ObjectReader},
-    read_message as read_message_from_buf, read_metadata_offset,
+    read_message_from_buf, read_metadata_offset,
 };
 use crate::utils::distance::l2_distance;
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};

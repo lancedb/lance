@@ -69,20 +69,6 @@ impl<'a> CloudObjectReader<'a> {
         })
     }
 
-    /// Read a Protobuf-backed struct at file position: `pos`.
-    pub async fn read_struct<
-        'm,
-        M: Message + Default + 'static,
-        T: ProtoStruct<Proto = M> + From<M>,
-    >(
-        &mut self,
-        pos: usize,
-    ) -> Result<T> {
-        let msg = read_message::<M>(self, pos).await?;
-        let obj = T::from(msg);
-        Ok(obj)
-    }
-
     /// Read a fixed stride array from disk.
     ///
     pub(crate) async fn read_fixed_stride_array(
@@ -164,6 +150,20 @@ pub async fn read_message<M: Message + Default>(
     } else {
         Ok(M::decode(&buf[4..4 + msg_len])?)
     }
+}
+
+/// Read a Protobuf-backed struct at file position: `pos`.
+pub async fn read_struct<
+    'm,
+    M: Message + Default + 'static,
+    T: ProtoStruct<Proto = M> + From<M>,
+>(
+    reader: &dyn ObjectReader,
+    pos: usize,
+) -> Result<T> {
+    let msg = read_message::<M>(reader, pos).await?;
+    let obj = T::from(msg);
+    Ok(obj)
 }
 
 #[cfg(test)]
