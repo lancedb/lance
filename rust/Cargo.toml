@@ -73,3 +73,7 @@ harness = false
 [[bench]]
 name = "scan"
 harness = false
+
+[[bench]]
+name = "vector_index"
+harness = false

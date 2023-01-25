@@ -60,8 +60,13 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
 ///
 #[inline]
 pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
-    let mul: Float32Array = binary(from, to, |a, b| (a - b).powf(2.0)).unwrap();
-    sum(&mul).unwrap()
+    let a = from.values();
+    let b = to.values();
+    let mut d = 0.0;
+    for i in 0..a.len() {
+        d += (a[i] - b[i]).powf(2.0)
+    }
+    d
 }
 
 #[cfg(any(target_arch = "x86_64"))]
