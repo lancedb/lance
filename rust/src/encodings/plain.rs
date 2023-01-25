@@ -478,7 +478,8 @@ mod tests {
 
         let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
+        let decoder =
+            PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
         assert_eq!(
             decoder.get(2..4).await.unwrap().as_ref(),
             &Int32Array::from_iter_values([2, 3])
@@ -520,7 +521,8 @@ mod tests {
 
         let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
+        let decoder =
+            PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
 
         let results = decoder
             .take(&UInt32Array::from_iter(

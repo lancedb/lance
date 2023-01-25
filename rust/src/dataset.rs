@@ -96,7 +96,10 @@ impl Dataset {
             .await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
-        manifest.schema.load_dictionary(object_reader.as_ref()).await?;
+        manifest
+            .schema
+            .load_dictionary(object_reader.as_ref())
+            .await?;
         Ok(Self {
             object_store,
             base: base_path,
