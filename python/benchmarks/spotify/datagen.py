@@ -2,6 +2,7 @@
 #
 
 import os
+from random import choice
 
 import lance
 import pyarrow as pa
@@ -19,7 +20,13 @@ def generate_embeddings(col: pd.Series, **hyper_params) -> pd.Series:
         sentences.append(s)
     model = Word2Vec(sentences, **hyper_params)
     print(f"Vector space size: {len(model.wv.index_to_key)}")
-    embeddings = model.wv[sentences]
+    embeddings = []
+    for query_item in col:
+        if query_item not in model.wv:
+            query_item = choice(list(model.wv.index_to_key))
+        embeding = model.wv[query_item]
+        embeddings.append(embeding)
+
     print(embeddings)
     return embeddings
 
