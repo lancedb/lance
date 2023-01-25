@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arrow_arith::{aggregate::sum, arity::binary};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_buffer::MutableBuffer;
 use arrow_schema::DataType;
 
 use crate::Result;
@@ -56,8 +57,14 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     results[7]
 }
 
-fn distance(a: &[f32], b: &[f32]) -> f32 {
+/// Calculate L2 distance directly using Arrow compute kernels.
+///
+#[inline]
+pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
+    let a = from.values();
+    let b = to.values();
     let mut d = 0.0;
+    // Better chance to auto-vectorization.
     let l = a.len();
     for i in 0..l {
         let s = a[i] - b[i];
@@ -66,19 +73,33 @@ fn distance(a: &[f32], b: &[f32]) -> f32 {
     d
 }
 
-/// Calculate L2 distance directly using Arrow compute kernels.
-///
-#[inline]
-pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
-    let a = from.values();
-    let b = to.values();
-    let mut d = 0.0;
-    let l = a.len();
-    for i in 0..l {
-        let s = a[i] - b[i];
-        d += s * s;
-    }
-    d
+use std::arch::aarch64::float32x4x4_t;
+
+#[cfg(feature = "blas")]
+pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
+    use arrow_array::{cast::as_primitive_array, types::Float32Type};
+
+    use accelerate_src;
+    use cblas::*;
+
+    let inner_array = to.values();
+    let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
+    let dimension = from.len() as i32;
+    let from_vector = from.values();
+
+    let scores =
+        Float32Array::from_iter_values(buffer.chunks_exact(dimension as usize).map(|t| unsafe {
+            // Allocating new buffer is FASTER (12%) than zero out existing buffer.
+            let mut buf = MutableBuffer::from_len_zeroed(dimension as usize * 4);
+            let result: &mut [f32] = buf.typed_data_mut();
+            // Set result buffer to x
+            saxpy(dimension, 1.0, from_vector, 1, result, 1);
+            // x - y
+            saxpy(dimension, -1.0, t, 1, result, 1);
+            // (x-y)^2
+            sdot(dimension, result, 1, result, 1)
+        }));
+    Ok(Arc::new(scores))
 }
 
 #[cfg(any(target_arch = "x86_64"))]
@@ -115,6 +136,13 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
             return l2_distance_x86_64(from, to);
         }
+    }
+
+    #[cfg(feature = "blas")]
+    {
+        let v = l2_distance_blas(from, to);
+        // println!("Vector result is: to:{} {:?}", to.len(), v.len());
+        return v;
     }
 
     let scores: Float32Array = unsafe {

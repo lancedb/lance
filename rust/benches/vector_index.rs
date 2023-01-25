@@ -44,19 +44,22 @@ fn bench_flat_index(c: &mut Criterion) {
         as_fixed_size_list_array(&vector_column).value(rng.gen_range(0..vector_column.len()));
     let q: &Float32Array = as_primitive_array(&value);
 
-    c.bench_function(format!("Flat_Index(d={},top_k=10)", q.len()).as_str(), |b| {
-        b.to_async(&rt).iter(|| async {
-            let results = dataset
-                .scan()
-                .nearest("vector", q, 10)
-                .unwrap()
-                .into_stream()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            assert!(results.len() >= 1);
-        })
-    });
+    c.bench_function(
+        format!("Flat_Index(d={},top_k=10)", q.len()).as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let results = dataset
+                    .scan()
+                    .nearest("vector", q, 10)
+                    .unwrap()
+                    .into_stream()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert!(results.len() >= 1);
+            })
+        },
+    );
 }
 
 criterion_group!(
