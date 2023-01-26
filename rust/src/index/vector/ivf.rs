@@ -507,17 +507,14 @@ impl<'a> IvfPqIndexBuilder<'a> {
         let field = dataset.schema().field(column).ok_or(Error::IO(format!(
             "Column {column} does not exist in the dataset"
         )))?;
-        let dimension = match field.data_type() {
-            DataType::FixedSizeList(_, d) => d,
-            _ => {
-                return Err(Error::IO(format!("Column {column} is not a vector type")));
-            }
+        let DataType::FixedSizeList(_, d) = field.data_type() else {
+            return Err(Error::IO(format!("Column {column} is not a vector type")));
         };
         Ok(Self {
             dataset,
             name: name.to_string(),
             column: column.to_string(),
-            dimension: dimension as usize,
+            dimension: d as usize,
             num_partitions,
             num_sub_vectors,
             nbits: 8,

@@ -6,6 +6,7 @@ rustflags = [
     "-Wclippy::all",
     # "-Wclippy::style",
     "-Wclippy::fallible_impl_from",
+    "-Wclippy::manual_let_else",
     "-Wclippy::redundant_pub_crate",
     "-Wclippy::string_add_assign",
     "-Wclippy::string_add",
