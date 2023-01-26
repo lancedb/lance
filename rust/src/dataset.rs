@@ -20,6 +20,7 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
+use crate::index::{IndexBuildParams, IndexType};
 use crate::io::{object_reader::read_struct, read_metadata_offset, ObjectStore};
 use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::{Error, Result};
@@ -214,6 +215,16 @@ impl Dataset {
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
+    }
+
+    /// Create indices on columns.
+    pub async fn create_index(
+        &self,
+        columns: &[&str],
+        index_type: IndexType,
+        params: Option<impl IndexBuildParams>,
+    ) -> Result<Self> {
+        todo!()
     }
 
     /// Take rows by the internal ROW ids.

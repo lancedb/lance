@@ -22,12 +22,13 @@ use super::pb;
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
+    /// Unique ID across all dataset versions.
     id: u64,
 
     /// Fields to build the index.
     fields: Vec<i32>,
 
-    /// Index name
+    /// Human readable index name
     name: String,
 }
 

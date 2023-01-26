@@ -46,3 +46,5 @@ pub trait IndexBuilder {
 
     async fn build(&self) -> Result<()>;
 }
+
+pub trait IndexBuildParams {}

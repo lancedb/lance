@@ -107,7 +107,7 @@ impl<'a> IvfPQIndex<'a> {
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
         Ok(Self {
-            reader: reader,
+            reader,
             name: name.to_string(),
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension as usize,

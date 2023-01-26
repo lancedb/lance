@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::Fragment;
 use crate::datatypes::Schema;
-use crate::format::{pb, Index, ProtoStruct};
+use crate::format::{pb, ProtoStruct};
 use std::collections::HashMap;
 
 /// Manifest of a dataset
