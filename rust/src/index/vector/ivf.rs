@@ -562,8 +562,6 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 field.data_type())));
         }
 
-        // if field.data_type()
-
         let object_store = self.dataset.object_store();
         let path = self
             .dataset
