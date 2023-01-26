@@ -497,7 +497,7 @@ pub struct IvfPqIndexBuilder<'a> {
     num_sub_vectors: u32,
 
     /// Max iterations to train a k-mean model.
-    kmean_max_iters: u32,
+    kmeans_max_iters: u32,
 }
 
 impl<'a> IvfPqIndexBuilder<'a> {
@@ -524,7 +524,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
             num_partitions,
             num_sub_vectors,
             nbits: 8,
-            kmean_max_iters: 100,
+            kmeans_max_iters: 100,
         })
     }
 }
@@ -581,7 +581,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 &scanner,
                 self.dimension,
                 self.num_partitions,
-                self.kmean_max_iters,
+                self.kmeans_max_iters,
             )
             .await?,
         );
