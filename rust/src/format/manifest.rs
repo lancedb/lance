@@ -43,7 +43,7 @@ pub struct Manifest {
     pub version_aux_data: usize,
 
     /// The file position of the index metadata.
-    pub index_data: usize,
+    pub index_data: Option<usize>,
 }
 
 impl Manifest {
@@ -53,7 +53,7 @@ impl Manifest {
             version: 1,
             fragments,
             version_aux_data: 0,
-            index_data: 0,
+            index_data: None,
         }
     }
 }
@@ -69,7 +69,7 @@ impl From<pb::Manifest> for Manifest {
             version: p.version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
             version_aux_data: p.version_aux_data as usize,
-            index_data: p.index_data as usize,
+            index_data: p.index_data.map(|i| i as usize),
         }
     }
 }
@@ -82,7 +82,7 @@ impl From<&Manifest> for pb::Manifest {
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             metadata: HashMap::default(),
             version_aux_data: m.version_aux_data as u64,
-            index_data: m.index_data as u64,
+            index_data: m.index_data.map(|i| i as u64),
         }
     }
 }

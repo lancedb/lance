@@ -59,8 +59,8 @@ message Manifest {
   // Schema metadata.
   map<string, bytes> metadata = 5;
 
-  // The file position of the index metadata.
-  uint64 index_data = 6;
+  // If presented, the file position of the index metadata.
+  optional uint64 index_data = 6;
 }
 
 // Auxiliary Data attached to a version.
@@ -84,7 +84,7 @@ message Index {
   // The columns to build the index.
   repeated int32 fields = 2;
 
-  // Index name
+  // Index name. Must be unique within one dataset version.
   string name = 3;
 }
 

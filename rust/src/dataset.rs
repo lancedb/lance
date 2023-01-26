@@ -19,8 +19,11 @@ mod write;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Manifest};
-use crate::index::{IndexBuildParams, IndexType};
+use crate::format::{pb, Fragment, Index, Manifest};
+use crate::index::vector::ivf::IvfPqIndexBuilder;
+use crate::index::vector::VectorIndexParams;
+use crate::index::{IndexBuilder, IndexParams, IndexType};
+use crate::io::object_reader::read_message;
 use crate::io::{object_reader::read_struct, read_metadata_offset, ObjectStore};
 use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::{Error, Result};
@@ -218,12 +221,68 @@ impl Dataset {
     }
 
     /// Create indices on columns.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    ///  - `columns`: the columns to build the indices on.
+    ///  - `index_type`: specify [`IndexType`].
+    ///  - `name`: optional index name. Must be unique in the dataset.
+    ///            if not provided, it will auto-generate one.
+    ///  - `params`: optional index parameters.
     pub async fn create_index(
         &self,
         columns: &[&str],
         index_type: IndexType,
-        params: Option<impl IndexBuildParams>,
+        name: Option<String>,
+        params: &dyn IndexParams,
     ) -> Result<Self> {
+        if columns.len() != 1 {
+            return Err(Error::Index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
+        }
+        let column = columns[0];
+        if self.schema().field(column).is_none() {
+            return Err(Error::Index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
+        }
+
+        // Load indices from the disk.
+        let existing_indices = self.load_indices().await?;
+
+        let index_name = name.unwrap_or(format!("{column}_idx"));
+        if existing_indices
+            .iter()
+            .find(|i| i.name == index_name)
+            .is_some()
+        {
+            return Err(Error::Index(format!(
+                "Index name '{index_name} already exists'"
+            )));
+        }
+
+        match index_type {
+            IndexType::Vector => {
+                let vec_params = params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .ok_or_else(|| {
+                        Error::Index("Vector index type must take a VectorIndexParams".to_string())
+                    })?;
+
+                let builder = IvfPqIndexBuilder::try_new(
+                    self,
+                    &index_name,
+                    column,
+                    vec_params.num_partitions,
+                    vec_params.num_sub_vectors,
+                )?;
+                builder.build().await?
+            }
+        }
         todo!()
     }
 
@@ -291,6 +350,10 @@ impl Dataset {
         self.base.child(VERSIONS_DIR)
     }
 
+    fn manifest_file(&self, version: u64) -> Path {
+        self.versions_dir().child(format!("{version}.manifest"))
+    }
+
     fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -330,15 +393,27 @@ impl Dataset {
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
+
+    /// Read all indices of this Dataset version.
+    async fn load_indices(&self) -> Result<Vec<Index>> {
+        if let Some(pos) = self.manifest.index_data.as_ref() {
+            let manifest_file = self.manifest_file(self.version().version);
+
+            let reader = self.object_store.open(&manifest_file).await?;
+            let proto: pb::IndexData = read_message(reader.as_ref(), *pos).await?;
+
+            Ok(proto.indices.iter().map(|pb| Index::from(pb)).collect())
+        } else {
+            return Ok(vec![]);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use arrow_array::{
-        types::UInt16Type, DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
-    };
+    use arrow_array::{DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
 

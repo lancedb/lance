@@ -23,13 +23,13 @@ use super::pb;
 #[derive(Debug, Clone)]
 pub struct Index {
     /// Unique ID across all dataset versions.
-    id: u64,
+    pub id: u64,
 
     /// Fields to build the index.
-    fields: Vec<i32>,
+    pub fields: Vec<i32>,
 
     /// Human readable index name
-    name: String,
+    pub name: String,
 }
 
 impl From<&pb::Index> for Index {

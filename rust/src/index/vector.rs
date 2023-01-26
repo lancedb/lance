@@ -18,6 +18,7 @@
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::{Float32Array, RecordBatch};
@@ -28,6 +29,7 @@ pub mod ivf;
 mod kmeans;
 mod pq;
 
+use super::IndexParams;
 use crate::Result;
 
 /// Query parameters for the vector indices
@@ -42,10 +44,10 @@ pub struct Query {
     pub nprobs: usize,
 }
 
-/// Vector Index for (Appoximate) Nearest Neighbor (ANN) Search.
+/// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 pub trait VectorIndex {
-    /// Search the vector for nearest neighbours.
+    /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
     ///
@@ -61,4 +63,50 @@ pub trait VectorIndex {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
+}
+
+/// The parameters to build vector index.
+pub struct VectorIndexParams {
+    // This is hard coded for IVF_PQ for now. Can refactor later to support more.
+    /// The number of IVF partitions
+    pub num_partitions: u32,
+
+    /// the number of bits to present the centroids used in PQ.
+    pub nbits: u8,
+
+    /// the number of sub vectors used in PQ.
+    pub num_sub_vectors: u32,
+}
+
+impl VectorIndexParams {
+    /// Create index parameters for `IVF_PQ` index.
+    ///
+    /// Parameters
+    ///
+    ///  - `num_partitions`: the number of IVF partitions.
+    ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
+    ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
+    pub fn ivf_pq(num_partitions: u32, nbits: u8, num_sub_vectors: u32) -> Self {
+        Self {
+            num_partitions,
+            nbits,
+            num_sub_vectors,
+        }
+    }
+}
+
+impl Default for VectorIndexParams {
+    fn default() -> Self {
+        Self {
+            num_partitions: 32,
+            nbits: 8,
+            num_sub_vectors: 16,
+        }
+    }
+}
+
+impl IndexParams for VectorIndexParams {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
