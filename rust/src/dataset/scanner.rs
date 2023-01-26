@@ -136,8 +136,15 @@ impl Scanner {
     /// The schema of the output, a.k.a, projection schema.
     pub fn schema(&self) -> SchemaRef {
         if self.nearest.as_ref().is_some() {
+            let q = self.nearest.as_ref().unwrap();
+            let column: ArrowField = self
+                .dataset
+                .schema()
+                .field(q.column.as_str())
+                .unwrap()
+                .into();
             let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![score]);
+            let score_schema = ArrowSchema::new(vec![column.clone(), score]);
             let to_merge = &Schema::try_from(&score_schema).unwrap();
             let merged = self.projections.merge(to_merge);
             SchemaRef::new(ArrowSchema::from(&merged))
