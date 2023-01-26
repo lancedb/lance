@@ -32,6 +32,9 @@ def generate_embeddings(col: pd.Series, **hyper_params) -> pd.Series:
 
 
 def main():
+    # Get dataset from:
+    # https://www.kaggle.com/datasets/andrewmvd/spotify-playlists
+    #
     df = pd.read_csv("spotify_dataset.csv", on_bad_lines="skip")
     # clean up the col names
     df.columns = df.columns.str.replace('"', "")
