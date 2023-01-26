@@ -1,10 +1,12 @@
 //! On-disk format
 
 mod fragment;
+mod index;
 mod manifest;
 mod metadata;
 mod page_table;
 pub use fragment::Fragment;
+pub use index::Index;
 pub use manifest::Manifest;
 pub use metadata::Metadata;
 pub use page_table::{PageInfo, PageTable};

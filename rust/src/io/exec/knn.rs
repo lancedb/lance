@@ -87,9 +87,7 @@ pub struct KNNIndex<'a> {
     index: &'a dyn VectorIndex,
 }
 
-impl KNNIndex<'_> {
-
-}
+impl KNNIndex<'_> {}
 
 impl ExecNode for KNNIndex<'_> {
     fn node_type(&self) -> NodeType {

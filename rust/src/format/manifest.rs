@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use super::Fragment;
 use crate::datatypes::Schema;
-use crate::format::{pb, ProtoStruct};
+use crate::format::{pb, Index, ProtoStruct};
 use std::collections::HashMap;
 
 /// Manifest of a dataset
@@ -27,6 +27,7 @@ use std::collections::HashMap;
 ///  * Schema
 ///  * Version
 ///  * Fragments.
+///  * Indices.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     /// Dataset schema.
@@ -37,6 +38,8 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     pub fragments: Arc<Vec<Fragment>>,
+
+    pub indices: Vec<Index>,
 }
 
 impl Manifest {
@@ -45,6 +48,7 @@ impl Manifest {
             schema: schema.clone(),
             version: 1,
             fragments,
+            indices: vec![],
         }
     }
 }
@@ -59,6 +63,7 @@ impl From<pb::Manifest> for Manifest {
             schema: Schema::from(&p.fields),
             version: p.version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
+            indices: vec![],
         }
     }
 }
