@@ -48,7 +48,7 @@ class LanceDataset(pa.dataset.Dataset):
         nearest: dict, default None
             Get the rows corresponding to the K most similar vectors
             nearest should look like {
-              "columns": <embedding col name>,
+              "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
               "k": 10
             }
@@ -85,7 +85,7 @@ class LanceDataset(pa.dataset.Dataset):
         nearest: dict, default None
             Get the rows corresponding to the K most similar vectors
             nearest should look like {
-              "columns": <embedding col name>,
+              "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
               "k": 10
             }
@@ -272,7 +272,7 @@ class ScannerBuilder:
         return self
 
     def nearest(self, column: Optional[str] = None,
-                q: Optional[pa.Float32Array] = None,
+                q: Optional[pa.FloatingPointArray] = None,
                 k: Optional[int] = None) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
@@ -281,7 +281,7 @@ class ScannerBuilder:
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if isinstance(q, (np.ndarray, list, tuple)):
-            q = pa.Float32Array.from_pandas(q)
+            q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         self._nearest = {
