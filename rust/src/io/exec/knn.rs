@@ -87,6 +87,24 @@ pub struct KNNIndex<'a> {
     index: &'a dyn VectorIndex,
 }
 
+impl KNNIndex<'_> {
+
+}
+
+impl ExecNode for KNNIndex<'_> {
+    fn node_type(&self) -> NodeType {
+        NodeType::Knn
+    }
+}
+
+impl Stream for KNNIndex<'_> {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

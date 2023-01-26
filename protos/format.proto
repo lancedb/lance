@@ -58,6 +58,9 @@ message Manifest {
 
   // Schema metadata.
   map<string, bytes> metadata = 5;
+
+  // The file position of the index metadata.
+  uint64 index_data = 6;
 }
 
 // Auxiliary Data attached to a version.
@@ -71,6 +74,21 @@ message VersionAuxData {
 
   // key-value metadata.
   map<string, bytes> metadata = 3;
+}
+
+// Metadata for one index.
+message Index {
+
+  // The columns to build the index.
+  repeated int32 fields = 1;
+
+  // Index name
+  string name = 2;
+}
+
+// Index data
+message IndexData {
+  repeated Index indices = 1;
 }
 
 // Data fragment. A fragment is a set of files which represent the

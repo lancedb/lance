@@ -20,9 +20,8 @@
 
 use std::sync::Arc;
 
-use arrow_arith::{aggregate::sum, arity::binary};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
-use arrow_buffer::MutableBuffer;
+
 use arrow_schema::DataType;
 
 use crate::Result;
@@ -93,6 +92,7 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
 #[cfg(feature = "blas")]
 pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
+    use arrow_buffer::MutableBuffer;
 
     #[cfg(target_os = "macos")]
     use accelerate_src;

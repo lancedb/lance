@@ -71,6 +71,7 @@ impl From<&Manifest> for pb::Manifest {
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             metadata: HashMap::default(),
             version_aux_data: 0,
+            index_data: 0,
         }
     }
 }
