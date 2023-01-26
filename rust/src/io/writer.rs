@@ -28,7 +28,7 @@ use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
-use crate::format::{Index, Manifest, Metadata, PageInfo, PageTable, pb};
+use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 

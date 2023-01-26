@@ -543,22 +543,32 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         );
 
         // Step 1. Sanity check
-        let schema = self.dataset.schema().field(&self.column);
-        if schema.is_none() {
+        let Some(field) = self.dataset.schema().field(&self.column) else {
             return Err(Error::IO(format!(
                 "Building index: column {} does not exist in dataset: {:?}",
                 self.column, self.dataset
             )));
+        };
+        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
+            if !matches!(elem_type.data_type(), DataType::Float32) {
+                return Err(
+                    Error::Index(
+                        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                        elem_type.data_type())));
+            }
+        } else {
+            return Err(Error::Index(
+                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                field.data_type())));
         }
 
-        let object_store = self.dataset.object_store();
+        // if field.data_type()
 
-        // object_store.
-        // Just use column.idx for POC
+        let object_store = self.dataset.object_store();
         let path = self
             .dataset
             .indices_dir()
-            .child(self.name.as_str())
+            .child(self.uuid.to_string())
             .child(INDEX_FILE_NAME);
         let mut writer = object_store.create(&path).await?;
 
