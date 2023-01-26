@@ -17,13 +17,16 @@
 
 //! Metadata for index
 
-use super::pb;
+use uuid::Uuid;
+
+use super::*;
+use crate::Error;
 
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
     /// Unique ID across all dataset versions.
-    pub id: u64,
+    pub uuid: Uuid,
 
     /// Fields to build the index.
     pub fields: Vec<i32>,
@@ -32,20 +35,38 @@ pub struct Index {
     pub name: String,
 }
 
-impl From<&pb::Index> for Index {
-    fn from(proto: &pb::Index) -> Self {
+impl Index {
+    pub fn new(uuid: Uuid, name: &str, fields: &[i32]) -> Self {
         Self {
-            id: proto.id,
+            uuid,
+            name: name.to_string(),
+            fields: Vec::from(fields),
+        }
+    }
+}
+
+impl TryFrom<&pb::Index> for Index {
+    type Error = Error;
+
+    fn try_from(proto: &pb::Index) -> Result<Self> {
+        Ok(Self {
+            uuid: proto
+                .uuid
+                .as_ref()
+                .map(|u| Uuid::try_from(u))
+                .ok_or_else(|| {
+                    Error::IO("uuid field does not exist in Index metadata".to_string())
+                })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
-        }
+        })
     }
 }
 
 impl From<&Index> for pb::Index {
     fn from(idx: &Index) -> Self {
         Self {
-            id: idx.id,
+            uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
         }

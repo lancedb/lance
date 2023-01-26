@@ -244,14 +244,14 @@ impl Dataset {
             ));
         }
         let column = columns[0];
-        if self.schema().field(column).is_none() {
+        let Some(field) = self.schema().field(column) else {
             return Err(Error::Index(format!(
                 "CreateIndex: column '{column}' does not exist"
             )));
-        }
+        };
 
         // Load indices from the disk.
-        let existing_indices = self.load_indices().await?;
+        let mut existing_indices = self.load_indices().await?;
 
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if existing_indices
@@ -264,6 +264,7 @@ impl Dataset {
             )));
         }
 
+        let index_id = Uuid::new_v4();
         match index_type {
             IndexType::Vector => {
                 let vec_params = params
@@ -283,6 +284,10 @@ impl Dataset {
                 builder.build().await?
             }
         }
+
+        // Write index metadata down
+        let new_idx = Index::new(index_id, &index_name, &[field.id]);
+        existing_indices.push(new_idx);
         todo!()
     }
 
@@ -402,7 +407,11 @@ impl Dataset {
             let reader = self.object_store.open(&manifest_file).await?;
             let proto: pb::IndexData = read_message(reader.as_ref(), *pos).await?;
 
-            Ok(proto.indices.iter().map(|pb| Index::from(pb)).collect())
+            Ok(proto
+                .indices
+                .iter()
+                .map(|pb| Index::try_from(pb))
+                .collect::<Result<Vec<_>>>()?)
         } else {
             return Ok(vec![]);
         }

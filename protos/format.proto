@@ -40,6 +40,11 @@ Format:
 +----------------------------------------+
  */
 
+/// UUID type. encoded as 16 bytes.
+message UUID {
+  bytes uuid = 1;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -79,7 +84,7 @@ message VersionAuxData {
 // Metadata for one index.
 message Index {
   // Unique ID of an index. It is unique across all the dataset versions.
-  uint64 id = 1;
+  UUID uuid = 1;
 
   // The columns to build the index.
   repeated int32 fields = 2;

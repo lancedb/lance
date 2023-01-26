@@ -50,6 +50,5 @@ pub trait IndexBuilder {
 }
 
 pub trait IndexParams {
-
     fn as_any(&self) -> &dyn Any;
 }
