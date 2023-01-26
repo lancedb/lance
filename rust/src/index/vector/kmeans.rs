@@ -33,7 +33,12 @@ fn train_kmeans_faiss(
 }
 
 /// Fallback implementation of KMeans.
-fn train_kmeans_fallback() -> Result<Float32Array> {
+fn train_kmeans_fallback(
+    _array: &Float32Array,
+    _dimension: usize,
+    _num_clusters: u32,
+    _max_iterations: u32,
+) -> Result<Float32Array> {
     todo!()
 }
 
@@ -48,5 +53,5 @@ pub fn train_kmeans(
     return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback()
+    train_kmeans_fallback(array, dimension, num_clusters, max_iterations)
 }
