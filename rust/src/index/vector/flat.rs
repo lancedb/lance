@@ -22,7 +22,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
-use futures::stream::{Stream, TryStreamExt};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex};
 use crate::arrow::*;
@@ -64,9 +64,9 @@ pub async fn flat_search(
     let score_column = "score";
 
     let batches = stream
-        .and_then(|batch| async move {
+        .map(|batch| async move {
             let k = query.key.clone();
-            let batch = batch.clone();
+            let batch = batch?;
             let vectors = batch
                 .column_by_name(&query.column)
                 .ok_or_else(|| {
@@ -88,6 +88,7 @@ pub async fn flat_search(
             let selected_arr = take(&struct_arr, &indices, None)?;
             Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
         })
+        .buffer_unordered(16)
         .try_collect::<Vec<_>>()
         .await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
