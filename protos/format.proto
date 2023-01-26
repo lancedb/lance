@@ -78,12 +78,14 @@ message VersionAuxData {
 
 // Metadata for one index.
 message Index {
+  // Unique ID of an index.
+  uint64 id = 1;
 
   // The columns to build the index.
-  repeated int32 fields = 1;
+  repeated int32 fields = 2;
 
   // Index name
-  string name = 2;
+  string name = 3;
 }
 
 // Index data

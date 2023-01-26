@@ -22,6 +22,8 @@ use super::pb;
 /// Index metadata
 #[derive(Debug, Clone)]
 pub struct Index {
+    id: u64,
+
     /// Fields to build the index.
     fields: Vec<i32>,
 
@@ -32,6 +34,7 @@ pub struct Index {
 impl From<&pb::Index> for Index {
     fn from(proto: &pb::Index) -> Self {
         Self {
+            id: proto.id,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
         }
@@ -41,6 +44,7 @@ impl From<&pb::Index> for Index {
 impl From<&Index> for pb::Index {
     fn from(idx: &Index) -> Self {
         Self {
+            id: idx.id,
             name: idx.name.clone(),
             fields: idx.fields.clone(),
         }

@@ -39,7 +39,11 @@ pub struct Manifest {
     /// Fragments, the pieces to build the dataset.
     pub fragments: Arc<Vec<Fragment>>,
 
-    pub indices: Vec<Index>,
+    /// The file position of the version aux data.
+    pub version_aux_data: usize,
+
+    /// The file position of the index metadata.
+    pub index_data: usize,
 }
 
 impl Manifest {
@@ -48,7 +52,8 @@ impl Manifest {
             schema: schema.clone(),
             version: 1,
             fragments,
-            indices: vec![],
+            version_aux_data: 0,
+            index_data: 0,
         }
     }
 }
@@ -63,7 +68,8 @@ impl From<pb::Manifest> for Manifest {
             schema: Schema::from(&p.fields),
             version: p.version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
-            indices: vec![],
+            version_aux_data: p.version_aux_data as usize,
+            index_data: p.index_data as usize,
         }
     }
 }
@@ -75,8 +81,8 @@ impl From<&Manifest> for pb::Manifest {
             version: m.version,
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             metadata: HashMap::default(),
-            version_aux_data: 0,
-            index_data: 0,
+            version_aux_data: m.version_aux_data as u64,
+            index_data: m.index_data as u64,
         }
     }
 }
