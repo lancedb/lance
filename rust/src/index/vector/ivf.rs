@@ -256,7 +256,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
 
                         Ok::<Self, Error>(Self {
                             name: idx.name.clone(),
-                            column: idx.columns[0].to_string(),
+                            column: idx.columns[0].clone(),
                             dimension: vidx.dimension,
                             dataset_version: idx.dataset_version,
                             ivf,
@@ -333,7 +333,7 @@ impl Ivf {
             .into_stream()
             .and_then(|b| async move {
                 let arr = b.column_by_name(column_name).ok_or_else(|| {
-                    Error::IO(format!("Dataset does not have column {}", column_name))
+                    Error::IO(format!("Dataset does not have column {column_name}"))
                 })?;
                 let vectors: &FixedSizeListArray = arr.as_any().downcast_ref().unwrap();
                 let vec = vectors.clone();
@@ -372,7 +372,7 @@ impl Ivf {
         let mut partitions = BTreeMap::<u32, RecordBatch>::new();
         for (key, value) in partitions_with_id.iter() {
             let batch = concat_batches(&value[0].schema(), value)?;
-            let arr = self.centroids.value(key.clone() as usize);
+            let arr = self.centroids.value(*key as usize);
             let centroids: &Float32Array = as_primitive_array(&arr);
             let column = batch.column_by_name(column_name).unwrap();
             let vectors = as_fixed_size_list_array(column);
@@ -456,7 +456,7 @@ fn compute_residual(
 fn partition_batch(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, RecordBatch>> {
     let part_col = batch
         .column_by_name(col)
-        .ok_or_else(|| Error::IO(format!("Column {} does not exist", col)))?;
+        .ok_or_else(|| Error::IO(format!("Column {col} does not exist")))?;
     let partition_ids: &UInt32Array = as_primitive_array(part_col);
     let min_id = min(partition_ids).unwrap_or(0);
     let max_id = max(partition_ids).unwrap_or(1024 * 1024);
@@ -505,13 +505,12 @@ impl<'a> IvfPqIndexBuilder<'a> {
         num_sub_vectors: u32,
     ) -> Result<Self> {
         let field = dataset.schema().field(column).ok_or(Error::IO(format!(
-            "Column {} does not exist in the dataset",
-            column
+            "Column {column} does not exist in the dataset"
         )))?;
         let dimension = match field.data_type() {
             DataType::FixedSizeList(_, d) => d,
             _ => {
-                return Err(Error::IO(format!("Column {} is not a vector type", column)));
+                return Err(Error::IO(format!("Column {column} is not a vector type")));
             }
         };
         Ok(Self {

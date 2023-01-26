@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
 use crate::index::vector::flat::flat_search;
-use crate::index::vector::Query;
+use crate::index::vector::{Query, VectorIndex};
 use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
 
@@ -46,7 +46,7 @@ impl KNNFlat {
             let result = match flat_search(child, &q).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tx.send(Err(Error::IO(format!("Failed to compute scores: {}", e))))
+                    tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
                         .await
                         .expect("KNNFlat failed to send message");
                     return;
@@ -55,7 +55,7 @@ impl KNNFlat {
 
             if !tx.is_closed() {
                 if let Err(e) = tx.send(Ok(result)).await {
-                    eprintln!("KNNFlat tx.send error: {}", e)
+                    eprintln!("KNNFlat tx.send error: {e}")
                 };
             }
             drop(tx);
@@ -80,6 +80,11 @@ impl Stream for KNNFlat {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
     }
+}
+
+/// KNN Node from reading a vector index.
+pub struct KNNIndex<'a> {
+    index: &'a dyn VectorIndex,
 }
 
 #[cfg(test)]
