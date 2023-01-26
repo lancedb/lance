@@ -203,7 +203,7 @@ pub struct ScannerStream {
 }
 
 impl ScannerStream {
-    fn new<'a>(exec_node: ExecNodeBox) -> Self {
+    fn new(exec_node: ExecNodeBox) -> Self {
         Self { exec_node }
     }
 }

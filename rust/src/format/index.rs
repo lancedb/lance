@@ -45,30 +45,34 @@ impl Index {
     }
 }
 
-impl TryFrom<&pb::Index> for Index {
+impl TryFrom<&pb::IndexMetadata> for Index {
     type Error = Error;
 
-    fn try_from(proto: &pb::Index) -> Result<Self> {
+    fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
         Ok(Self {
-            uuid: proto
-                .uuid
-                .as_ref()
-                .map(|u| Uuid::try_from(u))
-                .ok_or_else(|| {
-                    Error::IO("uuid field does not exist in Index metadata".to_string())
-                })??,
+            uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
+                Error::IO("uuid field does not exist in Index metadata".to_string())
+            })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
         })
     }
 }
 
-impl From<&Index> for pb::Index {
+impl From<&Index> for pb::IndexMetadata {
     fn from(idx: &Index) -> Self {
         Self {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
+        }
+    }
+}
+
+impl From<&Vec<Index>> for pb::IndexSection {
+    fn from(indices: &Vec<Index>) -> Self {
+        Self {
+            indices: indices.iter().map(pb::IndexMetadata::from).collect(),
         }
     }
 }

@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_arith::arithmetic::subtract_dyn;
-use arrow_array::BooleanArray;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
-    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
+    UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::filter::filter_record_batch;
 use arrow_select::{
     concat::{concat, concat_batches},
+    filter::filter_record_batch,
     take::take,
 };
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
@@ -476,6 +477,9 @@ fn partition_batch(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, Recor
 pub struct IvfPqIndexBuilder<'a> {
     dataset: &'a Dataset,
 
+    /// Unique id of the index.
+    uuid: Uuid,
+
     /// Index name
     name: String,
 
@@ -499,6 +503,7 @@ pub struct IvfPqIndexBuilder<'a> {
 impl<'a> IvfPqIndexBuilder<'a> {
     pub fn try_new(
         dataset: &'a Dataset,
+        uuid: Uuid,
         name: &str,
         column: &str,
         num_partitions: u32,
@@ -512,6 +517,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
         };
         Ok(Self {
             dataset,
+            uuid,
             name: name.to_string(),
             column: column.to_string(),
             dimension: d as usize,

@@ -48,7 +48,7 @@ impl TryFrom<&pb::Uuid> for Uuid {
 
 impl From<&Uuid> for pb::Uuid {
     fn from(value: &Uuid) -> Self {
-        pb::Uuid {
+        Self {
             uuid: value.into_bytes().to_vec(),
         }
     }

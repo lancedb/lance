@@ -65,7 +65,7 @@ message Manifest {
   map<string, bytes> metadata = 5;
 
   // If presented, the file position of the index metadata.
-  optional uint64 index_data = 6;
+  optional uint64 index_section = 6;
 }
 
 // Auxiliary Data attached to a version.
@@ -81,8 +81,8 @@ message VersionAuxData {
   map<string, bytes> metadata = 3;
 }
 
-// Metadata for one index.
-message Index {
+// Metadata describing the index.
+message IndexMetadata {
   // Unique ID of an index. It is unique across all the dataset versions.
   UUID uuid = 1;
 
@@ -93,9 +93,9 @@ message Index {
   string name = 3;
 }
 
-// Index data
-message IndexData {
-  repeated Index indices = 1;
+// Index Section, containing a list of index metadata for one dataset version.
+message IndexSection {
+  repeated IndexMetadata indices = 1;
 }
 
 // Data fragment. A fragment is a set of files which represent the

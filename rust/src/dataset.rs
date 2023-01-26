@@ -35,10 +35,6 @@ const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
 const DATA_DIR: &str = "data";
 
-fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
-}
-
 /// Lance Dataset
 #[derive(Debug, Clone)]
 pub struct Dataset {
@@ -83,6 +79,17 @@ async fn new_file_writer<'a>(
     FileWriter::try_new(object_store, &full_path, schema).await
 }
 
+/// Get the manifest file path for a version.
+fn manifest_path(base: &Path, version: u64) -> Path {
+    base.child(VERSIONS_DIR)
+        .child(format!("{version}.manifest"))
+}
+
+/// Get the latest manifest path
+fn latest_manifest_path(base: &Path) -> Path {
+    base.child(LATEST_MANIFEST_NAME)
+}
+
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
@@ -124,7 +131,7 @@ impl Dataset {
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
         match object_store.inner.head(&latest_manifest_path).await {
-            Ok(_) => return Err(Error::IO(format!("Dataset already exists: {}", uri))),
+            Ok(_) => return Err(Error::IO(format!("Dataset already exists: {uri}"))),
             Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
             Err(e) => return Err(Error::from(e)),
         }
@@ -191,21 +198,7 @@ impl Dataset {
         };
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
-        let manifest_file_path = object_store
-            .base_path()
-            .child(VERSIONS_DIR)
-            .child(format!("{}.manifest", manifest.version));
-        {
-            let mut object_writer = object_store.create(&manifest_file_path).await?;
-            let pos = write_manifest(&mut object_writer, &mut manifest).await?;
-            object_writer.write_magics(pos).await?;
-            object_writer.shutdown().await?;
-        }
-        let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
-        object_store
-            .inner
-            .copy(&manifest_file_path, &latest_manifest)
-            .await?;
+        write_manifest_file(&object_store, &mut manifest, None).await?;
 
         let base = object_store.base_path().clone();
         Ok(Self {
@@ -251,14 +244,10 @@ impl Dataset {
         };
 
         // Load indices from the disk.
-        let mut existing_indices = self.load_indices().await?;
+        let mut indices = self.load_indices().await?;
 
         let index_name = name.unwrap_or(format!("{column}_idx"));
-        if existing_indices
-            .iter()
-            .find(|i| i.name == index_name)
-            .is_some()
-        {
+        if indices.iter().any(|i| i.name == index_name) {
             return Err(Error::Index(format!(
                 "Index name '{index_name} already exists'"
             )));
@@ -276,6 +265,7 @@ impl Dataset {
 
                 let builder = IvfPqIndexBuilder::try_new(
                     self,
+                    index_id,
                     &index_name,
                     column,
                     vec_params.num_partitions,
@@ -287,7 +277,14 @@ impl Dataset {
 
         // Write index metadata down
         let new_idx = Index::new(index_id, &index_name, &[field.id]);
-        existing_indices.push(new_idx);
+        indices.push(new_idx);
+
+        let latest_manifest = self.latest_manifest().await?;
+        let mut new_manifest = self.manifest.as_ref().clone();
+        new_manifest.version = latest_manifest.version + 1;
+
+        write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
+
         todo!()
     }
 
@@ -359,6 +356,14 @@ impl Dataset {
         self.versions_dir().child(format!("{version}.manifest"))
     }
 
+    fn latest_manifest_path(&self) -> Path {
+        latest_manifest_path(&self.base)
+    }
+
+    async fn latest_manifest(&self) -> Result<Manifest> {
+        read_manifest(&self.object_store, &self.latest_manifest_path()).await
+    }
+
     fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -401,21 +406,41 @@ impl Dataset {
 
     /// Read all indices of this Dataset version.
     async fn load_indices(&self) -> Result<Vec<Index>> {
-        if let Some(pos) = self.manifest.index_data.as_ref() {
+        if let Some(pos) = self.manifest.index_section.as_ref() {
             let manifest_file = self.manifest_file(self.version().version);
 
             let reader = self.object_store.open(&manifest_file).await?;
-            let proto: pb::IndexData = read_message(reader.as_ref(), *pos).await?;
+            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
-            Ok(proto
+            Ok(section
                 .indices
                 .iter()
                 .map(|pb| Index::try_from(pb))
                 .collect::<Result<Vec<_>>>()?)
         } else {
-            return Ok(vec![]);
+            Ok(vec![])
         }
     }
+}
+
+/// Finish writing the manifest file, and commit the changes by linking the latest manifest file
+/// to this version.
+async fn write_manifest_file(
+    object_store: &ObjectStore,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+) -> Result<()> {
+    let path = manifest_path(object_store.base_path(), manifest.version);
+    let mut object_writer = object_store.create(&path).await?;
+    let pos = write_manifest(&mut object_writer, manifest, indices).await?;
+    object_writer.write_magics(pos).await?;
+    object_writer.shutdown().await?;
+
+    // Link it to latest manifest, and COMMIT.
+    let latest_manifest = latest_manifest_path(object_store.base_path());
+    object_store.inner.copy(&path, &latest_manifest).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
