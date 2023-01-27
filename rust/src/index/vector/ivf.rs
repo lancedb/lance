@@ -82,8 +82,8 @@ pub struct IvfPQIndex<'a> {
 
 impl<'a> IvfPQIndex<'a> {
     /// Open the IvfPQ index on dataset, specified by the index `name`.
-    async fn new(dataset: &'a Dataset, name: &str) -> Result<IvfPQIndex<'a>> {
-        let index_dir = dataset.indices_dir().child(name);
+    pub async fn new(dataset: &'a Dataset, uuid: &str) -> Result<IvfPQIndex<'a>> {
+        let index_dir = dataset.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
 
         let object_store = dataset.object_store();
@@ -109,7 +109,7 @@ impl<'a> IvfPQIndex<'a> {
 
         Ok(Self {
             reader,
-            name: name.to_string(),
+            name: uuid.to_string(),
             column: index_metadata.column.clone(),
             dimension: index_metadata.dimension as usize,
             ivf: index_metadata.ivf,
@@ -331,7 +331,8 @@ impl Ivf {
         let schema = scanner.schema();
         let column_name = schema.field(0).name();
         let partitions_with_id = scanner
-            .into_stream()
+            .try_into_stream()
+            .await?
             .and_then(|b| async move {
                 let arr = b.column_by_name(column_name).ok_or_else(|| {
                     Error::IO(format!("Dataset does not have column {column_name}"))
@@ -641,7 +642,11 @@ async fn train_kmean_model(
     assert_eq!(schema.fields.len(), 1);
     let column_name = schema.fields[0].name();
     // Copy all to memory for now, optimize later.
-    let batches = scanner.into_stream().try_collect::<Vec<_>>().await?;
+    let batches = scanner
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
     let mut arr_list = vec![];
     for batch in batches {
         let arr = batch.column_by_name(&column_name).unwrap();

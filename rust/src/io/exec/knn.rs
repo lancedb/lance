@@ -16,6 +16,7 @@
 // under the License.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
@@ -24,7 +25,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
 use super::{ExecNode, NodeType};
+use crate::dataset::Dataset;
 use crate::index::vector::flat::flat_search;
+use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
 use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
@@ -83,23 +86,66 @@ impl Stream for KNNFlat {
 }
 
 /// KNN Node from reading a vector index.
-pub struct KNNIndex<'a> {
-    index: &'a dyn VectorIndex,
+pub struct KNNIndex {
+    rx: Receiver<Result<RecordBatch>>,
+
+    _bg_thread: JoinHandle<()>,
 }
 
-impl KNNIndex<'_> {}
+impl KNNIndex {
+    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
 
-impl ExecNode for KNNIndex<'_> {
+        let q = query.clone();
+        let name = index_name.to_string();
+        let bg_thread = tokio::spawn(async move {
+            let index = match IvfPQIndex::new(&dataset, &name).await {
+                Ok(idx) => idx,
+                Err(e) => {
+                    tx.send(Err(Error::IO(format!(
+                        "Failed to open vector index: {name}: {e}"
+                    ))))
+                    .await
+                    .expect("KNNFlat failed to send message");
+                    return;
+                }
+            };
+            let result = match index.search(&q).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
+                        .await
+                        .expect("KNNFlat failed to send message");
+                    return;
+                }
+            };
+
+            if !tx.is_closed() {
+                if let Err(e) = tx.send(Ok(result)).await {
+                    eprintln!("KNNFlat tx.send error: {e}")
+                };
+            }
+            drop(tx);
+        });
+
+        Self {
+            rx,
+            _bg_thread: bg_thread,
+        }
+    }
+}
+
+impl ExecNode for KNNIndex {
     fn node_type(&self) -> NodeType {
         NodeType::Knn
     }
 }
 
-impl Stream for KNNIndex<'_> {
+impl Stream for KNNIndex {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+        Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
 
@@ -175,14 +221,16 @@ mod tests {
             .scan()
             .nearest("vector", as_primitive_array(&q), 10)
             .unwrap()
-            .into_stream();
+            .try_into_stream()
+            .await
+            .unwrap();
         let results = stream.try_collect::<Vec<_>>().await.unwrap();
 
         assert!(results[0].schema().column_with_name("score").is_some());
 
         assert_eq!(results.len(), 1);
 
-        let stream = dataset.scan().into_stream();
+        let stream = dataset.scan().try_into_stream().await.unwrap();
         let expected = flat_search(
             stream,
             &Query {

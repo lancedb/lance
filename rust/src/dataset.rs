@@ -409,7 +409,7 @@ impl Dataset {
     }
 
     /// Read all indices of this Dataset version.
-    async fn load_indices(&self) -> Result<Vec<Index>> {
+    pub async fn load_indices(&self) -> Result<Vec<Index>> {
         if let Some(pos) = self.manifest.index_section.as_ref() {
             let manifest_file = self.manifest_file(self.version().version);
 
@@ -449,8 +449,8 @@ async fn write_manifest_file(
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::testing::generate_random_array;
     use super::*;
+    use crate::utils::testing::generate_random_array;
 
     use arrow_array::{
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
@@ -512,7 +512,9 @@ mod tests {
 
         let actual_batches = actual_ds
             .scan()
-            .into_stream()
+            .try_into_stream()
+            .await
+            .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();

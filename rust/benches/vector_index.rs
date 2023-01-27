@@ -31,7 +31,9 @@ fn bench_flat_index(c: &mut Criterion) {
     let first_batch = rt.block_on(async {
         dataset
             .scan()
-            .into_stream()
+            .try_into_stream()
+            .await
+            .unwrap()
             .try_next()
             .await
             .unwrap()
@@ -52,7 +54,9 @@ fn bench_flat_index(c: &mut Criterion) {
                     .scan()
                     .nearest("vector", q, 10)
                     .unwrap()
-                    .into_stream()
+                    .try_into_stream()
+                    .await
+                    .unwrap()
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();

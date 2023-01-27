@@ -109,7 +109,8 @@ impl VectorIndex for FlatIndex<'_> {
             .scan()
             .project(&[&self.column])?
             .with_row_id()
-            .into_stream();
+            .try_into_stream()
+            .await?;
         flat_search(stream, params).await
     }
 }
