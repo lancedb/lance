@@ -223,7 +223,7 @@ impl Dataset {
     ///  - `index_type`: specify [`IndexType`].
     ///  - `name`: optional index name. Must be unique in the dataset.
     ///            if not provided, it will auto-generate one.
-    ///  - `params`: optional index parameters.
+    ///  - `params`: index parameters.
     pub async fn create_index(
         &self,
         columns: &[&str],
@@ -445,9 +445,14 @@ async fn write_manifest_file(
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::testing::generate_random_array;
+
     use super::*;
 
-    use arrow_array::{DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array};
+    use arrow_array::{
+        types::Float32Type, DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch,
+        StringArray, UInt16Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
 
@@ -520,5 +525,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..10).collect::<Vec<_>>()
         )
+    }
+
+    #[tokio::test]
+    async fn test_create_index() {
+        let test_dir = tempdir().unwrap();
+
+        let dimension = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Box::new(Field::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let float_arr = generate_random_array(100 * dimension as usize);
+        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
+        let batches =
+            RecordBatchBuffer::new(vec![
+                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
+            ]);
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::create(&mut reader, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::default();
+        dataset
+            .create_index(&["embeddings"], IndexType::Vector, None, &params)
+            .await
+            .unwrap();
     }
 }
