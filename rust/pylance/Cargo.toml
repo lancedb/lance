@@ -28,7 +28,6 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-lance = { path = ".." }
 arrow-array = "31.0"
 arrow-data = "31.0"
 arrow-schema = "31.0"
@@ -37,6 +36,13 @@ tokio = { version = "1.23", features = ["rt-multi-thread"] }
 futures = "0.3"
 pyo3 = { version = "0.17.3", features = ["extension-module", "abi3-py38"] }
 arrow = { version = "31.0.0", features = ["pyarrow"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lance = { path = "..", features = ["blas"]}
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+lance = { path = ".."}
+
 
 [build-dependencies]
 prost-build = "0.11"
