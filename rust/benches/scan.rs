@@ -31,7 +31,9 @@ fn bench_scan(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let count = dataset
                 .scan()
-                .into_stream()
+                .try_into_stream()
+                .await
+                .unwrap()
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();

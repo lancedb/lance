@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
             let dataset = Dataset::open(uri).await.unwrap();
             let mut scanner = dataset.scan();
             scanner.limit(*n, None).unwrap();
-            let stream = scanner.into_stream();
+            let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
             println!("{:?}", batch);
 
