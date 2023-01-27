@@ -64,15 +64,6 @@ const INDEX_FILE_NAME: &str = "index.idx";
 pub struct IvfPQIndex<'a> {
     reader: Box<dyn ObjectReader + 'a>,
 
-    /// Index name.
-    name: String,
-
-    /// The column to build the indices.
-    column: String,
-
-    /// Vector dimension.
-    dimension: usize,
-
     /// Ivf file.
     ivf: Ivf,
 
@@ -109,9 +100,6 @@ impl<'a> IvfPQIndex<'a> {
 
         Ok(Self {
             reader,
-            name: uuid.to_string(),
-            column: index_metadata.column.clone(),
-            dimension: index_metadata.dimension as usize,
             ivf: index_metadata.ivf,
             pq: index_metadata.pq,
         })

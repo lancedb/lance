@@ -34,10 +34,10 @@ fn train_kmeans_faiss(
 
 /// A fallback default implementation of KMeans, if not accelerator found.
 fn train_kmeans_fallback(
-    array: &Float32Array,
-    dimension: usize,
-    k: u32,
-    max_iter: u32,
+    _array: &Float32Array,
+    _dimension: usize,
+    _k: u32,
+    _max_iter: u32,
 ) -> Result<Float32Array> {
     todo!()
 }

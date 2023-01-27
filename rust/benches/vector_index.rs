@@ -47,13 +47,14 @@ fn bench_flat_index(c: &mut Criterion) {
     let q: &Float32Array = as_primitive_array(&value);
 
     c.bench_function(
-        format!("Flat_Index(d={},top_k=10)", q.len()).as_str(),
+        format!("Flat_Index(d={},top_k=10,nprops=10)", q.len()).as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let results = dataset
                     .scan()
                     .nearest("vector", q, 10)
                     .unwrap()
+                    .nprobs(10)
                     .try_into_stream()
                     .await
                     .unwrap()
