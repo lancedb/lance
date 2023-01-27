@@ -15,6 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Before running the dataset, prepare a "test.lance" dataset, in the
+//! `lance/rust` directly. There is no limitation in the dataset size,
+//! schema, or content.
+//!
+//! Run benchmark.
+//! ```
+//! cargo bench --bench scan
+//! ```.
+//!
+//! TODO: Take parameterized input to specify dataset URI from command line.
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
 use pprof::criterion::{Output, PProfProfiler};
