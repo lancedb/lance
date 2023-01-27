@@ -316,7 +316,7 @@ impl Ivf {
     async fn partition(&self, scanner: &Scanner) -> Result<BTreeMap<u32, RecordBatch>> {
         const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 
-        let schema = scanner.schema();
+        let schema = scanner.schema()?;
         let column_name = schema.field(0).name();
         let partitions_with_id = scanner
             .try_into_stream()
@@ -626,7 +626,7 @@ async fn train_kmean_model(
     k: u32,
     max_iterations: u32,
 ) -> Result<FixedSizeListArray> {
-    let schema = scanner.schema();
+    let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);
     let column_name = schema.fields[0].name();
     // Copy all to memory for now, optimize later.

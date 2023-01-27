@@ -88,7 +88,7 @@ pub struct FileReader<'a> {
     object_reader: Box<dyn ObjectReader + 'a>,
     metadata: Metadata,
     page_table: PageTable,
-    projection: Option<Arc<Schema>>,
+    projection: Option<Schema>,
 
     /// The id of the fragment which this file belong to.
     /// For simple file access, this can just be zero.
@@ -145,7 +145,7 @@ impl<'a> FileReader<'a> {
         Ok(Self {
             object_reader,
             metadata,
-            projection: Some(Arc::new(projection)),
+            projection: Some(projection),
             page_table,
             fragment_id,
             with_row_id: false,
@@ -158,7 +158,7 @@ impl<'a> FileReader<'a> {
     }
 
     /// Set the projection [Schema].
-    pub fn set_projection(&mut self, schema: Arc<Schema>) {
+    pub fn set_projection(&mut self, schema: Schema) {
         self.projection = Some(schema)
     }
 

@@ -324,7 +324,7 @@ impl Dataset {
                     Some(self.manifest.as_ref()),
                 )
                 .await?;
-                reader.set_projection(Arc::new(projection.clone()));
+                reader.set_projection(projection.clone());
                 if let Some(indices) = row_ids_per_fragment.get(&fragment.id) {
                     reader.take(indices.as_slice()).await
                 } else {

@@ -51,7 +51,7 @@ impl Scan {
     ) -> Self {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
-        let projection = Arc::new(projection.clone());
+        let projection = projection.clone();
         let io_thread = tokio::spawn(async move {
             for frag in fragments.as_ref() {
                 if tx.is_closed() {
