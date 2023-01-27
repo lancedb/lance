@@ -43,8 +43,8 @@ impl Scanner {
         Self { scanner, rt }
     }
 
-    pub(crate) fn to_reader(&self) -> ::lance::error::Result<LanceReader> {
-        LanceReader::try_new(self.scanner.clone(), self.rt.clone())
+    pub(crate) async fn to_reader(&self) -> ::lance::error::Result<LanceReader> {
+        LanceReader::try_new(self.scanner.clone(), self.rt.clone()).await
     }
 }
 
@@ -63,6 +63,7 @@ impl Scanner {
         self_.rt.block_on(async {
             let reader = self_
                 .to_reader()
+                .await
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
             // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
             let stream = Arc::new(FFI_ArrowArrayStream::empty());

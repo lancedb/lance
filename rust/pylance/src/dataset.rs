@@ -114,22 +114,25 @@ impl Dataset {
 
 #[pyfunction(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
-    let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
-        let scanner: Scanner = reader.extract()?;
-        Box::new(
-            scanner
-                .to_reader()
-                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-        )
-    } else {
-        Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-    };
-
     let params = get_write_params(options)?;
-    Runtime::new()?
-        .block_on(async move { LanceDataset::create(&mut batches, uri, params).await })
-        .map(|_| true)
-        .map_err(|err| PyIOError::new_err(err.to_string()))
+    Runtime::new()?.block_on(async move {
+        let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+            let scanner: Scanner = reader.extract()?;
+            Box::new(
+                scanner
+                    .to_reader()
+                    .await
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            )
+        } else {
+            Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
+        };
+
+        LanceDataset::create(&mut batches, uri, params)
+            .await
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        Ok(true)
+    })
 }
 
 fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
