@@ -40,6 +40,11 @@ Format:
 +----------------------------------------+
  */
 
+/// UUID type. encoded as 16 bytes.
+message UUID {
+  bytes uuid = 1;
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -58,6 +63,9 @@ message Manifest {
 
   // Schema metadata.
   map<string, bytes> metadata = 5;
+
+  // If presented, the file position of the index metadata.
+  optional uint64 index_section = 6;
 }
 
 // Auxiliary Data attached to a version.
@@ -71,6 +79,23 @@ message VersionAuxData {
 
   // key-value metadata.
   map<string, bytes> metadata = 3;
+}
+
+// Metadata describing the index.
+message IndexMetadata {
+  // Unique ID of an index. It is unique across all the dataset versions.
+  UUID uuid = 1;
+
+  // The columns to build the index.
+  repeated int32 fields = 2;
+
+  // Index name. Must be unique within one dataset version.
+  string name = 3;
+}
+
+// Index Section, containing a list of index metadata for one dataset version.
+message IndexSection {
+  repeated IndexMetadata indices = 1;
 }
 
 // Data fragment. A fragment is a set of files which represent the
@@ -92,21 +117,23 @@ message DataFile {
   repeated int32 fields = 2;
 }
 
-
 // Metadata of one Lane file.
 message Metadata {
-  // Position of the manifest in the file. If it is zero, the manifest is stored externally.
+  // Position of the manifest in the file. If it is zero, the manifest is stored
+  // externally.
   uint64 manifest_position = 1;
 
-  // Logical offsets of each chunk group, i.e., number of the rows in each chunk.
+  // Logical offsets of each chunk group, i.e., number of the rows in each
+  // chunk.
   repeated int32 batch_offsets = 2;
 
   // The file position that page table is stored.
   //
-  // A page table is a matrix of N x N x 2, where N = num_fields, and M = num_batches.
-  // Each cell in the table is a pair of <position:int64, length:int64> of the page.
-  // Both position and length are int64 values.
-  // The <position, length> of all the pages in the same column are then contiguously stored.
+  // A page table is a matrix of N x N x 2, where N = num_fields, and M =
+  // num_batches. Each cell in the table is a pair of <position:int64,
+  // length:int64> of the page. Both position and length are int64 values. The
+  // <position, length> of all the pages in the same column are then
+  // contiguously stored.
   //
   // For example, for the column 5 and batch 4, we have:
   // ```text
@@ -141,7 +168,6 @@ message Dictionary {
   /// The length of dictionary values.
   int64 length = 2;
 }
-
 
 // Field metadata for a column.
 message Field {

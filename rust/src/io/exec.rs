@@ -24,7 +24,7 @@ mod scan;
 mod take;
 
 use crate::Result;
-pub(crate) use knn::KNNFlat;
+pub(crate) use knn::*;
 pub(crate) use limit::Limit;
 pub(crate) use scan::Scan;
 pub(crate) use take::Take;
@@ -39,6 +39,8 @@ pub enum NodeType {
     Limit = 4, // Filter can be 3
     /// Knn Flat Scan
     KnnFlat = 10,
+    /// Knn Index Scan
+    Knn = 11,
 }
 
 /// I/O Exec Node

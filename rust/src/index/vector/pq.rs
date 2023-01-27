@@ -78,20 +78,15 @@ impl PQIndex {
         pq: &ProductQuantizer,
         offset: usize,
         length: usize,
-    ) -> Result<PQIndex> {
+    ) -> Result<Self> {
         // TODO: read code book, PQ code and row_ids in parallel.
         let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
-        let codebook = read_fixed_stride_array(
-            reader,
-            &DataType::Float32,
-            offset,
-            code_book_length as usize,
-            ..,
-        )
-        .await?;
+        let codebook =
+            read_fixed_stride_array(reader, &DataType::Float32, offset, code_book_length, ..)
+                .await?;
 
-        let pq_code_offset = offset + code_book_length as usize * 4;
-        let pq_code_length = pq.num_sub_vectors as usize * length;
+        let pq_code_offset = offset + code_book_length * 4;
+        let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, pq_code_offset, pq_code_length, ..)
                 .await?;
@@ -113,12 +108,11 @@ impl PQIndex {
 
     /// Get the centroids for one sub-vector.
     pub fn centroids(&self, sub_vector_idx: usize) -> FixedSizeListArray {
-        assert!(sub_vector_idx < self.num_sub_vectors as usize);
+        assert!(sub_vector_idx < self.num_sub_vectors);
 
-        let arr = self.codebook.slice(
-            sub_vector_idx * self.dimension as usize,
-            self.dimension as usize,
-        );
+        let arr = self
+            .codebook
+            .slice(sub_vector_idx * self.dimension, self.dimension);
         let f32_arr: &Float32Array = as_primitive_array(&arr);
         FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
             .unwrap()
@@ -127,7 +121,7 @@ impl PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
-        assert_eq!(self.code.len() % self.num_sub_vectors as usize, 0);
+        assert_eq!(self.code.len() % self.num_sub_vectors, 0);
 
         // Build distance table for each sub-centroid to the query key.
         //
@@ -208,7 +202,7 @@ impl ProductQuantizer {
         assert!(nbits == 8, "nbits can only be 8");
         Self {
             nbits,
-            num_sub_vectors: m as usize,
+            num_sub_vectors: m,
             dimension,
             codebook: None,
         }

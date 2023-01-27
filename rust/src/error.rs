@@ -22,18 +22,20 @@ pub enum Error {
     Arrow(String),
     Schema(String),
     IO(String),
+    Index(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (catelog, message) = match self {
+        let (catalog, message) = match self {
             Self::Arrow(s) => ("Arrow", s),
             Self::Schema(s) => ("Schema", s),
             Self::IO(s) => ("I/O", s),
+            Self::Index(s) => ("Index", s),
         };
-        write!(f, "LanceError({}): {}", catelog, message)
+        write!(f, "LanceError({catalog}): {message}")
     }
 }
 
@@ -84,9 +86,10 @@ impl std::error::Error for Error {}
 impl From<Error> for ArrowError {
     fn from(value: Error) -> Self {
         match value {
-            Error::Arrow(err) => ArrowError::IoError(err), // we lose the error type converting to LanceError
-            Error::IO(err) => ArrowError::IoError(err),
-            Error::Schema(err) => ArrowError::SchemaError(err),
+            Error::Arrow(err) => Self::IoError(err), // we lose the error type converting to LanceError
+            Error::IO(err) => Self::IoError(err),
+            Error::Schema(err) => Self::SchemaError(err),
+            Error::Index(err) => Self::IoError(err),
         }
     }
 }

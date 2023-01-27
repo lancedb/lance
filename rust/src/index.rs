@@ -18,6 +18,8 @@
 //! Secondary Index
 //!
 
+use std::any::Any;
+
 use async_trait::async_trait;
 
 /// Protobuf definitions for the index on-disk format.
@@ -45,4 +47,8 @@ pub trait IndexBuilder {
     fn index_type() -> IndexType;
 
     async fn build(&self) -> Result<()>;
+}
+
+pub trait IndexParams {
+    fn as_any(&self) -> &dyn Any;
 }

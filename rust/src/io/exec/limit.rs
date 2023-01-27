@@ -141,7 +141,9 @@ mod tests {
         let mut scanner = dataset.scan();
         scanner.limit(2, Some(19)).unwrap();
         let actual_batches: Vec<RecordBatch> = scanner
-            .into_stream()
+            .try_into_stream()
+            .await
+            .unwrap()
             .map(|b| b.unwrap())
             .collect::<Vec<RecordBatch>>()
             .await;

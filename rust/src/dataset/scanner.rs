@@ -28,9 +28,8 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
+use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Limit, Scan, Take};
 use crate::Error::IO;
-
-use crate::io::exec::{ExecNodeBox, KNNFlat, Limit, Scan, Take};
 use crate::Result;
 
 /// Column name for the meta row ID.
@@ -147,10 +146,14 @@ impl Scanner {
         }
     }
 
+    fn should_use_index(&self) -> bool {
+        self.nearest.is_some()
+    }
+
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub fn into_stream(&self) -> ScannerStream {
+    pub async fn try_into_stream(&self) -> Result<ScannerStream> {
         const PREFECTH_SIZE: usize = 8;
 
         let data_dir = self.dataset.data_dir();
@@ -158,23 +161,45 @@ impl Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
+        let indices = if self.should_use_index() {
+            self.dataset.load_indices().await?
+        } else {
+            vec![]
+        };
+
         let mut exec_node: ExecNodeBox = if let Some(q) = self.nearest.as_ref() {
-            let vector_scan_projection =
-                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-            let scan_node = Box::new(Scan::new(
-                self.dataset.object_store.clone(),
-                data_dir.clone(),
-                self.fragments.clone(),
-                &vector_scan_projection,
-                manifest.clone(),
-                PREFECTH_SIZE,
-                true,
-            ));
-            let flat_knn_node = Box::new(KNNFlat::new(scan_node, q));
+            let column_id = self
+                .dataset
+                .schema()
+                .field(&q.column)
+                .expect("vector column does not exist")
+                .id;
+            let knn_node: Box<dyn ExecNode + Send + Unpin> =
+                if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                    Box::new(KNNIndex::new(
+                        self.dataset.clone(),
+                        &index.uuid.to_string(),
+                        q,
+                    ))
+                } else {
+                    let vector_scan_projection =
+                        Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+                    let scan_node = Box::new(Scan::new(
+                        self.dataset.object_store.clone(),
+                        data_dir.clone(),
+                        self.fragments.clone(),
+                        &vector_scan_projection,
+                        manifest.clone(),
+                        PREFECTH_SIZE,
+                        true,
+                    ));
+                    Box::new(KNNFlat::new(scan_node, q))
+                };
+
             Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),
-                flat_knn_node,
+                knn_node,
             ))
         } else {
             Box::new(Scan::new(
@@ -191,7 +216,7 @@ impl Scanner {
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
         }
-        ScannerStream::new(exec_node)
+        Ok(ScannerStream::new(exec_node))
     }
 }
 
@@ -203,7 +228,7 @@ pub struct ScannerStream {
 }
 
 impl ScannerStream {
-    fn new<'a>(exec_node: ExecNodeBox) -> Self {
+    fn new(exec_node: ExecNodeBox) -> Self {
         Self { exec_node }
     }
 }

@@ -32,12 +32,17 @@ fn train_kmeans_faiss(
     Ok(model.centroids.into())
 }
 
-/// Fallback implementation of KMeans.
-fn train_kmeans_fallback() -> Result<Float32Array> {
+/// A fallback default implementation of KMeans, if not accelerator found.
+fn train_kmeans_fallback(
+    _array: &Float32Array,
+    _dimension: usize,
+    _k: u32,
+    _max_iter: u32,
+) -> Result<Float32Array> {
     todo!()
 }
 
-/// Train kmean model and returns the centroids of each cluster.
+/// Train kmeans model and returns the centroids of each cluster.
 pub fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
@@ -48,5 +53,5 @@ pub fn train_kmeans(
     return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback()
+    train_kmeans_fallback(array, dimension, num_clusters, max_iterations)
 }

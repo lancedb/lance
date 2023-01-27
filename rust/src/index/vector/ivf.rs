@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_arith::arithmetic::subtract_dyn;
-use arrow_array::BooleanArray;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
-    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, StructArray, UInt32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
+    UInt32Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::filter::filter_record_batch;
 use arrow_select::{
     concat::{concat, concat_batches},
+    filter::filter_record_batch,
     take::take,
 };
 use async_trait::async_trait;
@@ -39,6 +39,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
@@ -63,15 +64,6 @@ const INDEX_FILE_NAME: &str = "index.idx";
 pub struct IvfPQIndex<'a> {
     reader: Box<dyn ObjectReader + 'a>,
 
-    /// Index name.
-    name: String,
-
-    /// The column to build the indices.
-    column: String,
-
-    /// Vector dimension.
-    dimension: usize,
-
     /// Ivf file.
     ivf: Ivf,
 
@@ -81,8 +73,8 @@ pub struct IvfPQIndex<'a> {
 
 impl<'a> IvfPQIndex<'a> {
     /// Open the IvfPQ index on dataset, specified by the index `name`.
-    async fn new(dataset: &'a Dataset, name: &str) -> Result<IvfPQIndex<'a>> {
-        let index_dir = dataset.indices_dir().child(name);
+    pub async fn new(dataset: &'a Dataset, uuid: &str) -> Result<IvfPQIndex<'a>> {
+        let index_dir = dataset.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
 
         let object_store = dataset.object_store();
@@ -107,10 +99,7 @@ impl<'a> IvfPQIndex<'a> {
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
         Ok(Self {
-            reader: reader,
-            name: name.to_string(),
-            column: index_metadata.column.clone(),
-            dimension: index_metadata.dimension as usize,
+            reader,
             ivf: index_metadata.ivf,
             pq: index_metadata.pq,
         })
@@ -256,7 +245,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
 
                         Ok::<Self, Error>(Self {
                             name: idx.name.clone(),
-                            column: idx.columns[0].to_string(),
+                            column: idx.columns[0].clone(),
                             dimension: vidx.dimension,
                             dataset_version: idx.dataset_version,
                             ivf,
@@ -330,10 +319,11 @@ impl Ivf {
         let schema = scanner.schema();
         let column_name = schema.field(0).name();
         let partitions_with_id = scanner
-            .into_stream()
+            .try_into_stream()
+            .await?
             .and_then(|b| async move {
                 let arr = b.column_by_name(column_name).ok_or_else(|| {
-                    Error::IO(format!("Dataset does not have column {}", column_name))
+                    Error::IO(format!("Dataset does not have column {column_name}"))
                 })?;
                 let vectors: &FixedSizeListArray = arr.as_any().downcast_ref().unwrap();
                 let vec = vectors.clone();
@@ -372,7 +362,7 @@ impl Ivf {
         let mut partitions = BTreeMap::<u32, RecordBatch>::new();
         for (key, value) in partitions_with_id.iter() {
             let batch = concat_batches(&value[0].schema(), value)?;
-            let arr = self.centroids.value(key.clone() as usize);
+            let arr = self.centroids.value(*key as usize);
             let centroids: &Float32Array = as_primitive_array(&arr);
             let column = batch.column_by_name(column_name).unwrap();
             let vectors = as_fixed_size_list_array(column);
@@ -456,7 +446,7 @@ fn compute_residual(
 fn partition_batch(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, RecordBatch>> {
     let part_col = batch
         .column_by_name(col)
-        .ok_or_else(|| Error::IO(format!("Column {} does not exist", col)))?;
+        .ok_or_else(|| Error::IO(format!("Column {col} does not exist")))?;
     let partition_ids: &UInt32Array = as_primitive_array(part_col);
     let min_id = min(partition_ids).unwrap_or(0);
     let max_id = max(partition_ids).unwrap_or(1024 * 1024);
@@ -476,6 +466,9 @@ fn partition_batch(batch: &RecordBatch, col: &str) -> Result<BTreeMap<u32, Recor
 pub struct IvfPqIndexBuilder<'a> {
     dataset: &'a Dataset,
 
+    /// Unique id of the index.
+    uuid: Uuid,
+
     /// Index name
     name: String,
 
@@ -493,36 +486,34 @@ pub struct IvfPqIndexBuilder<'a> {
     num_sub_vectors: u32,
 
     /// Max iterations to train a k-mean model.
-    kmean_max_iters: u32,
+    kmeans_max_iters: u32,
 }
 
 impl<'a> IvfPqIndexBuilder<'a> {
     pub fn try_new(
         dataset: &'a Dataset,
+        uuid: Uuid,
         name: &str,
         column: &str,
         num_partitions: u32,
         num_sub_vectors: u32,
     ) -> Result<Self> {
         let field = dataset.schema().field(column).ok_or(Error::IO(format!(
-            "Column {} does not exist in the dataset",
-            column
+            "Column {column} does not exist in the dataset"
         )))?;
-        let dimension = match field.data_type() {
-            DataType::FixedSizeList(_, d) => d,
-            _ => {
-                return Err(Error::IO(format!("Column {} is not a vector type", column)));
-            }
+        let DataType::FixedSizeList(_, d) = field.data_type() else {
+            return Err(Error::IO(format!("Column {column} is not a vector type")));
         };
         Ok(Self {
             dataset,
+            uuid,
             name: name.to_string(),
             column: column.to_string(),
-            dimension: dimension as usize,
+            dimension: d as usize,
             num_partitions,
             num_sub_vectors,
             nbits: 8,
-            kmean_max_iters: 100,
+            kmeans_max_iters: 100,
         })
     }
 }
@@ -541,22 +532,30 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         );
 
         // Step 1. Sanity check
-        let schema = self.dataset.schema().field(&self.column);
-        if schema.is_none() {
+        let Some(field) = self.dataset.schema().field(&self.column) else {
             return Err(Error::IO(format!(
                 "Building index: column {} does not exist in dataset: {:?}",
                 self.column, self.dataset
             )));
+        };
+        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
+            if !matches!(elem_type.data_type(), DataType::Float32) {
+                return Err(
+                    Error::Index(
+                        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                        elem_type.data_type())));
+            }
+        } else {
+            return Err(Error::Index(
+                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                field.data_type())));
         }
 
         let object_store = self.dataset.object_store();
-
-        // object_store.
-        // Just use column.idx for POC
         let path = self
             .dataset
             .indices_dir()
-            .child(self.name.as_str())
+            .child(self.uuid.to_string())
             .child(INDEX_FILE_NAME);
         let mut writer = object_store.create(&path).await?;
 
@@ -569,7 +568,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 &scanner,
                 self.dimension,
                 self.num_partitions,
-                self.kmean_max_iters,
+                self.kmeans_max_iters,
             )
             .await?,
         );
@@ -629,11 +628,16 @@ async fn train_kmean_model(
 ) -> Result<FixedSizeListArray> {
     let schema = scanner.schema();
     assert_eq!(schema.fields.len(), 1);
+    let column_name = schema.fields[0].name();
     // Copy all to memory for now, optimize later.
-    let batches = scanner.into_stream().try_collect::<Vec<_>>().await?;
+    let batches = scanner
+        .try_into_stream()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
     let mut arr_list = vec![];
     for batch in batches {
-        let arr = batch.column_by_name("vector").unwrap();
+        let arr = batch.column_by_name(&column_name).unwrap();
         let list_arr = as_fixed_size_list_array(&arr);
         arr_list.push(list_arr.values().clone());
     }

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 ///  * Schema
 ///  * Version
 ///  * Fragments.
+///  * Indices.
 #[derive(Debug, Clone)]
 pub struct Manifest {
     /// Dataset schema.
@@ -37,6 +38,12 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     pub fragments: Arc<Vec<Fragment>>,
+
+    /// The file position of the version aux data.
+    pub version_aux_data: usize,
+
+    /// The file position of the index metadata.
+    pub index_section: Option<usize>,
 }
 
 impl Manifest {
@@ -45,6 +52,8 @@ impl Manifest {
             schema: schema.clone(),
             version: 1,
             fragments,
+            version_aux_data: 0,
+            index_section: None,
         }
     }
 }
@@ -59,6 +68,8 @@ impl From<pb::Manifest> for Manifest {
             schema: Schema::from(&p.fields),
             version: p.version,
             fragments: Arc::new(p.fragments.iter().map(Fragment::from).collect()),
+            version_aux_data: p.version_aux_data as usize,
+            index_section: p.index_section.map(|i| i as usize),
         }
     }
 }
@@ -70,7 +81,8 @@ impl From<&Manifest> for pb::Manifest {
             version: m.version,
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
             metadata: HashMap::default(),
-            version_aux_data: 0,
+            version_aux_data: m.version_aux_data as u64,
+            index_section: m.index_section.map(|i| i as u64),
         }
     }
 }

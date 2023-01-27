@@ -23,6 +23,7 @@ use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
 use lance::index::vector::ivf::IvfPqIndexBuilder;
+use lance::index::vector::VectorIndexParams;
 use lance::index::IndexBuilder;
 use lance::{Error, Result};
 
@@ -114,7 +115,7 @@ async fn main() -> Result<()> {
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
             let mut scanner = dataset.scan();
-            scanner.limit(*n, None);
+            scanner.limit(*n, None).unwrap();
             let stream = scanner.into_stream();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
             println!("{:?}", batch);
@@ -159,39 +160,14 @@ async fn create_index(
     let col = column
         .as_ref()
         .ok_or_else(|| Error::IO("Must specify column".to_string()))?;
-    let schema = dataset.schema();
-    let field = schema
-        .field(col)
-        .ok_or_else(|| Error::IO(format!("Column {} does not exist in dataset", col)))?;
-    match field.data_type() {
-        DataType::FixedSizeList(elem_type, _) => {
-            if !matches!(elem_type.as_ref().data_type(), &DataType::Float32) {
-                return Err(Error::IO(format!(
-                    "Only support to create vector index on f32 vector, but got {}",
-                    elem_type.as_ref()
-                )));
-            }
-        }
-        _ => {
-            return Err(Error::IO(format!(
-                "Column '{}' is not a vector column: {}",
-                col, field
-            )))
-        }
-    }
-
     let index_type = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
-
-    match index_type {
-        IndexType::IvfPQ => {
-            let builder = IvfPqIndexBuilder::try_new(
-                dataset,
-                name.as_ref().unwrap(),
-                column.as_ref().unwrap(),
-                *num_partitions,
-                *num_sub_vectors,
-            )?;
-            builder.build().await
-        }
-    }
+    dataset
+        .create_index(
+            &[&col],
+            lance::index::IndexType::Vector,
+            name.clone(),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors),
+        )
+        .await;
+    Ok(())
 }

@@ -28,13 +28,18 @@ use crate::arrow::*;
 use crate::datatypes::{Field, Schema};
 use crate::encodings::dictionary::DictionaryEncoder;
 use crate::encodings::{binary::BinaryEncoder, plain::PlainEncoder, Encoder, Encoding};
-use crate::format::{Manifest, Metadata, PageInfo, PageTable};
+use crate::format::{pb, Index, Manifest, Metadata, PageInfo, PageTable};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
 use super::ObjectStore;
 
-pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) -> Result<usize> {
+/// Write manifest to an open file.
+pub async fn write_manifest(
+    writer: &mut ObjectWriter,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
     for field_id in 1..max_field_id + 1 {
@@ -73,6 +78,14 @@ pub async fn write_manifest(writer: &mut ObjectWriter, manifest: &mut Manifest) 
             }
         }
     }
+
+    // Write indices if presented.
+    if let Some(indices) = indices.as_ref() {
+        let section: pb::IndexSection = indices.into();
+        let pos = writer.write_protobuf(&section).await?;
+        manifest.index_section = Some(pos);
+    }
+
     writer.write_struct(manifest).await
 }
 
@@ -248,7 +261,7 @@ impl<'a> FileWriter<'a> {
 
         // Step 2. Write manifest and dictionary values.
         let mut manifest = Manifest::new(self.schema, Arc::new(vec![]));
-        let pos = write_manifest(&mut self.object_writer, &mut manifest).await?;
+        let pos = write_manifest(&mut self.object_writer, &mut manifest, None).await?;
 
         // Step 3. Write metadata.
         self.metadata.manifest_position = Some(pos);

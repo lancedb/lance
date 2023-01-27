@@ -6,6 +6,7 @@ rustflags = [
     "-Wclippy::all",
     # "-Wclippy::style",
     "-Wclippy::fallible_impl_from",
+#    "-Wclippy::manual_let_else",  # wait for GHA to upgrade to 1.67
     "-Wclippy::redundant_pub_crate",
     "-Wclippy::string_add_assign",
     "-Wclippy::string_add",

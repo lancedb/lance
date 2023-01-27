@@ -19,7 +19,11 @@ mod write;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Manifest};
+use crate::format::{pb, Fragment, Index, Manifest};
+use crate::index::vector::ivf::IvfPqIndexBuilder;
+use crate::index::vector::VectorIndexParams;
+use crate::index::{IndexBuilder, IndexParams, IndexType};
+use crate::io::object_reader::read_message;
 use crate::io::{object_reader::read_struct, read_metadata_offset, ObjectStore};
 use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
 use crate::{Error, Result};
@@ -30,10 +34,6 @@ const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
 const DATA_DIR: &str = "data";
-
-fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
-}
 
 /// Lance Dataset
 #[derive(Debug, Clone)]
@@ -79,6 +79,17 @@ async fn new_file_writer<'a>(
     FileWriter::try_new(object_store, &full_path, schema).await
 }
 
+/// Get the manifest file path for a version.
+fn manifest_path(base: &Path, version: u64) -> Path {
+    base.child(VERSIONS_DIR)
+        .child(format!("{version}.manifest"))
+}
+
+/// Get the latest manifest path
+fn latest_manifest_path(base: &Path) -> Path {
+    base.child(LATEST_MANIFEST_NAME)
+}
+
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
@@ -120,7 +131,7 @@ impl Dataset {
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
         match object_store.inner.head(&latest_manifest_path).await {
-            Ok(_) => return Err(Error::IO(format!("Dataset already exists: {}", uri))),
+            Ok(_) => return Err(Error::IO(format!("Dataset already exists: {uri}"))),
             Err(object_store::Error::NotFound { path: _, source: _ }) => { /* we are good */ }
             Err(e) => return Err(Error::from(e)),
         }
@@ -187,21 +198,7 @@ impl Dataset {
         };
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
-        let manifest_file_path = object_store
-            .base_path()
-            .child(VERSIONS_DIR)
-            .child(format!("{}.manifest", manifest.version));
-        {
-            let mut object_writer = object_store.create(&manifest_file_path).await?;
-            let pos = write_manifest(&mut object_writer, &mut manifest).await?;
-            object_writer.write_magics(pos).await?;
-            object_writer.shutdown().await?;
-        }
-        let latest_manifest = object_store.base_path().child(LATEST_MANIFEST_NAME);
-        object_store
-            .inner
-            .copy(&manifest_file_path, &latest_manifest)
-            .await?;
+        write_manifest_file(&object_store, &mut manifest, None).await?;
 
         let base = object_store.base_path().clone();
         Ok(Self {
@@ -214,6 +211,85 @@ impl Dataset {
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
+    }
+
+    /// Create indices on columns.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    ///  - `columns`: the columns to build the indices on.
+    ///  - `index_type`: specify [`IndexType`].
+    ///  - `name`: optional index name. Must be unique in the dataset.
+    ///            if not provided, it will auto-generate one.
+    ///  - `params`: index parameters.
+    pub async fn create_index(
+        &self,
+        columns: &[&str],
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+    ) -> Result<Self> {
+        if columns.len() != 1 {
+            return Err(Error::Index(
+                "Only support building index on 1 column at the moment".to_string(),
+            ));
+        }
+        let column = columns[0];
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::Index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
+        };
+
+        // Load indices from the disk.
+        let mut indices = self.load_indices().await?;
+
+        let index_name = name.unwrap_or(format!("{column}_idx"));
+        if indices.iter().any(|i| i.name == index_name) {
+            return Err(Error::Index(format!(
+                "Index name '{index_name} already exists'"
+            )));
+        }
+
+        let index_id = Uuid::new_v4();
+        match index_type {
+            IndexType::Vector => {
+                let vec_params = params
+                    .as_any()
+                    .downcast_ref::<VectorIndexParams>()
+                    .ok_or_else(|| {
+                        Error::Index("Vector index type must take a VectorIndexParams".to_string())
+                    })?;
+
+                let builder = IvfPqIndexBuilder::try_new(
+                    self,
+                    index_id,
+                    &index_name,
+                    column,
+                    vec_params.num_partitions,
+                    vec_params.num_sub_vectors,
+                )?;
+                builder.build().await?
+            }
+        }
+
+        // Write index metadata down
+        let new_idx = Index::new(index_id, &index_name, &[field.id]);
+        indices.push(new_idx);
+
+        let latest_manifest = self.latest_manifest().await?;
+        let mut new_manifest = self.manifest.as_ref().clone();
+        new_manifest.version = latest_manifest.version + 1;
+
+        write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
+
+        Ok(Self {
+            object_store: self.object_store.clone(),
+            base: self.base.clone(),
+            manifest: Arc::new(new_manifest),
+        })
     }
 
     /// Take rows by the internal ROW ids.
@@ -280,6 +356,18 @@ impl Dataset {
         self.base.child(VERSIONS_DIR)
     }
 
+    fn manifest_file(&self, version: u64) -> Path {
+        self.versions_dir().child(format!("{version}.manifest"))
+    }
+
+    fn latest_manifest_path(&self) -> Path {
+        latest_manifest_path(&self.base)
+    }
+
+    async fn latest_manifest(&self) -> Result<Manifest> {
+        read_manifest(&self.object_store, &self.latest_manifest_path()).await
+    }
+
     fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
@@ -319,14 +407,53 @@ impl Dataset {
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
+
+    /// Read all indices of this Dataset version.
+    pub async fn load_indices(&self) -> Result<Vec<Index>> {
+        if let Some(pos) = self.manifest.index_section.as_ref() {
+            let manifest_file = self.manifest_file(self.version().version);
+
+            let reader = self.object_store.open(&manifest_file).await?;
+            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
+
+            Ok(section
+                .indices
+                .iter()
+                .map(|pb| Index::try_from(pb))
+                .collect::<Result<Vec<_>>>()?)
+        } else {
+            Ok(vec![])
+        }
+    }
+}
+
+/// Finish writing the manifest file, and commit the changes by linking the latest manifest file
+/// to this version.
+async fn write_manifest_file(
+    object_store: &ObjectStore,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+) -> Result<()> {
+    let path = manifest_path(object_store.base_path(), manifest.version);
+    let mut object_writer = object_store.create(&path).await?;
+    let pos = write_manifest(&mut object_writer, manifest, indices).await?;
+    object_writer.write_magics(pos).await?;
+    object_writer.shutdown().await?;
+
+    // Link it to latest manifest, and COMMIT.
+    let latest_manifest = latest_manifest_path(object_store.base_path());
+    object_store.inner.copy(&path, &latest_manifest).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::testing::generate_random_array;
 
     use arrow_array::{
-        types::UInt16Type, DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
@@ -385,7 +512,9 @@ mod tests {
 
         let actual_batches = actual_ds
             .scan()
-            .into_stream()
+            .try_into_stream()
+            .await
+            .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -400,5 +529,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..10).collect::<Vec<_>>()
         )
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_create_index() {
+        let test_dir = tempdir().unwrap();
+
+        let dimension = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "embeddings",
+            DataType::FixedSizeList(
+                Box::new(Field::new("item", DataType::Float32, true)),
+                dimension,
+            ),
+            false,
+        )]));
+
+        let float_arr = generate_random_array(100 * dimension as usize);
+        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
+        let batches =
+            RecordBatchBuffer::new(vec![
+                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
+            ]);
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::create(&mut reader, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::default();
+        dataset
+            .create_index(&["embeddings"], IndexType::Vector, None, &params)
+            .await
+            .unwrap();
     }
 }
