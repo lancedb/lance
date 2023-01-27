@@ -23,6 +23,8 @@ pub enum Error {
     Schema(String),
     IO(String),
     Index(String),
+    /// Stream early stop
+    Stop(),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -30,10 +32,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (catalog, message) = match self {
-            Self::Arrow(s) => ("Arrow", s),
-            Self::Schema(s) => ("Schema", s),
-            Self::IO(s) => ("I/O", s),
-            Self::Index(s) => ("Index", s),
+            Self::Arrow(s) => ("Arrow", s.as_str()),
+            Self::Schema(s) => ("Schema", s.as_str()),
+            Self::IO(s) => ("I/O", s.as_str()),
+            Self::Index(s) => ("Index", s.as_str()),
+            Self::Stop() => ("Early stop", ""),
         };
         write!(f, "LanceError({catalog}): {message}")
     }
@@ -90,6 +93,7 @@ impl From<Error> for ArrowError {
             Error::IO(err) => Self::IoError(err),
             Error::Schema(err) => Self::SchemaError(err),
             Error::Index(err) => Self::IoError(err),
+            Error::Stop() => Self::IoError("early stop".to_string()),
         }
     }
 }

@@ -15,6 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Before running the dataset, prepare a "test.lance" dataset, in the
+//! `lance/rust` directory. There is no limitation in the dataset size,
+//! schema, or content.
+//!
+//! Run benchmark.
+//! ```
+//! cargo bench --bench scan
+//! ```.
+//!
+//! TODO: Take parameterized input to specify dataset URI from command line.
+
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
 use pprof::criterion::{Output, PProfProfiler};
@@ -27,11 +38,13 @@ fn bench_scan(c: &mut Criterion) {
 
     let dataset = rt.block_on(async { Dataset::open("./test.lance").await.unwrap() });
 
-    c.bench_function("Scan datasets", |b| {
+    c.bench_function("Scan full dataset", |b| {
         b.to_async(&rt).iter(|| async {
             let count = dataset
                 .scan()
-                .into_stream()
+                .try_into_stream()
+                .await
+                .unwrap()
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();

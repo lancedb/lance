@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use futures::stream::Stream;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -83,17 +83,22 @@ impl Scan {
                         break;
                     }
                 };
-                for batch_id in 0..reader.num_batches() {
-                    let batch = reader.read_batch(batch_id as i32, ..).await;
-                    if tx.is_closed() {
-                        break;
-                    }
-                    if tx.send(batch).await.is_err() {
-                        // tx closed earlier.
+
+                let r = &reader;
+                match stream::iter(0..reader.num_batches())
+                    .map(|batch_id| async move { r.read_batch(batch_id as i32, ..).await })
+                    .buffer_unordered(prefetch_size)
+                    .try_for_each(|b| async { tx.send(Ok(b)).await.map_err(|_| Error::Stop()) })
+                    .await
+                {
+                    Ok(_) | Err(Error::Stop()) => {}
+                    Err(e) => {
+                        eprintln!("Failed to scan data: {e}");
                         break;
                     }
                 }
             }
+
             drop(tx)
         });
 
