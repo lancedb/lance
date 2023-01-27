@@ -52,13 +52,18 @@ impl Scanner {
 impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        self_.scanner.schema().map(|s| s.to_pyarrow(self_.py()))
+        self_
+            .scanner
+            .schema()
+            .map(|s| s.to_pyarrow(self_.py()))
             .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
 
     fn to_pyarrow(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         self_.rt.block_on(async {
-            let reader = self_.to_reader().map_err(|err| PyValueError::new_err(err.to_string()))?;
+            let reader = self_
+                .to_reader()
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
             // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
             let stream = Arc::new(FFI_ArrowArrayStream::empty());
             let stream_ptr = Arc::into_raw(stream) as *mut FFI_ArrowArrayStream;
