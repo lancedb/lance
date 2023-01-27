@@ -34,10 +34,13 @@ pub struct LanceReader {
 }
 
 impl LanceReader {
-    pub fn try_new(scanner: Arc<LanceScanner>, rt: Arc<Runtime>) -> ::lance::error::Result<Self> {
+    pub async fn try_new(
+        scanner: Arc<LanceScanner>,
+        rt: Arc<Runtime>,
+    ) -> ::lance::error::Result<Self> {
         Ok(Self {
             schema: scanner.schema()?,
-            stream: scanner.into_stream(), // needs tokio Runtime
+            stream: scanner.try_into_stream().await?, // needs tokio Runtime
             rt,
         })
     }
