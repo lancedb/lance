@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{Array, ArrayAccessor, Float32Array};
+use arrow_array::Float32Array;
 
 use crate::Result;
 
