@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
@@ -116,6 +117,9 @@ async fn main() -> Result<()> {
             let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
             println!("{:?}", batch);
+
+            // pretty print the batch
+            let _ = print_batches(&batch)?;
 
             Ok(())
         }
