@@ -142,7 +142,8 @@ mod tests {
         scanner.limit(2, Some(19)).unwrap();
         let actual_batches: Vec<RecordBatch> = scanner
             .try_into_stream()
-            .await.unwrap()
+            .await
+            .unwrap()
             .map(|b| b.unwrap())
             .collect::<Vec<RecordBatch>>()
             .await;
