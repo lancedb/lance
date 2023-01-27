@@ -27,11 +27,13 @@ fn bench_scan(c: &mut Criterion) {
 
     let dataset = rt.block_on(async { Dataset::open("./test.lance").await.unwrap() });
 
-    c.bench_function("Scan datasets", |b| {
+    c.bench_function("Scan full dataset", |b| {
         b.to_async(&rt).iter(|| async {
             let count = dataset
                 .scan()
-                .into_stream()
+                .try_into_stream()
+                .await
+                .unwrap()
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
