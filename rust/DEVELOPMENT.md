@@ -1,8 +1,29 @@
 # Developing Lance
 
+Lance in one diagram
+
+![img.png](img.png)
+
+The write path is analogous but there's no need for io planning. Instead,
+we need to version data correctly and create the right manifest data to
+be written
+
 ## Data format spec
 
 TODO: release data format spec and add link here
+
+## Rust codebase guide
+
+| Directory | Description                                  |
+|-----------|----------------------------------------------|
+| dataset   | dataset-level scanner and writer abstraction |
+| encodings | base level file serde                        |
+| format    | structs to match the format spec             |
+| index     | vector indices right now                     |
+| io        | readers, writers, and IO planning            |
+| utils     | distance metrics and testing utilities       |
+| arrow     | extensions for arrow-rs                      |
+| bin       | lq utility cli                               |
 
 ## Rust Roadmap
 
@@ -111,3 +132,9 @@ Under /rust/pylance, run `pytest python/tests`
 
 ## Extension types
 
+We want to add extension types for ML:
+- Images, Videos, PDF, Document
+- Boxes, Labels, Polygon, etc
+
+Currently arrow-rs doesn't have an extension mechanism nor does it talk to the
+C++ extension registry.
