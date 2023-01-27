@@ -285,7 +285,11 @@ impl Dataset {
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
 
-        todo!()
+        Ok(Self {
+            object_store: self.object_store.clone(),
+            base: self.base.clone(),
+            manifest: Arc::new(new_manifest),
+        })
     }
 
     /// Take rows by the internal ROW ids.

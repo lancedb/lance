@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
             let mut scanner = dataset.scan();
-            scanner.limit(*n, None);
+            scanner.limit(*n, None).unwrap();
             let stream = scanner.into_stream();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
             println!("{:?}", batch);
@@ -163,9 +163,9 @@ async fn create_index(
     let index_type = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
     dataset
         .create_index(
-            [&col],
-            index_type,
-            name.unwrap,
+            &[&col],
+            lance::index::IndexType::Vector,
+            name.clone(),
             &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors),
         )
         .await;
