@@ -176,7 +176,6 @@ impl Scanner {
                 .id;
             let knn_node: Box<dyn ExecNode + Send + Unpin> =
                 if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
-                    println!("Found index: lets go fast");
                     Box::new(KNNIndex::new(
                         self.dataset.clone(),
                         &index.uuid.to_string(),
