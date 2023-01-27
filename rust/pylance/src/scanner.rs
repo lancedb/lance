@@ -24,6 +24,7 @@ use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
+use pyo3::exceptions::PyValueError;
 
 use crate::errors::ioerror;
 use crate::reader::LanceReader;
@@ -42,8 +43,8 @@ impl Scanner {
         Self { scanner, rt }
     }
 
-    pub(crate) fn to_reader(&self) -> LanceReader {
-        LanceReader::new(self.scanner.clone(), self.rt.clone())
+    pub(crate) fn to_reader(&self) -> ::lance::error::Result<LanceReader> {
+        LanceReader::try_new(self.scanner.clone(), self.rt.clone())
     }
 }
 
@@ -51,12 +52,18 @@ impl Scanner {
 impl Scanner {
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
-        self_.scanner.schema().to_pyarrow(self_.py())
+        self_
+            .scanner
+            .schema()
+            .map(|s| s.to_pyarrow(self_.py()))
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
     }
 
     fn to_pyarrow(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         self_.rt.block_on(async {
-            let reader = self_.to_reader();
+            let reader = self_
+                .to_reader()
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
             // Export a `RecordBatchReader` through `FFI_ArrowArrayStream`
             let stream = Arc::new(FFI_ArrowArrayStream::empty());
             let stream_ptr = Arc::into_raw(stream) as *mut FFI_ArrowArrayStream;

@@ -116,7 +116,11 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
         let scanner: Scanner = reader.extract()?;
-        Box::new(scanner.to_reader())
+        Box::new(
+            scanner
+                .to_reader()
+                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+        )
     } else {
         Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
     };

@@ -29,7 +29,8 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Limit, Scan, Take};
-use crate::Error::IO;
+use crate::Error::{Schema as SchemaError, IO};
+
 use crate::Result;
 
 /// Column name for the meta row ID.
@@ -134,15 +135,24 @@ impl Scanner {
     }
 
     /// The schema of the output, a.k.a, projection schema.
-    pub fn schema(&self) -> SchemaRef {
+    pub fn schema(&self) -> Result<SchemaRef> {
         if self.nearest.as_ref().is_some() {
+            let q = self.nearest.as_ref().unwrap();
+            let column: ArrowField = self
+                .dataset
+                .schema()
+                .field(q.column.as_str())
+                .ok_or_else(|| {
+                    SchemaError(format!("Vector column {} not found in schema", q.column))
+                })?
+                .into();
             let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![score]);
+            let score_schema = ArrowSchema::new(vec![column.clone(), score]);
             let to_merge = &Schema::try_from(&score_schema).unwrap();
             let merged = self.projections.merge(to_merge);
-            SchemaRef::new(ArrowSchema::from(&merged))
+            Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
-            Arc::new(ArrowSchema::from(&self.projections))
+            Ok(Arc::new(ArrowSchema::from(&self.projections)))
         }
     }
 

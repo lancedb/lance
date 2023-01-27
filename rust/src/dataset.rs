@@ -317,13 +317,14 @@ impl Dataset {
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
             .then(|fragment| async {
                 let path = self.data_dir().child(fragment.files[0].path.as_str());
-                let reader = FileReader::try_new_with_fragment(
+                let mut reader = FileReader::try_new_with_fragment(
                     object_store,
                     &path,
                     fragment.id,
                     Some(self.manifest.as_ref()),
                 )
                 .await?;
+                reader.set_projection(projection.clone());
                 if let Some(indices) = row_ids_per_fragment.get(&fragment.id) {
                     reader.take(indices.as_slice()).await
                 } else {
