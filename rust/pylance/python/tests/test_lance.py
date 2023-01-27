@@ -62,8 +62,9 @@ def test_nearest(tmp_path):
     uri = tmp_path
 
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
-    npvals = np.random.rand(32 * 100)
-    values = pa.array(npvals, type=pa.float32())
+    npvals = np.random.rand(100, 32)
+    npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
+    values = pa.array(npvals.ravel(), type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
     lance.write_dataset(tbl, uri)
