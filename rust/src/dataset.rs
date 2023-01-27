@@ -454,9 +454,12 @@ mod tests {
     use crate::utils::testing::generate_random_array;
 
     use arrow_array::{
-        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+        cast::as_struct_array, DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch,
+        StringArray, UInt16Array,
     };
+    use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema};
+    use arrow_select::take::take;
     use futures::stream::TryStreamExt;
 
     use tempfile::tempdir;
@@ -519,7 +522,16 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        assert_eq!(expected_batches, actual_batches);
+        // sort
+        let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
+        let idx_arr = actual_batch.column_by_name("i").unwrap();
+        let sorted_indices = sort_to_indices(idx_arr, None, None).unwrap();
+        let struct_arr: StructArray = actual_batch.into();
+        let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
+
+        let expected_struct_arr: StructArray =
+            concat_batches(&schema, &expected_batches).unwrap().into();
+        assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
 
         // Each fragments has different fragment ID
         assert_eq!(

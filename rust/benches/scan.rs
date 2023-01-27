@@ -16,7 +16,7 @@
 // under the License.
 
 //! Before running the dataset, prepare a "test.lance" dataset, in the
-//! `lance/rust` directly. There is no limitation in the dataset size,
+//! `lance/rust` directory. There is no limitation in the dataset size,
 //! schema, or content.
 //!
 //! Run benchmark.
