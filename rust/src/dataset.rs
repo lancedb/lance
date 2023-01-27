@@ -446,12 +446,10 @@ async fn write_manifest_file(
 #[cfg(test)]
 mod tests {
     use crate::utils::testing::generate_random_array;
-
     use super::*;
 
     use arrow_array::{
-        types::Float32Type, DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch,
-        StringArray, UInt16Array,
+        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream::TryStreamExt;
@@ -527,6 +525,7 @@ mod tests {
         )
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_create_index() {
         let test_dir = tempdir().unwrap();

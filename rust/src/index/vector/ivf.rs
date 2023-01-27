@@ -639,11 +639,12 @@ async fn train_kmean_model(
 ) -> Result<FixedSizeListArray> {
     let schema = scanner.schema();
     assert_eq!(schema.fields.len(), 1);
+    let column_name = schema.fields[0].name();
     // Copy all to memory for now, optimize later.
     let batches = scanner.into_stream().try_collect::<Vec<_>>().await?;
     let mut arr_list = vec![];
     for batch in batches {
-        let arr = batch.column_by_name("vector").unwrap();
+        let arr = batch.column_by_name(&column_name).unwrap();
         let list_arr = as_fixed_size_list_array(&arr);
         arr_list.push(list_arr.values().clone());
     }

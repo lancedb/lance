@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::Float32Array;
+use arrow_array::{Array, ArrayAccessor, Float32Array};
 
 use crate::Result;
 
@@ -32,17 +32,17 @@ fn train_kmeans_faiss(
     Ok(model.centroids.into())
 }
 
-/// Fallback implementation of KMeans.
+/// A fallback default implementation of KMeans, if not accelerator found.
 fn train_kmeans_fallback(
-    _array: &Float32Array,
-    _dimension: usize,
-    _num_clusters: u32,
-    _max_iterations: u32,
+    array: &Float32Array,
+    dimension: usize,
+    k: u32,
+    max_iter: u32,
 ) -> Result<Float32Array> {
     todo!()
 }
 
-/// Train kmean model and returns the centroids of each cluster.
+/// Train kmeans model and returns the centroids of each cluster.
 pub fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
