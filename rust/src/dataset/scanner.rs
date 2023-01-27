@@ -29,7 +29,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Limit, Scan, Take};
-use crate::Error::{IO, Schema as SchemaError};
+use crate::Error::{Schema as SchemaError, IO};
 
 use crate::Result;
 
@@ -142,7 +142,9 @@ impl Scanner {
                 .dataset
                 .schema()
                 .field(q.column.as_str())
-                .ok_or_else(|| SchemaError(format!("Vector column {} not found in schema", q.column)))?
+                .ok_or_else(|| {
+                    SchemaError(format!("Vector column {} not found in schema", q.column))
+                })?
                 .into();
             let score = ArrowField::new("score", Float32, false);
             let score_schema = ArrowSchema::new(vec![column.clone(), score]);
