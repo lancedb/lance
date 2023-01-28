@@ -128,7 +128,7 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
             Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
         };
 
-        LanceDataset::create(&mut batches, uri, params)
+        LanceDataset::write(&mut batches, uri, params)
             .await
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
