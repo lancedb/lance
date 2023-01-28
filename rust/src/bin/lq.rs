@@ -16,15 +16,12 @@
 // under the License.
 
 use arrow_array::RecordBatch;
-use arrow_schema::DataType;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::index::vector::ivf::IvfPqIndexBuilder;
 use lance::index::vector::VectorIndexParams;
-use lance::index::IndexBuilder;
 use lance::{Error, Result};
 
 #[derive(Parser)]
@@ -160,7 +157,7 @@ async fn create_index(
     let col = column
         .as_ref()
         .ok_or_else(|| Error::IO("Must specify column".to_string()))?;
-    let index_type = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
+    let _ = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
     dataset
         .create_index(
             &[&col],
@@ -168,6 +165,7 @@ async fn create_index(
             name.clone(),
             &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors),
         )
-        .await;
+        .await
+        .expect("dataset create index");
     Ok(())
 }
