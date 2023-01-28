@@ -59,6 +59,7 @@ clap = { version = "4.1.1", features = ["derive"] }
 criterion = { version = "0.4", features = ["async", "async_tokio"] }
 pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 tempfile = "3.3.0"
+approx = "0.5.1"
 
 [features]
 cli = ["clap"]
