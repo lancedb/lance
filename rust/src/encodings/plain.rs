@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
+    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray,
     FixedSizeListArray, UInt8Array,
 };
 use arrow_array::{types::*, UInt32Array};
@@ -113,7 +113,7 @@ pub struct PlainDecoder<'a> {
 fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
     Ok(match data_type {
         DataType::Boolean => bit_util::ceil(row_offset, 8),
-        _ => get_primitive_byte_width(data_type)? * row_offset,
+        _ => data_type.byte_width() * row_offset,
     })
 }
 
@@ -208,39 +208,6 @@ impl<'a> PlainDecoder<'a> {
     }
 }
 
-fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
-    match data_type {
-        DataType::Int8 => Ok(Int8Type::get_byte_width()),
-        DataType::Int16 => Ok(Int16Type::get_byte_width()),
-        DataType::Int32 => Ok(Int32Type::get_byte_width()),
-        DataType::Int64 => Ok(Int64Type::get_byte_width()),
-        DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
-        DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
-        DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
-        DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
-        DataType::Float16 => Ok(Float16Type::get_byte_width()),
-        DataType::Float32 => Ok(Float32Type::get_byte_width()),
-        DataType::Float64 => Ok(Float64Type::get_byte_width()),
-        _ => Err(Error::Schema(format!(
-            "Unsupport primitive type: {data_type}",
-        ))),
-    }
-}
-
-fn get_byte_width(data_type: &DataType) -> Result<usize> {
-    if data_type.is_primitive() {
-        get_primitive_byte_width(data_type)
-    } else if let DataType::FixedSizeBinary(s) = data_type {
-        Ok(*s as usize)
-    } else if let DataType::FixedSizeList(dt, s) = data_type {
-        get_primitive_byte_width(dt.data_type()).map(|w| w * *s as usize)
-    } else {
-        Err(Error::Schema(format!(
-            "Unsupport primitive type: {data_type}"
-        )))
-    }
-}
-
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
@@ -253,9 +220,21 @@ impl<'a> Decoder for PlainDecoder<'a> {
         }
 
         // TODO: optimize read for sparse indices later.
+        let block_size = self.reader.prefetch_size() as u32;
         println!("take Indices: {indices:?}");
-        let byte_width = get_byte_width(self.data_type);
-        let start = indices.value(0);
+
+        let byte_width = self.data_type.byte_width() as u32;
+        let mut chunk_ranges = vec![];
+        let mut start = indices.value(0);
+        let mut end = start;
+        for idx in 0..(indices.len() - 1) as u32 {
+            if indices.value(idx as usize + 1) * byte_width > start * byte_width + block_size {
+                chunk_ranges.push(start..end);
+                start = idx + 1;
+                end = idx + 1;
+            }
+        }
+        println!("Chunks: {:?}", chunk_ranges);
         let end = indices.value(indices.len() - 1);
         let array = self.get(start as usize..end as usize + 1).await?;
         let adjusted_offsets = subtract_scalar(indices, start)?;
