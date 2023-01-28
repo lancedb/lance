@@ -116,7 +116,6 @@ async fn main() -> Result<()> {
             scanner.limit(*n, None).unwrap();
             let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
-            println!("{:?}", batch);
 
             // pretty print the batch
             let _ = print_batches(&batch)?;
