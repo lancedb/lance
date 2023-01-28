@@ -87,7 +87,7 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
         let left = vld1q_f32(from.as_ptr().add(i));
         let right = vld1q_f32(to.as_ptr().add(i));
         let sub = vsubq_f32(left, right);
-        sum = vfmaq_laneq_f32(sum, sub, sub, 1);
+        sum = vfmaq_f32(sum, sub, sub);
     }
     vaddvq_f32(sum)
 }
@@ -202,6 +202,7 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::FixedSizeListArrayExt;
 
     use approx::assert_relative_eq;
     use arrow_array::types::Float32Type;
@@ -240,15 +241,17 @@ mod tests {
 
     #[test]
     fn test_l2_distance_cases() {
-        let values: Vec<f32> = vec![
+        let values: Float32Array = vec![
             0.25335717, 0.24663818, 0.26330215, 0.14988247, 0.06042378, 0.21077952, 0.26687378,
             0.22145681, 0.18319066, 0.18688454, 0.05216244, 0.11470364, 0.10554603, 0.19964123,
             0.06387895, 0.18992095, 0.00123718, 0.13500804, 0.09516747, 0.19508345, 0.2582458,
             0.1211653, 0.21121833, 0.24809816, 0.04078768, 0.19586588, 0.16496408, 0.14766085,
             0.04898421, 0.14728612, 0.21263947, 0.16763233,
-        ];
+        ]
+        .into();
+        let vectors = FixedSizeListArray::try_new(values, 32).unwrap();
 
-        let q: Vec<f32> = vec![
+        let q: Float32Array = vec![
             0.18549609,
             0.29954708,
             0.28318876,
@@ -281,15 +284,10 @@ mod tests {
             0.040363103,
             0.19913352,
             0.14545348,
-        ];
+        ]
+        .into();
 
-        let d = unsafe {
-            euclidean_distance_fma(
-                Float32Array::from_iter_values(values).values(),
-                Float32Array::from_iter_values(q).values(),
-            )
-        };
-        println!("L2: {}", d);
-        assert_relative_eq!(0.31935785197341404, d);
+        let d = l2_distance(&q, &vectors).unwrap();
+        assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }
