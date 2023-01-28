@@ -484,7 +484,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
-    use prost_types::Struct;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -634,7 +633,7 @@ mod tests {
                 .iter()
                 .map(|f| f.id)
                 .collect::<Vec<_>>(),
-            (0..10).collect::<Vec<_>>()
+            (0..2).collect::<Vec<_>>()
         )
     }
 
