@@ -23,7 +23,6 @@ use std::any::Any;
 use async_trait::async_trait;
 
 /// Protobuf definitions for the index on-disk format.
-#[allow(clippy::all)]
 pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }

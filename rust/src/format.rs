@@ -17,9 +17,7 @@ pub use metadata::Metadata;
 pub use page_table::{PageInfo, PageTable};
 
 /// Protobuf definitions
-#[allow(clippy::all)]
 pub mod pb {
-    #![allow(clippy::all)]
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
 }
 
