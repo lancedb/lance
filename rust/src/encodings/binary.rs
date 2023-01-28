@@ -138,7 +138,6 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
             return Ok(new_empty_array(&T::DATA_TYPE));
         }
 
-        // TODO: optimize for sparse index
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
         let array = self.get(start as usize..end as usize + 1).await?;

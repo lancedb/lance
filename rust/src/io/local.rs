@@ -47,6 +47,10 @@ impl LocalObjectReader {
 
 #[async_trait]
 impl ObjectReader for LocalObjectReader {
+    fn prefetch_size(&self) -> usize {
+        4096
+    }
+
     /// Returns the file size.
     async fn size(&self) -> Result<usize> {
         Ok(self.file.metadata()?.len() as usize)

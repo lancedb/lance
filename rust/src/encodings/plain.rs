@@ -222,9 +222,22 @@ fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
         DataType::Float32 => Ok(Float32Type::get_byte_width()),
         DataType::Float64 => Ok(Float64Type::get_byte_width()),
         _ => Err(Error::Schema(format!(
-            "Unsupport primitive type: {}",
-            data_type
+            "Unsupport primitive type: {data_type}",
         ))),
+    }
+}
+
+fn get_byte_width(data_type: &DataType) -> Result<usize> {
+    if data_type.is_primitive() {
+        get_primitive_byte_width(data_type)
+    } else if let DataType::FixedSizeBinary(s) = data_type {
+        Ok(*s as usize)
+    } else if let DataType::FixedSizeList(dt, s) = data_type {
+        get_primitive_byte_width(dt.data_type()).map(|w| w * *s as usize)
+    } else {
+        Err(Error::Schema(format!(
+            "Unsupport primitive type: {data_type}"
+        )))
     }
 }
 
@@ -240,6 +253,8 @@ impl<'a> Decoder for PlainDecoder<'a> {
         }
 
         // TODO: optimize read for sparse indices later.
+        println!("take Indices: {indices:?}");
+        let byte_width = get_byte_width(self.data_type);
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
         let array = self.get(start as usize..end as usize + 1).await?;
