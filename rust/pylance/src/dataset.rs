@@ -102,8 +102,20 @@ impl Dataset {
             } else {
                 10
             };
+
+            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes") {
+                if nprobes.is_none() {
+                    10
+                } else {
+                    PyAny::downcast::<PyLong>(nprobes)?.extract()?
+                }
+            } else {
+                10
+            };
+
             scanner
                 .nearest(column.as_str(), &q, k)
+                .map(|s| s.nprobs(nprobes))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 

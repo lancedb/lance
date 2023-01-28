@@ -70,7 +70,7 @@ def test_nearest(tmp_path):
     lance.write_dataset(tbl, uri)
 
     dataset = lance.dataset(uri)
-    top10 = dataset.to_table(nearest={"column": "emb", "q": arr[0].values, "k": 10})
+    top10 = dataset.to_table(nearest={"column": "emb", "q": arr[0].values, "k": 10, "nprobes": 10})
     scores = l2sq(arr[0].values, npvals.reshape((100, 32)))
     indices = np.argsort(scores)
     assert tbl.take(indices[:10]).to_pandas().equals(top10.to_pandas()[["emb"]])
