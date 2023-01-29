@@ -32,6 +32,8 @@ use ::lance::dataset::scanner::Scanner as LanceScanner;
 use ::lance::dataset::Dataset as LanceDataset;
 use lance::dataset::{WriteMode, WriteParams};
 
+const DEFAULT_NPROBS: usize = 1;
+
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
 #[derive(Clone)]
@@ -102,8 +104,20 @@ impl Dataset {
             } else {
                 10
             };
+
+            let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes") {
+                if nprobes.is_none() {
+                    DEFAULT_NPROBS
+                } else {
+                    PyAny::downcast::<PyLong>(nprobes)?.extract()?
+                }
+            } else {
+                DEFAULT_NPROBS
+            };
+
             scanner
                 .nearest(column.as_str(), &q, k)
+                .map(|s| s.nprobs(nprobes))
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 

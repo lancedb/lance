@@ -50,7 +50,8 @@ class LanceDataset(pa.dataset.Dataset):
             nearest should look like {
               "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
-              "k": 10
+              "k": 10,
+              "nprobes": 1
             }
         """
         return (ScannerBuilder(self)
@@ -87,7 +88,8 @@ class LanceDataset(pa.dataset.Dataset):
             nearest should look like {
               "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
-              "k": 10
+              "k": 10,
+              "nprobes": 1
             }
         """
         return self.scanner(
@@ -273,7 +275,8 @@ class ScannerBuilder:
 
     def nearest(self, column: Optional[str] = None,
                 q: Optional[pa.FloatingPointArray] = None,
-                k: Optional[int] = None) -> ScannerBuilder:
+                k: Optional[int] = None,
+                nprobes: Optional[int] = None) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
             return self
@@ -284,10 +287,13 @@ class ScannerBuilder:
             q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
+        if nprobes is not None and int(nprobes) <= 0:
+            raise ValueError(f"Nearest-K must be > 0 but got {k}")
         self._nearest = {
             "column": column,
             "q": q,
-            "k": k
+            "k": k,
+            "nprobes": nprobes
         }
         return self
 
