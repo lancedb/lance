@@ -133,9 +133,9 @@ impl Scanner {
     ///
     /// A refine step uses the original vector values to re-rank the distances.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
-        self.nearest
-            .as_mut()
-            .map(|q| q.refine_factor = Some(factor));
+        if let Some(q) = self.nearest.as_mut() {
+            q.refine_factor = Some(factor)
+        };
         self
     }
 
@@ -203,10 +203,14 @@ impl Scanner {
             }
             let knn_node: Box<dyn ExecNode + Send + Unpin> =
                 if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                    // There is an index built for the column.
+                    // We will use the index.
+                    let mut inner_query = q.clone();
+                    inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
                     Box::new(KNNIndex::new(
                         self.dataset.clone(),
                         &index.uuid.to_string(),
-                        q,
+                        &inner_query,
                     ))
                 } else {
                     let vector_scan_projection =
@@ -223,11 +227,17 @@ impl Scanner {
                     Box::new(KNNFlat::new(scan_node, q))
                 };
 
-            Box::new(Take::new(
+            let take_node = Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),
                 knn_node,
-            ))
+            ));
+
+            if q.refine_factor.is_some() {
+                Box::new(KNNFlat::new(take_node, q))
+            } else {
+                take_node
+            }
         } else {
             Box::new(Scan::new(
                 self.dataset.object_store.clone(),
