@@ -139,4 +139,13 @@ impl ObjectStore {
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
         ObjectWriter::new(self, path).await
     }
+
+    /// Check a file exists.
+    pub async fn exists(&self, path: &Path) -> Result<bool> {
+        match self.inner.head(path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { path: _, source: _ }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
 }

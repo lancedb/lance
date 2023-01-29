@@ -16,6 +16,7 @@
 // under the License.
 
 /// The mode to write dataset.
+#[derive(Debug, Clone, Copy)]
 pub enum WriteMode {
     /// Create a new dataset. Expect the dataset does not exist.
     Create,
@@ -26,6 +27,7 @@ pub enum WriteMode {
 }
 
 /// Dataset Write Parameters
+#[derive(Debug, Clone, Copy)]
 pub struct WriteParams {
     /// Max number of records per file.
     pub max_rows_per_file: usize,
