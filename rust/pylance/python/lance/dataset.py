@@ -51,7 +51,7 @@ class LanceDataset(pa.dataset.Dataset):
               "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
               "k": 10,
-              "nprobes": 10
+              "nprobes": 1
             }
         """
         return (ScannerBuilder(self)
@@ -89,7 +89,7 @@ class LanceDataset(pa.dataset.Dataset):
               "column": <embedding col name>,
               "q": <query vector as pa.Float32Array>,
               "k": 10,
-              "nprobes": 10
+              "nprobes": 1
             }
         """
         return self.scanner(
