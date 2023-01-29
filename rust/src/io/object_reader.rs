@@ -59,7 +59,7 @@ pub struct CloudObjectReader {
     // File path
     pub path: Path,
 
-    _prefetch_size: usize,
+    prefetch_size: usize,
 }
 
 impl<'a> CloudObjectReader {
@@ -68,7 +68,7 @@ impl<'a> CloudObjectReader {
         Ok(Self {
             object_store: object_store.clone(),
             path,
-            _prefetch_size: prefetch_size,
+            prefetch_size,
         })
     }
 }
@@ -76,8 +76,7 @@ impl<'a> CloudObjectReader {
 #[async_trait]
 impl ObjectReader for CloudObjectReader {
     fn prefetch_size(&self) -> usize {
-        // 32KB as default.
-        32 * 1024
+        self.prefetch_size
     }
 
     /// Object/File Size.
@@ -140,8 +139,7 @@ pub(crate) async fn read_fixed_stride_array(
 ) -> Result<ArrayRef> {
     if !data_type.is_fixed_stride() {
         return Err(Error::Schema(format!(
-            "{} is not a fixed stride type",
-            data_type
+            "{data_type} is not a fixed stride type"
         )));
     }
     // TODO: support more than plain encoding here.
@@ -166,11 +164,7 @@ pub(crate) async fn read_binary_array(
         LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
             reader, position, length,
         )),
-        _ => {
-            return Err(Error::IO(
-                format!("Unsupported binary type: {}", data_type,),
-            ))
-        }
+        _ => return Err(Error::IO(format!("Unsupported binary type: {data_type}"))),
     };
     let fut = decoder.as_ref().get(params.into());
     fut.await
