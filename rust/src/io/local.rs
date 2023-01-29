@@ -41,14 +41,16 @@ pub struct LocalObjectReader {
     prefetch_size: usize,
 }
 
+/// Default prefetch size for local SSD.
 const PREFETCH_SIZE: usize = 4096;
 
 impl LocalObjectReader {
-    /// Open a local object reader.
+    /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path) -> Result<Box<dyn ObjectReader>> {
         Self::open_with_prefetch(path, PREFETCH_SIZE)
     }
 
+    /// Open a local object reader, with specified `prefetch` size.
     pub fn open_with_prefetch(path: &Path, prefetch: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
         Ok(Box::new(Self {
