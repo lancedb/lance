@@ -62,7 +62,7 @@ def test(nsamples=100):
     assert np.abs(rs.mean() - 1.0) < 1e-3
 
 
-def test_dataset(uri, nsamples=100, k=10):
+def test_dataset(uri, nsamples=100, k=10, nprobes=1):
     dataset = lance.dataset(uri)
     tbl = dataset.to_table()
     v = tbl["vector"].combine_chunks()
@@ -79,7 +79,7 @@ def test_dataset(uri, nsamples=100, k=10):
         actual_sorted.append(l2_sort(all_vectors, q))
         results.append(
             dataset.to_table(
-                nearest={"column": "vector", "q": q, "k": k}
+                nearest={"column": "vector", "q": q, "k": k, "nprobes": nprobes}
             )["score"].combine_chunks().to_numpy()
         )
     return recall(np.array(actual_sorted), np.array(results))
