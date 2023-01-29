@@ -24,30 +24,32 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::cast::as_primitive_array;
+use arrow_array::UInt32Array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, ArrowPrimitiveType, FixedSizeBinaryArray,
-    FixedSizeListArray, UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray,
+    UInt8Array,
 };
-use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
+use arrow_select::concat::concat;
 use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
+use super::Decoder;
 use crate::arrow::FixedSizeBinaryArrayExt;
 use crate::arrow::FixedSizeListArrayExt;
 use crate::arrow::*;
-use crate::Error;
-
-use super::Decoder;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
+use crate::Error;
 
 /// Encoder for plain encoding.
 ///
@@ -113,7 +115,7 @@ pub struct PlainDecoder<'a> {
 fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
     Ok(match data_type {
         DataType::Boolean => bit_util::ceil(row_offset, 8),
-        _ => get_primitive_byte_width(data_type)? * row_offset,
+        _ => data_type.byte_width() * row_offset,
     })
 }
 
@@ -208,26 +210,6 @@ impl<'a> PlainDecoder<'a> {
     }
 }
 
-fn get_primitive_byte_width(data_type: &DataType) -> Result<usize> {
-    match data_type {
-        DataType::Int8 => Ok(Int8Type::get_byte_width()),
-        DataType::Int16 => Ok(Int16Type::get_byte_width()),
-        DataType::Int32 => Ok(Int32Type::get_byte_width()),
-        DataType::Int64 => Ok(Int64Type::get_byte_width()),
-        DataType::UInt8 => Ok(UInt8Type::get_byte_width()),
-        DataType::UInt16 => Ok(UInt16Type::get_byte_width()),
-        DataType::UInt32 => Ok(UInt32Type::get_byte_width()),
-        DataType::UInt64 => Ok(UInt64Type::get_byte_width()),
-        DataType::Float16 => Ok(Float16Type::get_byte_width()),
-        DataType::Float32 => Ok(Float32Type::get_byte_width()),
-        DataType::Float64 => Ok(Float64Type::get_byte_width()),
-        _ => Err(Error::Schema(format!(
-            "Unsupport primitive type: {}",
-            data_type
-        ))),
-    }
-}
-
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
@@ -238,13 +220,38 @@ impl<'a> Decoder for PlainDecoder<'a> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
+        let block_size = self.reader.prefetch_size() as u32;
+        let byte_width = self.data_type.byte_width() as u32;
 
-        // TODO: optimize read for sparse indices later.
-        let start = indices.value(0);
-        let end = indices.value(indices.len() - 1);
-        let array = self.get(start as usize..end as usize + 1).await?;
-        let adjusted_offsets = subtract_scalar(indices, start)?;
-        Ok(take(&array, &adjusted_offsets, None)?)
+        let mut chunk_ranges = vec![];
+        let mut start: u32 = 0;
+        for j in 0..(indices.len() - 1) as u32 {
+            if indices.value(j as usize + 1) * byte_width
+                > indices.value(start as usize) * byte_width + block_size
+            {
+                chunk_ranges.push(start..j + 1);
+                start = j + 1;
+            }
+        }
+        // Remaining
+        chunk_ranges.push(start..indices.len() as u32);
+
+        let arrays = stream::iter(chunk_ranges)
+            .map(|cr| async move {
+                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let request: &UInt32Array = as_primitive_array(&index_chunk);
+
+                let start = request.value(0);
+                let end = request.value(request.len() - 1);
+                let array = self.get(start as usize..end as usize + 1).await?;
+                let adjusted_offsets = subtract_scalar(request, start)?;
+                Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        Ok(concat(&references)?)
     }
 }
 

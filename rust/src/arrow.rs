@@ -60,6 +60,8 @@ pub trait DataTypeExt {
 
     /// Returns true if the [DataType] is a dictionary type.
     fn is_dictionary(&self) -> bool;
+
+    fn byte_width(&self) -> usize;
 }
 
 impl DataTypeExt for DataType {
@@ -97,6 +99,31 @@ impl DataTypeExt for DataType {
 
     fn is_dictionary(&self) -> bool {
         matches!(self, Self::Dictionary(_, _))
+    }
+
+    fn byte_width(&self) -> usize {
+        match self {
+            DataType::Int8 => 1,
+            DataType::Int16 => 2,
+            DataType::Int32 => 4,
+            DataType::Int64 => 8,
+            DataType::UInt8 => 1,
+            DataType::UInt16 => 2,
+            DataType::UInt32 => 4,
+            DataType::UInt64 => 8,
+            DataType::Float16 => 2,
+            DataType::Float32 => 4,
+            DataType::Float64 => 8,
+            DataType::Date32 => 4,
+            DataType::Date64 => 8,
+            DataType::Time32(_) => 4,
+            DataType::Time64(_) => 8,
+            DataType::Decimal128(_, _) => 16,
+            DataType::Decimal256(_, _) => 32,
+            DataType::FixedSizeBinary(s) => *s as usize,
+            DataType::FixedSizeList(dt, s) => *s as usize * dt.data_type().byte_width(),
+            _ => panic!("Does not support get byte width on type {self}"),
+        }
     }
 }
 

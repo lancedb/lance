@@ -150,8 +150,7 @@ impl<'a> DictionaryDecoder<'a> {
             DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys).await,
             DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
             _ => Err(Error::Arrow(format!(
-                "Dictionary encoding does not support index type: {}",
-                index_type
+                "Dictionary encoding does not support index type: {index_type}",
             ))),
         }
     }
