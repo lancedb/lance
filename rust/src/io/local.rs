@@ -30,17 +30,32 @@ use object_store::path::Path;
 use super::object_reader::ObjectReader;
 use crate::Result;
 
-/// ObjectReader for local file system.
+/// [ObjectReader] for local file system.
 pub struct LocalObjectReader {
+    /// File handler.
     file: Arc<File>,
+
+    /// Preferred I/O size, in bytes.
+    ///
+    /// It could be the block size for local SSD.
+    prefetch_size: usize,
 }
 
+/// Default prefetch size for local SSD.
+const PREFETCH_SIZE: usize = 4096;
+
 impl LocalObjectReader {
-    /// Open a local object reader.
+    /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path) -> Result<Box<dyn ObjectReader>> {
-        let local_path = format!("/{}", path.to_string());
+        Self::open_with_prefetch(path, PREFETCH_SIZE)
+    }
+
+    /// Open a local object reader, with specified `prefetch` size.
+    pub fn open_with_prefetch(path: &Path, prefetch: usize) -> Result<Box<dyn ObjectReader>> {
+        let local_path = format!("/{path}");
         Ok(Box::new(Self {
             file: File::open(local_path)?.into(),
+            prefetch_size: prefetch,
         }))
     }
 }
@@ -48,7 +63,7 @@ impl LocalObjectReader {
 #[async_trait]
 impl ObjectReader for LocalObjectReader {
     fn prefetch_size(&self) -> usize {
-        4096
+        self.prefetch_size
     }
 
     /// Returns the file size.
