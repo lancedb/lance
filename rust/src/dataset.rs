@@ -333,12 +333,14 @@ impl Dataset {
                 .and_modify(|v| v.push(offset))
                 .or_insert_with(|| vec![offset]);
         });
-
         let schema = Arc::new(ArrowSchema::from(projection));
         let object_store = &self.object_store;
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
             .then(|fragment| async {
+                let Some(indices) = row_ids_per_fragment.get(&fragment.id) else {
+                    return Ok(RecordBatch::new_empty(schema.clone()));
+                };
                 let path = self.data_dir().child(fragment.files[0].path.as_str());
                 let mut reader = FileReader::try_new_with_fragment(
                     object_store,
@@ -348,11 +350,7 @@ impl Dataset {
                 )
                 .await?;
                 reader.set_projection(projection.clone());
-                if let Some(indices) = row_ids_per_fragment.get(&fragment.id) {
-                    reader.take(indices.as_slice()).await
-                } else {
-                    Ok(RecordBatch::new_empty(schema.clone()))
-                }
+                reader.take(indices.as_slice()).await
             })
             .try_collect::<Vec<_>>()
             .await?;

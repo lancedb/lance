@@ -24,30 +24,32 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::cast::as_primitive_array;
+use arrow_array::UInt32Array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray,
-    FixedSizeListArray, UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray,
+    UInt8Array,
 };
-use arrow_array::{types::*, UInt32Array};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
+use arrow_select::concat::concat;
 use arrow_select::take::take;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
+use super::Decoder;
 use crate::arrow::FixedSizeBinaryArrayExt;
 use crate::arrow::FixedSizeListArrayExt;
 use crate::arrow::*;
-use crate::Error;
-
-use super::Decoder;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
+use crate::Error;
 
 /// Encoder for plain encoding.
 ///
@@ -218,27 +220,41 @@ impl<'a> Decoder for PlainDecoder<'a> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
-
-        // TODO: optimize read for sparse indices later.
         let block_size = self.reader.prefetch_size() as u32;
-        println!("take Indices: {indices:?}");
-
         let byte_width = self.data_type.byte_width() as u32;
+
         let mut chunk_ranges = vec![];
-        let mut start = indices.value(0);
-        let mut end = start;
+        let mut start: u32 = 0;
+
         for idx in 0..(indices.len() - 1) as u32 {
-            if indices.value(idx as usize + 1) * byte_width > start * byte_width + block_size {
-                chunk_ranges.push(start..end);
+            if indices.value(idx as usize + 1) * byte_width
+                > indices.value(start as usize) * byte_width + block_size
+            {
+                chunk_ranges.push(start..idx + 1);
                 start = idx + 1;
-                end = idx + 1;
             }
         }
-        println!("Chunks: {:?}", chunk_ranges);
-        let end = indices.value(indices.len() - 1);
-        let array = self.get(start as usize..end as usize + 1).await?;
-        let adjusted_offsets = subtract_scalar(indices, start)?;
-        Ok(take(&array, &adjusted_offsets, None)?)
+        // Remaining
+        if start < indices.len() as u32 {
+            chunk_ranges.push(start..indices.len() as u32);
+        }
+
+        let arrays = stream::iter(chunk_ranges)
+            .map(|cr| async move {
+                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let request: &UInt32Array = as_primitive_array(&index_chunk);
+
+                let start = request.value(0);
+                let end = request.value(request.len() - 1);
+                let array = self.get(start as usize..end as usize + 1).await?;
+                let adjusted_offsets = subtract_scalar(request, start)?;
+                Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        Ok(concat(&references)?)
     }
 }
 

@@ -39,7 +39,6 @@ use crate::io::ObjectStore;
 
 #[async_trait]
 pub trait ObjectReader: Send + Sync {
-
     /// Suggest optimal I/O size per storage device.
     fn prefetch_size(&self) -> usize;
 
