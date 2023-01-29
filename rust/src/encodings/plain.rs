@@ -225,19 +225,16 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
-
-        for idx in 0..(indices.len() - 1) as u32 {
-            if indices.value(idx as usize + 1) * byte_width
+        for j in 0..(indices.len() - 1) as u32 {
+            if indices.value(j as usize + 1) * byte_width
                 > indices.value(start as usize) * byte_width + block_size
             {
-                chunk_ranges.push(start..idx + 1);
-                start = idx + 1;
+                chunk_ranges.push(start..j + 1);
+                start = j + 1;
             }
         }
         // Remaining
-        if start < indices.len() as u32 {
-            chunk_ranges.push(start..indices.len() as u32);
-        }
+        chunk_ranges.push(start..indices.len() as u32);
 
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
