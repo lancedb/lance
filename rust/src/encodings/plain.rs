@@ -247,7 +247,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = subtract_scalar(request, start)?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-            .buffer_unordered(8)
+            .buffered(8)
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
