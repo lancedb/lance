@@ -16,4 +16,5 @@ runs:
       uses: PyO3/maturin-action@v1
       with:
         command: build
+        working-directory: python
 
