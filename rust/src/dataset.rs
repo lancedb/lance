@@ -236,6 +236,29 @@ impl Dataset {
         Scanner::new(Arc::new(self.clone()))
     }
 
+    /// Count the number of rows in the dataset.
+    ///
+    /// It offers a fast path of counting rows by just computing via metadata.
+    pub async fn count_rows(&self) -> Result<usize> {
+        // Open file to read metadata.
+        let counts = stream::iter(self.manifest.fragments.as_ref())
+            .map(|f| async {
+                let path = self.data_dir().child(f.files[0].path.as_str());
+                let reader = FileReader::try_new_with_fragment(
+                    &self.object_store,
+                    &path,
+                    f.id,
+                    Some(self.manifest.as_ref()),
+                )
+                .await?;
+                Ok::<usize, Error>(reader.len())
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum())
+    }
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.
@@ -633,6 +656,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..2).collect::<Vec<_>>()
         )
+    }
+
+    #[tokio::test]
+    async fn test_fast_count_rows() {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+
+        let batches = RecordBatchBuffer::new(
+            (0..20)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(10, dataset.fragments().len());
+        assert_eq!(400, dataset.count_rows().await.unwrap());
     }
 
     #[ignore]

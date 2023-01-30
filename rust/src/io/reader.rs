@@ -177,6 +177,15 @@ impl<'a> FileReader<'a> {
         self.metadata.num_batches()
     }
 
+    /// Count the number of rows in this file.
+    pub fn len(&self) -> usize {
+        self.metadata.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.metadata.is_empty()
+    }
+
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].
@@ -255,7 +264,7 @@ async fn read_batch(
         let batch_offset = reader
             .metadata
             .get_offset(batch_id)
-            .ok_or_else(|| Error::IO(format!("batch {} does not exist", batch_id)))?;
+            .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
             (batch_offset..(batch_offset + batch.num_rows() as i32))
                 .map(|o| compute_row_id(reader.fragment_id, o))
