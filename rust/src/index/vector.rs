@@ -42,6 +42,10 @@ pub struct Query {
     pub k: usize,
     /// The number of probs to load and search.
     pub nprobs: usize,
+
+    /// If presented, apply a refine step.
+    /// TODO: should we support fraction / float number here?
+    pub refine_factor: Option<u32>,
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.

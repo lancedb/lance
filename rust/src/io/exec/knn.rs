@@ -238,6 +238,7 @@ mod tests {
                 key: Arc::new(as_primitive_array(&q).clone()),
                 k: 10,
                 nprobs: 0,
+                refine_factor: None,
             },
         )
         .await

@@ -65,6 +65,27 @@ fn bench_flat_index(c: &mut Criterion) {
             })
         },
     );
+
+    c.bench_function(
+        format!("Ivf_PQ_Refine(d={},top_k=10,nprops=10, refine=2)", q.len()).as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let results = dataset
+                    .scan()
+                    .nearest("vector", q, 10)
+                    .unwrap()
+                    .nprobs(10)
+                    .refine(2)
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert!(results.len() >= 1);
+            })
+        },
+    );
 }
 
 criterion_group!(

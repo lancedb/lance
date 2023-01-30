@@ -29,9 +29,7 @@ use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
 use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Limit, Scan, Take};
-use crate::Error::{Schema as SchemaError, IO};
-
-use crate::Result;
+use crate::{Error, Result};
 
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
@@ -92,11 +90,11 @@ impl Scanner {
     /// Set limit and offset.
     pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> Result<&mut Self> {
         if limit < 0 {
-            return Err(IO("Limit must be non-negative".to_string()));
+            return Err(Error::IO("Limit must be non-negative".to_string()));
         }
         if let Some(off) = offset {
             if off < 0 {
-                return Err(IO("Offset must be non-negative".to_string()));
+                return Err(Error::IO("Offset must be non-negative".to_string()));
             }
         }
         self.limit = Some(limit);
@@ -107,10 +105,12 @@ impl Scanner {
     /// Find k-nearest neighbour within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
         if k == 0 {
-            return Err(IO("k must be positive".to_string()));
+            return Err(Error::IO("k must be positive".to_string()));
         }
         if q.is_empty() {
-            return Err(IO("Query vector must have non-zero length".to_string()));
+            return Err(Error::IO(
+                "Query vector must have non-zero length".to_string(),
+            ));
         }
         // make sure the field exists
         self.dataset.schema().project(&[column])?;
@@ -119,12 +119,25 @@ impl Scanner {
             key: Arc::new(q.clone()),
             k,
             nprobs: 1,
+            refine_factor: None,
         });
         Ok(self)
     }
 
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
-        self.nearest.as_mut().map(|q| q.nprobs = n);
+        if let Some(q) = self.nearest.as_mut() {
+            q.nprobs = n;
+        }
+        self
+    }
+
+    /// Apply a refine step to the vector search.
+    ///
+    /// A refine step uses the original vector values to re-rank the distances.
+    pub fn refine(&mut self, factor: u32) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.refine_factor = Some(factor)
+        };
         self
     }
 
@@ -143,11 +156,11 @@ impl Scanner {
                 .schema()
                 .field(q.column.as_str())
                 .ok_or_else(|| {
-                    SchemaError(format!("Vector column {} not found in schema", q.column))
+                    Error::Schema(format!("Vector column {} not found in schema", q.column))
                 })?
                 .into();
             let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![column.clone(), score]);
+            let score_schema = ArrowSchema::new(vec![column, score]);
             let to_merge = &Schema::try_from(&score_schema).unwrap();
             let merged = self.projections.merge(to_merge);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
@@ -184,12 +197,22 @@ impl Scanner {
                 .field(&q.column)
                 .expect("vector column does not exist")
                 .id;
+
+            if let Some(rf) = q.refine_factor {
+                if rf == 0 {
+                    return Err(Error::IO("Refine factor can not be zero".to_string()));
+                }
+            }
             let knn_node: Box<dyn ExecNode + Send + Unpin> =
                 if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
+                    // There is an index built for the column.
+                    // We will use the index.
+                    let mut inner_query = q.clone();
+                    inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
                     Box::new(KNNIndex::new(
                         self.dataset.clone(),
                         &index.uuid.to_string(),
-                        q,
+                        &inner_query,
                     ))
                 } else {
                     let vector_scan_projection =
@@ -206,11 +229,17 @@ impl Scanner {
                     Box::new(KNNFlat::new(scan_node, q))
                 };
 
-            Box::new(Take::new(
+            let take_node = Box::new(Take::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),
                 knn_node,
-            ))
+            ));
+
+            if q.refine_factor.is_some() {
+                Box::new(KNNFlat::new(take_node, q))
+            } else {
+                take_node
+            }
         } else {
             Box::new(Scan::new(
                 self.dataset.object_store.clone(),
