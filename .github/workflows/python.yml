@@ -59,8 +59,4 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-
     - uses: ./.github/workflows/build_mac_wheel
-      with:
-        python-minor-version: "10"
     - uses: ./.github/workflows/run_tests
-      with:
-        python-minor-version: "10"
