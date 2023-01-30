@@ -149,7 +149,6 @@ impl Stream for KNNIndex {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

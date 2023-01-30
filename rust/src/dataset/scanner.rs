@@ -108,7 +108,9 @@ impl Scanner {
             return Err(Error::IO("k must be positive".to_string()));
         }
         if q.is_empty() {
-            return Err(Error::IO("Query vector must have non-zero length".to_string()));
+            return Err(Error::IO(
+                "Query vector must have non-zero length".to_string(),
+            ));
         }
         // make sure the field exists
         self.dataset.schema().project(&[column])?;
