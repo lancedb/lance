@@ -66,7 +66,10 @@ pub async fn flat_search(
     let batches = stream
         .map(|batch| async move {
             let k = query.key.clone();
-            let batch = batch?;
+            let mut batch = batch?;
+            if batch.column_by_name(score_column).is_some() {
+                batch = batch.drop_column(score_column)?;
+            }
             let vectors = batch
                 .column_by_name(&query.column)
                 .ok_or_else(|| {

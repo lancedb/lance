@@ -48,7 +48,7 @@ def test_input_types(tmp_path):
     # TODO allow Dataset::create to take both async and also RecordBatchReader
     # lance_dataset = lance.dataset(uri / "table.lance")
     # _check_roundtrip(lance_dataset, uri / "lance_dataset.lance", tbl)
-    
+
     # lance_scanner = lance_dataset.scanner()
     # _check_roundtrip(lance_scanner, uri / "lance_scanner.lance", tbl)
 
