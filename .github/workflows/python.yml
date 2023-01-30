@@ -33,7 +33,10 @@ jobs:
   mac:
     timeout-minutes: 30
     runs-on: "macos-12"
-    working-directory: python
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
     steps:
     - uses: actions/checkout@v3
       with:
