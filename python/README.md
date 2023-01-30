@@ -1,1 +1,1 @@
-../README.md
+../rust/README.md
