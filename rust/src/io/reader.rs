@@ -177,6 +177,11 @@ impl<'a> FileReader<'a> {
         self.metadata.num_batches()
     }
 
+    /// Count the number of rows in this file.
+    pub fn len(&self) -> usize {
+        self.metadata.len()
+    }
+
     /// Read a batch of data from the file.
     ///
     /// The schema of the returned [RecordBatch] is set by [`FileReader::schema()`].

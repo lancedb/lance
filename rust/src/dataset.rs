@@ -236,6 +236,29 @@ impl Dataset {
         Scanner::new(Arc::new(self.clone()))
     }
 
+    /// Count the number of rows in the dataset.
+    ///
+    /// It offers a fast path of counting rows by just computing via metadata.
+    pub async fn len(&self) -> Result<usize> {
+        // Open file to read metadata.
+        let counts = stream::iter(self.manifest.fragments.as_ref())
+            .map(|f| async {
+                let path = self.data_dir().child(f.files[0].path.as_str());
+                let reader = FileReader::try_new_with_fragment(
+                    &self.object_store,
+                    &path,
+                    f.id,
+                    Some(self.manifest.as_ref()),
+                )
+                .await?;
+                Ok::<usize, Error>(reader.len())
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum())
+    }
+
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.
