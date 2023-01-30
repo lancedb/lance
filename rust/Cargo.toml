@@ -83,3 +83,9 @@ harness = false
 [[bench]]
 name = "vector_index"
 harness = false
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1
