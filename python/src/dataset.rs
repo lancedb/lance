@@ -116,7 +116,8 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
-            let refine_factor: u32 = if let Some(refine_factor) = nearest.get_item("refine_factor") {
+            let refine_factor: u32 = if let Some(refine_factor) = nearest.get_item("refine_factor")
+            {
                 if refine_factor.is_none() {
                     DEFAULT_REFINE_FACTOR
                 } else {
