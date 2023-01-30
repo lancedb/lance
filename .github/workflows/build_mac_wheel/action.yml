@@ -14,4 +14,5 @@ runs:
         brew install protobuf
         pip install maturin pytest
     - name: Build
+      shell: bash
       run: maturin develop
