@@ -77,6 +77,10 @@ impl Metadata {
         *self.batch_offsets.last().unwrap_or(&0) as usize
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Push the length of the batch.
     pub fn push_batch_length(&mut self, batch_len: i32) {
         if self.batch_offsets.is_empty() {
