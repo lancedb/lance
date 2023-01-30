@@ -15,5 +15,3 @@ runs:
         pip install maturin pytest
     - name: Build
       run: maturin develop
-    - name: Run tests
-      run: pytest python/

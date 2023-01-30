@@ -9,15 +9,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-  - name: Pip install
-    working-directory: python
-    shell: bash
-    run: |
-      pip3 install xmltodict
-      pip3 install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-      pip3 install $(ls wheels/pylance-*-cp3${{ inputs.python-minor-version}}*.whl)[test]
   - name: Run python tests
     shell: bash
     working-directory: python
     run: |
-      pytest -x -v --durations=10
+      pytest -x -v --durations=30
