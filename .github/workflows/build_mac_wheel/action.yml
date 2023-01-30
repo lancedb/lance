@@ -15,4 +15,5 @@ runs:
     - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
-        command: develop
+        command: build
+

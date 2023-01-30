@@ -5,10 +5,14 @@ inputs:
   python-minor-version:
     required: true
     description: "8 9 10 11"
-
 runs:
   using: "composite"
   steps:
+  - name: Install dependencies
+    working-directory: python
+    shell: bash
+    run: |
+      pip3 install $(ls target/wheels/pylance-*-cp3${{ inputs.python-minor-version}}*.whl)[test]
   - name: Run python tests
     shell: bash
     working-directory: python
