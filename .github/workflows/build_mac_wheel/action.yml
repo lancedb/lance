@@ -12,7 +12,7 @@ runs:
       shell: bash
       run: |
         brew install protobuf
-        pip install maturin pytest
-    - name: Build
-      shell: bash
-      run: maturin develop
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        command: develop
