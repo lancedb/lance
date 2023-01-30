@@ -14,7 +14,6 @@ runs:
         brew install protobuf
     - name: Build wheel
       uses: PyO3/maturin-action@v1
-      working-directory: python
       with:
         command: build
 
