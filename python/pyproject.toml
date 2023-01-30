@@ -1,36 +1,15 @@
+[project]
+name = "pylance"
+dependencies = ["pyarrow>=10", "pandas", "numpy"]
+
+[tool.maturin]
+python-source = "python"
+
 [build-system]
-requires = ["setuptools>=42", "wheel", "ninja", "numpy", "cython", "pyarrow>=10,<11", "bump2version"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=0.14,<0.15"]
+build-backend = "maturin"
 
-[tool.isort]
-profile = "black"
-
-[tool.pytest.ini_options]
-minversion = "6.0"
-addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
-xfail_strict = true
-filterwarnings = ["error"]
-testpaths = ["lance/tests"]
-
-[tool.cibuildwheel]
-build = "cp38-* cp39-* cp310-* cp311-*"
-test-command = "pytest {project}/python/lance/tests"
-test-extras = ["test"]
-test-skip = ["*universal2:arm64"]
-# Setuptools bug causes collision between pypy and cpython artifacts
-before-build = [
-    "rm -rf {project}/build",
-    "rm -rf {project}/cpp/build",
-    "cd {project}/cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release && make -C build -j 4"
+[project.optional-dependencies]
+tests = [
+    "pytest",
 ]
-
-[tool.cibuildwheel.macos]
-# We only support native build for now, because homebrew only installs native libarrow and protobuf.
-archs = ["native"]
-repair-wheel-command = [
-  "delocate-listdeps {wheel}",
-  "./python/tools/delocate-wheel --require-archs {delocate_archs} -w {dest_dir} {wheel}",
-]
-
-[tool.cibuildwheel.macos.environment]
-MACOSX_DEPLOYMENT_TARGET = "10.15"
