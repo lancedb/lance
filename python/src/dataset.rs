@@ -136,6 +136,10 @@ impl Dataset {
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn.clone(), self_.rt.clone()))
     }
+
+    fn count_rows(&self) -> PyResult<usize> {
+        Ok(0)
+    }
 }
 
 #[pyfunction(name = "_write_dataset", module = "_lib")]

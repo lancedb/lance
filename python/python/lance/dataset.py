@@ -98,6 +98,11 @@ class LanceDataset(pa.dataset.Dataset):
             columns=columns, limit=limit, offset=offset, nearest=nearest
         ).to_table()
 
+    def count_rows(self) -> int:
+        """Count rows
+        """
+        
+
     @property
     def partition_expression(self):
         """
