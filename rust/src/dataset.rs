@@ -93,20 +93,20 @@ fn latest_manifest_path(base: &Path) -> Path {
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
-        Dataset::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+        Self::checkout_manifest(object_store, base_path, &latest_manifest_path).await
     }
 
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Dataset::checkout_manifest(object_store, base_path, &manifest_file).await
+        Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
     async fn checkout_manifest(
@@ -114,13 +114,8 @@ impl Dataset {
         base_path: Path,
         manifest_path: &Path,
     ) -> Result<Self> {
-        let object_reader = object_store.open(&manifest_path).await?;
-        let bytes = object_store
-            .inner
-            .get(&manifest_path)
-            .await?
-            .bytes()
-            .await?;
+        let object_reader = object_store.open(manifest_path).await?;
+        let bytes = object_store.inner.get(manifest_path).await?.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
         manifest
@@ -142,7 +137,7 @@ impl Dataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
         let params = params.unwrap_or_default();
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
@@ -492,7 +487,7 @@ impl Dataset {
             Ok(section
                 .indices
                 .iter()
-                .map(|pb| Index::try_from(pb))
+                .map(Index::try_from)
                 .collect::<Result<Vec<_>>>()?)
         } else {
             Ok(vec![])
