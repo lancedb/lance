@@ -54,9 +54,10 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
     use aws_credential_types::provider::ProvideCredentials;
 
-    let region_provider = RegionProviderChain::default_provider().or_else("us-west-1");
+    const DEFAULT_REGION: &str = "us-west-2";
+
+    let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
     let provider = aws_config::default_provider::credentials::default_provider().await;
-    // let credentials = provider.
     let credentials = provider.provide_credentials().await.unwrap();
     Ok(Arc::new(
         AmazonS3Builder::new()
@@ -68,7 +69,7 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
                     .region()
                     .await
                     .map(|r| r.as_ref().to_string())
-                    .unwrap_or("us-west-2".to_string()),
+                    .unwrap_or(DEFAULT_REGION.to_string()),
             )
             .build()?,
     ))
