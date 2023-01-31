@@ -192,7 +192,7 @@ impl Dataset {
             })
         } else {
             // Create or Overwrite.
-            // Overwrite will resets the fragment id to zero.
+            // Overwrite resets the fragment ID to zero.
             0
         };
 
