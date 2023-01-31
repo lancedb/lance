@@ -31,9 +31,6 @@ def test_dataset_overwrite(tmp_path: Path):
 
     dataset = lance.dataset(base_dir)
     assert dataset.to_table() == table2
-    assert dataset
-    # expected_df = table2.to_
-    # pd.testing.assert_frame_equal(expected_df, actual_df)
 
     ds_v1 = lance.dataset(base_dir, version=1)
     assert ds_v1.to_table() == table1
