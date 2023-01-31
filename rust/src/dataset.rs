@@ -93,7 +93,7 @@ fn latest_manifest_path(base: &Path) -> Path {
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
@@ -102,7 +102,7 @@ impl Dataset {
 
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
@@ -142,7 +142,7 @@ impl Dataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
         let params = params.unwrap_or_default();
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
