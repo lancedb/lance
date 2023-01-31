@@ -115,12 +115,7 @@ impl Dataset {
         manifest_path: &Path,
     ) -> Result<Self> {
         let object_reader = object_store.open(manifest_path).await?;
-        let bytes = object_store
-            .inner
-            .get(manifest_path)
-            .await?
-            .bytes()
-            .await?;
+        let bytes = object_store.inner.get(manifest_path).await?.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
         manifest
