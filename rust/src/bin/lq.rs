@@ -118,11 +118,10 @@ async fn main() -> Result<()> {
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
 
             // print the summary of data total rows and cols
+            let mut total_num_of_cols: usize = b.num_columns();
             let mut total_num_of_rows: usize = 0;
-            let mut total_num_of_cols: usize = 0;
             for b in batch.iter() {
                 total_num_of_rows += b.num_rows();
-                total_num_of_cols += b.num_columns();
             }
             println!("Number of columns: {:?}", total_num_of_cols);
             println!("Number of rows: {:?}", total_num_of_rows);
