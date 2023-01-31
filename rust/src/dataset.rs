@@ -97,11 +97,27 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
+        Dataset::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+    }
 
-        let object_reader = object_store.open(&latest_manifest_path).await?;
+    /// Check out a version of the dataset.
+    pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
+        let object_store = Arc::new(ObjectStore::new(uri)?);
+
+        let base_path = object_store.base_path().clone();
+        let manifest_file = manifest_path(&base_path, version);
+        Dataset::checkout_manifest(object_store, base_path, &manifest_file).await
+    }
+
+    async fn checkout_manifest(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        manifest_path: &Path,
+    ) -> Result<Self> {
+        let object_reader = object_store.open(&manifest_path).await?;
         let bytes = object_store
             .inner
-            .get(&latest_manifest_path)
+            .get(&manifest_path)
             .await?
             .bytes()
             .await?;
@@ -165,18 +181,25 @@ impl Dataset {
             }
         }
 
-        let mut fragment_id = latest_manifest.as_ref().map_or(0, |m| {
-            m.fragments
-                .iter()
-                .map(|f| f.id)
-                .max()
-                .map(|id| id + 1)
-                .unwrap_or(0)
-        });
+        let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
+            latest_manifest.as_ref().map_or(0, |m| {
+                m.fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .max()
+                    .map(|id| id + 1)
+                    .unwrap_or(0)
+            })
+        } else {
+            // Create or Overwrite.
+            // Overwrite will resets the fragment id to zero.
+            0
+        };
+
         let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
-             latest_manifest
-            .as_ref()
-            .map_or(vec![], |m| m.fragments.as_ref().clone())
+            latest_manifest
+                .as_ref()
+                .map_or(vec![], |m| m.fragments.as_ref().clone())
         } else {
             // Create or Overwrite create new fragments.
             vec![]
