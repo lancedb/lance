@@ -12,9 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from typing import Optional
 
 from .dataset import LanceDataset, write_dataset
 
 
-def dataset(uri: str) -> LanceDataset:
-    return LanceDataset(uri)
+def dataset(uri: str, version: Optional[int] = None) -> LanceDataset:
+    return LanceDataset(uri, version)

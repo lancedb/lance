@@ -48,9 +48,15 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[new]
-    fn new(uri: String) -> PyResult<Self> {
+    fn new(uri: String, version: Option<u64>) -> PyResult<Self> {
         let rt = Runtime::new()?;
-        let dataset = rt.block_on(async { LanceDataset::open(uri.as_str()).await });
+        let dataset = rt.block_on(async {
+            if let Some(ver) = version {
+                LanceDataset::checkout(uri.as_str(), ver).await
+            } else {
+                LanceDataset::open(uri.as_str()).await
+            }
+        });
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
