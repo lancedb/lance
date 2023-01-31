@@ -37,6 +37,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt install -y -qq doxygen pandoc
+      - name: Build python wheel
+        uses: ./.github/workflows/build_linux_wheel
       - name: Build Python
         working-directory: python
         run: |
