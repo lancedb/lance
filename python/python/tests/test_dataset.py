@@ -12,10 +12,25 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import Optional
 
-from .dataset import LanceDataset, write_dataset
+from pathlib import Path
+
+import pyarrow as pa
+import pandas as pd
+
+import lance
 
 
-def dataset(uri: str, version: Optional[int] = None) -> LanceDataset:
-    return LanceDataset(uri, version)
+def test_dataset_overwrite(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    table2 = pa.Table.from_pylist([{"s": "one"}, {"s": "two"}])
+    lance.write_dataset(table2, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    assert dataset.to_table() == table2
+
+    ds_v1 = lance.dataset(base_dir, version=1)
+    assert ds_v1.to_table() == table1

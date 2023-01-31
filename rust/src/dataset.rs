@@ -97,11 +97,27 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
+        Dataset::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+    }
 
-        let object_reader = object_store.open(&latest_manifest_path).await?;
+    /// Check out a version of the dataset.
+    pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
+        let object_store = Arc::new(ObjectStore::new(uri)?);
+
+        let base_path = object_store.base_path().clone();
+        let manifest_file = manifest_path(&base_path, version);
+        Dataset::checkout_manifest(object_store, base_path, &manifest_file).await
+    }
+
+    async fn checkout_manifest(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        manifest_path: &Path,
+    ) -> Result<Self> {
+        let object_reader = object_store.open(&manifest_path).await?;
         let bytes = object_store
             .inner
-            .get(&latest_manifest_path)
+            .get(&manifest_path)
             .await?
             .bytes()
             .await?;
@@ -165,17 +181,29 @@ impl Dataset {
             }
         }
 
-        let mut fragment_id = latest_manifest.as_ref().map_or(0, |m| {
-            m.fragments
-                .iter()
-                .map(|f| f.id)
-                .max()
-                .map(|id| id + 1)
-                .unwrap_or(0)
-        });
-        let mut fragments: Vec<Fragment> = latest_manifest
-            .as_ref()
-            .map_or(vec![], |m| m.fragments.as_ref().clone());
+        let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
+            latest_manifest.as_ref().map_or(0, |m| {
+                m.fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .max()
+                    .map(|id| id + 1)
+                    .unwrap_or(0)
+            })
+        } else {
+            // Create or Overwrite.
+            // Overwrite resets the fragment ID to zero.
+            0
+        };
+
+        let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
+            latest_manifest
+                .as_ref()
+                .map_or(vec![], |m| m.fragments.as_ref().clone())
+        } else {
+            // Create or Overwrite create new fragments.
+            vec![]
+        };
 
         macro_rules! new_writer {
             () => {{
@@ -498,8 +526,8 @@ mod tests {
     use crate::utils::testing::generate_random_array;
 
     use arrow_array::{
-        cast::as_struct_array, DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch,
-        StringArray, UInt16Array,
+        cast::{as_string_array, as_struct_array},
+        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema};
@@ -656,6 +684,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..2).collect::<Vec<_>>()
         )
+    }
+
+    #[tokio::test]
+    async fn overwrite_dataset() {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let new_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let new_batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            new_schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (20..40).map(|v| v.to_string()),
+            ))],
+        )
+        .unwrap()]);
+        write_params.mode = WriteMode::Overwrite;
+        let mut new_batch_reader: Box<dyn RecordBatchReader> = Box::new(new_batches);
+        Dataset::write(&mut new_batch_reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(actual_ds.version().version, 2);
+        let actual_schema = Schema::from(actual_ds.schema());
+        assert_eq!(&actual_schema, new_schema.as_ref());
+
+        let actual_batches = actual_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual_batch = concat_batches(&new_schema, &actual_batches).unwrap();
+
+        assert_eq!(new_schema.clone(), actual_batch.schema());
+        let arr = actual_batch.column_by_name("s").unwrap();
+        assert_eq!(
+            &StringArray::from_iter_values((20..40).map(|v| v.to_string())),
+            as_string_array(arr)
+        );
+        assert_eq!(actual_ds.version().version, 2);
+
+        // But we can still check out the first version
+        let first_ver = Dataset::checkout(test_uri, 1).await.unwrap();
+        assert_eq!(first_ver.version().version, 1);
+        assert_eq!(&ArrowSchema::from(first_ver.schema()), schema.as_ref());
     }
 
     #[tokio::test]

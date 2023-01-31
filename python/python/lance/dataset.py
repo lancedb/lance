@@ -28,15 +28,13 @@ from .lance import _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
-    """
-    A dataset in Lance format where the data is stored at the given uri
-    """
+    """A dataset in Lance format where the data is stored at the given uri"""
 
-    def __init__(self, uri: Union[str, Path]):
+    def __init__(self, uri: Union[str, Path], version: Optional[int] = None):
         if isinstance(uri, Path):
             uri = str(uri.absolute())
         self._uri = uri
-        self._ds = _Dataset(uri)
+        self._ds = _Dataset(uri, version)
 
     @property
     def uri(self) -> str:

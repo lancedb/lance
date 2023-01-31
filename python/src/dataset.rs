@@ -48,9 +48,15 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[new]
-    fn new(uri: String) -> PyResult<Self> {
+    fn new(uri: String, version: Option<u64>) -> PyResult<Self> {
         let rt = Runtime::new()?;
-        let dataset = rt.block_on(async { LanceDataset::open(uri.as_str()).await });
+        let dataset = rt.block_on(async {
+            if let Some(ver) = version {
+                LanceDataset::checkout(uri.as_str(), ver).await
+            } else {
+                LanceDataset::open(uri.as_str()).await
+            }
+        });
         match dataset {
             Ok(ds) => Ok(Self {
                 uri,
@@ -177,13 +183,13 @@ fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     } else {
         let mut p = WriteParams::default();
         if let Some(mode) = options.get_item("mode") {
-            match mode.to_string().to_lowercase().as_str() {
+            p.mode = match mode.to_string().to_lowercase().as_str() {
                 "create" => Ok(WriteMode::Create),
                 "append" => Ok(WriteMode::Append),
                 "overwrite" => Ok(WriteMode::Overwrite),
                 _ => Err(PyValueError::new_err(format!("Invalid mode {mode}"))),
             }?;
-        }
+        };
         if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
             p.max_rows_per_file = usize::extract(maybe_nrows)?;
         }
