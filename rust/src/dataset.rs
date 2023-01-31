@@ -97,7 +97,7 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
-        Dataset::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+        Self::checkout_manifest(object_store, base_path, &latest_manifest_path).await
     }
 
     /// Check out a version of the dataset.
@@ -106,7 +106,7 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Dataset::checkout_manifest(object_store, base_path, &manifest_file).await
+        Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
     async fn checkout_manifest(
@@ -114,10 +114,10 @@ impl Dataset {
         base_path: Path,
         manifest_path: &Path,
     ) -> Result<Self> {
-        let object_reader = object_store.open(&manifest_path).await?;
+        let object_reader = object_store.open(manifest_path).await?;
         let bytes = object_store
             .inner
-            .get(&manifest_path)
+            .get(manifest_path)
             .await?
             .bytes()
             .await?;
@@ -492,7 +492,7 @@ impl Dataset {
             Ok(section
                 .indices
                 .iter()
-                .map(|pb| Index::try_from(pb))
+                .map(Index::try_from)
                 .collect::<Result<Vec<_>>>()?)
         } else {
             Ok(vec![])
