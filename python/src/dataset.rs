@@ -177,13 +177,13 @@ fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     } else {
         let mut p = WriteParams::default();
         if let Some(mode) = options.get_item("mode") {
-            match mode.to_string().to_lowercase().as_str() {
+            p.mode = match mode.to_string().to_lowercase().as_str() {
                 "create" => Ok(WriteMode::Create),
                 "append" => Ok(WriteMode::Append),
                 "overwrite" => Ok(WriteMode::Overwrite),
                 _ => Err(PyValueError::new_err(format!("Invalid mode {mode}"))),
             }?;
-        }
+        };
         if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
             p.max_rows_per_file = usize::extract(maybe_nrows)?;
         }

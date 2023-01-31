@@ -13,8 +13,24 @@
 #  limitations under the License.
 
 
-from .dataset import LanceDataset, write_dataset
+from pathlib import Path
+
+import pyarrow as pa
+import pandas as pd
+
+import lance
 
 
-def dataset(uri: str) -> LanceDataset:
-    return LanceDataset(uri)
+def test_dataset_overwrite(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    table2 = pa.Table.from_pylist([{"s": "one"}, {"s": "two"}])
+    lance.write_dataset(table2, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    assert dataset.to_table() == table2
+    assert dataset
+    # expected_df = table2.to_
+    # pd.testing.assert_frame_equal(expected_df, actual_df)
