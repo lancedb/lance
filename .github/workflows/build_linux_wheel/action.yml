@@ -8,8 +8,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: "Build linux wheel"
-      shell: bash
-      working-directory: python
-      run: |
-        ./tools/build_wheel.sh $(echo cp3${{ inputs.python-minor-version }})
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        working-directory: python
