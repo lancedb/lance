@@ -134,7 +134,17 @@ impl Dataset {
         }
 
         let scn = Arc::new(scanner);
-        Ok(Scanner::new(scn.clone(), self_.rt.clone()))
+        Ok(Scanner::new(scn, self_.rt.clone()))
+    }
+
+    fn count_rows(&self) -> PyResult<usize> {
+        self.rt.block_on(async {
+            Ok(self
+                .ds
+                .count_rows()
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?)
+        })
     }
 }
 

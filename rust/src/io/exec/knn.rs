@@ -115,14 +115,14 @@ impl KNNIndex {
                 Err(e) => {
                     tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
                         .await
-                        .expect("KNNFlat failed to send message");
+                        .expect("KNNIndex failed to send message");
                     return;
                 }
             };
 
             if !tx.is_closed() {
                 if let Err(e) = tx.send(Ok(result)).await {
-                    eprintln!("KNNFlat tx.send error: {e}")
+                    eprintln!("KNNIndex tx.send error: {e}")
                 };
             }
             drop(tx);

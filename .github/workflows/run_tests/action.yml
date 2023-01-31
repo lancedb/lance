@@ -5,19 +5,16 @@ inputs:
   python-minor-version:
     required: true
     description: "8 9 10 11"
-
 runs:
   using: "composite"
   steps:
-  - name: Pip install
+  - name: Install dependencies
     working-directory: python
     shell: bash
     run: |
-      pip3 install xmltodict
-      pip3 install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-      pip3 install $(ls wheels/pylance-*-cp3${{ inputs.python-minor-version}}*.whl)[test]
+      pip3 install $(ls target/wheels/pylance-*.whl) pytest
   - name: Run python tests
     shell: bash
     working-directory: python
     run: |
-      pytest -x -v --durations=10
+      pytest -x -v --durations=30

@@ -8,13 +8,13 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: "Install macos dependencies"
-      uses: ./.github/workflows/build_mac_wheel/install_mac_deps
-    - name: Build macos wheels
-      uses: pypa/cibuildwheel@v2.8.1
-      env:
-        CIBW_BUILD: cp3${{ inputs.python-minor-version }}*
-        CIBW_TEST_SKIP: "*"
+    - name: Install macos dependency
+      shell: bash
+      run: |
+        brew install protobuf
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
       with:
-        package-dir: python
-        output-dir: python/wheels
+        command: build
+        working-directory: python
+

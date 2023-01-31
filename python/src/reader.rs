@@ -51,13 +51,12 @@ impl Iterator for LanceReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let stream = &mut self.stream;
-        let batch = self.rt.block_on(async {
+        self.rt.block_on(async {
             stream
                 .next()
                 .await
-                .map(|rs| rs.map_err(|err| ArrowError::from(err)))
-        });
-        batch
+                .map(|rs| rs.map_err(ArrowError::from))
+        })
     }
 }
 

@@ -1,3 +1,18 @@
+#  Copyright (c) 2023. Lance Developers
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Union, Iterator
@@ -30,9 +45,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
-    def scanner(self, columns: Optional[list[str]] = None,
-                limit: int = 0, offset: Optional[int] = None,
-                nearest: Optional[dict] = None) -> LanceScanner:
+    def scanner(
+        self,
+        columns: Optional[list[str]] = None,
+        limit: int = 0,
+        offset: Optional[int] = None,
+        nearest: Optional[dict] = None,
+    ) -> LanceScanner:
         """
         Return a Scanner that can support various pushdowns
 
@@ -55,12 +74,14 @@ class LanceDataset(pa.dataset.Dataset):
               "refine_factor": 1
             }
         """
-        return (ScannerBuilder(self)
-                .columns(columns)
-                .limit(limit)
-                .offset(offset)
-                .nearest(**(nearest or {}))
-                .to_scanner())
+        return (
+            ScannerBuilder(self)
+            .columns(columns)
+            .limit(limit)
+            .offset(offset)
+            .nearest(**(nearest or {}))
+            .to_scanner()
+        )
 
     @property
     def schema(self) -> pa.Schema:
@@ -69,9 +90,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.schema
 
-    def to_table(self, columns: Optional[list[str]] = None,
-                 limit: int = 0, offset: Optional[int] = None,
-                 nearest: Optional[dict] = None) -> pa.Table:
+    def to_table(
+        self,
+        columns: Optional[list[str]] = None,
+        limit: int = 0,
+        offset: Optional[int] = None,
+        nearest: Optional[dict] = None,
+    ) -> pa.Table:
         """
         Read the data into memory and return a pyarrow Table.
 
@@ -121,7 +146,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(self, filter: Expression=None):
+    def get_fragments(self, filter: Expression = None):
         """Returns an iterator over the fragments in this dataset.
 
         Parameters
@@ -186,7 +211,7 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        kwargs['limit'] = num_rows
+        kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
     def count_rows(self, **kwargs):
@@ -202,11 +227,19 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         count : int
         """
-        raise NotImplementedError("Count rows")
+        return self._ds.count_rows()
 
-    def join(self, right_dataset, keys, right_keys=None, join_type="left outer",
-             left_suffix=None, right_suffix=None, coalesce_keys=True,
-             use_threads=True):
+    def join(
+        self,
+        right_dataset,
+        keys,
+        right_keys=None,
+        join_type="left outer",
+        left_suffix=None,
+        right_suffix=None,
+        coalesce_keys=True,
+        use_threads=True,
+    ):
         """
         Perform a join between this dataset and another one.
 
@@ -249,7 +282,6 @@ class LanceDataset(pa.dataset.Dataset):
 
 
 class ScannerBuilder:
-
     def __init__(self, ds: LanceDataset):
         self.ds = ds
         self._limit = 0
@@ -275,11 +307,14 @@ class ScannerBuilder:
         self._columns = cols
         return self
 
-    def nearest(self, column: Optional[str] = None,
-                q: Optional[pa.FloatingPointArray] = None,
-                k: Optional[int] = None,
-                nprobes: Optional[int] = None,
-                refine_factor: Optional[int] = None) -> ScannerBuilder:
+    def nearest(
+        self,
+        column: Optional[str] = None,
+        q: Optional[pa.FloatingPointArray] = None,
+        k: Optional[int] = None,
+        nprobes: Optional[int] = None,
+        refine_factor: Optional[int] = None,
+    ) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
             return self
@@ -299,17 +334,18 @@ class ScannerBuilder:
             "q": q,
             "k": k,
             "nprobes": nprobes,
-            "refine_factor": refine_factor
+            "refine_factor": refine_factor,
         }
         return self
 
     def to_scanner(self) -> LanceScanner:
-        scanner = self.ds._ds.scanner(self._columns, self._limit, self._offset, self._nearest)
+        scanner = self.ds._ds.scanner(
+            self._columns, self._limit, self._offset, self._nearest
+        )
         return LanceScanner(scanner, self.ds)
 
 
 class LanceScanner(pa.dataset.Scanner):
-
     def __init__(self, scanner: _Scanner, dataset: LanceDataset):
         self._scanner = scanner
         self._ds = dataset
@@ -327,6 +363,7 @@ class LanceScanner(pa.dataset.Scanner):
         def _iterator(batch_iter):
             for batch in batch_iter:
                 yield batch.record_batch
+
         # Don't make ourselves a generator so errors are raised immediately
         return _iterator(self.to_reader())
 
@@ -557,17 +594,26 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         count : int
         """
-        raise NotImplementedError("count_rows")
+        return self._ds.count_rows()
 
 
-ReaderLike = Union[pa.Table, pa.dataset.Dataset, pa.dataset.Scanner,
-                   pa.RecordBatchReader, LanceDataset, LanceScanner]
+ReaderLike = Union[
+    pa.Table,
+    pa.dataset.Dataset,
+    pa.dataset.Scanner,
+    pa.RecordBatchReader,
+    LanceDataset,
+    LanceScanner,
+]
 
 
-def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
-                  mode: str = "create",
-                  max_rows_per_file: int = 1024*1024,
-                  max_rows_per_group: int = 1024) -> bool:
+def write_dataset(
+    data_obj: ReaderLike,
+    uri: Union[str, Path],
+    mode: str = "create",
+    max_rows_per_file: int = 1024 * 1024,
+    max_rows_per_group: int = 1024,
+) -> bool:
     """
     Write a given data_obj to the given uri
 
@@ -604,7 +650,7 @@ def write_dataset(data_obj: ReaderLike, uri: Union[str, Path],
     params = {
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
-        "max_rows_per_group": max_rows_per_group
+        "max_rows_per_group": max_rows_per_group,
     }
     if isinstance(uri, Path):
         uri = str(uri.absolute())
