@@ -173,9 +173,14 @@ impl Dataset {
                 .map(|id| id + 1)
                 .unwrap_or(0)
         });
-        let mut fragments: Vec<Fragment> = latest_manifest
+        let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
+             latest_manifest
             .as_ref()
-            .map_or(vec![], |m| m.fragments.as_ref().clone());
+            .map_or(vec![], |m| m.fragments.as_ref().clone())
+        } else {
+            // Create or Overwrite create new fragments.
+            vec![]
+        };
 
         macro_rules! new_writer {
             () => {{
