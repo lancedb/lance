@@ -18,6 +18,7 @@ Lance currently supports DuckDB.
 
    Quickstart <./notebooks/quickstart>
    howtos
+   File Format <./format>
    API References <./api/api>
 
 
