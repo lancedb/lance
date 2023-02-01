@@ -615,4 +615,33 @@ mod tests {
             .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn read_nullable_string_in_struct() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(vec![ArrowField::new("str", DataType::Utf8, false)]),
+            true,
+        )]));
+
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+
+        let string_arr = Arc::new(StringArray::from_iter([Some("a"), None, Some("b")]));
+        let struct_arr = Arc::new(StructArray::from(vec![(
+            ArrowField::new("str", DataType::Utf8, true),
+            string_arr.clone() as ArrayRef,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+        println!("Actual batch: {:?}", actual_batch);
+    }
 }
