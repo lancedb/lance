@@ -163,3 +163,9 @@ Dataset Update and Schema Evolution
 -----------------------------------
 
 ``Lance`` supports fast dataset update and schema evolution via manipulating the ``Manifest`` metadata.
+
+``Appending`` is done by appending new ``Fragment`` to the dataset.
+While adding columns is done by adding new ``DataFile`` of the new columns to each ``Fragment``.
+Finally, ``Overwrite`` a dataset can be done by resetting the ``Fragment`` list of the ``Manifest``.
+
+.. image:: schema_evolution.png
