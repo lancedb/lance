@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "python wrapper for lance-rs"
