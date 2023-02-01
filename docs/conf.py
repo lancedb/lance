@@ -8,8 +8,7 @@ def run_apidoc(_):
     from sphinx.ext.apidoc import main
 
     shutil.rmtree("api/python", ignore_errors=True)
-    main(["-f", "-o", "api/python", "../python/lance"])
-    subprocess.check_call("doxygen", shell=True)
+    main(["-f", "-o", "api/python", "../python/python/lance"])
 
 
 def setup(app):
@@ -19,7 +18,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = "2022, Lance Developer"
+copyright = "2023, Lance Developer"
 author = "Lance Developer"
 
 
@@ -59,8 +58,3 @@ html_theme = "piccolo_theme"
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ["_static"]
-
-
-breathe_projects = {"cpp": "_build/cpp/xml/"}
-
-breathe_default_project = "cpp"
