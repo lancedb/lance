@@ -73,7 +73,7 @@ Versioning and experimentation support should be built into the dataset instead 
 It should also be efficient and not require expensive copying everytime you want to create a new version.<br/>
 We call this "Zero copy versioning" in Lance. It makes versioning data easy without increasing storage costs.
 
-### 2. Performance needs to catch to cloud storage becoming the default
+### 2. Cloud storage is now the default
 
 Remote object storage is the default now for data science and machine learning and the performance characteristics of cloud are fundamentally different.<br/>
 Lance format is optimized to be cloud native. Common operations like filter-then-take can be order of magnitude faster 
@@ -85,11 +85,12 @@ The majority of reasonable scale workflows should not require the added complexi
 specialized database just to compute vector similarity. Lance integrates optimized vector indices
 into a columnar format so no additional infrastructure is required to get low latency top-K similarity search.
 
-### 4. Open standards is a requirement. We need open-source not fauxpen-source
+### 4. Open standards is a requirement 
 
 The DS/ML ecosystem is incredibly rich and data *must be* easily accessible across different languages, tools, and environments.
 Lance makes Apache Arrow integration its primary interface, which means conversions to/from is 2 lines of code, your
 code does not need to change after conversion, and nothing is locked-up to force you to pay for vendor compute.
+We need open-source not fauxpen-source.
 
 
 ## Python package

@@ -1,27 +1,9 @@
 [package]
 name = "pylance"
-version = "0.1.2"
+version = "0.3.0"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
-description = "python wrapper for lance-rs"
-license = "Apache-2.0"
-repository = "https://github.com/eto-ai/lance"
-readme = "README.md"
 rust-version = "1.65"
-keywords = [
-    "data-format",
-    "data-science",
-    "machine-learning",
-    "apache-arrow",
-    "data-analytics"
-]
-categories = [
-    "database-implementations",
-    "data-structures",
-    "development-tools",
-    "science"
-]
-
 
 [lib]
 name = "lance"
