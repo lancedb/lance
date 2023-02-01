@@ -52,16 +52,17 @@ Optionally, a ``Manifest`` block can be stored after the ``Metadata`` block, to 
 
 In the end of the file, a ``Footer`` is written to indicate the closure of a file:
 
+.. code-block::
 
-+---------------+----------------+
-| 0 - 3 byte    | 4 - 7 byte     |
-+===============+================+
-| metadata position (uint64)     |
-+---------------+----------------+
-| major version | minor version  |
-+---------------+----------------+
-|   Magic number "**LANC**"      |
-+--------------------------------+
+    +---------------+----------------+
+    | 0 - 3 byte    | 4 - 7 byte     |
+    +===============+================+
+    | metadata position (uint64)     |
+    +---------------+----------------+
+    | major version | minor version  |
+    +---------------+----------------+
+    |   Magic number "**LANC**"      |
+    +--------------------------------+
 
 
 
@@ -80,11 +81,20 @@ Plain Encoding
 Plain encoding stores Arrow array with **fixed size** values, such as primitive values, in contiguous space on disk.
 Because the size of each value is fixed, the offset of a particular value can be computed directly.
 
+Null: TBD
 
-Null:
+Variable-Length Binary Encoding
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Variable-Length Encoding
-~~~~~~~~~~~~~~~~~~~~~~~~
+For variable-length data types, i.e., ``(Large)Binary / (Large)String / (Large)List`` in Arrow, Lance uses variable-length
+encoding. Similar to Arrow in-memory layout, the on-disk layout include an offset array, and the actual data array.
+The offset array contains the **absolute offset** of each value appears in the file.
+
+.. code-block::
+
+    | offset array | data array |
+
+If ``offsets[i] == offsets[i + 1]``, we treat the ``i-th`` value as ``Null``.
 
 Dictionary Encoding
 ~~~~~~~~~~~~~~~~~~~
