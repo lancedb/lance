@@ -11,8 +11,59 @@ A `Lance Dataset` is organized in a directory.
     /path/to/dataset:
         data/*.lance  -- Data directory
         latest.manifest -- The manifest file for the latest version.
-        _versions/*.manifest -- Manifest file for each version.
+        _versions/*.manifest -- Manifest file for each dataset version.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
+
+
+A ``Manifest`` file includes the metadata to describe a version of the dataset.
+
+.. code-block:: protobuf
+
+    // Manifest is a global section shared between all the files.
+    message Manifest {
+        // All fields of the dataset, including the nested fields.
+        repeated Field fields = 1;
+
+        // Fragments of the dataset.
+        repeated DataFragment fragments = 2;
+
+        // Snapshot version number.
+        uint64 version = 3;
+
+        // The file position of the version auxiliary data.
+        //  * It is not inheritable between versions.
+        //  * It is not loaded by default during query.
+        uint64 version_aux_data = 4;
+
+        // Schema metadata.
+        map<string, bytes> metadata = 5;
+
+        // If presented, the file position of the index metadata.
+        optional uint64 index_section = 6;
+    }
+
+``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
+where each ``DataFile`` can contain several columns in the chunk of data.
+
+.. code-block:: protobuf
+
+    // Data fragment. A fragment is a set of files which represent the
+    // different columns of the same rows.
+    // If column exists in the schema, but the related file does not exist,
+    // treat this column as nulls.
+    message DataFragment {
+        // Unique ID of each DataFragment
+        uint64 id = 1;
+
+        repeated DataFile files = 2;
+    }
+
+    message DataFile {
+        // Relative path to the root.
+        string path = 1;
+        // The ids of the fields/columns in this file
+        repeated int32 fields = 2;
+    }
 
 File Structure
 --------------
@@ -106,3 +157,15 @@ Directory encoding is a composite encoding for a
 `Arrow Dictionary Type <https://arrow.apache.org/docs/python/generated/pyarrow.DictionaryType.html#pyarrow.DictionaryType>`_,
 where Lance encodes the `key` and `value` separately using primitive encoding types,
 i.e., `key` are usually encoded with `Plain Encoding`_.
+
+
+Dataset Update and Schema Evolution
+-----------------------------------
+
+``Lance`` supports fast dataset update and schema evolution via manipulating the ``Manifest`` metadata.
+
+``Appending`` is done by appending new ``Fragment`` to the dataset.
+While adding columns is done by adding new ``DataFile`` of the new columns to each ``Fragment``.
+Finally, ``Overwrite`` a dataset can be done by resetting the ``Fragment`` list of the ``Manifest``.
+
+.. image:: schema_evolution.png
