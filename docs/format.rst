@@ -6,7 +6,13 @@ Dataset Directory
 
 A `Lance Dataset` is organized in a directory.
 
+.. code-block::
 
+    /path/to/dataset:
+        data/*.lance  -- Data directory
+        latest.manifest -- The manifest file for the latest version.
+        _versions/*.manifest -- Manifest file for each version.
+        _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
 
 File Structure
 --------------
