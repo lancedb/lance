@@ -91,6 +91,8 @@ pub struct BinaryDecoder<'a, T: ByteArrayType> {
 
     length: usize,
 
+    nullable: bool,
+
     phantom: PhantomData<T>,
 }
 
@@ -101,6 +103,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///
     ///  - `position`, file position where this batch starts.
     ///  - `length`, the number of records in this batch.
+    ///  - `nullable`, whether this batch contains nullable value.
     ///
     /// ## Example
     ///
@@ -114,14 +117,20 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///     let object_store = ObjectStore::new(":memory:").await.unwrap();
     ///     let path = Path::from("/data.lance");
     ///     let reader = object_store.open(&path).await.unwrap();
-    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024);
+    ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```
-    pub fn new(reader: &'a dyn ObjectReader, position: usize, length: usize) -> Self {
+    pub fn new(
+        reader: &'a dyn ObjectReader,
+        position: usize,
+        length: usize,
+        nullable: bool,
+    ) -> Self {
         Self {
             reader,
             position,
             length,
+            nullable,
             phantom: PhantomData,
         }
     }
@@ -223,32 +232,38 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        // Count nulls
-        let mut null_buf = MutableBuffer::new_null(self.length);
-        let mut null_count = 0;
-        int64_positions
-            .values()
-            .windows(2)
-            .enumerate()
-            .for_each(|(idx, w)| {
-                if w[0] == w[1] {
-                    bit_util::unset_bit(null_buf.as_mut(), idx);
-                    null_count += 1;
-                } else {
-                    bit_util::set_bit(null_buf.as_mut(), idx);
-                }
-            });
-
         let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
         let bytes = self
             .reader
             .get_range(start_position as usize..(start_position + read_len) as usize)
             .await?;
 
-        let array_data = ArrayDataBuilder::new(T::DATA_TYPE)
+        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(index.len())
-            .null_count(null_count)
-            .null_bit_buffer(Some(null_buf.into()))
+            .null_count(0);
+
+        // Count nulls
+        if self.nullable {
+            let mut null_count = 0;
+            let mut null_buf = MutableBuffer::new_null(self.length);
+            int64_positions
+                .values()
+                .windows(2)
+                .enumerate()
+                .for_each(|(idx, w)| {
+                    if w[0] == w[1] {
+                        bit_util::unset_bit(null_buf.as_mut(), idx);
+                        null_count += 1;
+                    } else {
+                        bit_util::set_bit(null_buf.as_mut(), idx);
+                    }
+                });
+            data_builder = data_builder
+                .null_count(null_count)
+                .null_bit_buffer(Some(null_buf.into()));
+        }
+
+        let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(bytes.into())
             .build()?;
@@ -288,7 +303,8 @@ mod tests {
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, arr).await.unwrap();
         let reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, arr.len());
+        let decoder =
+            BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, arr.len(), true);
         let actual_arr = decoder.decode().await.unwrap();
         assert_eq!(
             actual_arr
@@ -328,7 +344,7 @@ mod tests {
         object_writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len());
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
         assert_eq!(
             decoder.decode().await.unwrap().as_ref(),
             &StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"])
@@ -369,7 +385,7 @@ mod tests {
         let pos = write_test_data(&store, &path, &data).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len());
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let actual = decoder
             .take(&UInt32Array::from_iter_values([1, 2, 5]))
