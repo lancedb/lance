@@ -61,7 +61,7 @@ In the end of the file, a ``Footer`` is written to indicate the closure of a fil
     +---------------+----------------+
     | major version | minor version  |
     +---------------+----------------+
-    |   Magic number "**LANC**"      |
+    |   Magic number "LANC"          |
     +--------------------------------+
 
 
@@ -92,7 +92,10 @@ The offset array contains the **absolute offset** of each value appears in the f
 
 .. code-block::
 
-    | offset array | data array |
+    +---------------+----------------+
+    | offset array  | data array     |
+    +---------------+----------------+
+
 
 If ``offsets[i] == offsets[i + 1]``, we treat the ``i-th`` value as ``Null``.
 
