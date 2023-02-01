@@ -2,7 +2,7 @@ name: Deploy docs to Pages
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "lei/doc_ci_fix"]
 
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
@@ -42,8 +42,7 @@ jobs:
       - name: Build Python
         working-directory: python
         run: |
-          ./tools/build_wheel.sh cp310
-          python -m pip install $(ls wheels/*.whl)
+          python -m pip install $(ls target/wheels/*.whl)
           python -m pip install -r ../docs/requirements.txt
       - name: Build docs
         working-directory: docs
