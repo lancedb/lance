@@ -29,10 +29,15 @@ pip install pylance
 ```python
 import lance
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 
-uri = "/path/to/parquet"
+df = pd.DataFrame({"a": [5], "b": [10]})
+uri = "/tmp/test.parquet"
+tbl = pa.Table.from_pandas(df)
+pa.dataset.write_dataset(tbl, uri, format='parquet')
+
 parquet = pa.dataset.dataset(uri, format='parquet')
 lance.write_dataset(parquet, "/tmp/test.lance")
 ```
@@ -58,19 +63,31 @@ duckdb.query("SELECT * FROM tbl LIMIT 10").to_df()
 
 **Vector search**
 
+Download an indexed [sift dataset](https://eto-public.s3.us-west-2.amazonaws.com/datasets/sift/sift_ivf256_pq16.tar.gz),
+and unzip it into `vec_data.lance`
+
 ```python
 # Get top 10 similar vectors
+import lance
+import duckdb
 import numpy as np
-q = np.random.randn(128)  # query vector
-query = {
-    "column": "vector",  # assume `emb` column is FixedSizeList of Float32
-    "q": q,
-    "k": 10
-}
-dataset.to_table(nearest=query).to_pandas()
+
+uri = "vec_data.lance"
+dataset = lance.dataset(uri)
+
+# Sample 100 query vectors
+tbl = dataset.to_table()
+sample = duckdb.query("SELECT vector FROM tbl USING SAMPLE 100").to_df()
+query_vectors = np.array([np.array(x) for x in sample.vector])
+
+# Get nearest neighbors for all of them
+rs = [dataset.to_table(nearest={"column": "vector", 
+                                "k": 10, 
+                                "q": query_vectors[i, :]}) 
+      for i in range(query_vectors.shape[0])]
 ```
 
-For the fast indexing capability, you can download an indexed [sift dataset](https://eto-public.s3.us-west-2.amazonaws.com/datasets/sift/sift_ivf256_pq16.tar.gz),
+For the fast indexing capability, you can 
 and run the same code as above. We're working on a more convenient indexing tool via python.
 
 *More distance metrics, supported types, and compute integration coming
