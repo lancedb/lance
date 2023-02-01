@@ -31,11 +31,11 @@ use object_store::path::Path;
 use prost::Message;
 
 use super::ReadBatchParams;
+use crate::arrow::*;
 use crate::encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder};
 use crate::error::{Error, Result};
 use crate::format::ProtoStruct;
 use crate::io::ObjectStore;
-use crate::{arrow::*, datatypes::Field};
 
 #[async_trait]
 pub trait ObjectReader: Send + Sync {

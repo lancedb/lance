@@ -663,7 +663,7 @@ impl Schema {
 impl fmt::Display for Schema {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for field in self.fields.iter() {
-            writeln!(f, "{}", field)?
+            writeln!(f, "{field}")?
         }
         Ok(())
     }
