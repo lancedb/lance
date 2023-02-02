@@ -37,7 +37,7 @@ async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
-object_store = { version = "0.5", features = ["aws"] }
+object_store = { version = "0.5.3", features = ["aws"] }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
 pin-project = "1.0"

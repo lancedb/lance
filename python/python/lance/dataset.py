@@ -278,6 +278,12 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
+    def versions(self):
+        """
+        Return all versions in this dataset
+        """
+        return self._ds.versions()
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
