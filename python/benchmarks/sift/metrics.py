@@ -15,6 +15,7 @@
 #  limitations under the License.
 
 import argparse
+from typing import Optional
 
 import duckdb
 import lance
@@ -28,9 +29,7 @@ def recall(actual_sorted: np.ndarray, results: np.ndarray):
     len = results.shape[1]
     t = actual_sorted[:, len - 1] + 1e-3
     recall_at_k = (results <= t[:, None]).sum(axis=1) * 1.0 / len
-    return (recall_at_k.mean(),
-            recall_at_k.std(),
-            recall_at_k)
+    return (recall_at_k.mean(), recall_at_k.std(), recall_at_k)
 
 
 def l2_sort(mat, q):
@@ -44,7 +43,7 @@ def l2_sort(mat, q):
     q: ndarray
         shape is d, this is the query vector
     """
-    return np.sort(((mat - q)**2).sum(axis=1))
+    return np.sort(((mat - q) ** 2).sum(axis=1))
 
 
 def l2_part(mat, q, k):
@@ -60,7 +59,7 @@ def l2_part(mat, q, k):
     k: int
         topk
     """
-    return np.partition(((mat - q)**2).sum(axis=1), k)[:k]
+    return np.partition(((mat - q) ** 2).sum(axis=1), k)[:k]
 
 
 def test(nsamples=100):
@@ -80,13 +79,17 @@ def test(nsamples=100):
     assert np.abs(rs.mean() - 1.0) < 1e-3
 
 
-def test_dataset(uri, nsamples=100, k=10, nprobes=1, refine_factor=1):
+def test_dataset(
+    uri, nsamples=100, k=10, nprobes=1, refine_factor: Optional[int] = None
+):
     dataset = lance.dataset(uri)
     tbl = dataset.to_table()
     v = tbl["vector"].combine_chunks()
     all_vectors = v.values.to_numpy().reshape(len(tbl), v.type.list_size)
 
-    query_vectors = duckdb.query(f"SELECT vector FROM tbl USING SAMPLE {nsamples}").to_df()
+    query_vectors = duckdb.query(
+        f"SELECT vector FROM tbl USING SAMPLE {nsamples}"
+    ).to_df()
     query_vectors = np.array([np.array(x) for x in query_vectors.vector.values])
 
     actual_sorted = []
@@ -102,9 +105,11 @@ def test_dataset(uri, nsamples=100, k=10, nprobes=1, refine_factor=1):
                     "q": q,
                     "k": k,
                     "nprobes": nprobes,
-#                    "refine_factor": refine_factor
+                    "refine_factor": refine_factor,
                 }
-            )["score"].combine_chunks().to_numpy()
+            )["score"]
+            .combine_chunks()
+            .to_numpy()
         )
     return recall(np.array(actual_sorted), np.array(results))
 
