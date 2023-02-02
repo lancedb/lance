@@ -236,12 +236,11 @@ impl Scanner {
                 knn_node,
             ));
 
-            // if q.refine_factor.is_some() {
-            //     Box::new(KNNFlat::new(take_node, q))
-            // } else {
-            //     take_node
-            // }
-            take_node
+            if q.refine_factor.is_some() {
+                Box::new(KNNFlat::new(take_node, q))
+            } else {
+                take_node
+            }
         } else {
             Box::new(Scan::new(
                 self.dataset.object_store.clone(),
