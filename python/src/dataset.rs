@@ -23,14 +23,14 @@ use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyLong};
+use pyo3::types::{IntoPyDict, PyDict, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 use ::lance::dataset::Dataset as LanceDataset;
-use lance::dataset::{WriteMode, WriteParams};
+use lance::dataset::{Version, WriteMode, WriteParams};
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_REFINE_FACTOR: u32 = 1;
@@ -151,6 +151,34 @@ impl Dataset {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))?)
         })
+    }
+
+    fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let versions = self_
+            .list_versions()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Python::with_gil(|py| {
+            let pyvers: Vec<PyObject> = versions
+                .iter()
+                .map(|v| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("version", v.version).unwrap();
+                    dict.set_item("timestamp", v.timestamp.timestamp()).unwrap();
+                    let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
+                    dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
+                    dict.to_object(py)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect();
+            Ok(pyvers)
+        })
+    }
+}
+
+impl Dataset {
+    fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
+        self.rt.block_on(async { self.ds.versions().await })
     }
 }
 
