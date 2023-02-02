@@ -23,9 +23,9 @@ Lance makes machine learning workflows with ML data easy (images, videos, point 
 
 * Use SQL to greatly simplify common operations on ML data, such as similarity search for data discovery, model inference and computing evaluation metrics.
 
-* Version, compare and diff ML datasets easily.
-
 * Search for nearest neighbors in under 1 millisecond.
+
+* Version, compare and diff ML datasets easily.
 
 * (Coming soon) visualize, slice and drill-into datasets to inspect embeddings, labels/annotations and metrics.
 
@@ -34,6 +34,11 @@ Lance is powered by Lance Format, an Apache-Arrow compatible columnar data forma
 
 ## Quick Start
 
+**Installation**
+
+```shell
+pip install pylance
+```
 
 **Converting to Lance**
 
@@ -78,6 +83,11 @@ duckdb.query("SELECT * FROM tbl LIMIT 10").to_df()
 Download an indexed [sift dataset](https://eto-public.s3.us-west-2.amazonaws.com/datasets/sift/sift_ivf256_pq16.tar.gz),
 and unzip it into `vec_data.lance`
 
+```shell
+wget https://eto-public.s3.us-west-2.amazonaws.com/datasets/sift/sift_ivf256_pq16.tar.gz
+tar -xzf sift_ivf256_pq16.tar.gz
+```
+
 ```python
 # Get top 10 similar vectors
 import lance
@@ -111,6 +121,8 @@ rs = [dataset.to_table(nearest={"column": "vector",
 
 Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://eto-ai.github.io/lance/format.html).
 
+**Vector index**: Vector index for similarity search over embedding space
+
 **Encodings**: to achieve both fast columnar scan and sub-linear point queries, Lance uses custom encodings and layouts.
 
 **Nested fields**: Lance stores each subfield as a separate column to support efficient filters like “find images where detected objects include cats”.
@@ -118,8 +130,6 @@ Here we will highlight a few aspects of Lance’s design. For more details, see 
 **Versioning**: a Manifest can be used to record snapshots. Currently we support creating new versions automatically via appends, overwrites, and index creation 
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
-
-**Vector index**: Vector index for similarity search over embedding space
 
 **Rich secondary indices** (ROADMAP): 
   - Inverted index for fuzzy search over many label / annotation fields
