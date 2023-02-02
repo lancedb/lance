@@ -119,7 +119,7 @@ if __name__ == "__main__":
     parser.add_argument("uri", help="Dataset URI", metavar="URI")
     args = parser.parse_args()
 
-    for nprobes in range(1, 30, 5):
-        k = 10
-        recalls = test_dataset(args.uri, nsamples=10, k=10, nprobes=nprobes)
+    for nprobes in range(1, 50, 5):
+        k = 100
+        recalls = test_dataset(args.uri, nsamples=10, k=k, nprobes=nprobes, refine_factor=5)
         print(f"k={k} nprobs: {nprobes} recall={recalls[1]}")

@@ -22,7 +22,6 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
-use arrow_select::take;
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
