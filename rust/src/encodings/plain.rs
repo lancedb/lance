@@ -80,7 +80,8 @@ impl<'a> PlainEncoder<'a> {
 
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
-        let data = array.data().buffers()[0].as_ref();
+        let data = array.data().buffer(array.len());
+        println!("Writing data: size={}", data.len());
         self.writer.write_all(data).await?;
         Ok(offset)
     }
