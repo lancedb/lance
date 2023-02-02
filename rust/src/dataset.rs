@@ -415,6 +415,13 @@ impl Dataset {
             })
             .collect();
         let struct_arr: StructArray = one_batch.into();
+        if remapping_index.len() > struct_arr.len() {
+            println!(
+                "Remapping index: {remapping_index:?} original ids: {row_ids:?}, arr={:?}, {:?}",
+
+                struct_arr.len(), row_ids_per_fragment,
+            );
+        }
         let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
     }

@@ -106,7 +106,6 @@ def test_dataset(uri, nsamples=100, k=10, nprobes=1, refine_factor=1):
                 }
             )["score"].combine_chunks().to_numpy()
         )
-    print(results)
     return recall(np.array(actual_sorted), np.array(results))
 
 
@@ -118,4 +117,4 @@ if __name__ == "__main__":
     for nprobes in range(1, 30, 5):
         k = 10
         recalls = test_dataset(args.uri, nsamples=10, k=10, nprobes=nprobes)
-        print(f"k={k} nprobs: {nprobes} recall={recalls}")
+        print(f"k={k} nprobs: {nprobes} recall={recalls[1]}")

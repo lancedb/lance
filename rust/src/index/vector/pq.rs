@@ -64,14 +64,11 @@ impl<'a> PQIndex<'a> {
         offset: usize,
         length: usize,
     ) -> Result<PQIndex<'a>> {
-        let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
-        let pq_code_offset = offset + code_book_length * 4;
         let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, pq_code_offset, pq_code_length, ..)
-                .await?;
+            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
 
-        let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
+        let row_id_offset = offset + pq_code_length /* *1 */;
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
