@@ -100,7 +100,5 @@ def l2sq(vec, mat):
 def test_count_rows(tmp_path):
     df = pd.DataFrame({"values": range(100)})
     tbl = pa.Table.from_pandas(df)
-    lance.write_dataset(tbl, tmp_path)
-
-    dataset = lance.dataset(tmp_path)
+    dataset = lance.write_dataset(tbl, tmp_path)
     assert dataset.count_rows() == 100

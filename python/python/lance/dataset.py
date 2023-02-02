@@ -611,7 +611,7 @@ def write_dataset(
     mode: str = "create",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
-) -> bool:
+) -> LanceDataset:
     """
     Write a given data_obj to the given uri
 
@@ -652,4 +652,5 @@ def write_dataset(
     }
     if isinstance(uri, Path):
         uri = str(uri.absolute())
-    return _write_dataset(reader, str(uri), params)
+    _write_dataset(reader, str(uri), params)
+    return LanceDataset(str(uri))
