@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_select::take;
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
@@ -235,12 +236,12 @@ impl Scanner {
                 knn_node,
             ));
 
-            if q.refine_factor.is_some() {
-                println!("Refine factor is: {:?}", q.refine_factor);
-                Box::new(KNNFlat::new(take_node, q))
-            } else {
-                take_node
-            }
+            // if q.refine_factor.is_some() {
+            //     Box::new(KNNFlat::new(take_node, q))
+            // } else {
+            //     take_node
+            // }
+            take_node
         } else {
             Box::new(Scan::new(
                 self.dataset.object_store.clone(),

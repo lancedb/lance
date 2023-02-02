@@ -247,7 +247,7 @@ impl<'a> FileReader<'a> {
     }
 }
 
-/// Read within one batch.
+/// Read a batch.
 async fn read_batch(
     reader: &FileReader<'_>,
     params: &ReadBatchParams,

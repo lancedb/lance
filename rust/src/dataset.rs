@@ -403,7 +403,6 @@ impl Dataset {
             })
             .try_collect::<Vec<_>>()
             .await?;
-        println!("Batches: {:?}", batches);
         let one_batch = concat_batches(&schema, &batches)?;
 
         let remapping_index: UInt64Array = row_ids
