@@ -121,6 +121,9 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
+            // When refine factor is specified, a final Refine stage will be added to the I/O plan,
+            // and use Flat index over the raw vectors to refine the results.
+            // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
             let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor") {
                 if rf.is_none() {
                     None
