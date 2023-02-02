@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+#
+#  Copyright (c) 2023. Lance Developers
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+import argparse
+
 import duckdb
 import lance
 import numpy as np
@@ -90,3 +108,13 @@ def test_dataset(uri, nsamples=100, k=10, nprobes=1, refine_factor=1):
         )
     return recall(np.array(actual_sorted), np.array(results))
 
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("uri", help="Dataset URI", metavar="URI")
+    args = parser.parse_args()
+
+    for nprobes in range(1, 30, 5):
+        k = 10
+        recall = test_dataset(args.uri, k=10, nprobes=nprobes)
+        print(f"k={k} nprobs: {nprobes} recall={recall}")

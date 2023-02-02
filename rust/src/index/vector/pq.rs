@@ -26,6 +26,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 
+use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::Result;
@@ -259,6 +260,28 @@ impl ProductQuantizer {
         let pd_centroids = codebook_builder.finish();
         self.codebook = Some(Arc::new(pd_centroids));
         Ok(self.transform(&sub_vectors))
+    }
+}
+
+impl From<&pb::Pq> for ProductQuantizer {
+    fn from(proto: &pb::Pq) -> Self {
+        Self {
+            nbits: proto.num_bits,
+            num_sub_vectors: proto.num_sub_vectors as usize,
+            dimension: proto.dimension as usize,
+            codebook: Some(Arc::new(Float32Array::from_iter_values(proto.codebook.iter().copied()))),
+        }
+    }
+}
+
+impl From<&ProductQuantizer> for pb::Pq {
+    fn from(pq: &ProductQuantizer) -> Self {
+        Self {
+            num_bits: pq.nbits,
+            num_sub_vectors: pq.num_sub_vectors as u32,
+            dimension: pq.dimension as u32,
+            codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+        }
     }
 }
 

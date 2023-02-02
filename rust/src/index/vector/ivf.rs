@@ -118,7 +118,8 @@ impl<'a> IvfPQIndex<'a> {
         let residual_key = subtract_dyn(key, &partition_centroids)?;
 
         // TODO: Keep PQ index in LRU
-        let pq_index = PQIndex::load(self.reader.as_ref(), self.pq.as_ref(), offset, length).await?;
+        let pq_index =
+            PQIndex::load(self.reader.as_ref(), self.pq.as_ref(), offset, length).await?;
         pq_index.search(as_primitive_array(&residual_key), k)
     }
 }
@@ -198,11 +199,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                         )?)),
                     },
                     pb::VectorIndexStage {
-                        stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq {
-                            num_bits: idx.pq.nbits,
-                            num_sub_vectors: idx.pq.num_sub_vectors as u32,
-                            codebook: idx.pq.codebook.as_ref().unwrap().values().to_vec(),
-                        })),
+                        stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
                     },
                 ],
             })),
@@ -237,11 +234,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let pq = match stage1 {
-                            Stage::Pq(pq_proto) => Ok(Arc::new(ProductQuantizer::new(
-                                pq_proto.num_sub_vectors as usize,
-                                pq_proto.num_bits,
-                                vidx.dimension as usize,
-                            ))),
+                            Stage::Pq(pq_proto) => Ok(Arc::new(pq_proto.into())),
                             _ => Err(Error::IO("Stage 1 only supports PQ".to_string())),
                         }?;
 
