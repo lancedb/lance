@@ -14,6 +14,7 @@
 #
 
 from __future__ import annotations
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union, Iterator
 
@@ -282,7 +283,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Return all versions in this dataset
         """
-        return self._ds.versions()
+        versions = self._ds.versions()
+        for v in versions:
+            v["timestamp"] = datetime.fromtimestamp(v["timestamp"])
+        return versions
 
 
 class ScannerBuilder:

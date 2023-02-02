@@ -23,7 +23,7 @@ use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict, PyList, PyLong};
+use pyo3::types::{IntoPyDict, PyDict, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -163,6 +163,9 @@ impl Dataset {
                 .map(|v| {
                     let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
+                    dict.set_item("timestamp", v.timestamp.timestamp()).unwrap();
+                    let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
+                    dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
                     dict.to_object(py)
                 })
                 .collect::<Vec<_>>()

@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 
+from datetime import datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -47,3 +48,7 @@ def test_versions(tmp_path: Path):
     lance.write_dataset(table2, base_dir, mode="overwrite")
 
     assert len(lance.dataset(base_dir).versions()) == 2
+
+    for v in lance.dataset(base_dir).versions():
+        assert isinstance(v["timestamp"], datetime)
+        assert isinstance(v["metadata"], dict)
