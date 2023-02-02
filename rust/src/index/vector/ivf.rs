@@ -327,7 +327,10 @@ impl Ivf {
             residual_builder.append_slice(residual_float32.values());
         }
         let values = residual_builder.finish();
-        Ok(Arc::new(FixedSizeListArray::try_new(values, vector_array.value_length())?))
+        Ok(Arc::new(FixedSizeListArray::try_new(
+            values,
+            vector_array.value_length(),
+        )?))
     }
 
     /// Scan the dataset and assign the partition ID for each row.
@@ -376,7 +379,7 @@ impl Ivf {
                 as_primitive_array(batch.column_by_name(PARTITION_ID_COLUMN).unwrap().as_ref()),
             )?;
             let residual_schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("_vector", residual.data_type().clone(), false),
+                ArrowField::new("__residual_vector", residual.data_type().clone(), false),
                 ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                 ArrowField::new(ROW_ID, DataType::UInt64, false),
             ]));
@@ -558,20 +561,20 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
         // Assign parition ID and compute residual vectors.
+        let now = std::time::Instant::now();
         let partitioned_batches = ivf_model.partition(&scanner).await?;
+        println!("Time to partition: {}", now.elapsed().as_secs_f32());
 
         // Train PQ
-        println!(
-            "Partitioned batch schema: {:?}",
-            partitioned_batches[0].schema()
-        );
-
-        let mut pq = ProductQuantizer::new(
-            self.num_sub_vectors as usize,
-            self.nbits,
-            self.dimension,
-        );
-
+        let mut pq =
+            ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
+        let batch = concat_batches(
+            &partitioned_batches[0].schema(),
+            &partitioned_batches,
+        )?;
+        let residual_vector = batch.column_by_name("__residual_vector").unwrap();
+        let pq_code = pq.fit_transform(as_fixed_size_list_array(residual_vector))?;
+        println!("PQ code: {:?}\n", pq_code);
 
         let object_store = self.dataset.object_store();
         let path = self
