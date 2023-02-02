@@ -568,13 +568,24 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         // Train PQ
         let mut pq =
             ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
-        let batch = concat_batches(
-            &partitioned_batches[0].schema(),
-            &partitioned_batches,
-        )?;
+        let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
         let residual_vector = batch.column_by_name("__residual_vector").unwrap();
         let pq_code = pq.fit_transform(as_fixed_size_list_array(residual_vector))?;
         println!("PQ code: {:?}\n", pq_code);
+
+        const PQ_CODE_COLUMN: &str = "__pq_code";
+        let pq_code_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false),
+                ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(pq_code),
+                batch.column_by_name(PARTITION_ID_COLUMN).unwrap().clone(),
+                batch.column_by_name(ROW_ID).unwrap().clone(),
+            ],
+        )?;
 
         let object_store = self.dataset.object_store();
         let path = self
@@ -582,44 +593,41 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             .indices_dir()
             .child(self.uuid.to_string())
             .child(INDEX_FILE_NAME);
+        let mut writer = object_store.create(&path).await?;
 
-        // for batch in partitioned_batches.iter() {
-        //     let arr = batch.column_by_name("_vector").unwrap();
-        //     let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        // Write each partition to disk.
+        let part_col = pq_code_batch
+            .column_by_name(PARTITION_ID_COLUMN)
+            .expect(format!("{} does not exist", PARTITION_ID_COLUMN).as_str());
+        let partition_ids: &UInt32Array = as_primitive_array(part_col);
+        let min_id = min(partition_ids).unwrap_or(0);
+        let max_id = max(partition_ids).unwrap_or(1024 * 1024);
+        for part_id in min_id..max_id + 1 {
+            let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
+            let parted_batch = filter_record_batch(&pq_code_batch, &predicates)?;
+            if parted_batch.num_rows() > 0 {
+                // Write one partition.
+                let pq_code = &parted_batch[PQ_CODE_COLUMN];
+                ivf_model.add_partition(writer.tell(), parted_batch.num_rows() as u32);
+                writer.write_plain_encoded_array(pq_code.as_ref()).await?;
+                let row_ids = &batch[ROW_ID];
+                writer.write_plain_encoded_array(row_ids.as_ref()).await?;
+            }
+        }
 
-        //     let mut pq = ProductQuantizer::new(
-        //         self.num_sub_vectors as usize,
-        //         self.nbits,
-        //         data.value_length() as usize,
-        //     );
-        //     let code = pq.fit_transform(data)?;
-        //     let row_id_column = &batch[ROW_ID];
-        //     ivf_model.add_partition(writer.tell(), data.len() as u32);
-        //     writer
-        //         .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
-        //         .await?;
-        //     writer
-        //         .write_plain_encoded_array(code.values().as_ref())
-        //         .await?;
-        //     writer
-        //         .write_plain_encoded_array(row_id_column.as_ref())
-        //         .await?;
-        // }
-        // let mut writer = object_store.create(&path).await?;
+        let metadata = IvfPQIndexMetadata {
+            name: self.name.clone(),
+            column: self.column.clone(),
+            dimension: self.dimension as u32,
+            dataset_version: self.dataset.version().version,
+            ivf: ivf_model,
+            pq,
+        };
 
-        // let metadata = IvfPQIndexMetadata {
-        //     name: self.name.clone(),
-        //     column: self.column.clone(),
-        //     dimension: self.dimension as u32,
-        //     dataset_version: self.dataset.version().version,
-        //     ivf: ivf_model,
-        //     pq: ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension),
-        // };
-
-        // let metadata = pb::Index::try_from(&metadata)?;
-        // let pos = writer.write_protobuf(&metadata).await?;
-        // writer.write_magics(pos).await?;
-        // writer.shutdown().await?;
+        let metadata = pb::Index::try_from(&metadata)?;
+        let pos = writer.write_protobuf(&metadata).await?;
+        writer.write_magics(pos).await?;
+        writer.shutdown().await?;
 
         Ok(())
     }
