@@ -33,7 +33,6 @@ use ::lance::dataset::Dataset as LanceDataset;
 use lance::dataset::{WriteMode, WriteParams};
 
 const DEFAULT_NPROBS: usize = 1;
-const DEFAULT_REFINE_FACTOR: u32 = 1;
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -122,20 +121,24 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
-            let refine_factor: u32 = if let Some(refine_factor) = nearest.get_item("refine_factor")
-            {
-                if refine_factor.is_none() {
-                    DEFAULT_REFINE_FACTOR
+            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor") {
+                if rf.is_none() {
+                    None
                 } else {
-                    PyAny::downcast::<PyLong>(refine_factor)?.extract()?
+                    PyAny::downcast::<PyLong>(rf)?.extract()?
                 }
             } else {
-                DEFAULT_REFINE_FACTOR
+                None
             };
-
             scanner
                 .nearest(column.as_str(), &q, k)
-                .map(|s| s.nprobs(nprobes).refine(refine_factor))
+                .map(|s| {
+                    let mut s = s.nprobs(nprobes);
+                    if let Some(factor) = refine_factor {
+                        s = s.refine(factor);
+                    }
+                    s
+                })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
