@@ -132,11 +132,11 @@ We used the sift dataset to benchmark our results with 1M vectors of 128D
 
 1. For 100 randomly sampled query vectors, we get <1ms average response time (on a 2023 m2 macbook air)
 
-![img.png](img.png)
+![avg_latency.png](docs/avg_latency.png)
 
 2. ANN is always a trade-off between recall and performance
 
-![img_1.png](img_1.png)
+![avg_latency.png](docs/recall_vs_latency.png)
 
 ### Vs parquet
 
