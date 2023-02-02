@@ -201,6 +201,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                         stage: Some(pb::vector_index_stage::Stage::Pq(pb::Pq {
                             num_bits: idx.pq.nbits,
                             num_sub_vectors: idx.pq.num_sub_vectors as u32,
+                            codebook: idx.pq.codebook.as_ref().unwrap().values().to_vec(),
                         })),
                     },
                 ],
@@ -595,7 +596,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 ivf_model.add_partition(writer.tell(), parted_batch.num_rows() as u32);
                 let pq_code = &parted_batch[PQ_CODE_COLUMN];
                 writer.write_plain_encoded_array(pq_code.as_ref()).await?;
-                let row_ids = &batch[ROW_ID];
+                let row_ids = &parted_batch[ROW_ID];
                 writer.write_plain_encoded_array(row_ids.as_ref()).await?;
             }
         }
