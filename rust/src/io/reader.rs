@@ -351,6 +351,7 @@ async fn read_binary_array(
     read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),
+        field.nullable,
         page_info.position,
         page_info.length,
         params,
@@ -453,8 +454,9 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        cast::as_primitive_array, types::UInt8Type, DictionaryArray, Float32Array, Int64Array,
-        StringArray, UInt8Array,
+        cast::{as_primitive_array, as_string_array, as_struct_array},
+        types::UInt8Type,
+        DictionaryArray, Float32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -614,5 +616,52 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    async fn test_write_null_string_in_struct(field_nullable: bool) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(vec![ArrowField::new("str", DataType::Utf8, field_nullable)]),
+            true,
+        )]));
+
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+
+        let string_arr = Arc::new(StringArray::from_iter([Some("a"), Some(""), Some("b")]));
+        let struct_arr = Arc::new(StructArray::from(vec![(
+            ArrowField::new("str", DataType::Utf8, field_nullable),
+            string_arr.clone() as ArrayRef,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+
+        if field_nullable {
+            assert_eq!(
+                &StringArray::from_iter(vec![Some("a"), None, Some("b")]),
+                as_string_array(
+                    as_struct_array(actual_batch.column_by_name("parent").unwrap().as_ref())
+                        .column_by_name("str")
+                        .unwrap()
+                        .as_ref()
+                )
+            );
+        } else {
+            assert_eq!(actual_batch, batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_nullable_string_in_struct() {
+        test_write_null_string_in_struct(true).await;
+        test_write_null_string_in_struct(false).await;
     }
 }
