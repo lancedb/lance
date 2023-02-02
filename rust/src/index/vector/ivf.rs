@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_arith::arithmetic::subtract_dyn;
+use arrow_array::builder::Float32Builder;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
@@ -59,6 +60,7 @@ use crate::{
 use crate::{Error, Result};
 
 const INDEX_FILE_NAME: &str = "index.idx";
+const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 
 /// IVF PQ Index.
 pub struct IvfPQIndex<'a> {
@@ -310,19 +312,36 @@ impl Ivf {
         self.lengths.push(len);
     }
 
-    /// Scan the dataset, and partition the batches based on the IVF partitions / Voronois.
-    ///
-    /// Currently, it keeps all partitioned batches in memory.
-    async fn partition(&self, scanner: &Scanner) -> Result<BTreeMap<u32, RecordBatch>> {
-        const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
+    /// Compute residual vector using the IVF centroids.
+    fn compute_residual(
+        &self,
+        vector_array: &FixedSizeListArray,
+        partition_ids: &UInt32Array,
+    ) -> Result<ArrayRef> {
+        let mut residual_builder = Float32Builder::new();
+        for i in 0..vector_array.len() {
+            let vector = vector_array.value(i);
+            let centroids = self.centroids.value(partition_ids.value(i) as usize);
+            let residual_vector = subtract_dyn(vector.as_ref(), centroids.as_ref())?;
+            let residual_float32: &Float32Array = as_primitive_array(residual_vector.as_ref());
+            residual_builder.append_slice(residual_float32.values());
+        }
+        let values = residual_builder.finish();
+        Ok(Arc::new(FixedSizeListArray::try_new(values, vector_array.value_length())?))
+    }
 
+    /// Scan the dataset and assign the partition ID for each row.
+    ///
+    /// Currently, it keeps batches in the memory.
+    async fn partition(&self, scanner: &Scanner) -> Result<Vec<RecordBatch>> {
         let schema = scanner.schema()?;
         let column_name = schema.field(0).name();
-        let partitions_with_id = scanner
+        let batches_with_partition_id = scanner
             .try_into_stream()
             .await?
-            .and_then(|b| async move {
-                let arr = b.column_by_name(column_name).ok_or_else(|| {
+            .map(|b| async move {
+                let batch = b?;
+                let arr = batch.column_by_name(column_name).ok_or_else(|| {
                     Error::IO(format!("Dataset does not have column {column_name}"))
                 })?;
                 let vectors: &FixedSizeListArray = arr.as_any().downcast_ref().unwrap();
@@ -339,46 +358,39 @@ impl Ivf {
                 })
                 .await??;
                 let partition_column = Arc::new(UInt32Array::from(partition_ids));
-                let batch_with_part_id = b.try_with_column(
+                let batch_with_part_id = batch.try_with_column(
                     ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                     partition_column,
                 )?;
-                let partitioned = partition_batch(&batch_with_part_id, PARTITION_ID_COLUMN)?;
-                Ok(partitioned)
+                Ok::<RecordBatch, Error>(batch_with_part_id)
             })
-            .try_fold(
-                BTreeMap::<u32, Vec<RecordBatch>>::new(),
-                |mut builder, partitions| async move {
-                    for (id, batch) in partitions {
-                        builder.entry(id).or_insert(vec![]);
-                        if let Some(batches) = builder.get_mut(&id) {
-                            batches.push(batch);
-                        }
-                    }
-                    Ok(builder)
-                },
-            )
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
             .await?;
-        let mut partitions = BTreeMap::<u32, RecordBatch>::new();
-        for (key, value) in partitions_with_id.iter() {
-            let batch = concat_batches(&value[0].schema(), value)?;
-            let arr = self.centroids.value(*key as usize);
-            let centroids: &Float32Array = as_primitive_array(&arr);
-            let column = batch.column_by_name(column_name).unwrap();
-            let vectors = as_fixed_size_list_array(column);
-            let residual = compute_residual(vectors, centroids)?;
+
+        // Compute the residual vectors for every RecordBatch.
+        let mut residual_batches = vec![];
+        for batch in batches_with_partition_id.iter() {
+            let residual = self.compute_residual(
+                as_fixed_size_list_array(batch.column_by_name(column_name).unwrap().as_ref()),
+                as_primitive_array(batch.column_by_name(PARTITION_ID_COLUMN).unwrap().as_ref()),
+            )?;
             let residual_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("_vector", residual.data_type().clone(), false),
+                ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                 ArrowField::new(ROW_ID, DataType::UInt64, false),
             ]));
             let batch = RecordBatch::try_new(
                 residual_schema,
-                vec![residual, batch.column_by_name(ROW_ID).unwrap().clone()],
+                vec![
+                    residual,
+                    batch.column_by_name(PARTITION_ID_COLUMN).unwrap().clone(),
+                    batch.column_by_name(ROW_ID).unwrap().clone(),
+                ],
             )?;
-
-            partitions.insert(*key, batch);
+            residual_batches.push(batch);
         }
-        Ok(partitions)
+        Ok(residual_batches)
     }
 }
 
@@ -414,30 +426,6 @@ impl TryFrom<&pb::Ivf> for Ivf {
             lengths: proto.lengths.clone(),
         })
     }
-}
-
-/// Computer the residual array from the centroids.
-///
-/// TODO: not optimized. only occurred in write path.
-fn compute_residual(
-    vectors: &FixedSizeListArray,
-    centroids: &Float32Array,
-) -> Result<Arc<FixedSizeListArray>> {
-    assert_eq!(vectors.value_length() as usize, centroids.len());
-    let mut residual_vectors = vec![];
-    for idx in 0..vectors.len() {
-        let val = vectors.value(idx);
-        let residual = subtract_dyn(val.as_ref(), centroids)?;
-        residual_vectors.push(residual);
-    }
-    let residual_refs: Vec<&dyn Array> = residual_vectors.iter().map(|r| r.as_ref()).collect();
-
-    let values = concat(&residual_refs)?;
-    let f32_values: &Float32Array = as_primitive_array(values.as_ref());
-    Ok(Arc::new(FixedSizeListArray::try_new(
-        f32_values,
-        centroids.len() as i32,
-    )?))
 }
 
 /// Partition one [`RecordBatch`] based on the partition column(s) value.
@@ -551,14 +539,6 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 field.data_type())));
         }
 
-        let object_store = self.dataset.object_store();
-        let path = self
-            .dataset
-            .indices_dir()
-            .child(self.uuid.to_string())
-            .child(INDEX_FILE_NAME);
-        let mut writer = object_store.create(&path).await?;
-
         // First, scan the dataset to train IVF models.
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
@@ -577,44 +557,66 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
+        // Assign parition ID and compute residual vectors.
         let partitioned_batches = ivf_model.partition(&scanner).await?;
 
-        for (_, batch) in partitioned_batches.iter() {
-            let arr = batch.column_by_name("_vector").unwrap();
-            let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        // Train PQ
+        println!(
+            "Partitioned batch schema: {:?}",
+            partitioned_batches[0].schema()
+        );
 
-            let mut pq = ProductQuantizer::new(
-                self.num_sub_vectors as usize,
-                self.nbits,
-                data.value_length() as usize,
-            );
-            let code = pq.fit_transform(data)?;
-            let row_id_column = &batch[ROW_ID];
-            ivf_model.add_partition(writer.tell(), data.len() as u32);
-            writer
-                .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
-                .await?;
-            writer
-                .write_plain_encoded_array(code.values().as_ref())
-                .await?;
-            writer
-                .write_plain_encoded_array(row_id_column.as_ref())
-                .await?;
-        }
+        let mut pq = ProductQuantizer::new(
+            self.num_sub_vectors as usize,
+            self.nbits,
+            self.dimension,
+        );
 
-        let metadata = IvfPQIndexMetadata {
-            name: self.name.clone(),
-            column: self.column.clone(),
-            dimension: self.dimension as u32,
-            dataset_version: self.dataset.version().version,
-            ivf: ivf_model,
-            pq: ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension),
-        };
 
-        let metadata = pb::Index::try_from(&metadata)?;
-        let pos = writer.write_protobuf(&metadata).await?;
-        writer.write_magics(pos).await?;
-        writer.shutdown().await?;
+        let object_store = self.dataset.object_store();
+        let path = self
+            .dataset
+            .indices_dir()
+            .child(self.uuid.to_string())
+            .child(INDEX_FILE_NAME);
+
+        // for batch in partitioned_batches.iter() {
+        //     let arr = batch.column_by_name("_vector").unwrap();
+        //     let data = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+
+        //     let mut pq = ProductQuantizer::new(
+        //         self.num_sub_vectors as usize,
+        //         self.nbits,
+        //         data.value_length() as usize,
+        //     );
+        //     let code = pq.fit_transform(data)?;
+        //     let row_id_column = &batch[ROW_ID];
+        //     ivf_model.add_partition(writer.tell(), data.len() as u32);
+        //     writer
+        //         .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
+        //         .await?;
+        //     writer
+        //         .write_plain_encoded_array(code.values().as_ref())
+        //         .await?;
+        //     writer
+        //         .write_plain_encoded_array(row_id_column.as_ref())
+        //         .await?;
+        // }
+        // let mut writer = object_store.create(&path).await?;
+
+        // let metadata = IvfPQIndexMetadata {
+        //     name: self.name.clone(),
+        //     column: self.column.clone(),
+        //     dimension: self.dimension as u32,
+        //     dataset_version: self.dataset.version().version,
+        //     ivf: ivf_model,
+        //     pq: ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension),
+        // };
+
+        // let metadata = pb::Index::try_from(&metadata)?;
+        // let pos = writer.write_protobuf(&metadata).await?;
+        // writer.write_magics(pos).await?;
+        // writer.shutdown().await?;
 
         Ok(())
     }
