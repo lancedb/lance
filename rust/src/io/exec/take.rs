@@ -46,7 +46,7 @@ impl Take {
         let (tx, rx) = mpsc::channel(4);
 
         let bg_thread = tokio::spawn(async move {
-            child
+            if let Err(e) = child
                 .zip(stream::repeat_with(|| (dataset.clone(), schema.clone())))
                 .then(|(batch, (dataset, schema))| async move {
                     let batch = batch?;
@@ -67,7 +67,11 @@ impl Take {
                     Ok(())
                 })
                 .await
-                .unwrap();
+            {
+                if let Err(e) = tx.send(Err(e)).await {
+                    eprintln!("ExecNode(Take): {}", e);
+                }
+            }
             drop(tx)
         });
 

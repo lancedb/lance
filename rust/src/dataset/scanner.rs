@@ -236,6 +236,7 @@ impl Scanner {
             ));
 
             if q.refine_factor.is_some() {
+                println!("Refine factor is: {:?}", q.refine_factor);
                 Box::new(KNNFlat::new(take_node, q))
             } else {
                 take_node

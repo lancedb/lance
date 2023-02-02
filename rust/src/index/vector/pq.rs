@@ -85,21 +85,6 @@ impl<'a> PQIndex<'a> {
         })
     }
 
-    /// Get the centroids for one sub-vector.
-    pub fn centroids(&self, sub_vector_idx: usize) -> FixedSizeListArray {
-        assert!(sub_vector_idx < self.num_sub_vectors);
-
-        let arr = self
-            .pq
-            .codebook
-            .as_ref()
-            .unwrap()
-            .slice(sub_vector_idx * self.dimension, self.dimension);
-        let f32_arr: &Float32Array = as_primitive_array(&arr);
-        FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
-            .unwrap()
-    }
-
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
@@ -113,7 +98,7 @@ impl<'a> PQIndex<'a> {
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length).clone();
-            let subvec_centroids = self.centroids(i);
+            let subvec_centroids = self.pq.centroids(i);
             let distances = l2_distance(as_primitive_array(&from), &subvec_centroids).unwrap();
             distance_table.extend(distances.iter().map(|d| d.unwrap_or(0.0)));
         }
@@ -160,7 +145,7 @@ pub struct ProductQuantizer {
 
     /// PQ codebook
     ///
-    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
+    /// ```((2 ^ nbits) * num_subvector * sub_vector_length)``` of `f32`
     ///
     /// Use a layout that is cache / SIMD friendly to compute centroid.
     /// But not sure how to make distance lookup via PQ code lookup
@@ -204,14 +189,15 @@ impl ProductQuantizer {
         assert!(sub_vector_idx < self.num_sub_vectors as usize);
         assert!(self.codebook.is_some());
 
+        let num_centroids = ProductQuantizer::num_centroids(self.nbits);
+        let sub_vector_width = self.dimension / self.num_sub_vectors;
         let codebook = self.codebook.as_ref().unwrap();
         let arr = codebook.slice(
-            sub_vector_idx * self.dimension as usize,
-            self.dimension as usize,
+            sub_vector_idx * num_centroids * sub_vector_width as usize,
+            num_centroids * sub_vector_width as usize,
         );
         let f32_arr: &Float32Array = as_primitive_array(&arr);
-        FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
-            .unwrap()
+        FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap()
     }
 
     /// Transform the vector array to PQ code array.
@@ -269,7 +255,9 @@ impl From<&pb::Pq> for ProductQuantizer {
             nbits: proto.num_bits,
             num_sub_vectors: proto.num_sub_vectors as usize,
             dimension: proto.dimension as usize,
-            codebook: Some(Arc::new(Float32Array::from_iter_values(proto.codebook.iter().copied()))),
+            codebook: Some(Arc::new(Float32Array::from_iter_values(
+                proto.codebook.iter().copied(),
+            ))),
         }
     }
 }

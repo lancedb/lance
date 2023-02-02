@@ -102,7 +102,7 @@ def test_dataset(uri, nsamples=100, k=10, nprobes=1, refine_factor=1):
                     "q": q,
                     "k": k,
                     "nprobes": nprobes,
-                    "refine_factor": refine_factor
+#                    "refine_factor": refine_factor
                 }
             )["score"].combine_chunks().to_numpy()
         )
