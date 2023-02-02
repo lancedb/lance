@@ -33,7 +33,7 @@ use crate::{arrow::*, utils::distance::l2_distance};
 
 /// Product Quantization Index.
 ///
-pub struct PQIndex {
+pub struct PQIndex<'a> {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -45,24 +45,8 @@ pub struct PQIndex {
     /// Vector dimension.
     pub dimension: usize,
 
-    /// PQ codebook
-    ///
-    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
-    ///
-    /// Use a layout that is cache / SIMD friendly to compute centroid.
-    /// But not sure how to make distance lookup via PQ code lookup
-    /// be cache friendly tho.
-    ///
-    /// Layout:
-    ///
-    ///  - *row*: all centroids for the same sub-vector.
-    ///  - *column*: the centroid value of the n-th sub-vector.
-    ///
-    /// ```text
-    /// // Centroids for a sub-vector.
-    /// Codebook[sub_vector_id][pq_code]
-    /// ```
-    pub codebook: Arc<Float32Array>,
+    /// Product quantizer.
+    pub pq: &'a ProductQuantizer,
 
     /// PQ code
     pub code: Arc<UInt8Array>,
@@ -71,20 +55,15 @@ pub struct PQIndex {
     pub row_ids: Arc<UInt64Array>,
 }
 
-impl PQIndex {
+impl<'a> PQIndex<'a> {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
         reader: &dyn ObjectReader,
-        pq: &ProductQuantizer,
+        pq: &'a ProductQuantizer,
         offset: usize,
         length: usize,
-    ) -> Result<Self> {
-        // TODO: read code book, PQ code and row_ids in parallel.
+    ) -> Result<PQIndex<'a>> {
         let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
-        let codebook =
-            read_fixed_stride_array(reader, &DataType::Float32, offset, code_book_length, ..)
-                .await?;
-
         let pq_code_offset = offset + code_book_length * 4;
         let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
@@ -99,10 +78,9 @@ impl PQIndex {
             nbits: pq.nbits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            // TODO: make reader returns typed array to avoid one array copy.
-            codebook: Arc::new(as_primitive_array(&codebook).clone()),
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+            pq,
         })
     }
 
@@ -111,7 +89,10 @@ impl PQIndex {
         assert!(sub_vector_idx < self.num_sub_vectors);
 
         let arr = self
+            .pq
             .codebook
+            .as_ref()
+            .unwrap()
             .slice(sub_vector_idx * self.dimension, self.dimension);
         let f32_arr: &Float32Array = as_primitive_array(&arr);
         FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)

@@ -69,7 +69,7 @@ pub struct IvfPQIndex<'a> {
     ivf: Ivf,
 
     /// Number of bits used for product quantization centroids.
-    pq: ProductQuantizer,
+    pq: Arc<ProductQuantizer>,
 }
 
 impl<'a> IvfPQIndex<'a> {
@@ -118,7 +118,7 @@ impl<'a> IvfPQIndex<'a> {
         let residual_key = subtract_dyn(key, &partition_centroids)?;
 
         // TODO: Keep PQ index in LRU
-        let pq_index = PQIndex::load(self.reader.as_ref(), &self.pq, offset, length).await?;
+        let pq_index = PQIndex::load(self.reader.as_ref(), self.pq.as_ref(), offset, length).await?;
         pq_index.search(as_primitive_array(&residual_key), k)
     }
 }
@@ -174,8 +174,8 @@ pub struct IvfPQIndexMetadata {
     // Ivf related
     ivf: Ivf,
 
-    // PQ configurations.
-    pq: ProductQuantizer,
+    /// Product Quantizer
+    pq: Arc<ProductQuantizer>,
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -237,11 +237,11 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let pq = match stage1 {
-                            Stage::Pq(pq_proto) => Ok(ProductQuantizer::new(
+                            Stage::Pq(pq_proto) => Ok(Arc::new(ProductQuantizer::new(
                                 pq_proto.num_sub_vectors as usize,
                                 pq_proto.num_bits,
                                 vidx.dimension as usize,
-                            )),
+                            ))),
                             _ => Err(Error::IO("Stage 1 only supports PQ".to_string())),
                         }?;
 
@@ -432,7 +432,10 @@ impl TryFrom<&pb::Ivf> for Ivf {
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
         let f32_centroids = Float32Array::from(proto.centroids.clone());
         let dimension = f32_centroids.len() / proto.offsets.len();
-        let centroids = Arc::new(FixedSizeListArray::try_new(f32_centroids, dimension as i32)?);
+        let centroids = Arc::new(FixedSizeListArray::try_new(
+            f32_centroids,
+            dimension as i32,
+        )?);
         Ok(Self {
             centroids,
             offsets: proto.offsets.iter().map(|o| *o as usize).collect(),
@@ -607,7 +610,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dimension: self.dimension as u32,
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
-            pq,
+            pq: pq.into(),
         };
 
         let metadata = pb::Index::try_from(&metadata)?;
