@@ -73,7 +73,7 @@ impl<'a> PQIndex<'a> {
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
         Ok(Self {
-            nbits: pq.nbits,
+            nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
             code: Arc::new(as_primitive_array(&pq_code).clone()),
@@ -132,7 +132,7 @@ pub struct ProductQuantizer {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
-    pub nbits: u32,
+    pub num_bits: u32,
 
     /// Number of sub-vectors.
     pub num_sub_vectors: usize,
@@ -165,7 +165,7 @@ impl ProductQuantizer {
     pub fn new(m: usize, nbits: u32, dimension: usize) -> Self {
         assert!(nbits == 8, "nbits can only be 8");
         Self {
-            nbits,
+            num_bits: nbits,
             num_sub_vectors: m,
             dimension,
             codebook: None,
@@ -186,7 +186,7 @@ impl ProductQuantizer {
         assert!(sub_vector_idx < self.num_sub_vectors as usize);
         assert!(self.codebook.is_some());
 
-        let num_centroids = ProductQuantizer::num_centroids(self.nbits);
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
         let codebook = self.codebook.as_ref().unwrap();
         let arr = codebook.slice(
@@ -224,7 +224,7 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_u32.pow(self.nbits);
+        let num_centorids = 2_u32.pow(self.num_bits);
         let dimension = data.value_length() as usize / self.num_sub_vectors;
 
         let mut codebook_builder =
@@ -249,7 +249,7 @@ impl ProductQuantizer {
 impl From<&pb::Pq> for ProductQuantizer {
     fn from(proto: &pb::Pq) -> Self {
         Self {
-            nbits: proto.num_bits,
+            num_bits: proto.num_bits,
             num_sub_vectors: proto.num_sub_vectors as usize,
             dimension: proto.dimension as usize,
             codebook: Some(Arc::new(Float32Array::from_iter_values(
@@ -262,7 +262,7 @@ impl From<&pb::Pq> for ProductQuantizer {
 impl From<&ProductQuantizer> for pb::Pq {
     fn from(pq: &ProductQuantizer) -> Self {
         Self {
-            num_bits: pq.nbits,
+            num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
             codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
