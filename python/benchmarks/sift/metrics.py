@@ -26,6 +26,7 @@ def recall(actual_sorted: np.ndarray, results: np.ndarray):
     """
     Recall-at-k
     """
+    print(results)
     len = results.shape[1]
     t = actual_sorted[:, len - 1] + 1e-3
     recall_at_k = (results <= t[:, None]).sum(axis=1) * 1.0 / len
@@ -100,6 +101,7 @@ def test_dataset(
         actual_sorted.append(l2_sort(all_vectors, q))
         results.append(
             dataset.to_table(
+                columns=["id", "vector"],
                 nearest={
                     "column": "vector",
                     "q": q,
@@ -119,6 +121,14 @@ if __name__ == "__main__":
     parser.add_argument("uri", help="Dataset URI", metavar="URI")
     parser.add_argument("-s", "--samples", default=10, type=int, metavar="N")
     parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
+    parser.add_argument(
+        "-r",
+        "--refine",
+        default=None,
+        type=int,
+        metavar="N",
+        help="Refine factor for the last Refine step.",
+    )
     args = parser.parse_args()
 
     for nprobes in range(1, 50, 5):
@@ -127,6 +137,8 @@ if __name__ == "__main__":
             nsamples=args.samples,
             k=args.top_k,
             nprobes=nprobes,
-            refine_factor=3,
+            refine_factor=args.refine,
         )
-        print(f"k={args.top_kn} nprobs: {nprobes} recall={recalls[1]}")
+        print(
+            f"nprobs: {nprobes}, refine={args.refine} recall@{args.top_k}={recalls[1]:0.3f}"
+        )

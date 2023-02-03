@@ -42,6 +42,11 @@ pub(crate) struct Take {
 }
 
 impl Take {
+    /// Create a Take node with
+    ///
+    ///  - Dataset: the dataset to read from
+    ///  - schema: projection schema for take node.
+    ///  - child: the upstream ExedNode to feed data in.
     pub fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: ExecNodeBox) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
