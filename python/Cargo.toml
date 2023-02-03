@@ -23,7 +23,7 @@ arrow = { version = "31.0.0", features = ["pyarrow"] }
 lance = { path = "../rust", features = ["blas"]}
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-lance = { path = "../rust", features = ["faiss"]}
+lance = { path = "../rust"}
 
 
 [build-dependencies]
