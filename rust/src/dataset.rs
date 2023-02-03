@@ -385,7 +385,7 @@ impl Dataset {
         });
         let schema = Arc::new(ArrowSchema::from(projection));
         let object_store = &self.object_store;
-        // println!("self. fragments: {:?} row_ids:{:?}", self.fragments(), row_ids);
+        println!("self. fragments: {:?} row_ids:{:?}", self.fragments(), row_ids);
         let batches = stream::iter(self.fragments().as_ref())
             .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
             .then(|fragment| async {
@@ -418,7 +418,7 @@ impl Dataset {
             .collect();
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
-        // println!("Take rows: return={:?}", reordered);
+        println!("Take rows: return={:?}", reordered);
         Ok(as_struct_array(&reordered).into())
     }
 

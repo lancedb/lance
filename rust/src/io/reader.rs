@@ -261,10 +261,6 @@ async fn read_batch(
         .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
-        let batch_offset = reader
-            .metadata
-            .get_offset(batch_id)
-            .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
         let ids_in_batch: Vec<i32> = match params {
             ReadBatchParams::Indices(indices) => {
                 indices.values().iter().map(|v| *v as i32).collect()
@@ -276,6 +272,10 @@ async fn read_batch(
                 .map(|v| v as i32)
                 .collect(),
         };
+        let batch_offset = reader
+            .metadata
+            .get_offset(batch_id)
+            .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
             ids_in_batch
                 .iter()
