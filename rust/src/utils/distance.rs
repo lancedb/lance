@@ -97,8 +97,10 @@ pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
     use arrow_buffer::MutableBuffer;
 
+    #[allow(unused_imports)]
     #[cfg(target_os = "macos")]
     use accelerate_src;
+
     use cblas::*;
 
     let inner_array = to.values();

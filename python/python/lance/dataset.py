@@ -96,8 +96,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
     ) -> pa.Table:
-        """
-        Read the data into memory and return a pyarrow Table.
+        """Read the data into memory and return a pyarrow Table.
 
         Parameters
         ----------
@@ -117,6 +116,7 @@ class LanceDataset(pa.dataset.Dataset):
               "nprobes": 1,
               "refine_factor": 1
             }
+
         """
         return self.scanner(
             columns=columns, limit=limit, offset=offset, nearest=nearest
@@ -214,8 +214,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self.scanner(**kwargs).to_table()
 
     def count_rows(self, **kwargs):
-        """
-        Count rows matching the scanner filter.
+        """Count rows matching the scanner filter.
 
         Parameters
         ----------
@@ -225,6 +224,7 @@ class LanceDataset(pa.dataset.Dataset):
         Returns
         -------
         count : int
+
         """
         return self._ds.count_rows()
 
@@ -287,6 +287,59 @@ class LanceDataset(pa.dataset.Dataset):
         for v in versions:
             v["timestamp"] = datetime.fromtimestamp(v["timestamp"])
         return versions
+
+    def create_index(
+        self, column: str, index_type: str, name: Optional[str] = None, **kwargs
+    ):
+        """Create index on column
+
+        ***Experimental API***
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.
+        index_type : str
+            The type of the index. Only "``IVF_PQ``" is supported now.
+        name : str, optional
+            The index name. If not provided, it will be generated from the
+            column name.
+        kwargs :
+            Parameters passed to the index building process.
+
+
+        Accepted keyword parameters:
+
+        - **num_partitions**: the number of partitions of IVF (Inverted File Index).
+        - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+
+        Examples
+        --------
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_PQ",
+                num_partitions=256,
+                num_sub_vectors=16
+            )
+
+        References
+        ----------
+        * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
+        * IVF introduced in `Video Google: a text retrieval approach to object matching in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
+        * `Product quantization for nearest neighbor search <https://hal.inria.fr/inria-00514462v2/document>`_
+
+        """
+        # Only support building index for 1 column from the API aspect, however
+        # the internal implementation might support building multi-column index later.
+        if isinstance(column, str):
+            column = [column]
+        self._ds.create_index(column, index_type, name, kwargs)
 
 
 class ScannerBuilder:
@@ -595,12 +648,12 @@ class LanceScanner(pa.dataset.Scanner):
         return self.to_table()[:num_rows]
 
     def count_rows(self):
-        """
-        Count rows matching the scanner filter.
+        """Count rows matching the scanner filter.
 
         Returns
         -------
         count : int
+
         """
         return self._ds.count_rows()
 
@@ -622,8 +675,7 @@ def write_dataset(
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
 ) -> LanceDataset:
-    """
-    Write a given data_obj to the given uri
+    """Write a given data_obj to the given uri
 
     Parameters
     ----------
@@ -634,14 +686,17 @@ def write_dataset(
     uri: str or Path
         Where to write the dataset to (directory)
     mode: str
-        create - create a new dataset (raises if uri already exists)
-        overwrite - create a new snapshot version
-        append - create a new version that is the concat of the input the
-                 latest version (raises if uri does not exist)
+        **create** - create a new dataset (raises if uri already exists).
+
+        **overwrite** - create a new snapshot version
+
+        **append** - create a new version that is the concat of the input the
+        latest version (raises if uri does not exist)
     max_rows_per_file: int, default 1024 * 1024
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
+
     """
     if isinstance(data_obj, pa.Table):
         reader = data_obj.to_reader()
