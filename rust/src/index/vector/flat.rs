@@ -17,8 +17,7 @@
 
 //! Flat Vector Index.
 
-use arrow_array::ArrayAccessor;
-use arrow_array::{cast::as_struct_array, Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
