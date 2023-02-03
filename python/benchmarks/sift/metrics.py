@@ -129,4 +129,4 @@ if __name__ == "__main__":
             nprobes=nprobes,
             refine_factor=3,
         )
-        print(f"k={args.top_k} nprobs: {nprobes} recall={recalls[1]}")
+        print(f"k={args.top_kn} nprobs: {nprobes} recall={recalls[1]}")
