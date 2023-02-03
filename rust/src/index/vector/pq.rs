@@ -108,7 +108,6 @@ impl<'a> PQIndex<'a> {
                     c.iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
-                            // println!("Sub vec indx: {}, centroid: {}", sub_vec_idx, centroid);
                             distance_table[sub_vec_idx * 256 + *centroid as usize]
                         })
                         .sum::<f32>()

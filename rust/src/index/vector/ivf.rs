@@ -544,9 +544,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
         // Assign parition ID and compute residual vectors.
-        let now = std::time::Instant::now();
         let partitioned_batches = ivf_model.partition(&scanner).await?;
-        println!("Time to partition: {}", now.elapsed().as_secs_f32());
 
         // Train PQ
         let mut pq =
