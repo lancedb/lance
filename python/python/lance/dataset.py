@@ -288,6 +288,31 @@ class LanceDataset(pa.dataset.Dataset):
             v["timestamp"] = datetime.fromtimestamp(v["timestamp"])
         return versions
 
+    def create_index(
+        self, column: str, index_type: str, name: Optional[str] = None, **kwargs
+    ):
+        """Create index on column
+
+        *Experimental*
+
+        Parameters
+        ----------
+        column : str
+            The column to be indexed.
+        index_type : str
+            The type of the index. Only support "IVF_PQ" now.
+        name : str, optional
+            The index name. If not provided, an index name will be generated from the
+            column name.
+        kwargs :
+            Parameters passed to the index building process.
+        """
+        # Only support building index for 1 column from the API aspect, however
+        # the internal implementation might support building multi-column index later.
+        if isinstance(column, str):
+            column = [column]
+        self._ds.create_index(column, index_type, name, kwargs)
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -603,31 +628,6 @@ class LanceScanner(pa.dataset.Scanner):
         count : int
         """
         return self._ds.count_rows()
-
-    def create_index(
-        self, column: str, index_type: str, name: Optional[str] = None, **kwargs
-    ):
-        """Create index on column
-
-        *Experimental*
-
-        Parameters
-        ----------
-        column : str
-            The column to be indexed.
-        index_type : str
-            The type of the index. Only support "IVF_PQ" now.
-        name : str, optional
-            The index name. If not provided, an index name will be generated from the
-            column name.
-        kwargs :
-            Parameters passed to the index building process.
-        """
-        # Only support building index for 1 column from the API aspect, however
-        # the internal implementation might support building multi-column index later.
-        if isinstance(column, str):
-            column = [column]
-        self._ds.create_index(column, index_type, name, kwargs)
 
 
 ReaderLike = Union[
