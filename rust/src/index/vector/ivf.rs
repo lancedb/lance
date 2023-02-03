@@ -60,6 +60,7 @@ use crate::{Error, Result};
 
 const INDEX_FILE_NAME: &str = "index.idx";
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
+const RESIDUAL_COLUMN: &str = "__residual_vector";
 
 /// IVF PQ Index.
 pub struct IvfPQIndex<'a> {
@@ -379,7 +380,7 @@ impl Ivf {
                 })
                 .await??;
                 let residual_schema = Arc::new(ArrowSchema::new(vec![
-                    ArrowField::new("__residual_vector", residual.data_type().clone(), false),
+                    ArrowField::new(RESIDUAL_COLUMN, residual.data_type().clone(), false),
                     ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                     ArrowField::new(ROW_ID, DataType::UInt64, false),
                 ]));
@@ -550,7 +551,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut pq =
             ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
         let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
-        let residual_vector = batch.column_by_name("__residual_vector").unwrap();
+        let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
         let pq_code = pq.fit_transform(as_fixed_size_list_array(residual_vector))?;
 
         const PQ_CODE_COLUMN: &str = "__pq_code";
