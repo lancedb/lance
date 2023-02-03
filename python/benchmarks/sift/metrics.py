@@ -117,9 +117,16 @@ def test_dataset(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("uri", help="Dataset URI", metavar="URI")
+    parser.add_argument("-s", "--samples", default=10, type=int, metavar="N")
+    parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
     args = parser.parse_args()
 
     for nprobes in range(1, 50, 5):
-        k = 100
-        recalls = test_dataset(args.uri, nsamples=10, k=k, nprobes=nprobes, refine_factor=5)
-        print(f"k={k} nprobs: {nprobes} recall={recalls[1]}")
+        recalls = test_dataset(
+            args.uri,
+            nsamples=args.samples,
+            k=args.top_k,
+            nprobes=nprobes,
+            refine_factor=3,
+        )
+        print(f"k={args.top_k} nprobs: {nprobes} recall={recalls[1]}")
