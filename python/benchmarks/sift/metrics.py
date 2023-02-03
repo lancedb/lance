@@ -26,7 +26,6 @@ def recall(actual_sorted: np.ndarray, results: np.ndarray):
     """
     Recall-at-k
     """
-    print(results)
     len = results.shape[1]
     t = actual_sorted[:, len - 1] + 1e-3
     recall_at_k = (results <= t[:, None]).sum(axis=1) * 1.0 / len

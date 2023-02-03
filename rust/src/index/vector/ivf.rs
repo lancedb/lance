@@ -587,9 +587,9 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         for part_id in min_id..max_id + 1 {
             let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
             let parted_batch = filter_record_batch(&pq_code_batch, &predicates)?;
+            ivf_model.add_partition(writer.tell(), parted_batch.num_rows() as u32);
             if parted_batch.num_rows() > 0 {
                 // Write one partition.
-                ivf_model.add_partition(writer.tell(), parted_batch.num_rows() as u32);
                 let pq_code = &parted_batch[PQ_CODE_COLUMN];
                 writer.write_plain_encoded_array(pq_code.as_ref()).await?;
                 let row_ids = &parted_batch[ROW_ID];

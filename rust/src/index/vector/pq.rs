@@ -94,10 +94,10 @@ impl<'a> PQIndex<'a> {
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
-            let from = key.slice(i * sub_vector_length, sub_vector_length).clone();
+            let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i);
-            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids).unwrap();
-            distance_table.extend(distances.iter().map(|d| d.unwrap_or(0.0)));
+            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids)?;
+            distance_table.extend(distances.values());
         }
 
         let scores = Arc::new(Float32Array::from_iter(
@@ -108,7 +108,8 @@ impl<'a> PQIndex<'a> {
                     c.iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * self.num_sub_vectors + *centroid as usize]
+                            // println!("Sub vec indx: {}, centroid: {}", sub_vec_idx, centroid);
+                            distance_table[sub_vec_idx * 256 + *centroid as usize]
                         })
                         .sum::<f32>()
                 }),
