@@ -17,7 +17,8 @@
 
 //! Flat Vector Index.
 
-use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::ArrayAccessor;
+use arrow_array::{cast::as_struct_array, Array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
@@ -74,13 +75,12 @@ pub async fn flat_search(
             let vectors = batch
                 .column_by_name(&query.column)
                 .ok_or_else(|| {
-                    Error::Schema(format!("column {} does not exist in dataset", query.column,))
+                    Error::Schema(format!("column {} does not exist in dataset", query.column))
                 })?
                 .clone();
-            let scores = tokio::task::spawn_blocking(move || {
-                l2_distance(&k, as_fixed_size_list_array(&vectors)).unwrap()
-            })
-            .await? as ArrayRef;
+            let vec = as_fixed_size_list_array(vectors.as_ref()).clone();
+            let scores = tokio::task::spawn_blocking(move || l2_distance(&k, &vec).unwrap()).await?
+                as ArrayRef;
 
             // TODO: use heap
             let indices = sort_to_indices(&scores, None, Some(query.k))?;

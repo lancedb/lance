@@ -139,5 +139,5 @@ if __name__ == "__main__":
             refine_factor=args.refine,
         )
         print(
-            f"nprobs: {nprobes}, refine={args.refine} recall@{args.top_k}={recalls[1]:0.3f}"
+            f"nprobs: {nprobes}, refine={args.refine} recall@{args.top_k}={recalls[0]:0.3f}"
         )
