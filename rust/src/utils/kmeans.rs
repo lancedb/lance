@@ -261,6 +261,7 @@ impl KMeans {
 
     async fn compute_membership(&self, data: Arc<FixedSizeListArray>) -> KMeanMembership {
         let cluster_with_distances = stream::iter(0..data.len())
+            // make tiles of input data to split between threads.
             .chunks(1024)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
