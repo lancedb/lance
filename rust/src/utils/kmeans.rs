@@ -192,13 +192,16 @@ impl KMeanMembership {
         hist
     }
 
-    fn stddev(&self) -> f32 {
+    /// Std deviation of the histogram / cluster distribution.
+    fn hist_stddev(&self) -> f32 {
         let mean: f32 = self.len() as f32 * 1.0 / self.k as f32;
-        self.histogram()
+        (self
+            .histogram()
             .iter()
             .map(|c| (*c as f32 - mean).powi(2))
             .sum::<f32>()
-            / self.len() as f32
+            / self.len() as f32)
+            .sqrt()
     }
 }
 
@@ -235,7 +238,7 @@ impl KMeans {
         println!(
             "kmean historam: {:?} stddev={}",
             last_membership.histogram(),
-            last_membership.stddev(),
+            last_membership.hist_stddev(),
         );
         kmeans
     }
