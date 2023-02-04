@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use arrow_array::FixedSizeListArray;
-
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
@@ -26,13 +25,16 @@ use lance::utils::kmeans::KMeans;
 use lance::{arrow::*, utils::testing::generate_random_array};
 
 fn bench_train(c: &mut Criterion) {
+    // default tokio runtime
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     let dimension: i32 = 128;
     let array = generate_random_array(1024 * 4 * dimension as usize);
     let data = Arc::new(FixedSizeListArray::try_new(&array, dimension).unwrap());
 
     c.bench_function("train_128d_4k", |b| {
-        b.iter(|| {
-            KMeans::new(data.clone(), 256, 25);
+        b.to_async(&rt).iter(|| async {
+            KMeans::new(data.clone(), 256, 25).await;
         })
     });
 
@@ -51,14 +53,14 @@ fn bench_train(c: &mut Criterion) {
     let array = generate_random_array(1024 * 64 * dimension as usize);
     let data = Arc::new(FixedSizeListArray::try_new(&array, dimension).unwrap());
     c.bench_function("train_128d_65535", |b| {
-        b.iter(|| {
-            KMeans::new(data.clone(), 256, 25);
+        b.to_async(&rt).iter(|| async {
+            KMeans::new(data.clone(), 256, 25).await;
         })
     });
 
     #[cfg(feature = "faiss")]
     c.bench_function("train_128d_65535_faiss", |b| {
-        use arrow_array::cast::as_primitive_array;
+        use arrow_array::{cast::as_primitive_array, Float32Array};
         use faiss::cluster::kmeans_clustering;
 
         let array = data.as_ref().values();
@@ -71,6 +73,7 @@ fn bench_train(c: &mut Criterion) {
 
 criterion_group!(
     name=benches;
-    config = Criterion::default().significance_level(0.1).sample_size(10).with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default().significance_level(0.1).sample_size(10)
+    .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_train);
 criterion_main!(benches);
