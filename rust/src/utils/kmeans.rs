@@ -30,8 +30,8 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng, RngCore};
 
 use super::distance::l2_distance;
-use crate::{arrow::*, Error};
 use crate::Result;
+use crate::{arrow::*, Error};
 
 #[derive(Debug)]
 pub struct KMeansParams {
@@ -287,8 +287,16 @@ impl KMeans {
         let k = self.k;
         KMeanMembership {
             data,
-            cluster_ids: cluster_with_distances.iter().flat_map(|v| v).map(|(c, _)| *c).collect(),
-            distances: cluster_with_distances.iter().flat_map(|v| v).map(|(_, d)| *d).collect(),
+            cluster_ids: cluster_with_distances
+                .iter()
+                .flat_map(|v| v)
+                .map(|(c, _)| *c)
+                .collect(),
+            distances: cluster_with_distances
+                .iter()
+                .flat_map(|v| v)
+                .map(|(_, d)| *d)
+                .collect(),
             k,
         }
     }
