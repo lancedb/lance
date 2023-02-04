@@ -40,7 +40,7 @@ fn bench_train(c: &mut Criterion) {
 
     #[cfg(feature = "faiss")]
     c.bench_function("train_128d_4k_faiss", |b| {
-        use arrow_array::cast::{as_primitive_array, Float32Array};
+        use arrow_array::{cast::as_primitive_array, Float32Array};
         use faiss::cluster::kmeans_clustering;
 
         let array = data.as_ref().values();
