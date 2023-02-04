@@ -42,7 +42,7 @@ pub struct KMeansParams {
     /// threshold, stop the training.
     tolerance: f32,
 
-    /// Run kmeans mulitple times and pick the best one.
+    /// Run kmeans multiple times and pick the best one.
     redos: usize,
 }
 
@@ -173,7 +173,7 @@ impl KMeanMembership {
         self.distances.iter().sum()
     }
 
-    /// Returns how many are here
+    /// Returns how many data points are here
     fn len(&self) -> usize {
         self.cluster_ids.len()
     }
