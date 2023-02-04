@@ -137,18 +137,18 @@ fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
-                        return euclidean_distance_fma(
+                        euclidean_distance_fma(
                             from_vector,
                             &buffer[idx * dimension..(idx + 1) * dimension],
-                        );
+                        )
                     }
 
                     #[cfg(any(target_arch = "aarch64"))]
                     {
-                        return l2_distance_neon(
+                        l2_distance_neon(
                             from_vector,
                             &buffer[idx * dimension..(idx + 1) * dimension],
-                        );
+                        )
                     }
                 })
                 .map(Some),

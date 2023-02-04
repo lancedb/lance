@@ -41,6 +41,9 @@ pub struct KMeansParams {
     /// When the difference of mean distance to the centroids is less than this `tolerance`
     /// threshold, stop the training.
     tolerance: f32,
+
+    /// Run kmeans mulitple times and pick the best one.
+    redos: usize,
 }
 
 impl Default for KMeansParams {
@@ -48,12 +51,13 @@ impl Default for KMeansParams {
         Self {
             max_iters: 50,
             tolerance: 1e-4,
+            redos: 1,
         }
     }
 }
 
 /// KMeans implementation for Apache Arrow Arrays.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KMeans {
     /// Centroids for each of the k clusters.
     ///
@@ -73,18 +77,9 @@ async fn kmean_plusplus(
     assert!(data.len() > k as usize);
     let dimension = data.value_length();
 
-    let empty_array = new_empty_array(&DataType::Float32);
-    let mut kmeans = KMeans {
-        centroids: Arc::new(
-            FixedSizeListArray::try_new(as_primitive_array::<Float32Type>(&empty_array), dimension)
-                .unwrap(),
-        ),
-        k,
-    };
+    let mut kmeans = KMeans::empty(k, dimension);
 
     let first = rng.gen_range(0..data.len());
-    println!("First node: {}", first);
-
     let vector = data.value(first);
     kmeans.centroids = FixedSizeListArray::try_new(vector, dimension)
         .unwrap()
@@ -206,11 +201,24 @@ impl KMeanMembership {
 }
 
 impl KMeans {
+    fn empty(k: u32, dimension: i32) -> Self {
+        let empty_array = new_empty_array(&DataType::Float32);
+        Self {
+            centroids: Arc::new(
+                FixedSizeListArray::try_new(
+                    as_primitive_array::<Float32Type>(&empty_array),
+                    dimension,
+                )
+                .unwrap(),
+            ),
+            k,
+        }
+    }
     /// Train a KMean on data with `k` clusters.
     pub async fn new(data: Arc<FixedSizeListArray>, k: u32, max_iters: u32) -> Self {
         let mut params = KMeansParams::default();
         params.max_iters = max_iters;
-        KMeans::new_with_params(data, k, &params).await
+        Self::new_with_params(data, k, &params).await
     }
 
     pub async fn new_with_params(
@@ -218,29 +226,36 @@ impl KMeans {
         k: u32,
         params: &KMeansParams,
     ) -> Self {
-        let mut kmeans = kmean_plusplus(data.clone(), k, &mut rand::thread_rng()).await;
+        let mut best_kmeans = KMeans::empty(k, data.value_length());
+        let mut best_stddev = f32::MAX;
 
-        let mut last_membership = kmeans.compute_membership(data.clone()).await;
-        for _ in 1..=params.max_iters {
-            let new_kmeans: KMeans = last_membership.to_kmean().await.unwrap();
-            let new_membership = new_kmeans.compute_membership(data.clone()).await;
-            if (new_membership.distance_sum() - last_membership.distance_sum()).abs()
-                / last_membership.distance_sum()
-                < params.tolerance
-            {
+        for _ in 1..=params.redos {
+            let mut kmeans = kmean_plusplus(data.clone(), k, &mut rand::thread_rng()).await;
+            let mut last_membership = kmeans.compute_membership(data.clone()).await;
+            for i in 1..=params.max_iters {
+                let new_kmeans = last_membership.to_kmean().await.unwrap();
+                let new_membership = new_kmeans.compute_membership(data.clone()).await;
+                if (new_membership.distance_sum() - last_membership.distance_sum()).abs()
+                    / last_membership.distance_sum()
+                    < params.tolerance
+                {
+                    kmeans = new_kmeans;
+                    last_membership = new_membership;
+                    println!("Early converged at iteration: {i}");
+                    break;
+                }
                 kmeans = new_kmeans;
                 last_membership = new_membership;
-                break;
             }
-            kmeans = new_kmeans;
-            last_membership = new_membership;
+            // Optimize for balanced clusters instead of minimal distance.
+            let stddev = last_membership.hist_stddev();
+            if stddev < best_stddev {
+                best_kmeans = kmeans;
+                best_stddev = stddev;
+            }
         }
-        println!(
-            "kmean historam: {:?} stddev={}",
-            last_membership.histogram(),
-            last_membership.hist_stddev(),
-        );
-        kmeans
+
+        best_kmeans
     }
 
     async fn compute_membership(&self, data: Arc<FixedSizeListArray>) -> KMeanMembership {
@@ -256,7 +271,7 @@ impl KMeans {
             .collect::<Vec<_>>();
         let k = self.k;
         KMeanMembership {
-            data: data.clone(),
+            data,
             cluster_ids: cluster_with_distances.iter().map(|(c, _)| *c).collect(),
             distances: cluster_with_distances.iter().map(|(_, d)| *d).collect(),
             k,
