@@ -19,12 +19,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{add, divide_scalar};
+use arrow_array::types::Float32Type;
 use arrow_array::{
     cast::as_primitive_array, new_empty_array, Array, FixedSizeListArray, Float32Array,
 };
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::DataType;
 use arrow_select::concat::concat;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng, RngCore};
 
@@ -70,19 +71,17 @@ fn kmean_plusplus(
     rng: &mut dyn RngCore,
 ) -> KMeans {
     assert!(data.len() > k as usize);
+    let dimension = data.value_length();
+
+    let empty_array = new_empty_array(&DataType::Float32);
     let mut kmeans = KMeans {
-        centroids: new_empty_array(&DataType::FixedSizeList(
-            Box::new(ArrowField::new("item", DataType::Float32, false)),
-            data.value_length(),
-        ))
-        .as_any()
-        .downcast_ref::<Arc<FixedSizeListArray>>()
-        .unwrap()
-        .clone(),
+        centroids: Arc::new(
+            FixedSizeListArray::try_new(as_primitive_array::<Float32Type>(&empty_array), dimension)
+                .unwrap(),
+        ),
         k,
     };
 
-    let dimension = data.value_length();
     let first = rng.gen_range(0..data.len());
 
     let vector = data.value(first);
@@ -139,39 +138,46 @@ impl TryFrom<&KMeanMembership> for KMeans {
 
     fn try_from(membership: &KMeanMembership) -> Result<Self> {
         let dimension = membership.data.value_length();
+        let cluster_ids = Arc::new(membership.cluster_ids.clone());
+        let data = membership.data.clone();
         let means = tokio::runtime::Runtime::new().unwrap().block_on(async {
             stream::iter(0..membership.k)
-                .map(|cluster| {
-                    membership
-                        .cluster_ids
-                        .iter()
-                        .filter(|id| **id == cluster)
-                        .fold(
-                            (
-                                Float32Array::from_iter_values(
-                                    (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
-                                ),
-                                0.0,
-                            ),
-                            |(arr, total), idx| {
+                .zip(repeat_with(|| (data.clone(), cluster_ids.clone())))
+                .map(|(cluster, (data, cluster_ids))| async move {
+                    tokio::task::spawn_blocking(move || {
+                        cluster_ids
+                            .clone()
+                            .as_ref()
+                            .iter()
+                            .filter(|id| **id == cluster)
+                            .fold(
                                 (
-                                    add(
-                                        &arr,
-                                        as_primitive_array(
-                                            membership.data.value(*idx as usize).as_ref(),
-                                        ),
+                                    Float32Array::from_iter_values(
+                                        (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
+                                    ),
+                                    0.0,
+                                ),
+                                |(arr, total), idx| {
+                                    (
+                                        add(
+                                            &arr,
+                                            as_primitive_array(data.value(*idx as usize).as_ref()),
+                                        )
+                                        .unwrap(),
+                                        total + 1.0,
                                     )
-                                    .unwrap(),
-                                    total + 1.0,
-                                )
-                            },
-                        )
+                                },
+                            )
+                    })
+                    .await
                 })
-                .map(|(arr, total)| divide_scalar(&arr, total).unwrap())
-                .collect::<Vec<_>>()
+                .buffered(16)
+                .map_ok(|(arr, total)| divide_scalar(&arr, total).unwrap())
+                .try_collect::<Vec<_>>()
                 .await
-        });
+        })?;
 
+        // TODO: concat requires `&[&dyn Array]`. Are there cheaper way to pass Vec<Float32Array> to `concat`?
         let mut mean_refs: Vec<&dyn Array> = vec![];
         for m in means.iter() {
             mean_refs.push(m);
