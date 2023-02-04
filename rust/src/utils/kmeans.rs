@@ -93,7 +93,7 @@ fn kmean_plusplus(
 
     let mut seen = HashSet::new();
     seen.insert(first);
-    for i in 1..k {
+    for _ in 1..k {
         let membership = kmeans.compute_membership(data.clone());
         let weights = WeightedIndex::new(&membership.distances).unwrap();
         let mut chosen;
@@ -208,6 +208,7 @@ impl KMeans {
                 break;
             }
             kmeans = new_kmeans;
+            last_membership = new_membership;
         }
         kmeans
     }
@@ -231,4 +232,9 @@ impl KMeans {
             k,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+
 }
