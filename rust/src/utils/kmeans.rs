@@ -30,7 +30,7 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng, RngCore};
 
 use super::distance::l2_distance;
-use crate::arrow::*;
+use crate::{arrow::*, Error};
 use crate::Result;
 
 #[derive(Debug)]
@@ -241,7 +241,8 @@ impl KMeans {
                 {
                     kmeans = new_kmeans;
                     last_membership = new_membership;
-                    println!("Early converged at iteration: {i}");
+                    #[cfg(debug_assertions)]
+                    println!("Kmeans: early converged at iteration: {i}");
                     break;
                 }
                 kmeans = new_kmeans;
@@ -259,21 +260,35 @@ impl KMeans {
     }
 
     async fn compute_membership(&self, data: Arc<FixedSizeListArray>) -> KMeanMembership {
-        let cluster_with_distances = (0..data.len())
-            .map(|idx| {
-                let value_arr = data.value(idx);
-                let vector: &Float32Array = as_primitive_array(&value_arr);
-                let distances = l2_distance(vector, self.centroids.as_ref()).unwrap();
-                let cluster_id = argmin(distances.as_ref()).unwrap();
-                let distance = distances.value(cluster_id as usize);
-                (cluster_id, distance)
+        let cluster_with_distances = stream::iter(0..data.len())
+            .chunks(1024)
+            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
+            .map(|(indices, (data, centroids))| async move {
+                // let data = data.clone();
+                let data = tokio::task::spawn_blocking(move || {
+                    let mut results = vec![];
+                    for idx in indices {
+                        let value_arr = data.value(idx);
+                        let vector: &Float32Array = as_primitive_array(&value_arr);
+                        let distances = l2_distance(vector, centroids.as_ref()).unwrap();
+                        let cluster_id = argmin(distances.as_ref()).unwrap();
+                        let distance = distances.value(cluster_id as usize);
+                        results.push((cluster_id, distance))
+                    }
+                    results
+                })
+                .await?;
+                Ok::<Vec<_>, Error>(data)
             })
-            .collect::<Vec<_>>();
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         let k = self.k;
         KMeanMembership {
             data,
-            cluster_ids: cluster_with_distances.iter().map(|(c, _)| *c).collect(),
-            distances: cluster_with_distances.iter().map(|(_, d)| *d).collect(),
+            cluster_ids: cluster_with_distances.iter().flat_map(|v| v).map(|(c, _)| *c).collect(),
+            distances: cluster_with_distances.iter().flat_map(|v| v).map(|(_, d)| *d).collect(),
             k,
         }
     }
