@@ -22,7 +22,6 @@ use arrow_arith::arithmetic::{add, divide_scalar};
 use arrow_array::{
     cast::as_primitive_array, new_empty_array, Array, FixedSizeListArray, Float32Array,
 };
-use arrow_array::{ArrayAccessor, PrimitiveArray};
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::concat::concat;
 use futures::stream::{self, StreamExt};
@@ -235,6 +234,4 @@ impl KMeans {
 }
 
 #[cfg(test)]
-mod tests {
-
-}
+mod tests {}
