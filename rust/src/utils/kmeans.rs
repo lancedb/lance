@@ -265,7 +265,6 @@ impl KMeans {
             .chunks(1024)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
-                // let data = data.clone();
                 let data = tokio::task::spawn_blocking(move || {
                     let mut results = vec![];
                     for idx in indices {
@@ -290,12 +289,12 @@ impl KMeans {
             data,
             cluster_ids: cluster_with_distances
                 .iter()
-                .flat_map(|v| v)
+                .flatten()
                 .map(|(c, _)| *c)
                 .collect(),
             distances: cluster_with_distances
                 .iter()
-                .flat_map(|v| v)
+                .flatten()
                 .map(|(_, d)| *d)
                 .collect(),
             k,
