@@ -29,19 +29,6 @@ use crate::{
     Result,
 };
 
-#[cfg(feature = "faiss")]
-fn train_kmeans_faiss(
-    array: &Float32Array,
-    dimension: usize,
-    num_clusters: u32,
-    max_iters: u32,
-) -> Result<Float32Array> {
-    use faiss::cluster::kmeans_clustering;
-
-    let model = kmeans_clustering(dimension as u32, num_clusters, array.values()).unwrap();
-    Ok(model.centroids.into())
-}
-
 /// A fallback default implementation of KMeans, if not accelerator found.
 async fn train_kmeans_fallback(
     array: &Float32Array,
@@ -94,9 +81,5 @@ pub async fn train_kmeans(
         k
     );
 
-    #[cfg(feature = "faiss")]
-    return train_kmeans_faiss(&data, dimension, k, max_iterations);
-
-    #[cfg(not(feature = "faiss"))]
     train_kmeans_fallback(&data, dimension, k, max_iterations).await
 }
