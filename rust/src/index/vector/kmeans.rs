@@ -74,12 +74,5 @@ pub async fn train_kmeans(
         array.clone()
     };
 
-    println!(
-        "Kmeans: Training {} samples, dimension={}, k={}",
-        data.len() / dimension,
-        dimension,
-        k
-    );
-
     train_kmeans_fallback(&data, dimension, k, max_iterations).await
 }

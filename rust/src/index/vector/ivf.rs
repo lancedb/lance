@@ -556,6 +556,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
         let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
         let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
+
         let pq_code = pq
             .fit_transform(as_fixed_size_list_array(residual_vector))
             .await?;
