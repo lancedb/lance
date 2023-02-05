@@ -45,14 +45,15 @@ prost = "0.11"
 prost-types = "0.11"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
-rand = "0.8.3"
+rand = { version = "0.8.3", features = ["small_rng"] }
 futures = "0.3"
 uuid = { version = "1.2", features = ["v4"] }
-faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 path-absolutize = "3.0.14"
 cblas = { version = "0.4.0", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
 num_cpus = "1.0"
+faiss = { version = "0.11.0", features = ["gpu"], optional = true }
+
 
 [build-dependencies]
 prost-build = "0.11"
@@ -63,6 +64,7 @@ criterion = { version = "0.4", features = ["async", "async_tokio"] }
 pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 tempfile = "3.3.0"
 approx = "0.5.1"
+
 
 [features]
 cli = ["clap"]

@@ -15,43 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::Float32Array;
+use std::sync::Arc;
 
-use crate::Result;
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array,
+    FixedSizeListArray, Float32Array,
+};
+use rand::{seq::IteratorRandom, Rng};
 
-#[cfg(feature = "faiss")]
-fn train_kmeans_faiss(
-    array: &Float32Array,
-    dimension: usize,
-    num_clusters: u32,
-    max_iters: u32,
-) -> Result<Float32Array> {
-    use faiss::cluster::kmeans_clustering;
-
-    let model = kmeans_clustering(dimension as u32, num_clusters, array.values()).unwrap();
-    Ok(model.centroids.into())
-}
+use crate::{
+    arrow::FixedSizeListArrayExt,
+    utils::kmeans::{KMeans, KMeansParams},
+    Result,
+};
 
 /// A fallback default implementation of KMeans, if not accelerator found.
-fn train_kmeans_fallback(
-    _array: &Float32Array,
-    _dimension: usize,
-    _k: u32,
-    _max_iter: u32,
+async fn train_kmeans_fallback(
+    array: &Float32Array,
+    dimension: usize,
+    k: u32,
+    max_iters: u32,
 ) -> Result<Float32Array> {
-    todo!()
+    let data = Arc::new(FixedSizeListArray::try_new(array, dimension as i32)?);
+    let mut params = KMeansParams::default();
+    params.max_iters = max_iters;
+    let model = KMeans::new_with_params(data, k, &params).await;
+    let centroids = model.centroids.values();
+    let floats: &Float32Array = as_primitive_array(centroids.as_ref());
+    Ok(floats.clone())
 }
 
 /// Train kmeans model and returns the centroids of each cluster.
-pub fn train_kmeans(
+pub async fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
-    num_clusters: u32,
+    k: u32,
     max_iterations: u32,
+    mut rng: impl Rng,
 ) -> Result<Float32Array> {
-    #[cfg(feature = "faiss")]
-    return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
+    let num_rows = array.len() / dimension;
+    // Ony sample 256 * num_clusters. See Faiss
+    let data = if num_rows > 256 * k as usize {
+        println!(
+            "Sample {} out of {} to train kmeans of {} clusters",
+            256 * k,
+            array.len() / dimension,
+            k,
+        );
+        let sample_size = 256 * k as usize;
+        let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
+        let mut builder = Float32Builder::with_capacity(sample_size * dimension);
+        for idx in chosen.iter() {
+            let s = array.slice(idx * dimension, dimension);
+            builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
+        }
+        builder.finish()
+    } else {
+        array.clone()
+    };
 
-    #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback(array, dimension, num_clusters, max_iterations)
+    train_kmeans_fallback(&data, dimension, k, max_iterations).await
 }

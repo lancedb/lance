@@ -39,6 +39,8 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use rand::SeedableRng;
+use rand::{rngs::SmallRng, Rng};
 use uuid::Uuid;
 
 use super::{
@@ -530,12 +532,14 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
 
+        let rng = SmallRng::from_entropy();
         let mut ivf_model = Ivf::new(
             train_kmean_model(
                 &scanner,
                 self.dimension,
                 self.num_partitions,
                 self.kmeans_max_iters,
+                rng.clone(),
             )
             .await?,
         );
@@ -552,7 +556,10 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
         let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
         let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
-        let pq_code = pq.fit_transform(as_fixed_size_list_array(residual_vector))?;
+
+        let pq_code = pq
+            .fit_transform(as_fixed_size_list_array(residual_vector))
+            .await?;
 
         const PQ_CODE_COLUMN: &str = "__pq_code";
         let pq_code_batch = RecordBatch::try_new(
@@ -619,6 +626,7 @@ async fn train_kmean_model(
     dimension: usize,
     k: u32,
     max_iterations: u32,
+    rng: impl Rng,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);
@@ -640,7 +648,7 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations)?;
+    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng).await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,
