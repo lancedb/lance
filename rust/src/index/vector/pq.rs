@@ -26,6 +26,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 
+use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::Result;
@@ -33,7 +34,7 @@ use crate::{arrow::*, utils::distance::l2_distance};
 
 /// Product Quantization Index.
 ///
-pub struct PQIndex {
+pub struct PQIndex<'a> {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -45,24 +46,8 @@ pub struct PQIndex {
     /// Vector dimension.
     pub dimension: usize,
 
-    /// PQ codebook
-    ///
-    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
-    ///
-    /// Use a layout that is cache / SIMD friendly to compute centroid.
-    /// But not sure how to make distance lookup via PQ code lookup
-    /// be cache friendly tho.
-    ///
-    /// Layout:
-    ///
-    ///  - *row*: all centroids for the same sub-vector.
-    ///  - *column*: the centroid value of the n-th sub-vector.
-    ///
-    /// ```text
-    /// // Centroids for a sub-vector.
-    /// Codebook[sub_vector_id][pq_code]
-    /// ```
-    pub codebook: Arc<Float32Array>,
+    /// Product quantizer.
+    pub pq: &'a ProductQuantizer,
 
     /// PQ code
     pub code: Arc<UInt8Array>,
@@ -71,51 +56,30 @@ pub struct PQIndex {
     pub row_ids: Arc<UInt64Array>,
 }
 
-impl PQIndex {
+impl<'a> PQIndex<'a> {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
         reader: &dyn ObjectReader,
-        pq: &ProductQuantizer,
+        pq: &'a ProductQuantizer,
         offset: usize,
         length: usize,
-    ) -> Result<Self> {
-        // TODO: read code book, PQ code and row_ids in parallel.
-        let code_book_length = ProductQuantizer::codebook_length(pq.nbits, pq.dimension);
-        let codebook =
-            read_fixed_stride_array(reader, &DataType::Float32, offset, code_book_length, ..)
-                .await?;
-
-        let pq_code_offset = offset + code_book_length * 4;
+    ) -> Result<PQIndex<'a>> {
         let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, pq_code_offset, pq_code_length, ..)
-                .await?;
+            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
 
-        let row_id_offset = pq_code_offset + pq_code_length /* *1 */;
+        let row_id_offset = offset + pq_code_length /* *1 */;
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
         Ok(Self {
-            nbits: pq.nbits,
+            nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            // TODO: make reader returns typed array to avoid one array copy.
-            codebook: Arc::new(as_primitive_array(&codebook).clone()),
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+            pq,
         })
-    }
-
-    /// Get the centroids for one sub-vector.
-    pub fn centroids(&self, sub_vector_idx: usize) -> FixedSizeListArray {
-        assert!(sub_vector_idx < self.num_sub_vectors);
-
-        let arr = self
-            .codebook
-            .slice(sub_vector_idx * self.dimension, self.dimension);
-        let f32_arr: &Float32Array = as_primitive_array(&arr);
-        FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
-            .unwrap()
     }
 
     /// Search top-k nearest neighbors for `key` within one PQ partition.
@@ -130,10 +94,10 @@ impl PQIndex {
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
-            let from = key.slice(i * sub_vector_length, sub_vector_length).clone();
-            let subvec_centroids = self.centroids(i);
-            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids).unwrap();
-            distance_table.extend(distances.iter().map(|d| d.unwrap_or(0.0)));
+            let from = key.slice(i * sub_vector_length, sub_vector_length);
+            let subvec_centroids = self.pq.centroids(i);
+            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids)?;
+            distance_table.extend(distances.values());
         }
 
         let scores = Arc::new(Float32Array::from_iter(
@@ -144,7 +108,7 @@ impl PQIndex {
                     c.iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * self.num_sub_vectors + *centroid as usize]
+                            distance_table[sub_vec_idx * 256 + *centroid as usize]
                         })
                         .sum::<f32>()
                 }),
@@ -168,7 +132,7 @@ pub struct ProductQuantizer {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
-    pub nbits: u32,
+    pub num_bits: u32,
 
     /// Number of sub-vectors.
     pub num_sub_vectors: usize,
@@ -178,7 +142,7 @@ pub struct ProductQuantizer {
 
     /// PQ codebook
     ///
-    /// ```((2 ^ nbits) * num_sub_vectors)``` of `f32`
+    /// ```((2 ^ nbits) * num_subvector * sub_vector_length)``` of `f32`
     ///
     /// Use a layout that is cache / SIMD friendly to compute centroid.
     /// But not sure how to make distance lookup via PQ code lookup
@@ -201,7 +165,7 @@ impl ProductQuantizer {
     pub fn new(m: usize, nbits: u32, dimension: usize) -> Self {
         assert!(nbits == 8, "nbits can only be 8");
         Self {
-            nbits,
+            num_bits: nbits,
             num_sub_vectors: m,
             dimension,
             codebook: None,
@@ -222,14 +186,15 @@ impl ProductQuantizer {
         assert!(sub_vector_idx < self.num_sub_vectors as usize);
         assert!(self.codebook.is_some());
 
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
+        let sub_vector_width = self.dimension / self.num_sub_vectors;
         let codebook = self.codebook.as_ref().unwrap();
         let arr = codebook.slice(
-            sub_vector_idx * self.dimension as usize,
-            self.dimension as usize,
+            sub_vector_idx * num_centroids * sub_vector_width as usize,
+            num_centroids * sub_vector_width as usize,
         );
         let f32_arr: &Float32Array = as_primitive_array(&arr);
-        FixedSizeListArray::try_new(f32_arr, self.dimension as i32 / self.num_sub_vectors as i32)
-            .unwrap()
+        FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap()
     }
 
     /// Transform the vector array to PQ code array.
@@ -259,7 +224,7 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_u32.pow(self.nbits);
+        let num_centorids = 2_u32.pow(self.num_bits);
         let dimension = data.value_length() as usize / self.num_sub_vectors;
 
         let mut codebook_builder =
@@ -278,6 +243,30 @@ impl ProductQuantizer {
         let pd_centroids = codebook_builder.finish();
         self.codebook = Some(Arc::new(pd_centroids));
         Ok(self.transform(&sub_vectors))
+    }
+}
+
+impl From<&pb::Pq> for ProductQuantizer {
+    fn from(proto: &pb::Pq) -> Self {
+        Self {
+            num_bits: proto.num_bits,
+            num_sub_vectors: proto.num_sub_vectors as usize,
+            dimension: proto.dimension as usize,
+            codebook: Some(Arc::new(Float32Array::from_iter_values(
+                proto.codebook.iter().copied(),
+            ))),
+        }
+    }
+}
+
+impl From<&ProductQuantizer> for pb::Pq {
+    fn from(pq: &ProductQuantizer) -> Self {
+        Self {
+            num_bits: pq.num_bits,
+            num_sub_vectors: pq.num_sub_vectors as u32,
+            dimension: pq.dimension as u32,
+            codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+        }
     }
 }
 

@@ -373,6 +373,7 @@ impl Dataset {
         let mut sorted_row_ids = Vec::from(row_ids);
         sorted_row_ids.sort();
 
+        // Group ROW Ids by the fragment
         let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         sorted_row_ids.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
@@ -405,7 +406,7 @@ impl Dataset {
             .await?;
         let one_batch = concat_batches(&schema, &batches)?;
 
-        let original_indices: UInt64Array = row_ids
+        let remapping_index: UInt64Array = row_ids
             .iter()
             .map(|o| {
                 sorted_row_ids
@@ -415,7 +416,7 @@ impl Dataset {
             })
             .collect();
         let struct_arr: StructArray = one_batch.into();
-        let reordered = take(&struct_arr, &original_indices, None)?;
+        let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
     }
 

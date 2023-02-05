@@ -247,7 +247,7 @@ impl<'a> FileReader<'a> {
     }
 }
 
-/// Read within one batch.
+/// Read a batch.
 async fn read_batch(
     reader: &FileReader<'_>,
     params: &ReadBatchParams,
@@ -261,14 +261,25 @@ async fn read_batch(
         .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
+        let ids_in_batch: Vec<i32> = match params {
+            ReadBatchParams::Indices(indices) => {
+                indices.values().iter().map(|v| *v as i32).collect()
+            }
+            ReadBatchParams::Range(r) => r.clone().map(|v| v as i32).collect(),
+            ReadBatchParams::RangeFull => (0..batch.num_rows() as i32).collect(),
+            ReadBatchParams::RangeTo(r) => (0..r.end).map(|v| v as i32).collect(),
+            ReadBatchParams::RangeFrom(r) => (r.start..r.start + batch.num_rows())
+                .map(|v| v as i32)
+                .collect(),
+        };
         let batch_offset = reader
             .metadata
             .get_offset(batch_id)
             .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
-            (batch_offset..(batch_offset + batch.num_rows() as i32))
-                .map(|o| compute_row_id(reader.fragment_id, o))
-                .collect::<Vec<_>>(),
+            ids_in_batch
+                .iter()
+                .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset)),
         ));
         batch = batch.try_with_column(
             ArrowField::new("_rowid", DataType::UInt64, false),

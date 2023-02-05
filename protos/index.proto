@@ -64,6 +64,12 @@ message PQ {
 
   // Number of sub vectors.
   uint32 num_sub_vectors = 2;
+
+  // Vector dimension
+  uint32 dimension = 3;
+
+  // Codebook. `dimension * 2 ^ num_bits` of float32s.
+  repeated float codebook = 4;
 }
 
 // Flat Index

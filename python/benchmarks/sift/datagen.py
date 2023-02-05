@@ -41,7 +41,6 @@ def main():
 
         schema = pa.schema([pa.field("vector", pa.list_(pa.float32(), 128))])
         table = pa.Table.from_arrays([data.tolist()], schema=schema)
-        print(table)
 
         lance.write_dataset(
             table,

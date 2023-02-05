@@ -226,7 +226,7 @@ impl Scanner {
                         PREFECTH_SIZE,
                         true,
                     ));
-                    Box::new(KNNFlat::new(scan_node, q))
+                    Box::new(KNNFlat::new(scan_node, &q.clone()))
                 };
 
             let take_node = Box::new(Take::new(
@@ -236,7 +236,7 @@ impl Scanner {
             ));
 
             if q.refine_factor.is_some() {
-                Box::new(KNNFlat::new(take_node, q))
+                Box::new(KNNFlat::new(take_node, &q.clone()))
             } else {
                 take_node
             }

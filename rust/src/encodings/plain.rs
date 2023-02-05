@@ -78,13 +78,15 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
+    /// Encode primitive values.
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
-        let data = array.data().buffers()[0].as_ref();
+        let data = array.data().buffers()[0].as_slice();
         self.writer.write_all(data).await?;
         Ok(offset)
     }
 
+    /// Encode fixed size list.
     async fn encode_fixed_size_list(&mut self, array: &dyn Array, items: &Field) -> Result<usize> {
         let list_array = array
             .as_any()
