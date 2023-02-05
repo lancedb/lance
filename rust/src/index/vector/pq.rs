@@ -25,6 +25,7 @@ use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
+use rand::SeedableRng;
 
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
@@ -229,12 +230,15 @@ impl ProductQuantizer {
 
         let mut codebook_builder =
             Float32Builder::with_capacity(num_centorids as usize * data.value_length() as usize);
+        let rng = rand::rngs::SmallRng::from_entropy();
+
         // TODO: parallel training.
         for sub_vec in &sub_vectors {
             // Centroids for one sub vector.
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
-            let centroids = train_kmeans(flatten_array, dimension, num_centorids, 100).await?;
+            let centroids =
+                train_kmeans(flatten_array, dimension, num_centorids, 25, rng.clone()).await?;
             // TODO: COPIED COPIED COPIED
             unsafe {
                 codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());

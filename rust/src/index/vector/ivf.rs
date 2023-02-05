@@ -39,6 +39,8 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use uuid::Uuid;
 
 use super::{
@@ -640,7 +642,7 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations)?;
+    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng.clone()).await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,

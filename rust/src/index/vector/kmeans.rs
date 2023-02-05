@@ -17,9 +17,17 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, Float32Array};
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array,
+    FixedSizeListArray, Float32Array,
+};
+use rand::{seq::IteratorRandom, Rng};
 
-use crate::{arrow::FixedSizeListArrayExt, Result, utils::kmeans::{KMeansParams, KMeans}};
+use crate::{
+    arrow::FixedSizeListArrayExt,
+    utils::kmeans::{KMeans, KMeansParams},
+    Result,
+};
 
 #[cfg(feature = "faiss")]
 fn train_kmeans_faiss(
@@ -45,8 +53,9 @@ async fn train_kmeans_fallback(
     let mut params = KMeansParams::default();
     params.max_iters = max_iters;
     let model = KMeans::new_with_params(data, k, &params).await;
-
-    todo!()
+    let centroids = model.centroids.values();
+    let floats: &Float32Array = as_primitive_array(centroids.as_ref());
+    Ok(floats.clone())
 }
 
 /// Train kmeans model and returns the centroids of each cluster.
@@ -55,10 +64,31 @@ pub async fn train_kmeans(
     dimension: usize,
     num_clusters: u32,
     max_iterations: u32,
+    mut rng: impl Rng,
 ) -> Result<Float32Array> {
+    let num_rows = array.len() / dimension;
+    // Ony sample 256 * num_clusters. See Faiss
+    let data = if num_rows > 256 * num_clusters as usize {
+        println!(
+            "Sample {} out of {} to train kmeans of {} clusters",
+            256 * num_clusters,
+            array.len() / dimension,
+            num_clusters,
+        );
+        let sample_size = 256 * num_clusters as usize;
+        let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
+        let mut builder = Float32Builder::with_capacity(sample_size * dimension);
+        for idx in chosen.iter() {
+            let s = array.slice(idx * dimension, dimension);
+            builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
+        }
+        builder.finish()
+    } else {
+        array.clone()
+    };
     #[cfg(feature = "faiss")]
-    return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
+    return train_kmeans_faiss(&data, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback(array, dimension, num_clusters, max_iterations).await
+    train_kmeans_fallback(&data, dimension, num_clusters, max_iterations).await
 }
