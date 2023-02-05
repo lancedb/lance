@@ -52,6 +52,7 @@ faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 path-absolutize = "3.0.14"
 cblas = { version = "0.4.0", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
+num_cpus = "1.0"
 
 [build-dependencies]
 prost-build = "0.11"
@@ -82,4 +83,8 @@ harness = false
 
 [[bench]]
 name = "vector_index"
+harness = false
+
+[[bench]]
+name = "kmeans"
 harness = false

@@ -18,4 +18,5 @@
 //! Various utilities
 
 pub mod distance;
+pub mod kmeans;
 pub mod testing;
