@@ -62,20 +62,20 @@ async fn train_kmeans_fallback(
 pub async fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
-    num_clusters: u32,
+    k: u32,
     max_iterations: u32,
     mut rng: impl Rng,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     // Ony sample 256 * num_clusters. See Faiss
-    let data = if num_rows > 256 * num_clusters as usize {
+    let data = if num_rows > 256 * k as usize {
         println!(
             "Sample {} out of {} to train kmeans of {} clusters",
-            256 * num_clusters,
+            256 * k,
             array.len() / dimension,
-            num_clusters,
+            k,
         );
-        let sample_size = 256 * num_clusters as usize;
+        let sample_size = 256 * k as usize;
         let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
         let mut builder = Float32Builder::with_capacity(sample_size * dimension);
         for idx in chosen.iter() {
@@ -86,9 +86,17 @@ pub async fn train_kmeans(
     } else {
         array.clone()
     };
+
+    println!(
+        "Kmeans: Training {} samples, dimension={}, k={}",
+        data.len() / dimension,
+        dimension,
+        k
+    );
+
     #[cfg(feature = "faiss")]
-    return train_kmeans_faiss(&data, dimension, num_clusters, max_iterations);
+    return train_kmeans_faiss(&data, dimension, k, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback(&data, dimension, num_clusters, max_iterations).await
+    train_kmeans_fallback(&data, dimension, k, max_iterations).await
 }
