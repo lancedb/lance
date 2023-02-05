@@ -52,6 +52,8 @@ path-absolutize = "3.0.14"
 cblas = { version = "0.4.0", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
 num_cpus = "1.0"
+faiss = { version = "0.11.0", features = ["gpu"], optional = true }
+
 
 [build-dependencies]
 prost-build = "0.11"
@@ -62,7 +64,6 @@ criterion = { version = "0.4", features = ["async", "async_tokio"] }
 pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 tempfile = "3.3.0"
 approx = "0.5.1"
-faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 
 
 [features]
