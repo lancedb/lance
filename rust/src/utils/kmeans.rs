@@ -27,7 +27,7 @@ use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
-use rand::{distributions::WeightedIndex, Rng, RngCore};
+use rand::{distributions::WeightedIndex, Rng};
 
 use super::distance::l2_distance;
 use crate::Result;
@@ -36,14 +36,14 @@ use crate::{arrow::*, Error};
 #[derive(Debug)]
 pub struct KMeansParams {
     /// Max number of iterations.
-    max_iters: u32,
+    pub max_iters: u32,
 
     /// When the difference of mean distance to the centroids is less than this `tolerance`
     /// threshold, stop the training.
-    tolerance: f32,
+    pub tolerance: f32,
 
     /// Run kmeans multiple times and pick the best one.
-    redos: usize,
+    pub redos: usize,
 }
 
 impl Default for KMeansParams {
@@ -72,7 +72,7 @@ pub struct KMeans {
 async fn kmean_plusplus(
     data: Arc<FixedSizeListArray>,
     k: u32, /* dist_fn, rand_seed */
-    rng: &mut dyn RngCore,
+    mut rng: impl Rng,
 ) -> KMeans {
     assert!(data.len() > k as usize);
     let dimension = data.value_length();
@@ -92,7 +92,7 @@ async fn kmean_plusplus(
         let weights = WeightedIndex::new(&membership.distances).unwrap();
         let mut chosen;
         loop {
-            chosen = weights.sample(rng);
+            chosen = weights.sample(&mut rng);
             if !seen.contains(&chosen) {
                 seen.insert(chosen);
                 break;
@@ -229,8 +229,9 @@ impl KMeans {
         let mut best_kmeans = KMeans::empty(k, data.value_length());
         let mut best_stddev = f32::MAX;
 
+        let rng = rand::rngs::SmallRng::from_entropy();
         for _ in 1..=params.redos {
-            let mut kmeans = kmean_plusplus(data.clone(), k, &mut rand::thread_rng()).await;
+            let mut kmeans = kmean_plusplus(data.clone(), k, rng.clone()).await;
             let mut last_membership = kmeans.compute_membership(data.clone()).await;
             for i in 1..=params.max_iters {
                 let new_kmeans = last_membership.to_kmean().await.unwrap();

@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::Float32Array;
+use std::sync::Arc;
 
-use crate::Result;
+use arrow_array::{FixedSizeListArray, Float32Array};
+
+use crate::{arrow::FixedSizeListArrayExt, Result, utils::kmeans::{KMeansParams, KMeans}};
 
 #[cfg(feature = "faiss")]
 fn train_kmeans_faiss(
@@ -33,17 +35,22 @@ fn train_kmeans_faiss(
 }
 
 /// A fallback default implementation of KMeans, if not accelerator found.
-fn train_kmeans_fallback(
-    _array: &Float32Array,
-    _dimension: usize,
-    _k: u32,
-    _max_iter: u32,
+async fn train_kmeans_fallback(
+    array: &Float32Array,
+    dimension: usize,
+    k: u32,
+    max_iters: u32,
 ) -> Result<Float32Array> {
+    let data = Arc::new(FixedSizeListArray::try_new(array, dimension as i32)?);
+    let mut params = KMeansParams::default();
+    params.max_iters = max_iters;
+    let model = KMeans::new_with_params(data, k, &params).await;
+
     todo!()
 }
 
 /// Train kmeans model and returns the centroids of each cluster.
-pub fn train_kmeans(
+pub async fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
     num_clusters: u32,
@@ -53,5 +60,5 @@ pub fn train_kmeans(
     return train_kmeans_faiss(array, dimension, num_clusters, max_iterations);
 
     #[cfg(not(feature = "faiss"))]
-    train_kmeans_fallback(array, dimension, num_clusters, max_iterations)
+    train_kmeans_fallback(array, dimension, num_clusters, max_iterations).await
 }

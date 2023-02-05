@@ -218,7 +218,7 @@ impl ProductQuantizer {
     }
 
     /// Train a [ProductQuantizer] using an array of vectors.
-    pub fn fit_transform(&mut self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+    pub async fn fit_transform(&mut self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
         assert!(data.value_length() % self.num_sub_vectors as i32 == 0);
         assert_eq!(data.value_type(), DataType::Float32);
         assert_eq!(data.null_count(), 0);
@@ -234,7 +234,7 @@ impl ProductQuantizer {
             // Centroids for one sub vector.
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
-            let centroids = train_kmeans(flatten_array, dimension, num_centorids, 100)?;
+            let centroids = train_kmeans(flatten_array, dimension, num_centorids, 100).await?;
             // TODO: COPIED COPIED COPIED
             unsafe {
                 codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());
