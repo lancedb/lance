@@ -5,6 +5,10 @@ inputs:
   python-minor-version:
     description: "8, 9, 10, 11"
     required: true
+  args:
+    description: "--release"
+    required: false
+    default: ""
 runs:
   using: "composite"
   steps:
@@ -16,5 +20,6 @@ runs:
       uses: PyO3/maturin-action@v1
       with:
         command: build
+        args: ${{ inputs.args }}
         working-directory: python
 

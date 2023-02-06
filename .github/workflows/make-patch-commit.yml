@@ -23,13 +23,12 @@ jobs:
       uses: ./.github/workflows/bump-version
       with:
         part: "patch"
-        tag: "--no-tag"
-    - name: Print the version and tag
-      working-directory: python
+        tag: ""
+    - name: Make patch commit
       run: |
-        cat lance/version.py
-        git tag | cat
-    - name: Push new version and tag
+        git add python/Cargo.toml rust/Cargo.toml
+        git commit -m "Bump patch version"
+    - name: Push new version
       uses: changhiskhan/github-push-action@master
       with:
         github_token: ${{ secrets.RELEASE_TOKEN }}

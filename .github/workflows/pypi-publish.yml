@@ -23,6 +23,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
+        args: "--release"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
@@ -47,6 +48,7 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
+        args: "--release"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
