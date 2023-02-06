@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
+/// Callbacks for duckdb to load lance (rust) code.
 
-#define DUCKDB_EXTENSION_API
+#include "extension.h"
 
-#include "duckdb.h"
+const char* lance_version_rust(void);
+void lance_init_rust(void* db);
+
+DUCKDB_EXTENSION_API const char* lance_version() {
+    return lance_version_rust();
+}
+
+DUCKDB_EXTENSION_API void lance_init(void* db) {
+    lance_init_rust(db);
+}

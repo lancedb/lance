@@ -1,0 +1,11 @@
+[package]
+name = "duckdb-lance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+duckdb-extension-framework = "0.7.0"
+
+[lib]
+name = "duckdb_lance"
+crate-type = ["staticlib"]
