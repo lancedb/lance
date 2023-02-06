@@ -12,6 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-struct Error {}
+#[derive(Debug)]
+pub enum Error {
+    DuckDB(String),
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// TODO: contribute to upstream (duckdb-extension) to have a Error impl.
+impl From<Box<dyn std::error::Error>> for Error {
+    fn from(value: Box<dyn std::error::Error>) -> Self {
+        Self::DuckDB(value.to_string())
+    }
+}

@@ -22,7 +22,7 @@ if (POLICY CMP0135)
 endif ()
 
 project(lance_duckdb VERSION 0.3)
-set(TARGET_NAME duckdb_lance)
+set(EXTENSION_NAME lance)
 
 include(FetchContent)
 
@@ -42,12 +42,13 @@ FetchContent_MakeAvailable(Corrosion DuckDB)
 corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml)
 include_directories(${duckdb_SOURCE_DIR}/src/include)
 
-set(ALL_SOURCES src/extension.cc src/extension.h)
+set(ALL_SOURCES src/extension.c src/extension.h)
 
-build_loadable_extension(${TARGET_NAME} ${ALL_SOURCES})
+set(PARAMETERS "-warnings")
+build_loadable_extension(${EXTENSION_NAME} ${PARAMETERS} ${ALL_SOURCES})
 
-set(LIB_NAME ${TARGET_NAME}_loadable_extension)
+set(LIB_NAME ${EXTENSION_NAME}_loadable_extension)
 
 set_target_properties(${LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(${LIB_NAME}
-        "${CMAKE_CURRENT_BINARY_DIR}/lib${TARGET_NAME}.a")
+        "${CMAKE_CURRENT_BINARY_DIR}/libduckdb_lance.a")

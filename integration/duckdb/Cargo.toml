@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 lance = {  path = "../../rust" }
 duckdb-extension-framework = "0.7.0"
+lazy_static = "1.4.0"
 
 [lib]
 name = "duckdb_lance"

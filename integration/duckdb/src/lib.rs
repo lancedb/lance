@@ -18,7 +18,9 @@ use duckdb_extension_framework::duckly::duckdb_library_version;
 use duckdb_extension_framework::Database;
 
 pub mod error;
+mod scan;
 
+use crate::scan::scan_table_function;
 use error::Result;
 
 #[no_mangle]
@@ -28,12 +30,12 @@ pub extern "C" fn lance_version_rust() -> *const c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_init_rust(db: *mut c_void) {
-    init(db).expect("init failed");
+    init(db).expect("duckdb lance extension init failed");
 }
 
 unsafe fn init(db: *mut c_void) -> Result<()> {
     let db = Database::from_cpp_duckdb(db);
-    let table_function = build_table_function_def();
+    let table_function = scan_table_function();
     let connection = db.connect()?;
     connection.register_table_function(table_function)?;
     Ok(())
