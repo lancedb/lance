@@ -16,12 +16,18 @@ use std::ffi::{c_char, c_void};
 
 use duckdb_extension_framework::duckly::duckdb_library_version;
 use duckdb_extension_framework::Database;
+use tokio::runtime::Runtime;
 
 pub mod error;
 mod scan;
 
 use crate::scan::scan_table_function;
 use error::Result;
+
+lazy_static::lazy_static! {
+    static ref RUNTIME: Runtime = tokio::runtime::Runtime::new()
+            .expect("Creating Tokio runtime");
+}
 
 #[no_mangle]
 pub extern "C" fn lance_version_rust() -> *const c_char {
@@ -35,9 +41,9 @@ pub unsafe extern "C" fn lance_init_rust(db: *mut c_void) {
 
 unsafe fn init(db: *mut c_void) -> Result<()> {
     let db = Database::from_cpp_duckdb(db);
-    // let table_function = scan_table_function();
-    // let connection = db.connect()?;
-    // connection.register_table_function(table_function)?;
+    let table_function = scan_table_function();
+    let connection = db.connect()?;
+    connection.register_table_function(table_function)?;
     Ok(())
 }
 
