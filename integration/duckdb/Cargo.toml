@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+lance = {  path = "../../rust" }
 duckdb-extension-framework = "0.7.0"
 
 [lib]
