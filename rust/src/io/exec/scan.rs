@@ -87,7 +87,7 @@ impl Scan {
                 let r = &reader;
                 match stream::iter(0..reader.num_batches())
                     .map(|batch_id| async move { r.read_batch(batch_id as i32, ..).await })
-                    .buffer_unordered(prefetch_size)
+                    .buffered(prefetch_size)
                     .try_for_each(|b| async { tx.send(Ok(b)).await.map_err(|_| Error::Stop()) })
                     .await
                 {
