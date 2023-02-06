@@ -24,6 +24,11 @@ endif ()
 project(lance_duckdb VERSION 0.3)
 set(EXTENSION_NAME lance)
 
+if (APPLE)
+  # POLICY CMP0042
+  set(CMAKE_MACOSX_RPATH 1)
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -32,15 +37,13 @@ FetchContent_Declare(
         GIT_TAG v0.3.2 # Optionally specify a commit hash, version tag or branch here
 )
 set(BUILD_UNITTESTS FALSE) # Disable unit test build in duckdb
-FetchContent_Declare(
-        DuckDB
-        URL https://github.com/duckdb/duckdb/archive/refs/tags/v0.6.1.tar.gz
-)
 
-FetchContent_MakeAvailable(Corrosion DuckDB)
+FetchContent_MakeAvailable(Corrosion)
+
+#set(EXTERNAL_EXTENSION_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR})
 
 corrosion_import_crate(MANIFEST_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml)
-include_directories(${duckdb_SOURCE_DIR}/src/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
 
 set(ALL_SOURCES src/extension.c src/extension.h)
 

@@ -35,9 +35,9 @@ pub unsafe extern "C" fn lance_init_rust(db: *mut c_void) {
 
 unsafe fn init(db: *mut c_void) -> Result<()> {
     let db = Database::from_cpp_duckdb(db);
-    let table_function = scan_table_function();
-    let connection = db.connect()?;
-    connection.register_table_function(table_function)?;
+    // let table_function = scan_table_function();
+    // let connection = db.connect()?;
+    // connection.register_table_function(table_function)?;
     Ok(())
 }
 

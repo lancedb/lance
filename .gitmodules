@@ -1,0 +1,3 @@
+[submodule "integration/duckdb/duckdb"]
+	path = integration/duckdb_lance/duckdb
+	url = git@github.com:duckdb/duckdb.git

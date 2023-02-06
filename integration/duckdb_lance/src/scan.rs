@@ -49,7 +49,6 @@ pub fn scan_table_function() -> TableFunction {
     table_function.add_parameter(&logical_type);
 
     table_function.set_function(Some(read_lance));
-    // table_function.set_init(Some(read_delta_init));
-    // table_function.set_bind(Some(read_delta_bind));
+    table_function.supports_pushdown(true);
     table_function
 }
