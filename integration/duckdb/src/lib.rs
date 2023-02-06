@@ -1,3 +1,9 @@
+
+
+#[no_mangle]
+pub extern "C" fn lance_version_rust() -> *const c_char {
+    unsafe {  }
+}
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
