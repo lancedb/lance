@@ -1,0 +1,19 @@
+[package]
+name = "duckdb-lance"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lance = { path = "../../rust" }
+duckdb-extension-framework = { path = "./duckdb-extension-framework", features = [
+    "statically_linked"
+] }
+lazy_static = "1.4.0"
+tokio = { version = "1.23", features = ["rt-multi-thread"] }
+arrow-schema = "31.0.0"
+arrow-array = "31.0.0"
+futures = "0.3"
+
+[lib]
+name = "duckdb_lance"
+crate-type = ["staticlib"]
