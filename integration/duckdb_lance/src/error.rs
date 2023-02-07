@@ -17,6 +17,15 @@ pub enum Error {
     DuckDB(String),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (catalog, message) = match self {
+            Self::DuckDB(s) => ("DuckDB", s.as_str()),
+        };
+        write!(f, "Lance({catalog}): {message}")
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 // TODO: contribute to upstream (duckdb-extension) to have a Error impl.

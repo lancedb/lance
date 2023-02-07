@@ -25,7 +25,7 @@ use futures::stream::StreamExt;
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
-use crate::arrow::to_duckdb_logical_type;
+use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
 
 #[repr(C)]
 struct ScanBindData {
@@ -39,7 +39,7 @@ struct ScanBindData {
 unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
     let actual = v.cast::<ScanBindData>();
 
-    // drop(Arc::from_raw(*actual).stream));
+    drop(Box::from_raw((*actual).dataset));
     duckdb_free(v);
 }
 
@@ -53,7 +53,7 @@ struct ScanInitData {
 #[no_mangle]
 unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_chunk) {
     let info = FunctionInfo::from(info);
-    let output = DataChunk::from(output);
+    let mut output = DataChunk::from(output);
 
     let mut init_data = info.get_init_data::<ScanInitData>();
     let batch = match crate::RUNTIME.block_on(async { (*(*init_data).stream).next().await }) {
@@ -66,9 +66,10 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     };
 
     if let Some(b) = batch {
-        println!("Batch is: {:?}", b);
-        // Fill the row
-        output.set_size(b.num_rows() as idx_t);
+        if let Err(e) = record_batch_to_duckdb_data_chunk(&b, &mut output) {
+            info.set_error(e.to_string().as_str());
+            return;
+        };
     } else {
         (*init_data).done = true;
         output.set_size(0);

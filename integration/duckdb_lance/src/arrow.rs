@@ -16,8 +16,11 @@
 
 use std::collections::HashMap;
 
+use arrow_array::{
+    cast::as_primitive_array, types::*, Array, ArrowPrimitiveType, PrimitiveArray, RecordBatch,
+};
 use arrow_schema::DataType;
-use duckdb_extension_framework::{LogicalType, LogicalTypeId};
+use duckdb_extension_framework::{duckly::idx_t, DataChunk, LogicalType, LogicalTypeId, Vector};
 
 use crate::{Error, Result};
 
@@ -92,4 +95,80 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
         )?));
     }
     todo!()
+}
+
+pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataChunk) -> Result<()> {
+    // Fill the row
+    for i in 0..batch.num_columns() {
+        let col = batch.column(i);
+        match col.data_type() {
+            DataType::UInt8 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<UInt8Type>(col.as_ref()),
+                    &mut chunk.get_vector::<u8>(i as idx_t),
+                );
+            }
+            DataType::UInt16 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<UInt16Type>(col.as_ref()),
+                    &mut chunk.get_vector::<u16>(i as idx_t),
+                );
+            }
+            DataType::UInt32 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<UInt32Type>(col.as_ref()),
+                    &mut chunk.get_vector::<u32>(i as idx_t),
+                );
+            }
+            DataType::UInt64 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<UInt64Type>(col.as_ref()),
+                    &mut chunk.get_vector::<u64>(i as idx_t),
+                );
+            }
+            DataType::Int8 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<Int8Type>(col.as_ref()),
+                    &mut chunk.get_vector::<i8>(i as idx_t),
+                );
+            }
+            DataType::Int16 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<Int16Type>(col.as_ref()),
+                    &mut chunk.get_vector::<i16>(i as idx_t),
+                );
+            }
+            DataType::Int32 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<Int32Type>(col.as_ref()),
+                    &mut chunk.get_vector::<i32>(i as idx_t),
+                );
+            }
+            DataType::Int64 => {
+                primitive_array_to_duckdb_vector(
+                    as_primitive_array::<Int64Type>(col.as_ref()),
+                    &mut chunk.get_vector::<i64>(i as idx_t),
+                );
+            }
+            _ => {}
+        }
+    }
+    chunk.set_size(batch.num_columns() as idx_t);
+    Ok(())
+}
+
+pub fn primitive_array_to_duckdb_vector<T: ArrowPrimitiveType>(
+    array: &PrimitiveArray<T>,
+    out_vector: &mut Vector<T::Native>,
+) {
+    println!(
+        "Array len: {} out vector len: {}",
+        array.len(),
+        out_vector.get_data_as_slice().len()
+    );
+    assert!(array.len() <= out_vector.get_data_as_slice().len(),);
+
+    for i in 0..array.len() {
+        out_vector.get_data_as_slice()[i] = array.value(i);
+    }
 }
