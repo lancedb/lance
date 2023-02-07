@@ -33,7 +33,7 @@ use crate::{datatypes::Schema, format::Fragment};
 use crate::{Error, Result};
 
 /// Dataset Scan Node.
-pub(crate) struct Scan {
+pub struct Scan {
     rx: Receiver<Result<RecordBatch>>,
 
     _io_thread: JoinHandle<()>,
@@ -75,12 +75,9 @@ impl Scan {
                         r
                     }
                     Err(e) => {
-                        tx.send(Err(Error::IO(format!(
-                            "Failed to open file: {}: {}",
-                            path, e
-                        ))))
-                        .await
-                        .expect("Scanner sending error message");
+                        tx.send(Err(Error::IO(format!("Failed to open file: {path}: {e}"))))
+                            .await
+                            .expect("Scanner sending error message");
                         // Stop reading.
                         break;
                     }
@@ -88,10 +85,10 @@ impl Scan {
 
                 let r = &reader;
                 for batch_id in 0..reader.num_batches() as i32 {
-                    let batch_length = reader.batch_length(batch_id);
-                    for start in (0..batch_length).step_by(batch_size) {
+                    let rows_in_batch = reader.num_rows_in_batch(batch_id);
+                    for start in (0..rows_in_batch).step_by(batch_size) {
                         let result = r
-                            .read_batch(batch_id, start..min(start + batch_size, batch_length))
+                            .read_batch(batch_id, start..min(start + batch_size, rows_in_batch))
                             .await;
                         if let Err(err) = tx.send(result).await {
                             eprintln!("Failed to scan data: {err}");

@@ -177,8 +177,9 @@ impl<'a> FileReader<'a> {
         self.metadata.num_batches()
     }
 
-    pub fn batch_length(&self, batch_id: i32) -> usize {
-        return self.metadata.get_batch_length(batch_id).unwrap_or_default() as usize;
+    /// Get the number of rows in this batch
+    pub fn num_rows_in_batch(&self, batch_id: i32) -> usize {
+        self.metadata.get_batch_length(batch_id).unwrap_or_default() as usize
     }
 
     /// Count the number of rows in this file.
