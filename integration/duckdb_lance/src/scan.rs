@@ -21,6 +21,7 @@ use duckdb_extension_framework::table_functions::{
     BindInfo, FunctionInfo, InitInfo, TableFunction,
 };
 use duckdb_extension_framework::{malloc_struct, DataChunk, LogicalType, LogicalTypeId};
+use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::to_duckdb_logical_type;
@@ -31,8 +32,18 @@ struct ScanBindData {
     uri: *mut c_char,
 }
 
+/// Drop the ScanBindData from C.
+unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
+    let actual = v.cast::<ScanBindData>();
+
+    // drop(Arc::from_raw(*actual).stream));
+    duckdb_free(v);
+}
+
 #[repr(C)]
 struct ScanInitData {
+    stream: ScannerStream,
+
     done: bool,
 }
 
@@ -52,6 +63,19 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
 #[no_mangle]
 unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
     let info = InitInfo::from(info);
+    let bind_data = info.get_bind_data::<ScanBindData>();
+
+    let column_indices = info.get_column_indices();
+    let uri = CStr::from_ptr((*bind_data).uri);
+    let dataset =
+        match crate::RUNTIME.block_on(async { Dataset::open(uri.to_str().unwrap()).await }) {
+            Ok(d) => d,
+            Err(e) => {
+                info.set_error(CString::new(e.to_string()).expect("Create error message"));
+                return;
+            }
+        };
+    println!("Open dataset: {}\n", dataset.schema());
 
     let mut init_data = malloc_struct::<ScanInitData>();
     (*init_data).done = false;
@@ -69,8 +93,9 @@ unsafe extern "C" fn read_lance_bind_c(bind_info: duckdb_bind_info) {
 fn read_lance_bind(bind: &BindInfo) {
     let uri_param = bind.get_parameter(0).get_varchar();
 
+    let uri = uri_param.to_str().unwrap();
     let dataset =
-        match crate::RUNTIME.block_on(async { Dataset::open(uri_param.to_str().unwrap()).await }) {
+        match crate::RUNTIME.block_on(async { Dataset::open(uri).await }) {
             Ok(d) => d,
             Err(e) => {
                 bind.set_error(e.to_string().as_str());
@@ -84,6 +109,13 @@ fn read_lance_bind(bind: &BindInfo) {
             &field.name,
             to_duckdb_logical_type(&field.data_type()).unwrap(),
         );
+    }
+
+    unsafe {
+        let bind_data = malloc_struct::<ScanBindData>();
+        (*bind_data).uri = CString::new(uri).expect("Bind uri").into_raw();
+
+        bind.set_bind_data(bind_data.cast(), Some(drop_scan_bind_data_c));
     }
 }
 
