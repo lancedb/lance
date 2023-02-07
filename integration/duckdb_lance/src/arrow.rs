@@ -103,54 +103,68 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
         let col = batch.column(i);
         match col.data_type() {
             DataType::UInt8 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<UInt8Type>(col.as_ref()),
-                    &mut chunk.get_vector::<u8>(i as idx_t),
+                primitive_array_to_duckdb_vector::<UInt8Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::UInt16 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<UInt16Type>(col.as_ref()),
-                    &mut chunk.get_vector::<u16>(i as idx_t),
+                primitive_array_to_duckdb_vector::<UInt16Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::UInt32 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<UInt32Type>(col.as_ref()),
-                    &mut chunk.get_vector::<u32>(i as idx_t),
+                primitive_array_to_duckdb_vector::<UInt32Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::UInt64 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<UInt64Type>(col.as_ref()),
-                    &mut chunk.get_vector::<u64>(i as idx_t),
+                primitive_array_to_duckdb_vector::<UInt64Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::Int8 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<Int8Type>(col.as_ref()),
-                    &mut chunk.get_vector::<i8>(i as idx_t),
+                primitive_array_to_duckdb_vector::<Int8Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::Int16 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<Int16Type>(col.as_ref()),
-                    &mut chunk.get_vector::<i16>(i as idx_t),
+                primitive_array_to_duckdb_vector::<Int16Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::Int32 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<Int32Type>(col.as_ref()),
-                    &mut chunk.get_vector::<i32>(i as idx_t),
+                primitive_array_to_duckdb_vector::<Int32Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
             DataType::Int64 => {
-                primitive_array_to_duckdb_vector(
-                    as_primitive_array::<Int64Type>(col.as_ref()),
-                    &mut chunk.get_vector::<i64>(i as idx_t),
+                primitive_array_to_duckdb_vector::<Int64Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
                 );
             }
-            _ => {}
+            DataType::Float32 => {
+                primitive_array_to_duckdb_vector::<Float32Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
+                );
+            }
+            DataType::Float64 => {
+                primitive_array_to_duckdb_vector::<Float64Type>(
+                    as_primitive_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
+                );
+            }
+            _ => {
+                println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
+            }
         }
     }
     chunk.set_size(batch.num_columns() as idx_t);
