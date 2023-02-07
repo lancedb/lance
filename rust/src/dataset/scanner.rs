@@ -347,7 +347,10 @@ mod test {
             .await
             .unwrap();
         for expected_len in [8, 8, 4, 8, 8, 4] {
-            assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), expected_len as usize);
-        };
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().num_rows(),
+                expected_len as usize
+            );
+        }
     }
 }
