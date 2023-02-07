@@ -16,6 +16,10 @@ jobs:
         working-directory: ./integration/duckdb_lance
     steps:
       - uses: actions/checkout@v3
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Checkout submodules
         run: |
           git submodule init
