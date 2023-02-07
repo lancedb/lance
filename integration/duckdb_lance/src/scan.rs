@@ -15,12 +15,13 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 
 use duckdb_extension_framework::duckly::{
-    duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info,
+    duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info, idx_t,
 };
 use duckdb_extension_framework::table_functions::{
     BindInfo, FunctionInfo, InitInfo, TableFunction,
 };
 use duckdb_extension_framework::{malloc_struct, DataChunk, LogicalType, LogicalTypeId};
+use futures::stream::StreamExt;
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
@@ -30,6 +31,8 @@ use crate::arrow::to_duckdb_logical_type;
 struct ScanBindData {
     /// Dataset URI
     uri: *mut c_char,
+
+    dataset: *mut Dataset,
 }
 
 /// Drop the ScanBindData from C.
@@ -42,7 +45,7 @@ unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
 
 #[repr(C)]
 struct ScanInitData {
-    stream: ScannerStream,
+    stream: *mut ScannerStream,
 
     done: bool,
 }
@@ -52,12 +55,24 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     let info = FunctionInfo::from(info);
     let output = DataChunk::from(output);
 
-    // let bind_data = info.get_bind_data::<ScanBindData>();
     let mut init_data = info.get_init_data::<ScanInitData>();
+    let batch = match crate::RUNTIME.block_on(async { (*(*init_data).stream).next().await }) {
+        Some(Ok(b)) => Some(b),
+        Some(Err(e)) => {
+            info.set_error(e.to_string().as_str());
+            return;
+        }
+        None => None,
+    };
 
-    // let uri = CStr::from_ptr((*bind_data).uri);
-    (*init_data).done = true;
-    output.set_size(0);
+    if let Some(b) = batch {
+        println!("Batch is: {:?}", b);
+        // Fill the row
+        output.set_size(b.num_rows() as idx_t);
+    } else {
+        (*init_data).done = true;
+        output.set_size(0);
+    }
 }
 
 #[no_mangle]
@@ -65,20 +80,29 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
     let info = InitInfo::from(info);
     let bind_data = info.get_bind_data::<ScanBindData>();
 
-    let column_indices = info.get_column_indices();
     let uri = CStr::from_ptr((*bind_data).uri);
     let dataset =
         match crate::RUNTIME.block_on(async { Dataset::open(uri.to_str().unwrap()).await }) {
-            Ok(d) => d,
+            Ok(d) => Box::new(d),
             Err(e) => {
+                // TODO: fix duckdb-extension to pass string instead of `CString`.
                 info.set_error(CString::new(e.to_string()).expect("Create error message"));
                 return;
             }
         };
     println!("Open dataset: {}\n", dataset.schema());
 
+    let stream = match crate::RUNTIME.block_on(async { dataset.scan().try_into_stream().await }) {
+        Ok(s) => Box::new(s),
+        Err(e) => {
+            info.set_error(CString::new(e.to_string()).expect("Create error message"));
+            return;
+        }
+    };
+
     let mut init_data = malloc_struct::<ScanInitData>();
     (*init_data).done = false;
+    (*init_data).stream = Box::into_raw(stream);
     info.set_init_data(init_data.cast(), Some(duckdb_free));
 }
 
@@ -94,14 +118,13 @@ fn read_lance_bind(bind: &BindInfo) {
     let uri_param = bind.get_parameter(0).get_varchar();
 
     let uri = uri_param.to_str().unwrap();
-    let dataset =
-        match crate::RUNTIME.block_on(async { Dataset::open(uri).await }) {
-            Ok(d) => d,
-            Err(e) => {
-                bind.set_error(e.to_string().as_str());
-                return;
-            }
-        };
+    let dataset = match crate::RUNTIME.block_on(async { Dataset::open(uri).await }) {
+        Ok(d) => d,
+        Err(e) => {
+            bind.set_error(e.to_string().as_str());
+            return;
+        }
+    };
 
     let schema = dataset.schema();
     for field in schema.fields.iter() {
