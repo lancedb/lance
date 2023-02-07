@@ -40,14 +40,26 @@ pub struct Scan {
 }
 
 impl Scan {
-    /// Create a new scan node.
+    /// Create a new dataset scan node.
+    ///
+    /// Parameters
+    ///
+    ///  - ***object_store***: The Object Store to operate the data.
+    ///  - ***data_dir***: The base directory of the dataset.
+    ///  - ***fragments***: list of [Fragment]s to open.
+    ///  - ***projection***: the projection [Schema].
+    ///  - ***manifest***: the [Manifest] of the dataset.
+    ///  - ***read_size***: the number of rows to read for each request.
+    ///  - ***prefetch_size***: the number of batches to read ahead.
+    ///  - ***with_row_id***: load row ID from the datasets.
+    ///
     pub fn new(
         object_store: Arc<ObjectStore>,
         data_dir: Path,
         fragments: Arc<Vec<Fragment>>,
         projection: &Schema,
         manifest: Arc<Manifest>,
-        batch_size: usize,
+        read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Self {
@@ -86,9 +98,9 @@ impl Scan {
                 let r = &reader;
                 for batch_id in 0..reader.num_batches() as i32 {
                     let rows_in_batch = reader.num_rows_in_batch(batch_id);
-                    for start in (0..rows_in_batch).step_by(batch_size) {
+                    for start in (0..rows_in_batch).step_by(read_size) {
                         let result = r
-                            .read_batch(batch_id, start..min(start + batch_size, rows_in_batch))
+                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
                             .await;
                         if let Err(err) = tx.send(result).await {
                             eprintln!("Failed to scan data: {err}");
