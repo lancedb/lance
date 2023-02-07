@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::min;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::Stream;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -32,20 +33,33 @@ use crate::{datatypes::Schema, format::Fragment};
 use crate::{Error, Result};
 
 /// Dataset Scan Node.
-pub(crate) struct Scan {
+pub struct Scan {
     rx: Receiver<Result<RecordBatch>>,
 
     _io_thread: JoinHandle<()>,
 }
 
 impl Scan {
-    /// Create a new scan node.
+    /// Create a new dataset scan node.
+    ///
+    /// Parameters
+    ///
+    ///  - ***object_store***: The Object Store to operate the data.
+    ///  - ***data_dir***: The base directory of the dataset.
+    ///  - ***fragments***: list of [Fragment]s to open.
+    ///  - ***projection***: the projection [Schema].
+    ///  - ***manifest***: the [Manifest] of the dataset.
+    ///  - ***read_size***: the number of rows to read for each request.
+    ///  - ***prefetch_size***: the number of batches to read ahead.
+    ///  - ***with_row_id***: load row ID from the datasets.
+    ///
     pub fn new(
         object_store: Arc<ObjectStore>,
         data_dir: Path,
         fragments: Arc<Vec<Fragment>>,
         projection: &Schema,
         manifest: Arc<Manifest>,
+        read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Self {
@@ -53,7 +67,7 @@ impl Scan {
 
         let projection = projection.clone();
         let io_thread = tokio::spawn(async move {
-            for frag in fragments.as_ref() {
+            'outer: for frag in fragments.as_ref() {
                 if tx.is_closed() {
                     return;
                 }
@@ -73,28 +87,25 @@ impl Scan {
                         r
                     }
                     Err(e) => {
-                        tx.send(Err(Error::IO(format!(
-                            "Failed to open file: {}: {}",
-                            path, e
-                        ))))
-                        .await
-                        .expect("Scanner sending error message");
+                        tx.send(Err(Error::IO(format!("Failed to open file: {path}: {e}"))))
+                            .await
+                            .expect("Scanner sending error message");
                         // Stop reading.
                         break;
                     }
                 };
 
                 let r = &reader;
-                match stream::iter(0..reader.num_batches())
-                    .map(|batch_id| async move { r.read_batch(batch_id as i32, ..).await })
-                    .buffered(prefetch_size)
-                    .try_for_each(|b| async { tx.send(Ok(b)).await.map_err(|_| Error::Stop()) })
-                    .await
-                {
-                    Ok(_) | Err(Error::Stop()) => {}
-                    Err(e) => {
-                        eprintln!("Failed to scan data: {e}");
-                        break;
+                for batch_id in 0..reader.num_batches() as i32 {
+                    let rows_in_batch = reader.num_rows_in_batch(batch_id);
+                    for start in (0..rows_in_batch).step_by(read_size) {
+                        let result = r
+                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
+                            .await;
+                        if let Err(err) = tx.send(result).await {
+                            eprintln!("Failed to scan data: {err}");
+                            break 'outer;
+                        }
                     }
                 }
             }

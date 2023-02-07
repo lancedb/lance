@@ -95,6 +95,12 @@ impl Metadata {
         self.batch_offsets.get(batch_id as usize).copied()
     }
 
+    /// Get the length of the batch.
+    pub fn get_batch_length(&self, batch_id: i32) -> Option<i32> {
+        self.get_offset(batch_id + 1)
+            .map(|o| o - self.get_offset(batch_id).unwrap_or_default())
+    }
+
     /// Group row indices into each batch.
     ///
     /// The indices must be sorted.
