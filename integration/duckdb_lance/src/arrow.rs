@@ -18,7 +18,6 @@ use std::collections::HashMap;
 
 use arrow_schema::DataType;
 use duckdb_extension_framework::{LogicalType, LogicalTypeId};
-use lance::arrow::DataTypeExt;
 
 use crate::{Error, Result};
 
@@ -79,6 +78,18 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
             );
         }
         return Ok(LogicalType::new_struct_type(shape));
+    } else if let DataType::List(child) = data_type {
+        return Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+            child.data_type(),
+        )?));
+    } else if let DataType::LargeList(child) = data_type {
+        return Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+            child.data_type(),
+        )?));
+    } else if let DataType::FixedSizeList(child, _) = data_type {
+        return Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+            child.data_type(),
+        )?));
     }
     todo!()
 }
