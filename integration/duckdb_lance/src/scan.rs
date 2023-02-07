@@ -21,12 +21,13 @@ use duckdb_extension_framework::duckly::{
 use duckdb_extension_framework::table_functions::{
     BindInfo, FunctionInfo, InitInfo, TableFunction,
 };
-use duckdb_extension_framework::{malloc_struct, DataChunk, LogicalType, LogicalTypeId};
+use duckdb_extension_framework::{malloc_struct, LogicalType, LogicalTypeId};
 use futures::stream::StreamExt;
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
+use crate::duckdb::DataChunk;
 
 #[repr(C)]
 struct ScanBindData {
@@ -70,7 +71,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
         };
     } else {
         (*init_data).done = true;
-        output.set_size(0);
+        output.set_len(0);
     }
 }
 

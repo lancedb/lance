@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::duckdb::ffi::{duckdb_data_chunk, duckdb_data_chunk_set_size};
+use super::vector::{ListVector, Vector};
+use crate::duckdb::ffi::{
+    duckdb_data_chunk, duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size,
+};
 
 /// DataChunk in DuckDB.
 pub struct DataChunk {
@@ -21,6 +24,19 @@ pub struct DataChunk {
 }
 
 impl DataChunk {
+    /// Get the vector at the specific column index: `idx`.
+    ///
+    pub fn vector<T: Copy>(&self, idx: usize) -> Vector<T> {
+        Vector::from(unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) })
+    }
+
+    /// Get a list vector from the column index.
+    pub fn list_vector(&self, idx: usize) -> ListVector {
+        ListVector::from(unsafe {
+            duckdb_data_chunk_get_vector(self.ptr, idx as u64)
+        })
+    }
+
     /// Set the size of the data chunk
     pub fn set_len(&self, new_len: usize) {
         unsafe { duckdb_data_chunk_set_size(self.ptr, new_len as u64) };

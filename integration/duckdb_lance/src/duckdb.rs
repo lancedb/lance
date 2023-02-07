@@ -15,5 +15,7 @@
 pub use libduckdb_sys as ffi;
 
 mod data_chunk;
+mod vector;
 
 pub use data_chunk::DataChunk;
+pub use vector::{ListVector, Vector, Inserter};
