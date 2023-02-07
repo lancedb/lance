@@ -150,21 +150,26 @@ pub(crate) async fn read_fixed_stride_array(
 pub(crate) async fn read_binary_array(
     reader: &dyn ObjectReader,
     data_type: &DataType,
+    nullable: bool,
     position: usize,
     length: usize,
     params: impl Into<ReadBatchParams>,
 ) -> Result<ArrayRef> {
     use arrow_schema::DataType::*;
     let decoder: Box<dyn Decoder<Output = Result<ArrayRef>> + Send> = match data_type {
-        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(reader, position, length)),
-        Binary => Box::new(BinaryDecoder::<BinaryType>::new(reader, position, length)),
+        Utf8 => Box::new(BinaryDecoder::<Utf8Type>::new(
+            reader, position, length, nullable,
+        )),
+        Binary => Box::new(BinaryDecoder::<BinaryType>::new(
+            reader, position, length, nullable,
+        )),
         LargeUtf8 => Box::new(BinaryDecoder::<LargeUtf8Type>::new(
-            reader, position, length,
+            reader, position, length, nullable,
         )),
         LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
-            reader, position, length,
+            reader, position, length, nullable,
         )),
-        _ => return Err(Error::IO(format!("Unsupported binary type: {data_type}"))),
+        _ => return Err(Error::IO(format!("Unsupported binary type: {data_type}",))),
     };
     let fut = decoder.as_ref().get(params.into());
     fut.await

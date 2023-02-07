@@ -97,8 +97,10 @@ pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
     use arrow_buffer::MutableBuffer;
 
+    #[allow(unused_imports)]
     #[cfg(target_os = "macos")]
     use accelerate_src;
+
     use cblas::*;
 
     let inner_array = to.values();
@@ -135,18 +137,18 @@ fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
-                        return euclidean_distance_fma(
+                        euclidean_distance_fma(
                             from_vector,
                             &buffer[idx * dimension..(idx + 1) * dimension],
-                        );
+                        )
                     }
 
                     #[cfg(any(target_arch = "aarch64"))]
                     {
-                        return l2_distance_neon(
+                        l2_distance_neon(
                             from_vector,
                             &buffer[idx * dimension..(idx + 1) * dimension],
-                        );
+                        )
                     }
                 })
                 .map(Some),

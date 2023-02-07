@@ -78,13 +78,15 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
+    /// Encode primitive values.
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
-        let data = array.data().buffers()[0].as_ref();
+        let data = array.data().buffers()[0].as_slice();
         self.writer.write_all(data).await?;
         Ok(offset)
     }
 
+    /// Encode fixed size list.
     async fn encode_fixed_size_list(&mut self, array: &dyn Array, items: &Field) -> Result<usize> {
         let list_array = array
             .as_any()
@@ -372,7 +374,7 @@ mod tests {
     }
 
     async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
-        let store = ObjectStore::new(":memory:").unwrap();
+        let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);

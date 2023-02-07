@@ -177,6 +177,11 @@ impl<'a> FileReader<'a> {
         self.metadata.num_batches()
     }
 
+    /// Get the number of rows in this batch
+    pub fn num_rows_in_batch(&self, batch_id: i32) -> usize {
+        self.metadata.get_batch_length(batch_id).unwrap_or_default() as usize
+    }
+
     /// Count the number of rows in this file.
     pub fn len(&self) -> usize {
         self.metadata.len()
@@ -247,7 +252,7 @@ impl<'a> FileReader<'a> {
     }
 }
 
-/// Read within one batch.
+/// Read a batch.
 async fn read_batch(
     reader: &FileReader<'_>,
     params: &ReadBatchParams,
@@ -261,14 +266,25 @@ async fn read_batch(
         .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
+        let ids_in_batch: Vec<i32> = match params {
+            ReadBatchParams::Indices(indices) => {
+                indices.values().iter().map(|v| *v as i32).collect()
+            }
+            ReadBatchParams::Range(r) => r.clone().map(|v| v as i32).collect(),
+            ReadBatchParams::RangeFull => (0..batch.num_rows() as i32).collect(),
+            ReadBatchParams::RangeTo(r) => (0..r.end).map(|v| v as i32).collect(),
+            ReadBatchParams::RangeFrom(r) => (r.start..r.start + batch.num_rows())
+                .map(|v| v as i32)
+                .collect(),
+        };
         let batch_offset = reader
             .metadata
             .get_offset(batch_id)
             .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
-            (batch_offset..(batch_offset + batch.num_rows() as i32))
-                .map(|o| compute_row_id(reader.fragment_id, o))
-                .collect::<Vec<_>>(),
+            ids_in_batch
+                .iter()
+                .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset)),
         ));
         batch = batch.try_with_column(
             ArrowField::new("_rowid", DataType::UInt64, false),
@@ -351,6 +367,7 @@ async fn read_binary_array(
     read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),
+        field.nullable,
         page_info.position,
         page_info.length,
         params,
@@ -453,8 +470,9 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        cast::as_primitive_array, types::UInt8Type, DictionaryArray, Float32Array, Int64Array,
-        StringArray, UInt8Array,
+        cast::{as_primitive_array, as_string_array, as_struct_array},
+        types::UInt8Type,
+        DictionaryArray, Float32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -614,5 +632,52 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    async fn test_write_null_string_in_struct(field_nullable: bool) {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "parent",
+            DataType::Struct(vec![ArrowField::new("str", DataType::Utf8, field_nullable)]),
+            true,
+        )]));
+
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+
+        let string_arr = Arc::new(StringArray::from_iter([Some("a"), Some(""), Some("b")]));
+        let struct_arr = Arc::new(StructArray::from(vec![(
+            ArrowField::new("str", DataType::Utf8, field_nullable),
+            string_arr.clone() as ArrayRef,
+        )]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+
+        if field_nullable {
+            assert_eq!(
+                &StringArray::from_iter(vec![Some("a"), None, Some("b")]),
+                as_string_array(
+                    as_struct_array(actual_batch.column_by_name("parent").unwrap().as_ref())
+                        .column_by_name("str")
+                        .unwrap()
+                        .as_ref()
+                )
+            );
+        } else {
+            assert_eq!(actual_batch, batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_nullable_string_in_struct() {
+        test_write_null_string_in_struct(true).await;
+        test_write_null_string_in_struct(false).await;
     }
 }

@@ -38,9 +38,6 @@ enum Commands {
     Inspect {
         /// The URI of the dataset.
         uri: String,
-
-        /// AWS profile
-        aws_profile: Option<String>,
     },
 
     /// Query the dataset
@@ -98,7 +95,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match &args.command {
-        Commands::Inspect { uri, aws_profile } => {
+        Commands::Inspect { uri } => {
             let dataset = Dataset::open(uri).await.unwrap();
             println!("Dataset URI: {}", uri);
             println!(

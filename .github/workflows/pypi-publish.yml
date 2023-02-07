@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        python-minor-version: [ "8", "9", "10", "11" ]
+        python-minor-version: [ "8"]
     runs-on: "ubuntu-22.04"
     steps:
     - uses: actions/checkout@v3
@@ -23,6 +23,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
+        args: "--release"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
@@ -33,7 +34,7 @@ jobs:
     runs-on: "macos-12"
     strategy:
       matrix:
-        python-minor-version: ["8", "9", "10", "11"]
+        python-minor-version: ["8"]
     steps:
     - uses: actions/checkout@v3
       with:
@@ -47,6 +48,7 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
+        args: "--release"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}

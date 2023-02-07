@@ -42,11 +42,16 @@ pub(crate) struct Take {
 }
 
 impl Take {
+    /// Create a Take node with
+    ///
+    ///  - Dataset: the dataset to read from
+    ///  - schema: projection schema for take node.
+    ///  - child: the upstream ExedNode to feed data in.
     pub fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: ExecNodeBox) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
         let bg_thread = tokio::spawn(async move {
-            child
+            if let Err(e) = child
                 .zip(stream::repeat_with(|| (dataset.clone(), schema.clone())))
                 .then(|(batch, (dataset, schema))| async move {
                     let batch = batch?;
@@ -67,7 +72,11 @@ impl Take {
                     Ok(())
                 })
                 .await
-                .unwrap();
+            {
+                if let Err(e) = tx.send(Err(e)).await {
+                    eprintln!("ExecNode(Take): {}", e);
+                }
+            }
             drop(tx)
         });
 

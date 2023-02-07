@@ -27,4 +27,4 @@ runs:
       TWINE_USERNAME: __token__
       TWINE_PASSWORD: ${{ inputs.token }}
     shell: bash
-    run: twine upload --repository ${{ inputs.repo }} wheels/*.whl
+    run: twine upload --repository ${{ inputs.repo }} target/wheels/pylance-*.whl

@@ -232,7 +232,7 @@ pub struct Field {
     logical_type: LogicalType,
     extension_name: String,
     pub(crate) encoding: Option<Encoding>,
-    nullable: bool,
+    pub nullable: bool,
 
     pub children: Vec<Field>,
 
@@ -397,6 +397,7 @@ impl Field {
                             read_binary_array(
                                 reader,
                                 value_type.as_ref(),
+                                false,
                                 dict_info.offset,
                                 dict_info.length,
                                 ..,
@@ -662,7 +663,7 @@ impl Schema {
 impl fmt::Display for Schema {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for field in self.fields.iter() {
-            writeln!(f, "{}", field)?
+            writeln!(f, "{field}")?
         }
         Ok(())
     }

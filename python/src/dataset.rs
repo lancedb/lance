@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -21,19 +22,20 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::index::vector::VectorIndexParams;
+use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyLong};
+use pyo3::types::{IntoPyDict, PyDict, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
 use ::lance::dataset::scanner::Scanner as LanceScanner;
 use ::lance::dataset::Dataset as LanceDataset;
-use lance::dataset::{WriteMode, WriteParams};
+use lance::dataset::{Version, WriteMode, WriteParams};
 
 const DEFAULT_NPROBS: usize = 1;
-const DEFAULT_REFINE_FACTOR: u32 = 1;
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -122,20 +124,27 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
-            let refine_factor: u32 = if let Some(refine_factor) = nearest.get_item("refine_factor")
-            {
-                if refine_factor.is_none() {
-                    DEFAULT_REFINE_FACTOR
+            // When refine factor is specified, a final Refine stage will be added to the I/O plan,
+            // and use Flat index over the raw vectors to refine the results.
+            // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
+            let refine_factor: Option<u32> = if let Some(rf) = nearest.get_item("refine_factor") {
+                if rf.is_none() {
+                    None
                 } else {
-                    PyAny::downcast::<PyLong>(refine_factor)?.extract()?
+                    PyAny::downcast::<PyLong>(rf)?.extract()?
                 }
             } else {
-                DEFAULT_REFINE_FACTOR
+                None
             };
-
             scanner
                 .nearest(column.as_str(), &q, k)
-                .map(|s| s.nprobs(nprobes).refine(refine_factor))
+                .map(|s| {
+                    let mut s = s.nprobs(nprobes);
+                    if let Some(factor) = refine_factor {
+                        s = s.refine(factor);
+                    }
+                    s
+                })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
@@ -151,6 +160,68 @@ impl Dataset {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))?)
         })
+    }
+
+    fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let versions = self_
+            .list_versions()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        Python::with_gil(|py| {
+            let pyvers: Vec<PyObject> = versions
+                .iter()
+                .map(|v| {
+                    let dict = PyDict::new(py);
+                    dict.set_item("version", v.version).unwrap();
+                    dict.set_item("timestamp", v.timestamp.timestamp()).unwrap();
+                    let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
+                    dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
+                    dict.to_object(py)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect();
+            Ok(pyvers)
+        })
+    }
+
+    fn create_index(
+        self_: PyRef<'_, Self>,
+        columns: Vec<&str>,
+        index_type: &str,
+        name: Option<String>,
+        kwargs: &PyDict,
+    ) -> PyResult<()> {
+        let idx_type = match index_type.to_uppercase().as_str() {
+            "IVF_PQ" => IndexType::Vector,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Index type '{index_type}' is not supported."
+                )))
+            }
+        };
+
+        // Only VectorParams are supported.
+        let mut params = VectorIndexParams::default();
+        if let Some(n) = kwargs.get_item("num_partitions") {
+            params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+        if let Some(n) = kwargs.get_item("num_sub_vectors") {
+            params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+        }
+
+        self_.rt.block_on(async {
+            self_
+                .ds
+                .create_index(columns.as_slice(), idx_type, name, &params)
+                .await
+        }).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl Dataset {
+    fn list_versions(&self) -> ::lance::error::Result<Vec<Version>> {
+        self.rt.block_on(async { self.ds.versions().await })
     }
 }
 

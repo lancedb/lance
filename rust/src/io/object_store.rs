@@ -49,9 +49,35 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+/// BUild S3 ObjectStore using default credential chain.
+async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    use aws_config::meta::region::RegionProviderChain;
+    use aws_credential_types::provider::ProvideCredentials;
+
+    const DEFAULT_REGION: &str = "us-west-2";
+
+    let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
+    let provider = aws_config::default_provider::credentials::default_provider().await;
+    let credentials = provider.provide_credentials().await.unwrap();
+    Ok(Arc::new(
+        AmazonS3Builder::new()
+            .with_url(uri)
+            .with_access_key_id(credentials.access_key_id())
+            .with_secret_access_key(credentials.secret_access_key())
+            .with_region(
+                region_provider
+                    .region()
+                    .await
+                    .map(|r| r.as_ref().to_string())
+                    .unwrap_or(DEFAULT_REGION.to_string()),
+            )
+            .build()?,
+    ))
+}
+
 impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
-    pub fn new(uri: &str) -> Result<Self> {
+    pub async fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
             return Ok(Self::memory());
         };
@@ -68,23 +94,16 @@ impl ObjectStore {
                 });
             }
             Err(e) => {
-                println!("Parse err: {}", e);
-                return Err(Error::IO(format!("URI parse error: {}", e)));
+                eprintln!("Parse err: {e}");
+                return Err(Error::IO(format!("URI parse error: {e}")));
             }
         };
 
-        let bucket_name = parsed.host().unwrap().to_string();
         let scheme: String;
         let object_store: Arc<dyn OSObjectStore> = match parsed.scheme() {
             "s3" => {
                 scheme = "s3".to_string();
-                match AmazonS3Builder::from_env()
-                    .with_bucket_name(bucket_name)
-                    .build()
-                {
-                    Ok(s3) => Arc::new(s3),
-                    Err(e) => return Err(e.into()),
-                }
+                build_s3_object_store(uri).await?
             }
             "file" => {
                 scheme = "flle".to_string();

@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow_array::cast::as_struct_array;
-use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt64Array};
+use arrow_array::{
+    cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
+};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
@@ -20,12 +21,14 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::index::vector::ivf::IvfPqIndexBuilder;
-use crate::index::vector::VectorIndexParams;
-use crate::index::{IndexBuilder, IndexParams, IndexType};
-use crate::io::object_reader::read_message;
-use crate::io::{object_reader::read_struct, read_metadata_offset, ObjectStore};
-use crate::io::{read_manifest, write_manifest, FileReader, FileWriter};
+use crate::index::{
+    vector::{ivf::IvfPqIndexBuilder, VectorIndexParams},
+    IndexBuilder, IndexParams, IndexType,
+};
+use crate::io::{
+    object_reader::{read_message, read_struct},
+    read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
+};
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -93,20 +96,20 @@ fn latest_manifest_path(base: &Path) -> Path {
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
-        Dataset::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+        Self::checkout_manifest(object_store, base_path, &latest_manifest_path).await
     }
 
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Dataset::checkout_manifest(object_store, base_path, &manifest_file).await
+        Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
     async fn checkout_manifest(
@@ -114,13 +117,8 @@ impl Dataset {
         base_path: Path,
         manifest_path: &Path,
     ) -> Result<Self> {
-        let object_reader = object_store.open(&manifest_path).await?;
-        let bytes = object_store
-            .inner
-            .get(&manifest_path)
-            .await?
-            .bytes()
-            .await?;
+        let object_reader = object_store.open(manifest_path).await?;
+        let bytes = object_store.inner.get(manifest_path).await?.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
         manifest
@@ -142,7 +140,7 @@ impl Dataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri)?);
+        let object_store = Arc::new(ObjectStore::new(uri).await?);
         let params = params.unwrap_or_default();
 
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
@@ -375,6 +373,7 @@ impl Dataset {
         let mut sorted_row_ids = Vec::from(row_ids);
         sorted_row_ids.sort();
 
+        // Group ROW Ids by the fragment
         let mut row_ids_per_fragment: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
         sorted_row_ids.iter().for_each(|row_id| {
             let fragment_id = row_id >> 32;
@@ -407,7 +406,7 @@ impl Dataset {
             .await?;
         let one_batch = concat_batches(&schema, &batches)?;
 
-        let original_indices: UInt64Array = row_ids
+        let remapping_index: UInt64Array = row_ids
             .iter()
             .map(|o| {
                 sorted_row_ids
@@ -417,7 +416,7 @@ impl Dataset {
             })
             .collect();
         let struct_arr: StructArray = one_batch.into();
-        let reordered = take(&struct_arr, &original_indices, None)?;
+        let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
     }
 
@@ -492,7 +491,7 @@ impl Dataset {
             Ok(section
                 .indices
                 .iter()
-                .map(|pb| Index::try_from(pb))
+                .map(Index::try_from)
                 .collect::<Result<Vec<_>>>()?)
         } else {
             Ok(vec![])
@@ -523,14 +522,14 @@ async fn write_manifest_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::testing::generate_random_array;
+    use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
     use arrow_ord::sort::sort_to_indices;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use tempfile::tempdir;
@@ -539,7 +538,7 @@ mod tests {
     async fn create_dataset() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
+        let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new(
                 "dict",
@@ -582,7 +581,7 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 1);
-        let actual_schema = Schema::from(actual_ds.schema());
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
         let actual_batches = actual_ds
@@ -619,7 +618,11 @@ mod tests {
     async fn append_dataset() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
@@ -654,7 +657,7 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 2);
-        let actual_schema = Schema::from(actual_ds.schema());
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, schema.as_ref());
 
         let actual_batches = actual_ds
@@ -690,7 +693,11 @@ mod tests {
     async fn overwrite_dataset() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
@@ -706,7 +713,11 @@ mod tests {
             .await
             .unwrap();
 
-        let new_schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let new_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "s",
+            DataType::Utf8,
+            false,
+        )]));
         let new_batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             new_schema.clone(),
             vec![Arc::new(StringArray::from_iter_values(
@@ -722,7 +733,7 @@ mod tests {
 
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         assert_eq!(actual_ds.version().version, 2);
-        let actual_schema = Schema::from(actual_ds.schema());
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
         assert_eq!(&actual_schema, new_schema.as_ref());
 
         let actual_batches = actual_ds
@@ -750,10 +761,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_take_rows() {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batches = RecordBatchBuffer::new(
+            (0..20)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        let projection = Schema::try_from(schema.as_ref()).unwrap();
+        let values = dataset
+            .take_rows(
+                &[
+                    5_u64 << 32,        // 200
+                    (4_u64 << 32) + 39, // 199
+                    39,                 // 39
+                    1_u64 << 32,        // 40
+                    (2_u64 << 32) + 20, // 100
+                ],
+                &projection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 100])),
+                    Arc::new(StringArray::from_iter_values(
+                        [200, 199, 39, 40, 100].iter().map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+    }
+
+    #[tokio::test]
     async fn test_fast_count_rows() {
         let test_dir = tempdir().unwrap();
 
-        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
 
         let batches = RecordBatchBuffer::new(
             (0..20)
@@ -787,7 +866,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
 
         let dimension = 32;
-        let schema = Arc::new(Schema::new(vec![Field::new(
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "embeddings",
             DataType::FixedSizeList(
                 Box::new(Field::new("item", DataType::Float32, true)),

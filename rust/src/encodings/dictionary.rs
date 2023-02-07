@@ -77,7 +77,7 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
             Int32 => self.write_typed_array::<Int32Type>(array).await,
             Int64 => self.write_typed_array::<Int64Type>(array).await,
             _ => Err(Error::Schema(format!(
-                "DictionaryEncoder: unsurpported key type: {:?}",
+                "DictionaryEncoder: unsupported key type: {:?}",
                 self.key_type
             ))),
         }
@@ -208,7 +208,7 @@ mod tests {
         let values = vec!["a", "b", "b", "a", "c"];
         let arr: DictionaryArray<T> = values.into_iter().collect();
 
-        let store = ObjectStore::new(":memory:").unwrap();
+        let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
 
         let pos;

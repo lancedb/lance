@@ -40,12 +40,7 @@ jobs:
       uses: ./.github/workflows/bump-version
       with:
         part: ${{ inputs.part }}
-        tag: ""
-    - name: Print the version and tag
-      working-directory: python
-      run: |
-        cat lance/version.py
-        git tag | cat
+        tag: "--git-tag"
     - name: Push new version and tag
       if: ${{ inputs.dry_run }} == "false"
       uses: changhiskhan/github-push-action@master
