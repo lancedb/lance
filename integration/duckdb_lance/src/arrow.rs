@@ -17,7 +17,7 @@
 use std::{collections::HashMap, ffi::CString};
 
 use arrow_array::{
-    cast::{as_boolean_array, as_primitive_array},
+    cast::{as_boolean_array, as_primitive_array, as_string_array},
     types::*,
     Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray,
 };
@@ -170,7 +170,12 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
                     &mut chunk.get_vector(i as idx_t),
                 );
             }
-            DataType::Utf8 => {}
+            DataType::Utf8 => {
+                string_array_to_vector(
+                    as_string_array(col.as_ref()),
+                    &mut chunk.get_vector::<String>(i as idx_t),
+                );
+            }
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
             }
