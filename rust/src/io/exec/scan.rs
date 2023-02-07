@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::min;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::Stream;
 use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -46,6 +47,7 @@ impl Scan {
         fragments: Arc<Vec<Fragment>>,
         projection: &Schema,
         manifest: Arc<Manifest>,
+        batch_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Self {
@@ -53,7 +55,7 @@ impl Scan {
 
         let projection = projection.clone();
         let io_thread = tokio::spawn(async move {
-            for frag in fragments.as_ref() {
+            'outer: for frag in fragments.as_ref() {
                 if tx.is_closed() {
                     return;
                 }
@@ -85,16 +87,16 @@ impl Scan {
                 };
 
                 let r = &reader;
-                match stream::iter(0..reader.num_batches())
-                    .map(|batch_id| async move { r.read_batch(batch_id as i32, ..).await })
-                    .buffered(prefetch_size)
-                    .try_for_each(|b| async { tx.send(Ok(b)).await.map_err(|_| Error::Stop()) })
-                    .await
-                {
-                    Ok(_) | Err(Error::Stop()) => {}
-                    Err(e) => {
-                        eprintln!("Failed to scan data: {e}");
-                        break;
+                for batch_id in 0..reader.num_batches() as i32 {
+                    let batch_length = reader.batch_length(batch_id);
+                    for start in (0..batch_length).step_by(batch_size) {
+                        let result = r
+                            .read_batch(batch_id, start..min(start + batch_size, batch_length))
+                            .await;
+                        if let Err(err) = tx.send(result).await {
+                            eprintln!("Failed to scan data: {err}");
+                            break 'outer;
+                        }
                     }
                 }
             }

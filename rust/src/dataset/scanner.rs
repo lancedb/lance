@@ -33,6 +33,7 @@ use crate::{Error, Result};
 
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
+pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
 /// Dataset Scanner
 ///
@@ -51,6 +52,9 @@ pub struct Scanner {
     dataset: Arc<Dataset>,
 
     projections: Schema,
+
+    /// The batch size controls the maximum size of rows to return for each read.
+    batch_size: usize,
 
     // filter: how to present filter
     limit: Option<i64>,
@@ -71,6 +75,7 @@ impl Scanner {
         Self {
             dataset,
             projections: projection,
+            batch_size: DEFAULT_BATCH_SIZE,
             limit: None,
             offset: None,
             fragments,
@@ -85,6 +90,12 @@ impl Scanner {
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
+    }
+
+    /// Set the batch size.
+    pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
+        self.batch_size = batch_size;
+        self
     }
 
     /// Set limit and offset.
@@ -223,6 +234,7 @@ impl Scanner {
                         self.fragments.clone(),
                         &vector_scan_projection,
                         manifest.clone(),
+                        self.batch_size,
                         PREFECTH_SIZE,
                         true,
                     ));
@@ -247,6 +259,7 @@ impl Scanner {
                 self.fragments.clone(),
                 projection,
                 manifest.clone(),
+                self.batch_size,
                 PREFECTH_SIZE,
                 with_row_id,
             ))
