@@ -1,6 +1,5 @@
-[submodule "integration/duckdb/duckdb"]
-	path = integration/duckdb_lance/duckdb
-	url = git@github.com:duckdb/duckdb.git
+[submodule "integration/duckdb_lance/duckdb"]
+	url = https://github.com/duckdb/duckdb.git
 [submodule "integration/duckdb_lance/duckdb-extension-framework"]
 	path = integration/duckdb_lance/duckdb-extension-framework
 	url = git@github.com:eto-ai/duckdb-extension-framework.git
