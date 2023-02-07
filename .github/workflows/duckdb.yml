@@ -24,7 +24,7 @@ jobs:
           git submodule init
           git submodule update
       - name: Make
-        run: make build
+        run: make build -j 4
       # - name: Upload Lance duckdb extension
       #   uses: actions/upload-artifact@v3
       #   with:
@@ -50,7 +50,7 @@ jobs:
           git submodule init
           git submodule update
       - name: Build
-        run: make build
+        run: make build -j 4
       # - name: Upload Lance duckdb extension
       #   uses: actions/upload-artifact@v3
       #   with:

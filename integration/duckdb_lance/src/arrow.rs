@@ -17,7 +17,9 @@
 use std::collections::HashMap;
 
 use arrow_array::{
-    cast::as_primitive_array, types::*, Array, ArrowPrimitiveType, PrimitiveArray, RecordBatch,
+    cast::{as_boolean_array, as_primitive_array},
+    types::*,
+    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
 };
 use arrow_schema::DataType;
 use duckdb_extension_framework::{duckly::idx_t, DataChunk, LogicalType, LogicalTypeId, Vector};
@@ -102,6 +104,12 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
         match col.data_type() {
+            DataType::Boolean => {
+                boolean_array_to_vector(
+                    as_boolean_array(col.as_ref()),
+                    &mut chunk.get_vector(i as idx_t),
+                );
+            }
             DataType::UInt8 => {
                 primitive_array_to_duckdb_vector::<UInt8Type>(
                     as_primitive_array(col.as_ref()),
@@ -161,31 +169,33 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
                     as_primitive_array(col.as_ref()),
                     &mut chunk.get_vector(i as idx_t),
                 );
-            },
-            DataType::Utf8 => {
-
-            },
+            }
+            DataType::Utf8 => {}
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
             }
         }
     }
-    chunk.set_size(batch.num_columns() as idx_t);
+    chunk.set_size(batch.num_rows() as idx_t);
     Ok(())
 }
 
-pub fn primitive_array_to_duckdb_vector<T: ArrowPrimitiveType>(
+fn primitive_array_to_duckdb_vector<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
     out_vector: &mut Vector<T::Native>,
 ) {
-    println!(
-        "Array len: {} out vector len: {}",
-        array.len(),
-        out_vector.get_data_as_slice().len()
-    );
-    assert!(array.len() <= out_vector.get_data_as_slice().len(),);
+    assert!(array.len() <= out_vector.get_data_as_slice().len());
 
     for i in 0..array.len() {
         out_vector.get_data_as_slice()[i] = array.value(i);
+    }
+}
+
+/// Convert Arrow [BooleanArray] to a duckdb vector.
+fn boolean_array_to_vector(array: &BooleanArray, out: &mut Vector<bool>) {
+    assert!(array.len() <= out.get_data_as_slice().len());
+
+    for i in 0..array.len() {
+        out.get_data_as_slice()[i] = array.value(i);
     }
 }
