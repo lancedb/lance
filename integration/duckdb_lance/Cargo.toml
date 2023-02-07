@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 lance = { path = "../../rust" }
-duckdb-extension-framework = { git = "https://github.com/eto-ai/duckdb-extension-framework.git", branch = "lei/duckdb_6.1", features = [
+duckdb-extension-framework = { path = "./duckdb-extension-framework", features = [
     "statically_linked"
 ] }
 lazy_static = "1.4.0"

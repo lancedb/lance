@@ -161,7 +161,10 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
                     as_primitive_array(col.as_ref()),
                     &mut chunk.get_vector(i as idx_t),
                 );
-            }
+            },
+            DataType::Utf8 => {
+
+            },
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
             }
