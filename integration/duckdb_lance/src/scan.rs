@@ -89,7 +89,6 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
                 return;
             }
         };
-    println!("Open dataset: {}\n", dataset.schema());
 
     let stream = match crate::RUNTIME.block_on(async {
         dataset
