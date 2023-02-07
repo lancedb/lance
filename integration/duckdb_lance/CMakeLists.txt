@@ -55,5 +55,10 @@ set(LIB_NAME ${EXTENSION_NAME}_loadable_extension)
 set_target_properties(${LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(${LIB_NAME}
         "${CMAKE_CURRENT_BINARY_DIR}/libduckdb_lance.a"
-        "-framework CoreFoundation"
-        "-framework Security")
+)
+
+if (APPLE)
+        target_link_libraries(${LIB_NAME}
+                "-framework CoreFoundation"
+                "-framework Security")
+endif()
