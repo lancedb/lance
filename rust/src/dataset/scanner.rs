@@ -293,3 +293,61 @@ impl Stream for ScannerStream {
         this.exec_node.poll_next_unpin(cx)
     }
 }
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
+
+    use arrow_array::{Int32Array, RecordBatchReader, StringArray};
+    use arrow_schema::DataType;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_batch_size() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches = RecordBatchBuffer::new(
+            (0..5)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut stream = dataset
+            .scan()
+            .batch_size(8)
+            .try_into_stream()
+            .await
+            .unwrap();
+        for expected_len in [8, 8, 4, 8, 8, 4] {
+            assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), expected_len as usize);
+        };
+    }
+}
