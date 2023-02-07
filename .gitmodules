@@ -1,4 +1,5 @@
 [submodule "integration/duckdb_lance/duckdb"]
+	path = integration/duckdb_lance/duckdb
 	url = https://github.com/duckdb/duckdb.git
 [submodule "integration/duckdb_lance/duckdb-extension-framework"]
 	path = integration/duckdb_lance/duckdb-extension-framework
