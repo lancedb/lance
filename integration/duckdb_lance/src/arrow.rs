@@ -14,12 +14,12 @@
 
 //! Arrow / DuckDB conversion.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ffi::CString};
 
 use arrow_array::{
     cast::{as_boolean_array, as_primitive_array},
     types::*,
-    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch,
+    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType;
 use duckdb_extension_framework::{duckly::idx_t, DataChunk, LogicalType, LogicalTypeId, Vector};
@@ -197,5 +197,16 @@ fn boolean_array_to_vector(array: &BooleanArray, out: &mut Vector<bool>) {
 
     for i in 0..array.len() {
         out.get_data_as_slice()[i] = array.value(i);
+    }
+}
+
+fn string_array_to_vector(array: &StringArray, out: &mut Vector<String>) {
+    assert!(array.len() <= out.get_data_as_slice().len());
+
+    // TODO: zero copy assignment
+    for i in 0..array.len() {
+        let s = array.value(i);
+        let cstr = CString::new(s.as_bytes()).unwrap();
+        unsafe { out.assign_string_element(i as u64, cstr.as_ptr()) }
     }
 }
