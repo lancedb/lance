@@ -3,5 +3,5 @@
 	url = https://github.com/duckdb/duckdb.git
 [submodule "integration/duckdb_lance/duckdb-extension-framework"]
 	path = integration/duckdb_lance/duckdb-extension-framework
-	url = git@github.com:eto-ai/duckdb-extension-framework.git
+	url = https://github.com/eto-ai/duckdb-extension-framework.git
 	branch = lance
