@@ -23,6 +23,8 @@ use duckdb_extension_framework::table_functions::{
 use duckdb_extension_framework::{malloc_struct, DataChunk, LogicalType, LogicalTypeId};
 use lance::dataset::Dataset;
 
+use crate::arrow::to_duckdb_logical_type;
+
 #[repr(C)]
 struct ScanBindData {
     /// Dataset URI
@@ -78,7 +80,10 @@ fn read_lance_bind(bind: &BindInfo) {
 
     let schema = dataset.schema();
     for field in schema.fields.iter() {
-        bind.add_result_column(&field.name, LogicalType::new(LogicalTypeId::Integer))
+        bind.add_result_column(
+            &field.name,
+            to_duckdb_logical_type(&field.data_type()).unwrap(),
+        );
     }
 }
 
@@ -92,5 +97,6 @@ pub fn scan_table_function() -> TableFunction {
     table_function.set_init(Some(read_lance_init));
     table_function.set_bind(Some(read_lance_bind_c));
     table_function.supports_pushdown(true);
+    // TODO: add filter push down.
     table_function
 }

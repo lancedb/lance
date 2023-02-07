@@ -18,11 +18,12 @@ use duckdb_extension_framework::duckly::duckdb_library_version;
 use duckdb_extension_framework::Database;
 use tokio::runtime::Runtime;
 
+mod arrow;
 pub mod error;
 mod scan;
 
 use crate::scan::scan_table_function;
-use error::Result;
+use error::{Error, Result};
 
 lazy_static::lazy_static! {
     static ref RUNTIME: Runtime = tokio::runtime::Runtime::new()
