@@ -19,6 +19,7 @@ use duckdb_extension_framework::Database;
 use tokio::runtime::Runtime;
 
 mod arrow;
+mod duckdb;
 pub mod error;
 mod scan;
 
