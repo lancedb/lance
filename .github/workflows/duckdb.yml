@@ -16,6 +16,9 @@ jobs:
         working-directory: ./integration/duckdb_lance
     steps:
       - uses: actions/checkout@v3
+      - name: Checkout submodules
+        run: |
+          git submodule sync --recursive
       - name: Make
         run: make build
       # - name: Upload Lance duckdb extension
@@ -35,6 +38,8 @@ jobs:
       - name: Install dependencies
         run: |
           brew install protobuf
+      - name: Checkout submodules
+        run: git submodule sync --recursive
       - name: Build
         run: make build
       # - name: Upload Lance duckdb extension
