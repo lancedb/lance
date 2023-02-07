@@ -15,7 +15,8 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 
 use duckdb_extension_framework::duckly::{
-    duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info, idx_t,
+    duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info,
+    duckdb_vector_size,
 };
 use duckdb_extension_framework::table_functions::{
     BindInfo, FunctionInfo, InitInfo, TableFunction,
@@ -31,15 +32,12 @@ use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
 struct ScanBindData {
     /// Dataset URI
     uri: *mut c_char,
-
-    dataset: *mut Dataset,
 }
 
 /// Drop the ScanBindData from C.
 unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
     let actual = v.cast::<ScanBindData>();
-
-    drop(Box::from_raw((*actual).dataset));
+    drop(CString::from_raw((*actual).uri.cast()));
     duckdb_free(v);
 }
 
@@ -93,7 +91,13 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
         };
     println!("Open dataset: {}\n", dataset.schema());
 
-    let stream = match crate::RUNTIME.block_on(async { dataset.scan().try_into_stream().await }) {
+    let stream = match crate::RUNTIME.block_on(async {
+        dataset
+            .scan()
+            .batch_size(duckdb_vector_size() as usize)
+            .try_into_stream()
+            .await
+    }) {
         Ok(s) => Box::new(s),
         Err(e) => {
             info.set_error(CString::new(e.to_string()).expect("Create error message"));
