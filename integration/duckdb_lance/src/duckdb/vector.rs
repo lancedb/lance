@@ -103,4 +103,10 @@ impl ListVector {
     pub fn len(&self) -> usize {
         unsafe { duckdb_list_vector_get_size(self.ptr) as usize }
     }
+
+    pub fn child<T: Copy>(&self) -> Vector<T> {
+        Vector::from(unsafe {
+            duckdb_list_vector_get_child(self.ptr)
+        })
+    }
 }
