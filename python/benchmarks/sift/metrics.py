@@ -15,13 +15,13 @@
 #  limitations under the License.
 
 import argparse
+import time
 from typing import Optional
 
 import duckdb
 import lance
 import numpy as np
 import pandas as pd
-import time
 
 
 def recall(actual_sorted: np.ndarray, results: np.ndarray):
@@ -70,7 +70,7 @@ def test(nsamples=100):
     if we just use np.partition, we should have perfect recall
     """
     mat = np.random.randn(1000000, 128)
-    mat = mat / np.sqrt((mat ** 2).sum(axis=1))[:, None]  # to unit vectors
+    mat = mat / np.sqrt((mat**2).sum(axis=1))[:, None]  # to unit vectors
     actual_sorted = []
     results = []
     for _ in range(nsamples):
@@ -125,11 +125,7 @@ def test_dataset(
         )
         end = time.time()
         tot += end - start
-        results.append(
-            rs["score"]
-            .combine_chunks()
-            .to_numpy()
-        )
+        results.append(rs["score"].combine_chunks().to_numpy())
     avg_latency = tot / nsamples
     return recall(np.array(actual_sorted), np.array(results)), avg_latency
 
@@ -143,7 +139,16 @@ if __name__ == "__main__":
     parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
     args = parser.parse_args()
 
-    columns = ["ivf", "pq", "nprobes", "nsamples", "topk", "refine_factor", "recall@k", "mean_time_sec"]
+    columns = [
+        "ivf",
+        "pq",
+        "nprobes",
+        "nsamples",
+        "topk",
+        "refine_factor",
+        "recall@k",
+        "mean_time_sec",
+    ]
     ivf = []
     pq = []
     nprobes = []
@@ -174,5 +179,21 @@ if __name__ == "__main__":
             )
 
     df = pd.DataFrame(
-        {k: v for k, v in zip(columns, [ivf, pq, nprobes, nsamples, topk, refine_factor, recall_at_k, mean_time])})
+        {
+            k: v
+            for k, v in zip(
+                columns,
+                [
+                    ivf,
+                    pq,
+                    nprobes,
+                    nsamples,
+                    topk,
+                    refine_factor,
+                    recall_at_k,
+                    mean_time,
+                ],
+            )
+        }
+    )
     df.to_csv(args.out, index=False)

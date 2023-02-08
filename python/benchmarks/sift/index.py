@@ -15,10 +15,10 @@
 #  limitations under the License.
 
 import argparse
-import lance
-import pyarrow as pa
-import numpy as np
 import struct
+
+import lance
+import numpy as np
 import pyarrow as pa
 
 
@@ -53,10 +53,12 @@ def main():
     args = parser.parse_args()
 
     dataset = lance.dataset(args.uri)
-    dataset.create_index(args.column_name,
-                         index_type="IVF_PQ",
-                         num_partitions=args.ivf_partitions,  # IVF
-                         num_sub_vectors=args.pq_bits)  # PQ
+    dataset.create_index(
+        args.column_name,
+        index_type="IVF_PQ",
+        num_partitions=args.ivf_partitions,  # IVF
+        num_sub_vectors=args.pq_bits,
+    )  # PQ
 
 
 if __name__ == "__main__":
