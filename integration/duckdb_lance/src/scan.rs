@@ -51,6 +51,12 @@ struct ScanInitData {
     done: bool,
 }
 
+#[repr(C)]
+struct ListEntry {
+    offset: u64,
+    length: u64,
+}
+
 #[no_mangle]
 unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_chunk) {
     let info = FunctionInfo::from(info);
