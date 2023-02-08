@@ -17,14 +17,14 @@
 use std::collections::HashMap;
 
 use arrow_array::{
-    cast::{as_boolean_array, as_primitive_array, as_string_array},
+    cast::{as_boolean_array, as_primitive_array, as_string_array, as_struct_array},
     types::*,
-    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray,
+    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
 use duckdb_extension_framework::{LogicalType, LogicalTypeId};
 
-use crate::duckdb::{DataChunk, Inserter, Vector};
+use crate::duckdb::{DataChunk, Inserter, Vector, StructVector};
 use crate::{Error, Result};
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
@@ -171,6 +171,11 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.vector::<&str>(i));
             }
+            DataType::Struct(fields) => {
+                let struct_array = as_struct_array(col.as_ref());
+                let mut struct_vector = chunk.struct_vector(i);
+                struct_array_to_vector(&struct_array, &mut struct_vector);
+            }
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
             }
@@ -204,5 +209,80 @@ fn string_array_to_vector(array: &StringArray, out: &mut Vector<&str>) {
     for i in 0..array.len() {
         let s = array.value(i);
         out.insert(i, s);
+    }
+}
+
+fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
+    for i in 0..array.num_columns() {
+        let column = array.column(i);
+        match column.data_type()  {
+            DataType::Boolean => {
+                boolean_array_to_vector(as_boolean_array(column.as_ref()), &mut out.child(i));
+            }
+            DataType::UInt8 => {
+                primitive_array_to_duckdb_vector::<UInt8Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i),
+                );
+            }
+            DataType::UInt16 => {
+                primitive_array_to_duckdb_vector::<UInt16Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i),
+                );
+            }
+            DataType::UInt32 => {
+                primitive_array_to_duckdb_vector::<UInt32Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i),
+                );
+            }
+            DataType::UInt64 => {
+                primitive_array_to_duckdb_vector::<UInt64Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Int8 => {
+                primitive_array_to_duckdb_vector::<Int8Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Int16 => {
+                primitive_array_to_duckdb_vector::<Int16Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Int32 => {
+                primitive_array_to_duckdb_vector::<Int32Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Int64 => {
+                primitive_array_to_duckdb_vector::<Int64Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Float32 => {
+                primitive_array_to_duckdb_vector::<Float32Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Float64 => {
+                primitive_array_to_duckdb_vector::<Float64Type>(
+                    as_primitive_array(column.as_ref()),
+                    &mut out.child(i)
+                );
+            }
+            DataType::Utf8 => {
+                string_array_to_vector(as_string_array(column.as_ref()), &mut out.child(i));
+            },
+            _ => {}
+        }
     }
 }

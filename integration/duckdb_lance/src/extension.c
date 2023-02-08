@@ -26,3 +26,4 @@ DUCKDB_EXTENSION_API const char* lance_version() {
 DUCKDB_EXTENSION_API void lance_init(void* db) {
     lance_init_rust(db);
 }
+

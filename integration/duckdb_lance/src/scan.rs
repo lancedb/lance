@@ -36,6 +36,8 @@ struct ScanBindData {
 }
 
 /// Drop the ScanBindData from C.
+///
+/// # Safety
 unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
     let actual = v.cast::<ScanBindData>();
     drop(CString::from_raw((*actual).uri.cast()));
@@ -66,8 +68,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
 
     if let Some(b) = batch {
         if let Err(e) = record_batch_to_duckdb_data_chunk(&b, &mut output) {
-            info.set_error(e.to_string().as_str());
-            return;
+            info.set_error(e.to_string().as_str())
         };
     } else {
         (*init_data).done = true;

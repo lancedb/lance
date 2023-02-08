@@ -18,4 +18,4 @@ mod data_chunk;
 mod vector;
 
 pub use data_chunk::DataChunk;
-pub use vector::{Inserter, ListVector, Vector};
+pub use vector::{Inserter, ListVector, StructVector, Vector};

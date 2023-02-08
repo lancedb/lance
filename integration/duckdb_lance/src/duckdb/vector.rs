@@ -17,8 +17,8 @@ use std::ops::{Index, IndexMut};
 use std::{marker::PhantomData, slice};
 
 use crate::duckdb::ffi::{
-    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_vector,
-    duckdb_vector_assign_string_element, duckdb_vector_get_data, duckdb_vector_size,
+    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_vector_get_child,
+    duckdb_vector, duckdb_vector_assign_string_element, duckdb_vector_get_data, duckdb_vector_size,
 };
 
 pub struct Vector<T: Copy> {
@@ -90,6 +90,7 @@ impl Inserter<&str> for Vector<&str> {
 }
 
 pub struct ListVector {
+    /// ListVector does not own the vector pointer.
     ptr: duckdb_vector,
 }
 
@@ -105,8 +106,23 @@ impl ListVector {
     }
 
     pub fn child<T: Copy>(&self) -> Vector<T> {
-        Vector::from(unsafe {
-            duckdb_list_vector_get_child(self.ptr)
-        })
+        Vector::from(unsafe { duckdb_list_vector_get_child(self.ptr) })
+    }
+}
+
+pub struct StructVector {
+    /// ListVector does not own the vector pointer.
+    ptr: duckdb_vector,
+}
+
+impl From<duckdb_vector> for StructVector {
+    fn from(ptr: duckdb_vector) -> Self {
+        Self { ptr }
+    }
+}
+
+impl StructVector {
+    pub fn child<T: Copy>(&self, idx: usize) -> Vector<T> {
+        Vector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
     }
 }
