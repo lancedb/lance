@@ -32,9 +32,7 @@ impl DataChunk {
 
     /// Get a list vector from the column index.
     pub fn list_vector(&self, idx: usize) -> ListVector {
-        ListVector::from(unsafe {
-            duckdb_data_chunk_get_vector(self.ptr, idx as u64)
-        })
+        ListVector::from(unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) })
     }
 
     /// Set the size of the data chunk

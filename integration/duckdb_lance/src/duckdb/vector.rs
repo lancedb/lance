@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use std::ffi::CString;
-use std::{marker::PhantomData, slice};
 use std::ops::{Index, IndexMut};
+use std::{marker::PhantomData, slice};
 
-use crate::duckdb::ffi::{duckdb_vector, duckdb_vector_get_data, duckdb_vector_size, duckdb_vector_assign_string_element};
+use crate::duckdb::ffi::{
+    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_vector,
+    duckdb_vector_assign_string_element, duckdb_vector_get_data, duckdb_vector_size,
+};
 
 pub struct Vector<T: Copy> {
     ptr: duckdb_vector,
@@ -92,8 +95,12 @@ pub struct ListVector {
 
 impl From<duckdb_vector> for ListVector {
     fn from(ptr: duckdb_vector) -> Self {
-        Self {
-            ptr,
-        }
+        Self { ptr }
+    }
+}
+
+impl ListVector {
+    pub fn len(&self) -> usize {
+        unsafe { duckdb_list_vector_get_size(self.ptr) as usize }
     }
 }

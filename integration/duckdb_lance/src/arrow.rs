@@ -14,7 +14,7 @@
 
 //! Arrow / DuckDB conversion.
 
-use std::{collections::HashMap};
+use std::collections::HashMap;
 
 use arrow_array::{
     cast::{as_boolean_array, as_primitive_array, as_string_array},
@@ -24,7 +24,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use duckdb_extension_framework::{LogicalType, LogicalTypeId};
 
-use crate::duckdb::{DataChunk, Vector, Inserter};
+use crate::duckdb::{DataChunk, Inserter, Vector};
 use crate::{Error, Result};
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
@@ -169,10 +169,7 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
                 );
             }
             DataType::Utf8 => {
-                string_array_to_vector(
-                    as_string_array(col.as_ref()),
-                    &mut chunk.vector::<&str>(i),
-                );
+                string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.vector::<&str>(i));
             }
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
