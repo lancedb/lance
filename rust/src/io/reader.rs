@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Lance Data File Reader
 
@@ -261,7 +258,9 @@ async fn read_batch(
     with_row_id: bool,
 ) -> Result<RecordBatch> {
     let arrs = stream::iter(&schema.fields)
-        .then(|f| async { read_array(reader, f, batch_id, params).await })
+        .then(|f| async move {
+            read_array(reader, f, batch_id, params).await
+        })
         .try_collect::<Vec<_>>()
         .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
@@ -470,9 +469,10 @@ mod tests {
     use super::*;
 
     use arrow_array::{
+        builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, StringArray, UInt8Array,
+        DictionaryArray, Float32Array, Int64Array, StringArray, StructArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -679,5 +679,71 @@ mod tests {
     async fn read_nullable_string_in_struct() {
         test_write_null_string_in_struct(true).await;
         test_write_null_string_in_struct(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_struct_of_list_arrays() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+                ArrowField::new(
+                    "ls",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+            ]),
+            true,
+        )]));
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let mut li_builder = ListBuilder::new(Int32Builder::new());
+        let mut ls_builder = ListBuilder::new(StringBuilder::new());
+        for i in 0..10 {
+            for j in 0..10 {
+                li_builder.values().append_value(i * 10 + j);
+                ls_builder
+                    .values()
+                    .append_value(format!("str-{}", i * 10 + j));
+            }
+            li_builder.append(true);
+            ls_builder.append(true);
+        }
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+                Arc::new(li_builder.finish()) as ArrayRef,
+            ),
+            (
+                ArrowField::new(
+                    "ls",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                Arc::new(ls_builder.finish()) as ArrayRef,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+
+        assert_eq!(batch, actual_batch);
+        println!("actual batch: {:?}", actual_batch);
     }
 }
