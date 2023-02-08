@@ -76,10 +76,16 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
     if data_type.is_primitive()
         || matches!(
             data_type,
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+            DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::LargeBinary
         )
     {
         Ok(LogicalType::new(to_duckdb_type_id(data_type)?))
+    } else if let DataType::Dictionary(_, value_type) = data_type {
+        to_duckdb_logical_type(value_type)
     } else if let DataType::Struct(fields) = data_type {
         let mut shape = HashMap::new();
         for field in fields.iter() {
@@ -102,7 +108,7 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
             child.data_type(),
         )?))
     } else {
-        println!("Unsupported data type: {}", data_type);
+        println!("Unsupported data type: {data_type}");
         todo!()
     }
 }
@@ -178,10 +184,10 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.vector::<&str>(i));
             }
-            DataType::Struct(fields) => {
+            DataType::Struct(_) => {
                 let struct_array = as_struct_array(col.as_ref());
                 let mut struct_vector = chunk.struct_vector(i);
-                struct_array_to_vector(&struct_array, &mut struct_vector);
+                struct_array_to_vector(struct_array, &mut struct_vector);
             }
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));

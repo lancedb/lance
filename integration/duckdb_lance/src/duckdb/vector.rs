@@ -49,11 +49,11 @@ impl<T: Copy> Vector<T> {
         unsafe { slice::from_raw_parts(self.as_mut_ptr(), self.capacity()) }
     }
 
-    pub fn as_mut_slice(&self) -> &mut [T] {
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.capacity()) }
     }
 
-    pub fn assign(&self, data: &[T]) {
+    pub fn assign(&mut self, data: &[T]) {
         assert!(data.len() <= self.capacity());
 
         for i in 0..data.len() {
