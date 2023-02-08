@@ -44,10 +44,10 @@ def main():
     )
     parser.add_argument(
         "-p",
-        "--pq-bits",
+        "--pq-subvectors",
         type=int,
         default=16,
-        help="Number of bits for product quantization",
+        help="Number of subvectors for product quantization",
         metavar="NUM",
     )
     args = parser.parse_args()
@@ -57,7 +57,7 @@ def main():
         args.column_name,
         index_type="IVF_PQ",
         num_partitions=args.ivf_partitions,  # IVF
-        num_sub_vectors=args.pq_bits,
+        num_sub_vectors=args.pq_subvectors,
     )  # PQ
 
 

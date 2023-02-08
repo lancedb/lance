@@ -158,7 +158,7 @@ if __name__ == "__main__":
     recall_at_k = []
     mean_time = []
     for n in [1, 10, 50, 100]:
-        for rf in [None, 5, 10]:
+        for rf in [None, 1, 5, 10]:
             recalls, times = test_dataset(
                 args.uri,
                 nsamples=args.samples,
