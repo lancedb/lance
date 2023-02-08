@@ -259,13 +259,7 @@ async fn read_batch(
 ) -> Result<RecordBatch> {
     let arrs = stream::iter(&schema.fields)
         .then(|f| async move {
-            match read_array(reader, f, batch_id, params).await {
-                Ok(b) => Ok(b),
-                Err(e) => {
-                    println!("Reading field: {}, type={}, {e}", f.name, f.data_type());
-                    Err(e)
-                }
-            }
+            read_array(reader, f, batch_id, params).await
         })
         .try_collect::<Vec<_>>()
         .await?;
@@ -414,18 +408,7 @@ async fn read_struct_array(
     // TODO: use tokio to make the reads in parallel.
     let mut sub_arrays = vec![];
     for child in field.children.as_slice() {
-        let arr = match read_array(reader, child, batch_id, params).await {
-            Ok(a) => a,
-            Err(e) => {
-                println!(
-                    "Failed to read child: {} type={} {}",
-                    child.name,
-                    child.data_type(),
-                    e
-                );
-                return Err(e);
-            }
-        };
+        let arr = read_array(reader, child, batch_id, params).await?;
         sub_arrays.push((child.into(), arr));
     }
 
