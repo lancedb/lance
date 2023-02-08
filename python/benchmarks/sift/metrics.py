@@ -20,6 +20,8 @@ from typing import Optional
 import duckdb
 import lance
 import numpy as np
+import pandas as pd
+import time
 
 
 def recall(actual_sorted: np.ndarray, results: np.ndarray):
@@ -68,7 +70,7 @@ def test(nsamples=100):
     if we just use np.partition, we should have perfect recall
     """
     mat = np.random.randn(1000000, 128)
-    mat = mat / np.sqrt((mat**2).sum(axis=1))[:, None]  # to unit vectors
+    mat = mat / np.sqrt((mat ** 2).sum(axis=1))[:, None]  # to unit vectors
     actual_sorted = []
     results = []
     for _ in range(nsamples):
@@ -95,49 +97,82 @@ def test_dataset(
     actual_sorted = []
     results = []
 
+    tot = 0
+
+    q = query_vectors[0, :]
+    dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": k,
+            "nprobes": nprobes,
+            "refine_factor": refine_factor,
+        }
+    )
+
     for i in range(nsamples):
         q = query_vectors[i, :]
         actual_sorted.append(l2_sort(all_vectors, q))
+        start = time.time()
+        rs = dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": k,
+                "nprobes": nprobes,
+                "refine_factor": refine_factor,
+            }
+        )
+        end = time.time()
+        tot += end - start
         results.append(
-            dataset.to_table(
-                columns=["id", "vector"],
-                nearest={
-                    "column": "vector",
-                    "q": q,
-                    "k": k,
-                    "nprobes": nprobes,
-                    "refine_factor": refine_factor,
-                }
-            )["score"]
+            rs["score"]
             .combine_chunks()
             .to_numpy()
         )
-    return recall(np.array(actual_sorted), np.array(results))
+    avg_latency = tot / nsamples
+    return recall(np.array(actual_sorted), np.array(results)), avg_latency
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("uri", help="Dataset URI", metavar="URI")
+    parser.add_argument("out", help="Output file", metavar="FILE")
+    parser.add_argument("-i", "--ivf-partitions", type=int, metavar="N")
     parser.add_argument("-s", "--samples", default=10, type=int, metavar="N")
     parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
-    parser.add_argument(
-        "-r",
-        "--refine",
-        default=None,
-        type=int,
-        metavar="N",
-        help="Refine factor for the last Refine step.",
-    )
     args = parser.parse_args()
 
-    for nprobes in range(1, 50, 5):
-        recalls = test_dataset(
-            args.uri,
-            nsamples=args.samples,
-            k=args.top_k,
-            nprobes=nprobes,
-            refine_factor=args.refine,
-        )
-        print(
-            f"nprobs: {nprobes}, refine={args.refine} recall@{args.top_k}={recalls[0]:0.3f}"
-        )
+    columns = ["ivf", "pq", "nprobes", "nsamples", "topk", "refine_factor", "recall@k", "mean_time_sec"]
+    ivf = []
+    pq = []
+    nprobes = []
+    nsamples = []
+    topk = []
+    refine_factor = []
+    recall_at_k = []
+    mean_time = []
+    for n in [1, 10, 50, 100]:
+        for rf in [None, 5, 10]:
+            recalls, times = test_dataset(
+                args.uri,
+                nsamples=args.samples,
+                k=args.top_k,
+                nprobes=n,
+                refine_factor=rf,
+            )
+            ivf.append(args.ivf_partitions)
+            pq.append(16)
+            nprobes.append(n)
+            nsamples.append(args.samples)
+            topk.append(args.top_k)
+            refine_factor.append(rf)
+            recall_at_k.append(recalls[0])
+            mean_time.append(times)
+            print(
+                f"nprobes: {n}, refine={rf}, recall@{args.top_k}={recalls[0]:0.3f}, mean(s)={times}"
+            )
+
+    df = pd.DataFrame(
+        {k: v for k, v in zip(columns, [ivf, pq, nprobes, nsamples, topk, refine_factor, recall_at_k, mean_time])})
+    df.to_csv(args.out, index=False)
