@@ -483,15 +483,13 @@ async fn read_large_list_array(
 
 #[cfg(test)]
 mod tests {
-    use std::primitive;
-
     use super::*;
 
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, StringArray, UInt8Array,
+        DictionaryArray, Float32Array, Int64Array, StringArray, StructArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -701,19 +699,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_var_length_list_array() {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(
-                "li",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
-                true,
-            ),
-            ArrowField::new(
-                "ls",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
-                true,
-            ),
-        ]));
+    async fn test_read_struct_of_list_arrays() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+                ArrowField::new(
+                    "ls",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+            ]),
+            true,
+        )]));
 
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
@@ -731,11 +733,25 @@ mod tests {
             li_builder.append(true);
             ls_builder.append(true);
         }
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![Arc::new(li_builder.finish()), Arc::new(ls_builder.finish())],
-        )
-        .unwrap();
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+                Arc::new(li_builder.finish()) as ArrayRef,
+            ),
+            (
+                ArrowField::new(
+                    "ls",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                Arc::new(ls_builder.finish()) as ArrayRef,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         file_writer.write(&batch).await.unwrap();
