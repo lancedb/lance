@@ -51,9 +51,9 @@ uuid = { version = "1.2", features = ["v4"] }
 path-absolutize = "3.0.14"
 cblas = { version = "0.4.0", optional = true }
 accelerate-src = { version = "0.3.2", optional = true }
+arrow = { version = "31.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
-
 
 [build-dependencies]
 prost-build = "0.11"
@@ -86,6 +86,12 @@ harness = false
 [[bench]]
 name = "vector_index"
 harness = false
+
+[profile.release]
+strip = true
+opt-level = "s"
+lto = true
+codegen-units = 1
 
 [[bench]]
 name = "kmeans"

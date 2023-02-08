@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::util::pretty::print_batches;
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
@@ -112,7 +113,18 @@ async fn main() -> Result<()> {
             scanner.limit(*n, None).unwrap();
             let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
-            println!("{:?}", batch);
+
+            // print the summary of data total rows and cols
+            let mut total_num_of_cols: usize = b.num_columns();
+            let mut total_num_of_rows: usize = 0;
+            for b in batch.iter() {
+                total_num_of_rows += b.num_rows();
+            }
+            println!("Number of columns: {:?}", total_num_of_cols);
+            println!("Number of rows: {:?}", total_num_of_rows);
+
+            // pretty print the batch
+            let _ = print_batches(&batch)?;
 
             Ok(())
         }
