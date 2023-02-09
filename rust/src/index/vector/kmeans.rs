@@ -39,7 +39,9 @@ async fn train_kmeans_fallback(
     let data = Arc::new(FixedSizeListArray::try_new(array, dimension as i32)?);
     let mut params = KMeansParams::default();
     params.max_iters = max_iters;
+    let now = std::time::Instant::now();
     let model = KMeans::new_with_params(data, k, &params).await;
+    println!("Train kmean time: {}", now.elapsed().as_secs_f32());
     let centroids = model.centroids.values();
     let floats: &Float32Array = as_primitive_array(centroids.as_ref());
     Ok(floats.clone())
@@ -57,11 +59,13 @@ pub async fn train_kmeans(
     // Ony sample 256 * num_clusters. See Faiss
     let data = if num_rows > 256 * k as usize {
         println!(
-            "Sample {} out of {} to train kmeans of {} clusters",
+            "Sample {} out of {} to train kmeans of {} dim, {} clusters",
             256 * k,
             array.len() / dimension,
+            dimension,
             k,
         );
+        let now = std::time::Instant::now();
         let sample_size = 256 * k as usize;
         let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
         let mut builder = Float32Builder::with_capacity(sample_size * dimension);
@@ -69,7 +73,9 @@ pub async fn train_kmeans(
             let s = array.slice(idx * dimension, dimension);
             builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
         }
-        builder.finish()
+        let d = builder.finish();
+        println!("Time spent on sampling: {}", now.elapsed().as_secs_f32());
+        d
     } else {
         array.clone()
     };
