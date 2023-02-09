@@ -3,7 +3,7 @@
  
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Alternative to Parquet. 100x faster for random access, includes an embedded vector index and automatic versioning. Apache Arrow and DuckDB compatible.**
+**Alternative to Parquet. 100x faster for random access, includes a vector index and automatic versioning. Apache Arrow and DuckDB compatible.**
 
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
@@ -23,7 +23,7 @@ Lance is a columnar data format that is easy and fast to version, query and trai
 
 * **High-performance random access:** 100x faster than Parquet.
 
-* **Embedded vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
+* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
 
 * **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
 
