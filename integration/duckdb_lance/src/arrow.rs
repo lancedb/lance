@@ -237,7 +237,7 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
             "struct_to_array_to_vector: i={i}, arrow_name={}, type={}, vector_type={:?}",
             array.column_names()[i],
             column.data_type(),
-            out.column_type()
+            out.logical_type()
         );
         match column.data_type() {
             DataType::Boolean => {
@@ -292,6 +292,13 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
                 );
             }
             DataType::Float32 => {
+                println!(
+                    "FLOAT ARRAY TO DUCKDB ARRAY: i={i}, arrow_name={}, type={}, vector_type={:?}, name={}",
+                    array.column_names()[i],
+                    column.data_type(),
+                    out.child::<f32>(i).logical_type(),
+                    out.child_name(i),
+                );
                 primitive_array_to_duckdb_vector::<Float32Type>(
                     as_primitive_array(column.as_ref()),
                     &mut out.child(i),

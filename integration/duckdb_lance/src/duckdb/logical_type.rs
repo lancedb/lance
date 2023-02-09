@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ffi::CString;
 use std::fmt::Debug;
 
 use crate::duckdb::ffi::*;
 
 #[repr(u32)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum LogicalTypeId {
     Boolean = DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN,
     Tinyint = DUCKDB_TYPE_DUCKDB_TYPE_TINYINT,
@@ -88,13 +89,28 @@ impl From<u32> for LogicalTypeId {
 }
 
 /// DuckDB Logical Type.
+///
+/// https://duckdb.org/docs/sql/data_types/overview
 pub struct LogicalType {
-    ptr: duckdb_logical_type,
+    pub(crate) ptr: duckdb_logical_type,
 }
 
 impl Debug for LogicalType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "{:?}", self.id())
+        let id = self.id();
+        match id {
+            LogicalTypeId::Struct => {
+                write!(f, "struct<")?;
+                for i in 0..self.num_children() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {:?}", self.child_name(i), self.child(i))?;
+                }
+                write!(f, ">")
+            },
+            _ => write!(f, "{:?}", self.id()),
+        }
     }
 }
 
@@ -110,6 +126,7 @@ impl Drop for LogicalType {
     }
 }
 
+/// Wrap a DuckDB logical type from C API
 impl From<duckdb_logical_type> for LogicalType {
     fn from(ptr: duckdb_logical_type) -> Self {
         Self { ptr }
@@ -117,8 +134,36 @@ impl From<duckdb_logical_type> for LogicalType {
 }
 
 impl LogicalType {
-    fn id(&self) -> LogicalTypeId {
+    /// Logical type ID
+    pub fn id(&self) -> LogicalTypeId {
         let duckdb_type_id = unsafe { duckdb_get_type_id(self.ptr) };
         duckdb_type_id.into()
+    }
+
+    pub fn num_children(&self) -> usize {
+        match self.id() {
+            LogicalTypeId::Struct => unsafe {
+                duckdb_struct_type_child_count(self.ptr) as usize
+            },
+            LogicalTypeId::List => 1,
+            _ => 0,
+        }
+    }
+
+    pub fn child_name(&self, idx: usize) -> String {
+        assert_eq!(self.id(), LogicalTypeId::Struct);
+        unsafe {
+            let child_name_ptr = duckdb_struct_type_child_name(self.ptr, idx as u64);
+            let c_str = CString::from_raw(child_name_ptr);
+            let name = c_str.to_str().unwrap();
+            name.to_string()
+        }
+    }
+
+    pub fn child(&self, idx: usize) -> Self {
+        let c_logical_type = unsafe {
+            duckdb_struct_type_child_type(self.ptr, idx as u64)
+        };
+        Self::from(c_logical_type)
     }
 }

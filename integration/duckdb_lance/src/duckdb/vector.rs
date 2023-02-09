@@ -17,9 +17,10 @@ use std::ops::{Index, IndexMut};
 use std::{marker::PhantomData, slice};
 
 use crate::duckdb::ffi::{
-    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_vector_get_child,
-    duckdb_vector, duckdb_vector_assign_string_element, duckdb_vector_get_column_type,
-    duckdb_vector_get_data, duckdb_vector_size,
+    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_type_child_count,
+    duckdb_struct_type_child_name, duckdb_struct_vector_get_child, duckdb_vector,
+    duckdb_vector_assign_string_element, duckdb_vector_get_column_type, duckdb_vector_get_data,
+    duckdb_vector_size,
 };
 use crate::duckdb::LogicalType;
 
@@ -53,6 +54,10 @@ impl<T: Copy> Vector<T> {
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.capacity()) }
+    }
+
+    pub fn logical_type(&self) -> LogicalType {
+        LogicalType::from(unsafe { duckdb_vector_get_column_type(self.ptr) })
     }
 
     pub fn copy(&mut self, data: &[T]) {
@@ -129,7 +134,26 @@ impl StructVector {
         Vector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
     }
 
-    pub fn column_type(&self) -> LogicalType {
+    /// Get the logical type of this struct vector.
+    pub fn logical_type(&self) -> LogicalType {
         LogicalType::from(unsafe { duckdb_vector_get_column_type(self.ptr) })
+    }
+
+    pub fn child_name(&self, idx: usize) -> String {
+        let logical_type = self.logical_type();
+        unsafe {
+            let child_name_ptr = duckdb_struct_type_child_name(logical_type.ptr, idx as u64);
+            let c_str = CString::from_raw(child_name_ptr);
+            let name = c_str.to_str().unwrap();
+            // duckdb_free(child_name_ptr.cast());
+            name.to_string()
+        }
+    }
+
+    pub fn num_children(&self) -> usize {
+        let logical_type = self.logical_type();
+        unsafe {
+            duckdb_struct_type_child_count(logical_type.ptr) as usize
+        }
     }
 }
