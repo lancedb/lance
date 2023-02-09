@@ -21,12 +21,13 @@ use arrow_array::{
         as_struct_array,
     },
     types::*,
-    Array, ArrowPrimitiveType, BooleanArray, GenericListArray, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StringArray, StructArray,
+    Array, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, GenericListArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
 use duckdb_ext::{DataChunk, FlatVector, Inserter, ListVector, StructVector, Vector};
 use duckdb_ext::{LogicalType, LogicalTypeId};
+use lance::arrow::as_fixed_size_list_array;
 use num_traits::AsPrimitive;
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
@@ -121,6 +122,18 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.flat_vector(i));
             }
+            DataType::List(_) => {
+                list_array_to_vector(as_list_array(col.as_ref()), &mut chunk.list_vector(i));
+            }
+            DataType::LargeList(_) => {
+                list_array_to_vector(as_large_list_array(col.as_ref()), &mut chunk.list_vector(i));
+            }
+            DataType::FixedSizeList(_, _) => {
+                fixed_size_list_array_to_vector(
+                    as_fixed_size_list_array(col.as_ref()),
+                    &mut chunk.list_vector(i),
+                );
+            }
             DataType::Struct(_) => {
                 let struct_array = as_struct_array(col.as_ref());
                 let mut struct_vector = chunk.struct_vector(i);
@@ -139,7 +152,7 @@ fn primitive_array_to_flat_vector<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
     out_vector: &mut FlatVector,
 ) {
-    assert!(array.len() <= out_vector.capacity());
+    // assert!(array.len() <= out_vector.capacity());
     out_vector.copy::<T::Native>(array.values());
 }
 
@@ -241,7 +254,7 @@ fn list_array_to_vector<O: OffsetSizeTrait + AsPrimitive<usize>>(
     out: &mut ListVector,
 ) {
     let value_array = array.values();
-    let mut child = out.child();
+    let mut child = out.child(value_array.len());
     match value_array.data_type() {
         dt if dt.is_primitive() => {
             primitive_array_to_vector(value_array.as_ref(), &mut child);
@@ -250,6 +263,26 @@ fn list_array_to_vector<O: OffsetSizeTrait + AsPrimitive<usize>>(
                 let length = array.value_length(i);
                 out.set_entry(i, offset.as_(), length.as_());
             }
+        }
+        _ => {
+            println!("Nested list is not supported yet.");
+            todo!()
+        }
+    }
+}
+
+fn fixed_size_list_array_to_vector(array: &FixedSizeListArray, out: &mut ListVector) {
+    let value_array = array.values();
+    let mut child = out.child(value_array.len());
+    match value_array.data_type() {
+        dt if dt.is_primitive() => {
+            primitive_array_to_vector(value_array.as_ref(), &mut child);
+            for i in 0..array.len() {
+                let offset = array.value_offset(i);
+                let length = array.value_length();
+                out.set_entry(i, offset as usize, length as usize);
+            }
+            out.set_len(value_array.len());
         }
         _ => {
             println!("Nested list is not supported yet.");
@@ -277,6 +310,12 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
             DataType::LargeList(_) => {
                 list_array_to_vector(
                     as_large_list_array(column.as_ref()),
+                    &mut out.list_vector_child(i),
+                );
+            }
+            DataType::FixedSizeList(_, _) => {
+                fixed_size_list_array_to_vector(
+                    as_fixed_size_list_array(column.as_ref()),
                     &mut out.list_vector_child(i),
                 );
             }

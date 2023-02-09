@@ -14,13 +14,14 @@
 
 use std::any::Any;
 use std::ffi::CString;
-use std::{slice};
+use std::slice;
 
 use crate::ffi::{
-    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_type_child_count,
+    duckdb_list_entry, duckdb_list_vector_get_child, duckdb_list_vector_get_size,
+    duckdb_list_vector_reserve, duckdb_list_vector_set_size, duckdb_struct_type_child_count,
     duckdb_struct_type_child_name, duckdb_struct_vector_get_child, duckdb_vector,
     duckdb_vector_assign_string_element, duckdb_vector_get_column_type, duckdb_vector_get_data,
-    duckdb_vector_size, duckdb_list_vector_reserve, duckdb_list_vector_set_size, duckdb_list_entry,
+    duckdb_vector_size,
 };
 use crate::LogicalType;
 
@@ -33,12 +34,14 @@ pub trait Vector {
 
 pub struct FlatVector {
     ptr: duckdb_vector,
+    capacity: usize,
 }
 
 impl From<duckdb_vector> for FlatVector {
     fn from(ptr: duckdb_vector) -> Self {
         Self {
             ptr,
+            capacity: unsafe { duckdb_vector_size() as usize },
         }
     }
 }
@@ -54,8 +57,12 @@ impl Vector for FlatVector {
 }
 
 impl FlatVector {
+    fn with_capacity(ptr: duckdb_vector, capacity: usize) -> Self {
+        Self { ptr, capacity }
+    }
+
     pub fn capacity(&self) -> usize {
-        unsafe { duckdb_vector_size() as usize }
+        self.capacity
     }
 
     /// Returns an unsafe mutable pointer to the vector’s
@@ -101,7 +108,9 @@ pub struct ListVector {
 
 impl From<duckdb_vector> for ListVector {
     fn from(ptr: duckdb_vector) -> Self {
-        Self { entries: ptr.into() }
+        Self {
+            entries: ptr.into(),
+        }
     }
 }
 
@@ -114,14 +123,18 @@ impl ListVector {
         self.len() == 0
     }
 
-    pub fn child(&self) -> FlatVector {
-        FlatVector::from(unsafe { duckdb_list_vector_get_child(self.entries.ptr) })
+    // TODO: not ideal interface. Where should we keep capacity.
+    pub fn child(&self, capacity: usize) -> FlatVector {
+        self.reserve(capacity);
+        FlatVector::with_capacity(
+            unsafe { duckdb_list_vector_get_child(self.entries.ptr) },
+            capacity,
+        )
     }
 
     /// Set primitive data to the child node.
     pub fn set_child<T: Copy>(&self, data: &[T]) {
-        self.reserve(data.len());
-        self.child().copy(data);
+        self.child(data.len()).copy(data);
         self.set_len(data.len());
     }
 
@@ -132,15 +145,11 @@ impl ListVector {
 
     /// Reserve the capacity for its child node.
     fn reserve(&self, capacity: usize) {
-        unsafe {
-            duckdb_list_vector_reserve(self.entries.ptr, capacity as u64)
-        }
+        unsafe { duckdb_list_vector_reserve(self.entries.ptr, capacity as u64) }
     }
 
-    fn set_len(&self, new_len: usize) {
-        unsafe {
-            duckdb_list_vector_set_size(self.entries.ptr, new_len as u64)
-        }
+    pub fn set_len(&self, new_len: usize) {
+        unsafe { duckdb_list_vector_set_size(self.entries.ptr, new_len as u64) }
     }
 }
 
