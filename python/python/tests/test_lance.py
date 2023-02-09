@@ -46,6 +46,10 @@ def test_input_types(tmp_path):
 
     df = pd.DataFrame({"a": range(100), "b": range(100)})
     tbl = pa.Table.from_pandas(df)
+
+    lance.write_dataset(df, str(uri / "pandas.lance"), schema=tbl.schema)
+    assert tbl == lance.dataset(str(uri / "pandas.lance")).to_table()
+
     _check_roundtrip(tbl, uri / "table.lance", tbl)
 
     parquet_uri = str(uri / "dataset.parquet")

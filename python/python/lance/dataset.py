@@ -659,18 +659,18 @@ class LanceScanner(pa.dataset.Scanner):
 
 
 ReaderLike = Union[
+    pd.DataFrame,
     pa.Table,
     pa.dataset.Dataset,
     pa.dataset.Scanner,
     pa.RecordBatchReader,
-    LanceDataset,
-    LanceScanner,
 ]
 
 
 def write_dataset(
     data_obj: ReaderLike,
     uri: Union[str, Path],
+    schema: Optional[pa.Schema] = None,
     mode: str = "create",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
@@ -681,15 +681,15 @@ def write_dataset(
     ----------
     data_obj: Reader-like
         The data to be written. Acceptable types are:
-        - Pyarrow Table, Dataset, Scanner, or RecordBatchReader
-        - LanceDataset or LanceScanner
+        - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
     uri: str or Path
         Where to write the dataset to (directory)
+    schema: Schema, optional
+        If specified and the input is a pandas DataFrame, use this schema
+        instead of the default pandas to arrow table conversion.
     mode: str
         **create** - create a new dataset (raises if uri already exists).
-
         **overwrite** - create a new snapshot version
-
         **append** - create a new version that is the concat of the input the
         latest version (raises if uri does not exist)
     max_rows_per_file: int, default 1024 * 1024
@@ -698,7 +698,9 @@ def write_dataset(
         The max number of rows before starting a new group (in the same file)
 
     """
-    if isinstance(data_obj, pa.Table):
+    if isinstance(data_obj, pd.DataFrame):
+        reader = pa.Table.from_pandas(data_obj, schema=schema).to_reader()
+    elif isinstance(data_obj, pa.Table):
         reader = data_obj.to_reader()
     elif isinstance(data_obj, pa.dataset.Dataset):
         reader = pa.dataset.Scanner.from_dataset(data_obj).to_reader()
