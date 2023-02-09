@@ -698,7 +698,9 @@ def write_dataset(
         The max number of rows before starting a new group (in the same file)
 
     """
-    if isinstance(data_obj, pa.Table):
+    if isinstance(data_obj, pd.DataFrame):
+        reader = pa.Table.from_pandas(data_obj).to_reader()
+    elif isinstance(data_obj, pa.Table):
         reader = data_obj.to_reader()
     elif isinstance(data_obj, pa.dataset.Dataset):
         reader = pa.dataset.Scanner.from_dataset(data_obj).to_reader()

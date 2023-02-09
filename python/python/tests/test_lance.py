@@ -46,6 +46,8 @@ def test_input_types(tmp_path):
 
     df = pd.DataFrame({"a": range(100), "b": range(100)})
     tbl = pa.Table.from_pandas(df)
+
+    _check_roundtrip(df, uri / "pandas.lance", tbl)
     _check_roundtrip(tbl, uri / "table.lance", tbl)
 
     parquet_uri = str(uri / "dataset.parquet")
