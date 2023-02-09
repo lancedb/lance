@@ -19,10 +19,11 @@ use duckdb_ext::ffi::{
     duckdb_vector_size,
 };
 use duckdb_extension_framework::table_functions::{
-    BindInfo, FunctionInfo, InitInfo, TableFunction,
+    FunctionInfo
 };
 use duckdb_extension_framework::{malloc_struct};
 use duckdb_ext::{DataChunk, LogicalType, LogicalTypeId};
+use duckdb_ext::table_function::{BindInfo, TableFunction, InitInfo};
 
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
@@ -155,8 +156,7 @@ fn read_lance_bind(bind: &BindInfo) {
 }
 
 pub fn scan_table_function() -> TableFunction {
-    let table_function = TableFunction::new();
-    table_function.set_name("lance_scan");
+    let table_function = TableFunction::new("lance_scan");
     let logical_type = LogicalType::new(LogicalTypeId::Varchar);
     table_function.add_parameter(&logical_type);
 

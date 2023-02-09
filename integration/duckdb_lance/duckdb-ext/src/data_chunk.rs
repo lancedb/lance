@@ -50,6 +50,10 @@ impl DataChunk {
     pub fn len(&self) -> usize {
         unsafe { duckdb_data_chunk_get_size(self.ptr) as usize }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl From<duckdb_data_chunk> for DataChunk {

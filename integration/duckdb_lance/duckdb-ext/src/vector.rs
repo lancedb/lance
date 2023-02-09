@@ -113,6 +113,10 @@ impl ListVector {
         unsafe { duckdb_list_vector_get_size(self.ptr) as usize }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn child<T: Copy>(&self) -> Vector<T> {
         Vector::from(unsafe { duckdb_list_vector_get_child(self.ptr) })
     }

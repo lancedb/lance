@@ -13,10 +13,13 @@
 // limitations under the License.
 
 mod data_chunk;
+mod error;
 mod logical_type;
+pub mod table_function;
 mod vector;
 
 pub use data_chunk::DataChunk;
+pub use error::{Error, Result};
 pub use logical_type::{LogicalType, LogicalTypeId};
 pub use vector::{Inserter, ListVector, StructVector, Vector};
 
