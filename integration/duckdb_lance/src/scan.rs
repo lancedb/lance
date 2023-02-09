@@ -20,8 +20,7 @@ use duckdb_ext::ffi::{
 };
 use duckdb_ext::table_function::{BindInfo, InitInfo, TableFunction};
 use duckdb_ext::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
-use duckdb_extension_framework::malloc_struct;
-
+use futures::stream::StreamExt;
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
@@ -32,6 +31,15 @@ struct ScanBindData {
     /// Dataset URI
     uri: *mut c_char,
 }
+
+impl ScanBindData {
+    fn new(uri: &str) -> Self {
+        Self {
+            uri: CString::new(uri).expect("Bind uri").into_raw(),
+        }
+    }
+}
+
 
 /// Drop the ScanBindData from C.
 ///
@@ -49,10 +57,13 @@ struct ScanInitData {
     done: bool,
 }
 
-#[repr(C)]
-struct ListEntry {
-    offset: u64,
-    length: u64,
+impl ScanInitData {
+    fn new(stream: Box<ScannerStream>) -> Self {
+        Self {
+            stream: Box::into_raw(stream),
+            done: false
+        }
+    }
 }
 
 #[no_mangle]
@@ -64,7 +75,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     let batch = match crate::RUNTIME.block_on(async { (*init_data.stream).next().await }) {
         Some(Ok(b)) => Some(b),
         Some(Err(e)) => {
-            info.set_error(e.to_string().as_str());
+            info.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
             return;
         }
         None => None,
@@ -83,15 +94,14 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
 #[no_mangle]
 unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
     let info = InitInfo::from(info);
-    let bind_data = info.get_bind_data::<ScanBindData>();
+    let bind_data = info.bind_data::<ScanBindData>();
 
     let uri = CStr::from_ptr((*bind_data).uri);
     let dataset =
         match crate::RUNTIME.block_on(async { Dataset::open(uri.to_str().unwrap()).await }) {
             Ok(d) => Box::new(d),
             Err(e) => {
-                // TODO: fix duckdb-extension to pass string instead of `CString`.
-                info.set_error(CString::new(e.to_string()).expect("Create error message"));
+                info.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
                 return;
             }
         };
@@ -105,33 +115,29 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
     }) {
         Ok(s) => Box::new(s),
         Err(e) => {
-            info.set_error(CString::new(e.to_string()).expect("Create error message"));
-            return;
+            info.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
+            return
         }
     };
 
-    let mut init_data = malloc_struct::<ScanInitData>();
-    (*init_data).done = false;
-    (*init_data).stream = Box::into_raw(stream);
-    info.set_init_data(init_data.cast(), Some(duckdb_free));
+    let mut init_data = Box::new(ScanInitData::new(stream));
+    info.set_init_data(Box::into_raw(init_data).cast(), Some(duckdb_free));
 }
 
 #[no_mangle]
 unsafe extern "C" fn read_lance_bind_c(bind_info: duckdb_bind_info) {
     let bind_info = BindInfo::from(bind_info);
-    assert!(bind_info.get_parameter_count() >= 1);
+    assert!(bind_info.num_parameters() > 0);
 
     read_lance_bind(&bind_info);
 }
 
 fn read_lance_bind(bind: &BindInfo) {
-    let uri_param = bind.get_parameter(0).get_varchar();
-
-    let uri = uri_param.to_str().unwrap();
-    let dataset = match crate::RUNTIME.block_on(async { Dataset::open(uri).await }) {
+    let uri = bind.parameter(0).to_string();
+    let dataset = match crate::RUNTIME.block_on(async { Dataset::open(&uri).await }) {
         Ok(d) => d,
         Err(e) => {
-            bind.set_error(e.to_string().as_str());
+            bind.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
             return;
         }
     };
@@ -144,11 +150,9 @@ fn read_lance_bind(bind: &BindInfo) {
         );
     }
 
+    let bind_data = Box::new(ScanBindData::new(&uri));
     unsafe {
-        let bind_data = malloc_struct::<ScanBindData>();
-        (*bind_data).uri = CString::new(uri).expect("Bind uri").into_raw();
-
-        bind.set_bind_data(bind_data.cast(), Some(drop_scan_bind_data_c));
+        bind.set_bind_data(Box::into_raw(bind_data).cast(), Some(drop_scan_bind_data_c));
     }
 }
 
@@ -160,7 +164,7 @@ pub fn scan_table_function() -> TableFunction {
     table_function.set_function(Some(read_lance));
     table_function.set_init(Some(read_lance_init));
     table_function.set_bind(Some(read_lance_bind_c));
-    table_function.supports_pushdown(true);
+    table_function.pushdown(true);
     // TODO: add filter push down.
     table_function
 }

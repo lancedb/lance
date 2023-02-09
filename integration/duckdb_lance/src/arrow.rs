@@ -14,8 +14,6 @@
 
 //! Arrow / DuckDB conversion.
 
-use std::collections::HashMap;
-
 use crate::{Error, Result};
 use arrow_array::{
     cast::{as_boolean_array, as_primitive_array, as_string_array, as_struct_array},
@@ -86,14 +84,14 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
     } else if let DataType::Dictionary(_, value_type) = data_type {
         to_duckdb_logical_type(value_type)
     } else if let DataType::Struct(fields) = data_type {
-        let mut shape = HashMap::new();
+        let mut shape = vec![];
         for field in fields.iter() {
-            shape.insert(
+            shape.push((
                 field.name().as_str(),
                 to_duckdb_logical_type(field.data_type())?,
-            );
+            ));
         }
-        Ok(LogicalType::struct_type(shape))
+        Ok(LogicalType::struct_type(shape.as_slice()))
     } else if let DataType::List(child) = data_type {
         Ok(LogicalType::list_type(&to_duckdb_logical_type(
             child.data_type(),

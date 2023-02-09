@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ffi::{duckdb_destroy_value, duckdb_value};
+use crate::ffi::{duckdb_destroy_value, duckdb_get_varchar, duckdb_value};
+use std::ffi::CString;
 
 /// The Value object holds a single arbitrary value of any type that can be
 /// stored in the database.
@@ -35,5 +36,12 @@ impl Drop for Value {
             }
         }
         self.ptr = std::ptr::null_mut();
+    }
+}
+
+impl Value {
+    pub fn to_string(&self) -> String {
+        let c_string = unsafe { CString::from_raw(duckdb_get_varchar(self.ptr)) };
+        c_string.into_string().unwrap()
     }
 }
