@@ -12,47 +12,69 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::ffi::CString;
-use std::ops::{Index, IndexMut};
-use std::{marker::PhantomData, slice};
+use std::slice;
 
 use crate::ffi::{
-    duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_type_child_count,
+    duckdb_list_entry, duckdb_list_vector_get_child, duckdb_list_vector_get_size,
+    duckdb_list_vector_reserve, duckdb_list_vector_set_size, duckdb_struct_type_child_count,
     duckdb_struct_type_child_name, duckdb_struct_vector_get_child, duckdb_vector,
     duckdb_vector_assign_string_element, duckdb_vector_get_column_type, duckdb_vector_get_data,
     duckdb_vector_size,
 };
 use crate::LogicalType;
 
-pub struct Vector<T: Copy> {
-    ptr: duckdb_vector,
-    phantom: PhantomData<T>,
+/// Vector trait.
+pub trait Vector {
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_mut_any(&mut self) -> &mut dyn Any;
 }
 
-impl<T: Copy> From<duckdb_vector> for Vector<T> {
+pub struct FlatVector {
+    ptr: duckdb_vector,
+    capacity: usize,
+}
+
+impl From<duckdb_vector> for FlatVector {
     fn from(ptr: duckdb_vector) -> Self {
         Self {
             ptr,
-            phantom: PhantomData {},
+            capacity: unsafe { duckdb_vector_size() as usize },
         }
     }
 }
 
-impl<T: Copy> Vector<T> {
+impl Vector for FlatVector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+impl FlatVector {
+    fn with_capacity(ptr: duckdb_vector, capacity: usize) -> Self {
+        Self { ptr, capacity }
+    }
+
     pub fn capacity(&self) -> usize {
-        unsafe { duckdb_vector_size() as usize }
+        self.capacity
     }
 
     /// Returns an unsafe mutable pointer to the vector’s
-    pub fn as_mut_ptr(&self) -> *mut T {
+    pub fn as_mut_ptr<T>(&self) -> *mut T {
         unsafe { duckdb_vector_get_data(self.ptr).cast() }
     }
 
-    pub fn as_slice(&self) -> &[T] {
+    pub fn as_slice<T>(&self) -> &[T] {
         unsafe { slice::from_raw_parts(self.as_mut_ptr(), self.capacity()) }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub fn as_mut_slice<T>(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.capacity()) }
     }
 
@@ -60,27 +82,9 @@ impl<T: Copy> Vector<T> {
         LogicalType::from(unsafe { duckdb_vector_get_column_type(self.ptr) })
     }
 
-    pub fn copy(&mut self, data: &[T]) {
+    pub fn copy<T: Copy>(&mut self, data: &[T]) {
         assert!(data.len() <= self.capacity());
-        println!("Data len: {} capacity={}", data.len(), self.capacity());
-        println!("Self len: {}", self.as_mut_slice().len());
-        println!("self.ptr : {:p} data: {:p}", self.ptr, data.as_ptr());
-        self.as_mut_slice().copy_from_slice(data);
-        println!("Done assignment");
-    }
-}
-
-impl<T: Copy> Index<usize> for Vector<T> {
-    type Output = T;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.as_slice()[index]
-    }
-}
-
-impl<T: Copy> IndexMut<usize> for Vector<T> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.as_mut_slice()[index]
+        self.as_mut_slice::<T>().copy_from_slice(data);
     }
 }
 
@@ -88,7 +92,7 @@ pub trait Inserter<T> {
     fn insert(&self, index: usize, value: T);
 }
 
-impl Inserter<&str> for Vector<&str> {
+impl Inserter<&str> for FlatVector {
     fn insert(&self, index: usize, value: &str) {
         let cstr = CString::new(value.as_bytes()).unwrap();
         unsafe {
@@ -99,26 +103,53 @@ impl Inserter<&str> for Vector<&str> {
 
 pub struct ListVector {
     /// ListVector does not own the vector pointer.
-    ptr: duckdb_vector,
+    entries: FlatVector,
 }
 
 impl From<duckdb_vector> for ListVector {
     fn from(ptr: duckdb_vector) -> Self {
-        Self { ptr }
+        Self {
+            entries: ptr.into(),
+        }
     }
 }
 
 impl ListVector {
     pub fn len(&self) -> usize {
-        unsafe { duckdb_list_vector_get_size(self.ptr) as usize }
+        unsafe { duckdb_list_vector_get_size(self.entries.ptr) as usize }
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn child<T: Copy>(&self) -> Vector<T> {
-        Vector::from(unsafe { duckdb_list_vector_get_child(self.ptr) })
+    // TODO: not ideal interface. Where should we keep capacity.
+    pub fn child(&self, capacity: usize) -> FlatVector {
+        self.reserve(capacity);
+        FlatVector::with_capacity(
+            unsafe { duckdb_list_vector_get_child(self.entries.ptr) },
+            capacity,
+        )
+    }
+
+    /// Set primitive data to the child node.
+    pub fn set_child<T: Copy>(&self, data: &[T]) {
+        self.child(data.len()).copy(data);
+        self.set_len(data.len());
+    }
+
+    pub fn set_entry(&mut self, idx: usize, offset: usize, length: usize) {
+        self.entries.as_mut_slice::<duckdb_list_entry>()[idx].offset = offset as u64;
+        self.entries.as_mut_slice::<duckdb_list_entry>()[idx].length = length as u64;
+    }
+
+    /// Reserve the capacity for its child node.
+    fn reserve(&self, capacity: usize) {
+        unsafe { duckdb_list_vector_reserve(self.entries.ptr, capacity as u64) }
+    }
+
+    pub fn set_len(&self, new_len: usize) {
+        unsafe { duckdb_list_vector_set_size(self.entries.ptr, new_len as u64) }
     }
 }
 
@@ -134,14 +165,17 @@ impl From<duckdb_vector> for StructVector {
 }
 
 impl StructVector {
-    pub fn child<T: Copy>(&self, idx: usize) -> Vector<T> {
-        Vector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
+    pub fn child(&self, idx: usize) -> FlatVector {
+        FlatVector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
     }
-
 
     /// Take the child as [StructVector].
     pub fn struct_vector_child(&self, idx: usize) -> StructVector {
         Self::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
+    }
+
+    pub fn list_vector_child(&self, idx: usize) -> ListVector {
+        ListVector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
     }
 
     /// Get the logical type of this struct vector.

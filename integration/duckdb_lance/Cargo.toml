@@ -6,12 +6,12 @@ edition = "2021"
 [dependencies]
 lance = { path = "../../rust" }
 duckdb-ext = { path = "./duckdb-ext" }
-libduckdb-sys = "0.6.1"
 lazy_static = "1.4.0"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
-arrow-schema = "31.0.0"
-arrow-array = "31.0.0"
+arrow-schema = "32.0.0"
+arrow-array = "32.0.0"
 futures = "0.3"
+num-traits = "0.2"
 
 [lib]
 name = "duckdb_lance"

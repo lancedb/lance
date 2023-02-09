@@ -29,7 +29,7 @@ pub use error::{Error, Result};
 pub use function_info::FunctionInfo;
 pub use logical_type::{LogicalType, LogicalTypeId};
 pub use value::Value;
-pub use vector::{Inserter, ListVector, StructVector, Vector};
+pub use vector::{FlatVector, Inserter, ListVector, StructVector, Vector};
 
 #[allow(clippy::all)]
 pub mod ffi {

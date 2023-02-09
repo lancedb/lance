@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::vector::{ListVector, StructVector, Vector};
+use super::vector::{FlatVector, ListVector, StructVector};
 use crate::ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size,
@@ -27,8 +27,8 @@ pub struct DataChunk {
 impl DataChunk {
     /// Get the vector at the specific column index: `idx`.
     ///
-    pub fn vector<T: Copy>(&self, idx: usize) -> Vector<T> {
-        Vector::from(unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) })
+    pub fn flat_vector(&self, idx: usize) -> FlatVector {
+        FlatVector::from(unsafe { duckdb_data_chunk_get_vector(self.ptr, idx as u64) })
     }
 
     /// Get a list vector from the column index.

@@ -16,13 +16,19 @@
 
 use crate::{Error, Result};
 use arrow_array::{
-    cast::{as_boolean_array, as_primitive_array, as_string_array, as_struct_array},
+    cast::{
+        as_boolean_array, as_large_list_array, as_list_array, as_primitive_array, as_string_array,
+        as_struct_array,
+    },
     types::*,
-    Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    Array, ArrowPrimitiveType, BooleanArray, FixedSizeListArray, GenericListArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
-use duckdb_ext::{DataChunk, Inserter, StructVector, Vector};
+use duckdb_ext::{DataChunk, FlatVector, Inserter, ListVector, StructVector, Vector};
 use duckdb_ext::{LogicalType, LogicalTypeId};
+use lance::arrow::as_fixed_size_list_array;
+use num_traits::AsPrimitive;
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
     use LogicalTypeId::*;
@@ -44,16 +50,11 @@ pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
         DataType::Date64 => Time,
         DataType::Time32(_) => Time,
         DataType::Time64(_) => Time,
-        DataType::Duration(_) => todo!(),
+        DataType::Duration(_) => Interval,
         DataType::Interval(_) => Interval,
-        DataType::Binary => Blob,
-        DataType::FixedSizeBinary(_) => Blob,
-        DataType::LargeBinary => Blob,
-        DataType::Utf8 => Varchar,
-        DataType::LargeUtf8 => Varchar,
-        DataType::List(_) => List,
-        DataType::FixedSizeList(_, _) => List,
-        DataType::LargeList(_) => List,
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => Blob,
+        DataType::Utf8 | DataType::LargeUtf8 => Varchar,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => List,
         DataType::Struct(_) => Struct,
         DataType::Union(_, _, _) => Union,
         DataType::Dictionary(_, _) => todo!(),
@@ -115,71 +116,23 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
         match col.data_type() {
-            DataType::Boolean => {
-                boolean_array_to_vector(as_boolean_array(col.as_ref()), &mut chunk.vector(i));
-            }
-            DataType::UInt8 => {
-                primitive_array_to_duckdb_vector::<UInt8Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::UInt16 => {
-                primitive_array_to_duckdb_vector::<UInt16Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::UInt32 => {
-                primitive_array_to_duckdb_vector::<UInt32Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::UInt64 => {
-                primitive_array_to_duckdb_vector::<UInt64Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Int8 => {
-                primitive_array_to_duckdb_vector::<Int8Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Int16 => {
-                primitive_array_to_duckdb_vector::<Int16Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Int32 => {
-                primitive_array_to_duckdb_vector::<Int32Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Int64 => {
-                primitive_array_to_duckdb_vector::<Int64Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Float32 => {
-                primitive_array_to_duckdb_vector::<Float32Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
-            }
-            DataType::Float64 => {
-                primitive_array_to_duckdb_vector::<Float64Type>(
-                    as_primitive_array(col.as_ref()),
-                    &mut chunk.vector(i),
-                );
+            dt if dt.is_primitive() => {
+                primitive_array_to_vector(col, &mut chunk.flat_vector(i));
             }
             DataType::Utf8 => {
-                string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.vector::<&str>(i));
+                string_array_to_vector(as_string_array(col.as_ref()), &mut chunk.flat_vector(i));
+            }
+            DataType::List(_) => {
+                list_array_to_vector(as_list_array(col.as_ref()), &mut chunk.list_vector(i));
+            }
+            DataType::LargeList(_) => {
+                list_array_to_vector(as_large_list_array(col.as_ref()), &mut chunk.list_vector(i));
+            }
+            DataType::FixedSizeList(_, _) => {
+                fixed_size_list_array_to_vector(
+                    as_fixed_size_list_array(col.as_ref()),
+                    &mut chunk.list_vector(i),
+                );
             }
             DataType::Struct(_) => {
                 let struct_array = as_struct_array(col.as_ref());
@@ -195,16 +148,90 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     Ok(())
 }
 
-fn primitive_array_to_duckdb_vector<T: ArrowPrimitiveType>(
+fn primitive_array_to_flat_vector<T: ArrowPrimitiveType>(
     array: &PrimitiveArray<T>,
-    out_vector: &mut Vector<T::Native>,
+    out_vector: &mut FlatVector,
 ) {
-    assert!(array.len() <= out_vector.capacity());
-    out_vector.copy(array.values());
+    // assert!(array.len() <= out_vector.capacity());
+    out_vector.copy::<T::Native>(array.values());
+}
+
+fn primitive_array_to_vector(array: &dyn Array, out: &mut dyn Vector) {
+    match array.data_type() {
+        DataType::Boolean => {
+            boolean_array_to_vector(
+                as_boolean_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::UInt8 => {
+            primitive_array_to_flat_vector::<UInt8Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::UInt16 => {
+            primitive_array_to_flat_vector::<UInt16Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::UInt32 => {
+            primitive_array_to_flat_vector::<UInt32Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::UInt64 => {
+            primitive_array_to_flat_vector::<UInt64Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Int8 => {
+            primitive_array_to_flat_vector::<Int8Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Int16 => {
+            primitive_array_to_flat_vector::<Int16Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Int32 => {
+            primitive_array_to_flat_vector::<Int32Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Int64 => {
+            primitive_array_to_flat_vector::<Int64Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Float32 => {
+            primitive_array_to_flat_vector::<Float32Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        DataType::Float64 => {
+            primitive_array_to_flat_vector::<Float64Type>(
+                as_primitive_array(array),
+                out.as_mut_any().downcast_mut().unwrap(),
+            );
+        }
+        _ => {
+            todo!()
+        }
+    }
 }
 
 /// Convert Arrow [BooleanArray] to a duckdb vector.
-fn boolean_array_to_vector(array: &BooleanArray, out: &mut Vector<bool>) {
+fn boolean_array_to_vector(array: &BooleanArray, out: &mut FlatVector) {
     assert!(array.len() <= out.capacity());
 
     for i in 0..array.len() {
@@ -212,7 +239,7 @@ fn boolean_array_to_vector(array: &BooleanArray, out: &mut Vector<bool>) {
     }
 }
 
-fn string_array_to_vector(array: &StringArray, out: &mut Vector<&str>) {
+fn string_array_to_vector(array: &StringArray, out: &mut FlatVector) {
     assert!(array.len() <= out.capacity());
 
     // TODO: zero copy assignment
@@ -222,75 +249,75 @@ fn string_array_to_vector(array: &StringArray, out: &mut Vector<&str>) {
     }
 }
 
+fn list_array_to_vector<O: OffsetSizeTrait + AsPrimitive<usize>>(
+    array: &GenericListArray<O>,
+    out: &mut ListVector,
+) {
+    let value_array = array.values();
+    let mut child = out.child(value_array.len());
+    match value_array.data_type() {
+        dt if dt.is_primitive() => {
+            primitive_array_to_vector(value_array.as_ref(), &mut child);
+            for i in 0..array.len() {
+                let offset = array.value_offsets()[i];
+                let length = array.value_length(i);
+                out.set_entry(i, offset.as_(), length.as_());
+            }
+        }
+        _ => {
+            println!("Nested list is not supported yet.");
+            todo!()
+        }
+    }
+}
+
+fn fixed_size_list_array_to_vector(array: &FixedSizeListArray, out: &mut ListVector) {
+    let value_array = array.values();
+    let mut child = out.child(value_array.len());
+    match value_array.data_type() {
+        dt if dt.is_primitive() => {
+            primitive_array_to_vector(value_array.as_ref(), &mut child);
+            for i in 0..array.len() {
+                let offset = array.value_offset(i);
+                let length = array.value_length();
+                out.set_entry(i, offset as usize, length as usize);
+            }
+            out.set_len(value_array.len());
+        }
+        _ => {
+            println!("Nested list is not supported yet.");
+            todo!()
+        }
+    }
+}
+
 fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
     for i in 0..array.num_columns() {
         let column = array.column(i);
         match column.data_type() {
-            DataType::Boolean => {
-                boolean_array_to_vector(as_boolean_array(column.as_ref()), &mut out.child(i));
-            }
-            DataType::UInt8 => {
-                primitive_array_to_duckdb_vector::<UInt8Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::UInt16 => {
-                primitive_array_to_duckdb_vector::<UInt16Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::UInt32 => {
-                primitive_array_to_duckdb_vector::<UInt32Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::UInt64 => {
-                primitive_array_to_duckdb_vector::<UInt64Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Int8 => {
-                primitive_array_to_duckdb_vector::<Int8Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Int16 => {
-                primitive_array_to_duckdb_vector::<Int16Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Int32 => {
-                primitive_array_to_duckdb_vector::<Int32Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Int64 => {
-                primitive_array_to_duckdb_vector::<Int64Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Float32 => {
-                primitive_array_to_duckdb_vector::<Float32Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
-            }
-            DataType::Float64 => {
-                primitive_array_to_duckdb_vector::<Float64Type>(
-                    as_primitive_array(column.as_ref()),
-                    &mut out.child(i),
-                );
+            dt if dt.is_primitive() => {
+                primitive_array_to_vector(column, &mut out.child(i));
             }
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(column.as_ref()), &mut out.child(i));
+            }
+            DataType::List(_) => {
+                list_array_to_vector(
+                    as_list_array(column.as_ref()),
+                    &mut out.list_vector_child(i),
+                );
+            }
+            DataType::LargeList(_) => {
+                list_array_to_vector(
+                    as_large_list_array(column.as_ref()),
+                    &mut out.list_vector_child(i),
+                );
+            }
+            DataType::FixedSizeList(_, _) => {
+                fixed_size_list_array_to_vector(
+                    as_fixed_size_list_array(column.as_ref()),
+                    &mut out.list_vector_child(i),
+                );
             }
             DataType::Struct(_) => {
                 let struct_array = as_struct_array(column.as_ref());
