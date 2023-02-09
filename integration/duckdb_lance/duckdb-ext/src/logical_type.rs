@@ -15,7 +15,7 @@
 use std::ffi::CString;
 use std::fmt::Debug;
 
-use crate::duckdb::ffi::*;
+use crate::ffi::*;
 
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq)]
@@ -108,7 +108,7 @@ impl Debug for LogicalType {
                     write!(f, "{}: {:?}", self.child_name(i), self.child(i))?;
                 }
                 write!(f, ">")
-            },
+            }
             _ => write!(f, "{:?}", self.id()),
         }
     }
@@ -142,9 +142,7 @@ impl LogicalType {
 
     pub fn num_children(&self) -> usize {
         match self.id() {
-            LogicalTypeId::Struct => unsafe {
-                duckdb_struct_type_child_count(self.ptr) as usize
-            },
+            LogicalTypeId::Struct => unsafe { duckdb_struct_type_child_count(self.ptr) as usize },
             LogicalTypeId::List => 1,
             _ => 0,
         }
@@ -161,9 +159,7 @@ impl LogicalType {
     }
 
     pub fn child(&self, idx: usize) -> Self {
-        let c_logical_type = unsafe {
-            duckdb_struct_type_child_type(self.ptr, idx as u64)
-        };
+        let c_logical_type = unsafe { duckdb_struct_type_child_type(self.ptr, idx as u64) };
         Self::from(c_logical_type)
     }
 }

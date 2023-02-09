@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::vector::{ListVector, StructVector, Vector};
-use crate::duckdb::ffi::{
+use crate::ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size,
 };
