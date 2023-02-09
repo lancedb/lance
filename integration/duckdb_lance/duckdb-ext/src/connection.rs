@@ -29,7 +29,6 @@ impl From<duckdb_connection> for Connection {
 }
 
 impl Connection {
-
     pub fn register_table_function(
         &self,
         table_function: TableFunction,
@@ -39,5 +38,4 @@ impl Connection {
         }
         Ok(())
     }
-
 }

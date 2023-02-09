@@ -138,7 +138,6 @@ impl StructVector {
         Vector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
     }
 
-
     /// Take the child as [StructVector].
     pub fn struct_vector_child(&self, idx: usize) -> StructVector {
         Self::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
