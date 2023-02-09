@@ -258,9 +258,7 @@ async fn read_batch(
     with_row_id: bool,
 ) -> Result<RecordBatch> {
     let arrs = stream::iter(&schema.fields)
-        .then(|f| async move {
-            read_array(reader, f, batch_id, params).await
-        })
+        .then(|f| async move { read_array(reader, f, batch_id, params).await })
         .try_collect::<Vec<_>>()
         .await?;
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
