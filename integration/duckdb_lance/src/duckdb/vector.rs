@@ -18,8 +18,10 @@ use std::{marker::PhantomData, slice};
 
 use crate::duckdb::ffi::{
     duckdb_list_vector_get_child, duckdb_list_vector_get_size, duckdb_struct_vector_get_child,
-    duckdb_vector, duckdb_vector_assign_string_element, duckdb_vector_get_data, duckdb_vector_size,
+    duckdb_vector, duckdb_vector_assign_string_element, duckdb_vector_get_column_type,
+    duckdb_vector_get_data, duckdb_vector_size,
 };
+use crate::duckdb::LogicalType;
 
 pub struct Vector<T: Copy> {
     ptr: duckdb_vector,
@@ -53,12 +55,13 @@ impl<T: Copy> Vector<T> {
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.capacity()) }
     }
 
-    pub fn assign(&mut self, data: &[T]) {
+    pub fn copy(&mut self, data: &[T]) {
         assert!(data.len() <= self.capacity());
-
-        for i in 0..data.len() {
-            self.as_mut_slice()[i] = data[i];
-        }
+        println!("Data len: {} capacity={}", data.len(), self.capacity());
+        println!("Self len: {}", self.as_mut_slice().len());
+        println!("self.ptr : {:p} data: {:p}", self.ptr, data.as_ptr());
+        self.as_mut_slice().copy_from_slice(data);
+        println!("Done assignment");
     }
 }
 
@@ -124,5 +127,9 @@ impl From<duckdb_vector> for StructVector {
 impl StructVector {
     pub fn child<T: Copy>(&self, idx: usize) -> Vector<T> {
         Vector::from(unsafe { duckdb_struct_vector_get_child(self.ptr, idx as u64) })
+    }
+
+    pub fn column_type(&self) -> LogicalType {
+        LogicalType::from(unsafe { duckdb_vector_get_column_type(self.ptr) })
     }
 }

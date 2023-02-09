@@ -91,7 +91,7 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
         for field in fields.iter() {
             shape.insert(
                 field.name().as_str(),
-                to_duckdb_logical_type(&field.data_type())?,
+                to_duckdb_logical_type(field.data_type())?,
             );
         }
         Ok(LogicalType::new_struct_type(shape))
@@ -117,6 +117,11 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     // Fill the row
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
+        println!(
+            "record_batch_to_duckdb_data_chunk: i={i}, arrow_name={}, type={}",
+            batch.schema().field(i).name(),
+            col.data_type()
+        );
         match col.data_type() {
             DataType::Boolean => {
                 boolean_array_to_vector(as_boolean_array(col.as_ref()), &mut chunk.vector(i));
@@ -203,7 +208,7 @@ fn primitive_array_to_duckdb_vector<T: ArrowPrimitiveType>(
     out_vector: &mut Vector<T::Native>,
 ) {
     assert!(array.len() <= out_vector.capacity());
-    out_vector.assign(array.values());
+    out_vector.copy(array.values());
 }
 
 /// Convert Arrow [BooleanArray] to a duckdb vector.
@@ -228,6 +233,12 @@ fn string_array_to_vector(array: &StringArray, out: &mut Vector<&str>) {
 fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
     for i in 0..array.num_columns() {
         let column = array.column(i);
+        println!(
+            "struct_to_array_to_vector: i={i}, arrow_name={}, type={}, vector_type={:?}",
+            array.column_names()[i],
+            column.data_type(),
+            out.column_type()
+        );
         match column.data_type() {
             DataType::Boolean => {
                 boolean_array_to_vector(as_boolean_array(column.as_ref()), &mut out.child(i));
@@ -295,7 +306,10 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(column.as_ref()), &mut out.child(i));
             }
-            _ => {}
+            _ => {
+                println!("Unsupported data type: {}", column.data_type());
+                todo!()
+            }
         }
     }
 }
