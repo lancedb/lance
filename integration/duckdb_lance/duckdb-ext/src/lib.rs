@@ -14,12 +14,14 @@
 
 mod data_chunk;
 mod error;
+mod function_info;
 mod logical_type;
 pub mod table_function;
 mod vector;
 
 pub use data_chunk::DataChunk;
 pub use error::{Error, Result};
+pub use function_info::FunctionInfo;
 pub use logical_type::{LogicalType, LogicalTypeId};
 pub use vector::{Inserter, ListVector, StructVector, Vector};
 
