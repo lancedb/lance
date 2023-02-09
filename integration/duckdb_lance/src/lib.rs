@@ -14,12 +14,11 @@
 
 use std::ffi::{c_char, c_void};
 
-use duckdb_extension_framework::duckly::duckdb_library_version;
+use duckdb_ext::ffi::duckdb_library_version;
 use duckdb_extension_framework::Database;
 use tokio::runtime::Runtime;
 
 mod arrow;
-mod duckdb;
 pub mod error;
 mod scan;
 

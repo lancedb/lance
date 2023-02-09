@@ -11,3 +11,18 @@
 //  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
+
+#include "duckdb_ext.h"
+
+#include "duckdb.hpp"
+
+extern "C" {
+
+duckdb_logical_type duckdb_create_struct_type(idx_t n_pairs,
+                                              const char **names,
+                                              const duckdb_logical_type *types) {
+  auto *stype = new duckdb::LogicalType;
+  *stype = duckdb::LogicalType::STRUCT(getVector(n_pairs, names, types));
+  return stype;
+}
+}

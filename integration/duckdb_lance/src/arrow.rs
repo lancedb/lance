@@ -22,9 +22,8 @@ use arrow_array::{
     Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
-use duckdb_extension_framework::{LogicalType, LogicalTypeId};
-
-use crate::duckdb::{DataChunk, Inserter, StructVector, Vector};
+use duckdb_ext::{LogicalType, LogicalTypeId};
+use duckdb_ext::{DataChunk, Inserter, StructVector, Vector};
 use crate::{Error, Result};
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
@@ -36,10 +35,10 @@ pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
         DataType::Int16 => Smallint,
         DataType::Int32 => Integer,
         DataType::Int64 => Bigint,
-        DataType::UInt8 => Utinyint,
-        DataType::UInt16 => Usmallint,
-        DataType::UInt32 => Uinteger,
-        DataType::UInt64 => Ubigint,
+        DataType::UInt8 => UTinyint,
+        DataType::UInt16 => USmallint,
+        DataType::UInt32 => UInteger,
+        DataType::UInt64 => UBigint,
         DataType::Float32 => Float,
         DataType::Float64 => Double,
         DataType::Timestamp(_, _) => Timestamp,

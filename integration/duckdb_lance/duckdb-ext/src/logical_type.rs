@@ -134,6 +134,15 @@ impl From<duckdb_logical_type> for LogicalType {
 }
 
 impl LogicalType {
+    /// Create a new [LogicalType] from [LogicalTypeId]
+    pub fn new(id: LogicalTypeId) -> Self {
+        unsafe {
+            Self {
+                ptr: duckdb_create_logical_type(id as u32),
+            }
+        }
+    }
+
     /// Logical type ID
     pub fn id(&self) -> LogicalTypeId {
         let duckdb_type_id = unsafe { duckdb_get_type_id(self.ptr) };

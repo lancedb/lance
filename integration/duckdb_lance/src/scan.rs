@@ -14,20 +14,20 @@
 
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use duckdb_extension_framework::duckly::{
+use duckdb_ext::ffi::{
     duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info,
     duckdb_vector_size,
 };
 use duckdb_extension_framework::table_functions::{
     BindInfo, FunctionInfo, InitInfo, TableFunction,
 };
-use duckdb_extension_framework::{malloc_struct, LogicalType, LogicalTypeId};
-use futures::stream::StreamExt;
+use duckdb_extension_framework::{malloc_struct};
+use duckdb_ext::{DataChunk, LogicalType, LogicalTypeId};
+
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
-use crate::duckdb::DataChunk;
 
 #[repr(C)]
 struct ScanBindData {
