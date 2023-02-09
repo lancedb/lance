@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
 
 use crate::ffi::{
-    duckdb_bind_add_result_column, duckdb_bind_info, duckdb_create_table_function,
-    duckdb_destroy_table_function, duckdb_init_info, duckdb_init_set_error, duckdb_table_function,
+    duckdb_bind_add_result_column, duckdb_bind_get_parameter, duckdb_bind_get_parameter_count,
+    duckdb_bind_info, duckdb_bind_set_bind_data, duckdb_bind_set_cardinality,
+    duckdb_create_table_function, duckdb_destroy_table_function, duckdb_init_info,
+    duckdb_init_set_error, duckdb_table_function, duckdb_table_function_add_parameter,
     duckdb_table_function_set_name,
 };
-use crate::{Error, LogicalType};
+use crate::{Error, LogicalType, Value};
 
 /// DuckDB BindInfo.
 pub struct BindInfo {
@@ -37,17 +39,66 @@ impl BindInfo {
     ///
     ///  - `name`: The name of the column
     ///  - `logical_type`: The [LogicalType] of the new column.
+    ///
+    /// # Safety
     pub fn add_result_column(&self, name: &str, logical_type: LogicalType) {
         let c_string = CString::new(name).unwrap();
         unsafe {
             duckdb_bind_add_result_column(self.ptr, c_string.as_ptr(), logical_type.ptr);
         }
     }
+
+    /// Sets the user-provided bind data in the bind object. This object can be retrieved again during execution.
+    ///
+    /// # Arguments
+    ///  * `extra_data`: The bind data object.
+    ///  * `destroy`: The callback that will be called to destroy the bind data (if any)
+    ///
+    /// # Safety
+    ///
+    pub fn set_bind_data(
+        &self,
+        data: *mut c_void,
+        free_function: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) {
+        unsafe {
+            duckdb_bind_set_bind_data(self.ptr, data, free_function);
+        }
+    }
+
+    /// Get the number of regular (non-named) parameters to the function.
+    pub fn num_parameters(&self) -> u64 {
+        unsafe { duckdb_bind_get_parameter_count(self.ptr) }
+    }
+
+    /// Get the parameter at the given index.
+    ///
+    /// # Arguments
+    ///  * `index`: The index of the parameter to get
+    ///
+    /// returns: The value of the parameter
+    pub fn parameter(&self, index: usize) -> Value {
+        unsafe { Value::from(duckdb_bind_get_parameter(self.ptr, index as u64)) }
+    }
+
+    /// Sets the cardinality estimate for the table function, used for optimization.
+    ///
+    /// * `cardinality`: The cardinality estimate
+    /// * `is_exact`: Whether or not the cardinality estimate is exact, or an approximation
+    pub fn set_cardinality(&self, cardinality: usize, is_exact: bool) {
+        unsafe { duckdb_bind_set_cardinality(self.ptr, cardinality as u64, is_exact) }
+    }
 }
 
 #[derive(Debug)]
 pub struct InitInfo {
     ptr: duckdb_init_info,
+}
+
+impl From<duckdb_init_info> for InitInfo {
+    fn from(ptr: duckdb_init_info) -> Self {
+        Self {ptr}
+    }
 }
 
 impl InitInfo {
@@ -91,6 +142,15 @@ impl TableFunction {
         unsafe {
             let string = CString::new(name).unwrap();
             duckdb_table_function_set_name(self.ptr, string.as_ptr());
+        }
+        self
+    }
+
+    /// Adds a parameter to the table function.
+    ///
+    pub fn add_parameter(&self, logical_type: &LogicalType) -> &Self {
+        unsafe {
+            duckdb_table_function_add_parameter(self.ptr, logical_type.ptr);
         }
         self
     }

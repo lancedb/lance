@@ -18,12 +18,9 @@ use duckdb_ext::ffi::{
     duckdb_bind_info, duckdb_data_chunk, duckdb_free, duckdb_function_info, duckdb_init_info,
     duckdb_vector_size,
 };
-use duckdb_extension_framework::table_functions::{
-    FunctionInfo
-};
-use duckdb_extension_framework::{malloc_struct};
-use duckdb_ext::{DataChunk, LogicalType, LogicalTypeId};
-use duckdb_ext::table_function::{BindInfo, TableFunction, InitInfo};
+use duckdb_ext::table_function::{BindInfo, InitInfo, TableFunction};
+use duckdb_ext::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
+use duckdb_extension_framework::malloc_struct;
 
 use lance::dataset::scanner::ScannerStream;
 use lance::dataset::Dataset;
@@ -63,8 +60,8 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     let info = FunctionInfo::from(info);
     let mut output = DataChunk::from(output);
 
-    let mut init_data = info.get_init_data::<ScanInitData>();
-    let batch = match crate::RUNTIME.block_on(async { (*(*init_data).stream).next().await }) {
+    let mut init_data = info.init_data::<ScanInitData>();
+    let batch = match crate::RUNTIME.block_on(async { (*init_data.stream).next().await }) {
         Some(Ok(b)) => Some(b),
         Some(Err(e)) => {
             info.set_error(e.to_string().as_str());
@@ -75,7 +72,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
 
     if let Some(b) = batch {
         if let Err(e) = record_batch_to_duckdb_data_chunk(&b, &mut output) {
-            info.set_error(e.to_string().as_str())
+            info.set_error(e.into())
         };
     } else {
         (*init_data).done = true;

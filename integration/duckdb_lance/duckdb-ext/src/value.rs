@@ -12,28 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ffi::{duckdb_function_get_init_data, duckdb_function_info, duckdb_function_set_error};
-use crate::Error;
+use crate::ffi::{duckdb_destroy_value, duckdb_value};
 
-/// UDF
-pub struct FunctionInfo {
-    ptr: duckdb_function_info,
+/// The Value object holds a single arbitrary value of any type that can be
+/// stored in the database.
+#[derive(Debug)]
+pub struct Value {
+    pub(crate) ptr: duckdb_value,
 }
 
-impl From<duckdb_function_info> for FunctionInfo {
-    fn from(ptr: duckdb_function_info) -> Self {
+impl From<duckdb_value> for Value {
+    fn from(ptr: duckdb_value) -> Self {
         Self { ptr }
     }
 }
 
-impl FunctionInfo {
-    pub fn init_data<T>(&self) -> &T {
-        unsafe { *duckdb_function_get_init_data(self.ptr).cast() }
-    }
-
-    pub fn set_error(&self, error: Error) {
-        unsafe {
-            duckdb_function_set_error(self.ptr, error.c_str().as_ptr());
+impl Drop for Value {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            unsafe {
+                duckdb_destroy_value(&mut self.ptr);
+            }
         }
+        self.ptr = std::ptr::null_mut();
     }
 }

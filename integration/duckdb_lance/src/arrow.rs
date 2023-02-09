@@ -16,15 +16,15 @@
 
 use std::collections::HashMap;
 
+use crate::{Error, Result};
 use arrow_array::{
     cast::{as_boolean_array, as_primitive_array, as_string_array, as_struct_array},
     types::*,
     Array, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::DataType;
-use duckdb_ext::{LogicalType, LogicalTypeId};
 use duckdb_ext::{DataChunk, Inserter, StructVector, Vector};
-use crate::{Error, Result};
+use duckdb_ext::{LogicalType, LogicalTypeId};
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
     use LogicalTypeId::*;
