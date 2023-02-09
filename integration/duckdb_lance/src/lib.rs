@@ -14,8 +14,8 @@
 
 use std::ffi::{c_char, c_void};
 
-use duckdb_extension_framework::duckly::duckdb_library_version;
-use duckdb_extension_framework::Database;
+use duckdb_ext::ffi::duckdb_library_version;
+use duckdb_ext::Database;
 use tokio::runtime::Runtime;
 
 mod arrow;
@@ -41,7 +41,7 @@ pub unsafe extern "C" fn lance_init_rust(db: *mut c_void) {
 }
 
 unsafe fn init(db: *mut c_void) -> Result<()> {
-    let db = Database::from_cpp_duckdb(db);
+    let db = Database::from(db);
     let table_function = scan_table_function();
     let connection = db.connect()?;
     connection.register_table_function(table_function)?;

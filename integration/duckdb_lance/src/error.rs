@@ -34,3 +34,15 @@ impl From<Box<dyn std::error::Error>> for Error {
         Self::DuckDB(value.to_string())
     }
 }
+
+impl From<Error> for duckdb_ext::Error {
+    fn from(e: Error) -> Self {
+        Self::DuckDB(e.to_string())
+    }
+}
+
+impl From<duckdb_ext::Error> for Error {
+    fn from(e: duckdb_ext::Error) -> Self {
+        Self::DuckDB(e.to_string())
+    }
+}

@@ -1,4 +1,4 @@
-// Copyright 2023 Lance Authors
+// Copyright 2023 Lance Developers
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Callbacks for duckdb to load lance (rust) code.
+use std::ffi::CString;
 
-#include "extension.h"
-
-const char* lance_version_rust(void);
-void lance_init_rust(void* db);
-
-DUCKDB_EXTENSION_API const char* lance_version() {
-    return lance_version_rust();
+pub enum Error {
+    IO(String),
+    DuckDB(String),
 }
 
-DUCKDB_EXTENSION_API void lance_init(void* db) {
-    lance_init_rust(db);
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IO(s) => write!(f, "I/O: {s}"),
+            Self::DuckDB(s) => write!(f, "I/O: {s}"),
+        }
+    }
 }
 
+impl Error {
+    pub fn c_str(&self) -> CString {
+        CString::new(self.to_string()).unwrap()
+    }
+}
