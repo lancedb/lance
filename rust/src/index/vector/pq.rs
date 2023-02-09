@@ -216,14 +216,18 @@ impl ProductQuantizer {
             .map(|(vec, centroid)| async move {
                 tokio::task::spawn_blocking(move || {
                     // TODO Use tiling to improve cache efficiency.
-                    (0..vec.len()).map(|i| {
-                        let value = vec.value(i);
-                        let vector: &Float32Array = as_primitive_array(value.as_ref());
-                        let id = argmin(l2_distance(vector, centroid.as_ref()).unwrap().as_ref())
-                            .unwrap() as u8;
-                        id
-                    }).collect::<Vec<_>>()
-                }).await
+                    (0..vec.len())
+                        .map(|i| {
+                            let value = vec.value(i);
+                            let vector: &Float32Array = as_primitive_array(value.as_ref());
+                            let id =
+                                argmin(l2_distance(vector, centroid.as_ref()).unwrap().as_ref())
+                                    .unwrap() as u8;
+                            id
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
             })
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
