@@ -27,8 +27,8 @@ impl From<duckdb_function_info> for FunctionInfo {
 }
 
 impl FunctionInfo {
-    pub fn init_data<T>(&self) -> &T {
-        unsafe { *duckdb_function_get_init_data(self.ptr).cast() }
+    pub fn init_data<T>(&self) -> *mut T {
+        unsafe { duckdb_function_get_init_data(self.ptr).cast() }
     }
 
     pub fn set_error(&self, error: Error) {

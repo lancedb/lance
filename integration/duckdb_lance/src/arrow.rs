@@ -105,7 +105,7 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
             child.data_type(),
         )?))
     } else {
-        println!("Unsupported data type: {data_type}");
+        println!("Unsupported data type: {data_type}, please file an issue https://github.com/eto-ai/lance");
         todo!()
     }
 }
@@ -114,11 +114,6 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     // Fill the row
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
-        println!(
-            "record_batch_to_duckdb_data_chunk: i={i}, arrow_name={}, type={}",
-            batch.schema().field(i).name(),
-            col.data_type()
-        );
         match col.data_type() {
             DataType::Boolean => {
                 boolean_array_to_vector(as_boolean_array(col.as_ref()), &mut chunk.vector(i));
@@ -230,12 +225,6 @@ fn string_array_to_vector(array: &StringArray, out: &mut Vector<&str>) {
 fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
     for i in 0..array.num_columns() {
         let column = array.column(i);
-        println!(
-            "struct_to_array_to_vector: i={i}, arrow_name={}, type={}, vector_type={:?}",
-            array.column_names()[i],
-            column.data_type(),
-            out.logical_type()
-        );
         match column.data_type() {
             DataType::Boolean => {
                 boolean_array_to_vector(as_boolean_array(column.as_ref()), &mut out.child(i));
@@ -289,13 +278,6 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
                 );
             }
             DataType::Float32 => {
-                println!(
-                    "FLOAT ARRAY TO DUCKDB ARRAY: i={i}, arrow_name={}, type={}, vector_type={:?}, name={}",
-                    array.column_names()[i],
-                    column.data_type(),
-                    out.child::<f32>(i).logical_type(),
-                    out.child_name(i),
-                );
                 primitive_array_to_duckdb_vector::<Float32Type>(
                     as_primitive_array(column.as_ref()),
                     &mut out.child(i),
@@ -310,8 +292,13 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
             DataType::Utf8 => {
                 string_array_to_vector(as_string_array(column.as_ref()), &mut out.child(i));
             }
+            DataType::Struct(_) => {
+                let struct_array = as_struct_array(column.as_ref());
+                let mut struct_vector = out.struct_vector_child(i);
+                struct_array_to_vector(struct_array, &mut struct_vector);
+            }
             _ => {
-                println!("Unsupported data type: {}", column.data_type());
+                println!("Unsupported data type: {}, please file an issue https://github.com/eto-ai/lance", column.data_type());
                 todo!()
             }
         }

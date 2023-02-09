@@ -17,12 +17,14 @@ use std::ffi::{c_void, CString};
 use crate::ffi::{
     duckdb_bind_add_result_column, duckdb_bind_get_parameter, duckdb_bind_get_parameter_count,
     duckdb_bind_info, duckdb_bind_set_bind_data, duckdb_bind_set_cardinality,
-    duckdb_create_table_function, duckdb_delete_callback_t, duckdb_destroy_table_function,
-    duckdb_init_get_bind_data, duckdb_init_info, duckdb_init_set_error, duckdb_init_set_init_data,
-    duckdb_table_function, duckdb_table_function_add_parameter, duckdb_table_function_set_name,
-    duckdb_table_function_supports_projection_pushdown,
-    duckdb_table_function_set_function, duckdb_table_function_t, duckdb_table_function_init_t,
-    duckdb_table_function_set_bind, duckdb_table_function_set_init, duckdb_table_function_bind_t, duckdb_bind_set_error
+    duckdb_bind_set_error, duckdb_create_table_function, duckdb_delete_callback_t,
+    duckdb_destroy_table_function, duckdb_init_get_bind_data, duckdb_init_info,
+    duckdb_init_set_error, duckdb_init_set_init_data, duckdb_table_function,
+    duckdb_table_function_add_parameter, duckdb_table_function_bind_t,
+    duckdb_table_function_init_t, duckdb_table_function_set_bind,
+    duckdb_table_function_set_function, duckdb_table_function_set_init,
+    duckdb_table_function_set_name, duckdb_table_function_supports_projection_pushdown,
+    duckdb_table_function_t,
 };
 use crate::{Error, LogicalType, Value};
 
@@ -185,10 +187,7 @@ impl TableFunction {
 
     /// Sets the main function of the table function
     ///
-    pub fn set_function(
-        &self,
-        func: duckdb_table_function_t,
-    ) -> &Self {
+    pub fn set_function(&self, func: duckdb_table_function_t) -> &Self {
         unsafe {
             duckdb_table_function_set_function(self.ptr, func);
         }

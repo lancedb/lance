@@ -40,3 +40,9 @@ impl From<Error> for duckdb_ext::Error {
         Self::DuckDB(e.to_string())
     }
 }
+
+impl From<duckdb_ext::Error> for Error {
+    fn from(e: duckdb_ext::Error) -> Self {
+        Self::DuckDB(e.to_string())
+    }
+}

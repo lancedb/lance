@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod connection;
 mod data_chunk;
+mod database;
 mod error;
 mod function_info;
 mod logical_type;
@@ -20,7 +22,9 @@ pub mod table_function;
 mod value;
 mod vector;
 
+pub use connection::Connection;
 pub use data_chunk::DataChunk;
+pub use database::Database;
 pub use error::{Error, Result};
 pub use function_info::FunctionInfo;
 pub use logical_type::{LogicalType, LogicalTypeId};

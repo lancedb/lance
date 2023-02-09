@@ -40,7 +40,6 @@ impl ScanBindData {
     }
 }
 
-
 /// Drop the ScanBindData from C.
 ///
 /// # Safety
@@ -61,7 +60,7 @@ impl ScanInitData {
     fn new(stream: Box<ScannerStream>) -> Self {
         Self {
             stream: Box::into_raw(stream),
-            done: false
+            done: false,
         }
     }
 }
@@ -72,7 +71,7 @@ unsafe extern "C" fn read_lance(info: duckdb_function_info, output: duckdb_data_
     let mut output = DataChunk::from(output);
 
     let mut init_data = info.init_data::<ScanInitData>();
-    let batch = match crate::RUNTIME.block_on(async { (*init_data.stream).next().await }) {
+    let batch = match crate::RUNTIME.block_on(async { (*(*init_data).stream).next().await }) {
         Some(Ok(b)) => Some(b),
         Some(Err(e)) => {
             info.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
@@ -116,11 +115,11 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
         Ok(s) => Box::new(s),
         Err(e) => {
             info.set_error(duckdb_ext::Error::DuckDB(e.to_string()));
-            return
+            return;
         }
     };
 
-    let mut init_data = Box::new(ScanInitData::new(stream));
+    let init_data = Box::new(ScanInitData::new(stream));
     info.set_init_data(Box::into_raw(init_data).cast(), Some(duckdb_free));
 }
 
@@ -151,9 +150,7 @@ fn read_lance_bind(bind: &BindInfo) {
     }
 
     let bind_data = Box::new(ScanBindData::new(&uri));
-    unsafe {
         bind.set_bind_data(Box::into_raw(bind_data).cast(), Some(drop_scan_bind_data_c));
-    }
 }
 
 pub fn scan_table_function() -> TableFunction {
