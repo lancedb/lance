@@ -93,17 +93,17 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
                 to_duckdb_logical_type(field.data_type())?,
             );
         }
-        Ok(LogicalType::new_struct_type(shape))
+        Ok(LogicalType::struct_type(shape))
     } else if let DataType::List(child) = data_type {
-        Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+        Ok(LogicalType::list_type(&to_duckdb_logical_type(
             child.data_type(),
         )?))
     } else if let DataType::LargeList(child) = data_type {
-        Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+        Ok(LogicalType::list_type(&to_duckdb_logical_type(
             child.data_type(),
         )?))
     } else if let DataType::FixedSizeList(child, _) = data_type {
-        Ok(LogicalType::new_list_type(&to_duckdb_logical_type(
+        Ok(LogicalType::list_type(&to_duckdb_logical_type(
             child.data_type(),
         )?))
     } else {

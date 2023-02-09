@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::CString;
+use std::ffi::{c_char, CString};
 use std::fmt::Debug;
 
 use crate::ffi::*;
@@ -139,6 +139,37 @@ impl LogicalType {
         unsafe {
             Self {
                 ptr: duckdb_create_logical_type(id as u32),
+            }
+        }
+    }
+
+    /// Creates a list type from its child type.
+    ///
+    pub fn list_type(child_type: &LogicalType) -> Self {
+        unsafe {
+            Self {
+                ptr: duckdb_create_list_type(child_type.ptr),
+            }
+        }
+    }
+
+    /// Make a `LogicalType` for `struct`
+    ///
+    pub fn struct_type(fields: &[(&str, LogicalType)]) -> Self {
+        let keys: Vec<CString> = fields.iter().map(|f| CString::new(f.0).unwrap()).collect();
+        let values: Vec<duckdb_logical_type> = fields.iter().map(|it| it.1.ptr).collect();
+        let name_ptrs = keys
+            .iter()
+            .map(|it| it.as_ptr())
+            .collect::<Vec<*const c_char>>();
+
+        unsafe {
+            Self {
+                ptr: duckdb_create_struct_type(
+                    fields.len() as idx_t,
+                    name_ptrs.as_slice().as_ptr().cast_mut(),
+                    values.as_slice().as_ptr(),
+                ),
             }
         }
     }
