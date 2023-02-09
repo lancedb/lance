@@ -21,13 +21,13 @@
 
 Lance is a columnar data format that is easy and fast to version, query and train on. It’s designed to be used with images, videos, 3D point clouds, audio and of course tabular data. The key features of Lance include:
 
-* High-performance random access: 100x faster than Parquet.
+* **High-performance random access:** 100x faster than Parquet.
 
-* Embedded vector search: find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
+* **Embedded vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
 
-* Zero-copy, automatic versioning: manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
+* **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
 
-* Ecosystem integrations: Apache-Arrow, DuckDB and more on the way.
+* **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
 
 ## Quick Start
 
