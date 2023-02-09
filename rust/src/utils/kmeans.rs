@@ -19,11 +19,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{add, divide_scalar};
+use arrow_array::UInt64Array;
 use arrow_array::{
     cast::as_primitive_array, new_empty_array, types::Float32Type, Array, FixedSizeListArray,
     Float32Array,
 };
-use arrow_array::{UInt64Array};
 use arrow_schema::DataType;
 use arrow_select::{concat::concat, take::take};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
