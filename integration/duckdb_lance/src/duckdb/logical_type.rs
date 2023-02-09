@@ -26,8 +26,8 @@ pub enum LogicalTypeId {
     Bigint = DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
     UTinyint = DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT,
     USmallint = DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT,
-    Uinteger = DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
-    Ubigint = DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT,
+    UInteger = DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER,
+    UBigint = DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT,
     Float = DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
     Double = DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
     Timestamp = DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP,
@@ -60,16 +60,29 @@ impl From<u32> for LogicalTypeId {
             DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => Self::Bigint,
             DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => Self::UTinyint,
             DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => Self::USmallint,
-            DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => Self::Uinteger,
-            DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => Self::Ubigint,
+            DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => Self::UInteger,
+            DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => Self::UBigint,
             DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => Self::Float,
             DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => Self::Double,
+            DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => Self::Varchar,
+            DUCKDB_TYPE_DUCKDB_TYPE_BLOB => Self::Blob,
             DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP => Self::Timestamp,
             DUCKDB_TYPE_DUCKDB_TYPE_DATE => Self::Date,
-            /** .. */
+            DUCKDB_TYPE_DUCKDB_TYPE_TIME => Self::Time,
+            DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL => Self::Interval,
+            DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => Self::Hugeint,
+            DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => Self::Decimal,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => Self::TimestampS,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => Self::TimestampMs,
+            DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => Self::TimestampNs,
+            DUCKDB_TYPE_DUCKDB_TYPE_ENUM => Self::Enum,
             DUCKDB_TYPE_DUCKDB_TYPE_LIST => Self::List,
             DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => Self::Struct,
-            _ => panic!()
+            DUCKDB_TYPE_DUCKDB_TYPE_MAP => Self::Map,
+            DUCKDB_TYPE_DUCKDB_TYPE_UUID => Self::Uuid,
+            DUCKDB_TYPE_DUCKDB_TYPE_UNION => Self::Union,
+            DUCKDB_TYPE_DUCKDB_TYPE_JSON => Self::Json,
+            _ => panic!(),
         }
     }
 }
@@ -105,9 +118,7 @@ impl From<duckdb_logical_type> for LogicalType {
 
 impl LogicalType {
     fn id(&self) -> LogicalTypeId {
-        let duckdb_type_id = unsafe {
-            duckdb_get_type_id(self.ptr)
-        };
+        let duckdb_type_id = unsafe { duckdb_get_type_id(self.ptr) };
         duckdb_type_id.into()
     }
 }
