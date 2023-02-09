@@ -228,7 +228,18 @@ impl ProductQuantizer {
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
-        let values = UInt8Array::from_iter_values(pq_code.iter().flatten().copied());
+
+        // Need to transpose pq_code to column oriented.
+        let capacity = sub_vectors.len() * sub_vectors[0].len();
+        let mut pq_codebook_builder: Vec<u8> = vec![0; capacity];
+        for i in 0..pq_code.len() {
+            let vec = pq_code[i].as_slice();
+            for j in 0..vec.len() {
+                pq_codebook_builder[j * self.num_sub_vectors as usize + i] = vec[j];
+            }
+        }
+
+        let values = UInt8Array::from_iter_values(pq_codebook_builder);
         println!(
             "Time for transform pq code: {}",
             now.elapsed().as_secs_f32()
