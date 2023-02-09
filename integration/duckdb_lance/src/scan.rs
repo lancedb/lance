@@ -150,7 +150,7 @@ fn read_lance_bind(bind: &BindInfo) {
     }
 
     let bind_data = Box::new(ScanBindData::new(&uri));
-        bind.set_bind_data(Box::into_raw(bind_data).cast(), Some(drop_scan_bind_data_c));
+    bind.set_bind_data(Box::into_raw(bind_data).cast(), Some(drop_scan_bind_data_c));
 }
 
 pub fn scan_table_function() -> TableFunction {
