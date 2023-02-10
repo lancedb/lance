@@ -18,13 +18,7 @@ tokio = { version = "1.23", features = ["rt-multi-thread"] }
 futures = "0.3"
 pyo3 = { version = "0.18.1", features = ["extension-module", "abi3-py38"] }
 arrow = { version = "32.0.0", features = ["pyarrow"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-lance = { path = "../rust", features = ["blas"]}
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
 lance = { path = "../rust"}
-
 
 [build-dependencies]
 prost-build = "0.11"

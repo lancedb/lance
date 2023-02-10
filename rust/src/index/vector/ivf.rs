@@ -590,6 +590,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let partition_ids: &UInt32Array = as_primitive_array(part_col);
         let min_id = min(partition_ids).unwrap_or(0);
         let max_id = max(partition_ids).unwrap_or(1024 * 1024);
+
         for part_id in min_id..max_id + 1 {
             let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
             let parted_batch = filter_record_batch(&pq_code_batch, &predicates)?;

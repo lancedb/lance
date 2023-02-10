@@ -25,6 +25,7 @@ use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
 use crate::index::pb;
@@ -183,7 +184,7 @@ impl ProductQuantizer {
     }
 
     /// Get the centroids for one sub-vector.
-    pub fn centroids(&self, sub_vector_idx: usize) -> FixedSizeListArray {
+    pub fn centroids(&self, sub_vector_idx: usize) -> Arc<FixedSizeListArray> {
         assert!(sub_vector_idx < self.num_sub_vectors as usize);
         assert!(self.codebook.is_some());
 
@@ -195,27 +196,55 @@ impl ProductQuantizer {
             num_centroids * sub_vector_width as usize,
         );
         let f32_arr: &Float32Array = as_primitive_array(&arr);
-        FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap()
+        Arc::new(FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap())
     }
 
     /// Transform the vector array to PQ code array.
-    fn transform(&self, sub_vectors: &[FixedSizeListArray]) -> FixedSizeListArray {
+    async fn transform(
+        &self,
+        sub_vectors: &[Arc<FixedSizeListArray>],
+    ) -> Result<FixedSizeListArray> {
         assert_eq!(sub_vectors.len(), self.num_sub_vectors as usize);
 
+        let now = std::time::Instant::now();
+        let vectors = sub_vectors.iter().map(|v| v.clone()).collect::<Vec<_>>();
+        let all_centroids = (0..sub_vectors.len())
+            .map(|idx| self.centroids(idx))
+            .collect::<Vec<_>>();
+        let pq_code = stream::iter(vectors)
+            .zip(stream::iter(all_centroids))
+            .map(|(vec, centroid)| async move {
+                tokio::task::spawn_blocking(move || {
+                    // TODO Use tiling to improve cache efficiency.
+                    (0..vec.len())
+                        .map(|i| {
+                            let value = vec.value(i);
+                            let vector: &Float32Array = as_primitive_array(value.as_ref());
+                            let id =
+                                argmin(l2_distance(vector, centroid.as_ref()).unwrap().as_ref())
+                                    .unwrap() as u8;
+                            id
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Need to transpose pq_code to column oriented.
         let capacity = sub_vectors.len() * sub_vectors[0].len();
-        let mut pg_codebook_builder: Vec<u8> = vec![0; capacity];
-        for (idx, vec) in sub_vectors.iter().enumerate() {
-            // Centroids for sub-vector.
-            let centroids = self.centroids(idx);
-            for i in 0..vec.len() {
-                let value = vec.value(i);
-                let vector: &Float32Array = as_primitive_array(value.as_ref());
-                let id = argmin(l2_distance(vector, &centroids).unwrap().as_ref()).unwrap() as u8;
-                pg_codebook_builder[i * self.num_sub_vectors as usize + idx] = id;
+        let mut pq_codebook_builder: Vec<u8> = vec![0; capacity];
+        for i in 0..pq_code.len() {
+            let vec = pq_code[i].as_slice();
+            for j in 0..vec.len() {
+                pq_codebook_builder[j * self.num_sub_vectors as usize + i] = vec[j];
             }
         }
-        let values = UInt8Array::from_iter(pg_codebook_builder);
-        FixedSizeListArray::try_new(values, self.num_sub_vectors as i32).unwrap()
+
+        let values = UInt8Array::from_iter_values(pq_codebook_builder);
+        FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
     }
 
     /// Train a [ProductQuantizer] using an array of vectors.
@@ -246,7 +275,7 @@ impl ProductQuantizer {
         }
         let pd_centroids = codebook_builder.finish();
         self.codebook = Some(Arc::new(pd_centroids));
-        Ok(self.transform(&sub_vectors))
+        self.transform(&sub_vectors).await
     }
 }
 
@@ -278,7 +307,7 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<FixedSizeListArray> {
+fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!array.is_empty());
 
     let sub_vector_length = (array.value_length() / m) as usize;
@@ -299,7 +328,8 @@ fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<FixedSizeList
             }
         }
         let values = builder.finish();
-        let sub_array = FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap();
+        let sub_array =
+            Arc::new(FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap());
         subarrays.push(sub_array);
     }
     subarrays
@@ -322,8 +352,8 @@ mod tests {
         assert_eq!(sub_vectors[0].value_length(), 8);
 
         assert_eq!(
-            sub_vectors[0],
-            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            sub_vectors[0].as_ref(),
+            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 (0..10)
                     .map(|i| {
                         Some(

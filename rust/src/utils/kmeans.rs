@@ -19,12 +19,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{add, divide_scalar};
+use arrow_array::UInt64Array;
 use arrow_array::{
     cast::as_primitive_array, new_empty_array, types::Float32Type, Array, FixedSizeListArray,
     Float32Array,
 };
 use arrow_schema::DataType;
-use arrow_select::concat::concat;
+use arrow_select::{concat::concat, take::take};
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
@@ -32,6 +33,13 @@ use rand::{distributions::WeightedIndex, Rng};
 use super::distance::l2_distance;
 use crate::Result;
 use crate::{arrow::*, Error};
+
+/// KMean initialization method.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KMeanInit {
+    Random,
+    KMeanPlusPlus,
+}
 
 #[derive(Debug)]
 pub struct KMeansParams {
@@ -44,6 +52,8 @@ pub struct KMeansParams {
 
     /// Run kmeans multiple times and pick the best one.
     pub redos: usize,
+
+    pub init: KMeanInit,
 }
 
 impl Default for KMeansParams {
@@ -52,6 +62,7 @@ impl Default for KMeansParams {
             max_iters: 50,
             tolerance: 1e-4,
             redos: 1,
+            init: KMeanInit::Random,
         }
     }
 }
@@ -87,6 +98,7 @@ async fn kmean_plusplus(
 
     let mut seen = HashSet::new();
     seen.insert(first);
+
     for _ in 1..k {
         let membership = kmeans.compute_membership(data.clone()).await;
         let weights = WeightedIndex::new(&membership.distances).unwrap();
@@ -98,6 +110,7 @@ async fn kmean_plusplus(
                 break;
             }
         }
+
         let vector = data.value(chosen);
         let new_vector: &Float32Array = as_primitive_array(&vector);
 
@@ -113,6 +126,26 @@ async fn kmean_plusplus(
         kmeans.centroids =
             Arc::new(FixedSizeListArray::try_new(new_centroid_values, dimension).unwrap());
     }
+    kmeans
+}
+
+async fn kmean_random(
+    data: Arc<FixedSizeListArray>,
+    k: u32, /* dist_fn, rand_seed */
+    mut rng: impl Rng,
+) -> KMeans {
+    assert!(data.len() > k as usize);
+    let dimension = data.value_length();
+
+    let chosen: UInt64Array = (0..data.len())
+        .choose_multiple(&mut rng, k as usize)
+        .iter()
+        .map(|v| *v as u64)
+        .collect::<UInt64Array>();
+    let samples = take(data.as_ref(), &chosen, None).unwrap();
+    let centroids: &FixedSizeListArray = as_fixed_size_list_array(samples.as_ref());
+    let mut kmeans = KMeans::empty(k, dimension);
+    kmeans.centroids = Arc::new(centroids.clone());
     kmeans
 }
 
@@ -214,6 +247,7 @@ impl KMeans {
             k,
         }
     }
+
     /// Train a KMean on data with `k` clusters.
     pub async fn new(data: Arc<FixedSizeListArray>, k: u32, max_iters: u32) -> Self {
         let mut params = KMeansParams::default();
@@ -231,9 +265,13 @@ impl KMeans {
 
         let rng = rand::rngs::SmallRng::from_entropy();
         for _ in 1..=params.redos {
-            let mut kmeans = kmean_plusplus(data.clone(), k, rng.clone()).await;
+            let mut kmeans = match params.init {
+                KMeanInit::Random => kmean_random(data.clone(), k, rng.clone()).await,
+                KMeanInit::KMeanPlusPlus => kmean_plusplus(data.clone(), k, rng.clone()).await,
+            };
+
             let mut last_membership = kmeans.compute_membership(data.clone()).await;
-            for i in 1..=params.max_iters {
+            for _ in 1..=params.max_iters {
                 let new_kmeans = last_membership.to_kmean().await.unwrap();
                 let new_membership = new_kmeans.compute_membership(data.clone()).await;
                 if (new_membership.distance_sum() - last_membership.distance_sum()).abs()
@@ -242,8 +280,6 @@ impl KMeans {
                 {
                     kmeans = new_kmeans;
                     last_membership = new_membership;
-                    #[cfg(debug_assertions)]
-                    println!("Kmeans: early converged at iteration: {i}");
                     break;
                 }
                 kmeans = new_kmeans;

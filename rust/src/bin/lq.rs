@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
                 dataset.version().version,
                 dataset.versions().await.unwrap().len()
             );
+            println!("Total records: {}", dataset.count_rows().await.unwrap());
             println!("Schema:\n{}", dataset.schema());
 
             Ok(())
@@ -113,15 +114,6 @@ async fn main() -> Result<()> {
             scanner.limit(*n, None).unwrap();
             let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
-
-            // print the summary of data total rows and cols
-            let mut total_num_of_cols: usize = b.num_columns();
-            let mut total_num_of_rows: usize = 0;
-            for b in batch.iter() {
-                total_num_of_rows += b.num_rows();
-            }
-            println!("Number of columns: {:?}", total_num_of_cols);
-            println!("Number of rows: {:?}", total_num_of_rows);
 
             // pretty print the batch
             let _ = print_batches(&batch)?;

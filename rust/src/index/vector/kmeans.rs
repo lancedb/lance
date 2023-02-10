@@ -57,9 +57,10 @@ pub async fn train_kmeans(
     // Ony sample 256 * num_clusters. See Faiss
     let data = if num_rows > 256 * k as usize {
         println!(
-            "Sample {} out of {} to train kmeans of {} clusters",
+            "Sample {} out of {} to train kmeans of {} dim, {} clusters",
             256 * k,
             array.len() / dimension,
+            dimension,
             k,
         );
         let sample_size = 256 * k as usize;

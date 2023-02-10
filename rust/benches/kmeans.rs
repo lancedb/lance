@@ -69,6 +69,15 @@ fn bench_train(c: &mut Criterion) {
             kmeans_clustering(dimension as u32, 256, f32array.values()).unwrap();
         })
     });
+
+    let dimension = 8;
+    let array = generate_random_array(1024 * 64 * dimension as usize);
+    let data = Arc::new(FixedSizeListArray::try_new(&array, dimension).unwrap());
+    c.bench_function("train_8d_65535", |b| {
+        b.to_async(&rt).iter(|| async {
+            KMeans::new(data.clone(), 256, 25).await;
+        })
+    });
 }
 
 criterion_group!(
