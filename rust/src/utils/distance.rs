@@ -92,37 +92,6 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     vaddvq_f32(sum)
 }
 
-#[cfg(feature = "blas")]
-pub fn l2_distance_blas(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
-    use arrow_array::{cast::as_primitive_array, types::Float32Type};
-    use arrow_buffer::MutableBuffer;
-
-    #[allow(unused_imports)]
-    #[cfg(target_os = "macos")]
-    use accelerate_src;
-
-    use cblas::*;
-
-    let inner_array = to.values();
-    let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
-    let dimension = from.len() as i32;
-    let from_vector = from.values();
-
-    let scores =
-        Float32Array::from_iter_values(buffer.chunks_exact(dimension as usize).map(|t| unsafe {
-            // Allocating new buffer is FASTER (12%) than zero out existing buffer.
-            let mut buf = MutableBuffer::from_len_zeroed(dimension as usize * 4);
-            let result: &mut [f32] = buf.typed_data_mut();
-            // Set result buffer to x
-            saxpy(dimension, 1.0, from_vector, 1, result, 1);
-            // x - y
-            saxpy(dimension, -1.0, t, 1, result, 1);
-            // (x-y)^2
-            sdot(dimension, result, 1, result, 1)
-        }));
-    Ok(Arc::new(scores))
-}
-
 fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
     use arrow_array::{cast::as_primitive_array, types::Float32Type};
 
@@ -167,15 +136,6 @@ pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<F
         if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
             return l2_distance_simd(from, to);
         }
-    }
-
-    // We've found that using Apple Accelerate (BLAS) is faster than Neon SIMD.
-    // It might due to the case where MacOS can use AMX coprocessor to compute
-    // the vectors, thus there are more CPU cycles for run the rest of the tasks.
-    // So if the BLAS feature is enabled, we will prefer to use the BLAS routine.
-    #[cfg(feature = "blas")]
-    {
-        return l2_distance_blas(from, to);
     }
 
     #[cfg(any(target_arch = "aarch64"))]
