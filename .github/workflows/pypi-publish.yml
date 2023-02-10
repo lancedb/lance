@@ -35,6 +35,8 @@ jobs:
     strategy:
       matrix:
         python-minor-version: ["8"]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: 10.15
     steps:
     - uses: actions/checkout@v3
       with:
@@ -48,7 +50,7 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release"
+        args: "--release --strip"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
