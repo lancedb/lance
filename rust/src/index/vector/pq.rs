@@ -244,10 +244,6 @@ impl ProductQuantizer {
         }
 
         let values = UInt8Array::from_iter_values(pq_codebook_builder);
-        println!(
-            "Time for transform pq code: {}",
-            now.elapsed().as_secs_f32()
-        );
         FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
     }
 
