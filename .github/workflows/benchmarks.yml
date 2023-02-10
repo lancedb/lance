@@ -2,8 +2,7 @@ name: Run benchmarks
 
 on:
   push:
-    branches:
-      - main
+    branches: ["main"]
 
 jobs:
   dataset:
@@ -29,7 +28,7 @@ jobs:
       run: |
         python -m pip install $(ls target/wheels/*.whl)
     - name: Run test
-      working-directory: python/benchmarks/${{ matrix.dataset }}
+      working-directory: benchmarks/${{ matrix.dataset }}
       run: |
         ./test_dataset.sh
     - name: Archive results
@@ -37,4 +36,4 @@ jobs:
       with:
         name: ${{ matrix.dataset }}-results
         path: |
-          python/benchmarks/${{ matrix.dataset }}/benchmark.csv
+          benchmarks/${{ matrix.dataset }}/benchmark.csv

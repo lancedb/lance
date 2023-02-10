@@ -8,6 +8,7 @@ on:
     paths:
       - python/**
       - rust/**
+      - protos/**
 jobs:
   linux:
     timeout-minutes: 30
