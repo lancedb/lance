@@ -3,7 +3,7 @@
  
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Blazing fast exploration and analysis of ML data using python and SQL, backed by an Apache-Arrow compatible data format**
+**Alternative to Parquet. 100x faster for random access, includes a vector index and automatic versioning. Apache Arrow and DuckDB compatible.**
 
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
@@ -19,18 +19,15 @@
 
 <hr />
 
-Lance makes machine learning workflows with ML data easy (images, videos, point clouds, audio, and of course tabular data), by allowing Developers, Analysts and Operations to:
+Lance is a columnar data format that is easy and fast to version, query and train on. It’s designed to be used with images, videos, 3D point clouds, audio and of course tabular data. The key features of Lance include:
 
-* Use SQL to greatly simplify common operations on ML data, such as similarity search for data discovery, model inference and computing evaluation metrics.
+* **High-performance random access:** 100x faster than Parquet.
 
-* Search for nearest neighbors in under 1 millisecond.
+* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
 
-* Version, compare and diff ML datasets easily.
+* **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
 
-* (Coming soon) visualize, slice and drill-into datasets to inspect embeddings, labels/annotations and metrics.
-
-Lance is powered by Lance Format, an Apache-Arrow compatible columnar data format which is an alternative to Parquet, Iceberg and Delta. Lance has 50-100x faster query performance for ML data.
-
+* **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
 
 ## Quick Start
 
