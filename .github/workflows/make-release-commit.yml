@@ -14,10 +14,10 @@ on:
       part:
         description: 'What kind of release is this?'
         required: true
-        default: 'release'
+        default: 'patch'
         type: choice
         options:
-          - release
+          - patch
           - minor
           - major
 

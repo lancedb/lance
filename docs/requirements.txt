@@ -7,7 +7,4 @@ piccolo-theme
 duckdb>=0.6,<0.7
 jupyterlab
 fastai
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
 xmltodict

@@ -28,12 +28,12 @@ author = "Lance Developer"
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
+    "sphinx.ext.napoleon",
     "breathe",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
     "sphinx.ext.intersphinx",
-    "sphinx.ext.napoleon",
 ]
 
 napoleon_google_docstring = False
