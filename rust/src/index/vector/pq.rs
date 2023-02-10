@@ -356,8 +356,8 @@ mod tests {
         assert_eq!(sub_vectors[0].value_length(), 8);
 
         assert_eq!(
-            sub_vectors[0],
-            FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            sub_vectors[0].as_ref(),
+            &FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                 (0..10)
                     .map(|i| {
                         Some(
