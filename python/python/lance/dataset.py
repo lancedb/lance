@@ -51,8 +51,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
     ) -> LanceScanner:
-        """
-        Return a Scanner that can support various pushdowns
+        """Return a Scanner that can support various pushdowns.
 
         Parameters
         ----------
@@ -64,14 +63,14 @@ class LanceDataset(pa.dataset.Dataset):
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors
-            nearest should look like {
-              "column": <embedding col name>,
-              "q": <query vector as pa.Float32Array>,
-              "k": 10,
-              "nprobes": 1,
-              "refine_factor": 1
-            }
+            Get the rows corresponding to the K most similar vectors.
+                Example: {
+                  "column": <embedding col name>,
+                  "q": <query vector as pa.Float32Array>,
+                  "k": 10,
+                  "nprobes": 1,
+                  "refine_factor": 1
+                }
         """
         return (
             ScannerBuilder(self)
@@ -96,7 +95,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
     ) -> pa.Table:
-        """Read the data into memory and return a pyarrow Table.
+        """Read the data into memory as a pyarrow Table.
 
         Parameters
         ----------
@@ -108,15 +107,14 @@ class LanceDataset(pa.dataset.Dataset):
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors
-            nearest should look like {
-              "column": <embedding col name>,
-              "q": <query vector as pa.Float32Array>,
-              "k": 10,
-              "nprobes": 1,
-              "refine_factor": 1
-            }
-
+            Get the rows corresponding to the K most similar vectors.
+                Example: {
+                  "column": <embedding col name>,
+                  "q": <query vector as pa.Float32Array>,
+                  "k": 10,
+                  "nprobes": 1,
+                  "refine_factor": 1
+                }
         """
         return self.scanner(
             columns=columns, limit=limit, offset=offset, nearest=nearest
@@ -125,39 +123,19 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def partition_expression(self):
         """
-        An Expression which evaluates to true for all data viewed by this
-        Dataset.
+        Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("partitioning not yet supported")
 
     def replace_schema(self, schema: Schema):
         """
-        Return a copy of this Dataset with a different schema.
-
-        The copy will view the same Fragments. If the new schema is not
-        compatible with the original dataset's schema then an error will
-        be raised.
-
-        Parameters
-        ----------
-        schema : Schema
-            The new dataset schema.
+        Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("not changing schemas yet")
 
     def get_fragments(self, filter: Expression = None):
-        """Returns an iterator over the fragments in this dataset.
-
-        Parameters
-        ----------
-        filter : Expression, default None
-            Return fragments matching the optional filter, either using the
-            partition_expression or internal information like Parquet's
-            statistics.
-
-        Returns
-        -------
-        fragments : iterator of Fragment
+        """
+        Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("Rust Fragments not yet exposed")
 
@@ -224,7 +202,6 @@ class LanceDataset(pa.dataset.Dataset):
         Returns
         -------
         count : int
-
         """
         return self._ds.count_rows()
 
@@ -240,42 +217,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_threads=True,
     ):
         """
-        Perform a join between this dataset and another one.
-
-        Result of the join will be a new dataset, where further
-        operations can be applied.
-
-        Parameters
-        ----------
-        right_dataset : dataset
-            The dataset to join to the current one, acting as the right dataset
-            in the join operation.
-        keys : str or list[str]
-            The columns from current dataset that should be used as keys
-            of the join operation left side.
-        right_keys : str or list[str], default None
-            The columns from the right_dataset that should be used as keys
-            on the join operation right side.
-            When ``None`` use the same key names as the left dataset.
-        join_type : str, default "left outer"
-            The kind of join that should be performed, one of
-            ("left semi", "right semi", "left anti", "right anti",
-            "inner", "left outer", "right outer", "full outer")
-        left_suffix : str, default None
-            Which suffix to add to right column names. This prevents confusion
-            when the columns in left and right datasets have colliding names.
-        right_suffix : str, default None
-            Which suffic to add to the left column names. This prevents confusion
-            when the columns in left and right datasets have colliding names.
-        coalesce_keys : bool, default True
-            If the duplicated keys should be omitted from one of the sides
-            in the join result.
-        use_threads : bool, default True
-            Whenever to use multithreading or not.
-
-        Returns
-        -------
-        InMemoryDataset
+        Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
@@ -435,158 +377,21 @@ class LanceScanner(pa.dataset.Scanner):
     @staticmethod
     def from_dataset(*args, **kwargs):
         """
-        Create Scanner from Dataset,
-
-        Parameters
-        ----------
-        dataset : Dataset
-            Dataset to scan.
-        columns : list of str, default None
-            The columns to project. This can be a list of column names to
-            include (order and duplicates will be preserved), or a dictionary
-            with {new_column_name: expression} values for more advanced
-            projections.
-
-            The list of columns or expressions may use the special fields
-            `__batch_index` (the index of the batch within the fragment),
-            `__fragment_index` (the index of the fragment within the dataset),
-            `__last_in_fragment` (whether the batch is last in fragment), and
-            `__filename` (the name of the source file or a description of the
-            source fragment).
-
-            The columns will be passed down to Datasets and corresponding data
-            fragments to avoid loading, copying, and deserializing columns
-            that will not be required further down the compute chain.
-            By default all of the available columns are projected. Raises
-            an exception if any of the referenced column names does not exist
-            in the dataset's Schema.
-        filter : Expression, default None
-            Scan will return only the rows matching the filter.
-            If possible the predicate will be pushed down to exploit the
-            partition information or internal metadata found in the data
-            source, e.g. Parquet statistics. Otherwise filters the loaded
-            RecordBatches before yielding them.
-        batch_size : int, default 128Ki
-            The maximum row count for scanned record batches. If scanned
-            record batches are overflowing memory then this method can be
-            called to reduce their size.
-        batch_readahead : int, default 16
-            The number of batches to read ahead in a file. This might not work
-            for all file formats. Increasing this number will increase
-            RAM usage but could also improve IO utilization.
-        fragment_readahead : int, default 4
-            The number of files to read ahead. Increasing this number will increase
-            RAM usage but could also improve IO utilization.
-        use_threads : bool, default True
-            If enabled, then maximum parallelism will be used determined by
-            the number of available CPU cores.
-        use_async : bool, default True
-            This flag is deprecated and is being kept for this release for
-            backwards compatibility.  It will be removed in the next
-            release.
-        memory_pool : MemoryPool, default None
-            For memory allocations, if required. If not specified, uses the
-            default pool.
-        fragment_scan_options : FragmentScanOptions, default None
-            Options specific to a particular scan and fragment type, which
-            can change between different scans of the same dataset.
+        Not implemented
         """
         raise NotImplementedError("from dataset")
 
     @staticmethod
     def from_fragment(*args, **kwargs):
         """
-        Create Scanner from Fragment,
-
-        Parameters
-        ----------
-        fragment : Fragment
-            fragment to scan.
-        schema : Schema, optional
-            The schema of the fragment.
-        columns : list of str, default None
-            The columns to project. This can be a list of column names to
-            include (order and duplicates will be preserved), or a dictionary
-            with {new_column_name: expression} values for more advanced
-            projections.
-
-            The list of columns or expressions may use the special fields
-            `__batch_index` (the index of the batch within the fragment),
-            `__fragment_index` (the index of the fragment within the dataset),
-            `__last_in_fragment` (whether the batch is last in fragment), and
-            `__filename` (the name of the source file or a description of the
-            source fragment).
-
-            The columns will be passed down to Datasets and corresponding data
-            fragments to avoid loading, copying, and deserializing columns
-            that will not be required further down the compute chain.
-            By default all of the available columns are projected. Raises
-            an exception if any of the referenced column names does not exist
-            in the dataset's Schema.
-        filter : Expression, default None
-            Scan will return only the rows matching the filter.
-            If possible the predicate will be pushed down to exploit the
-            partition information or internal metadata found in the data
-            source, e.g. Parquet statistics. Otherwise filters the loaded
-            RecordBatches before yielding them.
-        batch_size : int, default 128Ki
-            The maximum row count for scanned record batches. If scanned
-            record batches are overflowing memory then this method can be
-            called to reduce their size.
-        batch_readahead : int, default 16
-            The number of batches to read ahead in a file. This might not work
-            for all file formats. Increasing this number will increase
-            RAM usage but could also improve IO utilization.
-        use_threads : bool, default True
-            If enabled, then maximum parallelism will be used determined by
-            the number of available CPU cores.
-        use_async : bool, default True
-            This flag is deprecated and is being kept for this release for
-            backwards compatibility.  It will be removed in the next
-            release.
-        memory_pool : MemoryPool, default None
-            For memory allocations, if required. If not specified, uses the
-            default pool.
-        fragment_scan_options : FragmentScanOptions, default None
-            Options specific to a particular scan and fragment type, which
-            can change between different scans of the same dataset.
+        Not implemented
         """
         raise NotImplementedError("from fragment")
 
     @staticmethod
     def from_batches(*args, **kwargs):
         """
-        Create a Scanner from an iterator of batches.
-
-        This creates a scanner which can be used only once. It is
-        intended to support writing a dataset (which takes a scanner)
-        from a source which can be read only once (e.g. a
-        RecordBatchReader or generator).
-
-        Parameters
-        ----------
-        source : Iterator
-            The iterator of Batches.
-        schema : Schema
-            The schema of the batches.
-        columns : list of str or dict, default None
-                The columns to project.
-        filter : Expression, default None
-            Scan will return only the rows matching the filter.
-        batch_size : int, default 128Ki
-            The maximum row count for scanned record batches.
-        use_threads : bool, default True
-            If enabled, then maximum parallelism will be used determined by
-            the number of available CPU cores.
-        use_async : bool, default True
-            This flag is deprecated and is being kept for this release for
-            backwards compatibility.  It will be removed in the next
-            release.
-        memory_pool : MemoryPool, default None
-            For memory allocations, if required. If not specified, uses the
-            default pool.
-        fragment_scan_options : FragmentScanOptions
-            The fragment scan options.
+        Not implemented
         """
         raise NotImplementedError("from batches")
 
@@ -615,20 +420,7 @@ class LanceScanner(pa.dataset.Scanner):
 
     def take(self, indices):
         """
-        Select rows of data by index.
-
-        Will only consume as many batches of the underlying dataset as
-        needed. Otherwise, this is equivalent to
-        ``to_table().take(indices)``.
-
-        Parameters
-        ----------
-        indices : Array or array-like
-            indices of rows to select in the dataset.
-
-        Returns
-        -------
-        Table
+        Not implemented
         """
         raise NotImplementedError("take")
 
