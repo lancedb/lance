@@ -66,11 +66,12 @@ docs/notebooks
 
 integration/duckdb/*-build
 integration/duckdb/lance.duckdb_extension.*.zip
-python/notebooks/lance.duckdb_extension
-python/notebooks/sift
-python/benchmarks/sift/sift
-python/**/sift.tar.gz
-python/benchmarks/sift/lance_ivf*.csv
+
+notebooks/lance.duckdb_extension
+notebooks/sift
+benchmarks/sift/sift
+benchmarks/sift/lance_ivf*.csv
+**/sift.tar.gz
 
 wheelhouse
 

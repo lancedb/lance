@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 #
 # Copyright 2023 Lance Developers
 #
@@ -15,9 +14,9 @@
 # limitations under the License.
 #
 
+wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+tar -xzf sift.tar.gz
 rm -rf sift1m_*.lance
-
 ./datagen.py sift/sift_base.fvecs sift1m.lance
-
 ./index.py sift1m.lance -i 256 -p 16 -c vector
 ./metrics.py sift1m.lance benchmark.csv -i 256
