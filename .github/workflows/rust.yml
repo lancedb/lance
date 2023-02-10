@@ -26,7 +26,9 @@ jobs:
         #run: cargo clippy -- --deny "warnings"
         run: cargo clippy
       - name: Run tests
-        run: cargo test
+        run: |
+          cargo build --all-features 
+          cargo test
   mac-build:
     runs-on: macos-12
     timeout-minutes: 30
@@ -46,8 +48,10 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Install dependencies
         run: brew install protobuf
       - name: Run tests
-        run: cargo test
+        run: |
+          cargo build --all-features
+          cargo test
