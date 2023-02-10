@@ -70,8 +70,7 @@ pub async fn train_kmeans(
             let s = array.slice(idx * dimension, dimension);
             builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
         }
-        let d = builder.finish();
-        d
+        builder.finish()
     } else {
         array.clone()
     };

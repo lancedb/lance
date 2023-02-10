@@ -591,7 +591,6 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let min_id = min(partition_ids).unwrap_or(0);
         let max_id = max(partition_ids).unwrap_or(1024 * 1024);
 
-        let now = std::time::Instant::now();
         for part_id in min_id..max_id + 1 {
             let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
             let parted_batch = filter_record_batch(&pq_code_batch, &predicates)?;
@@ -604,10 +603,6 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 writer.write_plain_encoded_array(row_ids.as_ref()).await?;
             }
         }
-        println!(
-            "Time to write all partitions: {}",
-            now.elapsed().as_secs_f32()
-        );
 
         let metadata = IvfPQIndexMetadata {
             name: self.name.clone(),
