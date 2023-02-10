@@ -206,7 +206,6 @@ impl ProductQuantizer {
     ) -> Result<FixedSizeListArray> {
         assert_eq!(sub_vectors.len(), self.num_sub_vectors as usize);
 
-        let now = std::time::Instant::now();
         let vectors = sub_vectors.iter().map(|v| v.clone()).collect::<Vec<_>>();
         let all_centroids = (0..sub_vectors.len())
             .map(|idx| self.centroids(idx))
