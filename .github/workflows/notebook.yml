@@ -6,8 +6,10 @@ on:
       - main
   pull_request:
     paths:
-      - src/**
+      - python/**
+      - rust/**
       - protos/**
+      - notebooks/**
 
 jobs:
   linux:
@@ -29,9 +31,8 @@ jobs:
       working-directory: python
       shell: bash
       run: |
-        pip3 install torch torchvision --extra-index-url https://download.pytorch.org/whl/cpu
-        pip3 install jupyter
-        pip3 install $(ls wheels/pylance-*-cp3${{ inputs.python-minor-version}}*.whl)[test]
+        pip3 install jupyter duckdb
+        pip3 install $(ls target/wheels/*.whl)
     - name: Run python tests
       shell: bash
       working-directory: python/notebooks

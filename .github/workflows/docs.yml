@@ -46,7 +46,9 @@ jobs:
           python -m pip install -r ../docs/requirements.txt
       - name: Build docs
         working-directory: docs
-        run: make html
+        run: |
+          make nbconvert
+          make html
       - name: Setup Pages
         uses: actions/configure-pages@v2
       - name: Upload artifact

@@ -2,9 +2,7 @@ name: Run benchmarks
 
 on:
   push:
-    branches:
-      - main
-      - gha
+    branches: ["main"]
 
 jobs:
   dataset:
@@ -12,7 +10,7 @@ jobs:
     runs-on: "ubuntu-22.04"
     strategy:
       matrix:
-        dataset: ["coco"]
+        dataset: ["sift"]
     steps:
     - uses: actions/checkout@v3
       with:
@@ -28,32 +26,14 @@ jobs:
     - name: Pip install
       working-directory: python
       run: |
-        pip3 install $(ls wheels/pylance-*-cp310*.whl)[test]
-        pip3 install xmltodict pycocotools fsspec s3fs
+        python -m pip install $(ls target/wheels/*.whl)
     - name: Run test
-      working-directory: python/benchmarks
+      working-directory: benchmarks/${{ matrix.dataset }}
       run: |
-        ./test_dataset.sh ${{ matrix.dataset }} 200
-  functions:
-    timeout-minutes: 30
-    runs-on: "ubuntu-22.04"
-    steps:
-    - uses: actions/checkout@v3
+        ./test_dataset.sh
+    - name: Archive results
+      uses: actions/upload-artifact@v3
       with:
-        fetch-depth: 0
-        lfs: true
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
-    - uses: ./.github/workflows/build_linux_wheel
-      with:
-        python-minor-version: "10"
-    - name: Pip install
-      working-directory: python
-      run: |
-        pip3 install $(ls wheels/pylance-*-cp310*.whl)[test]
-    - name: Run test
-      working-directory: python/benchmarks/functions
-      run: |
-        ./functions.py -n 100
+        name: ${{ matrix.dataset }}-results
+        path: |
+          benchmarks/${{ matrix.dataset }}/benchmark.csv

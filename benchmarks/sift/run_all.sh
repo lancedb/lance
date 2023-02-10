@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 #
 # Copyright 2023 Lance Developers
 #
@@ -16,7 +15,6 @@
 #
 
 rm -rf sift1m_*.lance
-
 ./datagen.py sift/sift_base.fvecs sift1m_base.lance
 
 cp -r sift1m_base.lance sift1m_ivf512_pq16.lance
