@@ -24,9 +24,6 @@ jobs:
         run: |
           git submodule init
           git submodule update
-          cd duckdb-extension-framework
-          git submodule init
-          git submodule update
       - name: Make
         run: make build
       # - name: Upload Lance duckdb extension
@@ -48,9 +45,6 @@ jobs:
           brew install protobuf
       - name: Checkout submodules
         run: |
-          git submodule init
-          git submodule update
-          cd duckdb-extension-framework
           git submodule init
           git submodule update
       - name: Build
