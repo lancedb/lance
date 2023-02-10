@@ -10,7 +10,7 @@ on:
 jobs:
   Linux:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: ./integration/duckdb_lance
@@ -22,9 +22,6 @@ jobs:
           sudo apt install -y protobuf-compiler
       - name: Checkout submodules
         run: |
-          git submodule init
-          git submodule update
-          cd duckdb-extension-framework
           git submodule init
           git submodule update
       - name: Make
@@ -48,9 +45,6 @@ jobs:
           brew install protobuf
       - name: Checkout submodules
         run: |
-          git submodule init
-          git submodule update
-          cd duckdb-extension-framework
           git submodule init
           git submodule update
       - name: Build
