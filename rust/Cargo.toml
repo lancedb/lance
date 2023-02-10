@@ -49,8 +49,6 @@ rand = { version = "0.8.3", features = ["small_rng"] }
 futures = "0.3"
 uuid = { version = "1.2", features = ["v4"] }
 path-absolutize = "3.0.14"
-cblas = { version = "0.4.0", optional = true }
-accelerate-src = { version = "0.3.2", optional = true }
 arrow = { version = "32.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
@@ -68,7 +66,6 @@ approx = "0.5.1"
 
 [features]
 cli = ["clap"]
-blas = ["cblas", "accelerate-src"]
 
 [[bin]]
 name = "lq"
