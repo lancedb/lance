@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
@@ -83,12 +83,12 @@ harness = false
 name = "vector_index"
 harness = false
 
+[[bench]]
+name = "kmeans"
+harness = false
+
 [profile.release]
 strip = true
 opt-level = "s"
 lto = true
 codegen-units = 1
-
-[[bench]]
-name = "kmeans"
-harness = false
