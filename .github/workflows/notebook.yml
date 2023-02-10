@@ -35,6 +35,6 @@ jobs:
         pip3 install $(ls target/wheels/*.whl)
     - name: Run python tests
       shell: bash
-      working-directory: python/notebooks
+      working-directory: notebooks
       run: |
         jupyter nbconvert --to notebook --execute quickstart.ipynb
