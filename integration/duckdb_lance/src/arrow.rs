@@ -14,7 +14,6 @@
 
 //! Arrow / DuckDB conversion.
 
-use crate::{Error, Result};
 use arrow_array::{
     cast::{
         as_boolean_array, as_large_list_array, as_list_array, as_primitive_array, as_string_array,
@@ -29,6 +28,8 @@ use duckdb_ext::{DataChunk, FlatVector, Inserter, ListVector, StructVector, Vect
 use duckdb_ext::{LogicalType, LogicalTypeId};
 use lance::arrow::as_fixed_size_list_array;
 use num_traits::AsPrimitive;
+
+use crate::{Error, Result};
 
 pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
     use LogicalTypeId::*;
@@ -116,7 +117,7 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
         match col.data_type() {
-            dt if dt.is_primitive() => {
+            dt if dt.is_primitive() || matches!(dt, DataType::Boolean) => {
                 primitive_array_to_vector(col, &mut chunk.flat_vector(i));
             }
             DataType::Utf8 => {
@@ -329,5 +330,44 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
                 todo!()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_schema::{Field, Schema};
+
+    // use libduckdb to link to a duckdb binary.
+    #[allow(unused_imports)]
+    use libduckdb_sys;
+
+    #[test]
+    fn test_record_batch_to_data_chunk() {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, false)]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BooleanArray::from(vec![true, false, true]))],
+        )
+        .unwrap();
+
+        let logical_types = schema
+            .fields
+            .iter()
+            .map(|f| to_duckdb_logical_type(f.data_type()).unwrap())
+            .collect::<Vec<_>>();
+        let mut chunk = DataChunk::new(&logical_types);
+
+        record_batch_to_duckdb_data_chunk(&batch, &mut chunk).unwrap();
+        assert_eq!(chunk.len(), 3);
+        let vector = chunk.flat_vector(0);
+        assert_eq!(LogicalTypeId::Boolean, vector.logical_type().id());
+        assert_eq!(vector.as_slice::<bool>()[0], true);
+        assert_eq!(vector.as_slice::<bool>()[1], false);
+        assert_eq!(vector.as_slice::<bool>()[2], true);
     }
 }

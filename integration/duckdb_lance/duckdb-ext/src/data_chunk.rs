@@ -13,18 +13,31 @@
 // limitations under the License.
 
 use super::vector::{FlatVector, ListVector, StructVector};
-use crate::ffi::{
-    duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
-    duckdb_data_chunk_set_size,
+use crate::{
+    ffi::{
+        duckdb_create_data_chunk, duckdb_data_chunk, duckdb_data_chunk_get_size,
+        duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size, duckdb_destroy_data_chunk,
+    },
+    LogicalType,
 };
 
 /// DataChunk in DuckDB.
 pub struct DataChunk {
     /// Pointer to the DataChunk in duckdb C API.
     ptr: duckdb_data_chunk,
+
+    /// Whether this [DataChunk] own the [DataChunk::ptr].
+    owned: bool,
 }
 
 impl DataChunk {
+    pub fn new(logical_types: &[LogicalType]) -> Self {
+        let num_columns = logical_types.len();
+        let mut c_types = logical_types.iter().map(|t| t.ptr).collect::<Vec<_>>();
+        let ptr = unsafe { duckdb_create_data_chunk(c_types.as_mut_ptr(), num_columns as u64) };
+        DataChunk { ptr, owned: true }
+    }
+
     /// Get the vector at the specific column index: `idx`.
     ///
     pub fn flat_vector(&self, idx: usize) -> FlatVector {
@@ -58,6 +71,15 @@ impl DataChunk {
 
 impl From<duckdb_data_chunk> for DataChunk {
     fn from(ptr: duckdb_data_chunk) -> Self {
-        Self { ptr }
+        Self { ptr, owned: false }
+    }
+}
+
+impl Drop for DataChunk {
+    fn drop(&mut self) {
+        if self.owned && !self.ptr.is_null() {
+            unsafe { duckdb_destroy_data_chunk(&mut self.ptr) }
+            self.ptr = std::ptr::null_mut();
+        }
     }
 }
