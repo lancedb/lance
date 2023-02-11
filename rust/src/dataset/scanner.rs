@@ -110,6 +110,9 @@ impl Scanner {
     ///     .limit(10)
     ///     .into_stream();
     /// ```
+    ///
+    /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
+    ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
         let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
@@ -335,11 +338,12 @@ mod test {
 
     use super::*;
 
-    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
-
     use arrow_array::{Int32Array, RecordBatchReader, StringArray};
     use arrow_schema::DataType;
+    use sqlparser::ast::*;
     use tempfile::tempdir;
+
+    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     #[tokio::test]
     async fn test_batch_size() {
@@ -388,5 +392,44 @@ mod test {
                 expected_len as usize
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_filter_parsing() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|v| format!("s-{}", v)),
+                )),
+            ],
+        )
+        .unwrap()]);
+
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scan = dataset.scan();
+        assert!(scan.filter.is_none());
+
+        scan.filter("a > 50").unwrap();
+        println!("Filter is: {:?}", scan.filter);
+        assert_eq!(
+            scan.filter,
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("a"))),
+                op: BinaryOperator::Gt,
+                right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
+            })
+        );
     }
 }
