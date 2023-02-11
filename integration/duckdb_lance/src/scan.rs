@@ -104,10 +104,16 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
                 return;
             }
         };
+    let projected_columns = info.projected_column_ids();
+    let columns = projected_columns
+        .iter()
+        .map(|proj_id| dataset.schema().fields[*proj_id].name.as_str())
+        .collect::<Vec<_>>();
 
     let stream = match crate::RUNTIME.block_on(async {
         dataset
             .scan()
+            .project(columns.as_slice()).unwrap()
             .batch_size(duckdb_vector_size() as usize)
             .try_into_stream()
             .await
