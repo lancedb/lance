@@ -23,6 +23,9 @@ use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use futures::stream::{Stream, StreamExt};
+use sqlparser::ast::{Expr, SetExpr, Statement};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 use super::Dataset;
 use crate::datatypes::Schema;
@@ -53,10 +56,12 @@ pub struct Scanner {
 
     projections: Schema,
 
+    /// Optional filters.
+    filter: Option<Expr>,
+
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
 
-    // filter: how to present filter
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -75,6 +80,7 @@ impl Scanner {
         Self {
             dataset,
             projections: projection,
+            filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             limit: None,
             offset: None,
@@ -90,6 +96,36 @@ impl Scanner {
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
+    }
+
+    /// Apply filters
+    ///
+    /// The filters can be presented as the string, as in WHERE clause in SQL.
+    ///
+    /// ```rust,ignore
+    /// let dataset = Dataset::open(uri).await.unwrap();
+    /// let stream = dataset.scan()
+    ///     .project(&["col", "col2.subfield"]).unwrap()
+    ///     .filter("a > 10 AND b < 200").unwrap()
+    ///     .limit(10)
+    ///     .into_stream();
+    /// ```
+    pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
+        let sql = format!("SELECT 1 FROM t WHERE {filter}");
+
+        let dialect = GenericDialect {};
+        let stmts = Parser::parse_sql(&dialect, sql.as_str())?;
+        if stmts.len() != 1 {
+            return Err(Error::IO(format!("Filter is not valid: {filter}")));
+        }
+        if let Statement::Query(query) = &stmts[0] {
+            if let SetExpr::Select(s) = query.body.as_ref() {
+                self.filter = s.selection.clone();
+                return Ok(self);
+            }
+        }
+
+        return Err(Error::IO(format!("Filter is not valid: {filter}")));
     }
 
     /// Set the batch size.

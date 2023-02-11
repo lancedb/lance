@@ -97,3 +97,9 @@ impl From<Error> for ArrowError {
         }
     }
 }
+
+impl From<sqlparser::parser::ParserError> for Error {
+    fn from(e: sqlparser::parser::ParserError) -> Self {
+        Self::IO(e.to_string())
+    }
+}
