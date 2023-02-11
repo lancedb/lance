@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use super::vector::{FlatVector, ListVector, StructVector};
-use crate::ffi::{
+use crate::{ffi::{
     duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
     duckdb_data_chunk_set_size,
-};
+}, LogicalType};
 
 /// DataChunk in DuckDB.
 pub struct DataChunk {
@@ -25,6 +25,9 @@ pub struct DataChunk {
 }
 
 impl DataChunk {
+    pub fn new(logical_types: &[LogicalType]) -> Self {
+        let num_columns = logical_types.len();
+    }
     /// Get the vector at the specific column index: `idx`.
     ///
     pub fn flat_vector(&self, idx: usize) -> FlatVector {
