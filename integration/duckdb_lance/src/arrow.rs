@@ -298,7 +298,7 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
     for i in 0..array.num_columns() {
         let column = array.column(i);
         match column.data_type() {
-            dt if dt.is_primitive() => {
+            dt if dt.is_primitive() || matches!(dt, DataType::Boolean) => {
                 primitive_array_to_vector(column, &mut out.child(i));
             }
             DataType::Utf8 => {
