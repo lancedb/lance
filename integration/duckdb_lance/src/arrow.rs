@@ -117,7 +117,7 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
         match col.data_type() {
-            dt if dt.is_primitive() || matches!(dt, DataType::Boolean)=> {
+            dt if dt.is_primitive() || matches!(dt, DataType::Boolean) => {
                 primitive_array_to_vector(col, &mut chunk.flat_vector(i));
             }
             DataType::Utf8 => {
@@ -339,17 +339,35 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_schema::{Schema, Field};
+    use arrow_schema::{Field, Schema};
+
+    // use libduckdb to link to a duckdb binary.
+    #[allow(unused_imports)]
+    use libduckdb_sys;
 
     #[test]
     fn test_record_batch_to_data_chunk() {
         let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, false)]));
 
-        let batch = RecordBatch::try_new(schema, vec![
-            Arc::new(BooleanArray::from(vec![true, false, true])),
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BooleanArray::from(vec![true, false, true]))],
+        )
+        .unwrap();
 
+        let logical_types = schema
+            .fields
+            .iter()
+            .map(|f| to_duckdb_logical_type(f.data_type()).unwrap())
+            .collect::<Vec<_>>();
+        let mut chunk = DataChunk::new(&logical_types);
 
-
+        record_batch_to_duckdb_data_chunk(&batch, &mut chunk).unwrap();
+        assert_eq!(chunk.len(), 3);
+        let vector = chunk.flat_vector(0);
+        assert_eq!(LogicalTypeId::Boolean, vector.logical_type().id());
+        assert_eq!(vector.as_slice::<bool>()[0], true);
+        assert_eq!(vector.as_slice::<bool>()[1], false);
+        assert_eq!(vector.as_slice::<bool>()[2], true);
     }
 }

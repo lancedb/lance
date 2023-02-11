@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use super::vector::{FlatVector, ListVector, StructVector};
-use crate::{ffi::{
-    duckdb_data_chunk, duckdb_data_chunk_get_size, duckdb_data_chunk_get_vector,
-    duckdb_data_chunk_set_size, duckdb_create_data_chunk, duckdb_destroy_data_chunk,
-}, LogicalType};
+use crate::{
+    ffi::{
+        duckdb_create_data_chunk, duckdb_data_chunk, duckdb_data_chunk_get_size,
+        duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size, duckdb_destroy_data_chunk,
+    },
+    LogicalType,
+};
 
 /// DataChunk in DuckDB.
 pub struct DataChunk {
@@ -30,10 +33,8 @@ pub struct DataChunk {
 impl DataChunk {
     pub fn new(logical_types: &[LogicalType]) -> Self {
         let num_columns = logical_types.len();
-        let mut c_types = logical_types.iter().map(|t| t.ptr ).collect::<Vec<_>>();
-        let ptr = unsafe {
-            duckdb_create_data_chunk(c_types.as_mut_ptr(), num_columns as u64)
-        };
+        let mut c_types = logical_types.iter().map(|t| t.ptr).collect::<Vec<_>>();
+        let ptr = unsafe { duckdb_create_data_chunk(c_types.as_mut_ptr(), num_columns as u64) };
         DataChunk { ptr, owned: true }
     }
 
@@ -77,9 +78,7 @@ impl From<duckdb_data_chunk> for DataChunk {
 impl Drop for DataChunk {
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() {
-            unsafe {
-                duckdb_destroy_data_chunk(&mut self.ptr)
-            }
+            unsafe { duckdb_destroy_data_chunk(&mut self.ptr) }
             self.ptr = std::ptr::null_mut();
         }
     }
