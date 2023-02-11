@@ -84,7 +84,7 @@ impl FlatVector {
 
     pub fn copy<T: Copy>(&mut self, data: &[T]) {
         assert!(data.len() <= self.capacity());
-        self.as_mut_slice::<T>().copy_from_slice(data);
+        self.as_mut_slice::<T>()[0..data.len()].copy_from_slice(data);
     }
 }
 
@@ -109,7 +109,7 @@ pub struct ListVector {
 impl From<duckdb_vector> for ListVector {
     fn from(ptr: duckdb_vector) -> Self {
         Self {
-            entries: ptr.into(),
+            entries: FlatVector::from(ptr),
         }
     }
 }

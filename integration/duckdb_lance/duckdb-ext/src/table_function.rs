@@ -24,7 +24,7 @@ use crate::ffi::{
     duckdb_table_function_init_t, duckdb_table_function_set_bind,
     duckdb_table_function_set_function, duckdb_table_function_set_init,
     duckdb_table_function_set_name, duckdb_table_function_supports_projection_pushdown,
-    duckdb_table_function_t,
+    duckdb_table_function_t, duckdb_init_get_column_count, duckdb_init_get_column_index,
 };
 use crate::{Error, LogicalType, Value};
 
@@ -130,6 +130,14 @@ impl InitInfo {
     /// * `error`: The error message
     pub fn set_error(&self, error: Error) {
         unsafe { duckdb_init_set_error(self.ptr, error.c_str().as_ptr()) }
+    }
+
+    /// Get the total number of columns to be projected.
+    pub fn projected_column_ids(&self) -> Vec<usize> {
+        let num_columns = unsafe { duckdb_init_get_column_count(self.ptr) as usize };
+        (0..num_columns).map(|col_id| {
+            unsafe { duckdb_init_get_column_index(self.ptr, col_id as u64) as usize}
+        }).collect()
     }
 }
 

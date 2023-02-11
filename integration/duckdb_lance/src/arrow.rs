@@ -114,6 +114,7 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
 
 pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataChunk) -> Result<()> {
     // Fill the row
+    assert_eq!(batch.num_columns(), chunk.num_columns());
     for i in 0..batch.num_columns() {
         let col = batch.column(i);
         match col.data_type() {
@@ -142,6 +143,7 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
             }
             _ => {
                 println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
+                todo!()
             }
         }
     }

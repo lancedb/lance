@@ -17,6 +17,7 @@ use crate::{
     ffi::{
         duckdb_create_data_chunk, duckdb_data_chunk, duckdb_data_chunk_get_size,
         duckdb_data_chunk_get_vector, duckdb_data_chunk_set_size, duckdb_destroy_data_chunk,
+        duckdb_data_chunk_get_column_count,
     },
     LogicalType,
 };
@@ -66,6 +67,10 @@ impl DataChunk {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn num_columns(&self) -> usize {
+        unsafe { duckdb_data_chunk_get_column_count(self.ptr) as usize }
     }
 }
 
