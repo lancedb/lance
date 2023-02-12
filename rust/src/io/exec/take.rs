@@ -22,8 +22,7 @@ use std::task::{Context, Poll};
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, projection};
-use futures::io::Close;
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -108,7 +107,7 @@ impl Stream for Take {
 
 impl datafusion::physical_plan::RecordBatchStream for Take {
     fn schema(&self) -> SchemaRef {
-        self.schema()
+        Arc::new(self.schema.as_ref().into())
     }
 }
 
@@ -142,11 +141,11 @@ impl ExecutionPlan for GlobalTakeExec {
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        datafusion::physical_plan::Partitioning::RoundRobinBatch(1)
+        self.input.output_partitioning()
     }
 
     fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        None
+        self.input.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -155,7 +154,7 @@ impl ExecutionPlan for GlobalTakeExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         todo!()
     }

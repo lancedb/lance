@@ -21,36 +21,39 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
+    SendableRecordBatchStream,
+};
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
-use crate::dataset::Dataset;
 use crate::dataset::scanner::RecordBatchStream;
+use crate::dataset::Dataset;
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
-use crate::{Error, Result};
 
 /// KNN node for post-filtering.
-pub struct KNNFlat {
-    rx: Receiver<Result<RecordBatch>>,
+pub struct KNNFlatStream {
+    rx: Receiver<DataFusionResult<RecordBatch>>,
 
     _bg_thread: JoinHandle<()>,
 }
 
-impl KNNFlat {
+impl KNNFlatStream {
     /// Construct a [KNNFlat] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let result = match flat_search(RecordBatchStream::new(child), &q).await {
+            let batch = match flat_search(RecordBatchStream::new(child), &q).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
+                    tx.send(Err(DataFusionError::Execution(format!("Failed to compute scores: {e}"))))
                         .await
                         .expect("KNNFlat failed to send message");
                     return;
@@ -58,7 +61,7 @@ impl KNNFlat {
             };
 
             if !tx.is_closed() {
-                if let Err(e) = tx.send(Ok(result)).await {
+                if let Err(e) = tx.send(Ok(batch)).await {
                     eprintln!("KNNFlat tx.send error: {e}")
                 };
             }
@@ -72,11 +75,17 @@ impl KNNFlat {
     }
 }
 
-impl Stream for KNNFlat {
-    type Item = Result<RecordBatch>;
+impl Stream for KNNFlatStream {
+    type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+impl DFRecordBatchStream for KNNFlatStream {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        todo!()
     }
 }
 
@@ -107,12 +116,12 @@ impl ExecutionPlan for KNNFlatExec {
         todo!()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        todo!()
+    fn output_partitioning(&self) -> Partitioning {
+        self.input.output_partitioning()
     }
 
     fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        todo!()
+        self.input.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -121,17 +130,18 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         todo!()
     }
 
     fn execute(
         &self,
-        _partition: usize,
-        _context: Arc<datafusion::execution::context::TaskContext>,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        todo!()
+        let input_stream = self.input.execute(partition, context)?;
+        Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
@@ -140,13 +150,13 @@ impl ExecutionPlan for KNNFlatExec {
 }
 
 /// KNN Node from reading a vector index.
-pub struct KNNIndex {
-    rx: Receiver<Result<RecordBatch>>,
+pub struct KNNIndexStream {
+    rx: Receiver<datafusion::error::Result<RecordBatch>>,
 
     _bg_thread: JoinHandle<()>,
 }
 
-impl KNNIndex {
+impl KNNIndexStream {
     pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
@@ -156,7 +166,7 @@ impl KNNIndex {
             let index = match IvfPQIndex::new(&dataset, &name).await {
                 Ok(idx) => idx,
                 Err(e) => {
-                    tx.send(Err(Error::IO(format!(
+                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
                         "Failed to open vector index: {name}: {e}"
                     ))))
                     .await
@@ -167,9 +177,11 @@ impl KNNIndex {
             let result = match index.search(&q).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
-                        .await
-                        .expect("KNNIndex failed to send message");
+                    tx.send(Err(datafusion::error::DataFusionError::Execution(
+                        format!("Failed to compute scores: {e}").into(),
+                    )))
+                    .await
+                    .expect("KNNIndex failed to send message");
                     return;
                 }
             };
@@ -189,8 +201,14 @@ impl KNNIndex {
     }
 }
 
-impl Stream for KNNIndex {
-    type Item = Result<RecordBatch>;
+impl DFRecordBatchStream for KNNIndexStream {
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        todo!()
+    }
+}
+
+impl Stream for KNNIndexStream {
+    type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
@@ -206,7 +224,11 @@ pub struct KNNIndexExec {
 
 impl std::fmt::Debug for KNNIndexExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KNN(index, k={})", self.query.k)
+        write!(
+            f,
+            "KNN(index, name={}, k={})",
+            self.index_name, self.query.k
+        )
     }
 }
 
@@ -229,31 +251,36 @@ impl ExecutionPlan for KNNIndexExec {
         todo!()
     }
 
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
-        todo!()
+    fn output_partitioning(&self) -> Partitioning {
+        Partitioning::RoundRobinBatch(1)
     }
 
     fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        todo!()
+        None
     }
 
+    /// KNNIndex is a leaf node, so returns zero children.
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        todo!()
+        vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         todo!()
     }
 
     fn execute(
         &self,
-        partition: usize,
-        context: Arc<datafusion::execution::context::TaskContext>,
+        _partition: usize,
+        _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        todo!()
+        Ok(Box::pin(KNNIndexStream::new(
+            self.dataset.clone(),
+            &self.index_name,
+            &self.query,
+        )))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {

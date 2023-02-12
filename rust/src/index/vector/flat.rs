@@ -22,7 +22,6 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex};

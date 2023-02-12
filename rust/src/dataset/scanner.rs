@@ -277,7 +277,7 @@ impl Scanner {
                         self.dataset.object_store.clone(),
                         data_dir.clone(),
                         self.fragments.clone(),
-                        Arc::new(self.projections.clone()),
+                        vector_scan_projection,
                         manifest.clone(),
                         self.batch_size,
                         PREFECTH_SIZE,
