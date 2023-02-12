@@ -31,7 +31,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
-use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Limit, Scan, Take};
+use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Lan, LanceScanExec, Limit, Take};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -267,7 +267,7 @@ impl Scanner {
                 } else {
                     let vector_scan_projection =
                         Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                    let scan_node = Box::new(Scan::new(
+                    let scan_node = Box::new(LanceScanExec::new(
                         self.dataset.object_store.clone(),
                         data_dir.clone(),
                         self.fragments.clone(),
@@ -292,7 +292,7 @@ impl Scanner {
                 take_node
             }
         } else {
-            Box::new(Scan::new(
+            Box::new(LanceScanExec::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),

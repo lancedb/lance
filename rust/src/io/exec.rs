@@ -26,7 +26,7 @@ mod take;
 use crate::Result;
 pub(crate) use knn::*;
 pub(crate) use limit::Limit;
-pub(crate) use scan::Scan;
+pub(crate) use scan::{LanceScanExec, LanceStream};
 pub(crate) use take::Take;
 
 #[derive(Debug)]
