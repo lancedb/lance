@@ -186,11 +186,11 @@ impl LanceScanExec {
         with_row_id: bool,
     ) -> Self {
         Self {
-            object_store: object_store.clone(),
+            object_store,
             data_dir,
-            fragments: fragments.clone(),
-            projection: projection.clone(),
-            manifest: manifest.clone(),
+            fragments,
+            projection,
+            manifest,
             read_size,
             prefetch_size,
             with_row_id,
@@ -200,8 +200,7 @@ impl LanceScanExec {
 
 impl ExecutionPlan for LanceScanExec {
     fn as_any(&self) -> &dyn Any {
-        let this = self;
-        this
+        self
     }
 
     fn schema(&self) -> SchemaRef {

@@ -180,7 +180,7 @@ impl KNNIndexStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(
-                        format!("Failed to compute scores: {e}").into(),
+                        format!("Failed to compute scores: {e}"),
                     )))
                     .await
                     .expect("KNNIndex failed to send message");
@@ -237,7 +237,7 @@ impl std::fmt::Debug for KNNIndexExec {
 impl KNNIndexExec {
     pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
         Self {
-            dataset: dataset.clone(),
+            dataset,
             index_name: index_name.to_string(),
             query: query.clone(),
         }
