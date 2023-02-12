@@ -179,9 +179,9 @@ impl KNNIndexStream {
             let result = match index.search(&q).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tx.send(Err(datafusion::error::DataFusionError::Execution(
-                        format!("Failed to compute scores: {e}"),
-                    )))
+                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
+                        "Failed to compute scores: {e}"
+                    ))))
                     .await
                     .expect("KNNIndex failed to send message");
                     return;
