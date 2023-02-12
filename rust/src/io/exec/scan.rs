@@ -39,16 +39,16 @@ use crate::{datatypes::Schema, format::Fragment};
 
 /// Dataset Scan Node.
 #[derive(Debug)]
-pub struct LanceStream<'a> {
+pub struct LanceStream {
     rx: Receiver<std::result::Result<RecordBatch, DataFusionError>>,
 
     _io_thread: JoinHandle<()>,
 
     /// Manifest of the dataset
-    projection: &'a Schema,
+    projection: Arc<Schema>,
 }
 
-impl<'a> LanceStream<'a> {
+impl LanceStream {
     /// Create a new dataset scan node.
     ///
     /// Parameters
@@ -66,7 +66,7 @@ impl<'a> LanceStream<'a> {
         object_store: Arc<ObjectStore>,
         data_dir: Path,
         fragments: Arc<Vec<Fragment>>,
-        projection: &'a Schema,
+        projection: Arc<Schema>,
         manifest: Arc<Manifest>,
         read_size: usize,
         prefetch_size: usize,
@@ -91,7 +91,7 @@ impl<'a> LanceStream<'a> {
                 .await
                 {
                     Ok(mut r) => {
-                        r.set_projection(project_schema.clone());
+                        r.set_projection(project_schema.as_ref().clone());
                         r.with_row_id(with_row_id);
                         r
                     }
@@ -132,13 +132,13 @@ impl<'a> LanceStream<'a> {
     }
 }
 
-impl<'a> RecordBatchStream for LanceStream<'a> {
+impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
-        Arc::new(self.projection.into())
+        Arc::new(self.projection.as_ref().into())
     }
 }
 
-impl<'a> Stream for LanceStream<'_> {
+impl Stream for LanceStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -186,11 +186,11 @@ impl LanceScanExec {
         with_row_id: bool,
     ) -> Self {
         Self {
-            object_store,
+            object_store: object_store.clone(),
             data_dir,
-            fragments,
-            projection,
-            manifest,
+            fragments: fragments.clone(),
+            projection: projection.clone(),
+            manifest: manifest.clone(),
             read_size,
             prefetch_size,
             with_row_id,
@@ -234,10 +234,10 @@ impl ExecutionPlan for LanceScanExec {
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         Ok(Box::pin(LanceStream::new(
-            self.object_store,
-            self.data_dir,
-            self.fragments,
-            &self.projection,
+            self.object_store.clone(),
+            self.data_dir.clone(),
+            self.fragments.clone(),
+            self.projection.clone(),
             self.manifest.clone(),
             self.read_size,
             self.prefetch_size,

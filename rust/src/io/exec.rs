@@ -25,7 +25,7 @@ mod take;
 
 use crate::Result;
 pub(crate) use knn::*;
-pub(crate) use scan::{LanceScanExec, LanceStream};
+pub(crate) use scan::LanceScanExec;
 pub(crate) use take::GlobalTakeExec;
 
 #[derive(Debug)]

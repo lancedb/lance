@@ -22,8 +22,11 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use datafusion::execution::context::SessionState;
+use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 use sqlparser::ast::{Expr, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
@@ -33,7 +36,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
-use crate::io::exec::{ExecNodeBox, GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
+use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -228,7 +231,7 @@ impl Scanner {
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
+    pub async fn try_into_stream(&self) -> Result<ScannerStream> {
         const PREFECTH_SIZE: usize = 8;
 
         let data_dir = self.dataset.data_dir();
@@ -274,7 +277,7 @@ impl Scanner {
                         self.dataset.object_store.clone(),
                         data_dir.clone(),
                         self.fragments.clone(),
-                        Arc::new(self.projections),
+                        Arc::new(self.projections.clone()),
                         manifest.clone(),
                         self.batch_size,
                         PREFECTH_SIZE,
@@ -299,7 +302,7 @@ impl Scanner {
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),
-                Arc::new(self.projections),
+                Arc::new(self.projections.clone()),
                 manifest.clone(),
                 self.batch_size,
                 PREFECTH_SIZE,
@@ -314,7 +317,14 @@ impl Scanner {
                 self.limit.map(|l| l as usize),
             ));
         }
-        plan.execute(0, context).map_err(|e| e.into())
+
+        let session_config = SessionConfig::new();
+        let runtime_config = RuntimeConfig::new();
+        let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
+        let session_state = SessionState::with_config_rt(session_config, runtime_env);
+        Ok(ScannerStream::new(
+            plan.execute(0, session_state.task_ctx())?,
+        ))
     }
 }
 
@@ -322,11 +332,11 @@ impl Scanner {
 #[pin_project::pin_project]
 pub struct ScannerStream {
     #[pin]
-    exec_node: ExecNodeBox,
+    exec_node: SendableRecordBatchStream,
 }
 
 impl ScannerStream {
-    fn new(exec_node: ExecNodeBox) -> Self {
+    fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
 }
@@ -336,7 +346,12 @@ impl Stream for ScannerStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
-        this.exec_node.poll_next_unpin(cx)
+        match this.exec_node.poll_next_unpin(cx) {
+            Poll::Ready(result) => {
+                Poll::Ready(result.map(|r| r.map_err(|e| Error::IO(e.to_string()))))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
