@@ -97,3 +97,21 @@ impl From<Error> for ArrowError {
         }
     }
 }
+
+impl From<sqlparser::parser::ParserError> for Error {
+    fn from(e: sqlparser::parser::ParserError) -> Self {
+        Self::IO(e.to_string())
+    }
+}
+
+impl From<Error> for datafusion::error::DataFusionError {
+    fn from(e: Error) -> Self {
+        Self::Execution(e.to_string())
+    }
+}
+
+impl From<datafusion::error::DataFusionError> for Error {
+    fn from(e: datafusion::error::DataFusionError) -> Self {
+        Self::IO(e.to_string())
+    }
+}
