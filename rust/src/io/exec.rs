@@ -15,36 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::RecordBatch;
-use futures::stream::Stream;
-
 mod knn;
-mod limit;
 mod scan;
 mod take;
 
-use crate::Result;
-pub(crate) use knn::*;
-pub(crate) use scan::LanceScanExec;
-pub(crate) use take::GlobalTakeExec;
-
-#[derive(Debug)]
-pub enum NodeType {
-    /// Dataset Scan
-    Scan = 1,
-    /// Dataset Take (row_ids).
-    Take = 2,
-    /// Limit / offset
-    Limit = 4, // Filter can be 3
-    /// Knn Flat Scan
-    KnnFlat = 10,
-    /// Knn Index Scan
-    Knn = 11,
-}
-
-/// I/O Exec Node
-pub(crate) trait ExecNode: Stream<Item = Result<RecordBatch>> {
-    fn node_type(&self) -> NodeType;
-}
-
-pub(crate) type ExecNodeBox = Box<dyn ExecNode<Item = Result<RecordBatch>> + Unpin + Send>;
+pub use knn::*;
+pub use scan::LanceScanExec;
+pub use take::GlobalTakeExec;

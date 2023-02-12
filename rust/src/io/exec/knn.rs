@@ -21,17 +21,16 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
-use super::{ExecNode, NodeType};
 use crate::dataset::Dataset;
+use crate::dataset::scanner::RecordBatchStream;
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
-use crate::io::exec::ExecNodeBox;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
@@ -43,12 +42,12 @@ pub struct KNNFlat {
 
 impl KNNFlat {
     /// Construct a [KNNFlat] node.
-    pub(crate) fn new(child: ExecNodeBox, query: &Query) -> Self {
+    pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let result = match flat_search(child, &q).await {
+            let result = match flat_search(RecordBatchStream::new(child), &q).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(Error::IO(format!("Failed to compute scores: {e}"))))
@@ -187,12 +186,6 @@ impl KNNIndex {
             rx,
             _bg_thread: bg_thread,
         }
-    }
-}
-
-impl ExecNode for KNNIndex {
-    fn node_type(&self) -> NodeType {
-        NodeType::Knn
     }
 }
 

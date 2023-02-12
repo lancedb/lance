@@ -231,7 +231,7 @@ impl Scanner {
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub async fn try_into_stream(&self) -> Result<ScannerStream> {
+    pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
         const PREFECTH_SIZE: usize = 8;
 
         let data_dir = self.dataset.data_dir();
@@ -322,7 +322,7 @@ impl Scanner {
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
-        Ok(ScannerStream::new(
+        Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
     }
@@ -330,18 +330,18 @@ impl Scanner {
 
 /// ScannerStream is a container to wrap different types of ExecNode.
 #[pin_project::pin_project]
-pub struct ScannerStream {
+pub struct RecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
 }
 
-impl ScannerStream {
-    fn new(exec_node: SendableRecordBatchStream) -> Self {
+impl RecordBatchStream {
+    pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
 }
 
-impl Stream for ScannerStream {
+impl Stream for RecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
