@@ -358,9 +358,12 @@ impl Stream for RecordBatchStream {
 #[cfg(test)]
 mod test {
 
+    use std::path::PathBuf;
+
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatchReader, StringArray};
+    use arrow::compute::concat_batches;
+    use arrow_array::{Int32Array, RecordBatchReader, StringArray, Int64Array, ArrayRef};
     use arrow_schema::DataType;
     use sqlparser::ast::*;
     use tempfile::tempdir;
@@ -453,5 +456,59 @@ mod test {
                 right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
             })
         );
+    }
+
+    #[tokio::test]
+    async fn test_limit() {
+        let temp = tempdir().unwrap();
+        let mut file_path = PathBuf::from(temp.as_ref());
+        file_path.push("limit_test.lance");
+        let path = file_path.to_str().unwrap();
+        let expected_batches = write_data(path).await;
+        let expected_combined =
+            concat_batches(&expected_batches[0].schema(), &expected_batches).unwrap();
+
+        let dataset = Dataset::open(path).await.unwrap();
+        let mut scanner = dataset.scan();
+        scanner.limit(2, Some(19)).unwrap();
+        let actual_batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .map(|b| b.unwrap())
+            .collect::<Vec<RecordBatch>>()
+            .await;
+        let actual_combined = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+
+        assert_eq!(expected_combined.slice(19, 2), actual_combined);
+        // skipped 1 batch
+        assert_eq!(actual_batches.len(), 2);
+    }
+
+    async fn write_data(path: &str) -> Vec<RecordBatch> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int64,
+            true,
+        )])) as SchemaRef;
+
+        // Write 3 batches.
+        let expected_batches: Vec<RecordBatch> = (0..3)
+            .map(|batch_id| {
+                let value_range = batch_id * 10..batch_id * 10 + 10;
+                let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter(
+                    value_range.clone().collect::<Vec<_>>(),
+                ))];
+                RecordBatch::try_new(schema.clone(), columns).unwrap()
+            })
+            .collect();
+        let batches = RecordBatchBuffer::new(expected_batches.clone());
+        let mut params = WriteParams::default();
+        params.max_rows_per_group = 10;
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut reader, path, Some(params))
+            .await
+            .unwrap();
+        expected_batches
     }
 }
