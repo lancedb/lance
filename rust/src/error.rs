@@ -109,3 +109,9 @@ impl From<Error> for datafusion::error::DataFusionError {
         Self::Execution(e.to_string())
     }
 }
+
+impl From<datafusion::error::DataFusionError> for Error {
+    fn from(e: datafusion::error::DataFusionError) -> Self {
+        Self::IO(e.to_string())
+    }
+}

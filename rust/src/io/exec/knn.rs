@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -71,17 +73,70 @@ impl KNNFlat {
     }
 }
 
-impl ExecNode for KNNFlat {
-    fn node_type(&self) -> NodeType {
-        NodeType::KnnFlat
-    }
-}
-
 impl Stream for KNNFlat {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+/// Physical [ExecutionPlan] for Flat KNN node.
+pub struct KNNFlatExec {
+    input: Arc<dyn ExecutionPlan>,
+    query: Query,
+}
+
+impl std::fmt::Debug for KNNFlatExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KNN(flat, k={})", self.query.k)
+    }
+}
+
+impl KNNFlatExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, query: Query) -> Self {
+        Self { input, query }
+    }
+}
+
+impl ExecutionPlan for KNNFlatExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        todo!()
+    }
+
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        todo!()
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        todo!()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        todo!()
+    }
+
+    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+        todo!()
     }
 }
 
@@ -146,6 +201,70 @@ impl Stream for KNNIndex {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+/// [ExecutionPlan] for KNNIndex node.
+pub struct KNNIndexExec {
+    dataset: Arc<Dataset>,
+    index_name: String,
+    query: Query,
+}
+
+impl std::fmt::Debug for KNNIndexExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KNN(index, k={})", self.query.k)
+    }
+}
+
+impl KNNIndexExec {
+    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
+        Self {
+            dataset: dataset.clone(),
+            index_name: index_name.to_string(),
+            query: query.clone(),
+        }
+    }
+}
+
+impl ExecutionPlan for KNNIndexExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        todo!()
+    }
+
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        todo!()
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        todo!()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        todo!()
+    }
+
+    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+        todo!()
     }
 }
 

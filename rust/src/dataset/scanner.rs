@@ -22,6 +22,8 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use futures::stream::{Stream, StreamExt};
 use sqlparser::ast::{Expr, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
@@ -31,7 +33,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 use crate::index::vector::Query;
-use crate::io::exec::{ExecNode, ExecNodeBox, KNNFlat, KNNIndex, Lan, LanceScanExec, Limit, Take};
+use crate::io::exec::{ExecNodeBox, GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -226,7 +228,7 @@ impl Scanner {
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub async fn try_into_stream(&self) -> Result<ScannerStream> {
+    pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
         const PREFECTH_SIZE: usize = 8;
 
         let data_dir = self.dataset.data_dir();
@@ -240,7 +242,8 @@ impl Scanner {
             vec![]
         };
 
-        let mut exec_node: ExecNodeBox = if let Some(q) = self.nearest.as_ref() {
+        // TODO: refactor to a DataFusion QueryPlanner
+        let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
             let column_id = self
                 .dataset
                 .schema()
@@ -253,13 +256,13 @@ impl Scanner {
                     return Err(Error::IO("Refine factor can not be zero".to_string()));
                 }
             }
-            let knn_node: Box<dyn ExecNode + Send + Unpin> =
+            let knn_node: Arc<dyn ExecutionPlan> =
                 if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
                     // There is an index built for the column.
                     // We will use the index.
                     let mut inner_query = q.clone();
                     inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
-                    Box::new(KNNIndex::new(
+                    Arc::new(KNNIndexExec::new(
                         self.dataset.clone(),
                         &index.uuid.to_string(),
                         &inner_query,
@@ -267,36 +270,36 @@ impl Scanner {
                 } else {
                     let vector_scan_projection =
                         Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                    let scan_node = Box::new(LanceScanExec::new(
+                    let scan_node = Arc::new(LanceScanExec::new(
                         self.dataset.object_store.clone(),
                         data_dir.clone(),
                         self.fragments.clone(),
-                        &vector_scan_projection,
+                        Arc::new(self.projections),
                         manifest.clone(),
                         self.batch_size,
                         PREFECTH_SIZE,
                         true,
                     ));
-                    Box::new(KNNFlat::new(scan_node, &q.clone()))
+                    Arc::new(KNNFlatExec::new(scan_node, q.clone()))
                 };
 
-            let take_node = Box::new(Take::new(
+            let take_node = Arc::new(GlobalTakeExec::new(
                 self.dataset.clone(),
                 Arc::new(projection.clone()),
                 knn_node,
             ));
 
             if q.refine_factor.is_some() {
-                Box::new(KNNFlat::new(take_node, &q.clone()))
+                Arc::new(KNNFlatExec::new(take_node, q.clone()))
             } else {
                 take_node
             }
         } else {
-            Box::new(LanceScanExec::new(
+            Arc::new(LanceScanExec::new(
                 self.dataset.object_store.clone(),
                 data_dir.clone(),
                 self.fragments.clone(),
-                projection,
+                Arc::new(self.projections),
                 manifest.clone(),
                 self.batch_size,
                 PREFECTH_SIZE,
@@ -305,9 +308,13 @@ impl Scanner {
         };
 
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
-            exec_node = Box::new(Limit::new(exec_node, self.limit, self.offset))
+            plan = Arc::new(GlobalLimitExec::new(
+                plan,
+                *self.offset.as_ref().unwrap_or(&0) as usize,
+                self.limit.map(|l| l as usize),
+            ));
         }
-        Ok(ScannerStream::new(exec_node))
+        plan.execute(0, context).map_err(|e| e.into())
     }
 }
 

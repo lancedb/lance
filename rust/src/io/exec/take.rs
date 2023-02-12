@@ -21,6 +21,8 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::SchemaRef;
+use datafusion::physical_plan::ExecutionPlan;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -98,5 +100,66 @@ impl Stream for Take {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+/// GlobalTake is a physical [`ExecutionPlan`] that takes the rows globally cross the [`Dataset`].
+///
+/// The rows are identified by the inexplicit row IDs.
+#[derive(Debug)]
+pub struct GlobalTakeExec {
+    dataset: Arc<Dataset>,
+    schema: Arc<Schema>,
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl GlobalTakeExec {
+    pub fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, input: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            dataset,
+            schema,
+            input,
+        }
+    }
+}
+
+impl ExecutionPlan for GlobalTakeExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.input.schema()
+    }
+
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        todo!()
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        todo!()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        todo!()
+    }
+
+    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+        todo!()
     }
 }
