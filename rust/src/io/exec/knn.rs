@@ -21,11 +21,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
     SendableRecordBatchStream,
 };
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
@@ -53,9 +53,11 @@ impl KNNFlatStream {
             let batch = match flat_search(RecordBatchStream::new(child), &q).await {
                 Ok(b) => b,
                 Err(e) => {
-                    tx.send(Err(DataFusionError::Execution(format!("Failed to compute scores: {e}"))))
-                        .await
-                        .expect("KNNFlat failed to send message");
+                    tx.send(Err(DataFusionError::Execution(format!(
+                        "Failed to compute scores: {e}"
+                    ))))
+                    .await
+                    .expect("KNNFlat failed to send message");
                     return;
                 }
             };

@@ -54,7 +54,9 @@ impl Take {
         let projection = schema.clone();
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = child
-                .zip(stream::repeat_with(|| (dataset.clone(), projection.clone())))
+                .zip(stream::repeat_with(|| {
+                    (dataset.clone(), projection.clone())
+                }))
                 .then(|(batch, (dataset, projection))| async move {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name("_rowid").unwrap();
