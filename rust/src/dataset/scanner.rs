@@ -363,7 +363,7 @@ mod test {
     use super::*;
 
     use arrow::compute::concat_batches;
-    use arrow_array::{Int32Array, RecordBatchReader, StringArray, Int64Array, ArrayRef};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray};
     use arrow_schema::DataType;
     use sqlparser::ast::*;
     use tempfile::tempdir;
