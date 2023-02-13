@@ -38,5 +38,6 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

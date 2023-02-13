@@ -25,7 +25,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .lance import _Dataset, _Scanner, _write_dataset
+from .lance import _Dataset, _Scanner, _write_dataset, __version__
 
 
 class LanceDataset(pa.dataset.Dataset):
