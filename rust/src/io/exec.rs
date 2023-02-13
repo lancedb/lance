@@ -50,6 +50,7 @@ pub(crate) fn create_session_state(dataset: &Dataset) -> Result<SessionState> {
 
     let catelog = Arc::new(MemoryCatalogProvider::new());
     let schema_provider = Arc::new(MemorySchemaProvider::new());
+    let table_provider = Arc::new()
     // schema_provider.as_ref().register_table("t", table);
     catelog
         .as_ref()

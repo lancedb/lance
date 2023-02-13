@@ -24,31 +24,45 @@ use datafusion::{
     physical_plan::{ExecutionPlan, PhysicalExpr, PhysicalPlanner},
     prelude::Expr,
 };
+use sqlparser::ast::{Expr as SQLExpr, Value};
 
-/// Lance Physical Planner
-pub struct LancePhysicalPlanner {}
+/// Resolve a [sqlparser::ast::Expr] to [LogicalPlan]
+///
+/// We do the resolving by hand to support nested fields.
+/// We could add the function back to [datafusion] in long term.
+// fn resolve_filter(filter: &SQLExpr) -> Result<LogicalPlan> {
+//     match filter {
+//         SQLExpr::Value(v) => {
+//             match v => {
+//                 Value::Number(val, _) => LogicalPlan::Values(())
+//             }
+//             LogicalPlan::Values(),
+//         },
+//         _ => {
+//             return Err(datafusion::error::DataFusionError::Execution(format!(
+//                 "Lance does not support filter: {}",
+//                 filter
+//             )))
+//         }
+//     }
 
-#[async_trait]
-impl PhysicalPlanner for LancePhysicalPlanner {
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session_state: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        todo!()
-    }
+//     todo!()
+// }
 
-    /// Create a physical expression from a logical expression
-    /// suitable for evaluation
-    fn create_physical_expr(
-        &self,
-        expr: &Expr,
-        _input_dfschema: &DFSchema,
-        input_schema: &Schema,
-        _session_state: &SessionState,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        if !matches!(expr, Expr::Literal(_) | Expr::BinaryExpr(_)) {
-            return Err(datafusion::error::DataFusionError::Contex, ()))
-        }
-    }
+// ///
+// pub fn create_physical_filter_expr(expr: &Expr, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
+//     if !matches!(expr, Expr::Literal(_) | Expr::BinaryExpr(_)) {
+//         return Err(datafusion::error::DataFusionError::Execution(format!(
+//             "Lance only supports literal or binary expression, but got {}",
+//             expr
+//         )));
+//     }
+
+//     todo!()
+// }
+
+
+#[cfg(test)]
+mod tests {
+
 }

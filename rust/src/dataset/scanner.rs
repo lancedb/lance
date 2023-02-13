@@ -34,7 +34,9 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, create_session_state};
+use crate::io::exec::{
+    create_session_state, GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec,
+};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -299,7 +301,10 @@ impl Scanner {
         }
 
         let session_state = create_session_state(self.dataset.as_ref())?;
-        println!("Catalog names: {:?}", session_state.catalog_list().catalog_names());
+        println!(
+            "Catalog names: {:?}",
+            session_state.catalog_list().catalog_names()
+        );
 
         println!(
             "Session State Logical Plan: {:?}",
