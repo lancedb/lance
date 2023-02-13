@@ -422,12 +422,7 @@ impl Dataset {
 
         let remapping_index: UInt64Array = row_ids
             .iter()
-            .map(|o| {
-                sorted_row_ids
-                    .iter()
-                    .position(|sorted_id| sorted_id == o)
-                    .unwrap() as u64
-            })
+            .map(|o| sorted_row_ids.binary_search(o).unwrap() as u64)
             .collect();
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
