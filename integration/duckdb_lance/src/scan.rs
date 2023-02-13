@@ -21,7 +21,7 @@ use duckdb_ext::ffi::{
 use duckdb_ext::table_function::{BindInfo, InitInfo, TableFunction};
 use duckdb_ext::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
 use futures::stream::StreamExt;
-use lance::dataset::scanner::ScannerStream;
+use lance::dataset::scanner::RecordBatchStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
@@ -51,13 +51,13 @@ unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
 
 #[repr(C)]
 struct ScanInitData {
-    stream: *mut ScannerStream,
+    stream: *mut RecordBatchStream,
 
     done: bool,
 }
 
 impl ScanInitData {
-    fn new(stream: Box<ScannerStream>) -> Self {
+    fn new(stream: Box<RecordBatchStream>) -> Self {
         Self {
             stream: Box::into_raw(stream),
             done: false,

@@ -47,6 +47,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/src/include)
 
 set(ALL_SOURCES src/extension.c src/extension.h)
 
+SET(EXTENSION_STATIC_BUILD 1)
 set(PARAMETERS "-warnings")
 build_loadable_extension(${EXTENSION_NAME} ${PARAMETERS} ${ALL_SOURCES})
 
@@ -55,6 +56,7 @@ set(LIB_NAME ${EXTENSION_NAME}_loadable_extension)
 set_target_properties(${LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(${LIB_NAME}
         "${CMAKE_CURRENT_BINARY_DIR}/libduckdb_lance.a"
+        duckdb_static
 )
 
 if (APPLE)
