@@ -47,7 +47,8 @@ impl PhysicalPlanner for LancePhysicalPlanner {
         input_schema: &Schema,
         _session_state: &SessionState,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        // if ex
-        todo!()
+        if !matches!(expr, Expr::Literal(_) | Expr::BinaryExpr(_)) {
+            return Err(datafusion::error::DataFusionError::Contex, ()))
+        }
     }
 }

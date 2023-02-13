@@ -299,11 +299,12 @@ impl Scanner {
         }
 
         let session_state = create_session_state(self.dataset.as_ref())?;
+        println!("Catalog names: {:?}", session_state.catalog_list().catalog_names());
 
         println!(
             "Session State Logical Plan: {:?}",
             session_state
-                .create_logical_plan("SELECT a, b FROM t WHERE a > 10 AND b < 100")
+                .create_logical_plan("SELECT a, b.c FROM lance.default.t WHERE a > 10 AND b < 100")
                 .await
                 .unwrap()
         );
