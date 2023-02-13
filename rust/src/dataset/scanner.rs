@@ -22,11 +22,8 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
-use datafusion::execution::context::SessionState;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
-use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 use object_store::path::Path;
 use sqlparser::ast::{Expr, SetExpr, Statement};
@@ -37,7 +34,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
+use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, create_session_state};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -301,10 +298,16 @@ impl Scanner {
             plan = self.limit_node(plan);
         }
 
-        let session_config = SessionConfig::new();
-        let runtime_config = RuntimeConfig::new();
-        let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
-        let session_state = SessionState::with_config_rt(session_config, runtime_env);
+        let session_state = create_session_state(self.dataset.as_ref())?;
+
+        println!(
+            "Session State Logical Plan: {:?}",
+            session_state
+                .create_logical_plan("SELECT a, b FROM t WHERE a > 10 AND b < 100")
+                .await
+                .unwrap()
+        );
+
         Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
@@ -485,7 +488,6 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("a > 50").unwrap();
-        println!("Filter is: {:?}", scan.filter);
         assert_eq!(
             scan.filter,
             Some(Expr::BinaryOp {
@@ -494,6 +496,8 @@ mod test {
                 right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
             })
         );
+
+        let stream = scan.try_into_stream().await.unwrap();
     }
 
     #[tokio::test]
