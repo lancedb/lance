@@ -25,7 +25,7 @@ Why you should use Lance
 pip install pylance
 ```
 
-Make sure you have a recent version of pandas (1.5+), pyarrow (10.0+), and DuckDB (7.0+)
+Make sure you have a recent version of pandas (1.5+), pyarrow (10.0+), and DuckDB (0.7.0+)
 
 **Converting to Lance**
 ```python
