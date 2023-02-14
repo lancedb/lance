@@ -1,8 +1,4 @@
 """Embedding vector utilities"""
-from typing import Union, Optional
-
-import numpy as np
-import pyarrow as pa
 
 #  Copyright 2023 Lance Developers
 #
@@ -16,6 +12,11 @@ import pyarrow as pa
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
+from typing import Optional, Union
+
+import numpy as np
+import pyarrow as pa
 
 
 def _normalize_vectors(vectors, ndim):
@@ -35,10 +36,12 @@ def _validate_ndim(values, ndim):
     return ndim
 
 
-def to_vectors(data: Union[dict, list, np.ndarray],
-               names: Optional[Union[str, list[str]]] = None,
-               ndim: Optional[int] = None,
-               check_ndim: bool = True) -> pa.Table:
+def to_vectors(
+    data: Union[dict, list, np.ndarray],
+    names: Optional[Union[str, list]] = None,
+    ndim: Optional[int] = None,
+    check_ndim: bool = True,
+) -> pa.Table:
     """
     Create a pyarrow Table containing vectors.
     Vectors are created as FixedSizeListArray's in pyarrow with Float32 values.
@@ -61,7 +64,9 @@ def to_vectors(data: Union[dict, list, np.ndarray],
         if names is None:
             names = ["id", "vector"]
         elif not isinstance(names, (list, tuple)) and len(names) == 2:
-            raise ValueError("If data is a dict, names must be a list or tuple of 2 strings")
+            raise ValueError(
+                "If data is a dict, names must be a list or tuple of 2 strings"
+            )
         values = list(data.values())
         if check_ndim:
             ndim = _validate_ndim(values, ndim)
@@ -80,5 +85,7 @@ def to_vectors(data: Union[dict, list, np.ndarray],
         vectors = _normalize_vectors(data, ndim)
         arrays = [vectors]
     else:
-        raise NotImplementedError(f"data must be dict, list, or ndarray, got {type(data)} instead")
+        raise NotImplementedError(
+            f"data must be dict, list, or ndarray, got {type(data)} instead"
+        )
     return pa.Table.from_arrays(arrays, names=names)

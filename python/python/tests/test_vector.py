@@ -1,10 +1,3 @@
-
-import numpy as np
-import pyarrow as pa
-import pytest
-
-from lance.vector import to_vectors
-
 #  Copyright 2023 Lance Developers
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +10,11 @@ from lance.vector import to_vectors
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
+import numpy as np
+import pyarrow as pa
+import pytest
+from lance.vector import to_vectors
 
 
 def test_dict():
@@ -74,8 +72,13 @@ def assert_array_eq(left: pa.Array, right: pa.Array):
     if isinstance(right, pa.ChunkedArray):
         right = right.combine_chunks()
     if pa.types.is_float32(left.type):
-        assert np.all(np.abs(left.to_numpy(zero_copy_only=False) -
-                             right.to_numpy(zero_copy_only=False)) < 1e-6)
+        assert np.all(
+            np.abs(
+                left.to_numpy(zero_copy_only=False)
+                - right.to_numpy(zero_copy_only=False)
+            )
+            < 1e-6
+        )
     if pa.types.is_fixed_size_list(left.type):
         assert_array_eq(left.values, right.values)
     else:
@@ -97,5 +100,5 @@ def _create_bad_dims():
 
 def _to_vec(lst):
     return pa.FixedSizeListArray.from_arrays(
-        pa.array(np.array(lst).ravel(), type=pa.float32()),
-        list_size=8)
+        pa.array(np.array(lst).ravel(), type=pa.float32()), list_size=8
+    )

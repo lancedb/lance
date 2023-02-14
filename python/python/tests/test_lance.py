@@ -12,11 +12,11 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
-import lance
 
 
 def test_table_roundtrip(tmp_path):
