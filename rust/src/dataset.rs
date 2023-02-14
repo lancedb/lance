@@ -400,6 +400,61 @@ impl Dataset {
         })
     }
 
+    pub async fn take(&self, row_indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
+        let mut sorted_indices: Vec<u32> =
+            Vec::from_iter(row_indices.iter().map(|indice| *indice as u32));
+        sorted_indices.sort();
+
+        let mut row_count = 0;
+        let mut start = 0;
+        let schema = Arc::new(ArrowSchema::from(projection));
+        let object_store = &self.object_store;
+        let mut batches = Vec::with_capacity(sorted_indices.len());
+        for fragment in self.fragments().iter() {
+            if start >= sorted_indices.len() {
+                break;
+            }
+
+            let path = self.data_dir().child(fragment.files[0].path.as_str());
+            let mut reader = FileReader::try_new_with_fragment(
+                object_store,
+                &path,
+                fragment.id,
+                Some(self.manifest.as_ref()),
+            )
+            .await?;
+
+            let max_row_indices = row_count + reader.len() as u32;
+            if sorted_indices[start] < max_row_indices {
+                let mut end = start;
+                sorted_indices[end] -= row_count;
+                while end + 1 < sorted_indices.len() && sorted_indices[end + 1] < max_row_indices {
+                    end += 1;
+                    sorted_indices[end] -= row_count;
+                }
+                reader.set_projection(projection.clone());
+                batches.push(reader.take(&sorted_indices[start..end + 1]).await?);
+
+                // restore the row indices
+                for indice in sorted_indices[start..end + 1].iter_mut() {
+                    *indice += row_count;
+                }
+
+                start = end + 1;
+            }
+            row_count = max_row_indices;
+        }
+
+        let one_batch = concat_batches(&schema, &batches)?;
+        let remapping_index: UInt64Array = row_indices
+            .iter()
+            .map(|o| sorted_indices.binary_search(&(*o as u32)).unwrap() as u64)
+            .collect();
+        let struct_arr: StructArray = one_batch.into();
+        let reordered = take(&struct_arr, &remapping_index, None)?;
+        Ok(as_struct_array(&reordered).into())
+    }
+
     /// Take rows by the internal ROW ids.
     pub(crate) async fn take_rows(
         &self,
@@ -789,6 +844,70 @@ mod tests {
         let first_ver = Dataset::checkout(test_uri, 1).await.unwrap();
         assert_eq!(first_ver.version().version, 1);
         assert_eq!(&ArrowSchema::from(first_ver.schema()), schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_take() {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batches = RecordBatchBuffer::new(
+            (0..20)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 400);
+        let projection = Schema::try_from(schema.as_ref()).unwrap();
+        let values = dataset
+            .take(
+                &[
+                    200, // 200
+                    199, // 199
+                    39,  // 39
+                    40,  // 40
+                    100, // 100
+                ],
+                &projection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([200, 199, 39, 40, 100])),
+                    Arc::new(StringArray::from_iter_values(
+                        [200, 199, 39, 40, 100].iter().map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
     }
 
     #[tokio::test]

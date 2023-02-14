@@ -170,9 +170,8 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         table : Table
         """
-        # TODO expose take from Rust
         # kwargs['take'] = indices
-        return self.scanner(**kwargs).to_table().take(indices)
+        return pa.Table.from_batches([self._ds.take(indices)])
 
     def head(self, num_rows, **kwargs):
         """
