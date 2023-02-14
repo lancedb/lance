@@ -14,7 +14,7 @@
 
 from typing import Optional
 
-from .dataset import LanceDataset, write_dataset
+from .dataset import LanceDataset, write_dataset, __version__
 
 
 def dataset(uri: str, version: Optional[int] = None) -> LanceDataset:
