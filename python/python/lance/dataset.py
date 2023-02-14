@@ -251,10 +251,14 @@ class LanceDataset(pa.dataset.Dataset):
             Parameters passed to the index building process.
 
 
-        Accepted keyword parameters:
+        If `index_type` is "IVF_PQ", then the following parameters are required:
 
         - **num_partitions**: the number of partitions of IVF (Inverted File Index).
         - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+
+        For SIMD, the vector dimensions / num_sub_vectors must be a multiple of the stride
+        depending on the platform (4, 8, 16). An error is raised if this alignment
+        is not met.
 
         Examples
         --------
@@ -282,6 +286,34 @@ class LanceDataset(pa.dataset.Dataset):
         # the internal implementation might support building multi-column index later.
         if isinstance(column, str):
             column = [column]
+
+        # validate args
+        for c in column:
+            if c not in self.schema.names:
+                raise KeyError(f"{c} not found in schema")
+            field = self.schema.field(c)
+            if not pa.types.is_fixed_size_list(field.type):
+                raise TypeError(
+                    f"Vector column {c} must be FixedSizeListArray, got {field.type}"
+                )
+            if not pa.types.is_float32(field.type.value_type):
+                raise TypeError(
+                    f"Vector column {c} must have float32 value type, got {field.type.value_type}"
+                )
+            if field.type.list_size % 8 != 0:
+                if not kwargs.get("force_build", False):
+                    raise TypeError("Vector ndim must be divisible by 8 for SIMD. "
+                                    "Set `force_build=True` to continue build anyways.")
+        index_type = index_type.upper()
+        if index_type != "IVF_PQ":
+            raise NotImplementedError(
+                f"Only IVF_PQ index_type supported. Got {index_type}"
+            )
+        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+            raise ValueError(
+                "num_partitions and num_sub_vectors are required for IVF_PQ"
+            )
+
         self._ds.create_index(column, index_type, name, kwargs)
 
 

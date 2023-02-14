@@ -11,12 +11,14 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import os
 
 import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
+import pytest
 
 
 def test_table_roundtrip(tmp_path):
@@ -106,3 +108,41 @@ def test_count_rows(tmp_path):
     tbl = pa.Table.from_pandas(df)
     dataset = lance.write_dataset(tbl, tmp_path)
     assert dataset.count_rows() == 100
+
+
+def test_create_index(tmp_path):
+    dataset = _create_dataset(str(tmp_path / "test.lance"))
+
+    # Check required args
+    with pytest.raises(ValueError):
+        dataset.create_index("emb", "IVF_PQ")
+    with pytest.raises(ValueError):
+        dataset.create_index("emb", "IVF_PQ", num_partitions=5)
+    with pytest.raises(ValueError):
+        dataset.create_index("emb", "IVF_PQ", num_sub_vectors=4)
+    with pytest.raises(KeyError):
+        dataset.create_index("foo", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
+    with pytest.raises(NotImplementedError):
+        dataset.create_index("emb", "foo", num_partitions=5, num_sub_vectors=16)
+
+    # all good
+    dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
+
+
+@pytest.mark.skipif((os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+                    reason="no neon on GHA")
+def test_simd_alignment(tmp_path):
+    dataset = _create_dataset(str(tmp_path / "test.lance"))
+    # SIMD alignment is enforced
+    with pytest.raises(OSError):
+        dataset.create_index("emb", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
+
+
+def _create_dataset(uri):
+    schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
+    npvals = np.random.rand(1000, 32)
+    npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
+    values = pa.array(npvals.ravel(), type=pa.float32())
+    arr = pa.FixedSizeListArray.from_arrays(values, 32)
+    tbl = pa.Table.from_arrays([arr], schema=schema)
+    return lance.write_dataset(tbl, uri)

@@ -21,7 +21,7 @@ use arrow_schema::{ArrowError, SchemaRef};
 use futures::stream::StreamExt;
 use tokio::runtime::Runtime;
 
-use ::lance::dataset::scanner::{Scanner as LanceScanner, RecordBatchStream};
+use ::lance::dataset::scanner::{RecordBatchStream, Scanner as LanceScanner};
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait

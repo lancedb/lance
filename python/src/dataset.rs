@@ -205,16 +205,17 @@ impl Dataset {
         if let Some(n) = kwargs.get_item("num_partitions") {
             params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
         };
+
         if let Some(n) = kwargs.get_item("num_sub_vectors") {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
-        }
+        };
 
         self_
             .rt
             .block_on(async {
                 self_
                     .ds
-                    .create_index(columns.as_slice(), idx_type, name, &params)
+                    .create_index(columns.as_slice(), idx_type, name, &params, true)
                     .await
             })
             .map_err(|e| PyIOError::new_err(e.to_string()))?;

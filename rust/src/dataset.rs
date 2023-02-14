@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -43,6 +43,7 @@ use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
 };
+use crate::utils::distance::simd_alignment;
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -310,12 +311,14 @@ impl Dataset {
     ///  - `name`: optional index name. Must be unique in the dataset.
     ///            if not provided, it will auto-generate one.
     ///  - `params`: index parameters.
+    ///  - `strict_simd_alignment`: whether to return error if it doesn't align to SIMD
     pub async fn create_index(
         &self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
+        strict_simd_alignment: bool,
     ) -> Result<Self> {
         if columns.len() != 1 {
             return Err(Error::Index(
@@ -348,6 +351,25 @@ impl Dataset {
                     .ok_or_else(|| {
                         Error::Index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
+
+                if let Some(field) = self.schema().field(column) {
+                    match field.data_type() {
+                        DataType::FixedSizeList(_, ndims) => {
+                            let sub = vec_params.num_sub_vectors as i32;
+                            let stride = simd_alignment();
+
+                            if (ndims / sub) % stride != 0 {
+                                let msg = format!("Vector dimensions / num_subvectors must be a multiple of {stride}. Got {ndims} / {sub} ");
+                                if strict_simd_alignment {
+                                    return Err(Error::Index(msg));
+                                } else {
+                                    println!("{}", msg);
+                                }
+                            }
+                        }
+                        _ => return Err(Error::Index(format!("Must be FixedSizeList"))),
+                    }
+                }
 
                 let builder = IvfPqIndexBuilder::try_new(
                     self,
@@ -898,8 +920,13 @@ mod tests {
 
         let params = VectorIndexParams::default();
         dataset
-            .create_index(&["embeddings"], IndexType::Vector, None, &params)
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
+
+        let err = dataset
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+            .await;
+        assert!(err.is_err())
     }
 }

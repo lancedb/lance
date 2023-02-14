@@ -93,6 +93,11 @@ def vec_to_table(
         values = list(data.values())
         if check_ndim:
             ndim = _validate_ndim(values, ndim)
+            if ndim % 8 != 0:
+                raise ValueError("Vector dimensions should be multiples of 8 "
+                                 "for SIMD performance. To continue creating "
+                                 f"vectors with {ndim}-dimensions, "
+                                 "set `check_ndim=False")
         vectors = _normalize_vectors(values, ndim)
         ids = pa.array(data.keys())
         arrays = [ids, vectors]
@@ -105,6 +110,11 @@ def vec_to_table(
             raise ValueError(f"names cannot be more than 1 got {len(names)}")
         if check_ndim:
             ndim = _validate_ndim(data, ndim)
+            if ndim % 8 != 0:
+                raise ValueError("Vector dimensions should be multiples of 8 "
+                                 "for SIMD performance. To continue creating "
+                                 f"vectors with {ndim}-dimensions, "
+                                 "set `check_ndim=False")
         vectors = _normalize_vectors(data, ndim)
         arrays = [vectors]
     else:
