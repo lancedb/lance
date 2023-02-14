@@ -58,7 +58,7 @@ pub async fn train_kmeans(
     let num_rows = array.len() / dimension;
     if num_rows < k as usize {
         return Err(crate::Error::Index(format!(
-            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K instead"
+            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
         )));
     }
     // Ony sample 256 * num_clusters. See Faiss
