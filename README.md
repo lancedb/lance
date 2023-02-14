@@ -12,6 +12,7 @@
 
 ![CI](https://github.com/eto-ai/lance/actions/workflows/rust.yml/badge.svg)
 [![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
+![crates.io](https://img.shields.io/crates/v/lance.svg)
 ![Python versions](https://img.shields.io/pypi/pyversions/pylance)
 
 </p>
