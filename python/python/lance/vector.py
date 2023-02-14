@@ -36,7 +36,7 @@ def _validate_ndim(values, ndim):
     return ndim
 
 
-def vectors_to_table(
+def vec_to_table(
     data: Union[dict, list, np.ndarray],
     names: Optional[Union[str, list]] = None,
     ndim: Optional[int] = None,
@@ -45,6 +45,24 @@ def vectors_to_table(
     """
     Create a pyarrow Table containing vectors.
     Vectors are created as FixedSizeListArray's in pyarrow with Float32 values.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from lance.vector import vec_to_table
+    >>> dd = {"vector0": np.random.randn(10), "vector1": np.random.randn(10)}
+    >>> vec_to_table(dd)
+    pyarrow.Table
+    id: string
+    vector: fixed_size_list<item: float>[10]
+      child 0, item: float
+    ----
+    id: [["vector0","vector1"]]
+    vector: [[[-0.33557555,0.6820256,0.032771114,-2.0489552,1.7767109,-1.5897397,1.1590068,1.0758952,1.2181247,0.370031],[0.21812864,-0.25569424,-0.73859257,1.0457108,0.30512726,0.8789905,0.81300026,0.27856362,0.91289395,0.7440796]]]
+    >>> vec_to_table(dd).to_pandas()
+            id                                             vector
+    0  vector0  [-0.33557555, 0.6820256, 0.032771114, -2.04895...
+    1  vector1  [0.21812864, -0.25569424, -0.73859257, 1.04571...
 
     Parameters
     ----------
@@ -59,6 +77,11 @@ def vectors_to_table(
         Number of dimensions of the vectors. Inferred if omitted.
     check_ndim: bool, default True
         Whether to verify that all vectors have the same length
+
+    Returns
+    -------
+    tbl: pa.Table
+        A pyarrow Table with vectors converted to appropriate types
     """
     if isinstance(data, dict):
         if names is None:
