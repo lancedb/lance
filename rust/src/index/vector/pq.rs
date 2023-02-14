@@ -105,7 +105,7 @@ impl<'a> PQIndex<'a> {
         let scores = Arc::new(Float32Array::from_iter(
             self.code
                 .values()
-                .chunks_exact(self.num_sub_vectors as usize)
+                .chunks_exact(self.num_sub_vectors)
                 .map(|c| {
                     c.iter()
                         .enumerate()
@@ -180,20 +180,20 @@ impl ProductQuantizer {
 
     /// Calculate codebook length.
     pub fn codebook_length(num_bits: u32, num_sub_vectors: usize) -> usize {
-        ProductQuantizer::num_centroids(num_bits) * num_sub_vectors
+        Self::num_centroids(num_bits) * num_sub_vectors
     }
 
     /// Get the centroids for one sub-vector.
     pub fn centroids(&self, sub_vector_idx: usize) -> Arc<FixedSizeListArray> {
-        assert!(sub_vector_idx < self.num_sub_vectors as usize);
+        assert!(sub_vector_idx < self.num_sub_vectors);
         assert!(self.codebook.is_some());
 
-        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
+        let num_centroids = Self::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
         let codebook = self.codebook.as_ref().unwrap();
         let arr = codebook.slice(
-            sub_vector_idx * num_centroids * sub_vector_width as usize,
-            num_centroids * sub_vector_width as usize,
+            sub_vector_idx * num_centroids * sub_vector_width,
+            num_centroids * sub_vector_width,
         );
         let f32_arr: &Float32Array = as_primitive_array(&arr);
         Arc::new(FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap())
@@ -204,9 +204,9 @@ impl ProductQuantizer {
         &self,
         sub_vectors: &[Arc<FixedSizeListArray>],
     ) -> Result<FixedSizeListArray> {
-        assert_eq!(sub_vectors.len(), self.num_sub_vectors as usize);
+        assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
-        let vectors = sub_vectors.iter().map(|v| v.clone()).collect::<Vec<_>>();
+        let vectors = sub_vectors.to_vec();
         let all_centroids = (0..sub_vectors.len())
             .map(|idx| self.centroids(idx))
             .collect::<Vec<_>>();

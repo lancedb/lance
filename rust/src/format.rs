@@ -17,9 +17,15 @@ pub use metadata::Metadata;
 pub use page_table::{PageInfo, PageTable};
 
 /// Protobuf definitions
-#[allow(clippy::all)]
 pub mod pb {
     #![allow(clippy::all)]
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(unused)]
+    #![allow(improper_ctypes)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(clippy::use_self)]
     include!(concat!(env!("OUT_DIR"), "/lance.format.pb.rs"));
 }
 
@@ -42,7 +48,7 @@ impl TryFrom<&pb::Uuid> for Uuid {
         }
         let mut buf: [u8; 16] = [0; 16];
         buf.copy_from_slice(p.uuid.to_byte_slice());
-        Ok(Uuid::from_bytes(buf))
+        Ok(Self::from_bytes(buf))
     }
 }
 
