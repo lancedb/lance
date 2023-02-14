@@ -16,9 +16,10 @@
 from datetime import datetime
 from pathlib import Path
 
-import lance
 import pandas as pd
 import pyarrow as pa
+
+import lance
 
 
 def test_dataset_overwrite(tmp_path: Path):

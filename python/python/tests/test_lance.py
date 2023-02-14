@@ -11,13 +11,13 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import pytest
-
-import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
+import pytest
+
+import lance
 
 
 def test_table_roundtrip(tmp_path):
@@ -131,7 +131,7 @@ def test_create_index(tmp_path):
 def _create_dataset(uri):
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
     npvals = np.random.rand(1000, 32)
-    npvals /= np.sqrt((npvals ** 2).sum(axis=1))[:, None]
+    npvals /= np.sqrt((npvals**2).sum(axis=1))[:, None]
     values = pa.array(npvals.ravel(), type=pa.float32())
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
