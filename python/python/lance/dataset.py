@@ -14,9 +14,10 @@
 #
 
 from __future__ import annotations
+
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union, Iterator
+from typing import Iterator, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .lance import _Dataset, _Scanner, _write_dataset, __version__
+from .lance import __version__, _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
