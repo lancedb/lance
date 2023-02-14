@@ -65,16 +65,48 @@ duckdb.query("SELECT * FROM dataset LIMIT 10").to_df()
 
 **Vector search**
 
-Download an indexed [sift dataset](https://eto-public.s3.us-west-2.amazonaws.com/datasets/sift/sift_ivf256_pq16.tar.gz),
-and unzip it into `vec_data.lance`
+Download the sift1m subset
+
+```shell
+wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+tar -xzf sift.tar.gz
+```
+
+Convert it to Lance
+
+```python
+import lance
+from lance.vector import vec_to_table
+import numpy as np
+import struct
+
+nvecs = 1000000
+ndims = 128
+with open("sift/sift_base.fvecs", mode="rb") as fobj:
+    buf = fobj.read()
+    data = np.array(struct.unpack("<128000000f", buf[4 : 4 + 4 * nvecs * ndims])).reshape((nvecs, ndims))
+    dd = dict(zip(range(nvecs), data))
+
+table = vec_to_table(dd)
+uri = "vec_data.lance"
+sift1m = lance.write_dataset(table, uri, max_rows_per_group=8192, max_rows_per_file=1024*1024)
+```
+
+Build the index
+
+```python
+sift1m.create_index("vector",
+                    index_type="IVF_PQ", 
+                    num_partitions=256,  # IVF
+                    num_sub_vectors=16)  # PQ
+```
+
+Search the dataset
 
 ```python
 # Get top 10 similar vectors
-import lance
 import duckdb
-import numpy as np
 
-uri = "vec_data.lance"
 dataset = lance.dataset(uri)
 
 # Sample 100 query vectors. If this segfaults, make sure you have duckdb v0.7+ installed
@@ -82,16 +114,11 @@ sample = duckdb.query("SELECT vector FROM dataset USING SAMPLE 100").to_df()
 query_vectors = np.array([np.array(x) for x in sample.vector])
 
 # Get nearest neighbors for all of them
-rs = [dataset.to_table(nearest={"column": "vector", 
-                                "k": 10, 
-                                "q": query_vectors[i, :]}) 
-      for i in range(query_vectors.shape[0])]
+rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})      
+      for q in query_vectors]
 ```
 
-For the fast indexing capability, you can 
-and run the same code as above. We're working on a more convenient indexing tool via python.
-
-*More distance metrics, supported types, and compute integration coming
+*More distance metrics, HNSW, and distributed support is on the roadmap
 
 
 ## Python package details
