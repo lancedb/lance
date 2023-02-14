@@ -19,9 +19,11 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use futures::TryFutureExt;
+use lance::datatypes::Schema;
 use lance::index::vector::VectorIndexParams;
 use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
@@ -160,6 +162,15 @@ impl Dataset {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))?)
         })
+    }
+
+    fn take(self_: PyRef<'_, Self>, row_indices: Vec<usize>) -> PyResult<PyObject> {
+        let projection = self_.ds.schema();
+        let batch = self_
+            .rt
+            .block_on(async { self_.ds.take(&row_indices, &projection).await })
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        batch.to_pyarrow(self_.py())
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
