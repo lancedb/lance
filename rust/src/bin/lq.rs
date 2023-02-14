@@ -165,7 +165,7 @@ async fn create_index(
             lance::index::IndexType::Vector,
             name.clone(),
             &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors),
-            false
+            false,
         )
         .await
         .expect("dataset create index");
