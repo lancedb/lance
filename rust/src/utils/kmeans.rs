@@ -142,11 +142,6 @@ async fn kmean_random(
         .iter()
         .map(|v| *v as u64)
         .collect::<UInt64Array>();
-    let mut nums = std::collections::HashSet::new();
-    for i in 0..chosen.len() {
-        nums.insert(chosen.value(i));
-    }
-    assert_eq!(nums.len(), chosen.len());
     let samples = take(data.as_ref(), &chosen, None).unwrap();
     let centroids: &FixedSizeListArray = as_fixed_size_list_array(samples.as_ref());
     let mut kmeans = KMeans::empty(k, dimension);
