@@ -300,6 +300,10 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"Vector column {c} must have float32 value type, got {field.type.value_type}"
                 )
+            if field.type.list_size % 8 != 0:
+                if not kwargs.get("force_build", False):
+                    raise TypeError("Vector ndim must be divisible by 8 for SIMD. "
+                                    "Set `force_build=True` to continue build anyways.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
             raise NotImplementedError(
