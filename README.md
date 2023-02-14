@@ -71,8 +71,8 @@ df
 ```python
 import duckdb
 
-tbl = dataset.to_table()  # next release of duckdb will have pushdowns enabled
-duckdb.query("SELECT * FROM tbl LIMIT 10").to_df()
+# If this segfaults, make sure you have duckdb v0.7+ installed
+duckdb.query("SELECT * FROM dataset LIMIT 10").to_df()
 ```
 
 **Vector search**
@@ -94,9 +94,8 @@ import numpy as np
 uri = "vec_data.lance"
 dataset = lance.dataset(uri)
 
-# Sample 100 query vectors
-tbl = dataset.to_table()
-sample = duckdb.query("SELECT vector FROM tbl USING SAMPLE 100").to_df()
+# Sample 100 query vectors. If this segfaults, make sure you have duckdb v0.7+ installed
+sample = duckdb.query("SELECT vector FROM dataset USING SAMPLE 100").to_df()
 query_vectors = np.array([np.array(x) for x in sample.vector])
 
 # Get nearest neighbors for all of them
