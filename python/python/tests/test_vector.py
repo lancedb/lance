@@ -14,7 +14,6 @@
 import numpy as np
 import pyarrow as pa
 import pytest
-
 from lance.vector import vec_to_table
 
 

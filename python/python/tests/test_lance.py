@@ -11,13 +11,12 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 import pytest
-
-import lance
 
 
 def test_table_roundtrip(tmp_path):
@@ -119,6 +118,10 @@ def test_create_index(tmp_path):
         dataset.create_index("emb", "IVF_PQ", num_partitions=5)
     with pytest.raises(ValueError):
         dataset.create_index("emb", "IVF_PQ", num_sub_vectors=4)
+    with pytest.raises(KeyError):
+        dataset.create_index("foo", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
+    with pytest.raises(NotImplementedError):
+        dataset.create_index("emb", "foo", num_partitions=5, num_sub_vectors=16)
 
     # SIMD alignment is enforced
     with pytest.raises(OSError):

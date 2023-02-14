@@ -286,6 +286,30 @@ class LanceDataset(pa.dataset.Dataset):
         # the internal implementation might support building multi-column index later.
         if isinstance(column, str):
             column = [column]
+
+        # validate args
+        for c in column:
+            if c not in self.schema.names:
+                raise KeyError(f"{c} not found in schema")
+            field = self.schema.field(c)
+            if not pa.types.is_fixed_size_list(field.type):
+                raise TypeError(
+                    f"Vector column {c} must be FixedSizeListArray, got {field.type}"
+                )
+            if not pa.types.is_float32(field.type.value_type):
+                raise TypeError(
+                    f"Vector column {c} must have float32 value type, got {field.type.value_type}"
+                )
+        index_type = index_type.upper()
+        if index_type != "IVF_PQ":
+            raise NotImplementedError(
+                f"Only IVF_PQ index_type supported. Got {index_type}"
+            )
+        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+            raise ValueError(
+                "num_partitions and num_sub_vectors are required for IVF_PQ"
+            )
+
         self._ds.create_index(column, index_type, name, kwargs)
 
 
