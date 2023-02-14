@@ -188,7 +188,7 @@ impl KMeanMembership {
                     if total > 0.0 {
                         divide_scalar(&sum, total).unwrap()
                     } else {
-                        eprintln!("Warning: KMean: cluster {cluster} has no value, k={}");
+                        eprintln!("Warning: KMean: cluster {cluster} has no value");
                         sum
                     }
                 })
@@ -258,8 +258,7 @@ impl KMeans {
 
     /// Train a KMean on data with `k` clusters.
     pub async fn new(data: Arc<FixedSizeListArray>, k: u32, max_iters: u32) -> Self {
-        let mut params = KMeansParams::default();
-        params.max_iters = max_iters;
+        let params = KMeansParams { max_iters, ..Default::default() };
         Self::new_with_params(data, k, &params).await
     }
 
@@ -268,7 +267,7 @@ impl KMeans {
         k: u32,
         params: &KMeansParams,
     ) -> Self {
-        let mut best_kmeans = KMeans::empty(k, data.value_length());
+        let mut best_kmeans = Self::empty(k, data.value_length());
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
