@@ -150,6 +150,9 @@ async fn kmean_random(
 }
 
 struct KMeanMembership {
+    /// Previous centroids
+    centroids: Arc<FixedSizeListArray>,
+
     /// Reference to the input vectors.
     data: Arc<FixedSizeListArray>,
 
@@ -159,33 +162,51 @@ struct KMeanMembership {
     /// Distance between each vector, to its corresponding centroids.
     distances: Vec<f32>,
 
+    /// Number of centroids.
     k: u32,
 }
 
 impl KMeanMembership {
+    /// Reconstruct a KMeans model from the membership.
     async fn to_kmean(&self) -> Result<KMeans> {
         let dimension = self.data.value_length();
         let cluster_ids = Arc::new(self.cluster_ids.clone());
         let data = self.data.clone();
+        let previous_centroids = self.centroids.clone();
         // New centroids for each cluster
         let means = stream::iter(0..self.k)
-            .zip(repeat_with(|| (data.clone(), cluster_ids.clone())))
-            .map(|(cluster, (data, cluster_ids))| async move {
-                tokio::task::spawn_blocking(move || {
-                    let mut sum = Float32Array::from_iter_values(
-                        (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
-                    );
-                    let mut total = 0.0;
-                    for i in 0..cluster_ids.len() {
-                        if cluster_ids[i] == cluster {
-                            sum = add(&sum, as_primitive_array(data.value(i).as_ref())).unwrap();
-                            total += 1.0;
-                        };
-                    }
-                    divide_scalar(&sum, total).unwrap()
-                })
-                .await
-            })
+            .zip(repeat_with(|| {
+                (
+                    data.clone(),
+                    cluster_ids.clone(),
+                    previous_centroids.clone(),
+                )
+            }))
+            .map(
+                |(cluster, (data, cluster_ids, previous_centroids))| async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut sum = Float32Array::from_iter_values(
+                            (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
+                        );
+                        let mut total = 0.0;
+                        for i in 0..cluster_ids.len() {
+                            if cluster_ids[i] == cluster {
+                                sum =
+                                    add(&sum, as_primitive_array(data.value(i).as_ref())).unwrap();
+                                total += 1.0;
+                            };
+                        }
+                        if total > 0.0 {
+                            divide_scalar(&sum, total).unwrap()
+                        } else {
+                            eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
+                            let prev_centroids = previous_centroids.value(cluster as usize);
+                            as_primitive_array(prev_centroids.as_ref()).clone()
+                        }
+                    })
+                    .await
+                },
+            )
             .buffered(16)
             .try_collect::<Vec<_>>()
             .await?;
@@ -250,8 +271,10 @@ impl KMeans {
 
     /// Train a KMean on data with `k` clusters.
     pub async fn new(data: Arc<FixedSizeListArray>, k: u32, max_iters: u32) -> Self {
-        let mut params = KMeansParams::default();
-        params.max_iters = max_iters;
+        let params = KMeansParams {
+            max_iters,
+            ..Default::default()
+        };
         Self::new_with_params(data, k, &params).await
     }
 
@@ -260,7 +283,7 @@ impl KMeans {
         k: u32,
         params: &KMeansParams,
     ) -> Self {
-        let mut best_kmeans = KMeans::empty(k, data.value_length());
+        let mut best_kmeans = Self::empty(k, data.value_length());
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
@@ -323,6 +346,7 @@ impl KMeans {
             .unwrap();
         let k = self.k;
         KMeanMembership {
+            centroids: self.centroids.clone(),
             data,
             cluster_ids: cluster_with_distances
                 .iter()

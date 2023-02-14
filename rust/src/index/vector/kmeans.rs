@@ -37,15 +37,17 @@ async fn train_kmeans_fallback(
     max_iters: u32,
 ) -> Result<Float32Array> {
     let data = Arc::new(FixedSizeListArray::try_new(array, dimension as i32)?);
-    let mut params = KMeansParams::default();
-    params.max_iters = max_iters;
+    let params = KMeansParams {
+        max_iters,
+        ..Default::default()
+    };
     let model = KMeans::new_with_params(data, k, &params).await;
     let centroids = model.centroids.values();
     let floats: &Float32Array = as_primitive_array(centroids.as_ref());
     Ok(floats.clone())
 }
 
-/// Train kmeans model and returns the centroids of each cluster.
+/// Train KMeans model and returns the centroids of each cluster.
 pub async fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
@@ -54,6 +56,11 @@ pub async fn train_kmeans(
     mut rng: impl Rng,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
+    if num_rows < k as usize {
+        return Err(crate::Error::Index(format!(
+            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
+        )));
+    }
     // Ony sample 256 * num_clusters. See Faiss
     let data = if num_rows > 256 * k as usize {
         println!(
