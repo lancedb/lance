@@ -238,7 +238,7 @@ impl ProductQuantizer {
         for i in 0..pq_code.len() {
             let vec = pq_code[i].as_slice();
             for j in 0..vec.len() {
-                pq_codebook_builder[j * self.num_sub_vectors as usize + i] = vec[j];
+                pq_codebook_builder[j * self.num_sub_vectors + i] = vec[j];
             }
         }
 
