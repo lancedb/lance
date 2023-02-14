@@ -26,6 +26,18 @@ use arrow_schema::DataType;
 
 use crate::Result;
 
+#[inline]
+pub(crate) fn simd_alignment() -> i32 {
+    #[cfg(any(target_arch = "x86_64"))]
+    {
+        8
+    }
+    #[cfg(any(target_arch = "aarch64"))]
+    {
+        4
+    }
+}
+
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
 //
 // `from` and `to` must have the same length.

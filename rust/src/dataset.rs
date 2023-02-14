@@ -43,6 +43,7 @@ use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
 };
+use crate::utils::distance::simd_alignment;
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -355,7 +356,7 @@ impl Dataset {
                     match field.data_type() {
                         DataType::FixedSizeList(_, ndims) => {
                             let sub = vec_params.num_sub_vectors as i32;
-                            let stride = simd_stride();
+                            let stride = simd_alignment();
 
                             if (ndims / sub) % stride != 0 {
                                 let msg = format!("Vector dimensions / num_subvectors must be a multiple of {stride}. Got {ndims} / {sub} ");
@@ -526,18 +527,6 @@ impl Dataset {
         } else {
             Ok(vec![])
         }
-    }
-}
-
-#[inline]
-fn simd_stride() -> i32 {
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        8
-    }
-    #[cfg(any(target_arch = "aarch64"))]
-    {
-        4
     }
 }
 
