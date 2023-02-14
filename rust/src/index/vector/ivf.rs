@@ -586,7 +586,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         // Write each partition to disk.
         let part_col = pq_code_batch
             .column_by_name(PARTITION_ID_COLUMN)
-            .expect(format!("{} does not exist", PARTITION_ID_COLUMN).as_str());
+            .expect(format!("{PARTITION_ID_COLUMN} does not exist").as_str());
         let partition_ids: &UInt32Array = as_primitive_array(part_col);
         let min_id = min(partition_ids).unwrap_or(0);
         let max_id = max(partition_ids).unwrap_or(1024 * 1024);
@@ -640,7 +640,7 @@ async fn train_kmean_model(
         .await?;
     let mut arr_list = vec![];
     for batch in batches {
-        let arr = batch.column_by_name(&column_name).unwrap();
+        let arr = batch.column_by_name(column_name).unwrap();
         let list_arr = as_fixed_size_list_array(&arr);
         arr_list.push(list_arr.values().clone());
     }

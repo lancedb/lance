@@ -236,7 +236,7 @@ impl<'a> FileWriter<'a> {
         assert!(!offsets.is_empty());
         let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
         self.write_fixed_stride_array(field, &offsets).await?;
-        self.write_array(&field.children[0], &list_arr.values())
+        self.write_array(&field.children[0], list_arr.values())
             .await
     }
 
@@ -246,7 +246,7 @@ impl<'a> FileWriter<'a> {
         assert!(!offsets.is_empty());
         let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
         self.write_fixed_stride_array(field, &offsets).await?;
-        self.write_array(&field.children[0], &list_arr.values())
+        self.write_array(&field.children[0], list_arr.values())
             .await
     }
 

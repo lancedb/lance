@@ -87,8 +87,7 @@ impl PageTable {
         let num_batches = self
             .pages
             .values()
-            .map(|c_map| c_map.keys().max())
-            .flatten()
+            .flat_map(|c_map| c_map.keys().max())
             .max()
             .unwrap()
             + 1;
