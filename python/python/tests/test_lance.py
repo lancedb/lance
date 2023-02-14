@@ -11,6 +11,8 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+import os
+
 import lance
 import numpy as np
 import pandas as pd
@@ -123,12 +125,17 @@ def test_create_index(tmp_path):
     with pytest.raises(NotImplementedError):
         dataset.create_index("emb", "foo", num_partitions=5, num_sub_vectors=16)
 
+    # all good
+    dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
+
+
+@pytest.mark.skipif((os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+                    reason="no neon on GHA")
+def test_simd_alignment(tmp_path):
+    dataset = _create_dataset(str(tmp_path / "test.lance"))
     # SIMD alignment is enforced
     with pytest.raises(OSError):
         dataset.create_index("emb", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
-
-    # all good
-    dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
 
 
 def _create_dataset(uri):
