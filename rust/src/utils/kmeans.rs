@@ -159,15 +159,18 @@ struct KMeanMembership {
     /// Distance between each vector, to its corresponding centroids.
     distances: Vec<f32>,
 
+    /// Number of centroids.
     k: u32,
 }
 
 impl KMeanMembership {
+    /// Reconstruct a KMeans model from the membership.
     async fn to_kmean(&self) -> Result<KMeans> {
         let dimension = self.data.value_length();
         let cluster_ids = Arc::new(self.cluster_ids.clone());
         let data = self.data.clone();
         // New centroids for each cluster
+        let k = self.k;
         let means = stream::iter(0..self.k)
             .zip(repeat_with(|| (data.clone(), cluster_ids.clone())))
             .map(|(cluster, (data, cluster_ids))| async move {
@@ -182,7 +185,12 @@ impl KMeanMembership {
                             total += 1.0;
                         };
                     }
-                    divide_scalar(&sum, total).unwrap()
+                    if total > 0.0 {
+                        divide_scalar(&sum, total).unwrap()
+                    } else {
+                        eprintln!("Warning: KMean: cluster {cluster} has no value, k={}");
+                        sum
+                    }
                 })
                 .await
             })
