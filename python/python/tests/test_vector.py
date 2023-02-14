@@ -14,45 +14,45 @@
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.vector import to_vectors
+from lance.vector import vectors_to_table
 
 
 def test_dict():
     ids, vectors = _create_data()
     dd = dict(zip(ids, vectors))
-    tbl = to_vectors(dd)
+    tbl = vectors_to_table(dd)
     expected = [pa.array(ids), _to_vec(vectors)]
     assert_table(tbl, expected)
 
-    new_tbl = to_vectors(dd, names=["foo", "bar"])
+    new_tbl = vectors_to_table(dd, names=["foo", "bar"])
     assert new_tbl.column_names == ["foo", "bar"]
 
     with pytest.raises(ValueError):
         ids, vectors = _create_bad_dims()
         dd = dict(zip(ids, vectors))
-        to_vectors(dd)
+        vectors_to_table(dd)
 
 
 def test_list():
     _, vectors = _create_data()
-    tbl = to_vectors(vectors)
+    tbl = vectors_to_table(vectors)
     expected = [_to_vec(vectors)]
     assert_table(tbl, expected)
 
     with pytest.raises(ValueError):
         _, vectors = _create_bad_dims()
-        to_vectors(vectors)
+        vectors_to_table(vectors)
 
 
 def test_ndarray():
     _, vectors = _create_data()
-    tbl = to_vectors(np.array(vectors))
+    tbl = vectors_to_table(np.array(vectors))
     expected = [_to_vec(vectors)]
     assert_table(tbl, expected)
 
     with pytest.raises(ValueError):
         _, vectors = _create_bad_dims()
-        to_vectors(np.array(vectors))
+        vectors_to_table(np.array(vectors))
 
 
 def assert_table(tbl, expected_arrays, names=None):

@@ -36,7 +36,7 @@ def _validate_ndim(values, ndim):
     return ndim
 
 
-def to_vectors(
+def vectors_to_table(
     data: Union[dict, list, np.ndarray],
     names: Optional[Union[str, list]] = None,
     ndim: Optional[int] = None,
