@@ -30,12 +30,20 @@ use crate::Result;
 pub(crate) fn simd_alignment() -> i32 {
     #[cfg(any(target_arch = "x86_64"))]
     {
-        8
+        if is_x86_feature_detected!("fma") {
+            return 8;
+        }
     }
+
     #[cfg(any(target_arch = "aarch64"))]
     {
-        4
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") {
+            return 4;
+        }
     }
+
+    1
 }
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
