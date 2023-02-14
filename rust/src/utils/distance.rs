@@ -26,7 +26,6 @@ use arrow_schema::DataType;
 
 use crate::Result;
 
-
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
 //
 // `from` and `to` must have the same length.

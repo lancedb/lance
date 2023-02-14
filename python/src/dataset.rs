@@ -205,12 +205,12 @@ impl Dataset {
         if let Some(n) = kwargs.get_item("num_partitions") {
             params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
         } else {
-            return Err(PyValueError::new_err("num_partitions was not provided"))
+            return Err(PyValueError::new_err("num_partitions was not provided"));
         };
         if let Some(n) = kwargs.get_item("num_sub_vectors") {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         } else {
-            return Err(PyValueError::new_err("num_sub_vectors was not provided"))
+            return Err(PyValueError::new_err("num_sub_vectors was not provided"));
         }
 
         self_

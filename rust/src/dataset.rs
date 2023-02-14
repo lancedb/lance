@@ -317,7 +317,7 @@ impl Dataset {
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
-        strict_simd_alignment: bool
+        strict_simd_alignment: bool,
     ) -> Result<Self> {
         if columns.len() != 1 {
             return Err(Error::Index(
@@ -366,7 +366,7 @@ impl Dataset {
                                 }
                             }
                         }
-                        _ => return Err(Error::Index(format!("Must be FixedSizeList")))
+                        _ => return Err(Error::Index(format!("Must be FixedSizeList"))),
                     }
                 }
 
@@ -532,9 +532,13 @@ impl Dataset {
 #[inline]
 fn simd_stride() -> i32 {
     #[cfg(any(target_arch = "x86_64"))]
-    { 8 }
+    {
+        8
+    }
     #[cfg(any(target_arch = "aarch64"))]
-    { 4 }
+    {
+        4
+    }
 }
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
