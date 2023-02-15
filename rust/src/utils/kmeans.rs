@@ -87,9 +87,9 @@ async fn kmean_plusplus<D: Distance + 'static>(
     mut rng: impl Rng,
     dist_func: &D,
 ) -> KMeans<D> {
-    assert!(data.len() > k);
+    assert!(data.len() > k * dimension);
     let mut kmeans = KMeans::empty(k, dimension, dist_func.clone());
-    let first_idx = rng.gen_range(0..data.len());
+    let first_idx = rng.gen_range(0..data.len() / dimension);
     let first_vector = data.slice(first_idx * dimension, dimension);
     kmeans.centroids = Arc::new(as_primitive_array(first_vector.as_ref()).clone());
 
@@ -135,7 +135,7 @@ async fn kmeans_random_init<'a, D: Distance + 'static>(
 ) -> KMeans<D> {
     assert!(data.len() > k * dimension);
 
-    let chosen = (0..data.len()).choose_multiple(&mut rng, k).to_vec();
+    let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k).to_vec();
     let mut builder = Float32Builder::with_capacity(k * dimension);
     for i in chosen {
         builder.append_slice(&data.values()[i * dimension..(i + 1) * dimension]);

@@ -230,11 +230,7 @@ impl ProductQuantizer {
                             let vector: &Float32Array = as_primitive_array(value.as_ref());
                             let id = argmin(
                                 dist_func
-                                    .distance(
-                                        vector,
-                                        centroid.as_ref(),
-                                        vector.len(),
-                                    )
+                                    .distance(vector, centroid.as_ref(), vector.len())
                                     .unwrap()
                                     .as_ref(),
                             )
