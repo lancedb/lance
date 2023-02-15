@@ -51,7 +51,7 @@ use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
 };
-use crate::utils::distance::l2_distance;
+use crate::utils::distance::{Distance, L2Distance};
 use crate::{arrow::*, index::pb::vector_index_stage::Stage};
 use crate::{dataset::scanner::Scanner, index::pb};
 use crate::{
@@ -317,7 +317,13 @@ impl Ivf {
                 self.dimension()
             )));
         }
-        let distances = l2_distance(query, &self.centroids)? as ArrayRef;
+        let dist_func = L2Distance::new();
+        let centroid_values = self.centroids.values();
+        let distances = dist_func.distance(
+            query,
+            as_primitive_array(centroid_values.as_ref()),
+            self.dimension(),
+        )? as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
     }
@@ -342,15 +348,18 @@ impl Ivf {
                 let arr = batch.column_by_name(column_name).ok_or_else(|| {
                     Error::IO(format!("Dataset does not have column {column_name}"))
                 })?;
-                let vectors: &FixedSizeListArray = arr.as_any().downcast_ref().unwrap();
-                let vec = vectors.clone();
-                let centroids = self.centroids.clone();
+                let vectors = as_fixed_size_list_array(arr).clone();
+                // let vec = vectors.clone();
+                let values = self.centroids.values();
+                let centroids = as_primitive_array(values.as_ref()).clone();
                 let partition_ids = tokio::task::spawn_blocking(move || {
-                    (0..vec.len())
+                    let dist_func = L2Distance::new();
+                    (0..vectors.len())
                         .map(|idx| {
-                            let arr = vec.value(idx);
+                            let arr = vectors.value(idx);
                             let f: &Float32Array = as_primitive_array(&arr);
-                            Ok(argmin(l2_distance(f, &centroids)?.as_ref()).unwrap())
+                            Ok(argmin(dist_func.distance(f, &centroids, f.len())?.as_ref())
+                                .unwrap())
                         })
                         .collect::<Result<Vec<u32>>>()
                 })

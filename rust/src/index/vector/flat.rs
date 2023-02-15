@@ -23,7 +23,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
-use futures::stream::{Stream, StreamExt, TryStreamExt};
+use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex};
 use crate::arrow::*;
@@ -61,12 +61,13 @@ impl<'a> FlatIndex<'a> {
 pub async fn flat_search(
     stream: impl Stream<Item = Result<RecordBatch>>,
     query: &Query,
-    dist_func: impl Distance,
+    dist_func: impl Distance + 'static,
 ) -> Result<RecordBatch> {
     const SCORE_COLUMN: &str = "score";
 
     let batches = stream
-        .map(|batch| async move {
+        .zip(repeat_with(|| dist_func.clone()))
+        .map(|(batch, dist_func)| async move {
             let k = query.key.clone();
             let mut batch = batch?;
             if batch.column_by_name(SCORE_COLUMN).is_some() {
@@ -120,6 +121,6 @@ impl VectorIndex for FlatIndex<'_> {
             .with_row_id()
             .try_into_stream()
             .await?;
-        flat_search(stream, params).await
+        flat_search(stream, params, L2Distance::new()).await
     }
 }

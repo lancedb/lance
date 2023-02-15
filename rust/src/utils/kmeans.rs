@@ -24,7 +24,7 @@ use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use super::distance::{Distance};
+use super::distance::Distance;
 use crate::Result;
 use crate::{arrow::*, Error};
 
@@ -362,7 +362,9 @@ impl<D: Distance + 'static> KMeans<D> {
         let cluster_with_distances = stream::iter(0..n)
             // make tiles of input data to split between threads.
             .chunks(1024)
-            .zip(repeat_with(|| (data.clone(), self.centroids.clone(), dist_func.clone())))
+            .zip(repeat_with(|| {
+                (data.clone(), self.centroids.clone(), dist_func.clone())
+            }))
             .map(|(indices, (data, centroids, dist_func))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let mut results = vec![];
