@@ -275,8 +275,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
-        Float32Array, Int64Array, LargeListArray, ListArray, StringArray, UInt8Array, Decimal128Array
+        types::UInt32Type, BooleanArray, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
+        FixedSizeListArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
+        UInt8Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
@@ -290,7 +291,7 @@ mod tests {
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
             ArrowField::new("b", DataType::Utf8, true),
-            ArrowField::new("d", DataType::Decimal128(7,3), false),
+            ArrowField::new("d", DataType::Decimal128(7, 3), false),
             ArrowField::new(
                 "d",
                 DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
