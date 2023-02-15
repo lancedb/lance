@@ -17,7 +17,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
@@ -58,18 +57,13 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-
         Self {
             schema: schema.clone(),
             version: 1,
             fragments,
             version_aux_data: 0,
             index_section: None,
-            timestamp_nanos,
+            timestamp_nanos: 0,
             tag: None,
         }
     }

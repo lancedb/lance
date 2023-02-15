@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
@@ -262,6 +263,11 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = latest_manifest.map_or(1, |m| m.version + 1);
+        let duration_since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
+        manifest.timestamp_nanos = timestamp_nanos;
         write_manifest_file(&object_store, &mut manifest, None).await?;
 
         let base = object_store.base_path().clone();
