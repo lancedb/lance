@@ -233,6 +233,13 @@ class LanceDataset(pa.dataset.Dataset):
             )  # NOTE: python datetime supports only microsecond precision
         return versions
 
+    @property
+    def active_version(self) -> int:
+        """
+        Returns the currently checked out version of the dataset
+        """
+        return self._ds.active_version()
+
     def create_index(
         self, column: str, index_type: str, name: Optional[str] = None, **kwargs
     ):

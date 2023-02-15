@@ -194,6 +194,11 @@ impl Dataset {
         })
     }
 
+    /// Fetches the currently checked out version of the dataset.
+    fn active_version(&self) -> PyResult<u64> {
+        Ok(self.ds.version().version)
+    }
+
     fn create_index(
         self_: PyRef<'_, Self>,
         columns: Vec<&str>,
