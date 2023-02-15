@@ -66,17 +66,17 @@ message Manifest {
 
   // If presented, the file position of the index metadata.
   optional uint64 index_section = 6;
+
+  // Version creation Timestamp, UTC timezone
+  google.protobuf.Timestamp timestamp = 7;
+
+  // Optional version tag
+  string tag = 8;
 }
 
 // Auxiliary Data attached to a version.
 // Only load on-demand.
 message VersionAuxData {
-  // Version creation Timestamp, UTC timezone
-  google.protobuf.Timestamp timestamp = 1;
-
-  // Optional version tag
-  string tag = 2;
-
   // key-value metadata.
   map<string, bytes> metadata = 3;
 }

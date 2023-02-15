@@ -129,8 +129,10 @@ def test_create_index(tmp_path):
     dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
 
 
-@pytest.mark.skipif((os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
-                    reason="no neon on GHA")
+@pytest.mark.skipif(
+    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    reason="no neon on GHA",
+)
 def test_simd_alignment(tmp_path):
     dataset = _create_dataset(str(tmp_path / "test.lance"))
     # SIMD alignment is enforced
