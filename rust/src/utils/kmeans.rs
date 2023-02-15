@@ -87,7 +87,7 @@ async fn kmean_plusplus<D: Distance + 'static>(
     mut rng: impl Rng,
     dist_func: &D,
 ) -> KMeans<D> {
-    assert!(data.len() > k as usize);
+    assert!(data.len() > k);
     let mut kmeans = KMeans::empty(k, dimension, dist_func.clone());
     let first_idx = rng.gen_range(0..data.len());
     let first_vector = data.slice(first_idx * dimension, dimension);
@@ -135,12 +135,8 @@ async fn kmeans_random_init<'a, D: Distance + 'static>(
 ) -> KMeans<D> {
     assert!(data.len() > k * dimension);
 
-    let chosen = (0..data.len())
-        .choose_multiple(&mut rng, k as usize)
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
-    let mut builder = Float32Builder::with_capacity(k as usize * dimension);
+    let chosen = (0..data.len()).choose_multiple(&mut rng, k).to_vec();
+    let mut builder = Float32Builder::with_capacity(k * dimension);
     for i in chosen {
         builder.append_slice(&data.values()[i * dimension..(i + 1) * dimension]);
     }
@@ -206,7 +202,7 @@ impl<D: Distance> KMeanMembership<D> {
                             divide_scalar(&sum, total).unwrap()
                         } else {
                             eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
-                            let prev_centroids = previous_centroids.slice(cluster as usize * dimension, dimension);
+                            let prev_centroids = previous_centroids.slice(cluster * dimension, dimension);
                             as_primitive_array(prev_centroids.as_ref()).clone()
                         }
                     })
@@ -242,7 +238,7 @@ impl<D: Distance> KMeanMembership<D> {
 
     /// Histogram of the size of each cluster.
     fn histogram(&self) -> Vec<usize> {
-        let mut hist: Vec<usize> = vec![0; self.k as usize];
+        let mut hist: Vec<usize> = vec![0; self.k];
         for cluster_id in self.cluster_ids.iter() {
             hist[*cluster_id as usize] += 1;
         }

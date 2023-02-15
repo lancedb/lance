@@ -274,7 +274,7 @@ impl ProductQuantizer {
         let dimension = data.value_length() as usize / self.num_sub_vectors;
 
         let mut codebook_builder =
-            Float32Builder::with_capacity(num_centorids as usize * data.value_length() as usize);
+            Float32Builder::with_capacity(num_centorids * data.value_length() as usize);
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.
