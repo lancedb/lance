@@ -10,58 +10,62 @@
 **A new columnar data format for data science and machine learning**
 </p></div>
 
-## Quick start
+## Installation
 
-Warning: the pyo3 package is not yet on PyPI
+Install using cargo:
 
-From under the /pylance directory, run `maturin develop` to build and install the python package.
+```shell
+cargo install lance
+``` 
 
-**Converting to Lance**
-```python
-import lance
+## Examples
 
-import pyarrow as pa
-import pyarrow.dataset
+### Create dataset
 
-uri = "/path/to/parquet"
-parquet = pa.dataset.dataset(uri, format='parquet')
-lance.write_dataset(parquet, "/tmp/test.lance")
+Suppose `batches` is an Arrow RecordBatchBuffer:
+
+```rust
+use ::lance::dataset::write::WriteParams;
+use ::lance::dataset::Dataset;
+
+let mut write_params = WriteParams::default();
+let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+Dataset::write(&mut reader, test_uri, Some(write_params)).await?;
 ```
 
-**Reading Lance data**
-```python
-dataset = lance.dataset("/tmp/test.lance")
-assert isinstance(dataset, pa.dataset.Dataset)
+### Read
+
+```rust
+let dataset = Dataset::open(path).await.unwrap();
+let mut scanner = dataset.scan();
+let batches: Vec<RecordBatch> = scanner
+    .try_into_stream()
+    .await
+    .unwrap()
+    .map(|b| b.unwrap())
+    .collect::<Vec<RecordBatch>>()
+    .await;
 ```
 
-**Pandas**
-```python
-df = dataset.to_table().to_pandas()
+### Take
+
+```rust
+let values: Result<RecordBatch> = dataset.take(&[200, 199, 39, 40, 100], &projection).await;
 ```
 
-**DuckDB**
-```python
-import duckdb
+### Vector index
 
-tbl = dataset.to_table()  # next release of duckdb will have pushdowns enabled
-duckdb.query("SELECT * FROM tbl LIMIT 10").to_df()
+Assume "embeddings" is a FixedSizeListArray<f32>
+```rust
+use ::lance::index::vector::VectorIndexParams;
+
+let params = VectorIndexParams::default();
+params.num_partitions = 256;
+params.num_sub_vectors = 16;
+
+// this will Err if list_size(embeddings) / num_sub_vectors does not meet simd alignment
+dataset.create_index(&["embeddings"], IndexType::Vector, None, &params, true).await;
 ```
-
-**Vector search**
-
-```python
-# Get top 10 similar vectors
-import numpy as np
-q = np.random.randn(128)  # query vector
-query = {
-    "column": "emb",  # assume `emb` column is FixedSizeList of Float32
-    "q": q,
-    "k": 10
-}
-dataset.to_table(nearest=query).to_pandas()
-```
-
-*More distance metrics, supported types, and compute integration coming
 
 ## Motivation
 
@@ -91,29 +95,3 @@ The DS/ML ecosystem is incredibly rich and data *must be* easily accessible acro
 Lance makes Apache Arrow integration its primary interface, which means conversions to/from is 2 lines of code, your
 code does not need to change after conversion, and nothing is locked-up to force you to pay for vendor compute.
 We need open-source not fauxpen-source.
-
-
-## Python package
-
-Currently under development in the `pylance` directory. This will become the main python integration once ready.
-
-Install from source: `maturin develop` (later on `pip install pylance` will be from this package)
-
-Import via: `import lance`
-
-The python integration is done via pyo3 + custom python code:
-
-1. We make wrapper classes in Rust for Dataset/Scanner/RecordBatchReader that's exposed to python.
-2. These are then used by LanceDataset / LanceScanner implementations that extend pyarrow Dataset/Scanner for duckdb compat.
-3. Data is delivered via the Arrow C Data Interface
-
-## Rust package
-
-Include package "lance" in Cargo.toml as dependency.
-
-For macos we recommend you enable the blas feature flag for hardware acceleration.
-
-```toml
-[target.'cfg(target_os = "macos")'.dependencies]
-lance = { features = ["blas"]}
-```
