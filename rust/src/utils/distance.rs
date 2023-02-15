@@ -20,9 +20,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
-
-use arrow_schema::DataType;
+use arrow_array::{Array, Float32Array};
 
 use crate::Result;
 
@@ -44,6 +42,27 @@ pub(crate) fn simd_alignment() -> i32 {
     }
 
     1
+}
+
+/// Distance trait
+pub trait Distance {
+    /// Compute distance from one vector to an array of vectors (batch mode).
+    ///
+    /// Parameters
+    ///
+    /// - *from*: the source vector, with `dimension` of values.
+    /// - *to*: the target vector list. It is a flatten array with with `N x dimension` values.
+    /// - *dimension*: the dimension of the vector.
+    ///
+    /// Returns:
+    ///
+    /// - *Scores*: N elements vector to present the distance for each from/to pair.
+    fn distance(
+        &self,
+        from: &Float32Array,
+        to: &Float32Array,
+        dimension: usize,
+    ) -> Result<Arc<Float32Array>>;
 }
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
@@ -112,23 +131,24 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     vaddvq_f32(sum)
 }
 
-fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
-    use arrow_array::{cast::as_primitive_array, types::Float32Type};
-
-    let inner_array = to.values();
-    let buffer = as_primitive_array::<Float32Type>(&inner_array).values();
-    let dimension = from.len();
+fn l2_distance_simd(
+    from: &Float32Array,
+    to: &Float32Array,
+    dimension: usize,
+) -> Result<Arc<Float32Array>> {
+    let n = to.len() / dimension;
     let from_vector = from.values();
+    let to_buffer = to.values();
 
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
-            (0..to.len())
+            (0..n)
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
                         euclidean_distance_fma(
                             from_vector,
-                            &buffer[idx * dimension..(idx + 1) * dimension],
+                            &to_buffer[idx * dimension..(idx + 1) * dimension],
                         )
                     }
 
@@ -136,7 +156,7 @@ fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<
                     {
                         l2_distance_neon(
                             from_vector,
-                            &buffer[idx * dimension..(idx + 1) * dimension],
+                            &to_buffer[idx * dimension..(idx + 1) * dimension],
                         )
                     }
                 })
@@ -146,47 +166,66 @@ fn l2_distance_simd(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<
     Ok(Arc::new(scores))
 }
 
-/// Euclidean Distance (L2) from one vector to a list of vectors.
-pub fn l2_distance(from: &Float32Array, to: &FixedSizeListArray) -> Result<Arc<Float32Array>> {
-    assert_eq!(from.len(), to.value_length() as usize);
-    assert_eq!(to.value_type(), DataType::Float32);
+/// L2 (Euclidean) distance.
+#[derive(Debug)]
+pub struct L2Distance {}
 
-    #[cfg(any(target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
-            return l2_distance_simd(from, to);
+impl Distance for L2Distance {
+    fn distance(
+        &self,
+        from: &Float32Array,
+        to: &Float32Array,
+        dimension: usize,
+    ) -> Result<Arc<Float32Array>> {
+        assert_eq!(from.len(), dimension);
+        assert_eq!(to.len() % dimension, 0);
+
+        #[cfg(any(target_arch = "x86_64"))]
+        {
+            if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
+                return l2_distance_simd(from, to, dimension);
+            }
         }
-    }
 
-    #[cfg(any(target_arch = "aarch64"))]
-    {
-        use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-            return l2_distance_simd(from, to);
+        #[cfg(any(target_arch = "aarch64"))]
+        {
+            use std::arch::is_aarch64_feature_detected;
+            if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+                return l2_distance_simd(from, to, dimension);
+            }
         }
-    }
 
-    // Fallback
-    let scores: Float32Array = unsafe {
-        Float32Array::from_trusted_len_iter(
-            (0..to.len())
-                .map(|idx| {
-                    let left = to.value(idx);
-                    let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                    l2_distance_arrow(from, arr)
-                })
-                .map(Some),
-        )
-    };
-    Ok(Arc::new(scores))
+        // Fallback
+        use arrow_array::cast::as_primitive_array;
+        let n = to.len() / dimension;
+        let scores: Float32Array = unsafe {
+            Float32Array::from_trusted_len_iter(
+                (0..n)
+                    .map(|idx| {
+                        l2_distance_arrow(
+                            from,
+                            as_primitive_array(to.slice(idx * dimension, dimension).as_ref()),
+                        )
+                    })
+                    .map(Some),
+            )
+        };
+        Ok(Arc::new(scores))
+    }
+}
+
+impl L2Distance {
+    pub fn new() -> Self {
+        Self {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::FixedSizeListArrayExt;
 
     use approx::assert_relative_eq;
+    use arrow::array::as_primitive_array;
     use arrow_array::types::Float32Type;
 
     #[test]
@@ -201,7 +240,9 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance(&point, &mat).unwrap();
+        let scores = L2Distance::new()
+            .distance(&point, as_primitive_array(mat.values().as_ref()), 8)
+            .unwrap();
 
         assert_eq!(
             scores.as_ref(),
@@ -211,12 +252,9 @@ mod tests {
 
     #[test]
     fn test_odd_length_vector() {
-        let mat = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-            vec![Some((0..5).map(|v| Some(v as f32)).collect::<Vec<_>>())],
-            5,
-        );
+        let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance(&point, &mat).unwrap();
+        let scores = L2Distance::new().distance(&point, &mat, 5).unwrap();
 
         assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
@@ -231,7 +269,6 @@ mod tests {
             0.04898421, 0.14728612, 0.21263947, 0.16763233,
         ]
         .into();
-        let vectors = FixedSizeListArray::try_new(values, 32).unwrap();
 
         let q: Float32Array = vec![
             0.18549609,
@@ -269,7 +306,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance(&q, &vectors).unwrap();
+        let d = L2Distance::new().distance(&q, &values, 32).unwrap();
         assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }
