@@ -45,7 +45,7 @@ pub(crate) fn simd_alignment() -> i32 {
 }
 
 /// Distance trait
-pub trait Distance {
+pub trait Distance : Sync {
     /// Compute distance from one vector to an array of vectors (batch mode).
     ///
     /// Parameters

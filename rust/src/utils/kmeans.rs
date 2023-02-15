@@ -31,7 +31,7 @@ use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use super::distance::Distance;
+use super::distance::{Distance, L2Distance};
 use crate::Result;
 use crate::{arrow::*, Error};
 
@@ -154,7 +154,7 @@ async fn kmeans_random_init<'a>(
 
 struct KMeanMembership<'a> {
     /// Previous centroids
-    centroids: Arc<FixedSizeListArray>,
+    centroids: Arc<Float32Array>,
 
     /// Reference to the input vectors.
     data: &'a Float32Array,
@@ -168,12 +168,12 @@ struct KMeanMembership<'a> {
     distances: Vec<f32>,
 
     /// Number of centroids.
-    k: u32,
+    k: usize,
 }
 
 impl<'a> KMeanMembership<'a> {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans(&self) -> Result<KMeans> {
+    async fn to_kmeans(&'static self) -> Result<KMeans> {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
         let data = self.data;
@@ -194,7 +194,7 @@ impl<'a> KMeanMembership<'a> {
                         );
                         let mut total = 0.0;
                         for i in 0..cluster_ids.len() {
-                            if cluster_ids[i] == cluster {
+                            if cluster_ids[i] as usize == cluster {
                                 sum =
                                     add(&sum, as_primitive_array(data.slice(i * dimension, dimension).as_ref())).unwrap();
                                 total += 1.0;
@@ -204,7 +204,7 @@ impl<'a> KMeanMembership<'a> {
                             divide_scalar(&sum, total).unwrap()
                         } else {
                             eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
-                            let prev_centroids = previous_centroids.value(cluster as usize);
+                            let prev_centroids = previous_centroids.slice(cluster as usize * dimension, dimension);
                             as_primitive_array(prev_centroids.as_ref()).clone()
                         }
                     })
@@ -222,7 +222,7 @@ impl<'a> KMeanMembership<'a> {
         }
         let centroids = concat(&mean_refs).unwrap();
         Ok(KMeans {
-            centroids: Arc::new(FixedSizeListArray::try_new(centroids, dimension)?),
+            centroids: Arc::new(as_primitive_array(centroids.as_ref()).clone()),
             dimension,
             k: self.k,
         })
@@ -269,34 +269,37 @@ impl KMeans {
         }
     }
 
-    /// Train a KMean on data with `k` clusters.
-    pub async fn new(data: Arc<FixedSizeListArray>, k: usize, max_iters: u32) -> Self {
+    /// Train a KMeans model on data with `k` clusters.
+    pub async fn new(data: &Float32Array, dimension: usize, k: usize, max_iters: u32) -> Self {
         let params = KMeansParams {
             max_iters,
             ..Default::default()
         };
-        Self::new_with_params(data, k, &params).await
+        Self::new_with_params(data, dimension, k, &params, &L2Distance::new()).await
     }
 
+    /// Train a KMeans model with full parameters.
     pub async fn new_with_params(
-        data: Arc<FixedSizeListArray>,
+        data: &Float32Array,
+        dimension: usize,
         k: usize,
         params: &KMeansParams,
+        dist_func: &dyn Distance,
     ) -> Self {
-        let mut best_kmeans = Self::empty(k, data.value_length());
+        let mut best_kmeans = Self::empty(k, dimension);
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
         for _ in 1..=params.redos {
             let mut kmeans = match params.init {
-                KMeanInit::Random => kmeans_random_init(data.clone(), k, rng.clone()).await,
-                KMeanInit::KMeanPlusPlus => kmean_plusplus(data.clone(), k, rng.clone()).await,
+                KMeanInit::Random => kmeans_random_init(data, dimension, k, rng.clone()).await,
+                KMeanInit::KMeanPlusPlus => kmean_plusplus(data, dimension, k, rng.clone(), dist_func).await,
             };
 
-            let mut last_membership = kmeans.compute_membership(data.clone()).await;
+            let mut last_membership = kmeans.compute_membership(data, dist_func).await;
             for _ in 1..=params.max_iters {
                 let new_kmeans = last_membership.to_kmeans().await.unwrap();
-                let new_membership = new_kmeans.compute_membership(data.clone()).await;
+                let new_membership = new_kmeans.compute_membership(data, dist_func).await;
                 if (new_membership.distance_sum() - last_membership.distance_sum()).abs()
                     / last_membership.distance_sum()
                     < params.tolerance
@@ -319,7 +322,7 @@ impl KMeans {
         best_kmeans
     }
 
-    /// Recompute the membership.
+    /// Recompute the membership of each vector.
     ///
     async fn compute_membership(
         &self,
@@ -331,14 +334,14 @@ impl KMeans {
         let cluster_with_distances = stream::iter(0..n)
             // make tiles of input data to split between threads.
             .chunks(1024)
-            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
+            .zip(repeat_with(|| (data, self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let mut results = vec![];
                     for idx in indices {
-                        let value_arr = data.value(idx);
+                        let value_arr = data.slice(idx * dimension, dimension);
                         let vector: &Float32Array = as_primitive_array(&value_arr);
-                        let distances = dist_func(vector, centroids.as_ref()).unwrap();
+                        let distances = dist_func.distance(vector, centroids.as_ref(), dimension).unwrap();
                         let cluster_id = argmin(distances.as_ref()).unwrap();
                         let distance = distances.value(cluster_id as usize);
                         results.push((cluster_id, distance))
