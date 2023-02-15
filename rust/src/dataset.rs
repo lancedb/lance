@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
@@ -76,9 +77,14 @@ pub struct Version {
 /// Convert Manifest to Data Version.
 impl From<&Manifest> for Version {
     fn from(m: &Manifest) -> Self {
+        let nanos = m.timestamp_nanos % 1_000_000_000;
+        let seconds = ((m.timestamp_nanos - nanos) / 1_000_000_000) as i64;
+        let dt = DateTime::<Utc>::from_utc(
+            NaiveDateTime::from_timestamp(seconds, nanos as u32),
+            Utc);
         Self {
             version: m.version,
-            timestamp: Utc::now(),
+            timestamp: dt,
             metadata: BTreeMap::default(),
         }
     }

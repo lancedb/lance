@@ -19,11 +19,9 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
-use futures::TryFutureExt;
-use lance::datatypes::Schema;
 use lance::index::vector::VectorIndexParams;
 use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
@@ -240,7 +238,7 @@ impl Dataset {
     }
 }
 
-#[pyfunction(name = "_write_dataset", module = "_lib")]
+#[pyo3(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
