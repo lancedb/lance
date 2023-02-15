@@ -238,7 +238,7 @@ impl Dataset {
     }
 }
 
-#[pyo3(name = "_write_dataset", module = "_lib")]
+#[pyfunction(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
