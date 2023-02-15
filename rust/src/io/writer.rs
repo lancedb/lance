@@ -275,9 +275,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray,
-        Float32Array, Int64Array, LargeListArray, ListArray, StringArray, UInt8Array,
+        types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
+        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, LargeListArray,
+        ListArray, StringArray, UInt8Array,
     };
+    use arrow_buffer::i256;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use object_store::path::Path;
 
@@ -290,6 +292,8 @@ mod tests {
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
             ArrowField::new("b", DataType::Utf8, true),
+            ArrowField::new("decimal128", DataType::Decimal128(7, 3), false),
+            ArrowField::new("decimal256", DataType::Decimal256(7, 3), false),
             ArrowField::new(
                 "d",
                 DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
@@ -363,6 +367,18 @@ mod tests {
             Arc::new(StringArray::from(
                 (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
             )),
+            Arc::new(
+                Decimal128Array::from_iter_values((0..100).into_iter())
+                    .with_precision_and_scale(7, 3)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal256Array::from_iter_values(
+                    (0..100).into_iter().map(|v| i256::from_i128(v as i128)),
+                )
+                .with_precision_and_scale(7, 3)
+                .unwrap(),
+            ),
             Arc::new(dict_arr),
             Arc::new(fixed_size_list_arr),
             Arc::new(fixed_size_binary_arr),
