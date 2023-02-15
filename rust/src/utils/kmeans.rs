@@ -135,7 +135,9 @@ async fn kmeans_random_init<'a, D: Distance + 'static>(
 ) -> KMeans<D> {
     assert!(data.len() > k * dimension);
 
-    let chosen = (0..data.len() / dimension).choose_multiple(&mut rng, k).to_vec();
+    let chosen = (0..data.len() / dimension)
+        .choose_multiple(&mut rng, k)
+        .to_vec();
     let mut builder = Float32Builder::with_capacity(k * dimension);
     for i in chosen {
         builder.append_slice(&data.values()[i * dimension..(i + 1) * dimension]);
