@@ -31,8 +31,9 @@ use rand::SeedableRng;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::utils::distance::Distance;
 use crate::Result;
-use crate::{arrow::*, utils::distance::l2_distance};
+use crate::{arrow::*, utils::distance::L2Distance};
 
 /// Product Quantization Index.
 ///
@@ -95,10 +96,15 @@ impl<'a> PQIndex<'a> {
         let mut distance_table: Vec<f32> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
+        let dist_func = L2Distance::default();
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i);
-            let distances = l2_distance(as_primitive_array(&from), &subvec_centroids)?;
+            let distances = dist_func.distance(
+                as_primitive_array(&from),
+                &subvec_centroids,
+                sub_vector_length,
+            )?;
             distance_table.extend(distances.values());
         }
 
@@ -184,7 +190,9 @@ impl ProductQuantizer {
     }
 
     /// Get the centroids for one sub-vector.
-    pub fn centroids(&self, sub_vector_idx: usize) -> Arc<FixedSizeListArray> {
+    ///
+    /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
+    pub fn centroids(&self, sub_vector_idx: usize) -> Arc<Float32Array> {
         assert!(sub_vector_idx < self.num_sub_vectors);
         assert!(self.codebook.is_some());
 
@@ -195,8 +203,8 @@ impl ProductQuantizer {
             sub_vector_idx * num_centroids * sub_vector_width,
             num_centroids * sub_vector_width,
         );
-        let f32_arr: &Float32Array = as_primitive_array(&arr);
-        Arc::new(FixedSizeListArray::try_new(f32_arr, sub_vector_width as i32).unwrap())
+        // TODO: return reference instead of Arc?
+        Arc::new(as_primitive_array(&arr).clone())
     }
 
     /// Transform the vector array to PQ code array.
@@ -214,14 +222,19 @@ impl ProductQuantizer {
             .zip(stream::iter(all_centroids))
             .map(|(vec, centroid)| async move {
                 tokio::task::spawn_blocking(move || {
+                    let dist_func = L2Distance::new();
                     // TODO Use tiling to improve cache efficiency.
                     (0..vec.len())
                         .map(|i| {
                             let value = vec.value(i);
                             let vector: &Float32Array = as_primitive_array(value.as_ref());
-                            let id =
-                                argmin(l2_distance(vector, centroid.as_ref()).unwrap().as_ref())
-                                    .unwrap() as u8;
+                            let id = argmin(
+                                dist_func
+                                    .distance(vector, centroid.as_ref(), vector.len())
+                                    .unwrap()
+                                    .as_ref(),
+                            )
+                            .unwrap() as u8;
                             id
                         })
                         .collect::<Vec<_>>()
@@ -253,11 +266,11 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_u32.pow(self.num_bits);
+        let num_centorids = 2_usize.pow(self.num_bits);
         let dimension = data.value_length() as usize / self.num_sub_vectors;
 
         let mut codebook_builder =
-            Float32Builder::with_capacity(num_centorids as usize * data.value_length() as usize);
+            Float32Builder::with_capacity(num_centorids * data.value_length() as usize);
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.

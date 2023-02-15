@@ -373,7 +373,7 @@ impl Dataset {
                                 }
                             }
                         }
-                        _ => return Err(Error::Index(format!("Must be FixedSizeList"))),
+                        _ => return Err(Error::Index("Must be FixedSizeList".to_string())),
                     }
                 }
 
