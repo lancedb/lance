@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
+
+use chrono::prelude::*;
+use prost_types::Timestamp;
 
 use super::Fragment;
 use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
-use prost_types::Timestamp;
-use std::collections::HashMap;
-use std::time::SystemTime;
+
 
 /// Manifest of a dataset
 ///
@@ -70,6 +73,13 @@ impl Manifest {
             timestamp_nanos,
             tag: None,
         }
+    }
+
+    /// Return the `timestamp_nanos` value as a Utc DateTime
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        let nanos = self.timestamp_nanos % 1_000_000_000;
+        let seconds = ((self.timestamp_nanos - nanos) / 1_000_000_000) as i64;
+        DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN), Utc)
     }
 }
 
