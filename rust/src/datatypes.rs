@@ -76,6 +76,7 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float16 => "halffloat".to_string(),
             DataType::Float32 => "float".to_string(),
             DataType::Float64 => "double".to_string(),
+            DataType::Decimal128(precision, scale) => format!("decimal128:{precision}:{scale}"),
             DataType::Utf8 => "string".to_string(),
             DataType::Binary => "binary".to_string(),
             DataType::LargeUtf8 => "large_string".to_string(),
@@ -186,6 +187,21 @@ impl TryFrom<&LogicalType> for DataType {
                         let value_type: Self = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
                         Ok(Dictionary(Box::new(index_type), Box::new(value_type)))
+                    }
+                }
+                "decimal128" => {
+                    if splits.len() != 3 {
+                        Err(Error::Schema(format!("Unsupport decimal128 type: {}", lt)))
+                    } else {
+                        println!("{}", splits[1]);
+                        println!("{}", splits[2]);
+                        let precision: u8 = splits[1]
+                            .parse::<u8>()
+                            .map_err(|err| Error::Schema(err.to_string()))?;
+                        let scale: i8 = splits[2]
+                            .parse::<i8>()
+                            .map_err(|err| Error::Schema(err.to_string()))?;
+                        Ok(Decimal128(precision, scale))
                     }
                 }
                 _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
@@ -752,6 +768,7 @@ mod tests {
             ("float16", DataType::Float16),
             ("float32", DataType::Float32),
             ("float64", DataType::Float64),
+            ("decimal128:7:3", DataType::Decimal128(7, 3)),
             ("timestamp:s", DataType::Timestamp(TimeUnit::Second, None)),
             (
                 "timestamp:ms",
