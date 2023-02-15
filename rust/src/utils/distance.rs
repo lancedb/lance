@@ -18,10 +18,9 @@
 //! Compute distance
 //!
 
-use std::{sync::Arc, fmt::Debug};
+use std::{fmt::Debug, sync::Arc};
 
-use arrow::array::as_primitive_array;
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, Float32Array};
 
 use crate::Result;
 
@@ -46,12 +45,12 @@ pub(crate) fn simd_alignment() -> i32 {
 }
 
 /// Distance trait
-pub trait Distance : Debug + Send + Sync     {
+pub trait Distance {
     /// Compute distance from one vector to an array of vectors (batch mode).
     ///
     /// Parameters
     ///
-    /// - *from*: the source vector, with `dimension` of values.
+    /// - *from*: the source vector, with `dimension` of float numbers.
     /// - *to*: the target vector list. It is a flatten array with with `N x dimension` values.
     /// - *dimension*: the dimension of the vector.
     ///
@@ -226,7 +225,7 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow::array::as_primitive_array;
+    use arrow::array::{as_primitive_array, FixedSizeListArray};
     use arrow_array::types::Float32Type;
 
     #[test]
