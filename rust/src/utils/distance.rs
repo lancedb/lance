@@ -18,9 +18,10 @@
 //! Compute distance
 //!
 
-use std::sync::Arc;
+use std::{sync::Arc, fmt::Debug};
 
-use arrow_array::{Array, Float32Array};
+use arrow::array::as_primitive_array;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 
 use crate::Result;
 
@@ -45,7 +46,7 @@ pub(crate) fn simd_alignment() -> i32 {
 }
 
 /// Distance trait
-pub trait Distance {
+pub trait Distance : Debug + Send + Sync     {
     /// Compute distance from one vector to an array of vectors (batch mode).
     ///
     /// Parameters
@@ -167,7 +168,7 @@ fn l2_distance_simd(
 }
 
 /// L2 (Euclidean) distance.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct L2Distance {}
 
 impl Distance for L2Distance {
