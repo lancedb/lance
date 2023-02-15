@@ -18,11 +18,11 @@ from typing import Union
 import pandas as pd
 
 
-def sanitize_ts(ts: Union[datetime, str]) -> datetime:
+def sanitize_ts(ts: Union[datetime, pd.Timestamp, str]) -> datetime:
     if isinstance(ts, str):
-        ts = pd.Timestamp.fromisoformat(ts).to_pydatetime()
+        ts = pd.to_datetime(ts).to_pydatetime()
     elif isinstance(ts, pd.Timestamp):
         ts = ts.to_pydatetime()
     elif not isinstance(ts, datetime):
-        raise TypeError(f"Unrecognized version timestamp {ts} " f"of type {type(ts)}")
+        raise TypeError(f"Unrecognized version timestamp {ts} of type {type(ts)}")
     return ts

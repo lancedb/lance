@@ -223,14 +223,16 @@ class LanceDataset(pa.dataset.Dataset):
 
     def versions(self):
         """
-        Return all versions in this dataset
+        Return all versions in this dataset.
         """
         versions = self._ds.versions()
         for v in versions:
+            # TODO: python datetime supports only microsecond precision. When a separate Version object is
+            # implemented, expose the precise timestamp (ns) to python.
             ts_nanos = v["timestamp"]
             v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
                 microseconds=(ts_nanos % 1e9) // 1e3
-            )  # NOTE: python datetime supports only microsecond precision
+            )
         return versions
 
     @property
