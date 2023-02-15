@@ -17,6 +17,7 @@
 
 //! Flat Vector Index.
 
+use arrow::array::as_primitive_array;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
@@ -27,7 +28,7 @@ use futures::stream::{Stream, StreamExt, TryStreamExt};
 use super::{Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
-use crate::utils::distance::l2_distance;
+use crate::utils::distance::{Distance, L2Distance};
 use crate::{Error, Result};
 
 /// Flat Vector Index.
@@ -60,6 +61,7 @@ impl<'a> FlatIndex<'a> {
 pub async fn flat_search(
     stream: impl Stream<Item = Result<RecordBatch>>,
     query: &Query,
+    dist_func: impl Distance,
 ) -> Result<RecordBatch> {
     const SCORE_COLUMN: &str = "score";
 
@@ -77,9 +79,13 @@ pub async fn flat_search(
                     Error::Schema(format!("column {} does not exist in dataset", query.column))
                 })?
                 .clone();
-            let vec = as_fixed_size_list_array(vectors.as_ref()).clone();
-            let scores = tokio::task::spawn_blocking(move || l2_distance(&k, &vec).unwrap()).await?
-                as ArrayRef;
+            let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values();
+            let scores = tokio::task::spawn_blocking(move || {
+                dist_func
+                    .distance(&k, as_primitive_array(flatten_vectors.as_ref()), k.len())
+                    .unwrap()
+            })
+            .await? as ArrayRef;
 
             // TODO: use heap
             let indices = sort_to_indices(&scores, None, Some(query.k))?;
