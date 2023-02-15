@@ -193,8 +193,6 @@ impl TryFrom<&LogicalType> for DataType {
                     if splits.len() != 3 {
                         Err(Error::Schema(format!("Unsupport decimal128 type: {}", lt)))
                     } else {
-                        println!("{}", splits[1]);
-                        println!("{}", splits[2]);
                         let precision: u8 = splits[1]
                             .parse::<u8>()
                             .map_err(|err| Error::Schema(err.to_string()))?;
