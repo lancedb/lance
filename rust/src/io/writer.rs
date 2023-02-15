@@ -275,9 +275,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::UInt32Type, BooleanArray, Decimal128Array, DictionaryArray, FixedSizeBinaryArray,
-        FixedSizeListArray, Float32Array, Int64Array, LargeListArray, ListArray, StringArray,
-        UInt8Array, Decimal256Array
+        types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
+        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, LargeListArray,
+        ListArray, StringArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -373,9 +373,11 @@ mod tests {
                     .unwrap(),
             ),
             Arc::new(
-                Decimal256Array::from_iter_values((0..100).into_iter().map(|v| i256::from_i128(v as i128)))
-                    .with_precision_and_scale(7, 3)
-                    .unwrap(),
+                Decimal256Array::from_iter_values(
+                    (0..100).into_iter().map(|v| i256::from_i128(v as i128)),
+                )
+                .with_precision_and_scale(7, 3)
+                .unwrap(),
             ),
             Arc::new(dict_arr),
             Arc::new(fixed_size_list_arr),

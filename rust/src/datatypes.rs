@@ -209,7 +209,9 @@ impl TryFrom<&LogicalType> for DataType {
                         } else if bits == 256 {
                             Ok(Decimal256(precision, scale))
                         } else {
-                            Err(Error::Schema(format!("Only Decimal128 and Decimal256 is supported. Found {bits}")))
+                            Err(Error::Schema(format!(
+                                "Only Decimal128 and Decimal256 is supported. Found {bits}"
+                            )))
                         }
                     }
                 }
