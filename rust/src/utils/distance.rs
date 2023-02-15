@@ -45,7 +45,7 @@ pub(crate) fn simd_alignment() -> i32 {
 }
 
 /// Distance trait
-pub trait Distance : Sync {
+pub trait Distance: Sync + Send + Clone + Default + Sized {
     /// Compute distance from one vector to an array of vectors (batch mode).
     ///
     /// Parameters
@@ -167,7 +167,7 @@ fn l2_distance_simd(
 }
 
 /// L2 (Euclidean) distance.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct L2Distance {}
 
 impl Distance for L2Distance {

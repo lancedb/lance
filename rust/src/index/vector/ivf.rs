@@ -537,7 +537,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             train_kmean_model(
                 &scanner,
                 self.dimension,
-                self.num_partitions,
+                self.num_partitions as usize,
                 self.kmeans_max_iters,
                 rng.clone(),
             )
@@ -625,7 +625,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
 async fn train_kmean_model(
     scanner: &Scanner,
     dimension: usize,
-    k: u32,
+    k: usize,
     max_iterations: u32,
     rng: impl Rng,
 ) -> Result<Arc<FixedSizeListArray>> {

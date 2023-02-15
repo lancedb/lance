@@ -253,7 +253,7 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_u32.pow(self.num_bits);
+        let num_centorids = 2_usize.pow(self.num_bits);
         let dimension = data.value_length() as usize / self.num_sub_vectors;
 
         let mut codebook_builder =

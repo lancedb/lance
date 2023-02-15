@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array,
-    FixedSizeListArray, Float32Array,
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
 };
 use rand::{seq::IteratorRandom, Rng};
 
 use crate::{
-    arrow::FixedSizeListArrayExt,
-    utils::kmeans::{KMeans, KMeansParams},
+    utils::{
+        distance::L2Distance,
+        kmeans::{KMeans, KMeansParams},
+    },
     Result,
 };
 
@@ -33,25 +32,22 @@ use crate::{
 async fn train_kmeans_fallback(
     array: &Float32Array,
     dimension: usize,
-    k: u32,
+    k: usize,
     max_iters: u32,
 ) -> Result<Float32Array> {
-    let data = Arc::new(FixedSizeListArray::try_new(array, dimension as i32)?);
     let params = KMeansParams {
         max_iters,
         ..Default::default()
     };
-    let model = KMeans::new_with_params(data, k, &params).await;
-    let centroids = model.centroids.values();
-    let floats: &Float32Array = as_primitive_array(centroids.as_ref());
-    Ok(floats.clone())
+    let model = KMeans::new_with_params(array, dimension, k, &params, L2Distance::new()).await;
+    Ok(model.centroids.as_ref().clone())
 }
 
 /// Train KMeans model and returns the centroids of each cluster.
 pub async fn train_kmeans(
     array: &Float32Array,
     dimension: usize,
-    k: u32,
+    k: usize,
     max_iterations: u32,
     mut rng: impl Rng,
 ) -> Result<Float32Array> {
