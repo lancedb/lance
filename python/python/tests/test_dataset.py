@@ -55,13 +55,14 @@ def test_versions(tmp_path: Path):
     assert isinstance(v1["metadata"], dict)
     assert isinstance(v2["metadata"], dict)
 
+
 def test_take(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
     lance.write_dataset(table1, base_dir)
 
     dataset = lance.dataset(base_dir)
-    table2 = dataset.take([0,1])
+    table2 = dataset.take([0, 1])
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1

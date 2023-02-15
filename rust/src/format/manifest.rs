@@ -20,9 +20,9 @@ use std::sync::Arc;
 use super::Fragment;
 use crate::datatypes::Schema;
 use crate::format::{pb, ProtoStruct};
+use prost_types::Timestamp;
 use std::collections::HashMap;
 use std::time::SystemTime;
-use prost_types::Timestamp;
 
 /// Manifest of a dataset
 ///
@@ -56,7 +56,9 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(schema: &Schema, fragments: Arc<Vec<Fragment>>) -> Self {
-        let duration_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let duration_since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
         let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
 
         Self {
@@ -66,7 +68,7 @@ impl Manifest {
             version_aux_data: 0,
             index_section: None,
             timestamp_nanos,
-            tag: None
+            tag: None,
         }
     }
 }
@@ -101,7 +103,10 @@ impl From<&Manifest> for pb::Manifest {
         } else {
             let nanos = m.timestamp_nanos % 1e9 as u128;
             let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
-            Some(Timestamp { seconds, nanos: nanos as i32 })
+            Some(Timestamp {
+                seconds,
+                nanos: nanos as i32,
+            })
         };
         Self {
             fields: (&m.schema).into(),
