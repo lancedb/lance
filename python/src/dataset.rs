@@ -181,7 +181,8 @@ impl Dataset {
                 .map(|v| {
                     let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
-                    dict.set_item("timestamp", v.timestamp.timestamp()).unwrap();
+                    dict.set_item("timestamp", v.timestamp.timestamp_nanos())
+                        .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
                     dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
                     dict.to_object(py)
@@ -191,6 +192,11 @@ impl Dataset {
                 .collect();
             Ok(pyvers)
         })
+    }
+
+    /// Fetches the currently checked out version of the dataset.
+    fn version(&self) -> PyResult<u64> {
+        Ok(self.ds.version().version)
     }
 
     fn create_index(

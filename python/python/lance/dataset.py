@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional, Union
 
@@ -223,12 +223,24 @@ class LanceDataset(pa.dataset.Dataset):
 
     def versions(self):
         """
-        Return all versions in this dataset
+        Return all versions in this dataset.
         """
         versions = self._ds.versions()
         for v in versions:
-            v["timestamp"] = datetime.fromtimestamp(v["timestamp"])
+            # TODO: python datetime supports only microsecond precision. When a separate Version object is
+            # implemented, expose the precise timestamp (ns) to python.
+            ts_nanos = v["timestamp"]
+            v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
+                microseconds=(ts_nanos % 1e9) // 1e3
+            )
         return versions
+
+    @property
+    def version(self) -> int:
+        """
+        Returns the currently checked out version of the dataset
+        """
+        return self._ds.version()
 
     def create_index(
         self, column: str, index_type: str, name: Optional[str] = None, **kwargs

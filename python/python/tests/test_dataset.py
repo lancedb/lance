@@ -11,6 +11,7 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+
 import time
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,40 @@ def test_versions(tmp_path: Path):
     assert v1["timestamp"] < v2["timestamp"]
     assert isinstance(v1["metadata"], dict)
     assert isinstance(v2["metadata"], dict)
+
+
+def test_asof_checkout(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    assert len(lance.dataset(base_dir).versions()) == 1
+    ts_1 = datetime.now()
+    time.sleep(0.01)
+
+    lance.write_dataset(table, base_dir, mode="append")
+    assert len(lance.dataset(base_dir).versions()) == 2
+    ts_2 = datetime.now()
+    time.sleep(0.01)
+
+    lance.write_dataset(table, base_dir, mode="append")
+    assert len(lance.dataset(base_dir).versions()) == 3
+    ts_3 = datetime.now()
+
+    # check that only the first batch is present
+    ds = lance.dataset(base_dir, asof=ts_1)
+    assert ds.version == 1
+    assert len(ds.to_table()) == 3
+
+    # check that the first and second batch are present
+    ds = lance.dataset(base_dir, asof=ts_2)
+    assert ds.version == 2
+    assert len(ds.to_table()) == 6
+
+    # check that all batches are present
+    ds = lance.dataset(base_dir, asof=ts_3)
+    assert ds.version == 3
+    assert len(ds.to_table()) == 9
 
 
 def test_take(tmp_path: Path):
