@@ -195,7 +195,7 @@ impl Dataset {
     }
 
     /// Fetches the currently checked out version of the dataset.
-    fn active_version(&self) -> PyResult<u64> {
+    fn version(&self) -> PyResult<u64> {
         Ok(self.ds.version().version)
     }
 

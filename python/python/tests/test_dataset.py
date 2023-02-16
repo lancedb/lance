@@ -77,17 +77,17 @@ def test_asof_checkout(tmp_path: Path):
 
     # check that only the first batch is present
     ds = lance.dataset(base_dir, asof=ts_1)
-    assert ds.active_version == 1
+    assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that the first and second batch are present
     ds = lance.dataset(base_dir, asof=ts_2)
-    assert ds.active_version == 2
+    assert ds.version == 2
     assert len(ds.to_table()) == 6
 
     # check that all batches are present
     ds = lance.dataset(base_dir, asof=ts_3)
-    assert ds.active_version == 3
+    assert ds.version == 3
     assert len(ds.to_table()) == 9
 
 
