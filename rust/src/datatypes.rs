@@ -87,6 +87,7 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Time32(tu) => format!("time32:{}", timeunit_to_str(tu)),
             DataType::Time64(tu) => format!("time64:{}", timeunit_to_str(tu)),
             DataType::Timestamp(tu, _) => format!("timestamp:{}", timeunit_to_str(tu)),
+            DataType::Duration(tu) => format!("duration:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
             DataType::Dictionary(key_type, value_type) => {
                 format!(
@@ -151,6 +152,10 @@ impl TryFrom<&LogicalType> for DataType {
             "timestamp:ms" => Some(Timestamp(TimeUnit::Millisecond, None)),
             "timestamp:us" => Some(Timestamp(TimeUnit::Microsecond, None)),
             "timestamp:ns" => Some(Timestamp(TimeUnit::Nanosecond, None)),
+            "duration:s" => Some(Duration(TimeUnit::Second)),
+            "duration:ms" => Some(Duration(TimeUnit::Millisecond)),
+            "duration:us" => Some(Duration(TimeUnit::Microsecond)),
+            "duration:ns" => Some(Duration(TimeUnit::Nanosecond)),
             _ => None,
         } {
             Ok(t)
@@ -797,6 +802,10 @@ mod tests {
             ("time32:ms", DataType::Time32(TimeUnit::Millisecond)),
             ("time64:us", DataType::Time64(TimeUnit::Microsecond)),
             ("time64:ns", DataType::Time64(TimeUnit::Nanosecond)),
+            ("duration:s", DataType::Duration(TimeUnit::Second)),
+            ("duration:ms", DataType::Duration(TimeUnit::Millisecond)),
+            ("duration:us", DataType::Duration(TimeUnit::Microsecond)),
+            ("duration:ns", DataType::Duration(TimeUnit::Nanosecond)),
             ("fixed_size_binary:100", DataType::FixedSizeBinary(100)),
             (
                 "fixed_size_list:int32:10",
