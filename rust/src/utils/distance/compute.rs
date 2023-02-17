@@ -83,5 +83,3 @@ pub unsafe fn add_fma(x: std::arch::x86_64::__m256) -> f32 {
     _mm256_storeu_ps(results.as_mut_ptr(), sums);
     results[0]
 }
-
-
