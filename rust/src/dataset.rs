@@ -223,7 +223,8 @@ impl Dataset {
 
         let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
             dataset.as_ref().map_or(0, |d| {
-                d.manifest.fragments
+                d.manifest
+                    .fragments
                     .iter()
                     .map(|f| f.id)
                     .max()
@@ -237,7 +238,9 @@ impl Dataset {
         };
 
         let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
-            dataset.as_ref().map_or(vec![], |d| d.manifest.fragments.as_ref().clone())
+            dataset
+                .as_ref()
+                .map_or(vec![], |d| d.manifest.fragments.as_ref().clone())
         } else {
             // Create or Overwrite create new fragments.
             vec![]
@@ -1139,13 +1142,13 @@ mod tests {
             assert!(err.is_err())
         }
 
-
         let mut write_params = WriteParams::default();
         write_params.mode = WriteMode::Append;
-        let batches =
-            RecordBatchBuffer::new(vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()
-            ]);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![vectors.clone()],
+        )
+        .unwrap()]);
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
             .await

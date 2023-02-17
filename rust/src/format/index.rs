@@ -44,7 +44,7 @@ impl Index {
             uuid,
             name: name.to_string(),
             fields: Vec::from(fields),
-            max_fragment_id
+            max_fragment_id,
         }
     }
 }
@@ -59,7 +59,7 @@ impl TryFrom<&pb::IndexMetadata> for Index {
             })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
-            max_fragment_id: proto.max_fragment_id
+            max_fragment_id: proto.max_fragment_id,
         })
     }
 }
@@ -70,7 +70,7 @@ impl From<&Index> for pb::IndexMetadata {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
-            max_fragment_id: idx.max_fragment_id
+            max_fragment_id: idx.max_fragment_id,
         }
     }
 }
