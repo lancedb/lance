@@ -620,6 +620,7 @@ mod tests {
     use super::*;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
+    use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
@@ -1036,10 +1037,11 @@ mod tests {
 
         let float_arr = generate_random_array(512 * dimension as usize);
         let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches =
-            RecordBatchBuffer::new(vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
-            ]);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![vectors.clone()],
+        )
+        .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1061,5 +1063,17 @@ mod tests {
                 .await;
             assert!(err.is_err())
         }
+
+        let mut write_params = WriteParams::default();
+        write_params.mode = Overwrite;
+        let batches =
+            RecordBatchBuffer::new(vec![
+                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
+            ]);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_none());
     }
 }
