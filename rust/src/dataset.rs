@@ -457,8 +457,8 @@ impl Dataset {
         new_manifest.version = latest_manifest.version + 1;
 
         // Write index metadata down
-        let frag_ids = latest_manifest.fragments.last().map(|f| f.id).unwrap_or(0);
-        let new_idx = Index::new(index_id, &index_name, &[field.id], frag_ids);
+        let new_idx = Index::new(index_id, &index_name, &[field.id],
+                                 new_manifest.version);
         indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
@@ -1121,6 +1121,7 @@ mod tests {
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
+        // Make sure valid arguments should create index successfully
         let mut params = VectorIndexParams::default();
         params.num_partitions = 10;
         params.num_sub_vectors = 2;
@@ -1129,11 +1130,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Check the version is set correctly
         let indices = dataset.load_indices().await.unwrap();
-        let actual_frag_id = indices.first().unwrap().max_fragment_id;
-        let expected_frag_id = dataset.manifest.fragments.last().unwrap().id;
-        assert_eq!(actual_frag_id, expected_frag_id);
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version;
+        assert_eq!(actual, expected);
 
+        // If running on a SIMD-enabled platform, check that SIMD alignment is enforced
         if simd_alignment() > 1 {
             params.num_sub_vectors = 10;
             let err = dataset
@@ -1142,6 +1145,7 @@ mod tests {
             assert!(err.is_err())
         }
 
+        // Append should inherit index
         let mut write_params = WriteParams::default();
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
@@ -1155,10 +1159,11 @@ mod tests {
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         println!("Indices loaded: {:?}", indices);
-        let actual_frag_id = indices.first().unwrap().max_fragment_id;
-        let expected_frag_id = dataset.manifest.fragments.last().unwrap().id - 1;
-        assert_eq!(actual_frag_id, expected_frag_id);
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 1;
+        assert_eq!(actual, expected);
 
+        // Overwrite should invalidate index
         let mut write_params = WriteParams::default();
         write_params.mode = Overwrite;
         let batches =

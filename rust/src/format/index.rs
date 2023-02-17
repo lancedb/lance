@@ -34,17 +34,17 @@ pub struct Index {
     /// Human readable index name
     pub name: String,
 
-    /// The maximum fragment id used to construct this index
-    pub max_fragment_id: u64,
+    /// The latest version of the dataset this index covers
+    pub dataset_version: u64,
 }
 
 impl Index {
-    pub fn new(uuid: Uuid, name: &str, fields: &[i32], max_fragment_id: u64) -> Self {
+    pub fn new(uuid: Uuid, name: &str, fields: &[i32], dataset_version: u64) -> Self {
         Self {
             uuid,
             name: name.to_string(),
             fields: Vec::from(fields),
-            max_fragment_id,
+            dataset_version,
         }
     }
 }
@@ -59,7 +59,7 @@ impl TryFrom<&pb::IndexMetadata> for Index {
             })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
-            max_fragment_id: proto.max_fragment_id,
+            dataset_version: proto.dataset_version,
         })
     }
 }
@@ -70,7 +70,7 @@ impl From<&Index> for pb::IndexMetadata {
             uuid: Some((&idx.uuid).into()),
             name: idx.name.clone(),
             fields: idx.fields.clone(),
-            max_fragment_id: idx.max_fragment_id,
+            dataset_version: idx.dataset_version,
         }
     }
 }
