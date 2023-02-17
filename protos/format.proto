@@ -91,6 +91,9 @@ message IndexMetadata {
 
   // Index name. Must be unique within one dataset version.
   string name = 3;
+
+  // The max fragment_id included in this index
+  uint64 max_fragment_id = 6;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.
