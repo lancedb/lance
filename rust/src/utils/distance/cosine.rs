@@ -69,11 +69,7 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
 }
 
 #[inline]
-unsafe fn cosine_dist_simd(
-    from: &Float32Array,
-    to: &Float32Array,
-    dimension: usize,
-) -> Arc<Float32Array> {
+fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<Float32Array> {
     assert!(to.len() % dimension == 0);
     use arrow::array::Float32Builder;
 
@@ -83,7 +79,7 @@ unsafe fn cosine_dist_simd(
     let n = to.len() / dimension;
     let mut builder = Float32Builder::with_capacity(n);
     for y in to_values.chunks_exact(dimension) {
-        builder.append_value(cosine_dist_neon(x, y) / x_sq);
+        builder.append_value(unsafe { cosine_dist_neon(x, y) } / x_sq);
     }
     Arc::new(builder.finish())
 }
