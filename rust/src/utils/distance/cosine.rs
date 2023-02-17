@@ -53,6 +53,7 @@ fn cosine_dist(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<
 
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     let len = x.len();
