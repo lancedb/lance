@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
+use crate::datatypes::Schema;
 
 pub mod flat;
 pub mod ivf;
@@ -30,7 +31,7 @@ mod kmeans;
 mod pq;
 
 use super::IndexParams;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -46,6 +47,14 @@ pub struct Query {
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
     pub refine_factor: Option<u32>,
+}
+
+impl Query {
+    pub(crate) fn get_column_id(&self, schema: &Schema) -> Result<i32> {
+        schema.field(&self.column)
+            .map(|f| f.id)
+            .ok_or_else(|| Error::Schema("Vector column not in schema".to_string()))
+    }
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
