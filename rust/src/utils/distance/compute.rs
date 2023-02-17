@@ -57,9 +57,7 @@ pub fn normalize(vector: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        unsafe {
-            normalize_fma(vector)
-        }
+        unsafe { normalize_fma(vector) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
