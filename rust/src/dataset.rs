@@ -457,8 +457,7 @@ impl Dataset {
         new_manifest.version = latest_manifest.version + 1;
 
         // Write index metadata down
-        let new_idx = Index::new(index_id, &index_name, &[field.id],
-                                 new_manifest.version);
+        let new_idx = Index::new(index_id, &index_name, &[field.id], new_manifest.version);
         indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
