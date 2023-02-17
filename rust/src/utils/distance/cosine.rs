@@ -73,8 +73,8 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
 #[target_feature(enable = "fma")]
 #[inline]
 unsafe fn cosine_dist_fma(x: &[f32], y: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
     use super::compute::add_fma;
+    use std::arch::x86_64::*;
 
     let len = x.len();
     let mut xy = _mm256_setzero_ps();
