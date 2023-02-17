@@ -19,35 +19,41 @@ use arrow_arith::aggregate::sum;
 use arrow_arith::arithmetic::{multiply_dyn, subtract_dyn};
 use arrow_array::cast::as_primitive_array;
 use arrow_array::types::Float32Type;
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
+use arrow_array::{Array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::utils::distance::{l2_distance, l2_distance_arrow};
-use lance::{arrow::FixedSizeListArrayExt, utils::testing::generate_random_array};
+use lance::utils::distance::{l2_distance_arrow, CosineDistance, Distance, L2Distance};
+use lance::utils::testing::generate_random_array;
 
 fn bench_distance(c: &mut Criterion) {
-    const DIMENSION: i32 = 1024;
+    const DIMENSION: usize = 1024;
 
     let key = generate_random_array(DIMENSION as usize);
     // 1M of 1024 D vectors. 4GB in memory.
-    let values = generate_random_array(1024 * 1024 * DIMENSION as usize);
-    let target = FixedSizeListArray::try_new(values, DIMENSION).unwrap();
+    let target = generate_random_array(1024 * 1024 * DIMENSION as usize);
+    let dist = L2Distance::new();
 
     c.bench_function("L2 distance", |b| {
         b.iter(|| {
-            l2_distance(&key, &target).unwrap();
+            dist.distance(&key, &target, DIMENSION).unwrap();
+        })
+    });
+
+    c.bench_function("Cosine Distance", |b| {
+        let dist = CosineDistance::default();
+        b.iter(|| {
+            dist.distance(&key, &target, DIMENSION).unwrap();
         })
     });
 
     c.bench_function("L2_distance_arrow", |b| {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter(
-                (0..target.len())
+                (0..target.len() / DIMENSION)
                     .map(|idx| {
-                        let left = target.value(idx);
-                        let arr = left.as_any().downcast_ref::<Float32Array>().unwrap();
-                        l2_distance_arrow(&key, arr)
+                        let arr = target.slice(idx * DIMENSION, DIMENSION);
+                        l2_distance_arrow(&key, as_primitive_array(arr.as_ref()))
                     })
                     .map(|d| Some(d)),
             )
@@ -57,10 +63,10 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("L2_distance_arrow_arith", |b| {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter(
-                (0..target.len())
+                (0..target.len() / DIMENSION)
                     .map(|idx| {
-                        let left = target.value(idx);
-                        let sub = subtract_dyn(left.as_ref(), &key).unwrap();
+                        let arr = target.slice(idx * DIMENSION, DIMENSION);
+                        let sub = subtract_dyn(arr.as_ref(), &key).unwrap();
                         let mul = multiply_dyn(&sub, &sub).unwrap();
                         sum(as_primitive_array::<Float32Type>(&mul)).unwrap_or(0.0)
                     })
