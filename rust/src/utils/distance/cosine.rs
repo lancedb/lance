@@ -95,9 +95,7 @@ impl Distance for CosineDistance {
         {
             use std::arch::is_aarch64_feature_detected;
             if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-                unsafe {
-                    return Ok(cosine_dist_simd(from, to, dimension));
-                }
+                return Ok(cosine_dist_simd(from, to, dimension));
             }
         }
 
