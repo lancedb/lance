@@ -44,5 +44,23 @@ pub fn normalize(vector: &[f32]) -> f32 {
     0.0
 }
 
+#[cfg(any(target_arch = "x86_64"))]
+#[target_feature(enable = "fma")]
+#[inline]
+pub unsafe fn add_fma(x: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut sums = x;
+    let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
+    // [x0+x4, x1+x5, ..]
+    let x = _mm256_add_ps(sums, shift);
+    shift = _mm256_permute_ps(sums, 14);
+    sums = _mm256_add_ps(sums, shift);
+    sums = _mm256_hadd_ps(sums, sums);
+    let mut results: [f32; 8] = [0f32; 8];
+    _mm256_storeu_ps(results.as_mut_ptr(), sums);
+    results[0]
+}
+
 #[cfg(test)]
 mod tests {}

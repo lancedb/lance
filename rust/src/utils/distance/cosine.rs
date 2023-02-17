@@ -69,6 +69,26 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
     vaddvq_f32(xy) / vaddvq_f32(y_sq)
 }
 
+#[cfg(any(target_arch = "x86_64"))]
+#[target_feature(enable = "fma")]
+#[inline]
+unsafe fn cosine_dist_fma(x: &[f32], y: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    use super::compute::add_fma;
+
+    let len = x.len();
+    let mut xy = _mm256_setzero_ps();
+    let mut y_sq = _mm256_setzero_ps();
+    for i in (0..len).step_by(8) {
+        // Cache line-aligned
+        let left = _mm256_load_ps(x.as_ptr().add(i));
+        let right = _mm256_load_ps(y.as_ptr().add(i));
+        xy = _mm256_fmadd_ps(xy, left, right);
+        y_sq = _mm256_fmadd_ps(y_sq, right, right);
+    }
+    add_fma(xy) / add_fma(y_sq)
+}
+
 #[inline]
 fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<Float32Array> {
     assert!(to.len() % dimension == 0);
@@ -80,7 +100,14 @@ fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) ->
     let n = to.len() / dimension;
     let mut builder = Float32Builder::with_capacity(n);
     for y in to_values.chunks_exact(dimension) {
-        builder.append_value(unsafe { cosine_dist_neon(x, y) } / x_sq);
+        #[cfg(any(target_arch = "aarch64"))]
+        {
+            builder.append_value(unsafe { cosine_dist_neon(x, y) } / x_sq);
+        }
+        #[cfg(any(target_arch = "x86_64"))]
+        {
+            builder.append_value(unsafe { cosine_dist_fma(x, y) } / x_sq);
+        }
     }
     Arc::new(builder.finish())
 }
@@ -92,10 +119,17 @@ impl Distance for CosineDistance {
         to: &Float32Array,
         dimension: usize,
     ) -> Result<Arc<Float32Array>> {
-        #[cfg(any(target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         {
             use std::arch::is_aarch64_feature_detected;
             if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+                return Ok(cosine_dist_simd(from, to, dimension));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
                 return Ok(cosine_dist_simd(from, to, dimension));
             }
         }
