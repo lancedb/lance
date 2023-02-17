@@ -17,7 +17,7 @@
 
 //! Extend Arrow Functionality
 //!
-//! To improve Arrow-RS egonomitic
+//! To improve Arrow-RS ergonomic
 
 use std::sync::Arc;
 

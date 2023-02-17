@@ -49,7 +49,7 @@ pub(crate) fn simd_alignment() -> i32 {
 }
 
 /// Distance trait
-pub trait Distance: Sync + Send + Clone + Default + Sized {
+pub trait Distance: Sync + Send {
     /// Compute distance from one vector to an array of vectors (batch mode).
     ///
     /// Parameters
@@ -68,3 +68,5 @@ pub trait Distance: Sync + Send + Clone + Default + Sized {
         dimension: usize,
     ) -> Result<Arc<Float32Array>>;
 }
+
+pub trait DistanceFn : Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> {}

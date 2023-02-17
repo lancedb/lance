@@ -31,7 +31,10 @@ mod kmeans;
 mod pq;
 
 use super::IndexParams;
-use crate::{Error, Result};
+use crate::{
+    utils::distance::{CosineDistance, Distance, L2Distance},
+    Result, Error
+};
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -119,12 +122,17 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
-    pub fn ivf_pq(num_partitions: u32, nbits: u8, num_sub_vectors: u32, metrics_type: MetricsType) -> Self {
+    pub fn ivf_pq(
+        num_partitions: u32,
+        nbits: u8,
+        num_sub_vectors: u32,
+        metrics_type: MetricsType,
+    ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
-            metrics_type
+            metrics_type,
         }
     }
 }

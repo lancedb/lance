@@ -559,6 +559,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
 
         let rng = SmallRng::from_entropy();
+        let distance_func: Box<dyn Distance> =
         let mut ivf_model = Ivf::new(
             train_kmean_model(
                 &scanner,
@@ -655,6 +656,7 @@ async fn train_kmean_model(
     k: usize,
     max_iterations: u32,
     rng: impl Rng,
+    dist_func: Box<dyn Distance>,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);
@@ -676,7 +678,8 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids = super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng).await?;
+    let centroids =
+        super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng, dist_func).await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,
