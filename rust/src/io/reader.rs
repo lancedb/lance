@@ -21,7 +21,8 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray, UInt64Array,
+    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
@@ -306,6 +307,7 @@ async fn read_array(
         _read_fixed_stride_array(reader, field, batch_id, params).await
     } else {
         match data_type {
+            Null => read_null_array(reader, field, batch_id).await,
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
                 read_binary_array(reader, field, batch_id, params).await
             }
@@ -350,6 +352,16 @@ async fn _read_fixed_stride_array(
         params.clone(),
     )
     .await
+}
+
+async fn read_null_array(
+    reader: &FileReader<'_>,
+    field: &Field,
+    batch_id: i32,
+) -> Result<ArrayRef> {
+    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+
+    Ok(Arc::new(NullArray::new(page_info.length)))
 }
 
 async fn read_binary_array(
