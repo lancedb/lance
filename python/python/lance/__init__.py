@@ -32,7 +32,9 @@ __all__ = [
 def dataset(
     uri: Union[str, Path],
     version: Optional[int] = None,
+    *,
     asof: Optional[Union[datetime, pd.Timestamp, str]] = None,
+    tag: Optional[str] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -41,8 +43,9 @@ def dataset(
     ----------
     uri : str
         Address to the Lance dataset.
-    version : optional, int
-        If specified, load a specific version of the Lance dataset. Else, loads the latest version.
+    version : optional, int or str
+        If specified, loads the version of the Lance dataset specified by the integer id or the tag.
+        Else, loads the latest version.
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given argument value.
         If a version is already specified, this arg is ignored.
@@ -56,9 +59,19 @@ def dataset(
         )
         if ver_cutoff is None:
             raise ValueError(
-                f"{ts_cutoff} is earlier than the first version of this dataset"
+                f"No version of the dataset at '{uri}' created before: {ts_cutoff}"
             )
         else:
             return LanceDataset(uri, ver_cutoff)
+    elif version is None and tag is not None:
+        ver_w_tag = max(
+            [v["version"] for v in ds.versions() if v["tag"] == tag], default=None
+        )  # REVIEW: anticipate seeing multiple `release` tags, and picking the latest?
+        if ver_w_tag is None:
+            raise ValueError(
+                f"No version of the dataset at '{uri}' tagged with: '{tag}'"
+            )
+        else:
+            return LanceDataset(uri, ver_w_tag)
     else:
         return ds

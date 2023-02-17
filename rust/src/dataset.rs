@@ -67,6 +67,9 @@ pub struct Version {
     /// version number
     pub version: u64,
 
+    /// user-supplied version tag (optional)
+    pub tag: Option<String>,
+
     /// Timestamp of dataset creation in UTC.
     pub timestamp: DateTime<Utc>,
 
@@ -79,6 +82,7 @@ impl From<&Manifest> for Version {
     fn from(m: &Manifest) -> Self {
         Self {
             version: m.version,
+            tag: m.tag.clone(),
             timestamp: m.timestamp(),
             metadata: BTreeMap::default(),
         }

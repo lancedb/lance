@@ -181,6 +181,11 @@ impl Dataset {
                 .map(|v| {
                     let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
+                    if let Some(tag) = &v.tag {
+                        dict.set_item("tag", tag).unwrap();
+                    } else {
+                        dict.set_item("tag", py.None()).unwrap();
+                    }
                     dict.set_item("timestamp", v.timestamp.timestamp_nanos())
                         .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
@@ -247,6 +252,8 @@ impl Dataset {
 #[pyfunction(name = "_write_dataset", module = "_lib")]
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
+    let version_tag = get_version_tag(options)?;
+
     Runtime::new()?.block_on(async move {
         let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
             let scanner: Scanner = reader.extract()?;
@@ -265,6 +272,18 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
     })
+}
+
+fn get_version_tag(options: &PyDict) -> PyResult<Option<String>> {
+    if let Some(tag) = options.get_item("tag") {
+        if tag.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(tag.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {

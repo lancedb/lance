@@ -512,6 +512,7 @@ def write_dataset(
     mode: str = "create",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
+    tag: Optional[str] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -534,7 +535,8 @@ def write_dataset(
         The max number of rows to write before starting a new file
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
-
+    tag: str, optional
+        A tag to add to the dataset version after this commit
     """
     if isinstance(data_obj, pd.DataFrame):
         reader = pa.Table.from_pandas(data_obj, schema=schema).to_reader()
@@ -551,6 +553,7 @@ def write_dataset(
     # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
+        "tag": tag,
         "mode": mode,
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
