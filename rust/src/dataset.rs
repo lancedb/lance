@@ -263,6 +263,10 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = latest_manifest.map_or(1, |m| m.version + 1);
+        if matches!(params.mode, WriteMode::Overwrite) {
+            // If overwrite, invalidate index
+            manifest.index_section = None;
+        }
         let duration_since_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
@@ -616,6 +620,7 @@ mod tests {
     use super::*;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
+    use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
@@ -1016,12 +1021,11 @@ mod tests {
         assert_eq!(400, dataset.count_rows().await.unwrap());
     }
 
-    #[ignore]
     #[tokio::test]
     async fn test_create_index() {
         let test_dir = tempdir().unwrap();
 
-        let dimension = 32;
+        let dimension = 16;
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "embeddings",
             DataType::FixedSizeList(
@@ -1031,27 +1035,45 @@ mod tests {
             false,
         )]));
 
-        let float_arr = generate_random_array(100 * dimension as usize);
+        let float_arr = generate_random_array(512 * dimension as usize);
         let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches =
-            RecordBatchBuffer::new(vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
-            ]);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![vectors.clone()],
+        )
+        .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
 
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::default();
+        let mut params = VectorIndexParams::default();
+        params.num_partitions = 10;
+        params.num_sub_vectors = 2;
         dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
 
-        let err = dataset
-            .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
-            .await;
-        assert!(err.is_err())
+        if simd_alignment() > 1 {
+            params.num_sub_vectors = 10;
+            let err = dataset
+                .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+                .await;
+            assert!(err.is_err())
+        }
+
+        let mut write_params = WriteParams::default();
+        write_params.mode = Overwrite;
+        let batches =
+            RecordBatchBuffer::new(vec![
+                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
+            ]);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert!(dataset.manifest.index_section.is_none());
     }
 }
