@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
-    Query, VectorIndex,
+    MetricsType, Query, VectorIndex,
 };
 use crate::io::{
     object_reader::{read_message, ObjectReader},
@@ -175,6 +175,8 @@ pub struct IvfPQIndexMetadata {
     /// The version of dataset where this index was built.
     dataset_version: u64,
 
+    metrics_type: MetricsType,
+
     // Ivf related
     ivf: Ivf,
 
@@ -205,6 +207,10 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                         stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
                     },
                 ],
+                metric_type: match idx.metrics_type {
+                    MetricsType::L2 => pb::VectorMetricType::L2.into(),
+                    MetricsType::Cosine => pb::VectorMetricType::Cosine.into(),
+                },
             })),
         })
     }
@@ -246,6 +252,12 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                             column: idx.columns[0].clone(),
                             dimension: vidx.dimension,
                             dataset_version: idx.dataset_version,
+                            metrics_type: pb::VectorMetricType::from_i32(vidx.metric_type)
+                                .ok_or(Error::Index(format!(
+                                    "Unsupported metric type value: {}",
+                                    vidx.metric_type
+                                )))?
+                                .into(),
                             ivf,
                             pq,
                         })
@@ -463,6 +475,9 @@ pub struct IvfPqIndexBuilder<'a> {
 
     dimension: usize,
 
+    /// Metric type.
+    metric_type: MetricsType,
+
     /// Number of IVF partitions.
     num_partitions: u32,
 
@@ -483,6 +498,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
         column: &str,
         num_partitions: u32,
         num_sub_vectors: u32,
+        metric_type: MetricsType,
     ) -> Result<Self> {
         let field = dataset.schema().field(column).ok_or(Error::IO(format!(
             "Column {column} does not exist in the dataset"
@@ -496,6 +512,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
             name: name.to_string(),
             column: column.to_string(),
             dimension: d as usize,
+            metric_type,
             num_partitions,
             num_sub_vectors,
             nbits: 8,
@@ -620,6 +637,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
             pq: pq.into(),
+            metrics_type: self.metric_type,
         };
 
         let metadata = pb::Index::try_from(&metadata)?;

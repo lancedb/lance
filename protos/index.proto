@@ -87,6 +87,15 @@ message VectorIndexStage {
   }
 }
 
+// Metric Type for Vector Index
+enum VectorMetricType {
+  // L2 (Euclidean) Distance
+  L2 = 0;
+
+  // Cosine Distance
+  Cosine = 1;
+}
+
 // Vector Index Metadata
 message VectorIndex {
   // Index specification version.
@@ -103,4 +112,7 @@ message VectorIndex {
   // let stages = vec![Ivf{}, PQ{num_bits: 8, num_sub_vectors: 16}]
   // ```
   repeated VectorIndexStage stages = 3;
+
+  // Vector distance metrics type
+  VectorMetricType metric_type = 4;
 }

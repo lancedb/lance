@@ -70,6 +70,31 @@ pub trait VectorIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
 }
 
+/// Distance metrics type.
+#[derive(Debug, Clone, Copy)]
+pub enum MetricsType {
+    L2,
+    Cosine,
+}
+
+impl From<super::pb::VectorMetricType> for MetricsType {
+    fn from(proto: super::pb::VectorMetricType) -> Self {
+        match proto {
+            super::pb::VectorMetricType::L2 => Self::L2,
+            super::pb::VectorMetricType::Cosine => Self::Cosine,
+        }
+    }
+}
+
+impl From<MetricsType> for super::pb::VectorMetricType {
+    fn from(mt: MetricsType) -> Self {
+        match mt {
+            MetricsType::L2 => Self::L2,
+            MetricsType::Cosine => Self::Cosine,
+        }
+    }
+}
+
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
     // This is hard coded for IVF_PQ for now. Can refactor later to support more.
@@ -81,6 +106,9 @@ pub struct VectorIndexParams {
 
     /// the number of sub vectors used in PQ.
     pub num_sub_vectors: u32,
+
+    /// Vector distance metrics type.
+    pub metrics_type: MetricsType,
 }
 
 impl VectorIndexParams {
@@ -91,11 +119,12 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
-    pub fn ivf_pq(num_partitions: u32, nbits: u8, num_sub_vectors: u32) -> Self {
+    pub fn ivf_pq(num_partitions: u32, nbits: u8, num_sub_vectors: u32, metrics_type: MetricsType) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
+            metrics_type
         }
     }
 }
@@ -106,6 +135,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
+            metrics_type: MetricsType::L2,
         }
     }
 }
