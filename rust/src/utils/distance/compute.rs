@@ -1,0 +1,48 @@
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Optimized compute routines
+
+#[cfg(any(target_arch = "aarch64"))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn normalize_neon(vector: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+
+    let buf = [0.0_f32; 4];
+    let mut sum = vld1q_f32(buf.as_ptr());
+    let n = vector.len();
+    for i in (0..n).step_by(4) {
+        let x = vld1q_f32(vector.as_ptr().add(i));
+        sum = vfmaq_f32(sum, x, x);
+    }
+    vaddvq_f32(sum)
+}
+
+/// Normalize a vector.
+///
+/// The parameters must be cache line aligned. For example, from
+/// Arrow Arrays, i.e., Float32Array
+#[inline]
+pub fn normalize(vector: &[f32]) -> f32 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return normalize_neon(vector);
+    }
+
+    0.0
+}
+
+#[cfg(test)]
+mod tests {}
