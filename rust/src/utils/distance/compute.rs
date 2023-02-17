@@ -27,7 +27,21 @@ unsafe fn normalize_neon(vector: &[f32]) -> f32 {
         let x = vld1q_f32(vector.as_ptr().add(i));
         sum = vfmaq_f32(sum, x, x);
     }
-    vaddvq_f32(sum)
+    vaddvq_f32(sum).sqrt()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
+#[inline]
+unsafe fn normalize_fma(vector: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let mut sums = _mm256_setzero_ps();
+    for i in (0..vector.len()).step_by(8) {
+        // Cache line-aligned
+        let x = _mm256_load_ps(vector.as_ptr().add(i));
+        sums = _mm256_fmadd_ps(x, x, sums);
+    }
+    add_fma(sums).sqrt()
 }
 
 /// Normalize a vector.
@@ -41,7 +55,15 @@ pub fn normalize(vector: &[f32]) -> f32 {
         return normalize_neon(vector);
     }
 
-    0.0
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            return normalize_fma(vector);
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    vector.iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
 #[cfg(any(target_arch = "x86_64"))]
@@ -53,7 +75,7 @@ pub unsafe fn add_fma(x: std::arch::x86_64::__m256) -> f32 {
     let mut sums = x;
     let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
     // [x0+x4, x1+x5, ..]
-    let x = _mm256_add_ps(sums, shift);
+    sums = _mm256_add_ps(sums, shift);
     shift = _mm256_permute_ps(sums, 14);
     sums = _mm256_add_ps(sums, shift);
     sums = _mm256_hadd_ps(sums, sums);

@@ -83,8 +83,8 @@ unsafe fn cosine_dist_fma(x: &[f32], y: &[f32]) -> f32 {
         // Cache line-aligned
         let left = _mm256_load_ps(x.as_ptr().add(i));
         let right = _mm256_load_ps(y.as_ptr().add(i));
-        xy = _mm256_fmadd_ps(xy, left, right);
-        y_sq = _mm256_fmadd_ps(y_sq, right, right);
+        xy = _mm256_fmadd_ps(left, right, xy);
+        y_sq = _mm256_fmadd_ps(right, right, y_sq);
     }
     add_fma(xy) / add_fma(y_sq)
 }
