@@ -179,7 +179,7 @@ impl<'a> FileWriter<'a> {
     }
 
     async fn write_null_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
-        let page_info = PageInfo::new(0, array.len());
+        let page_info = PageInfo::new(self.object_writer.tell(), array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
