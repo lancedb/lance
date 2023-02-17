@@ -1053,5 +1053,15 @@ mod tests {
             .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
+
+        if simd_alignment() > 1 {
+            params.num_sub_vectors = 10;
+            let err = dataset
+                .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
+                .await;
+            assert!(err.is_err())
+        }
     }
+
+
 }
