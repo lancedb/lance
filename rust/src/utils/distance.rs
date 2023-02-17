@@ -15,13 +15,14 @@
 //! Compute distance
 //!
 
-use std::{sync::Arc};
+use std::sync::Arc;
 
-use arrow_array::{Float32Array};
+use arrow_array::Float32Array;
 
 pub mod compute;
-mod cosine;
-mod l2;
+pub mod cosine;
+pub mod l2;
+
 pub use cosine::CosineDistance;
 pub use l2::L2Distance;
 

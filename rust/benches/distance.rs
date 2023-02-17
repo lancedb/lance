@@ -23,7 +23,7 @@ use arrow_array::{Array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance::utils::distance::{l2_distance_arrow, CosineDistance, Distance, L2Distance};
+use lance::utils::distance::{l2::l2_distance_arrow, CosineDistance, Distance, L2Distance};
 use lance::utils::testing::generate_random_array;
 
 fn bench_distance(c: &mut Criterion) {
