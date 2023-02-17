@@ -19,6 +19,9 @@ use std::{fmt::Debug, sync::Arc};
 
 use arrow_array::{Array, Float32Array};
 
+mod cosine;
+pub use cosine::CosineDistance;
+
 use crate::Result;
 
 #[inline]
