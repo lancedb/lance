@@ -66,7 +66,7 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
         xy = vfmaq_f32(xy, left, right);
         y_sq = vfmaq_f32(y_sq, right, right);
     }
-    vaddvq_f32(xy) / vaddvq_f32(y_sq)
+    vaddvq_f32(xy) / (vaddvq_f32(y_sq).sqrt())
 }
 
 #[cfg(any(target_arch = "x86_64"))]
