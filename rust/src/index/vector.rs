@@ -21,9 +21,9 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::datatypes::Schema;
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
-use crate::datatypes::Schema;
 
 pub mod flat;
 pub mod ivf;
@@ -51,7 +51,8 @@ pub struct Query {
 
 impl Query {
     pub(crate) fn get_column_id(&self, schema: &Schema) -> Result<i32> {
-        schema.field(&self.column)
+        schema
+            .field(&self.column)
             .map(|f| f.id)
             .ok_or_else(|| Error::Schema("Vector column not in schema".to_string()))
     }

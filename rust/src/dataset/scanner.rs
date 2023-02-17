@@ -265,8 +265,13 @@ impl Scanner {
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node =
-                    self.scan(&data_dir, manifest.clone(), self.fragments.clone(),true, vector_scan_projection);
+                let scan_node = self.scan(
+                    &data_dir,
+                    manifest.clone(),
+                    self.fragments.clone(),
+                    true,
+                    vector_scan_projection,
+                );
                 let knn_node = self.knn(scan_node, &q);
                 self.take(knn_node, projection)
             }
