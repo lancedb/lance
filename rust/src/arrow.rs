@@ -94,6 +94,7 @@ impl DataTypeExt for DataType {
                 | Decimal256(_, _)
                 | FixedSizeList(_, _)
                 | FixedSizeBinary(_)
+                | Duration(_)
         )
     }
 
@@ -118,6 +119,7 @@ impl DataTypeExt for DataType {
             Self::Date64 => 8,
             Self::Time32(_) => 4,
             Self::Time64(_) => 8,
+            Self::Duration(_) => 8,
             Self::Decimal128(_, _) => 16,
             Self::Decimal256(_, _) => 32,
             Self::FixedSizeBinary(s) => *s as usize,
