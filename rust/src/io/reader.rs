@@ -21,7 +21,8 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, Int64Array, LargeListArray, ListArray, RecordBatch, StructArray, UInt64Array,
+    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
@@ -306,6 +307,7 @@ async fn read_array(
         _read_fixed_stride_array(reader, field, batch_id, params).await
     } else {
         match data_type {
+            Null => read_null_array(reader, field, batch_id, params),
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
                 read_binary_array(reader, field, batch_id, params).await
             }
@@ -350,6 +352,50 @@ async fn _read_fixed_stride_array(
         params.clone(),
     )
     .await
+}
+
+fn read_null_array(
+    reader: &FileReader<'_>,
+    field: &Field,
+    batch_id: i32,
+    params: &ReadBatchParams,
+) -> Result<ArrayRef> {
+    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+
+    let length_output = match params {
+        ReadBatchParams::Indices(indices) => {
+            if indices.is_empty() {
+                0
+            } else {
+                let idx_max = *indices.values().iter().max().unwrap() as u64;
+                if idx_max >= page_info.length.try_into().unwrap() {
+                    return Err(Error::IO(format!(
+                        "NullArray Reader: request([{}]) out of range: [0..{}]",
+                        idx_max, page_info.length
+                    )));
+                }
+                indices.len()
+            }
+        }
+        _ => {
+            let (idx_start, idx_end) = match params {
+                ReadBatchParams::Range(r) => (r.start, r.end),
+                ReadBatchParams::RangeFull => (0, page_info.length),
+                ReadBatchParams::RangeTo(r) => (0, r.end),
+                ReadBatchParams::RangeFrom(r) => (r.start, page_info.length),
+                _ => unreachable!(),
+            };
+            if idx_end > page_info.length {
+                return Err(Error::IO(format!(
+                    "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
+                    idx_start, idx_end, page_info.length
+                )));
+            }
+            idx_end - idx_start
+        }
+    };
+
+    Ok(Arc::new(NullArray::new(length_output)))
 }
 
 async fn read_binary_array(
@@ -470,7 +516,8 @@ mod tests {
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, StringArray, StructArray, UInt8Array,
+        DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray,
+        UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -743,5 +790,81 @@ mod tests {
 
         assert_eq!(batch, actual_batch);
         println!("actual batch: {:?}", actual_batch);
+    }
+
+    #[tokio::test]
+    async fn test_read_nullable_arrays() {
+        use arrow_array::Array;
+
+        // create a record batch with a null array column
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, false),
+            ArrowField::new("n", DataType::Null, true),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(0..100)),
+            Arc::new(NullArray::new(100)),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+
+        // write to a lance file
+        let store = ObjectStore::memory();
+        let path = Path::from("/takes");
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        // read the file back
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+
+        async fn read_array_w_params(
+            reader: &FileReader<'_>,
+            field: &Field,
+            params: ReadBatchParams,
+        ) -> ArrayRef {
+            let arr = read_array(reader, field, 0, &params)
+                .await
+                .expect("Error reading back the null array from file");
+            arr
+        }
+
+        let arr = read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFull).await;
+        assert_eq!(100, arr.len());
+        assert_eq!(100, arr.null_count());
+
+        let arr =
+            read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::Range(10..25)).await;
+        assert_eq!(15, arr.len());
+        assert_eq!(15, arr.null_count());
+
+        let arr =
+            read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFrom(60..)).await;
+        assert_eq!(40, arr.len());
+        assert_eq!(40, arr.null_count());
+
+        let arr =
+            read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeTo(..25)).await;
+        assert_eq!(25, arr.len());
+        assert_eq!(25, arr.null_count());
+
+        let arr = read_array_w_params(
+            &reader,
+            &schema.fields[1],
+            ReadBatchParams::Indices(UInt32Array::from(vec![1, 9, 30, 72])),
+        )
+        .await;
+        assert_eq!(4, arr.len());
+        assert_eq!(4, arr.null_count());
+
+        // raise error if take indices are out of bounds
+        let params = ReadBatchParams::Indices(UInt32Array::from(vec![1, 9, 30, 72, 100]));
+        let arr = read_array(&reader, &schema.fields[1], 0, &params);
+        assert!(arr.await.is_err());
+
+        // raise error if range indices are out of bounds
+        let params = ReadBatchParams::RangeTo(..107);
+        let arr = read_array(&reader, &schema.fields[1], 0, &params);
+        assert!(arr.await.is_err());
     }
 }

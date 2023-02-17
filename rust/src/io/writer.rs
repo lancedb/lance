@@ -155,6 +155,7 @@ impl<'a> FileWriter<'a> {
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         let data_type = array.data_type();
         match data_type {
+            DataType::Null => self.write_null_array(field, array).await,
             dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
             dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
             DataType::Dictionary(key_type, _) => {
@@ -175,6 +176,12 @@ impl<'a> FileWriter<'a> {
                 )))
             }
         }
+    }
+
+    async fn write_null_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        let page_info = PageInfo::new(self.object_writer.tell(), array.len());
+        self.page_table.set(field.id, self.batch_id, page_info);
+        Ok(())
     }
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
@@ -278,7 +285,7 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        LargeListArray, ListArray, StringArray, UInt8Array,
+        LargeListArray, ListArray, NullArray, StringArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -289,6 +296,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_file() {
         let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("null", DataType::Null, true),
             ArrowField::new("bool", DataType::Boolean, true),
             ArrowField::new("i", DataType::Int64, true),
             ArrowField::new("f", DataType::Float32, false),
@@ -374,6 +382,7 @@ mod tests {
             LargeListArray::try_new(large_list_values, &large_list_offsets).unwrap();
 
         let columns: Vec<ArrayRef> = vec![
+            Arc::new(NullArray::new(100)),
             Arc::new(BooleanArray::from_iter(
                 (0..100).map(|f| Some(f % 3 == 0)).collect::<Vec<_>>(),
             )),
