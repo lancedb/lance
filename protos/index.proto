@@ -43,6 +43,8 @@ message Index {
   oneof implementation {
     VectorIndex vector_index = 5;
   }
+
+  uint64 max_fragment_id = 6;
 }
 
 // Inverted Index File Metadata.
