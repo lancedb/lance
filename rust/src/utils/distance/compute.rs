@@ -52,13 +52,13 @@ unsafe fn normalize_fma(vector: &[f32]) -> f32 {
 pub fn normalize(vector: &[f32]) -> f32 {
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
-        return normalize_neon(vector);
+        normalize_neon(vector)
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         unsafe {
-            return normalize_fma(vector);
+            normalize_fma(vector)
         }
     }
 
