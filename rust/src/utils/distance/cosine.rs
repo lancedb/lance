@@ -54,7 +54,7 @@ fn cosine_dist(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
+unsafe fn cosine_dist_neon(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
     use std::arch::aarch64::*;
     let len = x.len();
     let buf = [0.0_f32; 4];
@@ -66,13 +66,13 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
         xy = vfmaq_f32(xy, left, right);
         y_sq = vfmaq_f32(y_sq, right, right);
     }
-    vaddvq_f32(xy) / (vaddvq_f32(y_sq).sqrt())
+    vaddvq_f32(xy) / (x_norm * vaddvq_f32(y_sq).sqrt())
 }
 
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 #[inline]
-unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32]) -> f32 {
+unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
     use super::compute::add_fma;
     use std::arch::x86_64::*;
 
@@ -85,7 +85,7 @@ unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32]) -> f32 {
         xy = _mm256_fmadd_ps(x, y, xy);
         y_sq = _mm256_fmadd_ps(y, y, y_sq);
     }
-    add_fma(xy) / (add_fma(y_sq).sqrt())
+    add_fma(xy) / (x_norm * add_fma(y_sq).sqrt())
 }
 
 #[inline]
@@ -95,17 +95,17 @@ fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) ->
 
     let x = from.values();
     let to_values = to.values();
-    let x_sq = normalize(x);
+    let x_norm = normalize(x);
     let n = to.len() / dimension;
     let mut builder = Float32Builder::with_capacity(n);
     for y in to_values.chunks_exact(dimension) {
         #[cfg(any(target_arch = "aarch64"))]
         {
-            builder.append_value(unsafe { cosine_dist_neon(x, y) } / x_sq);
+            builder.append_value(unsafe { cosine_dist_neon(x, y, x_norm) });
         }
         #[cfg(any(target_arch = "x86_64"))]
         {
-            builder.append_value(unsafe { cosine_dist_fma(x, y) } / x_sq);
+            builder.append_value(unsafe { cosine_dist_fma(x, y, x_norm) });
         }
     }
     Arc::new(builder.finish())
