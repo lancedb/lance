@@ -72,21 +72,20 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32]) -> f32 {
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 #[inline]
-unsafe fn cosine_dist_fma(x: &[f32], y: &[f32]) -> f32 {
+unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32]) -> f32 {
     use super::compute::add_fma;
     use std::arch::x86_64::*;
 
-    let len = x.len();
+    let len = x_vector.len();
     let mut xy = _mm256_setzero_ps();
     let mut y_sq = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
-        // Cache line-aligned
-        let left = _mm256_load_ps(x.as_ptr().add(i));
-        let right = _mm256_load_ps(y.as_ptr().add(i));
-        xy = _mm256_fmadd_ps(left, right, xy);
-        y_sq = _mm256_fmadd_ps(right, right, y_sq);
+        let x = _mm256_load_ps(x_vector.as_ptr().add(i));
+        let y = _mm256_load_ps(y_vector.as_ptr().add(i));
+        xy = _mm256_fmadd_ps(x, y, xy);
+        y_sq = _mm256_fmadd_ps(y, y, y_sq);
     }
-    add_fma(xy) / add_fma(y_sq)
+    add_fma(xy) / (add_fma(y_sq).sqrt())
 }
 
 #[inline]
@@ -136,5 +135,28 @@ impl Distance for CosineDistance {
 
         // Fallback
         Ok(cosine_dist(from, to, dimension))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use approx::assert_relative_eq;
+
+    #[test]
+    fn test_cosine() {
+        let dist = CosineDistance::default();
+        let x: Float32Array = (1..9).map(|v| v as f32).collect();
+        let y: Float32Array = (100..108).map(|v| v as f32).collect();
+        let d = dist.distance(&x, &y, 8).unwrap();
+        // from scipy.spatial.distance.cosine
+        assert_relative_eq!(d.value(0), 0.90095701);
+
+        let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
+        let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
+        let d = dist.distance(&x, &y, 8).unwrap();
+        // from sklearn.metrics.pairwise import cosine_similarity
+        assert_relative_eq!(d.value(0), 0.8735806510613104);
     }
 }

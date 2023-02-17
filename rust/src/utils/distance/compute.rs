@@ -84,5 +84,4 @@ pub unsafe fn add_fma(x: std::arch::x86_64::__m256) -> f32 {
     results[0]
 }
 
-#[cfg(test)]
-mod tests {}
+
