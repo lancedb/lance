@@ -307,7 +307,7 @@ async fn read_array(
         _read_fixed_stride_array(reader, field, batch_id, params).await
     } else {
         match data_type {
-            Null => read_null_array(reader, field, batch_id, params).await,
+            Null => read_null_array(reader, field, batch_id, params),
             Utf8 | LargeUtf8 | Binary | LargeBinary => {
                 read_binary_array(reader, field, batch_id, params).await
             }
@@ -354,7 +354,7 @@ async fn _read_fixed_stride_array(
     .await
 }
 
-async fn read_null_array(
+fn read_null_array(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
