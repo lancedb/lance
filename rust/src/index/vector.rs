@@ -49,15 +49,6 @@ pub struct Query {
     pub refine_factor: Option<u32>,
 }
 
-impl Query {
-    pub(crate) fn get_column_id(&self, schema: &Schema) -> Result<i32> {
-        schema
-            .field(&self.column)
-            .map(|f| f.id)
-            .ok_or_else(|| Error::Schema("Vector column not in schema".to_string()))
-    }
-}
-
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
 pub trait VectorIndex {

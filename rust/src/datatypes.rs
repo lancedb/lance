@@ -624,6 +624,12 @@ impl Schema {
         self.fields.iter().find(|f| f.name == name)
     }
 
+    pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
+        self.field(column)
+            .map(|f| f.id)
+            .ok_or_else(|| Error::Schema("Vector column not in schema".to_string()))
+    }
+
     /// Recursively collect all the field IDs,
     pub(crate) fn field_ids(&self) -> Vec<i32> {
         // TODO: make a tree travesal iterator.

@@ -241,7 +241,7 @@ impl Scanner {
         let projection = &self.projections;
 
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
-            let column_id = q.get_column_id(self.dataset.schema())?;
+            let column_id = self.dataset.schema().field_id(q.column.as_str())?;
             let indices = if self.should_use_index() {
                 self.dataset.load_indices().await?
             } else {
@@ -251,13 +251,16 @@ impl Scanner {
             if let Some(index) = qcol_index {
                 // There is an index built for the column.
                 // We will use the index.
-                let ann_node = self.ann(q, &index);
-                let take_node = self.take(ann_node, projection);
-
                 if let Some(rf) = q.refine_factor {
                     if rf == 0 {
                         return Err(Error::IO("Refine factor can not be zero".to_string()));
                     }
+                }
+
+                let ann_node = self.ann(q, &index);
+                let take_node = self.take(ann_node, projection);
+
+                if q.refine_factor.is_some() {
                     self.knn(take_node, &q)
                 } else {
                     take_node
@@ -327,7 +330,7 @@ impl Scanner {
     /// Create an Execution plan to do indexed ANN search
     fn ann(&self, q: &Query, index: &&Index) -> Arc<dyn ExecutionPlan> {
         let mut inner_query = q.clone();
-        inner_query.k = q.k * std::cmp::max(1, q.refine_factor.unwrap_or(1) as usize);
+        inner_query.k = q.k * q.refine_factor.unwrap_or(1) as usize;
         Arc::new(KNNIndexExec::new(
             self.dataset.clone(),
             &index.uuid.to_string(),
