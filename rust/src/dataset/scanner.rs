@@ -305,6 +305,11 @@ impl Scanner {
             "Catalog names: {:?}",
             session_state.catalog_list().catalog_names()
         );
+        let logical_plan = session_state
+            .create_logical_plan("SELECT i FROM lance.default.t WHERE i > 10")
+            .await
+            .unwrap();
+        println!("Logical plan: {:?}", logical_plan);
 
         Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
