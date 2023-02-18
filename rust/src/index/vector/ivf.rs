@@ -175,7 +175,7 @@ pub struct IvfPQIndexMetadata {
     /// The version of dataset where this index was built.
     dataset_version: u64,
 
-    metrics_type: MetricType,
+    metric_type: MetricType,
 
     // Ivf related
     ivf: Ivf,
@@ -207,7 +207,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                         stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
                     },
                 ],
-                metric_type: match idx.metrics_type {
+                metric_type: match idx.metric_type {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
                 },
@@ -252,7 +252,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                             column: idx.columns[0].clone(),
                             dimension: vidx.dimension,
                             dataset_version: idx.dataset_version,
-                            metrics_type: pb::VectorMetricType::from_i32(vidx.metric_type)
+                            metric_type: pb::VectorMetricType::from_i32(vidx.metric_type)
                                 .ok_or(Error::Index(format!(
                                     "Unsupported metric type value: {}",
                                     vidx.metric_type
@@ -519,6 +519,29 @@ impl<'a> IvfPqIndexBuilder<'a> {
             kmeans_max_iters: 100,
         })
     }
+
+    fn sanity_check(&self) -> Result<()> {
+        // Step 1. Sanity check
+        let Some(field) = self.dataset.schema().field(&self.column) else {
+    return Err(Error::IO(format!(
+        "Building index: column {} does not exist in dataset: {:?}",
+        self.column, self.dataset
+    )));
+};
+        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
+            if !matches!(elem_type.data_type(), DataType::Float32) {
+                return Err(
+            Error::Index(
+                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+                elem_type.data_type())));
+            }
+        } else {
+            return Err(Error::Index(
+        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+        field.data_type())));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -535,24 +558,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         );
 
         // Step 1. Sanity check
-        let Some(field) = self.dataset.schema().field(&self.column) else {
-            return Err(Error::IO(format!(
-                "Building index: column {} does not exist in dataset: {:?}",
-                self.column, self.dataset
-            )));
-        };
-        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-            if !matches!(elem_type.data_type(), DataType::Float32) {
-                return Err(
-                    Error::Index(
-                        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-                        elem_type.data_type())));
-            }
-        } else {
-            return Err(Error::Index(
-                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-                field.data_type())));
-        }
+        self.sanity_check()?;
 
         // First, scan the dataset to train IVF models.
         let mut scanner = self.dataset.scan();
@@ -566,7 +572,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 self.num_partitions as usize,
                 self.kmeans_max_iters,
                 rng.clone(),
-                self.metric_type.clone().func(),
+                &self.metric_type,
             )
             .await?,
         );
@@ -576,7 +582,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
         // Assign parition ID and compute residual vectors.
-        let partitioned_batches = ivf_model.partition(&scanner).await?;
+        let partitioned_batches: Vec<RecordBatch> = vec![]; // ivf_model.partition(&scanner).await?;
 
         // Train PQ
         let mut pq =
@@ -638,7 +644,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
             pq: pq.into(),
-            metrics_type: self.metric_type.clone(),
+            metric_type: self.metric_type.clone(),
         };
 
         let metadata = pb::Index::try_from(&metadata)?;
@@ -656,9 +662,7 @@ async fn train_kmean_model(
     k: usize,
     max_iterations: u32,
     rng: impl Rng,
-    dist_func: Arc<
-        dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
-    >,
+    metric_type: &MetricType,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);
@@ -680,8 +684,15 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids =
-        super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng, dist_func).await?;
+    let centroids = super::kmeans::train_kmeans(
+        values,
+        dimension,
+        k,
+        max_iterations,
+        rng,
+        metric_type.func(),
+    )
+    .await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,

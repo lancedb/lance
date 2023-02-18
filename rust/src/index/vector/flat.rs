@@ -27,7 +27,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
-use super::{Query, VectorIndex, MetricType};
+use super::{MetricType, Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
 use crate::utils::distance::L2Distance;

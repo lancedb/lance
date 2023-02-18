@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{RecordBatch};
+use arrow_array::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
@@ -49,30 +49,26 @@ impl KNNFlatStream {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
-        let bg_thread =
-            tokio::spawn(async move {
-                let batch =
-                    match flat_search(RecordBatchStream::new(child), &q)
-                        .await
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tx.send(Err(DataFusionError::Execution(format!(
-                                "Failed to compute scores: {e}"
-                            ))))
-                            .await
-                            .expect("KNNFlat failed to send message");
-                            return;
-                        }
-                    };
-
-                if !tx.is_closed() {
-                    if let Err(e) = tx.send(Ok(batch)).await {
-                        eprintln!("KNNFlat tx.send error: {e}")
-                    };
+        let bg_thread = tokio::spawn(async move {
+            let batch = match flat_search(RecordBatchStream::new(child), &q).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tx.send(Err(DataFusionError::Execution(format!(
+                        "Failed to compute scores: {e}"
+                    ))))
+                    .await
+                    .expect("KNNFlat failed to send message");
+                    return;
                 }
-                drop(tx);
-            });
+            };
+
+            if !tx.is_closed() {
+                if let Err(e) = tx.send(Ok(batch)).await {
+                    eprintln!("KNNFlat tx.send error: {e}")
+                };
+            }
+            drop(tx);
+        });
 
         Self {
             rx,
@@ -103,16 +99,17 @@ pub struct KNNFlatExec {
 
 impl std::fmt::Debug for KNNFlatExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KNN(flat, k={}, metric={})", self.query.k, self.query.metric_type)
+        write!(
+            f,
+            "KNN(flat, k={}, metric={})",
+            self.query.k, self.query.metric_type
+        )
     }
 }
 
 impl KNNFlatExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, query: Query) -> Self {
-        Self {
-            input,
-            query,
-        }
+        Self { input, query }
     }
 }
 
@@ -150,10 +147,7 @@ impl ExecutionPlan for KNNFlatExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(KNNFlatStream::new(
-            input_stream,
-            &self.query,
-        )))
+        Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
