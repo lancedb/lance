@@ -19,8 +19,9 @@ use std::sync::Arc;
 use datafusion::{
     catalog::{
         catalog::{CatalogProvider, MemoryCatalogProvider},
-        schema::MemorySchemaProvider,
+        schema::{MemorySchemaProvider, SchemaProvider},
     },
+    datasource::TableProvider,
     execution::{
         context::SessionState,
         runtime_env::{RuntimeConfig, RuntimeEnv},
@@ -37,12 +38,12 @@ pub use knn::*;
 pub use scan::LanceScanExec;
 pub use take::GlobalTakeExec;
 
-use crate::dataset::Dataset;
 use crate::Result;
+use crate::{dataset::Dataset, io::datafusion::LanceTableProvider};
 
 /// Create a session state for a dataset, to serve the rest of I/Os.
 ///
-pub(crate) fn create_session_state(dataset: &Dataset) -> Result<SessionState> {
+pub(crate) fn create_session_state(dataset: Arc<Dataset>) -> Result<SessionState> {
     let session_config = SessionConfig::default();
     let runtime_config = RuntimeConfig::new();
     let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
@@ -50,8 +51,10 @@ pub(crate) fn create_session_state(dataset: &Dataset) -> Result<SessionState> {
 
     let catelog = Arc::new(MemoryCatalogProvider::new());
     let schema_provider = Arc::new(MemorySchemaProvider::new());
-    let table_provider = Arc::new()
-    // schema_provider.as_ref().register_table("t", table);
+    let table_provider: Arc<dyn TableProvider> = Arc::new(LanceTableProvider::new(dataset));
+    schema_provider
+        .as_ref()
+        .register_table("t".to_string(), table_provider);
     catelog
         .as_ref()
         .register_schema("default", schema_provider)?;

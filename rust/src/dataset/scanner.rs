@@ -300,7 +300,7 @@ impl Scanner {
             plan = self.limit_node(plan);
         }
 
-        let session_state = create_session_state(self.dataset.as_ref())?;
+        let session_state = create_session_state(self.dataset.clone())?;
         println!(
             "Catalog names: {:?}",
             session_state.catalog_list().catalog_names()
