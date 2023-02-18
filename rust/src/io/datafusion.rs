@@ -73,14 +73,14 @@ impl TableProvider for LanceTableProvider {
     /// parallelized or distributed.
     async fn scan(
         &self,
-        state: &SessionState,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        _state: &SessionState,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
         // limit can be used to reduce the amount scanned
         // from the datasource as a performance optimization.
         // If set, it contains the amount of rows needed by the `LogicalPlan`,
         // The datasource should return *at least* this number of rows if available.
-        limit: Option<usize>,
+        _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         todo!()
     }
@@ -88,7 +88,7 @@ impl TableProvider for LanceTableProvider {
     /// Tests whether the table provider can make use of a filter expression
     /// to optimise data retrieval.
     fn supports_filter_pushdown(&self, _filter: &Expr) -> Result<TableProviderFilterPushDown> {
-        Ok(TableProviderFilterPushDown::Unsupported)
+        Ok(TableProviderFilterPushDown::Inexact)
     }
 
     /// Get statistics for this table, if available

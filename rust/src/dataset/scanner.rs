@@ -498,14 +498,25 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("i > 50 AND st.p < 75.0").unwrap();
-        // assert_eq!(
-        //     scan.filter,
-        //     Some(Expr::BinaryOp {
-        //         left: Box::new(Expr::Identifier(Ident::new("i"))),
-        //         op: BinaryOperator::Gt,
-        //         right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
-        //     })
-        // );
+        assert_eq!(
+            scan.filter,
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("i"))),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
+                }),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::CompoundIdentifier(vec![
+                        Ident::new("st"),
+                        Ident::new("p")
+                    ])),
+                    op: BinaryOperator::Lt,
+                    right: Box::new(Expr::Value(Value::Number(String::from("75.0"), false))),
+                })
+            })
+        );
 
         let stream = scan.try_into_stream().await.unwrap();
         let data = stream.try_collect::<Vec<_>>().await.unwrap();

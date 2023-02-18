@@ -61,8 +61,5 @@ use sqlparser::ast::{Expr as SQLExpr, Value};
 //     todo!()
 // }
 
-
 #[cfg(test)]
-mod tests {
-
-}
+mod tests {}

@@ -27,12 +27,12 @@ use prost::bytes::Bytes;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+mod datafusion;
 pub(crate) mod exec;
 pub mod local;
 pub mod object_reader;
 pub mod object_store;
 pub mod object_writer;
-mod datafusion;
 mod reader;
 mod writer;
 

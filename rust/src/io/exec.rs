@@ -34,12 +34,11 @@ mod planner;
 mod scan;
 mod take;
 
+use crate::Result;
+use crate::{dataset::Dataset, io::datafusion::LanceTableProvider};
 pub use knn::*;
 pub use scan::LanceScanExec;
 pub use take::GlobalTakeExec;
-
-use crate::Result;
-use crate::{dataset::Dataset, io::datafusion::LanceTableProvider};
 
 /// Create a session state for a dataset, to serve the rest of I/Os.
 ///
@@ -61,10 +60,6 @@ pub(crate) fn create_session_state(dataset: Arc<Dataset>) -> Result<SessionState
     session_state
         .catalog_list()
         .register_catalog("lance".to_string(), catelog);
-    println!(
-        "Catalog: {:?}",
-        session_state.catalog_list().catalog_names()
-    );
 
     Ok(session_state)
 }
