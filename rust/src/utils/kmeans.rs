@@ -128,7 +128,7 @@ async fn kmeans_random_init<'a, D: Distance + 'static>(
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
-) -> KMean {
+) -> KMeans {
     assert!(data.len() > k * dimension);
 
     let chosen = (0..data.len() / dimension)
@@ -341,18 +341,22 @@ impl KMeans {
 
     /// Recompute the membership of each vector.
     ///
+    /// Parameters:
+    ///
+    /// - *data*: a `N * dimension` float32 array.
+    /// - *dist_fn*: the function to compute distances.
     async fn compute_membership(
         &self,
         data: Arc<Float32Array>,
-        dist_func: impl DistanceFn+ Copy + Send,
+        dist_fn: Arc<dyn DistanceFn + Sync + Send>,
     ) -> KMeanMembership {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let cluster_with_distances = stream::iter(0..n)
             // make tiles of input data to split between threads.
             .chunks(1024)
-            .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
-            .map(|(indices, (data, centroids))| async move {
+            .zip(repeat_with(|| (data.clone(), self.centroids.clone(), dist_fn.clone())))
+            .map(|(indices, (data, centroids, dist_func))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let mut results = vec![];
                     for idx in indices {
@@ -372,7 +376,6 @@ impl KMeans {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let k = self.k;
         KMeanMembership {
             centroids: self.centroids.clone(),
             data,
@@ -387,7 +390,7 @@ impl KMeans {
                 .flatten()
                 .map(|(_, d)| *d)
                 .collect(),
-            k,
+            k: self.k,
         }
     }
 }

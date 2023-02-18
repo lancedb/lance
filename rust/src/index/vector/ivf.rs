@@ -559,7 +559,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
 
         let rng = SmallRng::from_entropy();
-        let distance_func: Box<dyn Distance> =
+        let distance_func: Box<dyn Distance> = Box::new(L2Distance::default());
         let mut ivf_model = Ivf::new(
             train_kmean_model(
                 &scanner,
@@ -567,6 +567,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 self.num_partitions as usize,
                 self.kmeans_max_iters,
                 rng.clone(),
+                distance_func.clone(),
             )
             .await?,
         );
