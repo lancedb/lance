@@ -78,6 +78,7 @@ enum Commands {
         #[arg(short = 's', long, default_value_t = 8, value_name = "NUM")]
         num_sub_vectors: u32,
 
+        /// Distance metric type. Only support 'l2' and 'cosine'.
         #[arg(short = 'm', long, value_name = "DISTANCE")]
         metric_type: Option<String>,
     },
