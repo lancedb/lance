@@ -138,6 +138,30 @@ impl Distance for CosineDistance {
     }
 }
 
+pub fn cosine_distance(
+    from: &Float32Array,
+    to: &Float32Array,
+    dimension: usize,
+) -> Result<Arc<Float32Array>> {
+    #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::is_aarch64_feature_detected;
+            if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+                return Ok(cosine_dist_simd(from, to, dimension));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
+                return Ok(cosine_dist_simd(from, to, dimension));
+            }
+        }
+
+        // Fallback
+        Ok(cosine_dist(from, to, dimension))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

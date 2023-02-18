@@ -68,5 +68,3 @@ pub trait Distance: Sync + Send {
         dimension: usize,
     ) -> Result<Arc<Float32Array>>;
 }
-
-pub trait DistanceFn: Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> {}

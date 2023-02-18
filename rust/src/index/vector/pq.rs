@@ -28,6 +28,7 @@ use rand::SeedableRng;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::utils::distance::l2::l2_distance;
 use crate::utils::distance::Distance;
 use crate::Result;
 use crate::{arrow::*, utils::distance::L2Distance};
@@ -275,8 +276,15 @@ impl ProductQuantizer {
             // Centroids for one sub vector.
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
-            let centroids =
-                train_kmeans(flatten_array, dimension, num_centorids, 25, rng.clone()).await?;
+            let centroids = train_kmeans(
+                flatten_array,
+                dimension,
+                num_centorids,
+                25,
+                rng.clone(),
+                Arc::new(l2_distance),
+            )
+            .await?;
             // TODO: COPIED COPIED COPIED
             unsafe {
                 codebook_builder.append_trusted_len_iter(centroids.values().iter().copied());

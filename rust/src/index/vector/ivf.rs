@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
-    MetricsType, Query, VectorIndex,
+    MetricType, Query, VectorIndex,
 };
 use crate::io::{
     object_reader::{read_message, ObjectReader},
@@ -175,7 +175,7 @@ pub struct IvfPQIndexMetadata {
     /// The version of dataset where this index was built.
     dataset_version: u64,
 
-    metrics_type: MetricsType,
+    metrics_type: MetricType,
 
     // Ivf related
     ivf: Ivf,
@@ -208,8 +208,8 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                     },
                 ],
                 metric_type: match idx.metrics_type {
-                    MetricsType::L2 => pb::VectorMetricType::L2.into(),
-                    MetricsType::Cosine => pb::VectorMetricType::Cosine.into(),
+                    MetricType::L2 => pb::VectorMetricType::L2.into(),
+                    MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
                 },
             })),
         })
@@ -476,7 +476,7 @@ pub struct IvfPqIndexBuilder<'a> {
     dimension: usize,
 
     /// Metric type.
-    metric_type: MetricsType,
+    metric_type: MetricType,
 
     /// Number of IVF partitions.
     num_partitions: u32,
@@ -498,7 +498,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
         column: &str,
         num_partitions: u32,
         num_sub_vectors: u32,
-        metric_type: MetricsType,
+        metric_type: MetricType,
     ) -> Result<Self> {
         let field = dataset.schema().field(column).ok_or(Error::IO(format!(
             "Column {column} does not exist in the dataset"
@@ -559,7 +559,6 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         scanner.project(&[&self.column])?;
 
         let rng = SmallRng::from_entropy();
-        let distance_func: Box<dyn Distance> = Box::new(L2Distance::default());
         let mut ivf_model = Ivf::new(
             train_kmean_model(
                 &scanner,
@@ -567,7 +566,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
                 self.num_partitions as usize,
                 self.kmeans_max_iters,
                 rng.clone(),
-                distance_func.clone(),
+                self.metric_type.clone().func(),
             )
             .await?,
         );
@@ -639,7 +638,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
             pq: pq.into(),
-            metrics_type: self.metric_type,
+            metrics_type: self.metric_type.clone(),
         };
 
         let metadata = pb::Index::try_from(&metadata)?;
@@ -657,7 +656,9 @@ async fn train_kmean_model(
     k: usize,
     max_iterations: u32,
     rng: impl Rng,
-    dist_func: Box<dyn Distance>,
+    dist_func: Arc<
+        dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
+    >,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);

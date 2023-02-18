@@ -25,7 +25,7 @@ use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
 use super::distance::l2::l2_distance;
-use super::distance::{Distance, DistanceFn};
+use super::distance::{Distance};
 use crate::Result;
 use crate::{arrow::*, Error};
 

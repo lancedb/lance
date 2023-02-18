@@ -32,8 +32,8 @@ mod pq;
 
 use super::IndexParams;
 use crate::{
-    utils::distance::{CosineDistance, Distance, L2Distance},
-    Result, Error
+    utils::distance::{cosine::cosine_distance, l2::l2_distance},
+    Result, Error,
 };
 
 /// Query parameters for the vector indices
@@ -50,6 +50,9 @@ pub struct Query {
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
     pub refine_factor: Option<u32>,
+
+    /// Distance metric type
+    pub metric_type: MetricType,
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
@@ -75,12 +78,33 @@ pub trait VectorIndex {
 
 /// Distance metrics type.
 #[derive(Debug, Clone, Copy)]
-pub enum MetricsType {
+pub enum MetricType {
     L2,
     Cosine,
 }
 
-impl From<super::pb::VectorMetricType> for MetricsType {
+impl MetricType {
+    pub fn func(
+        &self,
+    ) -> Arc<dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync>
+    {
+        match self {
+            Self::L2 => Arc::new(l2_distance),
+            Self::Cosine => Arc::new(cosine_distance),
+        }
+    }
+}
+
+impl std::fmt::Display for MetricType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            Self::L2 => "l2",
+            Self::Cosine => "cosine",
+        })
+    }
+}
+
+impl From<super::pb::VectorMetricType> for MetricType {
     fn from(proto: super::pb::VectorMetricType) -> Self {
         match proto {
             super::pb::VectorMetricType::L2 => Self::L2,
@@ -89,11 +113,11 @@ impl From<super::pb::VectorMetricType> for MetricsType {
     }
 }
 
-impl From<MetricsType> for super::pb::VectorMetricType {
-    fn from(mt: MetricsType) -> Self {
+impl From<MetricType> for super::pb::VectorMetricType {
+    fn from(mt: MetricType) -> Self {
         match mt {
-            MetricsType::L2 => Self::L2,
-            MetricsType::Cosine => Self::Cosine,
+            MetricType::L2 => Self::L2,
+            MetricType::Cosine => Self::Cosine,
         }
     }
 }
@@ -111,7 +135,7 @@ pub struct VectorIndexParams {
     pub num_sub_vectors: u32,
 
     /// Vector distance metrics type.
-    pub metrics_type: MetricsType,
+    pub metrics_type: MetricType,
 }
 
 impl VectorIndexParams {
@@ -126,7 +150,7 @@ impl VectorIndexParams {
         num_partitions: u32,
         nbits: u8,
         num_sub_vectors: u32,
-        metrics_type: MetricsType,
+        metrics_type: MetricType,
     ) -> Self {
         Self {
             num_partitions,
@@ -143,7 +167,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
-            metrics_type: MetricsType::L2,
+            metrics_type: MetricType::L2,
         }
     }
 }
