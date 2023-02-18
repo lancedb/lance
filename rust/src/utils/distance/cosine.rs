@@ -59,7 +59,7 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
         xy = vfmaq_f32(xy, left, right);
         y_sq = vfmaq_f32(y_sq, right, right);
     }
-    vaddvq_f32(xy) / (x_norm * vaddvq_f32(y_sq).sqrt())
+    1.0 - vaddvq_f32(xy) / (x_norm * vaddvq_f32(y_sq).sqrt())
 }
 
 #[cfg(any(target_arch = "x86_64"))]
@@ -78,7 +78,7 @@ unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f3
         xy = _mm256_fmadd_ps(x, y, xy);
         y_sq = _mm256_fmadd_ps(y, y, y_sq);
     }
-    add_fma(xy) / (x_norm * add_fma(y_sq).sqrt())
+    1.0 - add_fma(xy) / (x_norm * add_fma(y_sq).sqrt())
 }
 
 #[inline]
@@ -94,11 +94,11 @@ fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) ->
     for y in to_values.chunks_exact(dimension) {
         #[cfg(any(target_arch = "aarch64"))]
         {
-            builder.append_value(unsafe { 1.0 - cosine_dist_neon(x, y, x_norm) });
+            builder.append_value(unsafe { cosine_dist_neon(x, y, x_norm) });
         }
         #[cfg(any(target_arch = "x86_64"))]
         {
-            builder.append_value(unsafe { 1.0 - cosine_dist_fma(x, y, x_norm) });
+            builder.append_value(unsafe { cosine_dist_fma(x, y, x_norm) });
         }
     }
     Arc::new(builder.finish())

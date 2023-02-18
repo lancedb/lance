@@ -201,7 +201,7 @@ impl Scanner {
     }
 
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
-    pub fn distance_metrics(&mut self, metric_type: MetricType) -> &mut Self {
+    pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = metric_type
         }
