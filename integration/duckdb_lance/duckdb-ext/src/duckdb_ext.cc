@@ -37,23 +37,7 @@ duckdb_logical_type duckdb_create_struct_type(idx_t n_pairs,
                                               const duckdb_logical_type *types) {
   auto *stype = new duckdb::LogicalType;
   *stype = duckdb::LogicalType::STRUCT(build_child_list(n_pairs, names, types));
-  return stype;
-}
-
-void duckdb_list_vector_set_size(duckdb_vector vector, idx_t size) {
-  if (!vector) {
-    return;
-  }
-  auto v = (duckdb::Vector *)vector;
-  return duckdb::ListVector::SetListSize(*v, size);
-}
-
-void duckdb_list_vector_reserve(duckdb_vector vector, idx_t required_capacity) {
-  if (!vector) {
-    return;
-  }
-  auto v = (duckdb::Vector *)vector;
-  duckdb::ListVector::Reserve(*v, required_capacity);
+  return reinterpret_cast<duckdb_logical_type>(stype);
 }
 
 }
