@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
 };
 use rand::{seq::IteratorRandom, Rng};
 
 use crate::{
-    utils::{
-        distance::Distance,
-        kmeans::{KMeans, KMeansParams},
-    },
+    utils::kmeans::{KMeans, KMeansParams},
     Result,
 };
 
@@ -35,7 +34,9 @@ pub async fn train_kmeans(
     k: usize,
     max_iterations: u32,
     mut rng: impl Rng,
-    dist_func: impl Distance + 'static,
+    dist_func: Arc<
+        dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
+    >,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {

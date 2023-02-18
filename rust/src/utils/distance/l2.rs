@@ -176,6 +176,14 @@ impl L2Distance {
     }
 }
 
+pub fn l2_distance(
+    from: &Float32Array,
+    to: &Float32Array,
+    dimension: usize,
+) -> Result<Arc<Float32Array>> {
+    L2Distance {}.distance(from, to, dimension)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
