@@ -145,11 +145,11 @@ impl ListVector {
 
     /// Reserve the capacity for its child node.
     fn reserve(&self, capacity: usize) {
-        unsafe { duckdb_list_vector_reserve(self.entries.ptr, capacity as u64) }
+        unsafe { duckdb_list_vector_reserve(self.entries.ptr, capacity as u64); }
     }
 
     pub fn set_len(&self, new_len: usize) {
-        unsafe { duckdb_list_vector_set_size(self.entries.ptr, new_len as u64) }
+        unsafe { duckdb_list_vector_set_size(self.entries.ptr, new_len as u64); }
     }
 }
 
