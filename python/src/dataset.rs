@@ -22,8 +22,6 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
-use lance::index::vector::VectorIndexParams;
-use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict, PyInt, PyLong};
@@ -31,9 +29,13 @@ use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
-use ::lance::dataset::scanner::Scanner as LanceScanner;
-use ::lance::dataset::Dataset as LanceDataset;
-use lance::dataset::{Version, WriteMode, WriteParams};
+use lance::dataset::{
+    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
+};
+use lance::index::{
+    vector::{MetricType, VectorIndexParams},
+    IndexType,
+};
 
 const DEFAULT_NPROBS: usize = 1;
 
@@ -229,7 +231,11 @@ impl Dataset {
         params.metric_type = match metric_type.to_lowercase().as_str() {
             "l2" => MetricType::L2,
             "cosine" => MetricType::Cosine,
-            _ => return Err(PyValueError::new_err(format!("Metric type '{metric_type}' is not supported"))),
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Metric type '{metric_type}' is not supported"
+                )))
+            }
         };
 
         self_

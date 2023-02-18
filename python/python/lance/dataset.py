@@ -247,7 +247,7 @@ class LanceDataset(pa.dataset.Dataset):
         column: str,
         index_type: str,
         name: Optional[str] = None,
-        metric: str = "l2",
+        metric: str = "L2",
         **kwargs,
     ):
         """Create index on column
@@ -264,7 +264,7 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "l2" and "cosine". Default is "l2".
+            The distance metric type, i.e., "L2" and "cosine". Default is "L2".
         kwargs :
             Parameters passed to the index building process.
 
@@ -325,7 +325,7 @@ class LanceDataset(pa.dataset.Dataset):
                         "Set `force_build=True` to continue build anyways."
                     )
 
-        if metric not in ["l2", "cosine"]:
+        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine"]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":

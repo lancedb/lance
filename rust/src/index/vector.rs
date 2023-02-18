@@ -138,7 +138,7 @@ pub struct VectorIndexParams {
     pub num_sub_vectors: u32,
 
     /// Vector distance metrics type.
-    pub metrics_type: MetricType,
+    pub metric_type: MetricType,
 }
 
 impl VectorIndexParams {
@@ -153,13 +153,13 @@ impl VectorIndexParams {
         num_partitions: u32,
         nbits: u8,
         num_sub_vectors: u32,
-        metrics_type: MetricType,
+        metric_type: MetricType,
     ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
-            metrics_type,
+            metric_type,
         }
     }
 }
@@ -170,7 +170,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
-            metrics_type: MetricType::L2,
+            metric_type: MetricType::L2,
         }
     }
 }
