@@ -47,16 +47,14 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     MetricType, Query, VectorIndex,
 };
+use crate::arrow::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
 };
-use crate::utils::distance::{Distance, L2Distance};
-use crate::{arrow::*, index::pb::vector_index_stage::Stage};
-use crate::{dataset::scanner::Scanner, index::pb};
 use crate::{
-    dataset::{Dataset, ROW_ID},
-    index::{IndexBuilder, IndexType},
+    dataset::{scanner::Scanner, Dataset, ROW_ID},
+    index::{pb, pb::vector_index_stage::Stage, IndexBuilder, IndexType},
 };
 use crate::{Error, Result};
 
@@ -73,6 +71,8 @@ pub struct IvfPQIndex<'a> {
 
     /// Number of bits used for product quantization centroids.
     pq: Arc<ProductQuantizer>,
+
+    metric_type: MetricType,
 }
 
 impl<'a> IvfPQIndex<'a> {
@@ -106,6 +106,7 @@ impl<'a> IvfPQIndex<'a> {
             reader,
             ivf: index_metadata.ivf,
             pq: index_metadata.pq,
+            metric_type: index_metadata.metric_type.into(),
         })
     }
 
@@ -121,8 +122,14 @@ impl<'a> IvfPQIndex<'a> {
         let residual_key = subtract_dyn(key, &partition_centroids)?;
 
         // TODO: Keep PQ index in LRU
-        let pq_index =
-            PQIndex::load(self.reader.as_ref(), self.pq.as_ref(), offset, length).await?;
+        let pq_index = PQIndex::load(
+            self.reader.as_ref(),
+            self.pq.as_ref(),
+            self.metric_type,
+            offset,
+            length,
+        )
+        .await?;
         pq_index.search(as_primitive_array(&residual_key), k)
     }
 }
@@ -130,7 +137,9 @@ impl<'a> IvfPQIndex<'a> {
 #[async_trait]
 impl VectorIndex for IvfPQIndex<'_> {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        let partition_ids = self.ivf.find_partitions(&query.key, query.nprobs)?;
+        let partition_ids = self
+            .ivf
+            .find_partitions(&query.key, query.nprobs, self.metric_type)?;
         let candidates = stream::iter(partition_ids.values())
             .then(|part_id| async move {
                 self.search_in_partition(*part_id as usize, &query.key, query.k)
@@ -321,7 +330,12 @@ impl Ivf {
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
-    fn find_partitions(&self, query: &Float32Array, nprobes: usize) -> Result<UInt32Array> {
+    fn find_partitions(
+        &self,
+        query: &Float32Array,
+        nprobes: usize,
+        metric_type: MetricType,
+    ) -> Result<UInt32Array> {
         if query.len() != self.dimension() {
             return Err(Error::IO(format!(
                 "Ivf::find_partition: dimension mismatch: {} != {}",
@@ -329,9 +343,9 @@ impl Ivf {
                 self.dimension()
             )));
         }
-        let dist_func = L2Distance::new();
+        let dist_func = metric_type.func();
         let centroid_values = self.centroids.values();
-        let distances = dist_func.distance(
+        let distances = dist_func(
             query,
             as_primitive_array(centroid_values.as_ref()),
             self.dimension(),
@@ -349,7 +363,11 @@ impl Ivf {
     /// Scan the dataset and assign the partition ID for each row.
     ///
     /// Currently, it keeps batches in the memory.
-    async fn partition(&self, scanner: &Scanner) -> Result<Vec<RecordBatch>> {
+    async fn partition(
+        &self,
+        scanner: &Scanner,
+        metric_type: MetricType,
+    ) -> Result<Vec<RecordBatch>> {
         let schema = scanner.schema()?;
         let column_name = schema.field(0).name();
         let batches_with_partition_id = scanner
@@ -365,13 +383,12 @@ impl Ivf {
                 let values = self.centroids.values();
                 let centroids = as_primitive_array(values.as_ref()).clone();
                 let partition_ids = tokio::task::spawn_blocking(move || {
-                    let dist_func = L2Distance::new();
+                    let dist_func = metric_type.func();
                     (0..vectors.len())
                         .map(|idx| {
                             let arr = vectors.value(idx);
                             let f: &Float32Array = as_primitive_array(&arr);
-                            Ok(argmin(dist_func.distance(f, &centroids, f.len())?.as_ref())
-                                .unwrap())
+                            Ok(argmin(dist_func(f, &centroids, f.len())?.as_ref()).unwrap())
                         })
                         .collect::<Result<Vec<u32>>>()
                 })
@@ -542,6 +559,25 @@ impl<'a> IvfPqIndexBuilder<'a> {
         }
         Ok(())
     }
+
+    /// Train IVF partitions using kmeans.
+    async fn train_ivf_model(&self) -> Result<Ivf> {
+        let mut scanner = self.dataset.scan();
+        scanner.project(&[&self.column])?;
+
+        let rng = SmallRng::from_entropy();
+        Ok(Ivf::new(
+            train_kmeans_model(
+                &scanner,
+                self.dimension,
+                self.num_partitions as usize,
+                self.kmeans_max_iters,
+                rng.clone(),
+                self.metric_type,
+            )
+            .await?,
+        ))
+    }
 }
 
 #[async_trait]
@@ -561,28 +597,14 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         self.sanity_check()?;
 
         // First, scan the dataset to train IVF models.
-        let mut scanner = self.dataset.scan();
-        scanner.project(&[&self.column])?;
-
-        let rng = SmallRng::from_entropy();
-        let mut ivf_model = Ivf::new(
-            train_kmean_model(
-                &scanner,
-                self.dimension,
-                self.num_partitions as usize,
-                self.kmeans_max_iters,
-                rng.clone(),
-                &self.metric_type,
-            )
-            .await?,
-        );
+        let mut ivf_model = self.train_ivf_model().await?;
 
         // A new scanner, with row id to build inverted index.
-        scanner = self.dataset.scan();
+        let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
         // Assign parition ID and compute residual vectors.
-        let partitioned_batches: Vec<RecordBatch> = vec![]; // ivf_model.partition(&scanner).await?;
+        let partitioned_batches = ivf_model.partition(&scanner, self.metric_type).await?;
 
         // Train PQ
         let mut pq =
@@ -591,7 +613,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
 
         let pq_code = pq
-            .fit_transform(as_fixed_size_list_array(residual_vector))
+            .fit_transform(as_fixed_size_list_array(residual_vector), self.metric_type)
             .await?;
 
         const PQ_CODE_COLUMN: &str = "__pq_code";
@@ -656,13 +678,16 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
     }
 }
 
-async fn train_kmean_model(
+async fn train_kmeans_model(
     scanner: &Scanner,
     dimension: usize,
     k: usize,
     max_iterations: u32,
     rng: impl Rng,
-    metric_type: &MetricType,
+    metric_type: MetricType,
+    // metric_type: Arc<
+    //     dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
+    // >,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);
@@ -684,15 +709,8 @@ async fn train_kmean_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids = super::kmeans::train_kmeans(
-        values,
-        dimension,
-        k,
-        max_iterations,
-        rng,
-        metric_type.func(),
-    )
-    .await?;
+    let centroids =
+        super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng, metric_type).await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,

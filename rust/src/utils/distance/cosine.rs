@@ -20,14 +20,7 @@ use std::sync::Arc;
 use arrow_array::Float32Array;
 
 use super::compute::normalize;
-use super::Distance;
 use crate::Result;
-
-/// Cosine Distance
-///
-/// <https://en.wikipedia.org/wiki/Cosine_similarity>
-#[derive(Debug, Clone, Default)]
-pub struct CosineDistance {}
 
 /// Fallback Cosine Distance function.
 fn cosine_dist(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<Float32Array> {
@@ -111,33 +104,9 @@ fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) ->
     Arc::new(builder.finish())
 }
 
-impl Distance for CosineDistance {
-    fn distance(
-        &self,
-        from: &Float32Array,
-        to: &Float32Array,
-        dimension: usize,
-    ) -> Result<Arc<Float32Array>> {
-        #[cfg(target_arch = "aarch64")]
-        {
-            use std::arch::is_aarch64_feature_detected;
-            if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-                return Ok(cosine_dist_simd(from, to, dimension));
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
-                return Ok(cosine_dist_simd(from, to, dimension));
-            }
-        }
-
-        // Fallback
-        Ok(cosine_dist(from, to, dimension))
-    }
-}
-
+/// Cosine Distance
+///
+/// <https://en.wikipedia.org/wiki/Cosine_similarity>
 pub fn cosine_distance(
     from: &Float32Array,
     to: &Float32Array,

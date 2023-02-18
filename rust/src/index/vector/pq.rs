@@ -25,13 +25,13 @@ use arrow_select::take::take;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
+use crate::arrow::*;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::utils::distance::l2::l2_distance;
-use crate::utils::distance::Distance;
 use crate::Result;
-use crate::{arrow::*, utils::distance::L2Distance};
+
+use super::MetricType;
 
 /// Product Quantization Index.
 ///
@@ -55,6 +55,8 @@ pub struct PQIndex<'a> {
 
     /// ROW Id used to refer to the actual row in dataset.
     pub row_ids: Arc<UInt64Array>,
+
+    metric_type: MetricType,
 }
 
 impl<'a> PQIndex<'a> {
@@ -62,6 +64,7 @@ impl<'a> PQIndex<'a> {
     pub async fn load(
         reader: &dyn ObjectReader,
         pq: &'a ProductQuantizer,
+        metric_type: MetricType,
         offset: usize,
         length: usize,
     ) -> Result<PQIndex<'a>> {
@@ -80,6 +83,7 @@ impl<'a> PQIndex<'a> {
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
             pq,
+            metric_type,
         })
     }
 
@@ -94,11 +98,11 @@ impl<'a> PQIndex<'a> {
         let mut distance_table: Vec<f32> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
-        let dist_func = L2Distance::default();
+        let dist_func = self.metric_type.func();
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i);
-            let distances = dist_func.distance(
+            let distances = dist_func(
                 as_primitive_array(&from),
                 &subvec_centroids,
                 sub_vector_length,
@@ -209,6 +213,7 @@ impl ProductQuantizer {
     async fn transform(
         &self,
         sub_vectors: &[Arc<FixedSizeListArray>],
+        metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
         assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -220,15 +225,14 @@ impl ProductQuantizer {
             .zip(stream::iter(all_centroids))
             .map(|(vec, centroid)| async move {
                 tokio::task::spawn_blocking(move || {
-                    let dist_func = L2Distance::new();
+                    let dist_func = metric_type.func();
                     // TODO Use tiling to improve cache efficiency.
                     (0..vec.len())
                         .map(|i| {
                             let value = vec.value(i);
                             let vector: &Float32Array = as_primitive_array(value.as_ref());
                             let id = argmin(
-                                dist_func
-                                    .distance(vector, centroid.as_ref(), vector.len())
+                                dist_func(vector, centroid.as_ref(), vector.len())
                                     .unwrap()
                                     .as_ref(),
                             )
@@ -258,7 +262,11 @@ impl ProductQuantizer {
     }
 
     /// Train a [ProductQuantizer] using an array of vectors.
-    pub async fn fit_transform(&mut self, data: &FixedSizeListArray) -> Result<FixedSizeListArray> {
+    pub async fn fit_transform(
+        &mut self,
+        data: &FixedSizeListArray,
+        metric_type: MetricType,
+    ) -> Result<FixedSizeListArray> {
         assert!(data.value_length() % self.num_sub_vectors as i32 == 0);
         assert_eq!(data.value_type(), DataType::Float32);
         assert_eq!(data.null_count(), 0);
@@ -282,7 +290,7 @@ impl ProductQuantizer {
                 num_centorids,
                 25,
                 rng.clone(),
-                Arc::new(l2_distance),
+                crate::index::vector::MetricType::L2,
             )
             .await?;
             // TODO: COPIED COPIED COPIED
@@ -292,7 +300,7 @@ impl ProductQuantizer {
         }
         let pd_centroids = codebook_builder.finish();
         self.codebook = Some(Arc::new(pd_centroids));
-        self.transform(&sub_vectors).await
+        self.transform(&sub_vectors, metric_type).await
     }
 }
 

@@ -17,20 +17,17 @@
 
 //! Flat Vector Index.
 
-use std::sync::Arc;
-
 use arrow::array::as_primitive_array;
-use arrow_array::{cast::as_struct_array, ArrayRef, Float32Array, RecordBatch, StructArray};
+use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
-use super::{MetricType, Query, VectorIndex};
+use super::{Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
-use crate::utils::distance::L2Distance;
 use crate::{Error, Result};
 
 /// Flat Vector Index.

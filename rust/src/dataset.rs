@@ -388,7 +388,7 @@ impl Dataset {
                     column,
                     vec_params.num_partitions,
                     vec_params.num_sub_vectors,
-                    vec_params.metrics_type,
+                    vec_params.metrics_type.clone(),
                 )?;
                 builder.build().await?
             }

@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
 };
 use rand::{seq::IteratorRandom, Rng};
 
+use crate::index::vector::MetricType;
 use crate::{
     utils::kmeans::{KMeans, KMeansParams},
     Result,
@@ -34,9 +33,7 @@ pub async fn train_kmeans(
     k: usize,
     max_iterations: u32,
     mut rng: impl Rng,
-    dist_func: Arc<
-        dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
-    >,
+    metric_type: MetricType,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {
@@ -67,8 +64,9 @@ pub async fn train_kmeans(
 
     let params = KMeansParams {
         max_iters: max_iterations,
+        metric_type,
         ..Default::default()
     };
-    let model = KMeans::new_with_params(&data, dimension, k, &params, dist_func).await;
+    let model = KMeans::new_with_params(&data, dimension, k, &params).await;
     Ok(model.centroids.as_ref().clone())
 }
