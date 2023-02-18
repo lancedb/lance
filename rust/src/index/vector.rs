@@ -21,7 +21,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::datatypes::Schema;
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
 
@@ -33,7 +32,7 @@ mod pq;
 use super::IndexParams;
 use crate::{
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
-    Result, Error,
+    Result,
 };
 
 /// Query parameters for the vector indices
