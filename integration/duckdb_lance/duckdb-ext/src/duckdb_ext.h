@@ -20,14 +20,4 @@ extern "C" {
 DUCKDB_EXTENSION_API duckdb_logical_type duckdb_create_struct_type(
     idx_t n_pairs, const char** names, const duckdb_logical_type* types);
 
-// https://github.com/duckdb/duckdb/pull/6155/
-typedef struct {
-	uint64_t offset;
-	uint64_t length;
-} duckdb_list_entry;
-
-DUCKDB_API void duckdb_list_vector_set_size(duckdb_vector vector, idx_t size);
-
-DUCKDB_API void duckdb_list_vector_reserve(duckdb_vector vector, idx_t required_capacity);
-
 };

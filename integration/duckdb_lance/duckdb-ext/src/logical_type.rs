@@ -48,7 +48,6 @@ pub enum LogicalTypeId {
     Map = DUCKDB_TYPE_DUCKDB_TYPE_MAP,
     Uuid = DUCKDB_TYPE_DUCKDB_TYPE_UUID,
     Union = DUCKDB_TYPE_DUCKDB_TYPE_UNION,
-    Json = DUCKDB_TYPE_DUCKDB_TYPE_JSON,
 }
 
 impl From<u32> for LogicalTypeId {
@@ -82,7 +81,6 @@ impl From<u32> for LogicalTypeId {
             DUCKDB_TYPE_DUCKDB_TYPE_MAP => Self::Map,
             DUCKDB_TYPE_DUCKDB_TYPE_UUID => Self::Uuid,
             DUCKDB_TYPE_DUCKDB_TYPE_UNION => Self::Union,
-            DUCKDB_TYPE_DUCKDB_TYPE_JSON => Self::Json,
             _ => panic!(),
         }
     }

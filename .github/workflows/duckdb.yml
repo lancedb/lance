@@ -5,8 +5,8 @@ on:
       - main
   pull_request:
     paths:
-      - ./integration/duckdb_lance
-      - .github/workflows/duckdb*
+      - ./integration/duckdb_lance/*
+      - .github/workflows/duckdb.yml
 jobs:
   Linux:
     runs-on: ubuntu-22.04

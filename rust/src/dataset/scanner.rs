@@ -36,7 +36,7 @@ use sqlparser::parser::Parser;
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::vector::Query;
+use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
 
@@ -178,6 +178,7 @@ impl Scanner {
             k,
             nprobs: 1,
             refine_factor: None,
+            metric_type: MetricType::L2,
         });
         Ok(self)
     }
@@ -196,6 +197,14 @@ impl Scanner {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)
         };
+        self
+    }
+
+    /// Change the distance [MetricType], i.e, L2 or Cosine distance.
+    pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.metric_type = metric_type
+        }
         self
     }
 
@@ -240,50 +249,49 @@ impl Scanner {
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
 
-        let indices = if self.should_use_index() {
-            self.dataset.load_indices().await?
-        } else {
-            vec![]
-        };
-
-        // TODO: refactor to a DataFusion QueryPlanner
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
-            let column_id = self
-                .dataset
-                .schema()
-                .field(&q.column)
-                .expect("vector column does not exist")
-                .id;
-
-            if let Some(rf) = q.refine_factor {
-                if rf == 0 {
-                    return Err(Error::IO("Refine factor can not be zero".to_string()));
-                }
-            }
-            let nn_node: Arc<dyn ExecutionPlan> =
-                if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
-                    // There is an index built for the column.
-                    // We will use the index.
-                    self.ann(q, &index)
-                } else {
-                    let vector_scan_projection =
-                        Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                    let scan_node =
-                        self.scan(&data_dir, manifest.clone(), true, vector_scan_projection);
-                    self.knn(scan_node, &q)
-                };
-
-            let take_node = self.take(nn_node, projection);
-
-            if q.refine_factor.is_some() {
-                self.knn(take_node, &q)
+            let column_id = self.dataset.schema().field_id(q.column.as_str())?;
+            let indices = if self.should_use_index() {
+                self.dataset.load_indices().await?
             } else {
-                take_node
+                vec![]
+            };
+            let qcol_index = indices.iter().find(|i| i.fields.contains(&column_id));
+            if let Some(index) = qcol_index {
+                // There is an index built for the column.
+                // We will use the index.
+                if let Some(rf) = q.refine_factor {
+                    if rf == 0 {
+                        return Err(Error::IO("Refine factor can not be zero".to_string()));
+                    }
+                }
+
+                let ann_node = self.ann(q, &index);
+                let take_node = self.take(ann_node, projection);
+
+                if q.refine_factor.is_some() {
+                    self.knn(take_node, &q)
+                } else {
+                    take_node
+                }
+            } else {
+                let vector_scan_projection =
+                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+                let scan_node = self.scan(
+                    &data_dir,
+                    manifest.clone(),
+                    self.fragments.clone(),
+                    true,
+                    vector_scan_projection,
+                );
+                let knn_node = self.knn(scan_node, &q);
+                self.take(knn_node, projection)
             }
         } else {
             self.scan(
                 &data_dir,
                 manifest,
+                self.fragments.clone(),
                 with_row_id,
                 Arc::new(self.projections.clone()),
             )
@@ -307,15 +315,16 @@ impl Scanner {
         &self,
         data_dir: &Path,
         manifest: Arc<Manifest>,
+        fragments: Arc<Vec<Fragment>>,
         with_row_id: bool,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.object_store.clone(),
             data_dir.clone(),
-            self.fragments.clone(),
+            fragments,
             projection,
-            manifest.clone(),
+            manifest,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,
@@ -330,7 +339,7 @@ impl Scanner {
     /// Create an Execution plan to do indexed ANN search
     fn ann(&self, q: &Query, index: &&Index) -> Arc<dyn ExecutionPlan> {
         let mut inner_query = q.clone();
-        inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
+        inner_query.k = q.k * q.refine_factor.unwrap_or(1) as usize;
         Arc::new(KNNIndexExec::new(
             self.dataset.clone(),
             &index.uuid.to_string(),

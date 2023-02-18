@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Float32Array};
 
-use super::Distance;
 use crate::Result;
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
@@ -122,58 +121,45 @@ fn l2_distance_simd(
     Ok(Arc::new(scores))
 }
 
-/// L2 (Euclidean) distance.
-#[derive(Debug, Default, Clone)]
-pub struct L2Distance {}
+pub fn l2_distance(
+    from: &Float32Array,
+    to: &Float32Array,
+    dimension: usize,
+) -> Result<Arc<Float32Array>> {
+    assert_eq!(from.len(), dimension);
+    assert_eq!(to.len() % dimension, 0);
 
-impl Distance for L2Distance {
-    fn distance(
-        &self,
-        from: &Float32Array,
-        to: &Float32Array,
-        dimension: usize,
-    ) -> Result<Arc<Float32Array>> {
-        assert_eq!(from.len(), dimension);
-        assert_eq!(to.len() % dimension, 0);
-
-        #[cfg(any(target_arch = "x86_64"))]
-        {
-            if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
-                return l2_distance_simd(from, to, dimension);
-            }
+    #[cfg(any(target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
+            return l2_distance_simd(from, to, dimension);
         }
+    }
 
-        #[cfg(any(target_arch = "aarch64"))]
-        {
-            use std::arch::is_aarch64_feature_detected;
-            if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
-                return l2_distance_simd(from, to, dimension);
-            }
+    #[cfg(any(target_arch = "aarch64"))]
+    {
+        use std::arch::is_aarch64_feature_detected;
+        if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+            return l2_distance_simd(from, to, dimension);
         }
-
-        // Fallback
-        use arrow_array::cast::as_primitive_array;
-        let n = to.len() / dimension;
-        let scores: Float32Array = unsafe {
-            Float32Array::from_trusted_len_iter(
-                (0..n)
-                    .map(|idx| {
-                        l2_distance_arrow(
-                            from,
-                            as_primitive_array(to.slice(idx * dimension, dimension).as_ref()),
-                        )
-                    })
-                    .map(Some),
-            )
-        };
-        Ok(Arc::new(scores))
     }
-}
 
-impl L2Distance {
-    pub fn new() -> Self {
-        Self {}
-    }
+    // Fallback
+    use arrow_array::cast::as_primitive_array;
+    let n = to.len() / dimension;
+    let scores: Float32Array = unsafe {
+        Float32Array::from_trusted_len_iter(
+            (0..n)
+                .map(|idx| {
+                    l2_distance_arrow(
+                        from,
+                        as_primitive_array(to.slice(idx * dimension, dimension).as_ref()),
+                    )
+                })
+                .map(Some),
+        )
+    };
+    Ok(Arc::new(scores))
 }
 
 #[cfg(test)]
@@ -196,9 +182,7 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = L2Distance::new()
-            .distance(&point, as_primitive_array(mat.values().as_ref()), 8)
-            .unwrap();
+        let scores = l2_distance(&point, as_primitive_array(mat.values().as_ref()), 8).unwrap();
 
         assert_eq!(
             scores.as_ref(),
@@ -210,7 +194,7 @@ mod tests {
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = L2Distance::new().distance(&point, &mat, 5).unwrap();
+        let scores = l2_distance(&point, &mat, 5).unwrap();
 
         assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
@@ -262,7 +246,7 @@ mod tests {
         ]
         .into();
 
-        let d = L2Distance::new().distance(&q, &values, 32).unwrap();
+        let d = l2_distance(&q, &values, 32).unwrap();
         assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }
