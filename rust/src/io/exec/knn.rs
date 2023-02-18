@@ -35,7 +35,6 @@ use crate::dataset::Dataset;
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
-use crate::utils::distance::L2Distance;
 
 /// KNN node for post-filtering.
 pub struct KNNFlatStream {
@@ -51,18 +50,17 @@ impl KNNFlatStream {
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batch =
-                match flat_search(RecordBatchStream::new(child), &q, L2Distance::new()).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tx.send(Err(DataFusionError::Execution(format!(
-                            "Failed to compute scores: {e}"
-                        ))))
-                        .await
-                        .expect("KNNFlat failed to send message");
-                        return;
-                    }
-                };
+            let batch = match flat_search(RecordBatchStream::new(child), &q).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tx.send(Err(DataFusionError::Execution(format!(
+                        "Failed to compute scores: {e}"
+                    ))))
+                    .await
+                    .expect("KNNFlat failed to send message");
+                    return;
+                }
+            };
 
             if !tx.is_closed() {
                 if let Err(e) = tx.send(Ok(batch)).await {
@@ -101,7 +99,11 @@ pub struct KNNFlatExec {
 
 impl std::fmt::Debug for KNNFlatExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "KNN(flat, k={})", self.query.k)
+        write!(
+            f,
+            "KNN(flat, k={}, metric={})",
+            self.query.k, self.query.metric_type
+        )
     }
 }
 
@@ -307,6 +309,7 @@ mod tests {
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
+    use crate::index::vector::MetricType;
     use crate::utils::testing::generate_random_array;
 
     #[tokio::test]
@@ -382,8 +385,8 @@ mod tests {
                 k: 10,
                 nprobs: 0,
                 refine_factor: None,
+                metric_type: MetricType::L2,
             },
-            L2Distance::new(),
         )
         .await
         .unwrap();

@@ -22,7 +22,7 @@ use futures::stream::StreamExt;
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::index::vector::VectorIndexParams;
+use lance::index::vector::{MetricType, VectorIndexParams};
 use lance::{Error, Result};
 
 #[derive(Parser)]
@@ -77,6 +77,10 @@ enum Commands {
         /// Number of sub-vectors in Product Quantizer
         #[arg(short = 's', long, default_value_t = 8, value_name = "NUM")]
         num_sub_vectors: u32,
+
+        /// Distance metric type. Only support 'l2' and 'cosine'.
+        #[arg(short = 'm', long, value_name = "DISTANCE")]
+        metric_type: Option<String>,
     },
 }
 
@@ -128,6 +132,7 @@ async fn main() -> Result<()> {
             index_type,
             num_partitions,
             num_sub_vectors,
+            metric_type,
         } => {
             let dataset = Dataset::open(uri).await.unwrap();
             match action {
@@ -139,6 +144,7 @@ async fn main() -> Result<()> {
                         index_type,
                         num_partitions,
                         num_sub_vectors,
+                        metric_type,
                     )
                     .await
                 }
@@ -154,17 +160,28 @@ async fn create_index(
     index_type: &Option<IndexType>,
     num_partitions: &u32,
     num_sub_vectors: &u32,
+    metric_type: &Option<String>,
 ) -> Result<()> {
     let col = column
         .as_ref()
-        .ok_or_else(|| Error::IO("Must specify column".to_string()))?;
-    let _ = index_type.ok_or_else(|| Error::IO("Must specify index type".to_string()))?;
+        .ok_or_else(|| Error::Index("Must specify column".to_string()))?;
+    let _ = index_type.ok_or_else(|| Error::Index("Must specify index type".to_string()))?;
+    let mt = match metric_type.as_ref().unwrap_or(&"l2".to_string()).as_str() {
+        "l2" => MetricType::L2,
+        "cosine" => MetricType::Cosine,
+        _ => {
+            return Err(Error::Index(format!(
+                "Only l2 and cosine metric type are supported, got: {}",
+                metric_type.as_ref().unwrap_or(&"N/A".to_string())
+            )));
+        }
+    };
     dataset
         .create_index(
             &[&col],
             lance::index::IndexType::Vector,
             name.clone(),
-            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, mt),
             false,
         )
         .await

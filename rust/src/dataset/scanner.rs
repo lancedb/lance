@@ -36,7 +36,7 @@ use sqlparser::parser::Parser;
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::vector::Query;
+use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
 
@@ -178,6 +178,7 @@ impl Scanner {
             k,
             nprobs: 1,
             refine_factor: None,
+            metric_type: MetricType::L2,
         });
         Ok(self)
     }
@@ -196,6 +197,14 @@ impl Scanner {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)
         };
+        self
+    }
+
+    /// Change the distance [MetricType], i.e, L2 or Cosine distance.
+    pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.metric_type = metric_type
+        }
         self
     }
 
@@ -315,7 +324,7 @@ impl Scanner {
             data_dir.clone(),
             fragments,
             projection,
-            manifest.clone(),
+            manifest,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,

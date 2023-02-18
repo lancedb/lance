@@ -21,7 +21,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::datatypes::Schema;
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
 
@@ -31,7 +30,10 @@ mod kmeans;
 mod pq;
 
 use super::IndexParams;
-use crate::{Error, Result};
+use crate::{
+    utils::distance::{cosine::cosine_distance, l2::l2_distance},
+    Result,
+};
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -47,6 +49,9 @@ pub struct Query {
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
     pub refine_factor: Option<u32>,
+
+    /// Distance metric type
+    pub metric_type: MetricType,
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
@@ -70,6 +75,56 @@ pub trait VectorIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
 }
 
+/// Distance metrics type.
+#[derive(Debug, Copy, Clone)]
+pub enum MetricType {
+    L2,
+    Cosine,
+}
+
+impl MetricType {
+    pub fn func(
+        &self,
+    ) -> Arc<dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync>
+    {
+        match self {
+            Self::L2 => Arc::new(l2_distance),
+            Self::Cosine => Arc::new(cosine_distance),
+        }
+    }
+}
+
+impl std::fmt::Display for MetricType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::L2 => "l2",
+                Self::Cosine => "cosine",
+            }
+        )
+    }
+}
+
+impl From<super::pb::VectorMetricType> for MetricType {
+    fn from(proto: super::pb::VectorMetricType) -> Self {
+        match proto {
+            super::pb::VectorMetricType::L2 => Self::L2,
+            super::pb::VectorMetricType::Cosine => Self::Cosine,
+        }
+    }
+}
+
+impl From<MetricType> for super::pb::VectorMetricType {
+    fn from(mt: MetricType) -> Self {
+        match mt {
+            MetricType::L2 => Self::L2,
+            MetricType::Cosine => Self::Cosine,
+        }
+    }
+}
+
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
     // This is hard coded for IVF_PQ for now. Can refactor later to support more.
@@ -81,6 +136,9 @@ pub struct VectorIndexParams {
 
     /// the number of sub vectors used in PQ.
     pub num_sub_vectors: u32,
+
+    /// Vector distance metrics type.
+    pub metrics_type: MetricType,
 }
 
 impl VectorIndexParams {
@@ -91,11 +149,17 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
-    pub fn ivf_pq(num_partitions: u32, nbits: u8, num_sub_vectors: u32) -> Self {
+    pub fn ivf_pq(
+        num_partitions: u32,
+        nbits: u8,
+        num_sub_vectors: u32,
+        metrics_type: MetricType,
+    ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
+            metrics_type,
         }
     }
 }
@@ -106,6 +170,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
+            metrics_type: MetricType::L2,
         }
     }
 }

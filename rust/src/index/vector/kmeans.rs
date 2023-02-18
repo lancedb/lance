@@ -20,28 +20,11 @@ use arrow_array::{
 };
 use rand::{seq::IteratorRandom, Rng};
 
+use crate::index::vector::MetricType;
 use crate::{
-    utils::{
-        distance::L2Distance,
-        kmeans::{KMeans, KMeansParams},
-    },
+    utils::kmeans::{KMeans, KMeansParams},
     Result,
 };
-
-/// A fallback default implementation of KMeans, if not accelerator found.
-async fn train_kmeans_fallback(
-    array: &Float32Array,
-    dimension: usize,
-    k: usize,
-    max_iters: u32,
-) -> Result<Float32Array> {
-    let params = KMeansParams {
-        max_iters,
-        ..Default::default()
-    };
-    let model = KMeans::new_with_params(array, dimension, k, &params, L2Distance::new()).await;
-    Ok(model.centroids.as_ref().clone())
-}
 
 /// Train KMeans model and returns the centroids of each cluster.
 pub async fn train_kmeans(
@@ -50,6 +33,7 @@ pub async fn train_kmeans(
     k: usize,
     max_iterations: u32,
     mut rng: impl Rng,
+    metric_type: MetricType,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {
@@ -78,5 +62,11 @@ pub async fn train_kmeans(
         array.clone()
     };
 
-    train_kmeans_fallback(&data, dimension, k, max_iterations).await
+    let params = KMeansParams {
+        max_iters: max_iterations,
+        metric_type,
+        ..Default::default()
+    };
+    let model = KMeans::new_with_params(&data, dimension, k, &params).await;
+    Ok(model.centroids.as_ref().clone())
 }
