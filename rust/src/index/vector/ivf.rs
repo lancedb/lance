@@ -589,8 +589,8 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
     /// Build the IVF_PQ index
     async fn build(&self) -> Result<()> {
         println!(
-            "Building vector index: IVF{},PQ{}",
-            self.num_partitions, self.num_sub_vectors
+            "Building vector index: IVF{},PQ{}, metric={}",
+            self.num_partitions, self.num_sub_vectors, self.metric_type,
         );
 
         // Step 1. Sanity check
