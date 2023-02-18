@@ -15,15 +15,9 @@
 //! Compute distance
 //!
 
-use std::sync::Arc;
-
-use arrow_array::Float32Array;
-
 pub mod compute;
 pub mod cosine;
 pub mod l2;
-
-use crate::Result;
 
 #[inline]
 pub(crate) fn simd_alignment() -> i32 {

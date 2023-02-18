@@ -182,9 +182,7 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = L2Distance::new()
-            .distance(&point, as_primitive_array(mat.values().as_ref()), 8)
-            .unwrap();
+        let scores = l2_distance(&point, as_primitive_array(mat.values().as_ref()), 8).unwrap();
 
         assert_eq!(
             scores.as_ref(),
@@ -196,7 +194,7 @@ mod tests {
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = L2Distance::new().distance(&point, &mat, 5).unwrap();
+        let scores = l2_distance(&point, &mat, 5).unwrap();
 
         assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
@@ -248,7 +246,7 @@ mod tests {
         ]
         .into();
 
-        let d = L2Distance::new().distance(&q, &values, 32).unwrap();
+        let d = l2_distance(&q, &values, 32).unwrap();
         assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }

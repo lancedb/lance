@@ -309,6 +309,7 @@ mod tests {
 
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
+    use crate::index::vector::MetricType;
     use crate::utils::testing::generate_random_array;
 
     #[tokio::test]
@@ -384,8 +385,8 @@ mod tests {
                 k: 10,
                 nprobs: 0,
                 refine_factor: None,
+                metric_type: MetricType::L2,
             },
-            L2Distance::new(),
         )
         .await
         .unwrap();
