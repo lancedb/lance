@@ -36,7 +36,7 @@ use sqlparser::parser::Parser;
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index, Manifest};
-use crate::index::vector::{Query, MetricType};
+use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
 
