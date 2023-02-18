@@ -228,9 +228,8 @@ impl Dataset {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
-        params.metric_type = MetricType::try_from(metric_type).map_err(|e| {
-            PyValueError::new_err(e.to_string())
-        })?;
+        params.metric_type =
+            MetricType::try_from(metric_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         self_
             .rt
