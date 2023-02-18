@@ -243,7 +243,12 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.version()
 
     def create_index(
-        self, column: str, index_type: str, name: Optional[str] = None, **kwargs
+        self,
+        column: str,
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        **kwargs,
     ):
         """Create index on column
 
@@ -258,6 +263,9 @@ class LanceDataset(pa.dataset.Dataset):
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
+        metric : str
+            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
+            Default is "L2".
         kwargs :
             Parameters passed to the index building process.
 
@@ -317,6 +325,9 @@ class LanceDataset(pa.dataset.Dataset):
                         "Vector ndim must be divisible by 8 for SIMD. "
                         "Set `force_build=True` to continue build anyways."
                     )
+
+        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine", "euclidean"]:
+            raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
             raise NotImplementedError(
@@ -327,7 +338,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "num_partitions and num_sub_vectors are required for IVF_PQ"
             )
 
-        self._ds.create_index(column, index_type, name, kwargs)
+        self._ds.create_index(column, index_type, name, metric, kwargs)
 
 
 class ScannerBuilder:

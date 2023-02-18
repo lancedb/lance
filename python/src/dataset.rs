@@ -22,8 +22,6 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
-use lance::index::vector::VectorIndexParams;
-use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyDict, PyInt, PyLong};
@@ -31,9 +29,13 @@ use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
-use ::lance::dataset::scanner::Scanner as LanceScanner;
-use ::lance::dataset::Dataset as LanceDataset;
-use lance::dataset::{Version, WriteMode, WriteParams};
+use lance::dataset::{
+    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
+};
+use lance::index::{
+    vector::{MetricType, VectorIndexParams},
+    IndexType,
+};
 
 const DEFAULT_NPROBS: usize = 1;
 
@@ -204,6 +206,7 @@ impl Dataset {
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
+        metric_type: &str,
         kwargs: &PyDict,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
@@ -224,6 +227,9 @@ impl Dataset {
         if let Some(n) = kwargs.get_item("num_sub_vectors") {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
+
+        params.metric_type =
+            MetricType::try_from(metric_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         self_
             .rt
