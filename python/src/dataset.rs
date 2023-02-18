@@ -228,15 +228,9 @@ impl Dataset {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
-        params.metric_type = match metric_type.to_lowercase().as_str() {
-            "l2" => MetricType::L2,
-            "cosine" => MetricType::Cosine,
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Metric type '{metric_type}' is not supported"
-                )))
-            }
-        };
+        params.metric_type = MetricType::try_from(metric_type).map_err(|e| {
+            PyValueError::new_err(e.to_string())
+        })?;
 
         self_
             .rt

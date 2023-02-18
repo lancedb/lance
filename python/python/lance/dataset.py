@@ -264,7 +264,8 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "L2" and "cosine". Default is "L2".
+            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
+            Default is "L2".
         kwargs :
             Parameters passed to the index building process.
 
@@ -325,7 +326,7 @@ class LanceDataset(pa.dataset.Dataset):
                         "Set `force_build=True` to continue build anyways."
                     )
 
-        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine"]:
+        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine", "euclidean"]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
