@@ -38,7 +38,7 @@ fn cosine_dist(from: &Float32Array, to: &Float32Array, dimension: usize) -> Arc<
                 x_sq += x.powi(2);
                 y_sq += y.powi(2);
             });
-            xy / (x_sq.sqrt() * y_sq.sqrt())
+            1.0 - xy / (x_sq.sqrt() * y_sq.sqrt())
         })
         .collect();
     Arc::new(distances)
@@ -94,11 +94,11 @@ fn cosine_dist_simd(from: &Float32Array, to: &Float32Array, dimension: usize) ->
     for y in to_values.chunks_exact(dimension) {
         #[cfg(any(target_arch = "aarch64"))]
         {
-            builder.append_value(unsafe { cosine_dist_neon(x, y, x_norm) });
+            builder.append_value(unsafe { 1.0 - cosine_dist_neon(x, y, x_norm) });
         }
         #[cfg(any(target_arch = "x86_64"))]
         {
-            builder.append_value(unsafe { cosine_dist_fma(x, y, x_norm) });
+            builder.append_value(unsafe { 1.0 - cosine_dist_fma(x, y, x_norm) });
         }
     }
     Arc::new(builder.finish())
