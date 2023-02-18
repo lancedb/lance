@@ -28,13 +28,14 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
+use object_store::path::Path;
 use sqlparser::ast::{Expr, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use super::Dataset;
 use crate::datatypes::Schema;
-use crate::format::Fragment;
+use crate::format::{Fragment, Index, Manifest};
 use crate::index::vector::Query;
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
 use crate::{Error, Result};
@@ -42,6 +43,8 @@ use crate::{Error, Result};
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
+
+const PREFETCH_SIZE: usize = 8;
 
 /// Dataset Scanner
 ///
@@ -232,8 +235,6 @@ impl Scanner {
     ///
     /// TODO: implement as IntoStream/IntoIterator.
     pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
-        const PREFECTH_SIZE: usize = 8;
-
         let data_dir = self.dataset.data_dir();
         let manifest = self.dataset.manifest.clone();
         let with_row_id = self.with_row_id;
@@ -259,63 +260,37 @@ impl Scanner {
                     return Err(Error::IO("Refine factor can not be zero".to_string()));
                 }
             }
-            let knn_node: Arc<dyn ExecutionPlan> =
+            let nn_node: Arc<dyn ExecutionPlan> =
                 if let Some(index) = indices.iter().find(|i| i.fields.contains(&column_id)) {
                     // There is an index built for the column.
                     // We will use the index.
-                    let mut inner_query = q.clone();
-                    inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
-                    Arc::new(KNNIndexExec::new(
-                        self.dataset.clone(),
-                        &index.uuid.to_string(),
-                        &inner_query,
-                    ))
+                    self.ann(q, &index)
                 } else {
                     let vector_scan_projection =
                         Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                    let scan_node = Arc::new(LanceScanExec::new(
-                        self.dataset.object_store.clone(),
-                        data_dir.clone(),
-                        self.fragments.clone(),
-                        vector_scan_projection,
-                        manifest.clone(),
-                        self.batch_size,
-                        PREFECTH_SIZE,
-                        true,
-                    ));
-                    Arc::new(KNNFlatExec::new(scan_node, q.clone()))
+                    let scan_node =
+                        self.scan(&data_dir, manifest.clone(), true, vector_scan_projection);
+                    self.knn(scan_node, &q)
                 };
 
-            let take_node = Arc::new(GlobalTakeExec::new(
-                self.dataset.clone(),
-                Arc::new(projection.clone()),
-                knn_node,
-            ));
+            let take_node = self.take(nn_node, projection);
 
             if q.refine_factor.is_some() {
-                Arc::new(KNNFlatExec::new(take_node, q.clone()))
+                self.knn(take_node, &q)
             } else {
                 take_node
             }
         } else {
-            Arc::new(LanceScanExec::new(
-                self.dataset.object_store.clone(),
-                data_dir.clone(),
-                self.fragments.clone(),
-                Arc::new(self.projections.clone()),
-                manifest.clone(),
-                self.batch_size,
-                PREFECTH_SIZE,
+            self.scan(
+                &data_dir,
+                manifest,
                 with_row_id,
-            ))
+                Arc::new(self.projections.clone()),
+            )
         };
 
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
-            plan = Arc::new(GlobalLimitExec::new(
-                plan,
-                *self.offset.as_ref().unwrap_or(&0) as usize,
-                self.limit.map(|l| l as usize),
-            ));
+            plan = self.limit_node(plan);
         }
 
         let session_config = SessionConfig::new();
@@ -324,6 +299,60 @@ impl Scanner {
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
         Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
+        ))
+    }
+
+    /// Create an Execution plan with a scan node
+    fn scan(
+        &self,
+        data_dir: &Path,
+        manifest: Arc<Manifest>,
+        with_row_id: bool,
+        projection: Arc<Schema>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(LanceScanExec::new(
+            self.dataset.object_store.clone(),
+            data_dir.clone(),
+            self.fragments.clone(),
+            projection,
+            manifest.clone(),
+            self.batch_size,
+            PREFETCH_SIZE,
+            with_row_id,
+        ))
+    }
+
+    /// Add a knn search node to the input plan
+    fn knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
+        Arc::new(KNNFlatExec::new(input, q.clone()))
+    }
+
+    /// Create an Execution plan to do indexed ANN search
+    fn ann(&self, q: &Query, index: &&Index) -> Arc<dyn ExecutionPlan> {
+        let mut inner_query = q.clone();
+        inner_query.k = q.k * (q.refine_factor.unwrap_or(1) as usize);
+        Arc::new(KNNIndexExec::new(
+            self.dataset.clone(),
+            &index.uuid.to_string(),
+            &inner_query,
+        ))
+    }
+
+    /// Take row indices produced by input plan from the dataset (with projection)
+    fn take(&self, indices: Arc<dyn ExecutionPlan>, projection: &Schema) -> Arc<dyn ExecutionPlan> {
+        Arc::new(GlobalTakeExec::new(
+            self.dataset.clone(),
+            Arc::new(projection.clone()),
+            indices,
+        ))
+    }
+
+    /// Global offset-limit of the result of the input plan
+    fn limit_node(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(GlobalLimitExec::new(
+            plan,
+            *self.offset.as_ref().unwrap_or(&0) as usize,
+            self.limit.map(|l| l as usize),
         ))
     }
 }
