@@ -49,6 +49,9 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given argument value.
         If a version is already specified, this arg is ignored.
+    tag : optional, str
+        If specified, find the latest version tagged with the given argument value.
+        If a version is already specified, this arg is ignored.
     """
     ds = LanceDataset(uri, version)
     if version is None and asof is not None:

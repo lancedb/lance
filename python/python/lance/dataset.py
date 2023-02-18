@@ -536,7 +536,7 @@ def write_dataset(
     max_rows_per_group: int, default 1024
         The max number of rows before starting a new group (in the same file)
     tag: str, optional
-        A tag to add to the dataset version after this commit
+        Tag to assign to the version of the dataset post this commit
     """
     if isinstance(data_obj, pd.DataFrame):
         reader = pa.Table.from_pandas(data_obj, schema=schema).to_reader()
