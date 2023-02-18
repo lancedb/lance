@@ -91,6 +91,35 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_version_tagging(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    # check for retrieving the dataset by tag
+    lance.write_dataset(table, base_dir, mode="create", tag="release")
+    ds = lance.dataset(base_dir, tag="release")
+    assert ds.version == 1
+    assert len(ds.to_table()) == 3
+
+    # check that an older version can be retrieved by tag
+    lance.write_dataset(table, base_dir, mode="append")
+    ds = lance.dataset(base_dir, tag="release")
+    assert ds.version == 1
+    assert len(ds.to_table()) == 3
+
+    # check that distinct tags can be used for the same dataset
+    lance.write_dataset(table, base_dir, mode="append", tag="production")
+    ds = lance.dataset(base_dir, tag="production")
+    assert ds.version == 3
+    assert len(ds.to_table()) == 9
+
+    # check the same tag can be reused and the latest version is retrieved
+    lance.write_dataset(table, base_dir, mode="append", tag="release")
+    ds = lance.dataset(base_dir, tag="release")
+    assert ds.version == 4
+    assert len(ds.to_table()) == 12
+
+
 def test_take(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
