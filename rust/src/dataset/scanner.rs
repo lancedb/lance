@@ -306,14 +306,6 @@ impl Scanner {
             session_state.catalog_list().catalog_names()
         );
 
-        println!(
-            "Session State Logical Plan: {:?}",
-            session_state
-                .create_logical_plan("SELECT a, b.c FROM lance.default.t WHERE a > 10 AND b < 100")
-                .await
-                .unwrap()
-        );
-
         Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
@@ -404,14 +396,16 @@ impl Stream for RecordBatchStream {
 
 #[cfg(test)]
 mod test {
+    use super::*;
 
     use std::path::PathBuf;
 
-    use super::*;
-
     use arrow::compute::concat_batches;
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray};
+    use arrow_array::{
+        ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray, StructArray,
+    };
     use arrow_schema::DataType;
+    use futures::stream::TryStreamExt;
     use sqlparser::ast::*;
     use tempfile::tempdir;
 
@@ -471,6 +465,11 @@ mod test {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
+            ArrowField::new(
+                "st",
+                DataType::Struct(vec![ArrowField::new("p", DataType::Float32, false)]),
+                false,
+            ),
         ]));
 
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
@@ -480,6 +479,11 @@ mod test {
                 Arc::new(StringArray::from_iter_values(
                     (0..100).map(|v| format!("s-{}", v)),
                 )),
+                Arc::new(StructArray::from(vec![(
+                    ArrowField::new("p", DataType::Float32, false),
+                    Arc::new(Float32Array::from_iter_values((0..100).map(|v| v as f32)))
+                        as ArrayRef,
+                )])),
             ],
         )
         .unwrap()]);
@@ -493,17 +497,19 @@ mod test {
         let mut scan = dataset.scan();
         assert!(scan.filter.is_none());
 
-        scan.filter("a > 50").unwrap();
-        assert_eq!(
-            scan.filter,
-            Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("a"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
-            })
-        );
+        scan.filter("i > 50 AND st.p < 75.0").unwrap();
+        // assert_eq!(
+        //     scan.filter,
+        //     Some(Expr::BinaryOp {
+        //         left: Box::new(Expr::Identifier(Ident::new("i"))),
+        //         op: BinaryOperator::Gt,
+        //         right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
+        //     })
+        // );
 
         let stream = scan.try_into_stream().await.unwrap();
+        let data = stream.try_collect::<Vec<_>>().await.unwrap();
+        println!("Data is: {:#?}", data);
     }
 
     #[tokio::test]

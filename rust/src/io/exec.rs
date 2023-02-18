@@ -54,7 +54,7 @@ pub(crate) fn create_session_state(dataset: Arc<Dataset>) -> Result<SessionState
     let table_provider: Arc<dyn TableProvider> = Arc::new(LanceTableProvider::new(dataset));
     schema_provider
         .as_ref()
-        .register_table("t".to_string(), table_provider);
+        .register_table("t".to_string(), table_provider)?;
     catelog
         .as_ref()
         .register_schema("default", schema_provider)?;
