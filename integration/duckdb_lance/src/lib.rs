@@ -14,7 +14,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use duckdb_ext::ffi::duckdb_library_version;
+use duckdb_ext::ffi::{duckdb_library_version, _duckdb_database};
 use duckdb_ext::Database;
 use tokio::runtime::Runtime;
 
@@ -36,11 +36,11 @@ pub extern "C" fn lance_version_rust() -> *const c_char {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lance_init_rust(db: *mut c_void) {
+pub unsafe extern "C" fn lance_init_rust(db: *mut _duckdb_database) {
     init(db).expect("duckdb lance extension init failed");
 }
 
-unsafe fn init(db: *mut c_void) -> Result<()> {
+unsafe fn init(db: *mut _duckdb_database) -> Result<()> {
     let db = Database::from(db);
     let table_function = scan_table_function();
     let connection = db.connect()?;
