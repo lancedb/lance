@@ -32,7 +32,7 @@ mod pq;
 use super::IndexParams;
 use crate::{
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
-    Result, Error,
+    Error, Result,
 };
 
 /// Query parameters for the vector indices
@@ -132,7 +132,7 @@ impl TryFrom<&str> for MetricType {
         match s.to_lowercase().as_str() {
             "l2" | "euclidean" => Ok(MetricType::L2),
             "cosine" => Ok(MetricType::Cosine),
-            _ => Err(Error::Index(format!("Metric type '{s}' is not supported")))
+            _ => Err(Error::Index(format!("Metric type '{s}' is not supported"))),
         }
     }
 }
