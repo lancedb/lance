@@ -204,6 +204,7 @@ impl Dataset {
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
+        metric_type: &str,
         kwargs: &PyDict,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
@@ -223,6 +224,12 @@ impl Dataset {
 
         if let Some(n) = kwargs.get_item("num_sub_vectors") {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
+        params.metric_type = match metric_type.to_lowercase().as_str() {
+            "l2" => MetricType::L2,
+            "cosine" => MetricType::Cosine,
+            _ => return Err(PyValueError::new_err(format!("Metric type '{metric_type}' is not supported"))),
         };
 
         self_
