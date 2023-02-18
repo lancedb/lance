@@ -21,6 +21,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::datatypes::Schema;
 use arrow_array::{Float32Array, RecordBatch};
 use async_trait::async_trait;
 
@@ -30,7 +31,7 @@ mod kmeans;
 mod pq;
 
 use super::IndexParams;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
