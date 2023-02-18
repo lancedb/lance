@@ -159,6 +159,7 @@ impl Dataset {
         batches: &mut Box<dyn RecordBatchReader>,
         uri: &str,
         params: Option<WriteParams>,
+        version_tag: Option<String>,
     ) -> Result<Self> {
         let object_store = Arc::new(ObjectStore::new(uri).await?);
         let params = params.unwrap_or_default();
@@ -267,6 +268,8 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = latest_manifest.map_or(1, |m| m.version + 1);
+        manifest.tag = version_tag; // NOTE: should be overwritten on each Dataset::write call.
+
         if matches!(params.mode, WriteMode::Overwrite) {
             // If overwrite, invalidate index
             manifest.index_section = None;
