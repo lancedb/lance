@@ -324,7 +324,7 @@ impl Scanner {
             data_dir.clone(),
             fragments,
             projection,
-            manifest.clone(),
+            manifest,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,

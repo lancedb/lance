@@ -106,7 +106,7 @@ impl<'a> IvfPQIndex<'a> {
             reader,
             ivf: index_metadata.ivf,
             pq: index_metadata.pq,
-            metric_type: index_metadata.metric_type.into(),
+            metric_type: index_metadata.metric_type,
         })
     }
 
@@ -641,7 +641,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         // Write each partition to disk.
         let part_col = pq_code_batch
             .column_by_name(PARTITION_ID_COLUMN)
-            .expect(format!("{PARTITION_ID_COLUMN} does not exist").as_str());
+            .unwrap_or_else(|| panic!("{PARTITION_ID_COLUMN} does not exist"));
         let partition_ids: &UInt32Array = as_primitive_array(part_col);
         let min_id = min(partition_ids).unwrap_or(0);
         let max_id = max(partition_ids).unwrap_or(1024 * 1024);
@@ -666,7 +666,7 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
             pq: pq.into(),
-            metric_type: self.metric_type.clone(),
+            metric_type: self.metric_type,
         };
 
         let metadata = pb::Index::try_from(&metadata)?;

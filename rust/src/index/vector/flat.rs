@@ -64,7 +64,7 @@ pub async fn flat_search(
     const SCORE_COLUMN: &str = "score";
 
     let batches = stream
-        .zip(repeat_with(|| query.metric_type.clone()))
+        .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
             let mut batch = batch?;
