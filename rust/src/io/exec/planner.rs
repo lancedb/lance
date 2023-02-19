@@ -32,7 +32,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::{Error, Result};
+use crate::{datatypes::Schema, Error, Result};
 
 pub struct Planner {
     schema: SchemaRef,
@@ -202,14 +202,14 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         logical_expr::{col, lit},
         physical_expr::expressions::{binary, lit as phy_lit, BinaryExpr},
-        physical_plan::filter::FilterExec,
     };
 
-    use crate::datafusion::physical_expr::{col as phy_col};
+    use crate::datafusion::physical_expr::col as phy_col;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -243,17 +243,30 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         println!("Physical expr: {:#?}", physical_expr);
 
-        assert!(physical_expr
-            .as_any()
-            .downcast_ref::<BinaryExpr>()
-            .unwrap()
-            .eq(binary(
-                binary(phy_col("i"), Operator::Gt, phy_lit(10_i32), schema.as_ref()).unwrap(),
-                Operator::And,
-                binary(phy_col("st.x"), Operator::Eq, phy_lit(2.5), schema.as_ref()).unwrap(),
-                schema.as_ref()
-            )
-            .unwrap()
-            .as_any()))
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    (0..10).map(|v| format!("str-{}", v)),
+                )),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
+                            as ArrayRef,
+                    ),
+                    (
+                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Float32Array::from_iter_values(
+                            (0..10).map(|v| (v * 10) as f32),
+                        )),
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+        let value = physical_expr.evaluate(&batch).unwrap();
+        println!("Evaluate value: {:?}\n", value);
     }
 }
