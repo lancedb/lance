@@ -14,7 +14,6 @@
 
 //! Extends DataFusion Physical Expression
 
-
 use std::any::Any;
 use std::sync::Arc;
 
@@ -107,4 +106,33 @@ pub fn col(name: &str) -> Arc<dyn PhysicalExpr> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+
+    use super::*;
+
+    use arrow_schema::Field;
+
+    #[test]
+    fn test_simple_column() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(vec![
+                    Field::new("x", DataType::Float32, false),
+                    Field::new("y", DataType::Float32, false),
+                ]),
+                true,
+            ),
+        ]));
+
+        let column = Column::new("i".to_string());
+        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Int32);
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+
+        let column = Column::new("s".to_string());
+        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+    }
+}
