@@ -16,6 +16,7 @@
 // under the License.
 
 mod knn;
+mod planner;
 mod scan;
 mod take;
 
