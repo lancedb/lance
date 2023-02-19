@@ -173,7 +173,10 @@ impl Planner {
         use datafusion::physical_expr::expressions::BinaryExpr;
 
         Ok(match expr {
-            Expr::Column(c) => Arc::new(Column::new(c.name.clone())),
+            Expr::Column(c) => {
+                println!("Matched to column: col={:#?}", c);
+                Arc::new(Column::new(c.flat_name()))
+            }
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
             Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
                 self.create_physical_expr(expr.left.as_ref())?,
@@ -200,7 +203,13 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::{
+        logical_expr::{col, lit},
+        physical_expr::expressions::{binary, lit as phy_lit, BinaryExpr},
+        physical_plan::filter::FilterExec,
+    };
+
+    use crate::datafusion::physical_expr::{col as phy_col};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -217,12 +226,12 @@ mod tests {
             ),
         ]));
 
-        let planner = Planner::new(schema);
+        let planner = Planner::new(schema.clone());
 
         let expr = planner
             .parse_filter("i > 10 AND st.x = 2.5 AND s = 'abc'")
             .unwrap();
-        println!("Expr: {}", expr);
+        println!("Expr: {:#?}", expr);
         assert_eq!(
             expr,
             col("i")
@@ -232,6 +241,19 @@ mod tests {
         );
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
-        println!("Phyiscal expr: {}", physical_expr);
+        println!("Physical expr: {:#?}", physical_expr);
+
+        assert!(physical_expr
+            .as_any()
+            .downcast_ref::<BinaryExpr>()
+            .unwrap()
+            .eq(binary(
+                binary(phy_col("i"), Operator::Gt, phy_lit(10_i32), schema.as_ref()).unwrap(),
+                Operator::And,
+                binary(phy_col("st.x"), Operator::Eq, phy_lit(2.5), schema.as_ref()).unwrap(),
+                schema.as_ref()
+            )
+            .unwrap()
+            .as_any()))
     }
 }
