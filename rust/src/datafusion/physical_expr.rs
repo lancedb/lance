@@ -25,6 +25,7 @@ use datafusion::{
     physical_plan::ColumnarValue,
 };
 
+use crate::arrow::*;
 use crate::datatypes::Schema;
 
 /// Column expression.
@@ -70,7 +71,10 @@ impl PhysicalExpr for Column {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        todo!()
+        let array = batch
+            .column_by_qualified_name(&self.name)
+            .ok_or_else(|| DataFusionError::Plan(format!("column {} does not exist", self.name)))?;
+        Ok(ColumnarValue::Array(array.clone()))
     }
 
     fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
@@ -104,6 +108,7 @@ mod tests {
 
     use super::*;
 
+    use arrow_array::{ArrayRef, Float32Array, Int32Array, StringArray, StructArray};
     use arrow_schema::Field;
 
     #[test]
@@ -152,19 +157,46 @@ mod tests {
             ),
         ]));
 
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    (0..10).map(|v| format!("str-{}", v)),
+                )),
+                Arc::new(StructArray::from(vec![
+                    (
+                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
+                            as ArrayRef,
+                    ),
+                    (
+                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Float32Array::from_iter_values(
+                            (0..10).map(|v| (v * 10) as f32),
+                        )),
+                    ),
+                ])),
+            ],
+        )
+        .unwrap();
+
         let column = Column::new("i".to_string());
-        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Int32);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+        assert_eq!(
+            column.evaluate(&batch).unwrap().into_array(0).as_ref(),
+            &Int32Array::from_iter_values(0..10)
+        );
 
         let column = Column::new("s".to_string());
-        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+        assert_eq!(
+            column.evaluate(&batch).unwrap().into_array(0).as_ref(),
+            &StringArray::from_iter_values((0..10).map(|v| format!("str-{}", v)))
+        );
 
         let column = Column::new("st.x".to_string());
         assert_eq!(
-            column.data_type(schema.as_ref()).unwrap(),
-            DataType::Float32
+            column.evaluate(&batch).unwrap().into_array(0).as_ref(),
+            &Float32Array::from_iter_values((0..10).map(|v| v as f32))
         );
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
     }
 }
