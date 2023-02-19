@@ -14,8 +14,6 @@
 
 //! Exec plan planner
 
-use std::sync::Arc;
-
 use arrow_schema::SchemaRef;
 use datafusion::{
     logical_expr::{col, BinaryExpr, Operator},
@@ -167,6 +165,8 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
