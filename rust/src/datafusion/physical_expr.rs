@@ -130,7 +130,41 @@ mod tests {
         assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
 
         let column = Column::new("st.x".to_string());
-        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Float32);
+        assert_eq!(
+            column.data_type(schema.as_ref()).unwrap(),
+            DataType::Float32
+        );
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+    }
+
+    #[test]
+    fn test_column_evaluate() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new(
+                "st",
+                DataType::Struct(vec![
+                    Field::new("x", DataType::Float32, false),
+                    Field::new("y", DataType::Float32, false),
+                ]),
+                true,
+            ),
+        ]));
+
+        let column = Column::new("i".to_string());
+        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Int32);
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+
+        let column = Column::new("s".to_string());
+        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+
+        let column = Column::new("st.x".to_string());
+        assert_eq!(
+            column.data_type(schema.as_ref()).unwrap(),
+            DataType::Float32
+        );
         assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
     }
 }

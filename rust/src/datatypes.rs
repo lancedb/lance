@@ -984,17 +984,15 @@ mod tests {
 
     #[test]
     fn test_get_nested_field() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new(
-                "b",
-                DataType::Struct(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
-                    ArrowField::new("f2", DataType::Boolean, false),
-                    ArrowField::new("f3", DataType::Float32, false),
-                ]),
-                true,
-            ),
-        ]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(vec![
+                ArrowField::new("f1", DataType::Utf8, true),
+                ArrowField::new("f2", DataType::Boolean, false),
+                ArrowField::new("f3", DataType::Float32, false),
+            ]),
+            true,
+        )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let field = schema.field("b.f2").unwrap();
