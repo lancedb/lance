@@ -56,12 +56,6 @@ impl PhysicalExpr for Column {
     }
 
     fn data_type(&self, schema: &ArrowSchema) -> Result<DataType> {
-        println!(
-            "Fetch datatype: {:?}, {:?}",
-            schema,
-            Schema::try_from(schema)?.field(self.name.as_str())
-        );
-
         Schema::try_from(schema)?
             .field(self.name.as_str())
             .map(|f| f.data_type())
@@ -134,5 +128,9 @@ mod tests {
         let column = Column::new("s".to_string());
         assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
         assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+
+        let column = Column::new("st.x".to_string());
+        assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Float32);
+        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
     }
 }

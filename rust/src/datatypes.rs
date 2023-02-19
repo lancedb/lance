@@ -344,6 +344,19 @@ impl Field {
         }
     }
 
+    fn sub_field(&self, path_components: &[&str]) -> Option<&Self> {
+        if path_components.is_empty() {
+            Some(self)
+        } else {
+            let first = path_components[0];
+            self.children
+                .iter()
+                .find(|c| c.name == first)
+                .map(|c| c.sub_field(&path_components[1..]))
+                .flatten()
+        }
+    }
+
     fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -620,8 +633,14 @@ impl Schema {
         Ok(Self::from(&filtered_protos))
     }
 
+    /// Get a field by name. Return `None` if the field does not exist.
     pub fn field(&self, name: &str) -> Option<&Field> {
-        self.fields.iter().find(|f| f.name == name)
+        let split = name.split('.').collect::<Vec<_>>();
+        self.fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|c| c.sub_field(&split[1..]))
+            .flatten()
     }
 
     pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
@@ -632,8 +651,7 @@ impl Schema {
 
     /// Recursively collect all the field IDs,
     pub(crate) fn field_ids(&self) -> Vec<i32> {
-        // TODO: make a tree travesal iterator.
-
+        // TODO: make a tree traversal iterator.
         let protos: Vec<pb::Field> = self.into();
         protos.iter().map(|f| f.id).collect()
     }
