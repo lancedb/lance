@@ -169,9 +169,10 @@ mod tests {
     use super::*;
 
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::logical_expr::{col, lit};
 
     #[test]
-    fn test_resolve_simple() {
+    fn test_parse_filter_simple() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, true),
@@ -191,5 +192,12 @@ mod tests {
             .parse_filter("i > 10 AND st.x = 2.5 AND s = 'abc'")
             .unwrap();
         println!("Expr: {}", expr);
+        assert_eq!(
+            expr,
+            col("i")
+                .gt(lit(10_i64))
+                .and(col("st.x").eq(lit(2.5)))
+                .and(col("s").eq(lit("abc")))
+        );
     }
 }
