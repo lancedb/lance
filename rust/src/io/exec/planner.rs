@@ -14,9 +14,15 @@
 
 //! Exec plan planner
 
+use std::sync::Arc;
+
 use arrow_schema::SchemaRef;
 use datafusion::{
     logical_expr::{col, BinaryExpr, Operator},
+    physical_plan::{
+        expressions::{IsNotNullExpr, IsNullExpr, Literal, NotExpr},
+        PhysicalExpr,
+    },
     prelude::Expr,
     scalar::ScalarValue,
 };
@@ -92,7 +98,7 @@ impl Planner {
         Ok(match value {
             Value::Number(v, _) => self.number(v.as_str())?,
             Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::DollarQuotedString(_) => todo!(),
+            Value::DollarQuotedString(s) => todo!(),
             Value::EscapedStringLiteral(_) => todo!(),
             Value::NationalStringLiteral(_) => todo!(),
             Value::HexStringLiteral(_) => todo!(),
@@ -160,6 +166,30 @@ impl Planner {
 
         self.parse_sql_expr(expr)
     }
+
+    pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
+        use crate::datafusion::physical_expr::Column;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+
+        Ok(match expr {
+            Expr::Column(c) => Arc::new(Column::new(c.name.clone())),
+            Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
+            Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
+                self.create_physical_expr(expr.left.as_ref())?,
+                expr.op,
+                self.create_physical_expr(expr.right.as_ref())?,
+            )),
+            Expr::IsNotNull(expr) => Arc::new(IsNotNullExpr::new(self.create_physical_expr(expr)?)),
+            Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
+            Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
+            Expr::IsFalse(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
+            _ => {
+                return Err(Error::IO(format!(
+                    "Expression '{expr}' is not supported as filter in lance"
+                )))
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +229,8 @@ mod tests {
                 .and(col("st.x").eq(lit(2.5)))
                 .and(col("s").eq(lit("abc")))
         );
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        println!("Phyiscal expr: {}", physical_expr);
     }
 }
