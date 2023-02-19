@@ -24,6 +24,7 @@
 pub mod arrow;
 pub mod dataset;
 pub mod datatypes;
+pub mod datafusion;
 pub mod encodings;
 pub mod error;
 pub mod format;
