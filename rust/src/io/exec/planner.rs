@@ -167,6 +167,7 @@ impl Planner {
         self.parse_sql_expr(expr)
     }
 
+    /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         use crate::datafusion::physical_expr::Column;
         use datafusion::physical_expr::expressions::BinaryExpr;
