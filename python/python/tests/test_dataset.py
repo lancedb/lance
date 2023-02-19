@@ -76,17 +76,17 @@ def test_asof_checkout(tmp_path: Path):
     ts_3 = datetime.now()
 
     # check that only the first batch is present
-    ds = lance.dataset(base_dir, asof=ts_1)
+    ds = lance.dataset(base_dir).asof(ts_1)
     assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that the first and second batch are present
-    ds = lance.dataset(base_dir, asof=ts_2)
+    ds = lance.dataset(base_dir).asof(ts_2)
     assert ds.version == 2
     assert len(ds.to_table()) == 6
 
     # check that all batches are present
-    ds = lance.dataset(base_dir, asof=ts_3)
+    ds = lance.dataset(base_dir).asof(ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
 
@@ -97,25 +97,25 @@ def test_version_tagging(tmp_path: Path):
 
     # check for retrieving the dataset by tag
     lance.write_dataset(table, base_dir, mode="create", tag="release")
-    ds = lance.dataset(base_dir, tag="release")
+    ds = lance.dataset(base_dir).with_tag("release")
     assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that an older version can be retrieved by tag
     lance.write_dataset(table, base_dir, mode="append")
-    ds = lance.dataset(base_dir, tag="release")
+    ds = lance.dataset(base_dir).with_tag("release")
     assert ds.version == 1
     assert len(ds.to_table()) == 3
 
     # check that distinct tags can be used for the same dataset
     lance.write_dataset(table, base_dir, mode="append", tag="production")
-    ds = lance.dataset(base_dir, tag="production")
+    ds = lance.dataset(base_dir).with_tag("production")
     assert ds.version == 3
     assert len(ds.to_table()) == 9
 
     # check the same tag can be reused and the latest version is retrieved
     lance.write_dataset(table, base_dir, mode="append", tag="release")
-    ds = lance.dataset(base_dir, tag="release")
+    ds = lance.dataset(base_dir).with_tag("release")
     assert ds.version == 4
     assert len(ds.to_table()) == 12
 

@@ -27,6 +27,7 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .util import sanitize_ts
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -241,6 +242,36 @@ class LanceDataset(pa.dataset.Dataset):
         Returns the currently checked out version of the dataset
         """
         return self._ds.version()
+
+    def asof(self, asof: Union[datetime, pd.Timestamp, str]):
+        """
+        Checks out the dataset as of a given timestamp, by finding the latest version created on or before it.
+        """
+        ts_cutoff = sanitize_ts(asof)
+        ver_cutoff = max(
+            [v["version"] for v in self.versions() if v["timestamp"] < ts_cutoff],
+            default=None,
+        )
+        if ver_cutoff is None:
+            raise ValueError(
+                f"No version of the dataset at '{self._uri}' created before: {ts_cutoff}"
+            )
+        else:
+            return self.__class__(self._uri, ver_cutoff)
+
+    def with_tag(self, tag: str):
+        """
+        Checks out the latest version of the dataset with the specified tag.
+        """
+        ver_w_tag = max(
+            [v["version"] for v in self.versions() if v["tag"] == tag], default=None
+        )  # REVIEW: anticipate seeing multiple `release` tags, and picking the latest?
+        if ver_w_tag is None:
+            raise ValueError(
+                f"No version of the dataset at '{self._uri}' tagged with: '{tag}'"
+            )
+        else:
+            return self.__class__(self._uri, ver_w_tag)
 
     def create_index(
         self, column: str, index_type: str, name: Optional[str] = None, **kwargs
