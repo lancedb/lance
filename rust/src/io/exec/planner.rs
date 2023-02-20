@@ -32,7 +32,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::{datatypes::Schema, Error, Result};
+use crate::{datafusion::logical_expr::resolve_expr, datatypes::Schema, Error, Result};
 
 pub struct Planner {
     schema: SchemaRef,
@@ -164,7 +164,9 @@ impl Planner {
         };
         let expr = selection.ok_or_else(|| Error::IO(format!("Filter is not valid: {filter}")))?;
 
-        self.parse_sql_expr(expr)
+        let expr = self.parse_sql_expr(expr)?;
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        resolve_expr(&expr, &schema)
     }
 
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
@@ -173,10 +175,7 @@ impl Planner {
         use datafusion::physical_expr::expressions::BinaryExpr;
 
         Ok(match expr {
-            Expr::Column(c) => {
-                println!("Matched to column: col={:#?}", c);
-                Arc::new(Column::new(c.flat_name()))
-            }
+            Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
             Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
                 self.create_physical_expr(expr.left.as_ref())?,
@@ -202,14 +201,14 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         logical_expr::{col, lit},
         physical_expr::expressions::{binary, lit as phy_lit, BinaryExpr},
     };
-
-    use crate::datafusion::physical_expr::col as phy_col;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -229,15 +228,14 @@ mod tests {
         let planner = Planner::new(schema.clone());
 
         let expr = planner
-            .parse_filter("i > 10 AND st.x = 2.5 AND s = 'abc'")
+            .parse_filter("i > 3 AND st.x <= 5.0 AND s = 'str-4'")
             .unwrap();
-        println!("Expr: {:#?}", expr);
         assert_eq!(
             expr,
             col("i")
-                .gt(lit(10_i64))
-                .and(col("st.x").eq(lit(2.5)))
-                .and(col("s").eq(lit("abc")))
+                .gt(lit(3_i32))
+                .and(col("st.x").lt_eq(lit(5.0_f32)))
+                .and(col("s").eq(lit("str-4")))
         );
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
@@ -266,7 +264,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let value = physical_expr.evaluate(&batch).unwrap();
-        println!("Evaluate value: {:?}\n", value);
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, false, true, false, false, false, false, false
+            ])
+        );
     }
 }
