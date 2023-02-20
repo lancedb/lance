@@ -103,6 +103,31 @@ pub fn col(name: &str) -> Arc<dyn PhysicalExpr> {
     Arc::new(Column::new(name.to_string()))
 }
 
+struct ColumnVisitor {
+    columns: Vec<String>,
+}
+
+impl ColumnVisitor {
+    fn new() -> Self {
+        Self { columns: vec![] }
+    }
+
+    fn visit(&mut self, expr: &dyn PhysicalExpr) {
+        expr.as_any()
+            .downcast_ref::<Column>()
+            .map(|c| self.columns.push(c.name.clone()));
+
+        expr.children().iter().for_each(|e| self.visit(e.as_ref()))
+    }
+}
+
+/// Collect the columns in the physical expression.
+pub fn column_names_in_expr(expr: &dyn PhysicalExpr) -> Vec<String> {
+    let mut visitor = ColumnVisitor::new();
+    visitor.visit(expr);
+    visitor.columns
+}
+
 #[cfg(test)]
 mod tests {
 

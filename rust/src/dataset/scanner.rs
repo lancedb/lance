@@ -64,8 +64,8 @@ pub struct Scanner {
 
     projections: Schema,
 
-    /// Optional filters.
-    filter: Option<Expr>,
+    /// Optional filters string.
+    filter: Option<String>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
@@ -129,14 +129,8 @@ impl Scanner {
         if stmts.len() != 1 {
             return Err(Error::IO(format!("Filter is not valid: {filter}")));
         }
-        if let Statement::Query(query) = &stmts[0] {
-            if let SetExpr::Select(s) = query.body.as_ref() {
-                self.filter = s.selection.clone();
-                return Ok(self);
-            }
-        }
-
-        return Err(Error::IO(format!("Filter is not valid: {filter}")));
+        self.filter = Some(filter.to_string());
+        Ok(self)
     }
 
     /// Set the batch size.
@@ -248,6 +242,14 @@ impl Scanner {
         let manifest = self.dataset.manifest.clone();
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
+
+        let filter_expr = if let Some(filter) = self.filter.as_ref() {
+            let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
+            let logical_expr = planner.parse_filter(&filter)?;
+            Some(planner.create_physical_expr(&logical_expr)?)
+        } else {
+            None
+        };
 
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
             let column_id = self.dataset.schema().field_id(q.column.as_str())?;
