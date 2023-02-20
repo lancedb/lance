@@ -93,12 +93,10 @@ impl Planner {
     }
 
     fn value(&self, value: &Value) -> Result<Expr> {
-        use datafusion::scalar::ScalarValue;
-
         Ok(match value {
             Value::Number(v, _) => self.number(v.as_str())?,
             Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
-            Value::DollarQuotedString(s) => todo!(),
+            Value::DollarQuotedString(_) => todo!(),
             Value::EscapedStringLiteral(_) => todo!(),
             Value::NationalStringLiteral(_) => todo!(),
             Value::HexStringLiteral(_) => todo!(),
@@ -127,14 +125,20 @@ impl Planner {
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
-            sqlparser::ast::Expr::IsNotTrue(expr) => {
-                Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?)))
-            }
-            sqlparser::ast::Expr::IsNull(expr) => {
-                Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?)))
-            }
-            sqlparser::ast::Expr::IsNotNull(_) => {
-                Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?)))
+            SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsNotNull(_) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let value_expr = self.parse_sql_expr(expr)?;
+                let list_exprs = list
+                    .iter()
+                    .map(|e| self.parse_sql_expr(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(value_expr.in_list(list_exprs, *negated))
             }
             _ => {
                 return Err(Error::IO(format!(
