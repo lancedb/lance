@@ -140,6 +140,7 @@ impl Planner {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
+            SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"
@@ -221,10 +222,7 @@ mod tests {
         ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::{
-        logical_expr::{col, lit},
-        physical_expr::expressions::{binary, lit as phy_lit, BinaryExpr},
-    };
+    use datafusion::logical_expr::{col, lit};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -244,14 +242,18 @@ mod tests {
         let planner = Planner::new(schema.clone());
 
         let expr = planner
-            .parse_filter("i > 3 AND st.x <= 5.0 AND s = 'str-4'")
+            .parse_filter("i > 3 AND st.x <= 5.0 AND (s = 'str-4' OR s in ('str-4', 'str-5'))")
             .unwrap();
         assert_eq!(
             expr,
             col("i")
                 .gt(lit(3_i32))
                 .and(col("st.x").lt_eq(lit(5.0_f32)))
-                .and(col("s").eq(lit("str-4")))
+                .and(
+                    col("s")
+                        .eq(lit("str-4"))
+                        .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false))
+                )
         );
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
@@ -284,7 +286,7 @@ mod tests {
         assert_eq!(
             predicates.into_array(0).as_ref(),
             &BooleanArray::from(vec![
-                false, false, false, false, true, false, false, false, false, false
+                false, false, false, false, true, true, false, false, false, false
             ])
         );
     }

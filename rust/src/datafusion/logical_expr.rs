@@ -75,7 +75,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }));
             }
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(l), Expr::Literal(r)) => {
+                (Expr::Column(l), Expr::Literal(_)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO(format!("Column {} does not exist in the dataset.", l.flat_name())))
                     };

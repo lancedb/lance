@@ -996,5 +996,6 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let field = schema.field("b.f2").unwrap();
+        assert_eq!(field.data_type(), DataType::Boolean);
     }
 }
