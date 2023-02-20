@@ -151,6 +151,7 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL filter clause.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
+        // Allow sqlparser to parse filter as part of ONE SQL statement.
         let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
         let dialect = GenericDialect {};
