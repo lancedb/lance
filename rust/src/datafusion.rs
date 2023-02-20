@@ -15,4 +15,5 @@
 //! Extends DataFusion
 //!
 
+pub(crate) mod logical_expr;
 pub(crate) mod physical_expr;
