@@ -51,7 +51,11 @@ impl KNNFlatStream {
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
             let batch = match flat_search(RecordBatchStream::new(child), &q).await {
-                Ok(b) => b,
+                Ok(b) => {
+                    println!("Flat search");
+                    println!("{:?}", b);
+                    b
+                },
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
                         "Failed to compute scores: {e}"
@@ -181,7 +185,11 @@ impl KNNIndexStream {
                 }
             };
             let result = match index.search(&q).await {
-                Ok(b) => b,
+                Ok(b) => {
+                    println!("Index search");
+                    println!("{:?}", b);
+                    b
+                },
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
                         "Failed to compute scores: {e}"

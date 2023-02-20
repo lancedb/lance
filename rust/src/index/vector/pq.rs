@@ -98,6 +98,7 @@ impl<'a> PQIndex<'a> {
         let mut distance_table: Vec<f32> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
+        println!("PQ.search metric_type: {:?}", self.metric_type);
         let dist_func = self.metric_type.func();
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
