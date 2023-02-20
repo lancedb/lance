@@ -249,7 +249,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         metric: str = "L2",
         **kwargs,
-    ):
+    ) -> LanceDataset:
         """Create index on column
 
         ***Experimental API***
@@ -339,6 +339,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
         self._ds.create_index(column, index_type, name, metric, kwargs)
+        return LanceDataset(self.uri)
 
 
 class ScannerBuilder:
