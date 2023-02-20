@@ -113,6 +113,7 @@ class LanceDataset(pa.dataset.Dataset):
                   "column": <embedding col name>,
                   "q": <query vector as pa.Float32Array>,
                   "k": 10,
+                  "metric": "cosine",
                   "nprobes": 1,
                   "refine_factor": 1
                 }
@@ -373,6 +374,7 @@ class ScannerBuilder:
         column: Optional[str] = None,
         q: Optional[pa.FloatingPointArray] = None,
         k: Optional[int] = None,
+        metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
     ) -> ScannerBuilder:
@@ -397,6 +399,7 @@ class ScannerBuilder:
             "column": column,
             "q": q,
             "k": k,
+            "metric": metric,
             "nprobes": nprobes,
             "refine_factor": refine_factor,
         }

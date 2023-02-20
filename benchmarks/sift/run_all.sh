@@ -27,8 +27,11 @@ cp -r sift1m_base.lance sift1m_ivf2048_pq16.lance
 ./index.py sift1m_ivf1024_pq16.lance -i 1024 -p 16 -c vector
 ./index.py sift1m_ivf2048_pq16.lance -i 2048 -p 16 -c vector
 
+echo "Running with ivf512"
 ./metrics.py sift1m_ivf512_pq16.lance lance_ivf512.csv -i 512
+echo "Running with ivf1024"
 ./metrics.py sift1m_ivf1024_pq16.lance lance_ivf1024.csv -i 1024
+echo "Running with ivf2048"
 ./metrics.py sift1m_ivf2048_pq16.lance lance_ivf2048.csv -i 2048
 
 python -c "import pandas as pd; pd.concat([pd.read_csv(f'lance_ivf{ivf}.csv') for ivf in [512, 1024, 2048]]).to_csv('lance_sift1m_stats.csv', index=False)"
