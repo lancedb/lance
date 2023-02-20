@@ -53,12 +53,14 @@ def main():
     args = parser.parse_args()
 
     dataset = lance.dataset(args.uri)
-    dataset.create_index(
+    dataset = dataset.create_index(
         args.column_name,
         index_type="IVF_PQ",
+        metric="cosine",
         num_partitions=args.ivf_partitions,  # IVF
         num_sub_vectors=args.pq_subvectors,
     )  # PQ
+    return dataset
 
 
 if __name__ == "__main__":

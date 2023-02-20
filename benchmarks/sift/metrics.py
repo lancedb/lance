@@ -46,6 +46,22 @@ def l2_argsort(mat, q):
     return np.argsort(((mat - q) ** 2).sum(axis=1))
 
 
+def cosine_argsort(mat, q):
+    """
+    argsort of cosine distances
+    Parameters
+    ----------
+    mat: ndarray
+        shape is (n, d) where n is number of vectors and d is number of dims
+    q: ndarray
+        shape is d, this is the query vector
+    """
+    mat = mat / np.linalg.norm(mat, axis=1)[:, None]
+    q = q / np.linalg.norm(q)
+    scores = np.dot(mat, q)
+    return np.argsort(1 - scores)
+
+
 def test_dataset(
     uri, nsamples=100, k=10, nprobes=1, refine_factor: Optional[int] = None
 ):
@@ -67,13 +83,14 @@ def test_dataset(
     tot = 0
     for i in range(nsamples):
         q = query_vectors[i, :]
-        actual_sorted.append(l2_argsort(all_vectors, q)[:k])
+        actual_sorted.append(cosine_argsort(all_vectors, q)[:k])
         start = time.time()
         rs = dataset.to_table(
             nearest={
                 "column": "vector",
                 "q": q,
                 "k": k,
+                "metric": "cosine",
                 "nprobes": nprobes,
                 "refine_factor": refine_factor,
             }
@@ -90,7 +107,7 @@ if __name__ == "__main__":
     parser.add_argument("uri", help="Dataset URI", metavar="URI")
     parser.add_argument("out", help="Output file", metavar="FILE")
     parser.add_argument("-i", "--ivf-partitions", type=int, metavar="N")
-    parser.add_argument("-s", "--samples", default=10, type=int, metavar="N")
+    parser.add_argument("-s", "--samples", default=100, type=int, metavar="N")
     parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
     args = parser.parse_args()
 
