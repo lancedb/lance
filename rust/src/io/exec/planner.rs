@@ -20,7 +20,7 @@ use arrow_schema::SchemaRef;
 use datafusion::{
     logical_expr::{col, BinaryExpr, Operator},
     physical_plan::{
-        expressions::{IsNotNullExpr, IsNullExpr, Literal, NotExpr},
+        expressions::{InListExpr, IsNotNullExpr, IsNullExpr, Literal, NotExpr},
         PhysicalExpr,
     },
     prelude::Expr,
@@ -190,6 +190,18 @@ impl Planner {
             Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
             Expr::IsFalse(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Arc::new(InListExpr::new(
+                self.create_physical_expr(expr)?,
+                list.iter()
+                    .map(|e| self.create_physical_expr(e))
+                    .collect::<Result<Vec<_>>>()?,
+                *negated,
+                self.schema.as_ref(),
+            )),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"
