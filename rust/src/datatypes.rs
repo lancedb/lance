@@ -1076,9 +1076,7 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
-                ]),
+                DataType::Struct(vec![ArrowField::new("f1", DataType::Utf8, true)]),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
