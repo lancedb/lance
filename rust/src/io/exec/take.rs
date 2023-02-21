@@ -22,21 +22,24 @@ use std::task::{Context, Poll};
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::{
+    ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,
+};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
 use crate::arrow::RecordBatchExt;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
 
 /// Dataset Take Node.
 ///
 /// [Take] node takes the filtered batch from the child node.
 /// It uses the `_rowid` to random access on [Dataset] to gather the final results.
-pub(crate) struct Take {
-    rx: Receiver<datafusion::error::Result<RecordBatch>>,
+pub struct Take {
+    rx: Receiver<Result<RecordBatch>>,
     _bg_thread: JoinHandle<()>,
 
     schema: Arc<Schema>,
@@ -100,14 +103,14 @@ impl Take {
 }
 
 impl Stream for Take {
-    type Item = datafusion::error::Result<RecordBatch>;
+    type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
 
-impl datafusion::physical_plan::RecordBatchStream for Take {
+impl RecordBatchStream for Take {
     fn schema(&self) -> SchemaRef {
         Arc::new(self.schema.as_ref().into())
     }
@@ -157,7 +160,7 @@ impl ExecutionPlan for GlobalTakeExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         todo!()
     }
 
@@ -165,7 +168,7 @@ impl ExecutionPlan for GlobalTakeExec {
         &self,
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
@@ -176,5 +179,115 @@ impl ExecutionPlan for GlobalTakeExec {
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
         todo!()
+    }
+}
+
+pub struct LocalTake {
+    /// Filter stream.
+    input: SendableRecordBatchStream,
+
+    /// The output schema.
+    schema: Arc<Schema>,
+
+    rx: Receiver<Result<RecordBatch>>,
+    // _bg_thread: JoinHandle<()>,
+}
+
+impl LocalTake {
+    pub fn try_new(input: SendableRecordBatchStream, schema: Arc<Schema>) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(4);
+
+        let inner_schema = Schema::try_from(input.schema().as_ref())?;
+        let take_schema = schema.exclude(&inner_schema)?;
+        Ok(Self { input, schema, rx })
+    }
+}
+
+impl Stream for LocalTake {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::into_inner(self).rx.poll_recv(cx)
+    }
+}
+
+impl<'a> RecordBatchStream for LocalTake {
+    fn schema(&self) -> SchemaRef {
+        Arc::new(self.schema.as_ref().into())
+    }
+}
+
+/// [LocalTakeExec] is a physical [`ExecutionPlan`] that takes the rows within the same fragment
+/// as its children [super::LanceScanExec] node.
+///
+/// It is used to support filter/predicates push-down:
+///
+///  `LocalTakeExec` -> `FilterExec` -> `LanceScanExec`:
+///
+#[derive(Debug)]
+pub struct LocalTakeExec {
+    input: Arc<dyn ExecutionPlan>,
+    schema: Arc<Schema>,
+}
+
+impl LocalTakeExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, schema: Arc<Schema>) -> Self {
+        assert!(input.schema().column_with_name(ROW_ID).is_some());
+        Self { input, schema }
+    }
+}
+
+impl ExecutionPlan for LocalTakeExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::new(self.schema.as_ref().into())
+    }
+
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
+        self.input.output_partitioning()
+    }
+
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
+        self.input.output_ordering()
+    }
+
+    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        vec![self.input.clone()]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(
+                "LocalTakeExec only takes 1 child".to_string(),
+            ));
+        }
+        Ok(Arc::new(Self {
+            input: children[0].clone(),
+            schema: self.schema.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        Ok(Box::pin(LocalTake::try_new(input_stream, self.schema.clone())?))
+    }
+
+    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+        Statistics {
+            num_rows: None,
+            total_byte_size: None,
+            column_statistics: None,
+            is_exact: false,
+        }
     }
 }
