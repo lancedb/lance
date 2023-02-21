@@ -76,7 +76,7 @@ pub trait VectorIndex {
 }
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum MetricType {
     L2,
     Cosine,
@@ -89,11 +89,9 @@ impl MetricType {
     {
         match self {
             Self::L2 => {
-                println!("creating l2");
                 Arc::new(l2_distance)
             },
             Self::Cosine => {
-                println!("creating cosine");
                 Arc::new(cosine_distance)
             },
         }
