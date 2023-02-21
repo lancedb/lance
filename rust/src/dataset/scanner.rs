@@ -26,6 +26,7 @@ use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::{
     limit::GlobalLimitExec, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
 };
@@ -37,7 +38,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Index};
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
+use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -266,23 +267,32 @@ impl Scanner {
                     }
                 }
 
-                let ann_node = self.ann(q, &index);
-                let take_node = self.take(ann_node, projection);
-
-                if q.refine_factor.is_some() {
-                    self.knn(take_node, &q)
+                let knn_node = self.ann(q, &index);
+                let knn_node = if q.refine_factor.is_some() {
+                    self.flat_knn(knn_node, &q)
                 } else {
-                    take_node
+                    knn_node
+                };
+
+                if let Some(filter_expression) = filter_expr {
+                    self.filter_node(filter_expression, knn_node)?
+                } else {
+                    self.take(knn_node, projection)
                 }
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node = self.scan(filter_expr, true, vector_scan_projection);
-                let knn_node = self.knn(scan_node, &q);
+                let scan_node = self.scan(true, vector_scan_projection);
+                let knn_node = self.flat_knn(scan_node, &q);
                 self.take(knn_node, projection)
             }
         } else {
-            self.scan(filter_expr, with_row_id, Arc::new(self.projections.clone()))
+            let scan = self.scan(with_row_id, Arc::new(self.projections.clone()));
+            if let Some(filter) = filter_expr {
+                self.filter_node(filter, scan)?
+            } else {
+                scan
+            }
         };
 
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
@@ -299,16 +309,10 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    fn scan(
-        &self,
-        filter: Option<Arc<dyn PhysicalExpr>>,
-        with_row_id: bool,
-        projection: Arc<Schema>,
-    ) -> Arc<dyn ExecutionPlan> {
+    fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             projection,
-            filter,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,
@@ -316,7 +320,7 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
+    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
         Arc::new(KNNFlatExec::new(input, q.clone()))
     }
 
@@ -347,6 +351,19 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    fn filter_node(
+        &self,
+        filter: Arc<dyn PhysicalExpr>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_node = Arc::new(FilterExec::try_new(filter, plan)?);
+        Ok(Arc::new(LocalTakeExec::new(
+            filter_node,
+            self.dataset.clone(),
+            Arc::new(self.dataset.schema().clone()),
+        )))
     }
 }
 

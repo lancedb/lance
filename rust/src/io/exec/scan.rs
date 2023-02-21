@@ -22,13 +22,12 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
+    ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::Stream;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
-use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::io::FileReader;
@@ -59,22 +58,12 @@ impl LanceStream {
     pub fn try_new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
-        filter: Option<Arc<dyn PhysicalExpr>>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
-        let filter_schema = filter
-            .map(|expr| {
-                // Columns in the filter.
-                let columns = column_names_in_expr(expr.as_ref());
-                dataset
-                    .schema()
-                    .project(&columns.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-            })
-            .map_or(Ok(None), |v| v.map(Some))?;
         let project_schema = projection.clone();
         let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
@@ -156,7 +145,6 @@ impl Stream for LanceStream {
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     projection: Arc<Schema>,
-    filter: Option<Arc<dyn PhysicalExpr>>,
     read_size: usize,
     prefetch_size: usize,
     with_row_id: bool,
@@ -184,7 +172,6 @@ impl LanceScanExec {
     pub fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
-        filter: Option<Arc<dyn PhysicalExpr>>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
@@ -192,7 +179,6 @@ impl LanceScanExec {
         Self {
             dataset,
             projection,
-            filter,
             read_size,
             prefetch_size,
             with_row_id,
@@ -237,7 +223,6 @@ impl ExecutionPlan for LanceScanExec {
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.projection.clone(),
-            self.filter.clone(),
             self.read_size,
             self.prefetch_size,
             self.with_row_id,
