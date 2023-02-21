@@ -183,23 +183,64 @@ impl ExecutionPlan for GlobalTakeExec {
 }
 
 pub struct LocalTake {
-    /// Filter stream.
-    input: SendableRecordBatchStream,
-
     /// The output schema.
     schema: Arc<Schema>,
 
     rx: Receiver<Result<RecordBatch>>,
-    // _bg_thread: JoinHandle<()>,
+    _bg_thread: JoinHandle<()>,
 }
 
 impl LocalTake {
-    pub fn try_new(input: SendableRecordBatchStream, schema: Arc<Schema>) -> Result<Self> {
+    pub fn try_new(
+        input: SendableRecordBatchStream,
+        dataset: Arc<Dataset>,
+        schema: Arc<Schema>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(4);
 
         let inner_schema = Schema::try_from(input.schema().as_ref())?;
         let take_schema = schema.exclude(&inner_schema)?;
-        Ok(Self { input, schema, rx })
+
+        let _bg_thread = tokio::spawn(async move {
+            if let Err(e) = input
+                .zip(stream::repeat_with(|| {
+                    (dataset.clone(), take_schema.clone())
+                }))
+                .then(|(b, (dataset, projection))| async move {
+                    // TODO: need to cache the fragments.
+                    let batch = b?;
+                    let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
+                    let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
+                    let remaining_columns =
+                        dataset.take_rows(row_ids.values(), &projection).await?;
+                    Ok(batch.merge(&remaining_columns)?.drop_column(ROW_ID)?)
+                })
+                .try_for_each(|b| async {
+                    if tx.is_closed() {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "ExecNode(Take): channel closed".to_string(),
+                        ));
+                    }
+                    if let Err(_) = tx.send(Ok(b)).await {
+                        return Err(datafusion::error::DataFusionError::Execution(
+                            "ExecNode(Take): channel closed".to_string(),
+                        ));
+                    }
+                    Ok(())
+                })
+                .await
+            {
+                if let Err(e) = tx.send(Err(e)).await {
+                    eprintln!("ExecNode(Take): {}", e);
+                }
+            }
+            drop(tx)
+        });
+        Ok(Self {
+            schema,
+            rx,
+            _bg_thread,
+        })
     }
 }
 
@@ -226,14 +267,19 @@ impl<'a> RecordBatchStream for LocalTake {
 ///
 #[derive(Debug)]
 pub struct LocalTakeExec {
+    dataset: Arc<Dataset>,
     input: Arc<dyn ExecutionPlan>,
     schema: Arc<Schema>,
 }
 
 impl LocalTakeExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, schema: Arc<Schema>) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>, dataset: Arc<Dataset>, schema: Arc<Schema>) -> Self {
         assert!(input.schema().column_with_name(ROW_ID).is_some());
-        Self { input, schema }
+        Self {
+            dataset,
+            input,
+            schema,
+        }
     }
 }
 
@@ -269,6 +315,7 @@ impl ExecutionPlan for LocalTakeExec {
         }
         Ok(Arc::new(Self {
             input: children[0].clone(),
+            dataset: self.dataset.clone(),
             schema: self.schema.clone(),
         }))
     }
@@ -279,7 +326,11 @@ impl ExecutionPlan for LocalTakeExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(LocalTake::try_new(input_stream, self.schema.clone())?))
+        Ok(Box::pin(LocalTake::try_new(
+            input_stream,
+            self.dataset.clone(),
+            self.schema.clone(),
+        )?))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
