@@ -108,14 +108,6 @@ impl Planner {
         })
     }
 
-    /// True value
-    ///
-    /// For the expression that Lance does not support, just return True, and
-    /// let the upper runtime engine to filter.
-    fn true_value(&self) -> Result<Expr> {
-        Ok(Expr::Literal(ScalarValue::Boolean(Some(true))))
-    }
-
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
             SQLExpr::Identifier(id) => self.column(vec![id.clone()].as_slice()),

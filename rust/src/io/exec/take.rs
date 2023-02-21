@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::SchemaRef;
+use arrow_schema::{SchemaRef, Schema as ArrowSchema};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,
@@ -30,7 +30,7 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
-use crate::arrow::RecordBatchExt;
+use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
 
@@ -200,20 +200,25 @@ impl LocalTake {
 
         let inner_schema = Schema::try_from(input.schema().as_ref())?;
         let take_schema = schema.exclude(&inner_schema)?;
+        let projection = schema.clone();
 
         let _bg_thread = tokio::spawn(async move {
             if let Err(e) = input
                 .zip(stream::repeat_with(|| {
-                    (dataset.clone(), take_schema.clone())
+                    (dataset.clone(), take_schema.clone(), projection.clone())
                 }))
-                .then(|(b, (dataset, projection))| async move {
+                .then(|(b, (dataset, take_schema, projection))| async move {
                     // TODO: need to cache the fragments.
                     let batch = b?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let remaining_columns =
-                        dataset.take_rows(row_ids.values(), &projection).await?;
-                    Ok(batch.merge(&remaining_columns)?.drop_column(ROW_ID)?)
+                        dataset.take_rows(row_ids.values(), &take_schema).await?;
+                    let projection_schema = ArrowSchema::from(projection.as_ref());
+                    Ok(batch
+                        .merge(&remaining_columns)?
+                        .drop_column(ROW_ID)?
+                        .project_by_schema(&projection_schema)?)
                 })
                 .try_for_each(|b| async {
                     if tx.is_closed() {

@@ -35,8 +35,9 @@ use futures::stream::{Stream, StreamExt};
 use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
+use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Index};
+use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
 use crate::{Error, Result};
@@ -74,8 +75,6 @@ pub struct Scanner {
     limit: Option<i64>,
     offset: Option<i64>,
 
-    fragments: Arc<Vec<Fragment>>,
-
     nearest: Option<Query>,
 
     /// Scan the dataset with a meta column: "_rowid"
@@ -85,7 +84,6 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
-        let fragments = dataset.fragments().clone();
         Self {
             dataset,
             projections: projection,
@@ -93,7 +91,6 @@ impl Scanner {
             batch_size: DEFAULT_BATCH_SIZE,
             limit: None,
             offset: None,
-            fragments,
             nearest: None,
             with_row_id: false,
         }
@@ -287,11 +284,20 @@ impl Scanner {
                 self.take(knn_node, projection)
             }
         } else {
-            let scan = self.scan(with_row_id, Arc::new(self.projections.clone()));
             if let Some(filter) = filter_expr {
+                let columns_in_filter = column_names_in_expr(filter.as_ref());
+                let filter_schema = Arc::new(
+                    self.dataset.schema().project(
+                        &columns_in_filter
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>(),
+                    )?,
+                );
+                let scan = self.scan(true, filter_schema);
                 self.filter_node(filter, scan)?
             } else {
-                scan
+                self.scan(with_row_id, Arc::new(self.projections.clone()))
             }
         };
 
@@ -362,7 +368,7 @@ impl Scanner {
         Ok(Arc::new(LocalTakeExec::new(
             filter_node,
             self.dataset.clone(),
-            Arc::new(self.dataset.schema().clone()),
+            Arc::new(self.projections.clone()),
         )))
     }
 }
@@ -404,6 +410,7 @@ mod test {
     use arrow::compute::concat_batches;
     use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray};
     use arrow_schema::DataType;
+    use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
@@ -484,9 +491,34 @@ mod test {
         let mut scan = dataset.scan();
         assert!(scan.filter.is_none());
 
-        scan.filter("a > 50").unwrap();
+        scan.filter("i > 50").unwrap();
         println!("Filter is: {:?}", scan.filter);
-        assert_eq!(scan.filter, Some("a > 50".to_string()));
+        assert_eq!(scan.filter, Some("i > 50".to_string()));
+
+        let batches = scan
+            .project(&["s"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        println!("Batches: {:?}\n", batches);
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "s",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from_iter_values(
+                (51..100).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap();
+        assert_eq!(batch, expected_batch);
     }
 
     #[tokio::test]

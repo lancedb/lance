@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{SchemaRef, Schema as ArrowSchema, DataType, Field};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
@@ -28,7 +28,7 @@ use futures::stream::Stream;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
 use crate::io::FileReader;
 
@@ -192,7 +192,14 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(self.dataset.schema().into())
+        let schema: ArrowSchema = self.projection.as_ref().into();
+        if self.with_row_id {
+            let mut fields = schema.fields.clone();
+            fields.push(Field::new(ROW_ID, DataType::UInt64, false));
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+           Arc::new(schema)
+        }
     }
 
     fn output_partitioning(&self) -> Partitioning {
