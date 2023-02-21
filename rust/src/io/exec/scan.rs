@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::any::Any;
 use std::cmp::min;
@@ -31,6 +28,7 @@ use futures::stream::Stream;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
+use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::io::FileReader;
@@ -58,16 +56,25 @@ impl LanceStream {
     ///  - ***prefetch_size***: the number of batches to read ahead.
     ///  - ***with_row_id***: load row ID from the datasets.
     ///
-    pub fn new(
+    pub fn try_new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
         filter: Option<Arc<dyn PhysicalExpr>>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
+        let filter_schema = filter
+            .map(|expr| {
+                // Columns in the filter.
+                let columns = column_names_in_expr(expr.as_ref());
+                dataset
+                    .schema()
+                    .project(&columns.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+            })
+            .map_or(Ok(None), |v| v.map(Some))?;
         let project_schema = projection.clone();
         let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
@@ -123,11 +130,11 @@ impl LanceStream {
             drop(tx)
         });
 
-        Self {
+        Ok(Self {
             rx,
             _io_thread: io_thread, // Drop the background I/O thread with the stream.
             projection,
-        }
+        })
     }
 }
 
@@ -227,14 +234,14 @@ impl ExecutionPlan for LanceScanExec {
         _partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        Ok(Box::pin(LanceStream::new(
+        Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.projection.clone(),
             self.filter.clone(),
             self.read_size,
             self.prefetch_size,
             self.with_row_id,
-        )))
+        )?))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
