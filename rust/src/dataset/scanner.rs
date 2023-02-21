@@ -283,22 +283,20 @@ impl Scanner {
                 let knn_node = self.flat_knn(scan_node, &q);
                 self.take(knn_node, projection)
             }
+        } else if let Some(filter) = filter_expr {
+            let columns_in_filter = column_names_in_expr(filter.as_ref());
+            let filter_schema = Arc::new(
+                self.dataset.schema().project(
+                    &columns_in_filter
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                )?,
+            );
+            let scan = self.scan(true, filter_schema);
+            self.filter_node(filter, scan)?
         } else {
-            if let Some(filter) = filter_expr {
-                let columns_in_filter = column_names_in_expr(filter.as_ref());
-                let filter_schema = Arc::new(
-                    self.dataset.schema().project(
-                        &columns_in_filter
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>(),
-                    )?,
-                );
-                let scan = self.scan(true, filter_schema);
-                self.filter_node(filter, scan)?
-            } else {
-                self.scan(with_row_id, Arc::new(self.projections.clone()))
-            }
+            self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
 
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{SchemaRef, Schema as ArrowSchema, DataType, Field};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
@@ -198,7 +198,7 @@ impl ExecutionPlan for LanceScanExec {
             fields.push(Field::new(ROW_ID, DataType::UInt64, false));
             Arc::new(ArrowSchema::new(fields))
         } else {
-           Arc::new(schema)
+            Arc::new(schema)
         }
     }
 

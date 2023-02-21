@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{SchemaRef, Schema as ArrowSchema};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,

@@ -416,10 +416,13 @@ impl RecordBatchExt for RecordBatch {
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
         let mut columns = vec![];
         for field in schema.fields.iter() {
-            if let Some (col) = self.column_by_name(field.name()) {
+            if let Some(col) = self.column_by_name(field.name()) {
                 columns.push(col.clone());
             } else {
-                return Err(Error::Arrow(format!("field {} does not exist in the RecordBatch", field.name())))
+                return Err(Error::Arrow(format!(
+                    "field {} does not exist in the RecordBatch",
+                    field.name()
+                )));
             }
         }
         Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
