@@ -25,7 +25,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
+    ExecutionPlan, Partitioning, PhysicalExpr, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::Stream;
 use tokio::sync::mpsc::{self, Receiver};
@@ -51,11 +51,9 @@ impl LanceStream {
     ///
     /// Parameters
     ///
-    ///  - ***object_store***: The Object Store to operate the data.
-    ///  - ***data_dir***: The base directory of the dataset.
-    ///  - ***fragments***: list of [Fragment]s to open.
+    ///  - ***dataset***: The source dataset.
     ///  - ***projection***: the projection [Schema].
-    ///  - ***manifest***: the [Manifest] of the dataset.
+    ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
     ///  - ***prefetch_size***: the number of batches to read ahead.
     ///  - ***with_row_id***: load row ID from the datasets.
@@ -63,6 +61,7 @@ impl LanceStream {
     pub fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
@@ -107,7 +106,11 @@ impl LanceStream {
                     let rows_in_batch = reader.num_rows_in_batch(batch_id);
                     for start in (0..rows_in_batch).step_by(read_size) {
                         let result = r
-                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
+                            .read_batch(
+                                batch_id,
+                                start..min(start + read_size, rows_in_batch),
+                                project_schema.as_ref(),
+                            )
                             .await;
                         if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
                             eprintln!("Failed to scan data: {err}");
@@ -146,6 +149,7 @@ impl Stream for LanceStream {
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     projection: Arc<Schema>,
+    filter: Option<Arc<dyn PhysicalExpr>>,
     read_size: usize,
     prefetch_size: usize,
     with_row_id: bool,
@@ -173,6 +177,7 @@ impl LanceScanExec {
     pub fn new(
         dataset: Arc<Dataset>,
         projection: Arc<Schema>,
+        filter: Option<Arc<dyn PhysicalExpr>>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
@@ -180,6 +185,7 @@ impl LanceScanExec {
         Self {
             dataset,
             projection,
+            filter,
             read_size,
             prefetch_size,
             with_row_id,
@@ -224,6 +230,7 @@ impl ExecutionPlan for LanceScanExec {
         Ok(Box::pin(LanceStream::new(
             self.dataset.clone(),
             self.projection.clone(),
+            self.filter.clone(),
             self.read_size,
             self.prefetch_size,
             self.with_row_id,

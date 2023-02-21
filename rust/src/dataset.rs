@@ -444,7 +444,11 @@ impl Dataset {
                     sorted_indices[end] -= row_count;
                 }
                 reader.set_projection(projection.clone());
-                batches.push(reader.take(&sorted_indices[start..end + 1]).await?);
+                batches.push(
+                    reader
+                        .take(&sorted_indices[start..end + 1], projection)
+                        .await?,
+                );
 
                 // restore the row indices
                 for indice in sorted_indices[start..end + 1].iter_mut() {
@@ -502,7 +506,7 @@ impl Dataset {
                 )
                 .await?;
                 reader.set_projection(projection.clone());
-                reader.take(indices.as_slice()).await
+                reader.take(indices.as_slice(), projection).await
             })
             .try_collect::<Vec<_>>()
             .await?;
