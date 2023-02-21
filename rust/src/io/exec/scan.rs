@@ -23,19 +23,17 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::error::DataFusionError;
-use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::Stream;
-use object_store::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
-use crate::format::Manifest;
-use crate::io::{FileReader, ObjectStore};
-use crate::{datatypes::Schema, format::Fragment};
+use crate::dataset::Dataset;
+use crate::datatypes::Schema;
+use crate::io::FileReader;
 
 /// Dataset Scan Node.
 #[derive(Debug)]
@@ -63,11 +61,8 @@ impl LanceStream {
     ///  - ***with_row_id***: load row ID from the datasets.
     ///
     pub fn new(
-        object_store: Arc<ObjectStore>,
-        data_dir: Path,
-        fragments: Arc<Vec<Fragment>>,
+        dataset: Arc<Dataset>,
         projection: Arc<Schema>,
-        manifest: Arc<Manifest>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
@@ -75,18 +70,19 @@ impl LanceStream {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
         let project_schema = projection.clone();
+        let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
-            'outer: for frag in fragments.as_ref() {
+            'outer: for frag in dataset.fragments().as_ref() {
                 if tx.is_closed() {
                     return;
                 }
                 let data_file = &frag.files[0];
                 let path = data_dir.child(data_file.path.clone());
                 let reader = match FileReader::try_new_with_fragment(
-                    &object_store,
+                    dataset.object_store.as_ref(),
                     &path,
                     frag.id,
-                    Some(manifest.as_ref()),
+                    Some(dataset.manifest.as_ref()),
                 )
                 .await
                 {
@@ -148,11 +144,8 @@ impl Stream for LanceStream {
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
 pub struct LanceScanExec {
-    object_store: Arc<ObjectStore>,
-    data_dir: Path,
-    fragments: Arc<Vec<Fragment>>,
+    dataset: Arc<Dataset>,
     projection: Arc<Schema>,
-    manifest: Arc<Manifest>,
     read_size: usize,
     prefetch_size: usize,
     with_row_id: bool,
@@ -169,28 +162,24 @@ impl std::fmt::Debug for LanceScanExec {
         write!(
             f,
             "LanceScan(uri={}, projection={:#?}, row_id={})",
-            self.data_dir, columns, self.with_row_id
+            self.dataset.data_dir(),
+            columns,
+            self.with_row_id
         )
     }
 }
 
 impl LanceScanExec {
     pub fn new(
-        object_store: Arc<ObjectStore>,
-        data_dir: Path,
-        fragments: Arc<Vec<Fragment>>,
+        dataset: Arc<Dataset>,
         projection: Arc<Schema>,
-        manifest: Arc<Manifest>,
         read_size: usize,
         prefetch_size: usize,
         with_row_id: bool,
     ) -> Self {
         Self {
-            object_store,
-            data_dir,
-            fragments,
+            dataset,
             projection,
-            manifest,
             read_size,
             prefetch_size,
             with_row_id,
@@ -204,14 +193,14 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new((&self.manifest.schema).into())
+        Arc::new(self.dataset.schema().into())
     }
 
     fn output_partitioning(&self) -> Partitioning {
         Partitioning::RoundRobinBatch(1)
     }
 
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+    fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
         None
     }
 
@@ -231,13 +220,10 @@ impl ExecutionPlan for LanceScanExec {
         &self,
         _partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+    ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(LanceStream::new(
-            self.object_store.clone(),
-            self.data_dir.clone(),
-            self.fragments.clone(),
+            self.dataset.clone(),
             self.projection.clone(),
-            self.manifest.clone(),
             self.read_size,
             self.prefetch_size,
             self.with_row_id,

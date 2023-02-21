@@ -57,9 +57,9 @@ const DATA_DIR: &str = "data";
 /// Lance Dataset
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    object_store: Arc<ObjectStore>,
+    pub(crate) object_store: Arc<ObjectStore>,
     base: Path,
-    manifest: Arc<Manifest>,
+    pub(crate) manifest: Arc<Manifest>,
 }
 
 /// Dataset Version
@@ -537,7 +537,7 @@ impl Dataset {
         read_manifest(&self.object_store, &self.latest_manifest_path()).await
     }
 
-    fn data_dir(&self) -> Path {
+    pub(crate) fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
 

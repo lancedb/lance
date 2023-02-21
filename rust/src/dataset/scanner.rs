@@ -322,11 +322,8 @@ impl Scanner {
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
-            self.dataset.object_store.clone(),
-            data_dir.clone(),
-            fragments,
+            self.dataset.clone(),
             projection,
-            manifest,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,
@@ -488,14 +485,7 @@ mod test {
 
         scan.filter("a > 50").unwrap();
         println!("Filter is: {:?}", scan.filter);
-        assert_eq!(
-            scan.filter,
-            Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("a"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
-            })
-        );
+        assert_eq!(scan.filter, Some("a > 50".to_string()));
     }
 
     #[tokio::test]
