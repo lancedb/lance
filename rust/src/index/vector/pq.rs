@@ -130,7 +130,7 @@ impl<'a> PQIndex<'a> {
         let mut xy_table: Vec<f32> = vec![];
         let mut y_norm_table: Vec<f32> = vec![];
 
-        let x_norm = normalize(key.values());
+        let x_norm = normalize(key.values()).powi(2);
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
@@ -182,7 +182,6 @@ impl<'a> PQIndex<'a> {
                             y_norm_table[idx]
                         })
                         .sum::<f32>();
-                    println!("xy={}, x_norm={}, y_norm={}", xy, x_norm, y_norm);
                     xy / (x_norm.sqrt() * y_norm.sqrt())
                 }),
         )))

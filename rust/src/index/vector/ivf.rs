@@ -343,7 +343,6 @@ impl Ivf {
                 self.dimension()
             )));
         }
-        println!("What's my metric type: {:?}", metric_type);
         let dist_func = metric_type.func();
         let centroid_values = self.centroids.values();
         let distances = dist_func(

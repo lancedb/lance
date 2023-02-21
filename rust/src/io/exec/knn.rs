@@ -52,8 +52,6 @@ impl KNNFlatStream {
         let bg_thread = tokio::spawn(async move {
             let batch = match flat_search(RecordBatchStream::new(child), &q).await {
                 Ok(b) => {
-                    println!("Flat search");
-                    println!("{:?}", b);
                     b
                 },
                 Err(e) => {
@@ -186,8 +184,6 @@ impl KNNIndexStream {
             };
             let result = match index.search(&q).await {
                 Ok(b) => {
-                    println!("Index search");
-                    println!("{:?}", b);
                     b
                 },
                 Err(e) => {
