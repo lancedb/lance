@@ -80,6 +80,7 @@ impl Dataset {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        filter: Option<String>,
         limit: i64,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
@@ -89,6 +90,11 @@ impl Dataset {
             let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
             scanner
                 .project(&proj)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = filter {
+            scanner
+                .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         scanner
