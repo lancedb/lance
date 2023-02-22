@@ -234,6 +234,30 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     }
 }
 
+fn plan_take_chunks(
+    positions: &Int64Array,
+    indices: &UInt32Array,
+    min_io_size: i64,
+) -> Result<Vec<UInt32Array>> {
+    let start = indices.value(0);
+    let indices = subtract_scalar(indices, start)?;
+
+    let mut chunks: Vec<UInt32Array> = vec![];
+    let mut start_idx = 0;
+    for i in 0..indices.len() {
+        let current = indices.value(i) as usize;
+        if positions.value(current) - positions.value(indices.value(start_idx) as usize)
+            > min_io_size
+        {
+            chunks.push(as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone());
+            start_idx = i;
+        }
+    }
+    chunks.push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
+
+    Ok(chunks)
+}
+
 #[async_trait]
 impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
     async fn decode(&self) -> Result<ArrayRef> {
@@ -253,21 +277,8 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let positions = self
             .get_positions(start as usize..(end + 1) as usize)
             .await?;
-        let indices = subtract_scalar(indices, start)?;
+        let chunks = plan_take_chunks(&positions, indices, MIN_IO_SIZE)?;
 
-        let mut chunks: Vec<UInt32Array> = vec![];
-        let mut start_idx = 0;
-        for i in 0..indices.len() {
-            let current = indices.value(i) as usize;
-            if positions.value(current) - positions.value(indices.value(start_idx) as usize)
-                > MIN_IO_SIZE
-            {
-                chunks.push(as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone());
-                start_idx = i;
-            }
-        }
-        chunks
-            .push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
         let arrays = stream::iter(chunks)
             .zip(repeat_with(|| positions.clone()))
             .map(|(indices, positions)| async move {
@@ -477,6 +488,39 @@ mod tests {
         assert_eq!(
             actual.as_ref(),
             &StringArray::from_iter_values(["b", "c", "f"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_sparse_indices() {
+        let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, &data).await.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
+
+        let positions = decoder.get_positions(1..999998).await.unwrap();
+        let indices = UInt32Array::from_iter_values([1, 999998]);
+        let chunks = plan_take_chunks(positions.as_ref(), &indices, 64 * 1024).unwrap();
+        // Relative offset within the positions.
+        assert_eq!(
+            chunks,
+            vec![
+                UInt32Array::from_iter_values([0]),
+                UInt32Array::from_iter_values([999997])
+            ]
+        );
+
+        let actual = decoder
+            .take(&UInt32Array::from_iter_values([1, 999998]))
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.as_ref(),
+            &StringArray::from_iter_values(["string-1", "string-999998"])
         );
     }
 }
