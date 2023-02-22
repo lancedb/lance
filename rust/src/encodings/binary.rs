@@ -162,9 +162,15 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     }
 
     /// Read the array with batch positions and range.
-    async fn get_internal(&self, positions: &Int64Array, range: Range<usize>) -> Result<ArrayRef> {
-        let start = positions.value(0);
-        let end = positions.value(positions.len() - 1);
+    ///
+    /// Parameters
+    ///
+    ///  - *positions*: position array for the batch.
+    ///  - *range*: range of rows to read.
+    async fn get_range(&self, positions: &Int64Array, range: Range<usize>) -> Result<ArrayRef> {
+        assert!(positions.len() >= range.end);
+        let start = positions.value(range.start);
+        let end = positions.value(range.end - 1);
 
         let offset_data = if T::Offset::IS_LARGE {
             subtract_scalar(positions, start)?.into_data()
@@ -182,7 +188,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .await?;
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(range.len())
+            .len(range.len() - 1)
             .null_count(0);
 
         // Count nulls
@@ -212,14 +218,14 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .build()?;
 
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
-
     }
 
-    async fn take_internal(&self, positions: &[i64], indices: &[u32]) -> Result<ArrayRef> {
-        let array = self.get(start as usize..end as usize + 1).await?;
+    async fn take_internal(&self, positions: &Int64Array, indices: &UInt32Array) -> Result<ArrayRef> {
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self.get_range(positions, start as usize..end as usize + 1).await?;
         let adjusted_offsets = subtract_scalar(indices, start)?;
         Ok(take(&array, &adjusted_offsets, None)?)
-        todo!()
     }
 }
 
@@ -311,55 +317,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
         let positions = position_decoder.get(index.start..index.end + 1).await?;
         let int64_positions: &Int64Array = as_primitive_array(&positions);
 
-        let start_position = int64_positions.value(0);
-
-        let offset_data = if T::Offset::IS_LARGE {
-            subtract_scalar(int64_positions, start_position)?.into_data()
-        } else {
-            cast(
-                &subtract_scalar_dyn::<Int64Type>(&positions, start_position)?,
-                &DataType::Int32,
-            )?
-            .into_data()
-        };
-
-        let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
-        let bytes = self
-            .reader
-            .get_range(start_position as usize..(start_position + read_len) as usize)
-            .await?;
-
-        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(index.len())
-            .null_count(0);
-
-        // Count nulls
-        if self.nullable {
-            let mut null_count = 0;
-            let mut null_buf = MutableBuffer::new_null(self.length);
-            int64_positions
-                .values()
-                .windows(2)
-                .enumerate()
-                .for_each(|(idx, w)| {
-                    if w[0] == w[1] {
-                        bit_util::unset_bit(null_buf.as_mut(), idx);
-                        null_count += 1;
-                    } else {
-                        bit_util::set_bit(null_buf.as_mut(), idx);
-                    }
-                });
-            data_builder = data_builder
-                .null_count(null_count)
-                .null_bit_buffer(Some(null_buf.into()));
-        }
-
-        let array_data = data_builder
-            .add_buffer(offset_data.buffers()[0].clone())
-            .add_buffer(bytes.into())
-            .build()?;
-
-        Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+        self.get_range(int64_positions, 0..positions.len()).await
     }
 }
 
