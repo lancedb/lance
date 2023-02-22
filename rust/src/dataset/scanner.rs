@@ -316,6 +316,7 @@ impl Scanner {
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
+            self.dataset.fragments().clone(),
             projection,
             self.batch_size,
             PREFETCH_SIZE,

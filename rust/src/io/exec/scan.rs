@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
+use crate::format::Fragment;
 use crate::io::FileReader;
 
 /// Dataset Scan Node.
@@ -57,6 +58,7 @@ impl LanceStream {
     ///
     pub fn try_new(
         dataset: Arc<Dataset>,
+        fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
         prefetch_size: usize,
@@ -67,7 +69,7 @@ impl LanceStream {
         let project_schema = projection.clone();
         let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
-            'outer: for frag in dataset.fragments().as_ref() {
+            'outer: for frag in fragments.as_ref() {
                 if tx.is_closed() {
                     return;
                 }
@@ -144,6 +146,7 @@ impl Stream for LanceStream {
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
+    fragments: Arc<Vec<Fragment>>,
     projection: Arc<Schema>,
     read_size: usize,
     prefetch_size: usize,
@@ -171,6 +174,7 @@ impl std::fmt::Debug for LanceScanExec {
 impl LanceScanExec {
     pub fn new(
         dataset: Arc<Dataset>,
+        fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
         prefetch_size: usize,
@@ -178,6 +182,7 @@ impl LanceScanExec {
     ) -> Self {
         Self {
             dataset,
+            fragments,
             projection,
             read_size,
             prefetch_size,
@@ -229,6 +234,7 @@ impl ExecutionPlan for LanceScanExec {
     ) -> Result<SendableRecordBatchStream> {
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
+            self.fragments.clone(),
             self.projection.clone(),
             self.read_size,
             self.prefetch_size,
