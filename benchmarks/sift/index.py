@@ -56,7 +56,7 @@ def main():
     dataset = dataset.create_index(
         args.column_name,
         index_type="IVF_PQ",
-        metric="cosine",
+        # metric="cosine",
         num_partitions=args.ivf_partitions,  # IVF
         num_sub_vectors=args.pq_subvectors,
     )  # PQ

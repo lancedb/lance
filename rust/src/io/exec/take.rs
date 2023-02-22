@@ -51,7 +51,12 @@ impl Take {
     ///  - Dataset: the dataset to read from
     ///  - schema: projection schema for take node.
     ///  - child: the upstream ExedNode to feed data in.
-    fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: SendableRecordBatchStream, drop_row_id: bool) -> Self {
+    fn new(
+        dataset: Arc<Dataset>,
+        schema: Arc<Schema>,
+        child: SendableRecordBatchStream,
+        drop_row_id: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
         let projection = schema.clone();

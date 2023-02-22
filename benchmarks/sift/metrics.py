@@ -83,14 +83,14 @@ def test_dataset(
     tot = 0
     for i in range(nsamples):
         q = query_vectors[i, :]
-        actual_sorted.append(cosine_argsort(all_vectors, q)[:k])
+        actual_sorted.append(l2_argsort(all_vectors, q)[:k])
         start = time.time()
         rs = dataset.to_table(
             nearest={
                 "column": "vector",
                 "q": q,
                 "k": k,
-                "metric": "cosine",
+                # "metric": "cosine",
                 "nprobes": nprobes,
                 "refine_factor": refine_factor,
             }

@@ -342,7 +342,12 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
-    fn take(&self, indices: Arc<dyn ExecutionPlan>, projection: &Schema, drop_row_id: bool) -> Arc<dyn ExecutionPlan> {
+    fn take(
+        &self,
+        indices: Arc<dyn ExecutionPlan>,
+        projection: &Schema,
+        drop_row_id: bool,
+    ) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalTakeExec::new(
             self.dataset.clone(),
             Arc::new(projection.clone()),
