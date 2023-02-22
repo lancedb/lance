@@ -68,6 +68,7 @@ pub async fn flat_search(
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
             let mut batch = batch?;
+            println!("flat_search input batch: {:?}", batch.clone());
             if batch.column_by_name(SCORE_COLUMN).is_some() {
                 // Ignore the score calculated from inner vector index.
                 batch = batch.drop_column(SCORE_COLUMN)?;

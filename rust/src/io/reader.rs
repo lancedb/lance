@@ -288,6 +288,7 @@ async fn read_batch(
             ArrowField::new("_rowid", DataType::UInt64, false),
             row_id_arr,
         )?;
+        println!("reader::read_batch {:?}", batch.clone());
     }
     Ok(batch)
 }

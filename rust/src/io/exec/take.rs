@@ -55,6 +55,7 @@ impl Take {
         let (tx, rx) = mpsc::channel(4);
 
         let projection = schema.clone();
+        println!("take node projection: {:?}", projection.clone());
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = child
                 .zip(stream::repeat_with(|| {
@@ -62,6 +63,7 @@ impl Take {
                 }))
                 .then(|(batch, (dataset, projection))| async move {
                     let batch = batch?;
+                    println!("take node batch: {:?}", batch.clone());
                     let row_id_arr = batch.column_by_name("_rowid").unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let rows = dataset.take_rows(row_ids.values(), &projection).await?;

@@ -54,7 +54,7 @@ impl KNNFlatStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute scores in flat index: {e}"
                     ))))
                     .await
                     .expect("KNNFlat failed to send message");
@@ -181,10 +181,13 @@ impl KNNIndexStream {
                 }
             };
             let result = match index.search(&q).await {
-                Ok(b) => b,
+                Ok(b) => {
+                    println!("knnindex output batch: {:?}", b.clone());
+                    b
+                },
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute scores in ivf_pq index: {e}"
                     ))))
                     .await
                     .expect("KNNIndex failed to send message");
