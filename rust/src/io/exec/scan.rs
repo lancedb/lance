@@ -67,7 +67,6 @@ impl LanceStream {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
         let project_schema = projection.clone();
-        println!("project_schema in scan node: {:?}", projection.clone());
         let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
             'outer: for frag in fragments.as_ref() {
