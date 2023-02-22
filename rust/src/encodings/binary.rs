@@ -170,13 +170,15 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     async fn get_range(&self, positions: &Int64Array, range: Range<usize>) -> Result<ArrayRef> {
         assert!(positions.len() >= range.end);
         let start = positions.value(range.start);
-        let end = positions.value(range.end - 1);
+        let end = positions.value(range.end);
 
+        let slice = positions.slice(range.start, range.len() + 1);
+        let position_slice: &Int64Array = as_primitive_array(slice.as_ref());
         let offset_data = if T::Offset::IS_LARGE {
-            subtract_scalar(positions, start)?.into_data()
+            subtract_scalar(position_slice, start)?.into_data()
         } else {
             cast(
-                &(Arc::new(subtract_scalar::<Int64Type>(positions, start)?) as ArrayRef),
+                &(Arc::new(subtract_scalar::<Int64Type>(position_slice, start)?) as ArrayRef),
                 &DataType::Int32,
             )?
             .into_data()
@@ -185,7 +187,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let bytes = self.reader.get_range(start as usize..end as usize).await?;
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(range.len() - 1)
+            .len(range.len())
             .null_count(0);
 
         // Count nulls
@@ -251,21 +253,21 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let positions = self
             .get_positions(start as usize..(end + 1) as usize)
             .await?;
+        let indices = subtract_scalar(indices, start)?;
 
         let mut chunks: Vec<UInt32Array> = vec![];
         let mut start_idx = 0;
         for i in 0..indices.len() {
-            let idx = indices.value(i) as usize;
-            if positions.value(idx) - positions.value(indices.value(start_idx) as usize)
+            let current = indices.value(i) as usize;
+            if positions.value(current) - positions.value(indices.value(start_idx) as usize)
                 > MIN_IO_SIZE
             {
-                chunks.push(as_primitive_array(&indices.slice(start_idx, idx - start_idx)).clone());
+                chunks.push(as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone());
                 start_idx = i;
             }
         }
         chunks
             .push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
-        println!("Take chunks: {:?}", chunks);
         let arrays = stream::iter(chunks)
             .zip(repeat_with(|| positions.clone()))
             .map(|(indices, positions)| async move {
@@ -349,7 +351,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
         let positions = position_decoder.get(index.start..index.end + 1).await?;
         let int64_positions: &Int64Array = as_primitive_array(&positions);
 
-        self.get_range(int64_positions, 0..positions.len()).await
+        self.get_range(int64_positions, 0..index.len()).await
     }
 }
 
