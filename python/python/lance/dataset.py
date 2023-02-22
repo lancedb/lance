@@ -48,6 +48,7 @@ class LanceDataset(pa.dataset.Dataset):
     def scanner(
         self,
         columns: Optional[list[str]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -59,6 +60,8 @@ class LanceDataset(pa.dataset.Dataset):
         columns: list of str, default None
             List of column names to be fetched.
             All columns if None or unspecified.
+        filter : pa.compute.Expression or str
+            Scan will return only the rows matching the filter.
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -72,10 +75,15 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        When both `filter` and `nearest` are provided, the nearest neighbors search is performed first
+        before the filtering. In case where the filtered results are empty, try to use larger `K` in nearest
+        neighbors query.
         """
         return (
             ScannerBuilder(self)
             .columns(columns)
+            .filter(filter)
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
@@ -92,6 +100,7 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[list[str]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -103,6 +112,8 @@ class LanceDataset(pa.dataset.Dataset):
         columns: list of str, default None
             List of column names to be fetched.
             All columns if None or unspecified.
+        filter : pa.compute.Expression or str
+            Scan will return only the rows matching the filter.
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -116,9 +127,11 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        See `scanner()` for more details.
         """
         return self.scanner(
-            columns=columns, limit=limit, offset=offset, nearest=nearest
+            columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest
         ).to_table()
 
     @property
@@ -346,6 +359,7 @@ class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
         self._limit = 0
+        self._filter = None
         self._offset = None
         self._columns = None
         self._nearest = None
@@ -366,6 +380,12 @@ class ScannerBuilder:
         if cols is not None and len(cols) == 0:
             cols = None
         self._columns = cols
+        return self
+
+    def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
+        if isinstance(filter, pa.compute.Expression):
+            filter = str(filter)
+        self._filter = filter
         return self
 
     def nearest(
@@ -404,7 +424,7 @@ class ScannerBuilder:
 
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
-            self._columns, self._limit, self._offset, self._nearest
+            self._columns, self._filter, self._limit, self._offset, self._nearest
         )
         return LanceScanner(scanner, self.ds)
 
