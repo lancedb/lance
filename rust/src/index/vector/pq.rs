@@ -89,7 +89,7 @@ impl<'a> PQIndex<'a> {
         })
     }
 
-    fn fast_l2_scores(&self, key: &Float32Array, k: usize) -> Result<ArrayRef> {
+    fn fast_l2_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build distance table for each sub-centroid to the query key.
         //
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -122,7 +122,7 @@ impl<'a> PQIndex<'a> {
         )))
     }
 
-    fn cosine_scores(&self, key: &Float32Array, k: usize) -> Result<ArrayRef> {
+    fn cosine_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build two tables for cosine distance.
         //
         // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
@@ -193,9 +193,9 @@ impl<'a> PQIndex<'a> {
         assert_eq!(self.code.len() % self.num_sub_vectors, 0);
 
         let scores = if self.metric_type == MetricType::L2 {
-            self.fast_l2_scores(key, k)?
+            self.fast_l2_scores(key)?
         } else {
-            self.cosine_scores(key, k)?
+            self.cosine_scores(key)?
         };
 
         let indices = sort_to_indices(&scores, None, Some(k))?;

@@ -182,7 +182,7 @@ impl KNNIndexStream {
             };
             let result = match index.search(&q).await {
                 Ok(b) => {
-                    println!("knnindex output batch: {:?}", b.clone());
+                    // println!("knnindex output batch: {:?}", b.clone());
                     b
                 },
                 Err(e) => {
