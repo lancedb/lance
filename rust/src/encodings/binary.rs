@@ -19,20 +19,20 @@ use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
+use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::{
-    new_empty_array,
     cast::as_primitive_array,
-    UInt32Array,
+    new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray, UInt32Array,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use arrow_select::take::take;
+use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
+use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -150,7 +150,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     }
 
     /// Get the position array for the batch.
-    async fn get_positions(&self, index: Range<usize>) -> Result<Int64Array> {
+    async fn get_positions(&self, index: Range<usize>) -> Result<Arc<Int64Array>> {
         let position_decoder = PlainDecoder::new(
             self.reader,
             &DataType::Int64,
@@ -158,7 +158,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             self.length + 1,
         )?;
         let values = position_decoder.get(index.start..index.end + 1).await?;
-        Ok(as_primitive_array(&values).clone())
+        Ok(Arc::new(as_primitive_array(&values).clone()))
     }
 
     /// Read the array with batch positions and range.
@@ -182,10 +182,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        let bytes = self
-            .reader
-            .get_range(start as usize..end as usize)
-            .await?;
+        let bytes = self.reader.get_range(start as usize..end as usize).await?;
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(range.len() - 1)
@@ -220,10 +217,16 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
     }
 
-    async fn take_internal(&self, positions: &Int64Array, indices: &UInt32Array) -> Result<ArrayRef> {
+    async fn take_internal(
+        &self,
+        positions: &Int64Array,
+        indices: &UInt32Array,
+    ) -> Result<ArrayRef> {
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
-        let array = self.get_range(positions, start as usize..end as usize + 1).await?;
+        let array = self
+            .get_range(positions, start as usize..end as usize + 1)
+            .await?;
         let adjusted_offsets = subtract_scalar(indices, start)?;
         Ok(take(&array, &adjusted_offsets, None)?)
     }
@@ -243,12 +246,41 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
 
-        const MIN_IO_SIZE: usize = 128 * 1024;  // 128KB
-        let positions = self.get_positions(start as usize..(end + 1) as usize).await?;
+        // TODO: make min batch size configurable.
+        const MIN_IO_SIZE: i64 = 64 * 1024; // 64KB
+        let positions = self
+            .get_positions(start as usize..(end + 1) as usize)
+            .await?;
 
-        let array = self.get(start as usize..end as usize + 1).await?;
-        let adjusted_offsets = subtract_scalar(indices, start)?;
-        Ok(take(&array, &adjusted_offsets, None)?)
+        let mut chunks: Vec<UInt32Array> = vec![];
+        let mut start_idx = 0;
+        for i in 0..indices.len() {
+            let idx = indices.value(i) as usize;
+            if positions.value(idx) - positions.value(indices.value(start_idx) as usize)
+                > MIN_IO_SIZE
+            {
+                chunks.push(as_primitive_array(&indices.slice(start_idx, idx - start_idx)).clone());
+                start_idx = i;
+            }
+        }
+        chunks
+            .push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
+        println!("Take chunks: {:?}", chunks);
+        let arrays = stream::iter(chunks)
+            .zip(repeat_with(|| positions.clone()))
+            .map(|(indices, positions)| async move {
+                self.take_internal(positions.as_ref(), &indices).await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(concat(
+            arrays
+                .iter()
+                .map(|a| a.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?)
     }
 }
 
