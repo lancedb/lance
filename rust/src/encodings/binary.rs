@@ -1,4 +1,18 @@
-//! Var-length Binary Encoding
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Var-length binary encoding.
 //!
 
 use std::marker::PhantomData;
@@ -6,10 +20,10 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
-use arrow_array::cast::as_primitive_array;
-use arrow_array::UInt32Array;
 use arrow_array::{
     new_empty_array,
+    cast::as_primitive_array,
+    UInt32Array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
     Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
 };
@@ -134,6 +148,79 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             phantom: PhantomData,
         }
     }
+
+    /// Get the position array for the batch.
+    async fn get_positions(&self, index: Range<usize>) -> Result<Int64Array> {
+        let position_decoder = PlainDecoder::new(
+            self.reader,
+            &DataType::Int64,
+            self.position,
+            self.length + 1,
+        )?;
+        let values = position_decoder.get(index.start..index.end + 1).await?;
+        Ok(as_primitive_array(&values).clone())
+    }
+
+    /// Read the array with batch positions and range.
+    async fn get_internal(&self, positions: &Int64Array, range: Range<usize>) -> Result<ArrayRef> {
+        let start = positions.value(0);
+        let end = positions.value(positions.len() - 1);
+
+        let offset_data = if T::Offset::IS_LARGE {
+            subtract_scalar(positions, start)?.into_data()
+        } else {
+            cast(
+                &(Arc::new(subtract_scalar::<Int64Type>(positions, start)?) as ArrayRef),
+                &DataType::Int32,
+            )?
+            .into_data()
+        };
+
+        let bytes = self
+            .reader
+            .get_range(start as usize..end as usize)
+            .await?;
+
+        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
+            .len(range.len())
+            .null_count(0);
+
+        // Count nulls
+        if self.nullable {
+            let mut null_count = 0;
+            let mut null_buf = MutableBuffer::new_null(self.length);
+            positions
+                .values()
+                .windows(2)
+                .enumerate()
+                .for_each(|(idx, w)| {
+                    if w[0] == w[1] {
+                        bit_util::unset_bit(null_buf.as_mut(), idx);
+                        null_count += 1;
+                    } else {
+                        bit_util::set_bit(null_buf.as_mut(), idx);
+                    }
+                });
+            data_builder = data_builder
+                .null_count(null_count)
+                .null_bit_buffer(Some(null_buf.into()));
+        }
+
+        let array_data = data_builder
+            .add_buffer(offset_data.buffers()[0].clone())
+            .add_buffer(bytes.into())
+            .build()?;
+
+        Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+
+    }
+
+    async fn take_internal(&self, positions: &[i64], indices: &[u32]) -> Result<ArrayRef> {
+        let array = self.get(start as usize..end as usize + 1).await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
+        todo!()
+    }
 }
 
 #[async_trait]
@@ -149,6 +236,10 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
+
+        const MIN_IO_SIZE: usize = 128 * 1024;  // 128KB
+        let positions = self.get_positions(start as usize..(end + 1) as usize).await?;
+
         let array = self.get(start as usize..end as usize + 1).await?;
         let adjusted_offsets = subtract_scalar(indices, start)?;
         Ok(take(&array, &adjusted_offsets, None)?)
