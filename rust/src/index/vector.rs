@@ -88,12 +88,8 @@ impl MetricType {
     ) -> Arc<dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync>
     {
         match self {
-            Self::L2 => {
-                Arc::new(l2_distance)
-            },
-            Self::Cosine => {
-                Arc::new(cosine_distance)
-            },
+            Self::L2 => Arc::new(l2_distance),
+            Self::Cosine => Arc::new(cosine_distance),
         }
     }
 }

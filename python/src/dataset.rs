@@ -130,8 +130,10 @@ impl Dataset {
                 if metric.is_none() {
                     None
                 } else {
-                    Some(MetricType::try_from(metric.to_string().to_lowercase().as_str())
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?)
+                    Some(
+                        MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    )
                 }
             } else {
                 None
