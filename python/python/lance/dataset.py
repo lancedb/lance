@@ -383,7 +383,10 @@ class ScannerBuilder:
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if isinstance(q, (np.ndarray, list, tuple)):
+            q = np.array(q).astype("float64")  # workaround for GH-608
             q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
+        if not isinstance(q, pa.FloatingPointArray):
+            raise TypeError("query vector must be list-like or pa.FloatingPointArray")
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
