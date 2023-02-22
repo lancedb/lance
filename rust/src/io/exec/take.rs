@@ -51,7 +51,12 @@ impl Take {
     ///  - Dataset: the dataset to read from
     ///  - schema: projection schema for take node.
     ///  - child: the upstream ExedNode to feed data in.
-    fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: SendableRecordBatchStream) -> Self {
+    fn new(
+        dataset: Arc<Dataset>,
+        schema: Arc<Schema>,
+        child: SendableRecordBatchStream,
+        drop_row_id: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
         let projection = schema.clone();
@@ -62,10 +67,15 @@ impl Take {
                 }))
                 .then(|(batch, (dataset, projection))| async move {
                     let batch = batch?;
-                    let row_id_arr = batch.column_by_name("_rowid").unwrap();
+                    let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let rows = dataset.take_rows(row_ids.values(), &projection).await?;
-                    rows.merge(&batch)?.drop_column("_rowid")
+                    let rows = rows.merge(&batch)?;
+                    if drop_row_id {
+                        rows.drop_column(ROW_ID)
+                    } else {
+                        Ok(rows)
+                    }
                 })
                 .map(|r| {
                     r.map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
@@ -124,14 +134,21 @@ pub struct GlobalTakeExec {
     dataset: Arc<Dataset>,
     schema: Arc<Schema>,
     input: Arc<dyn ExecutionPlan>,
+    drop_row_id: bool,
 }
 
 impl GlobalTakeExec {
-    pub fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, input: Arc<dyn ExecutionPlan>) -> Self {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        schema: Arc<Schema>,
+        input: Arc<dyn ExecutionPlan>,
+        drop_row_id: bool,
+    ) -> Self {
         Self {
             dataset,
             schema,
             input,
+            drop_row_id,
         }
     }
 }
@@ -174,6 +191,7 @@ impl ExecutionPlan for GlobalTakeExec {
             self.dataset.clone(),
             self.schema.clone(),
             input_stream,
+            self.drop_row_id,
         )))
     }
 

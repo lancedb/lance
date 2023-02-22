@@ -76,7 +76,7 @@ pub trait VectorIndex {
 }
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum MetricType {
     L2,
     Cosine,

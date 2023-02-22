@@ -266,7 +266,8 @@ impl Scanner {
 
                 let knn_node = self.ann(q, &index);
                 let knn_node = if q.refine_factor.is_some() {
-                    self.flat_knn(knn_node, &q)
+                    let flat_knn_projection = self.dataset.schema().project(&[&q.column])?;
+                    self.flat_knn(self.take(knn_node, &flat_knn_projection, false), &q)
                 } else {
                     knn_node
                 };
@@ -274,14 +275,14 @@ impl Scanner {
                 if let Some(filter_expression) = filter_expr {
                     self.filter_node(filter_expression, knn_node)?
                 } else {
-                    self.take(knn_node, projection)
+                    self.take(knn_node, projection, true)
                 }
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
                 let knn_node = self.flat_knn(scan_node, &q);
-                self.take(knn_node, projection)
+                self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
             let columns_in_filter = column_names_in_expr(filter.as_ref());
@@ -341,11 +342,17 @@ impl Scanner {
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
-    fn take(&self, indices: Arc<dyn ExecutionPlan>, projection: &Schema) -> Arc<dyn ExecutionPlan> {
+    fn take(
+        &self,
+        indices: Arc<dyn ExecutionPlan>,
+        projection: &Schema,
+        drop_row_id: bool,
+    ) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalTakeExec::new(
             self.dataset.clone(),
             Arc::new(projection.clone()),
             indices,
+            drop_row_id,
         ))
     }
 

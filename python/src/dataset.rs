@@ -132,6 +132,19 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
+            let metric_type: Option<MetricType> = if let Some(metric) = nearest.get_item("metric") {
+                if metric.is_none() {
+                    None
+                } else {
+                    Some(
+                        MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    )
+                }
+            } else {
+                None
+            };
+
             // When refine factor is specified, a final Refine stage will be added to the I/O plan,
             // and use Flat index over the raw vectors to refine the results.
             // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
@@ -150,6 +163,9 @@ impl Dataset {
                     let mut s = s.nprobs(nprobes);
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
+                    }
+                    if let Some(m) = metric_type {
+                        s = s.distance_metric(m);
                     }
                     s
                 })
