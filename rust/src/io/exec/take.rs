@@ -257,7 +257,7 @@ impl Stream for LocalTake {
     }
 }
 
-impl<'a> RecordBatchStream for LocalTake {
+impl RecordBatchStream for LocalTake {
     fn schema(&self) -> SchemaRef {
         Arc::new(self.schema.as_ref().into())
     }

@@ -1,24 +1,38 @@
-//! Var-length Binary Encoding
+// Copyright 2023 Lance Developers.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Var-length binary encoding.
 //!
 
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{subtract_scalar, subtract_scalar_dyn};
-use arrow_array::cast::as_primitive_array;
-use arrow_array::UInt32Array;
+use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::{
+    cast::as_primitive_array,
     new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray,
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray, UInt32Array,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use arrow_select::take::take;
+use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
+use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -134,6 +148,114 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             phantom: PhantomData,
         }
     }
+
+    /// Get the position array for the batch.
+    async fn get_positions(&self, index: Range<usize>) -> Result<Arc<Int64Array>> {
+        let position_decoder = PlainDecoder::new(
+            self.reader,
+            &DataType::Int64,
+            self.position,
+            self.length + 1,
+        )?;
+        let values = position_decoder.get(index.start..index.end + 1).await?;
+        Ok(Arc::new(as_primitive_array(&values).clone()))
+    }
+
+    /// Read the array with batch positions and range.
+    ///
+    /// Parameters
+    ///
+    ///  - *positions*: position array for the batch.
+    ///  - *range*: range of rows to read.
+    async fn get_range(&self, positions: &Int64Array, range: Range<usize>) -> Result<ArrayRef> {
+        assert!(positions.len() >= range.end);
+        let start = positions.value(range.start);
+        let end = positions.value(range.end);
+
+        let slice = positions.slice(range.start, range.len() + 1);
+        let position_slice: &Int64Array = as_primitive_array(slice.as_ref());
+        let offset_data = if T::Offset::IS_LARGE {
+            subtract_scalar(position_slice, start)?.into_data()
+        } else {
+            cast(
+                &(Arc::new(subtract_scalar::<Int64Type>(position_slice, start)?) as ArrayRef),
+                &DataType::Int32,
+            )?
+            .into_data()
+        };
+
+        let bytes = self.reader.get_range(start as usize..end as usize).await?;
+
+        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
+            .len(range.len())
+            .null_count(0);
+
+        // Count nulls
+        if self.nullable {
+            let mut null_count = 0;
+            let mut null_buf = MutableBuffer::new_null(self.length);
+            positions
+                .values()
+                .windows(2)
+                .enumerate()
+                .for_each(|(idx, w)| {
+                    if w[0] == w[1] {
+                        bit_util::unset_bit(null_buf.as_mut(), idx);
+                        null_count += 1;
+                    } else {
+                        bit_util::set_bit(null_buf.as_mut(), idx);
+                    }
+                });
+            data_builder = data_builder
+                .null_count(null_count)
+                .null_bit_buffer(Some(null_buf.into()));
+        }
+
+        let array_data = data_builder
+            .add_buffer(offset_data.buffers()[0].clone())
+            .add_buffer(bytes.into())
+            .build()?;
+
+        Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+    }
+
+    async fn take_internal(
+        &self,
+        positions: &Int64Array,
+        indices: &UInt32Array,
+    ) -> Result<ArrayRef> {
+        let start = indices.value(0);
+        let end = indices.value(indices.len() - 1);
+        let array = self
+            .get_range(positions, start as usize..end as usize + 1)
+            .await?;
+        let adjusted_offsets = subtract_scalar(indices, start)?;
+        Ok(take(&array, &adjusted_offsets, None)?)
+    }
+}
+
+fn plan_take_chunks(
+    positions: &Int64Array,
+    indices: &UInt32Array,
+    min_io_size: i64,
+) -> Result<Vec<UInt32Array>> {
+    let start = indices.value(0);
+    let indices = subtract_scalar(indices, start)?;
+
+    let mut chunks: Vec<UInt32Array> = vec![];
+    let mut start_idx = 0;
+    for i in 0..indices.len() {
+        let current = indices.value(i) as usize;
+        if positions.value(current) - positions.value(indices.value(start_idx) as usize)
+            > min_io_size
+        {
+            chunks.push(as_primitive_array(&indices.slice(start_idx, i - start_idx)).clone());
+            start_idx = i;
+        }
+    }
+    chunks.push(as_primitive_array(&indices.slice(start_idx, indices.len() - start_idx)).clone());
+
+    Ok(chunks)
 }
 
 #[async_trait]
@@ -149,9 +271,29 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 
         let start = indices.value(0);
         let end = indices.value(indices.len() - 1);
-        let array = self.get(start as usize..end as usize + 1).await?;
-        let adjusted_offsets = subtract_scalar(indices, start)?;
-        Ok(take(&array, &adjusted_offsets, None)?)
+
+        // TODO: make min batch size configurable.
+        const MIN_IO_SIZE: i64 = 64 * 1024; // 64KB
+        let positions = self
+            .get_positions(start as usize..(end + 1) as usize)
+            .await?;
+        let chunks = plan_take_chunks(&positions, indices, MIN_IO_SIZE)?;
+
+        let arrays = stream::iter(chunks)
+            .zip(repeat_with(|| positions.clone()))
+            .map(|(indices, positions)| async move {
+                self.take_internal(positions.as_ref(), &indices).await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(concat(
+            arrays
+                .iter()
+                .map(|a| a.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?)
     }
 }
 
@@ -220,55 +362,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
         let positions = position_decoder.get(index.start..index.end + 1).await?;
         let int64_positions: &Int64Array = as_primitive_array(&positions);
 
-        let start_position = int64_positions.value(0);
-
-        let offset_data = if T::Offset::IS_LARGE {
-            subtract_scalar(int64_positions, start_position)?.into_data()
-        } else {
-            cast(
-                &subtract_scalar_dyn::<Int64Type>(&positions, start_position)?,
-                &DataType::Int32,
-            )?
-            .into_data()
-        };
-
-        let read_len = int64_positions.value(int64_positions.len() - 1) - start_position;
-        let bytes = self
-            .reader
-            .get_range(start_position as usize..(start_position + read_len) as usize)
-            .await?;
-
-        let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
-            .len(index.len())
-            .null_count(0);
-
-        // Count nulls
-        if self.nullable {
-            let mut null_count = 0;
-            let mut null_buf = MutableBuffer::new_null(self.length);
-            int64_positions
-                .values()
-                .windows(2)
-                .enumerate()
-                .for_each(|(idx, w)| {
-                    if w[0] == w[1] {
-                        bit_util::unset_bit(null_buf.as_mut(), idx);
-                        null_count += 1;
-                    } else {
-                        bit_util::set_bit(null_buf.as_mut(), idx);
-                    }
-                });
-            data_builder = data_builder
-                .null_count(null_count)
-                .null_bit_buffer(Some(null_buf.into()));
-        }
-
-        let array_data = data_builder
-            .add_buffer(offset_data.buffers()[0].clone())
-            .add_buffer(bytes.into())
-            .build()?;
-
-        Ok(Arc::new(GenericByteArray::<T>::from(array_data)))
+        self.get_range(int64_positions, 0..index.len()).await
     }
 }
 
@@ -394,6 +488,39 @@ mod tests {
         assert_eq!(
             actual.as_ref(),
             &StringArray::from_iter_values(["b", "c", "f"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_sparse_indices() {
+        let data = StringArray::from_iter_values((0..1000000).map(|v| format!("string-{v}")));
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let pos = write_test_data(&store, &path, &data).await.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
+
+        let positions = decoder.get_positions(1..999998).await.unwrap();
+        let indices = UInt32Array::from_iter_values([1, 999998]);
+        let chunks = plan_take_chunks(positions.as_ref(), &indices, 64 * 1024).unwrap();
+        // Relative offset within the positions.
+        assert_eq!(
+            chunks,
+            vec![
+                UInt32Array::from_iter_values([0]),
+                UInt32Array::from_iter_values([999997])
+            ]
+        );
+
+        let actual = decoder
+            .take(&UInt32Array::from_iter_values([1, 999998]))
+            .await
+            .unwrap();
+        assert_eq!(
+            actual.as_ref(),
+            &StringArray::from_iter_values(["string-1", "string-999998"])
         );
     }
 }
