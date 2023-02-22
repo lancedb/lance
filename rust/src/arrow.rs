@@ -336,6 +336,9 @@ pub trait RecordBatchExt {
 
     /// Get (potentially nested) column by qualified name.
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
+
+    /// Project the schema over the [RecordBatch].
+    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -408,6 +411,21 @@ impl RecordBatchExt for RecordBatch {
 
         self.column_by_name(split[0])
             .and_then(|arr| get_sub_array(arr, &split[1..]))
+    }
+
+    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
+        let mut columns = vec![];
+        for field in schema.fields.iter() {
+            if let Some(col) = self.column_by_name(field.name()) {
+                columns.push(col.clone());
+            } else {
+                return Err(Error::Arrow(format!(
+                    "field {} does not exist in the RecordBatch",
+                    field.name()
+                )));
+            }
+        }
+        Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
     }
 }
 

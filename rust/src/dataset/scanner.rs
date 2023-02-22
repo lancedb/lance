@@ -22,22 +22,24 @@ use std::task::{Context, Poll};
 use arrow_array::{Float32Array, RecordBatch};
 use arrow_schema::DataType::Float32;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
-use datafusion::execution::context::SessionState;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::physical_plan::limit::GlobalLimitExec;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::execution::{
+    context::SessionState,
+    runtime_env::{RuntimeConfig, RuntimeEnv},
+};
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::{
+    limit::GlobalLimitExec, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+};
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
-use object_store::path::Path;
-use sqlparser::ast::{Expr, SetExpr, Statement};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
+use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Index, Manifest};
+use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec};
+use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -64,16 +66,14 @@ pub struct Scanner {
 
     projections: Schema,
 
-    /// Optional filters.
-    filter: Option<Expr>,
+    /// Optional filters string.
+    filter: Option<String>,
 
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
 
     limit: Option<i64>,
     offset: Option<i64>,
-
-    fragments: Arc<Vec<Fragment>>,
 
     nearest: Option<Query>,
 
@@ -84,7 +84,6 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection = dataset.schema().clone();
-        let fragments = dataset.fragments().clone();
         Self {
             dataset,
             projections: projection,
@@ -92,7 +91,6 @@ impl Scanner {
             batch_size: DEFAULT_BATCH_SIZE,
             limit: None,
             offset: None,
-            fragments,
             nearest: None,
             with_row_id: false,
         }
@@ -129,14 +127,8 @@ impl Scanner {
         if stmts.len() != 1 {
             return Err(Error::IO(format!("Filter is not valid: {filter}")));
         }
-        if let Statement::Query(query) = &stmts[0] {
-            if let SetExpr::Select(s) = query.body.as_ref() {
-                self.filter = s.selection.clone();
-                return Ok(self);
-            }
-        }
-
-        return Err(Error::IO(format!("Filter is not valid: {filter}")));
+        self.filter = Some(filter.to_string());
+        Ok(self)
     }
 
     /// Set the batch size.
@@ -244,10 +236,16 @@ impl Scanner {
     ///
     /// TODO: implement as IntoStream/IntoIterator.
     pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
-        let data_dir = self.dataset.data_dir();
-        let manifest = self.dataset.manifest.clone();
         let with_row_id = self.with_row_id;
         let projection = &self.projections;
+
+        let filter_expr = if let Some(filter) = self.filter.as_ref() {
+            let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
+            let logical_expr = planner.parse_filter(&filter)?;
+            Some(planner.create_physical_expr(&logical_expr)?)
+        } else {
+            None
+        };
 
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
             let column_id = self.dataset.schema().field_id(q.column.as_str())?;
@@ -266,35 +264,39 @@ impl Scanner {
                     }
                 }
 
-                let ann_node = self.ann(q, &index);
-                let take_node = self.take(ann_node, projection);
-
-                if q.refine_factor.is_some() {
-                    self.knn(take_node, &q)
+                let knn_node = self.ann(q, &index);
+                let knn_node = if q.refine_factor.is_some() {
+                    self.flat_knn(knn_node, &q)
                 } else {
-                    take_node
+                    knn_node
+                };
+
+                if let Some(filter_expression) = filter_expr {
+                    self.filter_node(filter_expression, knn_node)?
+                } else {
+                    self.take(knn_node, projection)
                 }
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node = self.scan(
-                    &data_dir,
-                    manifest.clone(),
-                    self.fragments.clone(),
-                    true,
-                    vector_scan_projection,
-                );
-                let knn_node = self.knn(scan_node, &q);
+                let scan_node = self.scan(true, vector_scan_projection);
+                let knn_node = self.flat_knn(scan_node, &q);
                 self.take(knn_node, projection)
             }
+        } else if let Some(filter) = filter_expr {
+            let columns_in_filter = column_names_in_expr(filter.as_ref());
+            let filter_schema = Arc::new(
+                self.dataset.schema().project(
+                    &columns_in_filter
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                )?,
+            );
+            let scan = self.scan(true, filter_schema);
+            self.filter_node(filter, scan)?
         } else {
-            self.scan(
-                &data_dir,
-                manifest,
-                self.fragments.clone(),
-                with_row_id,
-                Arc::new(self.projections.clone()),
-            )
+            self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
 
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
@@ -311,20 +313,11 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    fn scan(
-        &self,
-        data_dir: &Path,
-        manifest: Arc<Manifest>,
-        fragments: Arc<Vec<Fragment>>,
-        with_row_id: bool,
-        projection: Arc<Schema>,
-    ) -> Arc<dyn ExecutionPlan> {
+    fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
-            self.dataset.object_store.clone(),
-            data_dir.clone(),
-            fragments,
+            self.dataset.clone(),
+            self.dataset.fragments().clone(),
             projection,
-            manifest,
             self.batch_size,
             PREFETCH_SIZE,
             with_row_id,
@@ -332,7 +325,7 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
+    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
         Arc::new(KNNFlatExec::new(input, q.clone()))
     }
 
@@ -363,6 +356,19 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    fn filter_node(
+        &self,
+        filter: Arc<dyn PhysicalExpr>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_node = Arc::new(FilterExec::try_new(filter, plan)?);
+        Ok(Arc::new(LocalTakeExec::new(
+            filter_node,
+            self.dataset.clone(),
+            Arc::new(self.projections.clone()),
+        )))
     }
 }
 
@@ -403,7 +409,7 @@ mod test {
     use arrow::compute::concat_batches;
     use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray};
     use arrow_schema::DataType;
-    use sqlparser::ast::*;
+    use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
@@ -484,16 +490,34 @@ mod test {
         let mut scan = dataset.scan();
         assert!(scan.filter.is_none());
 
-        scan.filter("a > 50").unwrap();
+        scan.filter("i > 50").unwrap();
         println!("Filter is: {:?}", scan.filter);
-        assert_eq!(
-            scan.filter,
-            Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("a"))),
-                op: BinaryOperator::Gt,
-                right: Box::new(Expr::Value(Value::Number(String::from("50"), false)))
-            })
-        );
+        assert_eq!(scan.filter, Some("i > 50".to_string()));
+
+        let batches = scan
+            .project(&["s"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        println!("Batches: {:?}\n", batches);
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "s",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from_iter_values(
+                (51..100).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap();
+        assert_eq!(batch, expected_batch);
     }
 
     #[tokio::test]

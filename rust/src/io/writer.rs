@@ -443,7 +443,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.read_batch(0, ..).await.unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batch);
     }
 }

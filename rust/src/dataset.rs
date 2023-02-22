@@ -57,9 +57,9 @@ const DATA_DIR: &str = "data";
 /// Lance Dataset
 #[derive(Debug, Clone)]
 pub struct Dataset {
-    object_store: Arc<ObjectStore>,
+    pub(crate) object_store: Arc<ObjectStore>,
     base: Path,
-    manifest: Arc<Manifest>,
+    pub(crate) manifest: Arc<Manifest>,
 }
 
 /// Dataset Version
@@ -444,7 +444,11 @@ impl Dataset {
                     sorted_indices[end] -= row_count;
                 }
                 reader.set_projection(projection.clone());
-                batches.push(reader.take(&sorted_indices[start..end + 1]).await?);
+                batches.push(
+                    reader
+                        .take(&sorted_indices[start..end + 1], projection)
+                        .await?,
+                );
 
                 // restore the row indices
                 for indice in sorted_indices[start..end + 1].iter_mut() {
@@ -502,7 +506,7 @@ impl Dataset {
                 )
                 .await?;
                 reader.set_projection(projection.clone());
-                reader.take(indices.as_slice()).await
+                reader.take(indices.as_slice(), projection).await
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -537,7 +541,7 @@ impl Dataset {
         read_manifest(&self.object_store, &self.latest_manifest_path()).await
     }
 
-    fn data_dir(&self) -> Path {
+    pub(crate) fn data_dir(&self) -> Path {
         self.base.child(DATA_DIR)
     }
 

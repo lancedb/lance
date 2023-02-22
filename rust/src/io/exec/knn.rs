@@ -24,7 +24,7 @@ use arrow_array::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
@@ -137,20 +137,20 @@ impl ExecutionPlan for KNNFlatExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> Statistics {
         todo!()
     }
 }
@@ -273,15 +273,15 @@ impl ExecutionPlan for KNNIndexExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         _partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
             &self.index_name,
