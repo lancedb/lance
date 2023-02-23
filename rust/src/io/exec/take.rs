@@ -72,7 +72,8 @@ impl Take {
                     let rows = if projection.fields.is_empty() {
                         batch
                     } else {
-                        dataset.take_rows(row_ids.values(), &projection)
+                        dataset
+                            .take_rows(row_ids.values(), &projection)
                             .await?
                             .merge(&batch)?
                     };
