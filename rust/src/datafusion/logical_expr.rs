@@ -34,6 +34,8 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::UInt16 => Ok(Expr::Literal(ScalarValue::UInt16(v.map(|v| v as u16)))),
             DataType::UInt32 => Ok(Expr::Literal(ScalarValue::UInt32(v.map(|v| v as u32)))),
             DataType::UInt64 => Ok(Expr::Literal(ScalarValue::UInt64(v.map(|v| v as u64)))),
+            DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
+            DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
             _ => {
                 return Err(Error::IO(format!(
                     "DataType '{data_type:?}' does not match to the value: {expr}"
