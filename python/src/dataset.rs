@@ -91,10 +91,6 @@ impl Dataset {
             scanner
                 .project(&proj)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        } else {
-            scanner
-                .project(&vec![])
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = filter {
             scanner

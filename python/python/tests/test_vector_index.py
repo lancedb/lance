@@ -10,6 +10,17 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
 
 import string
 import random
@@ -51,7 +62,7 @@ def indexed_dataset(tmp_path):
 
 def run(ds):
     q = np.random.randn(768)
-    project = [["price"], ["vector"], ["vector", "meta"]]
+    project = [None, [], ["price"], ["vector"], ["vector", "meta"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
     times = []
@@ -59,7 +70,9 @@ def run(ds):
     for columns in project:
 
         expected_columns = []
-        if columns is not None:
+        if columns is None:
+            expected_columns.extend(ds.column_names)
+        else:
             expected_columns.extend(columns)
         for c in ["vector", "score"]:
             if c not in expected_columns:
