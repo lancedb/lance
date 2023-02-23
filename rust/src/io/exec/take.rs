@@ -69,6 +69,7 @@ impl Take {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
+                    println!("KNN batch is: {:?}", batch);
                     let rows = dataset.take_rows(row_ids.values(), &projection).await?;
                     let rows = rows.merge(&batch)?;
                     if drop_row_id {
@@ -159,7 +160,7 @@ impl ExecutionPlan for GlobalTakeExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.input.schema()
+        Arc::new(ArrowSchema::from(self.schema.as_ref()))
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {

@@ -219,9 +219,11 @@ impl Scanner {
                 })?
                 .into();
             let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![column, score]);
-            let to_merge = &Schema::try_from(&score_schema).unwrap();
-            let merged = self.projections.merge(to_merge);
+            // let score_schema = ArrowSchema::new(vec![column, score]);
+            let score_schema = ArrowSchema::new(vec![score]);
+
+            let vector_search_columns = &Schema::try_from(&score_schema)?;
+            let merged = self.projections.merge(vector_search_columns);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))
@@ -275,7 +277,6 @@ impl Scanner {
                 if let Some(filter_expression) = filter_expr {
                     self.filter_node(filter_expression, knn_node)?
                 } else {
-                    println!("Take Projection: {:?} {:?}", projection, knn_node);
                     self.take(knn_node, projection, true)
                 }
             } else {
@@ -304,8 +305,6 @@ impl Scanner {
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
-
-        println!("Final plan: {:?}", plan);
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
