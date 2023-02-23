@@ -275,6 +275,7 @@ impl Scanner {
                 if let Some(filter_expression) = filter_expr {
                     self.filter_node(filter_expression, knn_node)?
                 } else {
+                    println!("Take Projection: {:?} {:?}", projection, knn_node);
                     self.take(knn_node, projection, true)
                 }
             } else {
@@ -303,6 +304,8 @@ impl Scanner {
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
+
+        println!("Final plan: {:?}", plan);
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
@@ -344,14 +347,14 @@ impl Scanner {
     /// Take row indices produced by input plan from the dataset (with projection)
     fn take(
         &self,
-        indices: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
         drop_row_id: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalTakeExec::new(
             self.dataset.clone(),
             Arc::new(projection.clone()),
-            indices,
+            input,
             drop_row_id,
         ))
     }
