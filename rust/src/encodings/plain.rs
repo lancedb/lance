@@ -23,11 +23,12 @@
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
+use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray,
-    UInt32Array, UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt32Array, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -77,12 +78,23 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
+    async fn encode_boolean(&mut self, array: &BooleanArray) -> Result<()> {
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for i in 0..array.len() {
+            builder.append_value(array.value(i));
+        }
+        let array = builder.finish();
+        self.writer.write_all(array.data().buffers()[0].as_slice()).await?;
+        Ok(())
+    }
+
     /// Encode primitive values.
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
         let data = array.data();
         if matches!(array.data_type(), DataType::Boolean) {
-            self.writer.write_all(&data.buffers()[0].as_slice()).await?;
+            let boolean_arr = as_boolean_array(array);
+            self.encode_boolean(boolean_arr).await?;
         } else {
             let byte_width = array.data_type().byte_width();
             self.writer
@@ -572,6 +584,20 @@ mod tests {
         for i in (0..100).step_by(4) {
             let pos = encoder.encode(array.slice(i, 4).as_ref()).await.unwrap();
             assert_eq!(pos, 4 * i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_boolean_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/bool_slice");
+
+        let array = BooleanArray::from((0..120).map(|v| v % 2 == 0).collect::<Vec<_>>());
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        for i in 0..10 {
+            let pos = encoder.encode(array.slice(i, 12).as_ref()).await.unwrap();
+            assert_eq!(pos, i * 2);
         }
     }
 
