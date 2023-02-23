@@ -224,7 +224,7 @@ impl Scanner {
 
             let vector_search_columns = &Schema::try_from(&score_schema)?;
             let merged = self.projections.merge(vector_search_columns);
-            // println!("Merged schema: {:?}", merged);
+            // println!("Scanner::schema: {:?}", merged);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))
@@ -268,11 +268,12 @@ impl Scanner {
                 }
 
                 let knn_node = self.ann(q, &index);
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector = self.take(knn_node, &with_vector, false);
                 let knn_node = if q.refine_factor.is_some() {
-                    let flat_knn_projection = self.dataset.schema().project(&[&q.column])?;
-                    self.flat_knn(self.take(knn_node, &flat_knn_projection, false), &q)
+                    self.flat_knn(knn_node_with_vector, &q)
                 } else {
-                    knn_node
+                    knn_node_with_vector
                 };
 
                 if let Some(filter_expression) = filter_expr {
