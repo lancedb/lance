@@ -61,18 +61,14 @@ impl<'a> BinaryEncoder<'a> {
 
         let value_offset = self.writer.tell();
         let offsets = arr.value_offsets();
-        let start = offsets.first().unwrap();
-        let end = offsets.last().unwrap();
-        // println!("Before write dataset: @{}", self.writer.tell());
-        // println!(
-        //     "Write arra value data len= {}, offset={start:?}, end={end:?}",
-        //     arr.value_data().len()
-        // );
-        self.writer.write_all(arr.value_data()).await?;
-        let offset = self.writer.tell();
-        // println!("Write dataset @{}", offset);
 
-        let offsets = arr.value_offsets();
+        self.writer
+            .write_all(
+                &arr.value_data()[offsets[0].as_usize()..offsets[offsets.len() - 1].as_usize()],
+            )
+            .await?;
+        let offset = self.writer.tell();
+
         let start_offset = offsets[0];
         // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
         let positions = PrimitiveArray::<Int64Type>::from_iter(
@@ -80,15 +76,9 @@ impl<'a> BinaryEncoder<'a> {
                 .iter()
                 .map(|o| (((*o - start_offset).as_usize() + value_offset) as i64)),
         );
-        // println!(
-        //     "Write position len={} bytes @{}",
-        //     positions.data().buffers()[0].as_slice().len(),
-        //     self.writer.tell()
-        // );
         self.writer
             .write_all(positions.data().buffers()[0].as_slice())
             .await?;
-        // println!("After write position: @{}", self.writer.tell());
 
         Ok(offset)
     }
@@ -537,5 +527,22 @@ mod tests {
             actual.as_ref(),
             &StringArray::from_iter_values(["string-1", "string-999998"])
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_slice() {
+        let data = StringArray::from_iter_values((0..100).map(|v| format!("abcdef-{v:#03}")));
+        let store = ObjectStore::memory();
+        let path = Path::from("/slices");
+
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut encoder = BinaryEncoder::new(&mut object_writer);
+        for i in 0..10 {
+            let pos = encoder
+                .encode(data.slice(i * 10, 10).as_ref())
+                .await
+                .unwrap();
+            assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));
+        }
     }
 }

@@ -70,9 +70,7 @@ impl<'a> PlainEncoder<'a> {
 
     #[async_recursion]
     async fn encode_internal(&mut self, array: &dyn Array, data_type: &DataType) -> Result<usize> {
-        println!("Encode internal: {:?}", data_type);
         if let DataType::FixedSizeList(items, _) = data_type {
-            println!("Fixed size list ");
             self.encode_fixed_size_list(array, items).await
         } else {
             self.encode_primitive(array).await
@@ -83,24 +81,12 @@ impl<'a> PlainEncoder<'a> {
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
         let data = array.data();
-        println!(
-            "Write primitive data: array={}, array offset={}, data len={}, offset={}, buf len={}, slice len={}",
-            array.len(),
-            array.offset(),
-            data.len(),
-            data.offset(),
-            data.buffers()[0].len(),
-            data.buffers()[0].as_slice().len(),
-        );
         if matches!(array.data_type(), DataType::Boolean) {
             self.writer.write_all(&data.buffers()[0].as_slice()).await?;
         } else {
             let byte_width = array.data_type().byte_width();
             self.writer
-                .write_all(
-                    &data.buffers()[0].as_slice()
-                        [0..array.len() * byte_width],
-                )
+                .write_all(&data.buffers()[0].as_slice()[0..array.len() * byte_width])
                 .await?;
         }
         Ok(offset)
