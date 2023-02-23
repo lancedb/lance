@@ -71,7 +71,7 @@ def run(ds):
 
         expected_columns = []
         if columns is None:
-            expected_columns.extend(ds.column_names)
+            expected_columns.extend(ds.schema.names)
         else:
             expected_columns.extend(columns)
         for c in ["vector", "score"]:
