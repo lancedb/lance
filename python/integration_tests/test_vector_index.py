@@ -23,7 +23,7 @@ import pyarrow.compute as pc
 import pytest
 
 
-def create_table(nvec=1000000, ndim=768):
+def create_table(nvec=10000, ndim=768):
     mat = np.random.randn(nvec, ndim)
     price = (np.random.rand(nvec) + 1) * 100
 
@@ -46,14 +46,14 @@ def dataset(tmp_path):
 def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
-    yield dataset.create_index("vector", index_type="IVF_PQ", num_partitions=1024, num_sub_vectors=16)
+    yield dataset.create_index("vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16)
 
 
 def run(ds):
     q = np.random.randn(768)
-    project = [None, ["price"], ["vector", "meta"]]
+    project = [["price"], ["vector"], ["vector", "meta"]]
     refine = [None, 1, 2]
-    filters = [None, pc.field("price") > 50]
+    filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:
