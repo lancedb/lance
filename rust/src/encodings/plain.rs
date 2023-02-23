@@ -84,7 +84,9 @@ impl<'a> PlainEncoder<'a> {
             builder.append_value(array.value(i));
         }
         let array = builder.finish();
-        self.writer.write_all(array.data().buffers()[0].as_slice()).await?;
+        self.writer
+            .write_all(array.data().buffers()[0].as_slice())
+            .await?;
         Ok(())
     }
 
