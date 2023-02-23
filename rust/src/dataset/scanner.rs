@@ -220,8 +220,8 @@ impl Scanner {
                 .into();
             let score = ArrowField::new("score", Float32, false);
             let score_schema = ArrowSchema::new(vec![column, score]);
-            let to_merge = &Schema::try_from(&score_schema).unwrap();
-            let merged = self.projections.merge(to_merge);
+            let vector_search_columns = &Schema::try_from(&score_schema)?;
+            let merged = self.projections.merge(vector_search_columns);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))
@@ -241,7 +241,7 @@ impl Scanner {
 
         let filter_expr = if let Some(filter) = self.filter.as_ref() {
             let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
-            let logical_expr = planner.parse_filter(&filter)?;
+            let logical_expr = planner.parse_filter(filter)?;
             Some(planner.create_physical_expr(&logical_expr)?)
         } else {
             None
@@ -265,11 +265,12 @@ impl Scanner {
                 }
 
                 let knn_node = self.ann(q, &index);
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector = self.take(knn_node, &with_vector, false);
                 let knn_node = if q.refine_factor.is_some() {
-                    let flat_knn_projection = self.dataset.schema().project(&[&q.column])?;
-                    self.flat_knn(self.take(knn_node, &flat_knn_projection, false), &q)
+                    self.flat_knn(knn_node_with_vector, q)
                 } else {
-                    knn_node
+                    knn_node_with_vector
                 };
 
                 if let Some(filter_expression) = filter_expr {
@@ -281,7 +282,7 @@ impl Scanner {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
-                let knn_node = self.flat_knn(scan_node, &q);
+                let knn_node = self.flat_knn(scan_node, q);
                 self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
@@ -344,14 +345,14 @@ impl Scanner {
     /// Take row indices produced by input plan from the dataset (with projection)
     fn take(
         &self,
-        indices: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
         drop_row_id: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalTakeExec::new(
             self.dataset.clone(),
             Arc::new(projection.clone()),
-            indices,
+            input,
             drop_row_id,
         ))
     }

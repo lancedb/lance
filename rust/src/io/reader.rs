@@ -214,7 +214,7 @@ impl<'a> FileReader<'a> {
             .buffered(8)
             .try_collect::<Vec<_>>()
             .await?;
-        let schema = Arc::new(ArrowSchema::from(self.schema()));
+        let schema = Arc::new(ArrowSchema::from(projection));
         Ok(concat_batches(&schema, &batches)?)
     }
 
@@ -792,7 +792,6 @@ mod tests {
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
 
         assert_eq!(batch, actual_batch);
-        println!("actual batch: {:?}", actual_batch);
     }
 
     #[tokio::test]
