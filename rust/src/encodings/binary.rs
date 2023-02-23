@@ -60,8 +60,17 @@ impl<'a> BinaryEncoder<'a> {
             .unwrap();
 
         let value_offset = self.writer.tell();
+        let offsets = arr.value_offsets();
+        let start = offsets.first().unwrap();
+        let end = offsets.last().unwrap();
+        // println!("Before write dataset: @{}", self.writer.tell());
+        // println!(
+        //     "Write arra value data len= {}, offset={start:?}, end={end:?}",
+        //     arr.value_data().len()
+        // );
         self.writer.write_all(arr.value_data()).await?;
         let offset = self.writer.tell();
+        // println!("Write dataset @{}", offset);
 
         let offsets = arr.value_offsets();
         let start_offset = offsets[0];
@@ -71,9 +80,15 @@ impl<'a> BinaryEncoder<'a> {
                 .iter()
                 .map(|o| (((*o - start_offset).as_usize() + value_offset) as i64)),
         );
+        // println!(
+        //     "Write position len={} bytes @{}",
+        //     positions.data().buffers()[0].as_slice().len(),
+        //     self.writer.tell()
+        // );
         self.writer
             .write_all(positions.data().buffers()[0].as_slice())
             .await?;
+        // println!("After write position: @{}", self.writer.tell());
 
         Ok(offset)
     }

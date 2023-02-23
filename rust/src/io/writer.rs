@@ -198,6 +198,11 @@ impl<'a> FileWriter<'a> {
     async fn write_binary_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::VarBinary));
         let mut encoder = BinaryEncoder::new(&mut self.object_writer);
+        println!(
+            "Write binary array: len={} mem-size={}",
+            array.len(),
+            array.get_array_memory_size()
+        );
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
