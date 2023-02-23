@@ -81,7 +81,7 @@ def run(ds):
                 times.append(end - start)
                 assert rs.column_names == expected_columns
                 assert len(rs) == 10
-                scores = rs["scores"].to_numpy()
+                scores = rs["score"].to_numpy()
                 assert (scores.max() - scores.min()) > 1e-6
     return times
 
