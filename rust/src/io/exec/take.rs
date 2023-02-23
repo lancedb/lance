@@ -69,9 +69,14 @@ impl Take {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-                    println!("KNN batch is: {:?}", batch);
-                    let rows = dataset.take_rows(row_ids.values(), &projection).await?;
-                    let rows = rows.merge(&batch)?;
+                    // println!("KNN batch is: {:?}", batch);
+                    let rows = if projection.fields.len() == 0 {
+                        batch
+                    } else {
+                        dataset.take_rows(row_ids.values(), &projection)
+                            .await?
+                            .merge(&batch)?
+                    };
                     if drop_row_id {
                         rows.drop_column(ROW_ID)
                     } else {

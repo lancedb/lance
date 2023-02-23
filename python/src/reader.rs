@@ -38,6 +38,7 @@ impl LanceReader {
         scanner: Arc<LanceScanner>,
         rt: Arc<Runtime>,
     ) -> ::lance::error::Result<Self> {
+        // println!("LanceReader Schema: {:?}", scanner.schema());
         Ok(Self {
             schema: scanner.schema()?,
             stream: scanner.try_into_stream().await?, // needs tokio Runtime
@@ -52,7 +53,14 @@ impl Iterator for LanceReader {
     fn next(&mut self) -> Option<Self::Item> {
         let stream = &mut self.stream;
         self.rt
-            .block_on(async { stream.next().await.map(|rs| rs.map_err(ArrowError::from)) })
+            .block_on(async {
+                stream.next().await.map(|rs| {
+                    rs.map(|rs| {
+                        // println!("LanceReader Batch Schema: {:?}", rs.schema());
+                        rs
+                    }).map_err(ArrowError::from)
+                })
+            })
     }
 }
 
