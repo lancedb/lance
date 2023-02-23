@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -273,11 +270,25 @@ impl Scanner {
                     knn_node_with_vector
                 };
 
-                if let Some(filter_expression) = filter_expr {
-                    self.filter_node(filter_expression, knn_node)?
+                let knn_node = if let Some(filter_expression) = filter_expr {
+                    let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
+                    let columns_refs = columns_in_filter
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>();
+                    let filter_projection = Arc::new(self.dataset.schema().project(&columns_refs)?);
+                    let take_node = Arc::new(GlobalTakeExec::new(
+                        self.dataset.clone(),
+                        filter_projection,
+                        knn_node,
+                        false,
+                    ));
+                    self.filter_node(filter_expression, take_node)?
                 } else {
-                    self.take(knn_node, projection, true)
-                }
+                    knn_node
+                };
+
+                self.take(knn_node, projection, true)
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
