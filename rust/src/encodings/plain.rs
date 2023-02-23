@@ -491,11 +491,9 @@ mod tests {
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr = FixedSizeListArray::try_new(
-            FixedSizeBinaryArray::try_new(&values, 2).unwrap(),
-            2,
-        )
-        .unwrap();
+        let arr =
+            FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
+                .unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
     }
 
