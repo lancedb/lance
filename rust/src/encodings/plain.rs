@@ -92,13 +92,17 @@ impl<'a> PlainEncoder<'a> {
             data.buffers()[0].len(),
             data.buffers()[0].as_slice().len(),
         );
-        let byte_width = array.data_type().byte_width();
-        self.writer
-            .write_all(
-                &data.buffers()[0].as_slice()
-                    [array.offset() * byte_width..(array.offset() + array.len()) * byte_width],
-            )
-            .await?;
+        if matches!(array.data_type(), DataType::Boolean) {
+            self.writer.write_all(&data.buffers()[0].as_slice()).await?;
+        } else {
+            let byte_width = array.data_type().byte_width();
+            self.writer
+                .write_all(
+                    &data.buffers()[0].as_slice()
+                        [0..array.len() * byte_width],
+                )
+                .await?;
+        }
         Ok(offset)
     }
 
@@ -114,11 +118,12 @@ impl<'a> PlainEncoder<'a> {
                 ))
             })?;
         let offset = list_array.value_offset(0) as usize;
-        let length = list_array.value_length() as usize;
+        let length = list_array.len() as usize;
+        let value_length = list_array.value_length() as usize;
         self.encode_internal(
             list_array
                 .values()
-                .slice(offset, length * list_array.len())
+                .slice(offset, length * value_length)
                 .as_ref(),
             items.data_type(),
         )
@@ -580,7 +585,7 @@ mod tests {
         let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
         for i in (0..100).step_by(4) {
             let pos = encoder.encode(array.slice(i, 4).as_ref()).await.unwrap();
-            assert_eq!(pos, 16 * i);
+            assert_eq!(pos, 4 * i);
         }
     }
 
