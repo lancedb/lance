@@ -21,6 +21,7 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use arrow::array::{as_boolean_array, BooleanBuilder};
@@ -97,12 +98,13 @@ impl<'a> PlainEncoder<'a> {
             self.encode_boolean(boolean_arr).await?;
         } else {
             let byte_width = array.data_type().byte_width();
-            self.writer
-                .write_all(
-                    &data.buffers()[0].as_slice()
-                        [array.offset() * byte_width..(array.offset() + array.len()) * byte_width],
+            let slice = unsafe {
+                from_raw_parts(
+                    data.buffers()[0].as_ptr().add(data.offset() * byte_width),
+                    data.len() * byte_width,
                 )
-                .await?;
+            };
+            self.writer.write_all(slice).await?;
         }
         Ok(offset)
     }
