@@ -23,12 +23,12 @@
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
+use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::UInt32Array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray,
-    UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt32Array, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -78,11 +78,31 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
+    async fn encode_boolean(&mut self, array: &BooleanArray) -> Result<()> {
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for i in 0..array.len() {
+            builder.append_value(array.value(i));
+        }
+        let array = builder.finish();
+        self.writer
+            .write_all(array.data().buffers()[0].as_slice())
+            .await?;
+        Ok(())
+    }
+
     /// Encode primitive values.
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
-        let data = array.data().buffers()[0].as_slice();
-        self.writer.write_all(data).await?;
+        let data = array.data();
+        if matches!(array.data_type(), DataType::Boolean) {
+            let boolean_arr = as_boolean_array(array);
+            self.encode_boolean(boolean_arr).await?;
+        } else {
+            let byte_width = array.data_type().byte_width();
+            self.writer
+                .write_all(&data.buffers()[0].as_slice()[0..array.len() * byte_width])
+                .await?;
+        }
         Ok(offset)
     }
 
@@ -97,8 +117,17 @@ impl<'a> PlainEncoder<'a> {
                     array.data_type()
                 ))
             })?;
-        self.encode_internal(list_array.values().as_ref(), items.data_type())
-            .await
+        let offset = list_array.value_offset(0) as usize;
+        let length = list_array.len() as usize;
+        let value_length = list_array.value_length() as usize;
+        self.encode_internal(
+            list_array
+                .values()
+                .slice(offset, length * value_length)
+                .as_ref(),
+            items.data_type(),
+        )
+        .await
     }
 }
 
@@ -543,5 +572,51 @@ mod tests {
             results.as_ref(),
             &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
         );
+    }
+
+    /// Test encoding arrays that share the same underneath buffer.
+    #[tokio::test]
+    async fn test_encode_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/shared_slice");
+
+        let array = Int32Array::from_iter_values(0..100);
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        for i in (0..100).step_by(4) {
+            let pos = encoder.encode(array.slice(i, 4).as_ref()).await.unwrap();
+            assert_eq!(pos, 4 * i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_boolean_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/bool_slice");
+
+        let array = BooleanArray::from((0..120).map(|v| v % 2 == 0).collect::<Vec<_>>());
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
+        for i in 0..10 {
+            let pos = encoder.encode(array.slice(i, 12).as_ref()).await.unwrap();
+            assert_eq!(pos, i * 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_encode_fixed_size_list_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/shared_slice");
+
+        let array = Int32Array::from_iter_values(0..1600);
+        let fixed_size_list = FixedSizeListArray::try_new(&array, 16).unwrap();
+        let mut writer = store.create(&path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut writer, fixed_size_list.data_type());
+        for i in (0..100).step_by(4) {
+            let data = fixed_size_list.slice(i, 4);
+            let slice: &FixedSizeListArray = as_fixed_size_list_array(data.as_ref());
+            let pos = encoder.encode(slice).await.unwrap();
+            assert_eq!(pos, 4 * 16 * i);
+        }
     }
 }
