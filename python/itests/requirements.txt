@@ -1,2 +1,4 @@
 duckdb
 pylance
+pytest
+pytest-xdist

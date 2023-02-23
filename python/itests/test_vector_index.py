@@ -36,13 +36,13 @@ def create_table(nvec=1000000, ndim=768):
     return tbl
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def dataset(tmp_path):
     tbl = create_table()
     yield lance.write_dataset(tbl, tmp_path)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture()
 def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
