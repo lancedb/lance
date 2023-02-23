@@ -244,7 +244,7 @@ impl Scanner {
 
         let filter_expr = if let Some(filter) = self.filter.as_ref() {
             let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
-            let logical_expr = planner.parse_filter(&filter)?;
+            let logical_expr = planner.parse_filter(filter)?;
             Some(planner.create_physical_expr(&logical_expr)?)
         } else {
             None
@@ -271,7 +271,7 @@ impl Scanner {
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
                 let knn_node_with_vector = self.take(knn_node, &with_vector, false);
                 let knn_node = if q.refine_factor.is_some() {
-                    self.flat_knn(knn_node_with_vector, &q)
+                    self.flat_knn(knn_node_with_vector, q)
                 } else {
                     knn_node_with_vector
                 };
@@ -285,7 +285,7 @@ impl Scanner {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
-                let knn_node = self.flat_knn(scan_node, &q);
+                let knn_node = self.flat_knn(scan_node, q);
                 self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
