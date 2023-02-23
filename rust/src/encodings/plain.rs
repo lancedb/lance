@@ -100,8 +100,8 @@ impl<'a> PlainEncoder<'a> {
             let byte_width = array.data_type().byte_width();
             let slice = unsafe {
                 from_raw_parts(
-                    data.buffers()[0].as_ptr().add(data.offset() * byte_width),
-                    data.len() * byte_width,
+                    data.buffers()[0].as_ptr().add(array.offset() * byte_width),
+                    array.len() * byte_width,
                 )
             };
             self.writer.write_all(slice).await?;
