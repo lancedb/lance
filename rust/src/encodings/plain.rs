@@ -617,6 +617,7 @@ mod tests {
                 .unwrap();
         }
         file_writer.finish().await.unwrap();
+        assert!(store.size(&path).await.unwrap() < 2 * 8 * 1000);
 
         let batch = read_file_as_one_batch(&store, &path).await;
         assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
@@ -635,7 +636,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
 
-        let array = BooleanArray::from((0..120).map(|v| v % 3 == 0).collect::<Vec<_>>());
+        let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         for i in 0..10 {
             let data = array.slice(i * 12, 12); // one and half byte
             file_writer
@@ -656,13 +657,31 @@ mod tests {
 
         let array = Int32Array::from_iter_values(0..1600);
         let fixed_size_list = FixedSizeListArray::try_new(&array, 16).unwrap();
-        let mut writer = store.create(&path).await.unwrap();
-        let mut encoder = PlainEncoder::new(&mut writer, fixed_size_list.data_type());
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fl",
+            fixed_size_list.data_type().clone(),
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
         for i in (0..100).step_by(4) {
             let data = fixed_size_list.slice(i, 4);
             let slice: &FixedSizeListArray = as_fixed_size_list_array(data.as_ref());
-            let pos = encoder.encode(slice).await.unwrap();
-            assert_eq!(pos, 4 * 16 * i);
+            file_writer
+                .write(
+                    &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(slice.clone())])
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
         }
+        file_writer.finish().await.unwrap();
+
+        let batch = read_file_as_one_batch(&store, &path).await;
+        assert_eq!(
+            batch.column_by_name("fl").unwrap().as_ref(),
+            &fixed_size_list
+        );
     }
 }
