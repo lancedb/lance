@@ -27,14 +27,14 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .util import sanitize_file_address
 
 
 class LanceDataset(pa.dataset.Dataset):
     """A dataset in Lance format where the data is stored at the given uri"""
 
     def __init__(self, uri: Union[str, Path], version: Optional[int] = None):
-        if isinstance(uri, Path):
-            uri = str(uri.absolute())
+        uri = sanitize_file_address(uri)
         self._uri = uri
         self._ds = _Dataset(uri, version)
 
@@ -340,7 +340,11 @@ class LanceDataset(pa.dataset.Dataset):
                         "Set `force_build=True` to continue build anyways."
                     )
 
-        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine", "euclidean"]:
+        if not isinstance(metric, str) or metric.lower() not in [
+            "l2",
+            "cosine",
+            "euclidean",
+        ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
@@ -593,7 +597,7 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
     }
-    if isinstance(uri, Path):
-        uri = str(uri.absolute())
-    _write_dataset(reader, str(uri), params)
-    return LanceDataset(str(uri))
+
+    uri = sanitize_file_address(uri)
+    _write_dataset(reader, uri, params)
+    return LanceDataset(uri)
