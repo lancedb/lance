@@ -220,11 +220,8 @@ impl Scanner {
                 .into();
             let score = ArrowField::new("score", Float32, false);
             let score_schema = ArrowSchema::new(vec![column, score]);
-            // let score_schema = ArrowSchema::new(vec![score]);
-
             let vector_search_columns = &Schema::try_from(&score_schema)?;
             let merged = self.projections.merge(vector_search_columns);
-            // println!("Scanner::schema: {:?}", merged);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))

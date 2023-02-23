@@ -181,10 +181,7 @@ impl KNNIndexStream {
                 }
             };
             let result = match index.search(&q).await {
-                Ok(b) => {
-                    // println!("ANN index.search result: {:?}", b);
-                    b
-                },
+                Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
                         "Failed to compute scores: {e}"
