@@ -22,6 +22,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
 import random
 import string
 import time
@@ -29,7 +30,6 @@ import time
 import lance
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 import pytest
 from lance.vector import vec_to_table
 
@@ -110,5 +110,9 @@ def test_flat(dataset):
     print(run(dataset))
 
 
+@pytest.mark.skipif(
+    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    reason="no neon on GHA",
+)
 def test_ann(indexed_dataset):
     print(run(indexed_dataset))
