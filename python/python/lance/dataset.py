@@ -61,7 +61,7 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Scan will return only the rows matching the filter.
+            Not enabled just yet. Soon...
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -75,10 +75,6 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
-
-        When both `filter` and `nearest` are provided, the nearest neighbors search is performed first
-        before the filtering. In case where the filtered results are empty, try to use larger `K` in nearest
-        neighbors query.
         """
         return (
             ScannerBuilder(self)
@@ -384,6 +380,8 @@ class ScannerBuilder:
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
+        if filter is not None:
+            raise NotImplementedError("Allllmost ready. For now, please do `to_table().filter(...)`")
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter
