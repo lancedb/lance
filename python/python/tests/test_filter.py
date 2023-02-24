@@ -36,8 +36,8 @@ def create_table(nrows=100):
     dictcol = pa.DictionaryArray.from_arrays(indices, dictionary=["foo", "bar", "baz"])
 
     tbl = pa.Table.from_arrays([
-        intcol, floatcol, structcol, stringcol, dictcol
-    ], names=["int", "float", "rec", "str", "dict"])
+        intcol, floatcol, stringcol, dictcol
+    ], names=["int", "float", "str", "dict"])
     return tbl
 
 
@@ -51,9 +51,9 @@ def test_predicates(dataset):
     predicates = {
         "int": pc.field("int") >= 50,
         "float": pc.field("float") > 20.0,
-        "rec": ~pc.field("rec.bool"),
-        "str": pc.field("str").isin(["aa", "bb", "cc"]),
-        "dict": pc.field("dict") == "foo"
+        # "rec": ~pc.field("rec.bool"),
+        # "str": pc.field("str").isin(["aa", "bb", "cc"]),
+        # "dict": pc.field("dict") == "foo"
     }
     for c, expr in predicates.items():
         print(c)

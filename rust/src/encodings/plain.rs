@@ -254,14 +254,14 @@ impl<'a> Decoder for PlainDecoder<'a> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
-        let block_size = self.reader.prefetch_size() as u32;
-        let byte_width = self.data_type.byte_width() as u32;
+        let block_size = self.reader.prefetch_size();
 
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
         for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1) * byte_width
-                > indices.value(start as usize) * byte_width + block_size
+
+            if make_byte_offset(self.data_type, indices.value(j as usize + 1) as usize)?
+                > make_byte_offset(self.data_type, indices.value(start as usize) as usize)? + block_size
             {
                 chunk_ranges.push(start..j + 1);
                 start = j + 1;
