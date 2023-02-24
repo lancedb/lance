@@ -67,7 +67,7 @@ impl Take {
                 }))
                 .then(|(batch, (dataset, projection))| async move {
                     let batch = batch?;
-                    println!("GlobalTake Batch is {:?}", batch);
+                    // println!("GlobalTake Batch is {:?}", batch);
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let rows = if projection.fields.is_empty() {
@@ -78,10 +78,10 @@ impl Take {
                             .await?
                             .merge(&batch)?
                     };
-                    println!(
-                        "Global batch after merge is: drop_column={drop_row_id} {:?}",
-                        rows
-                    );
+                    // println!(
+                    //    "Global batch after merge is: drop_column={drop_row_id} {:?}",
+                    //    rows
+                    //);
                     if drop_row_id {
                         rows.drop_column(ROW_ID)
                     } else {
