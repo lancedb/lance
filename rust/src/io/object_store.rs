@@ -170,3 +170,25 @@ impl ObjectStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_uri_expansion() {
+        // test tilde and absolute path expansion
+        for uri in &["./bar/foo.lance", "../bar/foo.lance", "~/foo.lance"] {
+            let store = ObjectStore::new(uri).await.unwrap();
+            // NOTE: this is an optimistic check, since Path.as_ref() doesn't read back the leading slash
+            // for an absolute path, we are assuming it takes at least 1 char more than the original uri.
+            assert!(store.base_path().as_ref().len() > uri.len());
+        }
+
+        // absolute file system uri doesn't need expansion
+        let uri = "/bar/foo.lance";
+        let store = ObjectStore::new(uri).await.unwrap();
+        // +1 for the leading slash Path.as_ref() doesn't read back
+        assert!(store.base_path().as_ref().len() + 1 == uri.len());
+    }
+}
