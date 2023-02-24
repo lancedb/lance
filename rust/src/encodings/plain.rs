@@ -144,13 +144,13 @@ pub struct PlainDecoder<'a> {
     length: usize,
 }
 
-/// Calculate offset in bytes from the row offset.
+/// Get byte range from the row offset range.
 #[inline]
-fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
-    Ok(match data_type {
-        DataType::Boolean => bit_util::ceil(row_offset, 8),
-        _ => data_type.byte_width() * row_offset,
-    })
+fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize> {
+    match data_type {
+        DataType::Boolean => row_range.start / 8..bit_util::ceil(row_range.end, 8),
+        _ => row_range.start * data_type.byte_width()..row_range.end * data_type.byte_width(),
+    }
 }
 
 impl<'a> PlainDecoder<'a> {
@@ -177,11 +177,10 @@ impl<'a> PlainDecoder<'a> {
                 start, end, self.length
             )));
         }
-        let start_offset = make_byte_offset(self.data_type, start)?;
-        let end_offset = make_byte_offset(self.data_type, end)?;
+        let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
-            start: self.position + start_offset,
-            end: self.position + end_offset,
+            start: self.position + byte_range.start,
+            end: self.position + byte_range.end,
         };
 
         let data = self.reader.get_range(range).await?;
@@ -242,6 +241,16 @@ impl<'a> PlainDecoder<'a> {
             })?;
         Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
     }
+
+    async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        // TODO: optimize boolean access
+        let start = indices.value(0) as usize;
+        let end = indices.value(indices.len() - 1) as usize;
+        let array = self.get(start..end).await?;
+        let array_byte_boundray = (start / 8 * 8) as u32;
+        let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
+        Ok(take(array.as_ref(), &shifted_indices, None)?)
+    }
 }
 
 #[async_trait]
@@ -254,6 +263,11 @@ impl<'a> Decoder for PlainDecoder<'a> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
+
+        if matches!(self.data_type, DataType::Boolean) {
+            return self.take_boolean(indices).await;
+        }
+
         let block_size = self.reader.prefetch_size() as u32;
         let byte_width = self.data_type.byte_width() as u32;
 
@@ -681,6 +695,34 @@ mod tests {
         assert_eq!(
             batch.column_by_name("fl").unwrap().as_ref(),
             &fixed_size_list
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_boolean() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/take_bools");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 20], &schema).await.unwrap();
+
+        assert_eq!(
+            actual.column_by_name("b").unwrap().as_ref(),
+            &BooleanArray::from(vec![false, false, true, false, true])
         );
     }
 }
