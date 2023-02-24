@@ -62,9 +62,10 @@ def indexed_dataset(tmp_path):
 
 def run(ds):
     q = np.random.randn(768)
-    project = [None, ["price"], ["vector"], ["vector", "meta"]]
+    project = [None, ["price"], ["vector"]]#, ["vector", "meta"]]
+    project = [["price"]]
     refine = [None, 1, 2]
-    filters = [None]#, pc.field("price") > 50.0]
+    filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:

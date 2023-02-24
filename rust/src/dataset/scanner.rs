@@ -283,7 +283,7 @@ impl Scanner {
                         knn_node,
                         false,
                     ));
-                    self.filter_node(filter_expression, take_node)?
+                    self.filter_node(filter_expression, take_node, false)?
                 } else {
                     knn_node
                 };
@@ -307,7 +307,7 @@ impl Scanner {
                 )?,
             );
             let scan = self.scan(true, filter_schema);
-            self.filter_node(filter, scan)?
+            self.filter_node(filter, scan, true)?
         } else {
             self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
@@ -380,13 +380,15 @@ impl Scanner {
     fn filter_node(
         &self,
         filter: Arc<dyn PhysicalExpr>,
-        plan: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
+        drop_row_id: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filter_node = Arc::new(FilterExec::try_new(filter, plan)?);
+        let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
         Ok(Arc::new(LocalTakeExec::new(
             filter_node,
             self.dataset.clone(),
             Arc::new(self.projections.clone()),
+            drop_row_id,
         )))
     }
 }
