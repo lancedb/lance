@@ -259,9 +259,9 @@ impl<'a> Decoder for PlainDecoder<'a> {
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
         for j in 0..(indices.len() - 1) as u32 {
-
             if make_byte_offset(self.data_type, indices.value(j as usize + 1) as usize)?
-                > make_byte_offset(self.data_type, indices.value(start as usize) as usize)? + block_size
+                > make_byte_offset(self.data_type, indices.value(start as usize) as usize)?
+                    + block_size
             {
                 chunk_ranges.push(start..j + 1);
                 start = j + 1;
