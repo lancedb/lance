@@ -336,7 +336,11 @@ class LanceDataset(pa.dataset.Dataset):
                         "Set `force_build=True` to continue build anyways."
                     )
 
-        if not isinstance(metric, str) or metric.lower() not in ["l2", "cosine", "euclidean"]:
+        if not isinstance(metric, str) or metric.lower() not in [
+            "l2",
+            "cosine",
+            "euclidean",
+        ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
@@ -381,7 +385,9 @@ class ScannerBuilder:
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
         if filter is not None:
-            raise NotImplementedError("Allllmost ready. For now, please do `to_table().filter(...)`")
+            raise NotImplementedError(
+                "Allllmost ready. For now, please do `to_table().filter(...)`"
+            )
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter

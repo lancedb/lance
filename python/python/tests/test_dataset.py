@@ -102,6 +102,7 @@ def test_take(tmp_path: Path):
     assert isinstance(table2, pa.Table)
     assert table2 == table1
 
+
 #
 # def test_filter(tmp_path: Path):
 #     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
