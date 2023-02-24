@@ -17,4 +17,4 @@ runs:
     shell: bash
     working-directory: python
     run: |
-      pytest -x -v --durations=30
+      pytest -x -v --durations=30 python/tests
