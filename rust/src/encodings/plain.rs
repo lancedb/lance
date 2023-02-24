@@ -144,21 +144,13 @@ pub struct PlainDecoder<'a> {
     length: usize,
 }
 
-/// Calculate offset in bytes from the row offset.
+/// Get byte range from the row offset range.
 #[inline]
-fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
-    Ok(match data_type {
-        DataType::Boolean => row_offset / 8,
-        _ => data_type.byte_width() * row_offset,
-    })
-}
-
-#[inline]
-fn make_ceil_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
-    Ok(match data_type {
-        DataType::Boolean => bit_util::ceil(row_offset, 8),
-        _ => data_type.byte_width() * row_offset,
-    })
+fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize> {
+    match data_type {
+        DataType::Boolean => row_range.start / 8..bit_util::ceil(row_range.end, 8),
+        _ => row_range.start * data_type.byte_width()..row_range.end * data_type.byte_width(),
+    }
 }
 
 impl<'a> PlainDecoder<'a> {
@@ -185,11 +177,10 @@ impl<'a> PlainDecoder<'a> {
                 start, end, self.length
             )));
         }
-        let start_offset = make_byte_offset(self.data_type, start)?;
-        let end_offset = make_ceil_byte_offset(self.data_type, end)?;
+        let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
-            start: self.position + start_offset,
-            end: self.position + end_offset,
+            start: self.position + byte_range.start,
+            end: self.position + byte_range.end,
         };
 
         let data = self.reader.get_range(range).await?;
