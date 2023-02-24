@@ -110,6 +110,10 @@ impl LanceStream {
                                 project_schema.as_ref(),
                             )
                             .await;
+                        if tx.is_closed() {
+                            // Early stop
+                            break 'outer;
+                        }
                         if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
                             eprintln!("Failed to scan data: {err}");
                             break 'outer;
