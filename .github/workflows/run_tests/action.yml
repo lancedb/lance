@@ -18,3 +18,13 @@ runs:
     working-directory: python
     run: |
       pytest -x -v --durations=30 python/tests
+  - name: Cargo cache
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
