@@ -24,6 +24,7 @@ use ::object_store::{
 };
 use object_store::local::LocalFileSystem;
 use path_absolutize::*;
+use shellexpand::tilde;
 use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
@@ -85,7 +86,8 @@ impl ObjectStore {
         let parsed = match Url::parse(uri) {
             Ok(u) => u,
             Err(ParseError::RelativeUrlWithoutBase) => {
-                let path = std::path::Path::new(uri);
+                let str_path = tilde(uri).to_string();
+                let path = std::path::Path::new(&str_path);
                 return Ok(Self {
                     inner: Arc::new(LocalFileSystem::new()),
                     scheme: String::from("file"),
