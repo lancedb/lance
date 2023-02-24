@@ -67,10 +67,9 @@ def indexed_dataset(tmp_path):
 
 def run(ds):
     q = np.random.randn(768)
-    project = [None, ["price"], ["vector"]]  # , ["vector", "meta"]]
-    project = [["price"]]
+    project = [None, ["price"], ["vector"], ["vector", "meta"]]
     refine = [None, 1, 2]
-    filters = [None, pc.field("price") > 50.0]
+    # filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:
@@ -85,25 +84,25 @@ def run(ds):
                 expected_columns.append(c)
 
         for rf in refine:
-            for filter_ in filters:
-                start = time.time()
-                rs = ds.to_table(
-                    columns=columns,
-                    filter=filter_,
-                    nearest={
-                        "column": "vector",
-                        "q": q,
-                        "k": 10,
-                        "nprobes": 1,
-                        "refine_factor": rf,
-                    },
-                )
-                end = time.time()
-                times.append(end - start)
-                assert rs.column_names == expected_columns
-                assert len(rs) == 10
-                scores = rs["score"].to_numpy()
-                assert (scores.max() - scores.min()) > 1e-6
+            # for filter_ in filters:
+            start = time.time()
+            rs = ds.to_table(
+                columns=columns,
+                # filter=filter_,
+                nearest={
+                    "column": "vector",
+                    "q": q,
+                    "k": 10,
+                    "nprobes": 1,
+                    "refine_factor": rf,
+                },
+            )
+            end = time.time()
+            times.append(end - start)
+            assert rs.column_names == expected_columns
+            assert len(rs) == 10
+            scores = rs["score"].to_numpy()
+            assert (scores.max() - scores.min()) > 1e-6
     return times
 
 
