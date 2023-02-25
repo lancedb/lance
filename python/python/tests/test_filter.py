@@ -57,10 +57,15 @@ def dataset(tmp_path):
     yield lance.write_dataset(tbl, tmp_path)
 
 
-def test_predicates(dataset):
+def test_simple_predicates(dataset):
     predicates = [
         pc.field("int") >= 50,
+        pc.field("int") == 50,
+        pc.field("int") != 50,
         pc.field("float") < 90.0,
+        pc.field("float") > 90.0,
+        pc.field("float") <= 90.0,
+        pc.field("float") >= 90.0,
         pc.field("str") != "aa",
         pc.field("str") == "aa",
     ]
@@ -68,8 +73,17 @@ def test_predicates(dataset):
     for expr in predicates:
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
 
+
+def test_compound(dataset):
+    predicates = [
+        pc.field("int") >= 50,
+        pc.field("float") < 90.0,
+        pc.field("str") == "aa",
+    ]
     # test compound
     for expr in predicates:
         for other_expr in predicates:
             compound = expr & other_expr
+            assert dataset.to_table(filter=compound) == dataset.to_table().filter(compound)
+            compound = expr | other_expr
             assert dataset.to_table(filter=compound) == dataset.to_table().filter(compound)
