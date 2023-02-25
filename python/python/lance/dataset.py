@@ -402,7 +402,6 @@ class ScannerBuilder:
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
-        print(f"Filter: {filter}")
         self._filter = filter
         return self
 
