@@ -61,7 +61,9 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Not enabled just yet. Soon...
+            Expression or str that is a valid SQL where clause.
+            Currently only comparisons (>, <, >=, <=, ==, !=) and | and &
+            are supported.
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -75,6 +77,12 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
         """
         return (
             ScannerBuilder(self)
@@ -384,12 +392,9 @@ class ScannerBuilder:
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
-        if filter is not None:
-            raise NotImplementedError(
-                "Allllmost ready. For now, please do `to_table().filter(...)`"
-            )
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
+        print(f"Filter: {filter}")
         self._filter = filter
         return self
 
