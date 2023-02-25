@@ -27,7 +27,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use sqlparser::{
-    ast::{BinaryOperator, Expr as SQLExpr, Ident, SetExpr, Statement, Value},
+    ast::{BinaryOperator, Expr as SQLExpr, Ident, SetExpr, Statement, Value, Function, FunctionArg, FunctionArgExpr},
     dialect::GenericDialect,
     parser::Parser,
 };
@@ -110,6 +110,28 @@ impl Planner {
         })
     }
 
+    fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
+        match func_args {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                self.parse_sql_expr(expr)
+            },
+            _ => {
+                Err(Error::IO(format!("Unsuppoted function args: {:?}", func_args)))
+            }
+        }
+
+    }
+
+    fn parse_function(&self, func: &Function) -> Result<Expr> {
+        if func.name.to_string() == "is_valid" {
+            if func.args.len() != 1 {
+                return Err(Error::IO(format!("is_valid only support 1 args, got {}", func.args.len())));
+            }
+            return Ok(Expr::IsNotNull(Box::new(self.parse_function_args(&func.args[0])?)));
+        }
+        Err(Error::IO(format!("function '{}' is not supported", func.name)))
+    }
+
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
             SQLExpr::Identifier(id) => {
@@ -141,6 +163,7 @@ impl Planner {
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
+            SQLExpr::Function(func) => self.parse_function(func),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"

@@ -119,6 +119,7 @@ def test_duckdb(tmp_path):
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE id==1000").to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.id == 1000].reset_index()
+    print("Expected: {}", expected)
     assert tm.assert_frame_equal(actual, expected)
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE id=1000").to_df()
