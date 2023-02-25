@@ -256,6 +256,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::exp;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -274,20 +275,25 @@ mod tests {
 
         let planner = Planner::new(schema.clone());
 
+        let expected = col("i")
+            .gt(lit(3_i32))
+            .and(col("st.x").lt_eq(lit(5.0_f32)))
+            .and(
+                col("s")
+                    .eq(lit("str-4"))
+                    .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false)),
+            );
+
+        // double quotes
         let expr = planner
             .parse_filter("i > 3 AND st.x <= 5.0 AND (s == 'str-4' OR s in ('str-4', 'str-5'))")
             .unwrap();
-        assert_eq!(
-            expr,
-            col("i")
-                .gt(lit(3_i32))
-                .and(col("st.x").lt_eq(lit(5.0_f32)))
-                .and(
-                    col("s")
-                        .eq(lit("str-4"))
-                        .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false))
-                )
-        );
+        assert_eq!(expr, expected);
+
+        // single quote
+        let expr = planner
+            .parse_filter("i > 3 AND st.x <= 5.0 AND (s = 'str-4' OR s in ('str-4', 'str-5'))")
+            .unwrap();
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         println!("Physical expr: {:#?}", physical_expr);
