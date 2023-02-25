@@ -105,6 +105,8 @@ impl Planner {
             Value::Null => Expr::Literal(ScalarValue::Null),
             Value::Placeholder(_) => todo!(),
             Value::UnQuotedString(_) => todo!(),
+            Value::SingleQuotedByteStringLiteral(_) => todo!(),
+            Value::DoubleQuotedByteStringLiteral(_) => todo!(),
         })
     }
 
