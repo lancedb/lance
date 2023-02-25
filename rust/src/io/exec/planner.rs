@@ -100,7 +100,7 @@ impl Planner {
             Value::EscapedStringLiteral(_) => todo!(),
             Value::NationalStringLiteral(_) => todo!(),
             Value::HexStringLiteral(_) => todo!(),
-            Value::DoubleQuotedString(_) => todo!(),
+            Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v))),
             Value::Null => Expr::Literal(ScalarValue::Null),
             Value::Placeholder(_) => todo!(),
@@ -112,7 +112,13 @@ impl Planner {
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
-            SQLExpr::Identifier(id) => self.column(vec![id.clone()].as_slice()),
+            SQLExpr::Identifier(id) => {
+                if id.quote_style == Some('"') {
+                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                } else {
+                    self.column(vec![id.clone()].as_slice())
+                }
+            }
             SQLExpr::CompoundIdentifier(ids) => self.column(ids.as_slice()),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::Value(value) => self.value(value),

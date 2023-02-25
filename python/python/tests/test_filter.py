@@ -24,6 +24,7 @@
 #  limitations under the License.
 
 """Tests for predicate pushdown"""
+
 import random
 import string
 
