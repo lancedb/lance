@@ -144,7 +144,7 @@ impl Planner {
     /// Create Logical [Expr] from a SQL filter clause.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let sql = format!("SELECT 1 FROM t WHERE {filter}");
+        let sql = format!("SELECT 1 FROM t WHERE {filter}").replace("==", "=");
 
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql.as_str())?;
@@ -235,7 +235,7 @@ mod tests {
         let planner = Planner::new(schema.clone());
 
         let expr = planner
-            .parse_filter("i > 3 AND st.x <= 5.0 AND (s = 'str-4' OR s in ('str-4', 'str-5'))")
+            .parse_filter("i > 3 AND st.x <= 5.0 AND (s == 'str-4' OR s in ('str-4', 'str-5'))")
             .unwrap();
         assert_eq!(
             expr,
