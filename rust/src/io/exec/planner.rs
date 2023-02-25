@@ -27,7 +27,10 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use sqlparser::{
-    ast::{BinaryOperator, Expr as SQLExpr, Ident, SetExpr, Statement, Value},
+    ast::{
+        BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, SetExpr,
+        Statement, Value,
+    },
     dialect::GenericDialect,
     parser::Parser,
 };
@@ -100,17 +103,53 @@ impl Planner {
             Value::EscapedStringLiteral(_) => todo!(),
             Value::NationalStringLiteral(_) => todo!(),
             Value::HexStringLiteral(_) => todo!(),
-            Value::DoubleQuotedString(_) => todo!(),
+            Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v))),
             Value::Null => Expr::Literal(ScalarValue::Null),
             Value::Placeholder(_) => todo!(),
             Value::UnQuotedString(_) => todo!(),
+            Value::SingleQuotedByteStringLiteral(_) => todo!(),
+            Value::DoubleQuotedByteStringLiteral(_) => todo!(),
         })
+    }
+
+    fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
+        match func_args {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
+            _ => Err(Error::IO(format!(
+                "Unsuppoted function args: {:?}",
+                func_args
+            ))),
+        }
+    }
+
+    fn parse_function(&self, func: &Function) -> Result<Expr> {
+        if func.name.to_string() == "is_valid" {
+            if func.args.len() != 1 {
+                return Err(Error::IO(format!(
+                    "is_valid only support 1 args, got {}",
+                    func.args.len()
+                )));
+            }
+            return Ok(Expr::IsNotNull(Box::new(
+                self.parse_function_args(&func.args[0])?,
+            )));
+        }
+        Err(Error::IO(format!(
+            "function '{}' is not supported",
+            func.name
+        )))
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
-            SQLExpr::Identifier(id) => self.column(vec![id.clone()].as_slice()),
+            SQLExpr::Identifier(id) => {
+                if id.quote_style == Some('"') {
+                    Ok(Expr::Literal(ScalarValue::Utf8(Some(id.value.clone()))))
+                } else {
+                    self.column(vec![id.clone()].as_slice())
+                }
+            }
             SQLExpr::CompoundIdentifier(ids) => self.column(ids.as_slice()),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::Value(value) => self.value(value),
@@ -133,6 +172,7 @@ impl Planner {
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
+            SQLExpr::Function(func) => self.parse_function(func),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"
@@ -216,6 +256,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
+    use datafusion::prelude::exp;
 
     #[test]
     fn test_parse_filter_simple() {
@@ -234,20 +275,25 @@ mod tests {
 
         let planner = Planner::new(schema.clone());
 
+        let expected = col("i")
+            .gt(lit(3_i32))
+            .and(col("st.x").lt_eq(lit(5.0_f32)))
+            .and(
+                col("s")
+                    .eq(lit("str-4"))
+                    .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false)),
+            );
+
+        // double quotes
+        let expr = planner
+            .parse_filter("i > 3 AND st.x <= 5.0 AND (s == 'str-4' OR s in ('str-4', 'str-5'))")
+            .unwrap();
+        assert_eq!(expr, expected);
+
+        // single quote
         let expr = planner
             .parse_filter("i > 3 AND st.x <= 5.0 AND (s = 'str-4' OR s in ('str-4', 'str-5'))")
             .unwrap();
-        assert_eq!(
-            expr,
-            col("i")
-                .gt(lit(3_i32))
-                .and(col("st.x").lt_eq(lit(5.0_f32)))
-                .and(
-                    col("s")
-                        .eq(lit("str-4"))
-                        .or(col("s").in_list(vec![lit("str-4"), lit("str-5")], false))
-                )
-        );
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         println!("Physical expr: {:#?}", physical_expr);

@@ -246,7 +246,7 @@ impl<'a> PlainDecoder<'a> {
         // TODO: optimize boolean access
         let start = indices.value(0) as usize;
         let end = indices.value(indices.len() - 1) as usize;
-        let array = self.get(start..end).await?;
+        let array = self.get(start..end + 1).await?;
         let array_byte_boundray = (start / 8 * 8) as u32;
         let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
         Ok(take(array.as_ref(), &shifted_indices, None)?)

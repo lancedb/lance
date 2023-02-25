@@ -255,12 +255,16 @@ impl LocalTake {
                     if take_schema.fields.is_empty() {
                         return Ok(batch);
                     };
+                    let projection_schema = ArrowSchema::from(projection.as_ref());
+                    if batch.num_rows() == 0 {
+                        return Ok(RecordBatch::new_empty(Arc::new(projection_schema)));
+                    }
+
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-
                     let remaining_columns =
                         dataset.take_rows(row_ids.values(), &take_schema).await?;
-                    let projection_schema = ArrowSchema::from(projection.as_ref());
+
                     let batch = batch
                         .merge(&remaining_columns)?
                         .project_by_schema(&projection_schema)?;

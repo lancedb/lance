@@ -61,7 +61,10 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Not enabled just yet. Soon...
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -75,6 +78,12 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
         """
         return (
             ScannerBuilder(self)
@@ -109,7 +118,10 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Scan will return only the rows matching the filter.
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -125,7 +137,11 @@ class LanceDataset(pa.dataset.Dataset):
                   "refine_factor": 1
                 }
 
-        See `scanner()` for more details.
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
         """
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest
@@ -384,10 +400,6 @@ class ScannerBuilder:
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
-        if filter is not None:
-            raise NotImplementedError(
-                "Allllmost ready. For now, please do `to_table().filter(...)`"
-            )
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter
