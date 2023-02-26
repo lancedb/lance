@@ -168,6 +168,7 @@ impl Scanner {
             nprobs: 1,
             refine_factor: None,
             metric_type: MetricType::L2,
+            use_index: true,
         });
         Ok(self)
     }
@@ -193,6 +194,14 @@ impl Scanner {
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = metric_type
+        }
+        self
+    }
+
+    /// Set whether to use the index if available
+    pub fn use_index(&mut self, use_index: bool) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.use_index = use_index
         }
         self
     }
@@ -225,10 +234,6 @@ impl Scanner {
         }
     }
 
-    fn should_use_index(&self) -> bool {
-        self.nearest.is_some()
-    }
-
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
@@ -246,7 +251,8 @@ impl Scanner {
 
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
             let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-            let indices = if self.should_use_index() {
+            let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
+            let indices = if use_index {
                 self.dataset.load_indices().await?
             } else {
                 vec![]

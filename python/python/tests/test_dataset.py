@@ -103,12 +103,11 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
-#
-# def test_filter(tmp_path: Path):
-#     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-#     base_dir = tmp_path / "test"
-#     lance.write_dataset(table, base_dir)
-#
-#     dataset = lance.dataset(base_dir)
-#     actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
-#     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
+def test_filter(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
+    assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})

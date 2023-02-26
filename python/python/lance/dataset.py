@@ -413,6 +413,7 @@ class ScannerBuilder:
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
+        use_index: bool = True,
     ) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
@@ -438,6 +439,7 @@ class ScannerBuilder:
             "metric": metric,
             "nprobes": nprobes,
             "refine_factor": refine_factor,
+            "use_index": use_index,
         }
         return self
 

@@ -52,6 +52,9 @@ pub struct Query {
 
     /// Distance metric type
     pub metric_type: MetricType,
+
+    /// Whether to use an ANN index if available
+    pub use_index: bool,
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
