@@ -169,6 +169,11 @@ impl ObjectStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Get file size.
+    pub async fn size(&self, path: &Path) -> Result<usize> {
+        Ok(self.inner.head(path).await?.size)
+    }
 }
 
 #[cfg(test)]

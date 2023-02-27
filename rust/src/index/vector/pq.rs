@@ -347,11 +347,11 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_usize.pow(self.num_bits);
-        let dimension = data.value_length() as usize / self.num_sub_vectors;
+        let num_centroids = 2_usize.pow(self.num_bits);
+        let dimension = data.value_length() as usize;
+        let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        let mut codebook_builder =
-            Float32Builder::with_capacity(num_centorids * data.value_length() as usize);
+        let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.
@@ -361,11 +361,11 @@ impl ProductQuantizer {
             let flatten_array: &Float32Array = as_primitive_array(&values);
             let centroids = train_kmeans(
                 flatten_array,
-                dimension,
-                num_centorids,
+                sub_vector_dimension,
+                num_centroids,
                 25,
                 rng.clone(),
-                crate::index::vector::MetricType::L2,
+                metric_type,
             )
             .await?;
             // TODO: COPIED COPIED COPIED

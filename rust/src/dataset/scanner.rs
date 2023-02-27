@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -171,6 +168,7 @@ impl Scanner {
             nprobs: 1,
             refine_factor: None,
             metric_type: MetricType::L2,
+            use_index: true,
         });
         Ok(self)
     }
@@ -200,6 +198,14 @@ impl Scanner {
         self
     }
 
+    /// Set whether to use the index if available
+    pub fn use_index(&mut self, use_index: bool) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.use_index = use_index
+        }
+        self
+    }
+
     /// Instruct the scanner to return the `_rowid` meta column from the dataset.
     pub fn with_row_id(&mut self) -> &mut Self {
         self.with_row_id = true;
@@ -220,16 +226,12 @@ impl Scanner {
                 .into();
             let score = ArrowField::new("score", Float32, false);
             let score_schema = ArrowSchema::new(vec![column, score]);
-            let to_merge = &Schema::try_from(&score_schema).unwrap();
-            let merged = self.projections.merge(to_merge);
+            let vector_search_columns = &Schema::try_from(&score_schema)?;
+            let merged = self.projections.merge(vector_search_columns);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))
         }
-    }
-
-    fn should_use_index(&self) -> bool {
-        self.nearest.is_some()
     }
 
     /// Create a stream of this Scanner.
@@ -241,7 +243,7 @@ impl Scanner {
 
         let filter_expr = if let Some(filter) = self.filter.as_ref() {
             let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
-            let logical_expr = planner.parse_filter(&filter)?;
+            let logical_expr = planner.parse_filter(filter)?;
             Some(planner.create_physical_expr(&logical_expr)?)
         } else {
             None
@@ -249,7 +251,8 @@ impl Scanner {
 
         let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
             let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-            let indices = if self.should_use_index() {
+            let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
+            let indices = if use_index {
                 self.dataset.load_indices().await?
             } else {
                 vec![]
@@ -265,23 +268,38 @@ impl Scanner {
                 }
 
                 let knn_node = self.ann(q, &index);
+                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let knn_node_with_vector = self.take(knn_node, &with_vector, false);
                 let knn_node = if q.refine_factor.is_some() {
-                    let flat_knn_projection = self.dataset.schema().project(&[&q.column])?;
-                    self.flat_knn(self.take(knn_node, &flat_knn_projection, false), &q)
+                    self.flat_knn(knn_node_with_vector, q)
+                } else {
+                    knn_node_with_vector
+                };
+
+                let knn_node = if let Some(filter_expression) = filter_expr {
+                    let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
+                    let columns_refs = columns_in_filter
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>();
+                    let filter_projection = Arc::new(self.dataset.schema().project(&columns_refs)?);
+                    let take_node = Arc::new(GlobalTakeExec::new(
+                        self.dataset.clone(),
+                        filter_projection,
+                        knn_node,
+                        false,
+                    ));
+                    self.filter_node(filter_expression, take_node, false)?
                 } else {
                     knn_node
                 };
 
-                if let Some(filter_expression) = filter_expr {
-                    self.filter_node(filter_expression, knn_node)?
-                } else {
-                    self.take(knn_node, projection, true)
-                }
+                self.take(knn_node, projection, true)
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
-                let knn_node = self.flat_knn(scan_node, &q);
+                let knn_node = self.flat_knn(scan_node, q);
                 self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
@@ -295,7 +313,7 @@ impl Scanner {
                 )?,
             );
             let scan = self.scan(true, filter_schema);
-            self.filter_node(filter, scan)?
+            self.filter_node(filter, scan, true)?
         } else {
             self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
@@ -344,14 +362,14 @@ impl Scanner {
     /// Take row indices produced by input plan from the dataset (with projection)
     fn take(
         &self,
-        indices: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
         drop_row_id: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(GlobalTakeExec::new(
             self.dataset.clone(),
             Arc::new(projection.clone()),
-            indices,
+            input,
             drop_row_id,
         ))
     }
@@ -368,13 +386,15 @@ impl Scanner {
     fn filter_node(
         &self,
         filter: Arc<dyn PhysicalExpr>,
-        plan: Arc<dyn ExecutionPlan>,
+        input: Arc<dyn ExecutionPlan>,
+        drop_row_id: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filter_node = Arc::new(FilterExec::try_new(filter, plan)?);
+        let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
         Ok(Arc::new(LocalTakeExec::new(
             filter_node,
             self.dataset.clone(),
             Arc::new(self.projections.clone()),
+            drop_row_id,
         )))
     }
 }

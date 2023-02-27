@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, UInt64Array};
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,
@@ -67,10 +67,21 @@ impl Take {
                 }))
                 .then(|(batch, (dataset, projection))| async move {
                     let batch = batch?;
+                    // println!("GlobalTake Batch is {:?}", batch);
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-                    let rows = dataset.take_rows(row_ids.values(), &projection).await?;
-                    let rows = rows.merge(&batch)?;
+                    let rows = if projection.fields.is_empty() {
+                        batch
+                    } else {
+                        dataset
+                            .take_rows(row_ids.values(), &projection)
+                            .await?
+                            .merge(&batch)?
+                    };
+                    // println!(
+                    //    "Global batch after merge is: drop_column={drop_row_id} {:?}",
+                    //    rows
+                    //);
                     if drop_row_id {
                         rows.drop_column(ROW_ID)
                     } else {
@@ -144,6 +155,7 @@ impl GlobalTakeExec {
         input: Arc<dyn ExecutionPlan>,
         drop_row_id: bool,
     ) -> Self {
+        assert!(input.schema().column_with_name(ROW_ID).is_some());
         Self {
             dataset,
             schema,
@@ -153,13 +165,24 @@ impl GlobalTakeExec {
     }
 }
 
+fn projection_with_row_id(projection: &Schema, drop_row_id: bool) -> SchemaRef {
+    let schema = ArrowSchema::from(projection);
+    if drop_row_id {
+        Arc::new(schema)
+    } else {
+        let mut fields = schema.fields;
+        fields.push(Field::new(ROW_ID, DataType::UInt64, false));
+        Arc::new(ArrowSchema::new(fields))
+    }
+}
+
 impl ExecutionPlan for GlobalTakeExec {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
     fn schema(&self) -> SchemaRef {
-        self.input.schema()
+        projection_with_row_id(&self.schema, self.drop_row_id)
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
@@ -213,6 +236,7 @@ impl LocalTake {
         input: SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         schema: Arc<Schema>,
+        drop_row_id: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(4);
 
@@ -228,15 +252,31 @@ impl LocalTake {
                 .then(|(b, (dataset, take_schema, projection))| async move {
                     // TODO: need to cache the fragments.
                     let batch = b?;
+                    if take_schema.fields.is_empty() {
+                        return Ok(batch);
+                    };
+                    let projection_schema = ArrowSchema::from(projection.as_ref());
+                    if batch.num_rows() == 0 {
+                        return Ok(RecordBatch::new_empty(Arc::new(projection_schema)));
+                    }
+
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
                     let remaining_columns =
                         dataset.take_rows(row_ids.values(), &take_schema).await?;
-                    let projection_schema = ArrowSchema::from(projection.as_ref());
-                    Ok(batch
+
+                    let batch = batch
                         .merge(&remaining_columns)?
-                        .drop_column(ROW_ID)?
-                        .project_by_schema(&projection_schema)?)
+                        .project_by_schema(&projection_schema)?;
+
+                    if !drop_row_id {
+                        Ok(batch.try_with_column(
+                            Field::new(ROW_ID, DataType::UInt64, false),
+                            Arc::new(row_id_arr.clone()),
+                        )?)
+                    } else {
+                        Ok(batch)
+                    }
                 })
                 .try_for_each(|b| async {
                     if tx.is_closed() {
@@ -293,15 +333,22 @@ pub struct LocalTakeExec {
     dataset: Arc<Dataset>,
     input: Arc<dyn ExecutionPlan>,
     schema: Arc<Schema>,
+    drop_row_id: bool,
 }
 
 impl LocalTakeExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, dataset: Arc<Dataset>, schema: Arc<Schema>) -> Self {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        schema: Arc<Schema>,
+        drop_row_id: bool,
+    ) -> Self {
         assert!(input.schema().column_with_name(ROW_ID).is_some());
         Self {
             dataset,
             input,
             schema,
+            drop_row_id,
         }
     }
 }
@@ -312,7 +359,7 @@ impl ExecutionPlan for LocalTakeExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(self.schema.as_ref().into())
+        projection_with_row_id(&self.schema, self.drop_row_id)
     }
 
     fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning {
@@ -340,6 +387,7 @@ impl ExecutionPlan for LocalTakeExec {
             input: children[0].clone(),
             dataset: self.dataset.clone(),
             schema: self.schema.clone(),
+            drop_row_id: self.drop_row_id,
         }))
     }
 
@@ -353,6 +401,7 @@ impl ExecutionPlan for LocalTakeExec {
             input_stream,
             self.dataset.clone(),
             self.schema.clone(),
+            self.drop_row_id,
         )?))
     }
 

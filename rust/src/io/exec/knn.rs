@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
@@ -31,7 +32,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
 use crate::dataset::scanner::RecordBatchStream;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
@@ -87,7 +88,10 @@ impl Stream for KNNFlatStream {
 
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 }
 
@@ -119,7 +123,10 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -254,7 +261,10 @@ impl ExecutionPlan for KNNIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -386,6 +396,7 @@ mod tests {
                 nprobs: 0,
                 refine_factor: None,
                 metric_type: MetricType::L2,
+                use_index: false,
             },
         )
         .await
