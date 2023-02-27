@@ -12,9 +12,9 @@ runs:
     working-directory: python
     shell: bash
     run: |
-      pip3 install $(ls target/wheels/pylance-*.whl) pytest
+      pip3 install $(ls target/wheels/pylance-*.whl) pytest duckdb
   - name: Run python tests
     shell: bash
     working-directory: python
     run: |
-      pytest -x -v --durations=30
+      pytest -x -v --durations=30 python/tests

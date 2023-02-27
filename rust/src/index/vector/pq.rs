@@ -29,6 +29,8 @@ use crate::arrow::*;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::utils::distance::compute::normalize;
+use crate::utils::distance::l2::l2_distance;
 use crate::Result;
 
 use super::MetricType;
@@ -87,22 +89,17 @@ impl<'a> PQIndex<'a> {
         })
     }
 
-    /// Search top-k nearest neighbors for `key` within one PQ partition.
-    ///
-    pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
-        assert_eq!(self.code.len() % self.num_sub_vectors, 0);
-
+    fn fast_l2_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build distance table for each sub-centroid to the query key.
         //
         // Distance table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
         let mut distance_table: Vec<f32> = vec![];
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
-        let dist_func = self.metric_type.func();
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
             let subvec_centroids = self.pq.centroids(i);
-            let distances = dist_func(
+            let distances = l2_distance(
                 as_primitive_array(&from),
                 &subvec_centroids,
                 sub_vector_length,
@@ -110,7 +107,7 @@ impl<'a> PQIndex<'a> {
             distance_table.extend(distances.values());
         }
 
-        let scores = Arc::new(Float32Array::from_iter(
+        Ok(Arc::new(Float32Array::from_iter(
             self.code
                 .values()
                 .chunks_exact(self.num_sub_vectors)
@@ -122,7 +119,85 @@ impl<'a> PQIndex<'a> {
                         })
                         .sum::<f32>()
                 }),
-        )) as ArrayRef;
+        )))
+    }
+
+    fn cosine_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
+        // Build two tables for cosine distance.
+        //
+        // xy table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        // y_norm table: `[f32: num_sub_vectors(row) * num_centroids(column)]`.
+        let mut xy_table: Vec<f32> = vec![];
+        let mut y_norm_table: Vec<f32> = vec![];
+
+        let x_norm = normalize(key.values()).powi(2);
+
+        let sub_vector_length = self.dimension / self.num_sub_vectors;
+        for i in 0..self.num_sub_vectors {
+            let slice = key.slice(i * sub_vector_length, sub_vector_length);
+            let key_sub_vector: &Float32Array = as_primitive_array(slice.as_ref());
+            let sub_vector_centroids = self.pq.centroids(i);
+            let xy = sub_vector_centroids
+                .as_ref()
+                .values()
+                .chunks_exact(sub_vector_length)
+                .map(|cent| {
+                    // Accelerate this later.
+                    cent.iter()
+                        .zip(key_sub_vector.values().iter())
+                        .map(|(y, x)| (x - y).powi(2))
+                        .sum::<f32>()
+                });
+            xy_table.extend(xy);
+
+            let y_norm = sub_vector_centroids
+                .as_ref()
+                .values()
+                .chunks_exact(sub_vector_length)
+                .map(|cent| {
+                    // Accelerate this later.
+                    cent.iter().map(|y| y.powi(2)).sum::<f32>()
+                });
+            y_norm_table.extend(y_norm);
+        }
+
+        Ok(Arc::new(Float32Array::from_iter(
+            self.code
+                .values()
+                .chunks_exact(self.num_sub_vectors)
+                .map(|c| {
+                    let xy = c
+                        .iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            let idx = sub_vec_idx * 256 + *centroid as usize;
+                            xy_table[idx]
+                        })
+                        .sum::<f32>();
+                    let y_norm = c
+                        .iter()
+                        .enumerate()
+                        .map(|(sub_vec_idx, centroid)| {
+                            let idx = sub_vec_idx * 256 + *centroid as usize;
+                            y_norm_table[idx]
+                        })
+                        .sum::<f32>();
+                    xy / (x_norm.sqrt() * y_norm.sqrt())
+                }),
+        )))
+    }
+
+    /// Search top-k nearest neighbors for `key` within one PQ partition.
+    ///
+    pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
+        assert_eq!(self.code.len() % self.num_sub_vectors, 0);
+
+        let scores = if self.metric_type == MetricType::L2 {
+            self.fast_l2_scores(key)?
+        } else {
+            self.cosine_scores(key)?
+        };
+
         let indices = sort_to_indices(&scores, None, Some(k))?;
         let scores = take(&scores, &indices, None)?;
         let row_ids = take(self.row_ids.as_ref(), &indices, None)?;
@@ -272,11 +347,11 @@ impl ProductQuantizer {
         assert_eq!(data.null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        let num_centorids = 2_usize.pow(self.num_bits);
-        let dimension = data.value_length() as usize / self.num_sub_vectors;
+        let num_centroids = 2_usize.pow(self.num_bits);
+        let dimension = data.value_length() as usize;
+        let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        let mut codebook_builder =
-            Float32Builder::with_capacity(num_centorids * data.value_length() as usize);
+        let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.
@@ -286,11 +361,11 @@ impl ProductQuantizer {
             let flatten_array: &Float32Array = as_primitive_array(&values);
             let centroids = train_kmeans(
                 flatten_array,
-                dimension,
-                num_centorids,
+                sub_vector_dimension,
+                num_centroids,
                 25,
                 rng.clone(),
-                crate::index::vector::MetricType::L2,
+                metric_type,
             )
             .await?;
             // TODO: COPIED COPIED COPIED

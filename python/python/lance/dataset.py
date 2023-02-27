@@ -49,6 +49,7 @@ class LanceDataset(pa.dataset.Dataset):
     def scanner(
         self,
         columns: Optional[list[str]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -60,6 +61,11 @@ class LanceDataset(pa.dataset.Dataset):
         columns: list of str, default None
             List of column names to be fetched.
             All columns if None or unspecified.
+        filter : pa.compute.Expression or str
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -73,10 +79,30 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
+
+        For debugging ANN results, you can choose to not use the index
+        even if present by specifying `use_index=False`. For example,
+        the following will always return exact KNN results:
+
+        ```
+        dataset.to_table(nearest={
+            "column": "vector",
+            "k": 10,
+            "q": <query vector>,
+            "use_index": False
+        }
+        ```
         """
         return (
             ScannerBuilder(self)
             .columns(columns)
+            .filter(filter)
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
@@ -93,6 +119,7 @@ class LanceDataset(pa.dataset.Dataset):
     def to_table(
         self,
         columns: Optional[list[str]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
@@ -104,6 +131,11 @@ class LanceDataset(pa.dataset.Dataset):
         columns: list of str, default None
             List of column names to be fetched.
             All columns if None or unspecified.
+        filter : pa.compute.Expression or str
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -114,12 +146,19 @@ class LanceDataset(pa.dataset.Dataset):
                   "column": <embedding col name>,
                   "q": <query vector as pa.Float32Array>,
                   "k": 10,
+                  "metric": "cosine",
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
         """
         return self.scanner(
-            columns=columns, limit=limit, offset=offset, nearest=nearest
+            columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest
         ).to_table()
 
     @property
@@ -274,8 +313,13 @@ class LanceDataset(pa.dataset.Dataset):
             return self.__class__(self._uri, ver_w_tag)
 
     def create_index(
-        self, column: str, index_type: str, name: Optional[str] = None, **kwargs
-    ):
+        self,
+        column: str,
+        index_type: str,
+        name: Optional[str] = None,
+        metric: str = "L2",
+        **kwargs,
+    ) -> LanceDataset:
         """Create index on column
 
         ***Experimental API***
@@ -289,6 +333,9 @@ class LanceDataset(pa.dataset.Dataset):
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
+        metric : str
+            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
+            Default is "L2".
         kwargs :
             Parameters passed to the index building process.
 
@@ -348,6 +395,13 @@ class LanceDataset(pa.dataset.Dataset):
                         "Vector ndim must be divisible by 8 for SIMD. "
                         "Set `force_build=True` to continue build anyways."
                     )
+
+        if not isinstance(metric, str) or metric.lower() not in [
+            "l2",
+            "cosine",
+            "euclidean",
+        ]:
+            raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
         if index_type != "IVF_PQ":
             raise NotImplementedError(
@@ -358,13 +412,15 @@ class LanceDataset(pa.dataset.Dataset):
                 "num_partitions and num_sub_vectors are required for IVF_PQ"
             )
 
-        self._ds.create_index(column, index_type, name, kwargs)
+        self._ds.create_index(column, index_type, name, metric, kwargs)
+        return LanceDataset(self.uri)
 
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
         self._limit = 0
+        self._filter = None
         self._offset = None
         self._columns = None
         self._nearest = None
@@ -387,13 +443,21 @@ class ScannerBuilder:
         self._columns = cols
         return self
 
+    def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
+        if isinstance(filter, pa.compute.Expression):
+            filter = str(filter)
+        self._filter = filter
+        return self
+
     def nearest(
         self,
         column: Optional[str] = None,
         q: Optional[pa.FloatingPointArray] = None,
         k: Optional[int] = None,
+        metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
+        use_index: bool = True,
     ) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
@@ -402,7 +466,10 @@ class ScannerBuilder:
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} not in dataset")
         if isinstance(q, (np.ndarray, list, tuple)):
+            q = np.array(q).astype("float64")  # workaround for GH-608
             q = pa.FloatingPointArray.from_pandas(q, type=pa.float32())
+        if not isinstance(q, pa.FloatingPointArray):
+            raise TypeError("query vector must be list-like or pa.FloatingPointArray")
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")
         if nprobes is not None and int(nprobes) <= 0:
@@ -413,14 +480,16 @@ class ScannerBuilder:
             "column": column,
             "q": q,
             "k": k,
+            "metric": metric,
             "nprobes": nprobes,
             "refine_factor": refine_factor,
+            "use_index": use_index,
         }
         return self
 
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
-            self._columns, self._limit, self._offset, self._nearest
+            self._columns, self._filter, self._limit, self._offset, self._nearest
         )
         return LanceScanner(scanner, self.ds)
 

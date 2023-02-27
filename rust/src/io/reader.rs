@@ -196,25 +196,25 @@ impl<'a> FileReader<'a> {
         &self,
         batch_id: i32,
         params: impl Into<ReadBatchParams>,
+        projection: &Schema,
     ) -> Result<RecordBatch> {
-        let schema = self.projection.as_ref().unwrap();
-        read_batch(self, &params.into(), schema, batch_id, self.with_row_id).await
+        read_batch(self, &params.into(), projection, batch_id, self.with_row_id).await
     }
 
     /// Take by records by indices within the file.
     ///
     /// The indices must be sorted.
-    pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
+    pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let indices_in_batches = self.metadata.group_indices_to_batches(indices);
         let batches = stream::iter(indices_in_batches)
             .map(|batch| async move {
-                self.read_batch(batch.batch_id, batch.offsets.as_slice())
+                self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                     .await
             })
             .buffered(8)
             .try_collect::<Vec<_>>()
             .await?;
-        let schema = Arc::new(ArrowSchema::from(self.schema()));
+        let schema = Arc::new(ArrowSchema::from(projection));
         Ok(concat_batches(&schema, &batches)?)
     }
 
@@ -597,7 +597,7 @@ mod tests {
         reader.with_row_id(true);
 
         for b in 0..10 {
-            let batch = reader.read_batch(b, ..).await.unwrap();
+            let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
             let row_ids_col = &batch["_rowid"];
             // Do the same computation as `compute_row_id`.
             let start_pos = (fragment << 32) as u64 + 10 * b as u64;
@@ -658,7 +658,10 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let batch = reader.take(&[1, 15, 20, 25, 30, 48, 90]).await.unwrap();
+        let batch = reader
+            .take(&[1, 15, 20, 25, 30, 48, 90], reader.schema())
+            .await
+            .unwrap();
         let dict_keys = UInt8Array::from_iter_values([1, 1, 6, 4, 2, 6, 6]);
         assert_eq!(
             batch,
@@ -703,7 +706,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
 
         if field_nullable {
             assert_eq!(
@@ -786,10 +789,9 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual_batch = reader.read_batch(0, ..).await.unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
 
         assert_eq!(batch, actual_batch);
-        println!("actual batch: {:?}", actual_batch);
     }
 
     #[tokio::test]

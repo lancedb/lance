@@ -16,9 +16,11 @@
 // under the License.
 
 mod knn;
+mod planner;
 mod scan;
 mod take;
 
 pub use knn::*;
+pub use planner::Planner;
 pub use scan::LanceScanExec;
-pub use take::GlobalTakeExec;
+pub use take::{GlobalTakeExec, LocalTakeExec};

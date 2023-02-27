@@ -22,6 +22,7 @@
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
 pub mod arrow;
+pub mod datafusion;
 pub mod dataset;
 pub mod datatypes;
 pub mod encodings;

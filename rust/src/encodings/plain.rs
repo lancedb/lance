@@ -21,14 +21,15 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::slice::from_raw_parts;
 use std::sync::Arc;
 
+use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::UInt32Array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray,
-    UInt8Array,
+    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt32Array, UInt8Array,
 };
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
@@ -41,8 +42,6 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
 use super::Decoder;
-use crate::arrow::FixedSizeBinaryArrayExt;
-use crate::arrow::FixedSizeListArrayExt;
 use crate::arrow::*;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
@@ -78,11 +77,35 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
+    async fn encode_boolean(&mut self, array: &BooleanArray) -> Result<()> {
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for i in 0..array.len() {
+            builder.append_value(array.value(i));
+        }
+        let array = builder.finish();
+        self.writer
+            .write_all(array.data().buffers()[0].as_slice())
+            .await?;
+        Ok(())
+    }
+
     /// Encode primitive values.
     async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
         let offset = self.writer.tell();
-        let data = array.data().buffers()[0].as_slice();
-        self.writer.write_all(data).await?;
+        let data = array.data();
+        if matches!(array.data_type(), DataType::Boolean) {
+            let boolean_arr = as_boolean_array(array);
+            self.encode_boolean(boolean_arr).await?;
+        } else {
+            let byte_width = array.data_type().byte_width();
+            let slice = unsafe {
+                from_raw_parts(
+                    data.buffers()[0].as_ptr().add(array.offset() * byte_width),
+                    array.len() * byte_width,
+                )
+            };
+            self.writer.write_all(slice).await?;
+        }
         Ok(offset)
     }
 
@@ -97,8 +120,17 @@ impl<'a> PlainEncoder<'a> {
                     array.data_type()
                 ))
             })?;
-        self.encode_internal(list_array.values().as_ref(), items.data_type())
-            .await
+        let offset = list_array.value_offset(0) as usize;
+        let length = list_array.len() as usize;
+        let value_length = list_array.value_length() as usize;
+        self.encode_internal(
+            list_array
+                .values()
+                .slice(offset, length * value_length)
+                .as_ref(),
+            items.data_type(),
+        )
+        .await
     }
 }
 
@@ -112,13 +144,13 @@ pub struct PlainDecoder<'a> {
     length: usize,
 }
 
-/// Calculate offset in bytes from the row offset.
+/// Get byte range from the row offset range.
 #[inline]
-fn make_byte_offset(data_type: &DataType, row_offset: usize) -> Result<usize> {
-    Ok(match data_type {
-        DataType::Boolean => bit_util::ceil(row_offset, 8),
-        _ => data_type.byte_width() * row_offset,
-    })
+fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize> {
+    match data_type {
+        DataType::Boolean => row_range.start / 8..bit_util::ceil(row_range.end, 8),
+        _ => row_range.start * data_type.byte_width()..row_range.end * data_type.byte_width(),
+    }
 }
 
 impl<'a> PlainDecoder<'a> {
@@ -145,11 +177,10 @@ impl<'a> PlainDecoder<'a> {
                 start, end, self.length
             )));
         }
-        let start_offset = make_byte_offset(self.data_type, start)?;
-        let end_offset = make_byte_offset(self.data_type, end)?;
+        let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
-            start: self.position + start_offset,
-            end: self.position + end_offset,
+            start: self.position + byte_range.start,
+            end: self.position + byte_range.end,
         };
 
         let data = self.reader.get_range(range).await?;
@@ -210,6 +241,16 @@ impl<'a> PlainDecoder<'a> {
             })?;
         Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
     }
+
+    async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+        // TODO: optimize boolean access
+        let start = indices.value(0) as usize;
+        let end = indices.value(indices.len() - 1) as usize;
+        let array = self.get(start..end + 1).await?;
+        let array_byte_boundray = (start / 8 * 8) as u32;
+        let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
+        Ok(take(array.as_ref(), &shifted_indices, None)?)
+    }
 }
 
 #[async_trait]
@@ -222,6 +263,11 @@ impl<'a> Decoder for PlainDecoder<'a> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
+
+        if matches!(self.data_type, DataType::Boolean) {
+            return self.take_boolean(indices).await;
+        }
+
         let block_size = self.reader.prefetch_size() as u32;
         let byte_width = self.data_type.byte_width() as u32;
 
@@ -333,16 +379,18 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::ObjectStore;
-    use arrow_array::*;
-    use arrow_schema::Field;
-    use object_store::path::Path;
-    use rand::prelude::*;
-    use std::borrow::Borrow;
     use std::sync::Arc;
 
+    use arrow::compute::concat_batches;
+    use arrow_array::*;
+    use arrow_schema::{Field, Schema as ArrowSchema};
+    use object_store::path::Path;
+    use rand::prelude::*;
+
     use super::*;
+    use crate::datatypes::Schema;
     use crate::io::object_writer::ObjectWriter;
+    use crate::io::{FileReader, FileWriter, ObjectStore};
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
@@ -457,11 +505,9 @@ mod tests {
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
         let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr = FixedSizeListArray::try_new(
-            FixedSizeBinaryArray::try_new(&values, 2).unwrap().borrow(),
-            2,
-        )
-        .unwrap();
+        let arr =
+            FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
+                .unwrap();
         test_round_trip(Arc::new(arr) as ArrayRef, t).await;
     }
 
@@ -542,6 +588,141 @@ mod tests {
         assert_eq!(
             results.as_ref(),
             &Int32Array::from_iter_values([2, 4, 5, 20, 30, 55, 60])
+        );
+    }
+
+    async fn read_file_as_one_batch(object_store: &ObjectStore, path: &Path) -> RecordBatch {
+        let reader = FileReader::try_new(object_store, path).await.unwrap();
+        let mut batches = vec![];
+        for i in 0..reader.num_batches() {
+            batches.push(
+                reader
+                    .read_batch(i as i32, .., reader.schema())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let arrow_schema = Arc::new(reader.schema().into());
+        concat_batches(&arrow_schema, &batches).unwrap()
+    }
+
+    /// Test encoding arrays that share the same underneath buffer.
+    #[tokio::test]
+    async fn test_encode_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/shared_slice");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = Int32Array::from_iter_values(0..1000);
+
+        for i in (0..1000).step_by(4) {
+            let data = array.slice(i, 4);
+            file_writer
+                .write(&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap())
+                .await
+                .unwrap();
+        }
+        file_writer.finish().await.unwrap();
+        assert!(store.size(&path).await.unwrap() < 2 * 8 * 1000);
+
+        let batch = read_file_as_one_batch(&store, &path).await;
+        assert_eq!(batch.column_by_name("i").unwrap().as_ref(), &array);
+    }
+
+    #[tokio::test]
+    async fn test_boolean_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/bool_slice");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        for i in 0..10 {
+            let data = array.slice(i * 12, 12); // one and half byte
+            file_writer
+                .write(&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap())
+                .await
+                .unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let batch = read_file_as_one_batch(&store, &path).await;
+        assert_eq!(batch.column_by_name("b").unwrap().as_ref(), &array);
+    }
+
+    #[tokio::test]
+    async fn test_encode_fixed_size_list_slice() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/shared_slice");
+
+        let array = Int32Array::from_iter_values(0..1600);
+        let fixed_size_list = FixedSizeListArray::try_new(&array, 16).unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "fl",
+            fixed_size_list.data_type().clone(),
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        for i in (0..100).step_by(4) {
+            let data = fixed_size_list.slice(i, 4);
+            let slice: &FixedSizeListArray = as_fixed_size_list_array(data.as_ref());
+            file_writer
+                .write(
+                    &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(slice.clone())])
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let batch = read_file_as_one_batch(&store, &path).await;
+        assert_eq!(
+            batch.column_by_name("fl").unwrap().as_ref(),
+            &fixed_size_list
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_boolean() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/take_bools");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 20], &schema).await.unwrap();
+
+        assert_eq!(
+            actual.column_by_name("b").unwrap().as_ref(),
+            &BooleanArray::from(vec![false, false, true, false, true])
         );
     }
 }

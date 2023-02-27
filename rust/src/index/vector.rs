@@ -32,7 +32,7 @@ mod pq;
 use super::IndexParams;
 use crate::{
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
-    Result,
+    Error, Result,
 };
 
 /// Query parameters for the vector indices
@@ -52,6 +52,9 @@ pub struct Query {
 
     /// Distance metric type
     pub metric_type: MetricType,
+
+    /// Whether to use an ANN index if available
+    pub use_index: bool,
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
@@ -76,7 +79,7 @@ pub trait VectorIndex {
 }
 
 /// Distance metrics type.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum MetricType {
     L2,
     Cosine,
@@ -125,6 +128,18 @@ impl From<MetricType> for super::pb::VectorMetricType {
     }
 }
 
+impl TryFrom<&str> for MetricType {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "l2" | "euclidean" => Ok(MetricType::L2),
+            "cosine" => Ok(MetricType::Cosine),
+            _ => Err(Error::Index(format!("Metric type '{s}' is not supported"))),
+        }
+    }
+}
+
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
     // This is hard coded for IVF_PQ for now. Can refactor later to support more.
@@ -138,7 +153,7 @@ pub struct VectorIndexParams {
     pub num_sub_vectors: u32,
 
     /// Vector distance metrics type.
-    pub metrics_type: MetricType,
+    pub metric_type: MetricType,
 }
 
 impl VectorIndexParams {
@@ -153,13 +168,13 @@ impl VectorIndexParams {
         num_partitions: u32,
         nbits: u8,
         num_sub_vectors: u32,
-        metrics_type: MetricType,
+        metric_type: MetricType,
     ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
-            metrics_type,
+            metric_type,
         }
     }
 }
@@ -170,7 +185,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
-            metrics_type: MetricType::L2,
+            metric_type: MetricType::L2,
         }
     }
 }

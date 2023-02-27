@@ -344,6 +344,19 @@ impl Field {
         }
     }
 
+    fn sub_field(&self, path_components: &[&str]) -> Option<&Self> {
+        if path_components.is_empty() {
+            Some(self)
+        } else {
+            let first = path_components[0];
+            self.children
+                .iter()
+                .find(|c| c.name == first)
+                .map(|c| c.sub_field(&path_components[1..]))
+                .flatten()
+        }
+    }
+
     fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -370,6 +383,40 @@ impl Field {
             }
         }
         Ok(f)
+    }
+
+    fn exclude(&self, other: &Self) -> Option<Self> {
+        if !self.data_type().is_nested() {
+            return None;
+        }
+        let children = self
+            .children
+            .iter()
+            .map(|c| {
+                if let Some(other_child) = other.child(&c.name) {
+                    c.exclude(other_child)
+                } else {
+                    Some(c.clone())
+                }
+            })
+            .filter(Option::is_some)
+            .map(Option::unwrap)
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            None
+        } else {
+            Some(Self {
+                name: self.name.clone(),
+                id: self.id,
+                parent_id: self.parent_id,
+                logical_type: self.logical_type.clone(),
+                extension_name: self.extension_name.clone(),
+                encoding: self.encoding.clone(),
+                nullable: self.nullable,
+                children,
+                dictionary: self.dictionary.clone(),
+            })
+        }
     }
 
     /// Merge the children of other field into this one.
@@ -620,8 +667,34 @@ impl Schema {
         Ok(Self::from(&filtered_protos))
     }
 
+    /// Exclude the fields from `other` Schema, and returns a new Schema.
+    pub fn exclude(&self, other: &Self) -> Result<Self> {
+        let mut fields = vec![];
+        for field in self.fields.iter() {
+            if let Some(other_field) = other.field(&field.name) {
+                if field.data_type().is_struct() {
+                    if let Some(f) = field.exclude(other_field) {
+                        fields.push(f)
+                    }
+                }
+            } else {
+                fields.push(field.clone());
+            }
+        }
+        Ok(Self {
+            fields,
+            metadata: HashMap::default(),
+        })
+    }
+
+    /// Get a field by name. Return `None` if the field does not exist.
     pub fn field(&self, name: &str) -> Option<&Field> {
-        self.fields.iter().find(|f| f.name == name)
+        let split = name.split('.').collect::<Vec<_>>();
+        self.fields
+            .iter()
+            .find(|f| f.name == split[0])
+            .map(|c| c.sub_field(&split[1..]))
+            .flatten()
     }
 
     pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
@@ -632,8 +705,7 @@ impl Schema {
 
     /// Recursively collect all the field IDs,
     pub(crate) fn field_ids(&self) -> Vec<i32> {
-        // TODO: make a tree travesal iterator.
-
+        // TODO: make a tree traversal iterator.
         let protos: Vec<pb::Field> = self.into();
         protos.iter().map(|f| f.id).collect()
     }
@@ -962,5 +1034,53 @@ mod tests {
             protos.iter().map(|p| p.id).collect::<Vec<_>>(),
             (0..6).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_get_nested_field() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(vec![
+                ArrowField::new("f1", DataType::Utf8, true),
+                ArrowField::new("f2", DataType::Boolean, false),
+                ArrowField::new("f3", DataType::Float32, false),
+            ]),
+            true,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let field = schema.field("b.f2").unwrap();
+        assert_eq!(field.data_type(), DataType::Boolean);
+    }
+
+    #[test]
+    fn test_exclude_fields() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
+        let excluded = schema.exclude(&projection).unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(vec![ArrowField::new("f1", DataType::Utf8, true)]),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(ArrowSchema::from(&excluded), expected_arrow_schema);
     }
 }

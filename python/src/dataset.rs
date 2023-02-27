@@ -22,18 +22,20 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
-use lance::index::vector::VectorIndexParams;
-use lance::index::IndexType;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict, PyInt, PyLong};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use crate::Scanner;
-use ::lance::dataset::scanner::Scanner as LanceScanner;
-use ::lance::dataset::Dataset as LanceDataset;
-use lance::dataset::{Version, WriteMode, WriteParams};
+use lance::dataset::{
+    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
+};
+use lance::index::{
+    vector::{MetricType, VectorIndexParams},
+    IndexType,
+};
 
 const DEFAULT_NPROBS: usize = 1;
 
@@ -78,6 +80,7 @@ impl Dataset {
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
+        filter: Option<String>,
         limit: i64,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
@@ -87,6 +90,11 @@ impl Dataset {
             let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
             scanner
                 .project(&proj)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = filter {
+            scanner
+                .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         scanner
@@ -124,6 +132,19 @@ impl Dataset {
                 DEFAULT_NPROBS
             };
 
+            let metric_type: Option<MetricType> = if let Some(metric) = nearest.get_item("metric") {
+                if metric.is_none() {
+                    None
+                } else {
+                    Some(
+                        MetricType::try_from(metric.to_string().to_lowercase().as_str())
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                    )
+                }
+            } else {
+                None
+            };
+
             // When refine factor is specified, a final Refine stage will be added to the I/O plan,
             // and use Flat index over the raw vectors to refine the results.
             // By default, `refine_factor` is None to not involve extra I/O exec node and random access.
@@ -136,6 +157,13 @@ impl Dataset {
             } else {
                 None
             };
+
+            let use_index: bool = if let Some(idx) = nearest.get_item("use_index") {
+                PyAny::downcast::<PyBool>(idx)?.extract()?
+            } else {
+                true
+            };
+
             scanner
                 .nearest(column.as_str(), &q, k)
                 .map(|s| {
@@ -143,6 +171,10 @@ impl Dataset {
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
                     }
+                    if let Some(m) = metric_type {
+                        s = s.distance_metric(m);
+                    }
+                    s.use_index(use_index);
                     s
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -209,6 +241,7 @@ impl Dataset {
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
+        metric_type: &str,
         kwargs: &PyDict,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
@@ -229,6 +262,9 @@ impl Dataset {
         if let Some(n) = kwargs.get_item("num_sub_vectors") {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
+
+        params.metric_type =
+            MetricType::try_from(metric_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         self_
             .rt

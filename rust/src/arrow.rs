@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Extend Arrow Functionality
 //!
@@ -21,6 +18,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::as_struct_array;
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, Int64Array,
     LargeListArray, ListArray, RecordBatch, UInt8Array,
@@ -335,6 +333,12 @@ pub trait RecordBatchExt {
     ///
     /// If the named column does not exist, it returns a copy of this [`RecordBatch`].
     fn drop_column(&self, name: &str) -> Result<RecordBatch>;
+
+    /// Get (potentially nested) column by qualified name.
+    fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef>;
+
+    /// Project the schema over the [RecordBatch].
+    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
 }
 
 impl RecordBatchExt for RecordBatch {
@@ -398,4 +402,42 @@ impl RecordBatchExt for RecordBatch {
             columns,
         )?)
     }
+
+    fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
+        let split = name.split('.').collect::<Vec<_>>();
+        if split.is_empty() {
+            return None;
+        }
+
+        self.column_by_name(split[0])
+            .and_then(|arr| get_sub_array(arr, &split[1..]))
+    }
+
+    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
+        let mut columns = vec![];
+        for field in schema.fields.iter() {
+            if let Some(col) = self.column_by_name(field.name()) {
+                columns.push(col.clone());
+            } else {
+                return Err(Error::Arrow(format!(
+                    "field {} does not exist in the RecordBatch",
+                    field.name()
+                )));
+            }
+        }
+        Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+    }
+}
+
+fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
+    if components.is_empty() {
+        return Some(array);
+    }
+    if !matches!(array.data_type(), DataType::Struct(_)) {
+        return None;
+    }
+    let struct_arr = as_struct_array(array.as_ref());
+    struct_arr
+        .column_by_name(components[0])
+        .and_then(|arr| get_sub_array(arr, &components[1..]))
 }

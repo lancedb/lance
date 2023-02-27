@@ -21,17 +21,18 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
 use crate::dataset::scanner::RecordBatchStream;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::ivf::IvfPQIndex;
 use crate::index::vector::{Query, VectorIndex};
@@ -87,7 +88,10 @@ impl Stream for KNNFlatStream {
 
 impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 }
 
@@ -119,7 +123,10 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -137,20 +144,20 @@ impl ExecutionPlan for KNNFlatExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
     }
 
-    fn statistics(&self) -> datafusion::physical_plan::Statistics {
+    fn statistics(&self) -> Statistics {
         todo!()
     }
 }
@@ -254,7 +261,10 @@ impl ExecutionPlan for KNNIndexExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new("score", DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -273,15 +283,15 @@ impl ExecutionPlan for KNNIndexExec {
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
     }
 
     fn execute(
         &self,
         _partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+    ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         Ok(Box::pin(KNNIndexStream::new(
             self.dataset.clone(),
             &self.index_name,
@@ -386,6 +396,7 @@ mod tests {
                 nprobs: 0,
                 refine_factor: None,
                 metric_type: MetricType::L2,
+                use_index: false,
             },
         )
         .await
