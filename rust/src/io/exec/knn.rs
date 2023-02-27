@@ -396,7 +396,7 @@ mod tests {
                 nprobs: 0,
                 refine_factor: None,
                 metric_type: MetricType::L2,
-                use_index: false
+                use_index: false,
             },
         )
         .await
