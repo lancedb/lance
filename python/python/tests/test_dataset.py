@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 import lance
 import pandas as pd
 import pyarrow as pa
+import pytest
 
 
 def test_dataset_overwrite(tmp_path: Path):
@@ -111,3 +113,27 @@ def test_filter(tmp_path: Path):
     dataset = lance.dataset(base_dir)
     actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
+
+
+def test_relative_paths(tmp_path: Path):
+    current_dir = os.getcwd()
+
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    rel_uri = "test.lance"
+    try:
+        os.chdir(tmp_path)
+        lance.write_dataset(table, rel_uri)
+
+        # relative path works in the current dir
+        ds_1 = lance.dataset(rel_uri)
+        assert ds_1.to_table() == table
+    finally:
+        os.chdir(current_dir)
+
+    # relative path doesn't work in context of a different dir
+    with pytest.raises(ValueError):
+        ds_3 = lance.dataset(rel_uri)
+
+    # relative path gets resolved to the right absolute path
+    ds_2 = lance.dataset(tmp_path / rel_uri)
+    assert ds_2.to_table() == table
