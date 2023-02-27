@@ -24,7 +24,7 @@ use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyDict, PyInt, PyLong};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -157,6 +157,13 @@ impl Dataset {
             } else {
                 None
             };
+
+            let use_index: bool = if let Some(idx) = nearest.get_item("use_index") {
+                PyAny::downcast::<PyBool>(idx)?.extract()?
+            } else {
+                true
+            };
+
             scanner
                 .nearest(column.as_str(), &q, k)
                 .map(|s| {
@@ -167,6 +174,7 @@ impl Dataset {
                     if let Some(m) = metric_type {
                         s = s.distance_metric(m);
                     }
+                    s.use_index(use_index);
                     s
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

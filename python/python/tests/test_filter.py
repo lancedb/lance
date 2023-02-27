@@ -35,24 +35,25 @@ import pandas.testing as tm
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
-
 from lance.vector import vec_to_table
 
 
 def create_table(nrows=100):
     intcol = pa.array(range(nrows))
-    floatcol = pa.array(np.arange(nrows) * 2/3, type=pa.float32())
+    floatcol = pa.array(np.arange(nrows) * 2 / 3, type=pa.float32())
     arr = np.arange(nrows) < nrows / 2
-    structcol = pa.StructArray.from_arrays([pa.array(arr, type=pa.bool_())], names=["bool"])
+    structcol = pa.StructArray.from_arrays(
+        [pa.array(arr, type=pa.bool_())], names=["bool"]
+    )
 
     def gen_str(n):
-        return ''.join(random.choices("abc"))
+        return "".join(random.choices("abc"))
 
     stringcol = pa.array([gen_str(2) for _ in range(nrows)])
 
-    tbl = pa.Table.from_arrays([
-        intcol, floatcol, structcol, stringcol
-    ], names=["int", "float", "rec", "str"])
+    tbl = pa.Table.from_arrays(
+        [intcol, floatcol, structcol, stringcol], names=["int", "float", "rec", "str"]
+    )
     return tbl
 
 
@@ -89,9 +90,13 @@ def test_compound(dataset):
     for expr in predicates:
         for other_expr in predicates:
             compound = expr & other_expr
-            assert dataset.to_table(filter=compound) == dataset.to_table().filter(compound)
+            assert dataset.to_table(filter=compound) == dataset.to_table().filter(
+                compound
+            )
             compound = expr | other_expr
-            assert dataset.to_table(filter=compound) == dataset.to_table().filter(compound)
+            assert dataset.to_table(filter=compound) == dataset.to_table().filter(
+                compound
+            )
 
 
 def create_table_for_duckdb(nvec=10000, ndim=768):
@@ -126,9 +131,13 @@ def test_duckdb(tmp_path):
     expected = expected[expected.id == 1000].reset_index(drop=True)
     tm.assert_frame_equal(actual, expected)
 
-    actual = duckdb.query("SELECT id, meta, price FROM ds WHERE price>20.0 and price<=90").to_df()
+    actual = duckdb.query(
+        "SELECT id, meta, price FROM ds WHERE price>20.0 and price<=90"
+    ).to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
-    expected = expected[(expected.price > 20.0) & (expected.price <= 90)].reset_index(drop=True)
+    expected = expected[(expected.price > 20.0) & (expected.price <= 90)].reset_index(
+        drop=True
+    )
     tm.assert_frame_equal(actual, expected)
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE meta=='aa'").to_df()
