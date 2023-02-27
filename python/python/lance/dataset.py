@@ -84,6 +84,19 @@ class LanceDataset(pa.dataset.Dataset):
         For now, if BOTH filter and nearest is specified, then:
         1. nearest is executed first.
         2. The results are filtered afterwards.
+
+        For debugging ANN results, you can choose to not use the index
+        even if present by specifying `use_index=False`. For example,
+        the following will always return exact KNN results:
+
+        ```
+        dataset.to_table(nearest={
+            "column": "vector",
+            "k": 10,
+            "q": <query vector>,
+            "use_index": False
+        }
+        ```
         """
         return (
             ScannerBuilder(self)
