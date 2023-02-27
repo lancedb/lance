@@ -371,7 +371,8 @@ impl ProductQuantizer {
                 flatten_array,
                 sub_vector_dimension,
                 num_centroids,
-                25,
+                50,
+                3,
                 rng.clone(),
                 metric_type,
             )

@@ -723,8 +723,17 @@ async fn train_kmeans_model(
 
     let all_vectors = concat(&arrays)?;
     let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids =
-        super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng, metric_type).await?;
+    let redos = 1;
+    let centroids = super::kmeans::train_kmeans(
+        values,
+        dimension,
+        k,
+        max_iterations,
+        redos,
+        rng,
+        metric_type,
+    )
+    .await?;
     Ok(Arc::new(FixedSizeListArray::try_new(
         centroids,
         dimension as i32,

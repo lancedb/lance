@@ -29,15 +29,16 @@ pub async fn train_kmeans(
     dimension: usize,
     k: usize,
     max_iterations: u32,
+    redos: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
-    // if num_rows < k {
-    //     return Err(crate::Error::Index(format!(
-    //         "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
-    //     )));
-    // }
+    if num_rows < k {
+        return Err(crate::Error::Index(format!(
+            "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
+        )));
+    }
     // Ony sample 256 * num_clusters. See Faiss
     let data = if num_rows > 256 * k {
         println!(
@@ -62,6 +63,7 @@ pub async fn train_kmeans(
     let params = KMeansParams {
         max_iters: max_iterations,
         metric_type,
+        redos,
         ..Default::default()
     };
     let model = KMeans::new_with_params(&data, dimension, k, &params).await;
