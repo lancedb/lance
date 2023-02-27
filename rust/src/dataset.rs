@@ -1040,7 +1040,7 @@ mod tests {
             false,
         )]));
 
-        let float_arr = generate_random_array(512 * dimension as usize);
+        let float_arr = generate_random_array(5000 * dimension as usize);
         let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),

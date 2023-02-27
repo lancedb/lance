@@ -37,7 +37,7 @@ use super::MetricType;
 
 /// Product Quantization Index.
 ///
-pub struct PQIndex<'a> {
+pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -50,7 +50,7 @@ pub struct PQIndex<'a> {
     pub dimension: usize,
 
     /// Product quantizer.
-    pub pq: &'a ProductQuantizer,
+    pub pq: ProductQuantizer,
 
     /// PQ code
     pub code: Arc<UInt8Array>,
@@ -61,15 +61,23 @@ pub struct PQIndex<'a> {
     metric_type: MetricType,
 }
 
-impl<'a> PQIndex<'a> {
+impl PQIndex {
     /// Load a PQ index (page) from the disk.
     pub async fn load(
         reader: &dyn ObjectReader,
-        pq: &'a ProductQuantizer,
+        pq: &ProductQuantizer,
         metric_type: MetricType,
         offset: usize,
         length: usize,
-    ) -> Result<PQIndex<'a>> {
+    ) -> Result<Self> {
+        let codebook_length = ProductQuantizer::codebook_length(pq.num_bits, pq.num_sub_vectors);
+        let codebook =
+            read_fixed_stride_array(reader, &DataType::Float32, offset, codebook_length, ..)
+                .await?;
+        let mut pq = pq.clone();
+        pq.codebook = Some(Arc::new(as_primitive_array(codebook.as_ref()).clone()));
+
+        let offset = offset + codebook_length * DataType::Float32.byte_width();
         let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
@@ -84,7 +92,7 @@ impl<'a> PQIndex<'a> {
             dimension: pq.dimension,
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
-            pq,
+            pq: pq,
             metric_type,
         })
     }
@@ -212,7 +220,7 @@ impl<'a> PQIndex<'a> {
 
 /// Product Quantization, optimized for [Apache Arrow] buffer memory layout.
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProductQuantizer {
     /// Number of bits for the centroids.
     ///
@@ -261,7 +269,7 @@ impl ProductQuantizer {
         2_usize.pow(num_bits)
     }
 
-    /// Calculate codebook length.
+    /// Calculate the codebook length, total number of floats.
     pub fn codebook_length(num_bits: u32, num_sub_vectors: usize) -> usize {
         Self::num_centroids(num_bits) * num_sub_vectors
     }
@@ -398,7 +406,7 @@ impl From<&ProductQuantizer> for pb::Pq {
             num_bits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
-            codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+            codebook: vec![], // pq.codebook.as_ref().unwrap().values().to_vec(),
         }
     }
 }

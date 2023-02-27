@@ -89,7 +89,7 @@ async fn kmean_plusplus(
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> KMeans {
-    assert!(data.len() > k * dimension);
+    // assert!(data.len() > k * dimension);
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
     let first_idx = rng.gen_range(0..data.len() / dimension);
     let first_vector = data.slice(first_idx * dimension, dimension);
@@ -135,7 +135,7 @@ async fn kmeans_random_init(
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> KMeans {
-    assert!(data.len() > k * dimension);
+    // assert!(data.len() > k * dimension);
 
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
@@ -346,7 +346,7 @@ impl KMeans {
         let metric_type = self.metric_type;
         let cluster_with_distances = stream::iter(0..n)
             // make tiles of input data to split between threads.
-            .chunks(1024)
+            .chunks(24)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {

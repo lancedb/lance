@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! IVF - Inverted File index.
 
@@ -22,6 +19,7 @@ use std::sync::Arc;
 use arrow_arith::aggregate::{max, min};
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::builder::Float32Builder;
+use arrow_array::UInt64Array;
 use arrow_array::{
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
@@ -48,6 +46,7 @@ use super::{
     MetricType, Query, VectorIndex,
 };
 use crate::arrow::*;
+use crate::io::object_writer::ObjectWriter;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
@@ -400,20 +399,19 @@ impl Ivf {
                 )?;
                 Ok::<RecordBatch, Error>(batch_with_part_id)
             })
-            .buffer_unordered(16)
+            .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
 
         // Compute the residual vectors for every RecordBatch.
-        // let mut residual_batches = vec![];
         let residual_batches = stream::iter(batches_with_partition_id)
             .map(|batch| async move {
-                let centorids = self.centroids.clone();
+                let centroids = self.centroids.clone();
                 let vector = batch.column_by_name(column_name).unwrap().clone();
                 let partition_ids = batch.column_by_name(PARTITION_ID_COLUMN).unwrap().clone();
                 let residual = tokio::task::spawn_blocking(move || {
                     compute_residual(
-                        centorids.clone(),
+                        centroids.clone(),
                         as_fixed_size_list_array(vector.as_ref()),
                         as_primitive_array(partition_ids.as_ref()),
                     )
@@ -578,6 +576,41 @@ impl<'a> IvfPqIndexBuilder<'a> {
             .await?,
         ))
     }
+
+    /// Train [ProductQuantizer] with a residual vector array.
+    ///
+    /// Returns a tuple of [ProductQuantizer] and PQ code of the input vectors.
+    async fn train_product_quantizer(
+        &self,
+        residual_vectors: &FixedSizeListArray,
+    ) -> Result<(ProductQuantizer, FixedSizeListArray)> {
+        let mut pq =
+            ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
+        let pq_code = pq
+            .fit_transform(as_fixed_size_list_array(residual_vectors), self.metric_type)
+            .await?;
+        Ok((pq, pq_code))
+    }
+
+    /// Write one IVF index partition.
+    async fn write_partition(
+        &self,
+        writer: &mut ObjectWriter,
+        vector_col: &FixedSizeListArray,
+        row_id_col: &UInt64Array,
+    ) -> Result<()> {
+        assert_eq!(vector_col.len(), row_id_col.len());
+        let (pq, pq_code) = self.train_product_quantizer(vector_col).await?;
+        assert!(pq.codebook.is_some());
+
+        // Write codebook
+        writer
+            .write_plain_encoded_array(pq.codebook.unwrap().as_ref())
+            .await?;
+        writer.write_plain_encoded_array(&pq_code).await?;
+        writer.write_plain_encoded_array(row_id_col).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -603,32 +636,10 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
-        // Assign parition ID and compute residual vectors.
+
+        // Assign partition ID and compute residual vectors.
         let partitioned_batches = ivf_model.partition(&scanner, self.metric_type).await?;
-
-        // Train PQ
-        let mut pq =
-            ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
         let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
-        let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
-
-        let pq_code = pq
-            .fit_transform(as_fixed_size_list_array(residual_vector), self.metric_type)
-            .await?;
-
-        const PQ_CODE_COLUMN: &str = "__pq_code";
-        let pq_code_batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false),
-                ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
-                ArrowField::new(ROW_ID, DataType::UInt64, false),
-            ])),
-            vec![
-                Arc::new(pq_code),
-                batch.column_by_name(PARTITION_ID_COLUMN).unwrap().clone(),
-                batch.column_by_name(ROW_ID).unwrap().clone(),
-            ],
-        )?;
 
         let object_store = self.dataset.object_store();
         let path = self
@@ -639,23 +650,25 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut writer = object_store.create(&path).await?;
 
         // Write each partition to disk.
-        let part_col = pq_code_batch
+        let part_col = batch
             .column_by_name(PARTITION_ID_COLUMN)
             .unwrap_or_else(|| panic!("{PARTITION_ID_COLUMN} does not exist"));
         let partition_ids: &UInt32Array = as_primitive_array(part_col);
-        let min_id = min(partition_ids).unwrap_or(0);
         let max_id = max(partition_ids).unwrap_or(1024 * 1024);
 
-        for part_id in min_id..max_id + 1 {
+        for part_id in 0..=max_id {
             let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
-            let parted_batch = filter_record_batch(&pq_code_batch, &predicates)?;
+            let parted_batch = filter_record_batch(&batch, &predicates)?;
             ivf_model.add_partition(writer.tell(), parted_batch.num_rows() as u32);
             if parted_batch.num_rows() > 0 {
-                // Write one partition.
-                let pq_code = &parted_batch[PQ_CODE_COLUMN];
-                writer.write_plain_encoded_array(pq_code.as_ref()).await?;
+                let vector_col = &parted_batch[RESIDUAL_COLUMN];
                 let row_ids = &parted_batch[ROW_ID];
-                writer.write_plain_encoded_array(row_ids.as_ref()).await?;
+                self.write_partition(
+                    &mut writer,
+                    as_fixed_size_list_array(vector_col),
+                    as_primitive_array(row_ids),
+                )
+                .await?;
             }
         }
 
@@ -665,7 +678,8 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
             dimension: self.dimension as u32,
             dataset_version: self.dataset.version().version,
             ivf: ivf_model,
-            pq: pq.into(),
+            pq: ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension)
+                .into(),
             metric_type: self.metric_type,
         };
 
