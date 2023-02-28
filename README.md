@@ -3,7 +3,8 @@
  
 <img width="257" alt="Lance Logo" src="https://user-images.githubusercontent.com/917119/199353423-d3e202f7-0269-411d-8ff2-e747e419e492.png">
 
-**Alternative to Parquet. 100x faster for random access, includes a vector index and automatic versioning. Apache Arrow and DuckDB compatible.**
+**Modern columnar data format for ML. Convert from parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
+**Compatible with pandas, duckdb, polars, pyarrow, with more integrations on the way.**
 
 <a href="https://eto-ai.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
@@ -20,15 +21,21 @@
 
 <hr />
 
-Lance is a columnar data format that is easy and fast to version, query and train on. It’s designed to be used with images, videos, 3D point clouds, audio and of course tabular data. The key features of Lance include:
+Lance is a modern columnar data format that is optimized for ML workflows and datasets. Lance is perfect for:
 
-* **High-performance random access:** 100x faster than Parquet.
+1. Building search engines and features stores.
+2. Large-scale ML training requiring high performance IO and shuffles.
+3. Storing, querying, and inspecting deeply nested data for robotics or large blobs like images, point-clouds, and more.
 
-* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
+The key features of Lance include:
 
-* **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
+* **High-performance random access:** 100x faster than Parquet without sacrificing scan performance.
 
-* **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
+* **Vector search:** find nearest neighbors in milliseconds and combine OLAP-queries with vector search.
+
+* **Zero-copy, automatic versioning:** manage versions of your data without needing extra infrastructure.
+
+* **Ecosystem integrations:** Apache-Arrow, Pandas, Polars, DuckDB and more on the way.
 
 ## Quick Start
 
