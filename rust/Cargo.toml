@@ -49,6 +49,7 @@ rand = { version = "0.8.3", features = ["small_rng"] }
 futures = "0.3"
 uuid = { version = "1.2", features = ["v4"] }
 path-absolutize = "3.0.14"
+shellexpand = "3.0.0"
 arrow = { version = "32.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 sqlparser = { git = "https://github.com/eto-ai/sqlparser-rs.git", branch = "lei/double_eq" }

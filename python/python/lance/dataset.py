@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional, Union
@@ -33,8 +34,7 @@ class LanceDataset(pa.dataset.Dataset):
     """A dataset in Lance format where the data is stored at the given uri"""
 
     def __init__(self, uri: Union[str, Path], version: Optional[int] = None):
-        if isinstance(uri, Path):
-            uri = str(uri.absolute())
+        uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(uri, version)
 
@@ -624,7 +624,7 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
     }
-    if isinstance(uri, Path):
-        uri = str(uri.absolute())
-    _write_dataset(reader, str(uri), params)
-    return LanceDataset(str(uri))
+
+    uri = os.fspath(uri) if isinstance(uri, Path) else uri
+    _write_dataset(reader, uri, params)
+    return LanceDataset(uri)
