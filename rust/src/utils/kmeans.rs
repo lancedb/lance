@@ -202,6 +202,7 @@ impl KMeanMembership {
                                 total += 1.0;
                             };
                         }
+                        println!("Cluster id={cluster}, count={total}");
                         if total > 0.0 {
                             divide_scalar(&sum, total).unwrap()
                         } else {
