@@ -256,7 +256,6 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::logical_expr::{col, lit};
-    use datafusion::prelude::exp;
 
     #[test]
     fn test_parse_filter_simple() {
