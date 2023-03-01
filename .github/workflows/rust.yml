@@ -83,7 +83,7 @@ jobs:
           Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
           .\rustup-init.exe -y --default-host=x86_64-pc-windows-gnu --default-toolchain=none
           del rustup-init.exe
-          rustup target add 86_64-pc-windows-gnu
+          rustup target add x86_64-pc-windows-gnu
         shell: powershell
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
