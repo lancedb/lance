@@ -187,8 +187,6 @@ fn split_clusters(centroids: Vec<Float32Array>, histogram: Vec<i32>) -> Result<V
             // Find the largest cluster to split into halfs.
             let largest_hist = histogram.iter().max().unwrap();
             let idx = histogram.iter().position(|h| *h == *largest_hist).unwrap();
-            println!("Historgram: {:?}", histogram);
-            eprintln!("Split cluster {idx}/{} (size={largest_hist}) to cluster {i}", centroids.len());
             histogram[i] = histogram[idx] / 2;
             histogram[idx] = histogram[i];
             centroids[i] = multiply_scalar(&centroids[idx], 1.0 + EPS)?;
@@ -228,11 +226,9 @@ impl KMeanMembership {
                                 total += 1;
                             };
                         }
-                        // println!("Cluster id={cluster}, count={total}");
                         if total > 0 {
                             (divide_scalar(&sum, total as f32).unwrap(), total)
                         } else {
-                            eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
                             let prev_centroids = previous_centroids.slice(cluster * dimension, dimension);
                             (as_primitive_array(prev_centroids.as_ref()).clone(), total)
                         }
@@ -257,7 +253,8 @@ impl KMeanMembership {
             new_centroids
                 .iter()
                 .map(|c| c as &dyn Array)
-                .collect::<Vec<_>>().as_slice(),
+                .collect::<Vec<_>>()
+                .as_slice(),
         )
         .unwrap();
         Ok(KMeans {
@@ -327,6 +324,10 @@ impl KMeans {
         k: usize,
         params: &KMeansParams,
     ) -> Self {
+        if data.len() < dimension * k {
+            // Don't have enough data to train k centroids.
+            return KMeans::new_partial_kmeans(data, dimension, k, params.metric_type);
+        }
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
@@ -369,6 +370,33 @@ impl KMeans {
         }
 
         best_kmeans
+    }
+
+    /// Create a kmeans model for a dataset that has less than `k` vectors.
+    ///
+    /// It assigns each vector as a centroid, and make the rest of the centroids
+    /// to be `f32::MAX`.
+    fn new_partial_kmeans(
+        data: &Float32Array,
+        dimension: usize,
+        k: usize,
+        metric_type: MetricType,
+    ) -> Self {
+        let mut builder = Float32Builder::with_capacity(dimension * k);
+        builder.append_values(
+            data.values(),
+            (0..data.len()).map(|_| true).collect::<Vec<_>>().as_slice(),
+        );
+        for _ in 0..(builder.capacity() - data.len()) {
+            builder.append_value(f32::MAX);
+        }
+        let centroids = Arc::new(builder.finish());
+        Self {
+            centroids,
+            dimension,
+            k,
+            metric_type,
+        }
     }
 
     /// Recompute the membership of each vector.
