@@ -20,8 +20,12 @@
 use std::fs::File;
 use std::ops::Range;
 use std::sync::Arc;
-// TODO: worry about windows later.
+
+// TODO: Clean up windows/unix stuff
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -74,11 +78,15 @@ impl ObjectReader for LocalObjectReader {
     /// Reads a range of data.
     ///
     /// TODO: return [arrow_buffer::Buffer] to avoid one memory copy from Bytes to Buffer.
+
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
             let mut buf = BytesMut::zeroed(range.len());
+            #[cfg(unix)]
             file.read_at(buf.as_mut(), range.start as u64)?;
+            #[cfg(windows)]
+            file.seek_read(buf.as_mut(), range.start as u64)?;
             Ok(buf.freeze())
         })
         .await?
