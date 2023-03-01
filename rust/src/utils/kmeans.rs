@@ -176,6 +176,7 @@ struct KMeanMembership {
 ///
 fn split_clusters(centroids: Vec<Float32Array>, histogram: Vec<i32>) -> Result<Vec<Float32Array>> {
     // Used to split the centroid of largest cluster to two centroids.
+    // See Faiss
     const EPS: f32 = 1.0 / 1024.0;
 
     let mut histogram = histogram;
