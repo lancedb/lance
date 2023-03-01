@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use arrow_arith::aggregate::{max, min};
+use arrow_arith::aggregate::max;
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::builder::Float32Builder;
 use arrow_array::UInt64Array;

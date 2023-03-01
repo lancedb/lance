@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::Float32Builder;
-use arrow_arith::arithmetic::{add, divide_scalar};
+use arrow_arith::arithmetic::{add, divide_scalar, multiply_scalar};
 use arrow_array::{cast::as_primitive_array, new_empty_array, Array, Float32Array};
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
@@ -172,6 +172,31 @@ struct KMeanMembership {
     metric_type: MetricType,
 }
 
+/// Split the largest clusters.
+///
+fn split_clusters(centroids: Vec<Float32Array>, histogram: Vec<i32>) -> Result<Vec<Float32Array>> {
+    // Used to split the centroid of largest cluster to two centroids.
+    const EPS: f32 = 1.0 / 1024.0;
+
+    let mut histogram = histogram;
+    let mut centroids = centroids;
+    // Split the biggest clusters
+    for i in 0..histogram.len() {
+        if histogram[i] == 0 {
+            // Find the largest cluster to split into halfs.
+            let largest_hist = histogram.iter().max().unwrap();
+            let idx = histogram.iter().position(|h| *h == *largest_hist).unwrap();
+            println!("Historgram: {:?}", histogram);
+            eprintln!("Split cluster {idx}/{} (size={largest_hist}) to cluster {i}", centroids.len());
+            histogram[i] = histogram[idx] / 2;
+            histogram[idx] = histogram[i];
+            centroids[i] = multiply_scalar(&centroids[idx], 1.0 + EPS)?;
+            centroids[idx] = multiply_scalar(&centroids[idx], 1.0 - EPS)?;
+        }
+    }
+    Ok(centroids)
+}
+
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
     async fn to_kmeans(&self) -> Result<KMeans> {
@@ -180,7 +205,7 @@ impl KMeanMembership {
         let data = self.data.clone();
         let previous_centroids = self.centroids.clone();
         // New centroids for each cluster
-        let means = stream::iter(0..self.k)
+        let centroids_and_cnt = stream::iter(0..self.k)
             .zip(repeat_with(|| {
                 (
                     data.clone(),
@@ -194,21 +219,21 @@ impl KMeanMembership {
                         let mut sum = Float32Array::from_iter_values(
                             (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
                         );
-                        let mut total = 0.0;
+                        let mut total = 0;
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
                                 sum =
                                     add(&sum, as_primitive_array(data.slice(i * dimension, dimension).as_ref())).unwrap();
-                                total += 1.0;
+                                total += 1;
                             };
                         }
-                        println!("Cluster id={cluster}, count={total}");
-                        if total > 0.0 {
-                            divide_scalar(&sum, total).unwrap()
+                        // println!("Cluster id={cluster}, count={total}");
+                        if total > 0 {
+                            (divide_scalar(&sum, total as f32).unwrap(), total)
                         } else {
                             eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
                             let prev_centroids = previous_centroids.slice(cluster * dimension, dimension);
-                            as_primitive_array(prev_centroids.as_ref()).clone()
+                            (as_primitive_array(prev_centroids.as_ref()).clone(), total)
                         }
                     })
                     .await
@@ -219,11 +244,21 @@ impl KMeanMembership {
             .await?;
 
         // TODO: concat requires `&[&dyn Array]`. Are there cheaper way to pass Vec<Float32Array> to `concat`?
-        let mut mean_refs: Vec<&dyn Array> = vec![];
-        for m in means.iter() {
-            mean_refs.push(m);
+        let mut centroids: Vec<Float32Array> = vec![];
+        let mut histogram: Vec<i32> = vec![];
+        for m in centroids_and_cnt.iter() {
+            centroids.push(m.0.clone());
+            histogram.push(m.1);
         }
-        let centroids = concat(&mean_refs).unwrap();
+        let new_centroids = split_clusters(centroids, histogram)?;
+
+        let centroids = concat(
+            new_centroids
+                .iter()
+                .map(|c| c as &dyn Array)
+                .collect::<Vec<_>>().as_slice(),
+        )
+        .unwrap();
         Ok(KMeans {
             centroids: Arc::new(as_primitive_array(centroids.as_ref()).clone()),
             dimension,
