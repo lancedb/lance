@@ -22,47 +22,18 @@ use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
-use async_trait::async_trait;
-use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
+use futures::stream::{repeat_with, StreamExt, TryStreamExt};
 
-use super::{Query, VectorIndex};
+use super::Query;
 use crate::arrow::*;
-use crate::dataset::Dataset;
+use crate::dataset::scanner::RecordBatchStream;
 use crate::{Error, Result};
 
-/// Flat Vector Index.
-///
-/// Flat index is a meta index. It does not build extra index structure,
-/// and does exhaustive search.
-///
-/// Flat index always provides 100% recall because exhaustive search over the
-/// uncompressed original vectors.
-///
-/// Reference:
-///   - <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>
-#[derive(Debug)]
-pub struct FlatIndex<'a> {
-    dataset: &'a Dataset,
-
-    /// Vector column to search for.
-    column: String,
-}
-
-impl<'a> FlatIndex<'a> {
-    pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
-        Ok(Self {
-            dataset,
-            column: name.to_string(),
-        })
-    }
-}
-
-pub async fn flat_search(
-    stream: impl Stream<Item = Result<RecordBatch>>,
-    query: &Query,
-) -> Result<RecordBatch> {
+/// Run flat search over a stream of RecordBatch.
+pub async fn flat_search(stream: &RecordBatchStream, query: &Query) -> Result<RecordBatch> {
     const SCORE_COLUMN: &str = "score";
 
+    let schema_with_score = stream.schema().
     let batches = stream
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
@@ -97,6 +68,9 @@ pub async fn flat_search(
         .buffer_unordered(16)
         .try_collect::<Vec<_>>()
         .await?;
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(stream.schema().clone()));
+    }
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let scores = batch.column_by_name(SCORE_COLUMN).unwrap();
     let indices = sort_to_indices(scores, None, Some(query.k))?;
@@ -104,19 +78,4 @@ pub async fn flat_search(
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;
     Ok(as_struct_array(&selected_arr).into())
-}
-
-#[async_trait]
-impl VectorIndex for FlatIndex<'_> {
-    /// Search the flat index.
-    async fn search(&self, params: &Query) -> Result<RecordBatch> {
-        let stream = self
-            .dataset
-            .scan()
-            .project(&[&self.column])?
-            .with_row_id()
-            .try_into_stream()
-            .await?;
-        flat_search(stream, params).await
-    }
 }

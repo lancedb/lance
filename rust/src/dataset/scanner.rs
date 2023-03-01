@@ -410,6 +410,10 @@ impl RecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.exec_node.schema()
+    }
 }
 
 impl Stream for RecordBatchStream {
