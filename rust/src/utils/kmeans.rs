@@ -221,15 +221,21 @@ impl KMeanMembership {
                         let mut total = 0;
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
-                                sum =
-                                    add(&sum, as_primitive_array(data.slice(i * dimension, dimension).as_ref())).unwrap();
+                                sum = add(
+                                    &sum,
+                                    as_primitive_array(
+                                        data.slice(i * dimension, dimension).as_ref(),
+                                    ),
+                                )
+                                .unwrap();
                                 total += 1;
                             };
                         }
                         if total > 0 {
                             (divide_scalar(&sum, total as f32).unwrap(), total)
                         } else {
-                            let prev_centroids = previous_centroids.slice(cluster * dimension, dimension);
+                            let prev_centroids =
+                                previous_centroids.slice(cluster * dimension, dimension);
                             (as_primitive_array(prev_centroids.as_ref()).clone(), total)
                         }
                     })

@@ -29,8 +29,8 @@ use arrow_select::{concat::concat_batches, take::take};
 use futures::stream::{repeat_with, StreamExt, TryStreamExt};
 
 use super::Query;
-use crate::{arrow::*, dataset::ROW_ID};
 use crate::dataset::scanner::RecordBatchStream;
+use crate::{arrow::*, dataset::ROW_ID};
 use crate::{Error, Result};
 
 /// Run flat search over a stream of RecordBatch.
@@ -73,15 +73,10 @@ pub async fn flat_search(stream: RecordBatchStream, query: &Query) -> Result<Rec
         .try_collect::<Vec<_>>()
         .await?;
     if batches.is_empty() {
-        let score_schema = Schema::new(vec![ArrowField::new(
-            SCORE_COLUMN,
-            DataType::Float32,
-            false,
-        ), ArrowField::new(
-            ROW_ID,
-            DataType::UInt64,
-            false,
-        )]);
+        let score_schema = Schema::new(vec![
+            ArrowField::new(SCORE_COLUMN, DataType::Float32, false),
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+        ]);
         let schema_with_score =
             Schema::try_merge(vec![stream_schema.as_ref().clone(), score_schema])?;
         return Ok(RecordBatch::new_empty(Arc::new(schema_with_score)));
