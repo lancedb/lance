@@ -40,6 +40,7 @@ dist/
 .python-version
 
 .idea
+.bsp
 cmake-build-*
 .vscode
 .DS_Store
