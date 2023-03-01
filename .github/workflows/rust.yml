@@ -7,6 +7,7 @@ on:
     paths:
       - rust/**
       - protos/**
+      - .github/workflows/rust.yml
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -51,6 +52,46 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Install dependencies
         run: brew install protobuf
+      - name: Run tests
+        run: |
+          cargo build --all-features
+          cargo test
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup cache
+        uses: actions/cache@v3
+        continue-on-error: false
+        with:
+          path: |
+            $HOME/.cargo/bin/
+            $HOME/.cargo/registry/index/
+            $HOME/.cargo/registry/cache/
+            $HOME/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Rustup using win.rustup.rs
+        run: |
+          # Disable the download progress bar which can cause perf issues
+          $ProgressPreference = "SilentlyContinue"
+          Invoke-WebRequest https://win.rustup.rs/ -OutFile rustup-init.exe
+          .\rustup-init.exe -y --default-host=x86_64-pc-windows-gnu --default-toolchain=none
+          del rustup-init.exe
+          rustup target add 86_64-pc-windows-gnu
+        shell: powershell
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          version: '3.21.x'
+      - name: Add mingw64 to path for x86_64-gnu
+        run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
+        shell: bash
       - name: Run tests
         run: |
           cargo build --all-features
