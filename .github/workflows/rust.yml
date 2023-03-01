@@ -92,6 +92,8 @@ jobs:
         run: |
           Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile protoc.zip
           7z x protoc.zip
+          echo %CD%
+          echo %CD%\protoc-21.12-win64\bin
           echo %CD%\protoc-21.12-win64\bin >> $GITHUB_PATH
       - name: Run tests
         run: |
