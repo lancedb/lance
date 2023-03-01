@@ -326,7 +326,7 @@ impl KMeans {
     ) -> Self {
         if data.len() < dimension * k {
             // Don't have enough data to train k centroids.
-            return KMeans::new_partial_kmeans(data, dimension, k, params.metric_type);
+            return Self::new_partial_kmeans(data, dimension, k, params.metric_type);
         }
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());

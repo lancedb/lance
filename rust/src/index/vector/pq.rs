@@ -70,7 +70,7 @@ impl PQIndex {
         offset: usize,
         length: usize,
     ) -> Result<Self> {
-        let codebook_length = ProductQuantizer::codebook_length(pq.num_bits, pq.num_sub_vectors);
+        let codebook_length = ProductQuantizer::codebook_length(pq.num_bits, pq.dimension);
         let codebook =
             read_fixed_stride_array(reader, &DataType::Float32, offset, codebook_length, ..)
                 .await?;
@@ -92,7 +92,7 @@ impl PQIndex {
             dimension: pq.dimension,
             code: Arc::new(as_primitive_array(&pq_code).clone()),
             row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
-            pq: pq,
+            pq,
             metric_type,
         })
     }

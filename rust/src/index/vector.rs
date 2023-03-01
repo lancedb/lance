@@ -133,8 +133,8 @@ impl TryFrom<&str> for MetricType {
 
     fn try_from(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "l2" | "euclidean" => Ok(MetricType::L2),
-            "cosine" => Ok(MetricType::Cosine),
+            "l2" | "euclidean" => Ok(Self::L2),
+            "cosine" => Ok(Self::Cosine),
             _ => Err(Error::Index(format!("Metric type '{s}' is not supported"))),
         }
     }

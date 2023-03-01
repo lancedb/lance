@@ -17,23 +17,27 @@
 
 //! Flat Vector Index.
 
-use arrow::array::as_primitive_array;
-use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
+use std::sync::Arc;
+
+use arrow_array::{
+    cast::{as_primitive_array, as_struct_array},
+    ArrayRef, RecordBatch, StructArray,
+};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::stream::{repeat_with, StreamExt, TryStreamExt};
 
 use super::Query;
-use crate::arrow::*;
+use crate::{arrow::*, dataset::ROW_ID};
 use crate::dataset::scanner::RecordBatchStream;
 use crate::{Error, Result};
 
 /// Run flat search over a stream of RecordBatch.
-pub async fn flat_search(stream: &RecordBatchStream, query: &Query) -> Result<RecordBatch> {
+pub async fn flat_search(stream: RecordBatchStream, query: &Query) -> Result<RecordBatch> {
     const SCORE_COLUMN: &str = "score";
 
-    let schema_with_score = stream.schema().
+    let stream_schema = stream.schema();
     let batches = stream
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
@@ -69,7 +73,18 @@ pub async fn flat_search(stream: &RecordBatchStream, query: &Query) -> Result<Re
         .try_collect::<Vec<_>>()
         .await?;
     if batches.is_empty() {
-        return Ok(RecordBatch::new_empty(stream.schema().clone()));
+        let score_schema = Schema::new(vec![ArrowField::new(
+            SCORE_COLUMN,
+            DataType::Float32,
+            false,
+        ), ArrowField::new(
+            ROW_ID,
+            DataType::UInt64,
+            false,
+        )]);
+        let schema_with_score =
+            Schema::try_merge(vec![stream_schema.as_ref().clone(), score_schema])?;
+        return Ok(RecordBatch::new_empty(Arc::new(schema_with_score)));
     }
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let scores = batch.column_by_name(SCORE_COLUMN).unwrap();
