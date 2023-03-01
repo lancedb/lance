@@ -85,13 +85,13 @@ jobs:
           del rustup-init.exe
           rustup target add x86_64-pc-windows-gnu
         shell: powershell
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          version: '3.21.x'
       - name: Add mingw64 to path for x86_64-gnu
         run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
         shell: bash
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v1
+        with:
+          version: '21.x'
       - name: Run tests
         run: |
           cargo build --all-features
