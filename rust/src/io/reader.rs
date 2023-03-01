@@ -258,10 +258,15 @@ async fn read_batch(
     batch_id: i32,
     with_row_id: bool,
 ) -> Result<RecordBatch> {
+    println!("read_batch: {}", schema);
+    println!("batch_id {}, with_row_id {}", batch_id, with_row_id);
+
     let arrs = stream::iter(&schema.fields)
         .then(|f| async move { read_array(reader, f, batch_id, params).await })
         .try_collect::<Vec<_>>()
         .await?;
+
+    println!("Got here");
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
         let ids_in_batch: Vec<i32> = match params {
@@ -299,6 +304,7 @@ async fn read_array(
     batch_id: i32,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
+    println!("read_array: field {} batch_id {} params {:?}", field, batch_id, params);
     let data_type = field.data_type();
 
     use DataType::*;
@@ -465,6 +471,8 @@ async fn read_list_array(
     batch_id: i32,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
+    println!("reader.read_list_array {:?}", field);
+
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
     let position_arr = read_fixed_stride_array(
@@ -480,6 +488,7 @@ async fn read_list_array(
     // Compute offsets
     let offset_arr = subtract_scalar(positions, start_position)?;
     let value_arrs = read_array(reader, &field.children[0], batch_id, params).await?;
+    println!("read_list_array {:?} {:?}", start_position, offset_arr);
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
 }
 
@@ -512,15 +521,11 @@ async fn read_large_list_array(
 mod tests {
     use super::*;
 
-    use arrow_array::{
-        builder::{Int32Builder, ListBuilder, StringBuilder},
-        cast::{as_primitive_array, as_string_array, as_struct_array},
-        types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray,
-        UInt32Array, UInt8Array,
-    };
+    use arrow_array::{builder::{Int32Builder, ListBuilder, StringBuilder}, cast::{as_primitive_array, as_string_array, as_struct_array}, types::UInt8Type, DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray, UInt32Array, UInt8Array, RecordBatchReader};
+    use arrow_array::builder::Float32Builder;
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
+    use crate::dataset::{Dataset, WriteParams};
 
     use crate::io::FileWriter;
 
@@ -727,6 +732,87 @@ mod tests {
     async fn read_nullable_string_in_struct() {
         test_write_null_string_in_struct(true).await;
         test_write_null_string_in_struct(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_file() {
+        let uri = "/Users/eto/dev/katniss/katniss-test/data/tests/control_batch/1677541790291.lance";
+        let uri = "/Users/eto/dev/katniss/katniss-test/data/tests/control_batch/1677601111263.lance";
+        let uri = "/Users/eto/dev/katniss/katniss-test/data/tests/control_batch/1677601584808.lance";
+
+
+        // let object_store = Arc::new(ObjectStore::new(uri).await.unwrap());
+        // let base_path = Path::from("Users/eto/dev/katniss/katniss-test/data/tests/control_batch/1677541790291.lance/data/eed121e3-f515-481f-ac5e-8ebd05d01994.lance");
+        // let file_reader = FileReader::try_new(&object_store, &base_path).await.unwrap();
+
+        // let object_store = Arc::new(ObjectStore::new(uri).await?);
+        // let base_path = object_store.base_path().clone();
+        // let latest_manifest_path =  base_path.child("_latest.manifest");
+
+        let ds = Dataset::open(uri).await.unwrap();
+        let scanner = ds.scan();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+
+        let t = stream.next().await.unwrap().unwrap().num_rows();
+        print!("{}", t);
+        // file_reader.take(&[0], file_reader.schema()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_struct_of_empty_list_arrays() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
+                    true,
+                ),
+            ]),
+            true,
+        )]));
+
+        let store = Arc::new(ObjectStore::memory());
+        let path = Path::from("/empty_list");
+        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let mut li_builder = ListBuilder::new(Float32Builder::new());
+        let struct_array = Arc::new(StructArray::from(vec![
+            (
+                ArrowField::new(
+                    "li",
+                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
+                    true,
+                ),
+                Arc::new(li_builder.finish()) as ArrayRef,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
+
+        assert_eq!(batch, actual_batch);
+
+        // Let's try to scan it
+        // Made this public to help with testing
+        // let latest_manifest_path = crate::dataset::latest_manifest_path(&base_path);
+
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![batch]));
+        Dataset::write(&mut reader, "/tmp/empty_list", Some(WriteParams::default())).await.unwrap();
+        // let latest_manifest_path = store.base_path().clone().child("_latest.manifest");
+
+        // let ds = Dataset::checkout_manifest(store.clone(), path, &latest_manifest_path).await.unwrap();
+        let ds = Dataset::open("/tmp/empty_list").await.unwrap();
+        let scanner = ds.scan();
+        let mut stream = scanner.try_into_stream().await.unwrap();
+
+        let t = stream.next().await.unwrap().unwrap();
+        print!("{:?}", t);
     }
 
     #[tokio::test]

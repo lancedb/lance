@@ -137,6 +137,8 @@ pub(crate) async fn read_fixed_stride_array(
     length: usize,
     params: impl Into<ReadBatchParams>,
 ) -> Result<ArrayRef> {
+    println!("object_reader.read_fixed_stride_array data_type {} position {} length {}", data_type, position, length);
+
     if !data_type.is_fixed_stride() {
         return Err(Error::Schema(format!(
             "{data_type} is not a fixed stride type"
