@@ -88,10 +88,11 @@ jobs:
       - name: Add mingw64 to path for x86_64-gnu
         run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
         shell: bash
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          version: '21.x'
+      - name: Install Protoc v21.12
+        run: |
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile protoc.zip
+          7z x protoc.zip
+          echo %CD%\protoc-21.12-win64\bin >> $GITHUB_PATH
       - name: Run tests
         run: |
           cargo build --all-features
