@@ -7,6 +7,9 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 
 public class JNI {
+    static {
+        System.loadLibrary("jlance");
+    }
     public static void fillVector(long schemaAddress, long arrayAddress, FieldVector vec, BufferAllocator allocator) {
         try (ArrowArray arrow_array = ArrowArray.wrap(arrayAddress);
              ArrowSchema arrow_schema = ArrowSchema.wrap(schemaAddress)) {

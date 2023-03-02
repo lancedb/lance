@@ -10,6 +10,8 @@ libraryDependencies ++= Seq(
 // remove it after scala 2.13
   "com.github.bigwheel" %% "util-backports"     % "2.1"
 )
+run / fork := true
+run / javaOptions += "-Djava.library.path=../target/debug/"
 
 ThisBuild / assemblyMergeStrategy := {
   case PathList("javax", "servlet", xs @ _*)         => MergeStrategy.first
