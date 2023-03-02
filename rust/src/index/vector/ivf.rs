@@ -604,9 +604,14 @@ impl<'a> IvfPqIndexBuilder<'a> {
         assert!(pq.codebook.is_some());
 
         // Write codebook
-        writer
-            .write_plain_encoded_array(pq.codebook.unwrap().as_ref())
+        let pos = writer
+            .write_plain_encoded_array(pq.codebook.as_ref().unwrap().as_ref())
             .await?;
+        println!(
+            "Write codebook length: {} at offset={pos}",
+            pq.codebook.as_ref().map(|cb| cb.len()).unwrap_or_default()
+        );
+
         writer.write_plain_encoded_array(&pq_code).await?;
         writer.write_plain_encoded_array(row_id_col).await?;
         Ok(())

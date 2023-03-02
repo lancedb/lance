@@ -74,6 +74,7 @@ impl PQIndex {
         let codebook =
             read_fixed_stride_array(reader, &DataType::Float32, offset, codebook_length, ..)
                 .await?;
+        println!("Read codebook at offset={offset}, length={codebook_length}");
         let mut pq = pq.clone();
         pq.codebook = Some(Arc::new(as_primitive_array(codebook.as_ref()).clone()));
 
