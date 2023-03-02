@@ -89,12 +89,11 @@ jobs:
         run: echo "C:\msys64\mingw64\bin" >> $GITHUB_PATH
         shell: bash
       - name: Install Protoc v21.12
+        working-directory: C:\
         run: |
           Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile protoc.zip
           7z x protoc.zip
-          echo %cd%
-          echo %cd%\protoc-21.12-win64\bin
-          echo %cd%\protoc-21.12-win64\bin >> $GITHUB_PATH
+          echo "C:\protoc-21.12-win64\bin" >> $GITHUB_PATH
       - name: Run tests
         run: |
           cargo build --all-features
