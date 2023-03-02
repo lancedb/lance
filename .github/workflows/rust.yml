@@ -61,7 +61,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: ./rust
+        working-directory: rust
     steps:
       - uses: actions/checkout@v3
       - name: Setup cache
@@ -69,13 +69,13 @@ jobs:
         continue-on-error: false
         with:
           path: |
-            $HOME/.cargo/bin/
-            $HOME/.cargo/registry/index/
-            $HOME/.cargo/registry/cache/
-            $HOME/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            $HOME\.cargo\bin\
+            $HOME\.cargo\registry\index\
+            $HOME\.cargo\registry\cache\
+            $HOME\.cargo\git\db\
+            target\
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**\Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**\Cargo.lock') }}
       - name: Install Rustup using win.rustup.rs
         run: |
           # Disable the download progress bar which can cause perf issues
@@ -91,10 +91,15 @@ jobs:
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
-          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile protoc.zip
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
           7z x protoc.zip
-          echo "C:\protoc-21.12-win64\bin" >> $GITHUB_PATH
+        shell: powershell
       - name: Run tests
         run: |
+          $env:PATH = 'C:\protoc\bin;' + $env:PATH          
+          $env:GITHUB_PATH = 'C:\protoc\bin;' + $env:GITHUB_PATH      
+          protoc --version
           cargo build --all-features
           cargo test
