@@ -12,6 +12,8 @@ object Main extends App {
       intVector.set(2, 2)
       intVector.setValueCount(3)
       println("Vector created in memory: " + intVector)
+      val path = "/tmp/example.lance"
+      lance.Dataset.fromArrow(intVector).saveToPath(path)
     }
   }
 }
