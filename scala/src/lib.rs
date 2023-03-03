@@ -1,9 +1,10 @@
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use jni::JNIEnv;
 
 // These objects are what you should use as arguments to your native
 // function. They carry extra lifetime information to prevent them escaping
 // this context and getting used after being GC'd.
-use jni::objects::{JClass, JLongArray, JString};
+use jni::objects::{JClass, JLongArray, JString, JValue, JValueGen};
 
 // This is just a pointer. We'll be returning it from our function. We
 // can't return one of the objects with lifetime information because the
@@ -21,6 +22,19 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
         .get_string(&path)
         .expect("Couldn't get java string!")
         .into();
+    let schema = FFI_ArrowSchema::empty();
+    let array = FFI_ArrowArray::empty();
+
+    let schema = Box::new(schema);
+    let array = Box::new(array);
+
+    let schema_ptr = &*schema as *const FFI_ArrowSchema;
+    let array_ptr = &*array as *const FFI_ArrowArray;
+
+    let schema_jlong = schema_ptr as i64;
+    let array_jlong = schema_ptr as i64;
+
+    env.call_static_method(_class, "fillVector", "(I)V", &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
 
     println!("jenv {:?}", env);
     println!("class {:?}", _class);
