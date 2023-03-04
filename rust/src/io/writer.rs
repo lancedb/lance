@@ -184,7 +184,7 @@ impl<'a> FileWriter<'a> {
         Ok(())
     }
 
-    /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
+    /// Write fixed size array, including, primitives, fixed size binary, and fixed size list.
     async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());

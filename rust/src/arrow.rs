@@ -148,6 +148,7 @@ pub trait ListArrayExt {
     fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
 }
 
+// this is one big list of all recordsin the array
 impl ListArrayExt for ListArray {
     fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
         println!("ListArrayExt {:?} offsets {:?}", values, offsets);
@@ -161,6 +162,7 @@ impl ListArrayExt for ListArray {
         .add_child_data(values.into_data())
         .build()?;
 
+        println!("ListArrayExt going to call from");
         Ok(Self::from(data))
     }
 }

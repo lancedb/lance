@@ -325,14 +325,17 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     async fn get(&self, index: Range<usize>) -> Self::Output {
         println!("AsyncIndex.get  data_type {} index start {} end {}", self.data_type, index.start, index.end);
         if index.is_empty() {
+            println!("Index is empty!");
             return Ok(new_empty_array(self.data_type));
         }
         match self.data_type {
             DataType::FixedSizeList(items, list_size) => {
+                println!("PlainDecoder.get: FixedSizeList");
                 self.decode_fixed_size_list(items, *list_size, index.start, index.end)
                     .await
             }
             DataType::FixedSizeBinary(stride) => {
+                println!("PlainDecoder.get: FixedSizeBinary");
                 self.decode_fixed_size_binary(*stride, index.start, index.end)
                     .await
             }
