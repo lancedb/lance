@@ -509,18 +509,30 @@ async fn read_list_array(
     // let new_params = crate::io::ReadBatchParams::from(new_range);
 
     // lookup the ranges for this array in the offset table
+    let offset_of_original_params = match params {
+        ReadBatchParams::Range(range) => {
+            range.start
+        }
+        ReadBatchParams::RangeTo(range) => {
+            0 // correct?
+        }
+        ReadBatchParams::RangeFrom(range) => {
+            range.start
+        }
+        p => panic!("Not implement for index")
+    };
     let new_params = match params {
         ReadBatchParams::Range(range) => {
-            ReadBatchParams::from(offset_arr.value(range.start) as usize..offset_arr.value(range.end) as usize)
+            ReadBatchParams::from(offset_arr.value(range.start - offset_of_original_params) as usize..offset_arr.value(range.end - offset_of_original_params) as usize)
         }
         ReadBatchParams::RangeTo(RangeTo{end}) => {
-            ReadBatchParams::from(..offset_arr.value(*end) as usize)
+            ReadBatchParams::from(..offset_arr.value(*end - offset_of_original_params) as usize)
         }
         ReadBatchParams::RangeFrom(RangeFrom{start}) => {
-            ReadBatchParams::from(offset_arr.value(*start) as usize..)
+            ReadBatchParams::from(offset_arr.value(*start - offset_of_original_params) as usize..)
         }
         ReadBatchParams::RangeFull => {
-            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize)
+            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1 - offset_of_original_params) as usize)
         }
         ReadBatchParams::Indices(_) => {
             return Err(Error::IO(
@@ -528,6 +540,8 @@ async fn read_list_array(
             ))
         }
     };
+    // let new_params= ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize);
+
     //
     // let new_params = match params {
     //     ReadBatchParams::Range(r) => {
