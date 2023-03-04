@@ -4,7 +4,7 @@ use jni::JNIEnv;
 // These objects are what you should use as arguments to your native
 // function. They carry extra lifetime information to prevent them escaping
 // this context and getting used after being GC'd.
-use jni::objects::{JClass, JLongArray, JString, JValue, JValueGen};
+use jni::objects::{JClass, JLongArray, JObject, JString, JValue, JValueGen};
 
 // This is just a pointer. We'll be returning it from our function. We
 // can't return one of the objects with lifetime information because the
@@ -14,10 +14,10 @@ use jni::sys::{jclass, jlong, jlongArray, jobjectArray, jstring};
 #[no_mangle]
 pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
+    class: JClass<'local>,
     path: JString<'local>,
-    vec: jclass,
-    allocator: jclass) {
+    vec: JObject,
+    allocator: JObject) {
     let path: String = env
         .get_string(&path)
         .expect("Couldn't get java string!")
@@ -34,11 +34,11 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     let schema_jlong = schema_ptr as i64;
     let array_jlong = schema_ptr as i64;
 
-    env.call_static_method(_class, "fillVector", "(I)V", &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
-
     println!("jenv {:?}", env);
-    println!("class {:?}", _class);
+    println!("class {:?}", &class);
     println!("path {:?}", path);
     println!("vec {:?}", vec);
-    println!("allocator {:?}", allocator)
+    println!("allocator {:?}", allocator);
+
+    env.call_static_method(class, "fillVector", "(I)V", &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
 }
