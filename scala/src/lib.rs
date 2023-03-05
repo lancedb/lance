@@ -1,5 +1,5 @@
 use std::mem::ManuallyDrop;
-use arrow::array::{ArrayData, Int32Array};
+use arrow::array::{ArrayData, Int32Array, make_array};
 use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
 use jni::JNIEnv;
 
@@ -54,7 +54,7 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
             let array = unsafe {
                 ArrowArray::new(std::ptr::read(array_ptr), std::ptr::read(schema_ptr))
             };
-            let array = Int32Array::from(ArrayData::try_from(array).unwrap());
+            let array = make_array(ArrayData::try_from(array).unwrap());
             println!("array: {:?}", array)
         }
         Err(e) => {
