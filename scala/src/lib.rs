@@ -39,7 +39,16 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     println!("path {:?}", path);
     println!("vec {:?}", vec);
     println!("allocator {:?}", allocator);
-
-    env.call_static_method(class, "fillVector", "(JJLorg.apache.arrow.vector.FieldVector;Lorg.apache.arrow.memory.BufferAllocator;)V",
-                           &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]).unwrap();
+    //javap -s
+    let result = env.call_static_method(class, "fillVector",
+                                        "(JJLorg/apache/arrow/vector/FieldVector;Lorg/apache/arrow/memory/BufferAllocator;)V",
+                                        &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
+    match result {
+        Ok(_) => {
+            println!("OK!")
+        }
+        Err(e) => {
+            println!("error: {:?}", e)
+        }
+    }
 }
