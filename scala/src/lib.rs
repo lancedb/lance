@@ -1,4 +1,5 @@
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::array::{ArrayData, Int32Array};
+use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
 use jni::JNIEnv;
 
 // These objects are what you should use as arguments to your native
@@ -45,7 +46,12 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
                                         &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
     match result {
         Ok(_) => {
-            println!("OK!")
+            println!("OK!");
+            let array = unsafe {
+                ArrowArray::new(std::ptr::read(array_ptr), std::ptr::read(schema_ptr))
+            };
+            let array = Int32Array::from(ArrayData::try_from(array).unwrap());
+            println!("array: {:?}", array)
         }
         Err(e) => {
             println!("error: {:?}", e)
