@@ -32,7 +32,7 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     let array_ptr = &*array as *const FFI_ArrowArray;
 
     let schema_jlong = schema_ptr as i64;
-    let array_jlong = schema_ptr as i64;
+    let array_jlong = array_ptr as i64;
 
     println!("jenv {:?}", env);
     println!("class {:?}", &class);
@@ -40,5 +40,6 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     println!("vec {:?}", vec);
     println!("allocator {:?}", allocator);
 
-    env.call_static_method(class, "fillVector", "(I)V", &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]);
+    env.call_static_method(class, "fillVector", "(JJLorg.apache.arrow.vector.FieldVector;Lorg.apache.arrow.memory.BufferAllocator;)V",
+                           &[schema_jlong.into(), array_jlong.into(), JValue::from(&vec), JValue::from(&allocator)]).unwrap();
 }
