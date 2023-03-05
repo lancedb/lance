@@ -1,10 +1,12 @@
 package lance;
 
+import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
+import org.apache.arrow.vector.ipc.ArrowReader;
 
 public class JNI {
     static {
@@ -22,5 +24,11 @@ public class JNI {
         }
     }
 
+    public static void fillStream(long streamAddress, ArrowReader reader) {
+        Data.exportArrayStream(null, reader, ArrowArrayStream.wrap(streamAddress));
+    }
+
     native public static void saveToLance(String path, FieldVector vec, BufferAllocator allocator);
+
+    native public static void saveStreamToLance(String path, ArrowReader reader, BufferAllocator allocator);
 }
