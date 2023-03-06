@@ -64,7 +64,6 @@ impl SingularValueDecomposition for FixedSizeListArray {
             use openblas_src;
         }
 
-
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesvd;
@@ -146,9 +145,9 @@ impl SingularValueDecomposition for FixedSizeListArray {
         }
 
         let u_values = Float32Array::from_iter_values(transpose(&u, m as usize));
-        let u = FixedSizeListArray::try_new(&u_values, m)?;
+        let u = Self::try_new(&u_values, m)?;
         let vt_values = Float32Array::from_iter_values(transpose(&vt, n as usize));
-        let vt = FixedSizeListArray::try_new(&vt_values, n)?;
+        let vt = Self::try_new(&vt_values, n)?;
         let sigma = Float32Array::from_iter_values(sigma);
         Ok((u, sigma, vt))
     }
