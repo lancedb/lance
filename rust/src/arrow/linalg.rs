@@ -16,13 +16,24 @@
 //!
 //!
 
-use std::cmp::min;
-
-use arrow::array::{as_primitive_array, Float32Builder};
+use arrow::array::as_primitive_array;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 
 use crate::{arrow::FixedSizeListArrayExt, Error, Result};
+
+/// Transpose a matrix.
+fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
+    let n = input.len() / dimension;
+    let mut mat = vec![0_f32; input.len()];
+    for row in 0..dimension {
+        for col in 0..n {
+            mat[row * n + col] = input[col * dimension + row];
+        }
+    }
+
+    mat
+}
 
 /// Single Value Decomposition.
 ///
@@ -45,7 +56,11 @@ impl SingularValueDecomposition for FixedSizeListArray {
 
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
         #[cfg(target_os = "macos")]
+        #[allow(unused_imports)]
         use accelerate_src;
+
+        /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
+        /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesvd;
 
         if !matches!(self.value_type(), DataType::Float32) {
@@ -64,17 +79,44 @@ impl SingularValueDecomposition for FixedSizeListArray {
         //
         // TODO: Lapacke requires a mutable reference of `A`.
         // How can we get mutable reference without copying data?
-        let mut a = flatten_values.values().to_vec();
+        let mut a = transpose(flatten_values.values(), n as usize);
         // f32 array builder for matrix U.
         let mut u = vec![0.0; (m * m) as usize];
         // f32 array builder for matrix V_T
-        let mut vt = vec![0.0; (n*n) as usize];
-        let mut sigma = vec![0.0;n as usize];
+        let mut vt = vec![0.0; (n * n) as usize];
+        let mut sigma = vec![0.0; n as usize];
 
         let mut work = vec![0_f32; 1];
+        // Length of the workspace
         let lwork: i32 = -1;
+        // SGESVG return value.
         let mut info: i32 = -1;
 
+        // Query the optimal workspace size, will be stored in `work[0]`.
+        unsafe {
+            sgesvd(
+                b'A',
+                b'A',
+                m,
+                n,
+                a.as_mut_slice(),
+                m,
+                sigma.as_mut_slice(),
+                u.as_mut_slice(),
+                m,
+                vt.as_mut_slice(),
+                m,
+                work.as_mut_slice(),
+                lwork,
+                &mut info,
+            );
+        }
+        if info > 0 {
+            println!("Failed to compute sgesvd");
+        }
+
+        let lwork = work[0] as i32;
+        let mut work = vec![0_f32; lwork as usize];
         unsafe {
             sgesvd(
                 b'A',
@@ -93,14 +135,13 @@ impl SingularValueDecomposition for FixedSizeListArray {
                 &mut info,
             );
         }
-        println!("Info value: {info} work={:?}", work);
-        if info > 0 {
-            println!("Failed to compute sgesvd");
+        if info != 0 {
+            return Err(Error::Arrow("Failed to compute SVD".to_string()));
         }
 
-        let u_values = Float32Array::from_iter_values(u);
+        let u_values = Float32Array::from_iter_values(transpose(&u, m as usize));
         let u = FixedSizeListArray::try_new(&u_values, m)?;
-        let vt_values = Float32Array::from_iter_values(vt);
+        let vt_values = Float32Array::from_iter_values(transpose(&vt, n as usize));
         let vt = FixedSizeListArray::try_new(&vt_values, n)?;
         let sigma = Float32Array::from_iter_values(sigma);
         Ok((u, sigma, vt))
@@ -109,6 +150,9 @@ impl SingularValueDecomposition for FixedSizeListArray {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_relative_eq;
+    use arrow::datatypes::Float32Type;
+
     use super::*;
 
     #[test]
@@ -121,7 +165,7 @@ mod tests {
         let a = FixedSizeListArray::try_new(&values, 5).unwrap();
 
         let (u, sigma, vt) = a.svd().unwrap();
-        let expected_u = Float32Array::from_iter_values([
+        let expected_u = vec![
             -0.59114238,
             0.26316781,
             0.35543017,
@@ -158,7 +202,52 @@ mod tests {
             0.37907767,
             -0.6525516,
             0.10910681,
-        ]);
-        assert_eq!(as_primitive_array(u.values().as_ref()), &expected_u);
+        ];
+        as_primitive_array::<Float32Type>(u.values().as_ref())
+            .values()
+            .iter()
+            .zip(expected_u)
+            .for_each(|(actual, expect)| {
+                assert_relative_eq!(*actual, expect, epsilon = 0.0001);
+            });
+
+        assert_relative_eq!(
+            sigma.values(),
+            vec![27.46873242, 22.64318501, 8.55838823, 5.9857232, 2.01489966].as_slice(),
+            epsilon = 0.0001,
+        );
+
+        let expected_vt = vec![
+            -0.25138279,
+            -0.39684555,
+            -0.69215101,
+            -0.36617044,
+            -0.40763524,
+            0.81483669,
+            0.3586615,
+            -0.24888801,
+            -0.36859354,
+            -0.09796257,
+            -0.26061851,
+            0.70076821,
+            -0.22081145,
+            0.38593848,
+            -0.49325014,
+            0.39672378,
+            -0.45071124,
+            0.25132115,
+            0.4342486,
+            -0.62268407,
+            -0.21802776,
+            0.14020995,
+            0.58911945,
+            -0.62652825,
+            -0.43955169,
+        ];
+        assert_relative_eq!(
+            as_primitive_array::<Float32Type>(vt.values().as_ref()).values(),
+            expected_vt.as_slice(),
+            epsilon = 0.0001,
+        )
     }
 }
