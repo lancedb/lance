@@ -14,15 +14,14 @@
 
 //! Lance Data File Reader
 
-use std::any::Any;
 // Standard
-use std::ops::{Range, RangeFrom, RangeTo};
+use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    Array, ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
+    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -501,7 +500,7 @@ async fn read_list_array(
         ReadBatchParams::RangeTo(RangeTo{end}) => {
             ReadBatchParams::from(..offset_arr.value(*end) as usize)
         }
-        ReadBatchParams::RangeFrom(RangeFrom{start}) => {
+        ReadBatchParams::RangeFrom(_) => {
             ReadBatchParams::from(offset_arr.value(0) as usize..)
         }
         ReadBatchParams::RangeFull => {
