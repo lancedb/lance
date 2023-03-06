@@ -15,6 +15,14 @@ extern "C" {
 JNIEXPORT void JNICALL Java_lance_JNI_saveToLance
   (JNIEnv *, jclass, jstring, jobject, jobject);
 
+/*
+ * Class:     lance_JNI
+ * Method:    saveStreamToLance
+ * Signature: (Ljava/lang/String;Lorg/apache/arrow/vector/ipc/ArrowReader;Lorg/apache/arrow/memory/BufferAllocator;)V
+ */
+JNIEXPORT void JNICALL Java_lance_JNI_saveStreamToLance
+  (JNIEnv *, jclass, jstring, jobject, jobject);
+
 #ifdef __cplusplus
 }
 #endif
