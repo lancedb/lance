@@ -61,4 +61,5 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
             println!("error: {:?}", e)
         }
     }
+    todo!("we don't have ways to array to lance ")
 }
