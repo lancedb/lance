@@ -24,47 +24,6 @@ use arrow_schema::DataType;
 
 use crate::{arrow::FixedSizeListArrayExt, Error, Result};
 
-/// Wrap an Apache arrow to present as 2D matrix.
-pub struct MatrixView<'a> {
-    data: &'a Float32Array,
-    dimension: usize,
-}
-
-impl<'a> MatrixView<'a> {
-    pub fn new(data: &'a Float32Array, dimension: usize) -> Self {
-        Self { data, dimension }
-    }
-
-    pub fn num_rows(&self) -> usize {
-        self.data.len() / self.dimension
-    }
-
-    pub fn num_columns(&self) -> usize {
-        self.dimension
-    }
-
-    pub fn data(&self) -> &[f32] {
-        self.data.values()
-    }
-
-    pub fn data_mut(&mut self) -> &mut [f32] {
-        &mut self.data.values()
-    }
-}
-
-impl<'a> TryFrom<&FixedSizeListArray> for MatrixView<'a> {
-    type Error = Error;
-
-    fn try_from(arr: &FixedSizeListArray) -> Result<Self> {
-        if !matches!(arr.data_type(), DataType::Float32) {
-            return Err(Error::Arrow("Only support f32".to_string()));
-        }
-        let values = arr.values();
-        let f32_array = as_primitive_array(values.as_ref());
-        Ok(MatrixView::new(f32_array, arr.value_length() as usize))
-    }
-}
-
 /// Single Value Decomposition.
 ///
 /// https://en.wikipedia.org/wiki/Singular_value_decomposition
@@ -85,18 +44,24 @@ impl SingularValueDecomposition for FixedSizeListArray {
     type Sigma = Float32Array;
 
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
+        use lapacke::{sgesvd, Layout};
+
         if !matches!(self.data_type(), DataType::Float32) {
             return Err(Error::Arrow(format!(
                 "SVD only supports f32 type, got {}",
                 self.data_type()
             )));
         }
-        use lapacke::{sgesvd, Layout};
 
-        // A = U * Sigma * Vt
-        let mut a: MatrixView = self.try_into()?;
-        let m = a.num_rows() as i32;
-        let n = a.num_columns() as i32;
+        let m = self.len() as i32;
+        let n = self.value_length();
+        let values = self.values();
+        let flatten_values: &Float32Array = as_primitive_array(values.as_ref());
+        // Solving: A = U * Sigma * Vt
+        //
+        // TODO: Lapacke requires a mutable reference of `A`.
+        // How can we get mutable reference without copying data?
+        let mut a = flatten_values.values().to_vec();
         // f32 array builder for matrix U.
         let mut u_builder = Float32Builder::with_capacity((m * m) as usize);
         // f32 array builder for matrix V_T
@@ -111,7 +76,7 @@ impl SingularValueDecomposition for FixedSizeListArray {
                 b'A',
                 m,
                 n,
-                a.data_mut(),
+                a.as_mut_slice(),
                 m as i32,
                 sigma_builder.values_slice_mut(),
                 u_builder.values_slice_mut(),
@@ -123,9 +88,9 @@ impl SingularValueDecomposition for FixedSizeListArray {
         }
 
         let u_values = u_builder.finish();
-        let u = FixedSizeListArray::try_new(&u_values, a.num_rows() as i32)?;
+        let u = FixedSizeListArray::try_new(&u_values, m)?;
         let vt_values = vt_builder.finish();
-        let vt = FixedSizeListArray::try_new(&vt_values, a.num_columns() as i32)?;
+        let vt = FixedSizeListArray::try_new(&vt_values, n)?;
         let sigma = sigma_builder.finish();
         Ok((u, sigma, vt))
     }
