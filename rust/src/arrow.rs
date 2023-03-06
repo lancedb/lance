@@ -27,6 +27,7 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Schema};
 
 mod kernels;
+mod linalg;
 mod record_batch;
 use crate::error::{Error, Result};
 pub use kernels::*;
