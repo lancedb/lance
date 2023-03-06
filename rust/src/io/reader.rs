@@ -539,8 +539,6 @@ async fn read_large_list_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::ipc::NullBuilder;
-    use std::time::SystemTime;
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::Float32Builder;
@@ -548,7 +546,7 @@ mod tests {
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader,
+        DictionaryArray, Float32Array, Int64Array, NullArray,
         StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -763,6 +761,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_struct_of_list_arrays() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+
+        let (arrow_schema, struct_array) = make_struct_of_list_array(10);
+        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(batch, actual_batch);
+    }
+
+    #[tokio::test]
+    async fn test_scan_struct_of_list_arrays() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/null_strings");
+
+        let (arrow_schema, struct_array) = make_struct_of_list_array(100);
+        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let params = ReadBatchParams::Range(10..20);
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
+        assert_eq!(10, slice_of_batch.num_rows());
+    }
+
+    fn make_struct_of_list_array(rows: i32) -> (Arc<arrow_schema::Schema>, Arc<StructArray>) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![
@@ -780,13 +814,9 @@ mod tests {
             true,
         )]));
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/null_strings");
-        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-
         let mut li_builder = ListBuilder::new(Int32Builder::new());
         let mut ls_builder = ListBuilder::new(StringBuilder::new());
-        for i in 0..100 {
+        for i in 0..rows {
             for j in 0..10 {
                 li_builder.values().append_value(i * 10 + j);
                 ls_builder
@@ -814,19 +844,7 @@ mod tests {
                 Arc::new(ls_builder.finish()) as ArrayRef,
             ),
         ]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
-
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
-        file_writer.finish().await.unwrap();
-
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
-        assert_eq!(batch, actual_batch);
-
-        let params = ReadBatchParams::Range(10..20);
-        let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
-        assert_eq!(10, slice_of_batch.num_rows());
+        (arrow_schema, struct_array)
     }
 
     #[tokio::test]
