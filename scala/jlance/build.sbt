@@ -8,6 +8,7 @@ libraryDependencies ++= Seq(
   "org.apache.arrow"     % "arrow-c-data"       % arrowVersion,
   "org.apache.arrow"     % "arrow-memory-netty" % arrowVersion,
   "org.apache.arrow"     % "arrow-dataset" % arrowVersion,
+  "ch.qos.logback" % "logback-classic" % "1.2.11",
 // remove it after scala 2.13
   "com.github.bigwheel" %% "util-backports"     % "2.1"
 )
