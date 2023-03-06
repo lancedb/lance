@@ -550,13 +550,7 @@ mod tests {
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::Float32Builder;
-    use arrow_array::{
-        builder::{Int32Builder, ListBuilder, StringBuilder},
-        cast::{as_primitive_array, as_string_array, as_struct_array},
-        types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader, StringArray,
-        StructArray, UInt32Array, UInt8Array,
-    };
+    use arrow_array::{builder::{Int32Builder, ListBuilder, StringBuilder}, cast::{as_primitive_array, as_string_array, as_struct_array}, types::UInt8Type, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array, Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -830,8 +824,9 @@ mod tests {
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(batch, actual_batch);
 
-        let params = ReadBatchParams::Range(10..20) ;
-        let actual_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
+        let params = ReadBatchParams::Range(10..20);
+        let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
+        assert_eq!(10, slice_of_batch.num_rows());
     }
 
     #[tokio::test]
