@@ -259,18 +259,10 @@ async fn read_batch(
     batch_id: i32,
     with_row_id: bool,
 ) -> Result<RecordBatch> {
-    println!("read_batch: {}", schema);
-    println!(
-        "read_batch: batch_id {}, with_row_id {} params {:?}",
-        batch_id, with_row_id, params
-    );
-
     let arrs = stream::iter(&schema.fields)
         .then(|f| async move { read_array(reader, f, batch_id, params).await })
         .try_collect::<Vec<_>>()
         .await?;
-
-    println!("Got here");
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
     if with_row_id {
         let ids_in_batch: Vec<i32> = match params {
@@ -308,10 +300,6 @@ async fn read_array(
     batch_id: i32,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    println!(
-        "read_array: field {} batch_id {} params {:?}",
-        field, batch_id, params
-    );
     let data_type = field.data_type();
 
     use DataType::*;
@@ -356,7 +344,6 @@ async fn _read_fixed_stride_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    println!("_read_fixed_stride_array {:?} - {}", page_info, field);
 
     read_fixed_stride_array(
         reader.object_reader.as_ref(),
@@ -467,17 +454,9 @@ async fn read_struct_array(
     let mut sub_arrays = vec![];
     for child in field.children.as_slice() {
         let arr = read_array(reader, child, batch_id, params).await?;
-        println!(
-            "reader.read_struct_array {}.{}({:?}) - {}",
-            field.name,
-            child.name,
-            child.data_type(),
-            arr.len()
-        );
         sub_arrays.push((child.into(), arr));
     }
 
-    println!("reader.read_struct_array {}", sub_arrays.len());
     Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
@@ -487,10 +466,7 @@ async fn read_list_array(
     batch_id: i32,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
-    println!("reader.read_list_array {:?}", field);
-
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    println!("reader.read_list_array: {:?} {}", page_info, field.name);
 
     // We need to offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
@@ -511,15 +487,12 @@ async fn read_list_array(
         positions_params,
     )
     .await?;
-    println!("reader.read_list_array: positions {:?}", position_arr);
 
     let positions = as_primitive_array(position_arr.as_ref());
     let start_position: i32 = positions.value(0);
     // Compute offsets
     let offset_arr = subtract_scalar(positions, start_position)?;
 
-    println!("reader.read_list_array {:?} {:?}", start_position, offset_arr);
-    println!("reader.read_list_array params {:?}", params);
     // Recompute params so they align with the offset array
     let value_params = match params {
         ReadBatchParams::Range(range) => {
@@ -540,7 +513,6 @@ async fn read_list_array(
             ))
         }
     };
-    println!("reader.read_list_array new_params {:?}", value_params);
 
     let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
@@ -794,158 +766,6 @@ mod tests {
     async fn read_nullable_string_in_struct() {
         test_write_null_string_in_struct(true).await;
         test_write_null_string_in_struct(false).await;
-    }
-
-    #[tokio::test]
-    async fn test_read_file() {
-        // an struct with a list inside
-        /*
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(vec![
-                ArrowField::new(
-                    "lf",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
-                    true,
-                ),
-                ArrowField::new(
-                    "lf_null",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
-                    true,
-                ),
-            ]),
-            true,
-        )]));
-
-        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-
-        let mut lf_builder = ListBuilder::new(Float32Builder::new());
-        for i in 0..10 {
-            lf_builder.values().append_value(i as f32);
-        }
-        lf_builder.append(true);
-        let struct_array = Arc::new(StructArray::from(vec![
-            (
-                ArrowField::new(
-                    "lf",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
-                    true,
-                ),
-                Arc::new(lf_builder.finish()) as ArrayRef,
-            ),
-            (
-                ArrowField::new(
-                    "lf_null",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Float32, true))),
-                    true,
-                ),
-                Arc::new(Float32Builder::new().finish()) as ArrayRef,
-            )
-        ]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
-
-        let uri= "/tmp/offsets.lance";
-        let mut reader : Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![batch]));
-        Dataset::write(&mut reader, uri, None).await.unwrap();
-         */
-
-        // let uri = "/Users/eto/dev/katniss/katniss-bench/data/tests/control/1677794414881.lance";
-        let uri = "/Users/eto/dev/katniss/katniss-bench/data/tests/control/1677815685265.lance";
-
-        let ds = Dataset::open(uri).await.unwrap();
-        let scanner = ds.scan();
-        let mut stream = scanner.try_into_stream().await.unwrap();
-
-        let t = stream.next().await.unwrap().unwrap().num_rows();
-        print!("{}", t);
-        // file_reader.take(&[0], file_reader.schema()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_read_struct_of_empty_list_arrays() {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(vec![
-                ArrowField::new(
-                    "li",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
-                    true,
-                ),
-                ArrowField::new(
-                    "ls",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
-                    true,
-                ),
-            ]),
-            true,
-        )]));
-
-        let store = Arc::new(ObjectStore::memory());
-        let path = Path::from("/empty_list");
-        let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-
-        let mut li_builder = ListBuilder::new(Int32Builder::new());
-        let mut ls_builder = ListBuilder::new(StringBuilder::new());
-        for i in 0..1 {
-            for j in 0..10 {
-                // li_builder.values().append_value(i * 10 + j);
-                li_builder.values().append_null();
-                ls_builder
-                    .values()
-                    .append_value(format!("str-{}", i * 10 + j));
-            }
-            li_builder.append(true);
-            ls_builder.append(true);
-        }
-        let struct_array = Arc::new(StructArray::from(vec![
-            (
-                ArrowField::new(
-                    "li",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
-                    true,
-                ),
-                Arc::new(li_builder.finish()) as ArrayRef,
-            ),
-            (
-                ArrowField::new(
-                    "ls",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
-                    true,
-                ),
-                Arc::new(ls_builder.finish()) as ArrayRef,
-            ),
-        ]));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
-
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
-        file_writer.finish().await.unwrap();
-
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
-
-        assert_eq!(batch, actual_batch);
-
-        // Let's try to scan it
-        // Made this public to help with testing
-        // let latest_manifest_path = crate::dataset::latest_manifest_path(&base_path);
-
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![batch]));
-        Dataset::write(&mut reader, "/tmp/empty_list", Some(WriteParams::default()))
-            .await
-            .unwrap();
-        // let latest_manifest_path = store.base_path().clone().child("_latest.manifest");
-
-        // let ds = Dataset::checkout_manifest(store.clone(), path, &latest_manifest_path).await.unwrap();
-        let ds = Dataset::open("/tmp/empty_list").await.unwrap();
-        let scanner = ds.scan();
-        let mut stream = scanner.try_into_stream().await.unwrap();
-
-        println!("Printing elements");
-        while let Some(batch) = stream.next().await {
-            arrow::util::pretty::print_batches(&*vec![batch.unwrap()]);
-            // println!("{:?}", arrow::util::pretty::pretty_format_batches(batch.unwrap()));
-        }
     }
 
     #[tokio::test]
