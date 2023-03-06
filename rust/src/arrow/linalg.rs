@@ -55,9 +55,15 @@ impl SingularValueDecomposition for FixedSizeListArray {
     type Sigma = Float32Array;
 
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
-        #[cfg(target_os = "macos")]
         #[allow(unused_imports)]
-        use accelerate_src;
+        {
+            #[cfg(target_os = "macos")]
+            use accelerate_src;
+
+            #[cfg(target_os = "linux")]
+            use openblas_src;
+        }
+
 
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
