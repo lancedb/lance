@@ -477,8 +477,8 @@ async fn read_list_array(
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
     println!("reader.read_list_array: {:?} {}", page_info, field.name);
 
-    // recompute params in order to include the upper bound of the range
-    let fake_params = match params {
+    // We need to offset the position array by 1 in order to include the upper bound of the last element
+    let positions_params = match params {
         ReadBatchParams::Range(range) => {
             ReadBatchParams::from(range.start..(range.end + 1))
         }
@@ -493,7 +493,7 @@ async fn read_list_array(
         &DataType::Int32,
         page_info.position,
         page_info.length,
-        fake_params,
+        positions_params,
     )
     .await?;
     println!("reader.read_list_array: positions {:?}", position_arr);
@@ -505,54 +505,29 @@ async fn read_list_array(
 
     println!("reader.read_list_array {:?} {:?}", start_position, offset_arr);
     println!("reader.read_list_array params {:?}", params);
-    // let new_range = start_position as usize..offset_arr.value(0) as usize;
-    // let new_params = crate::io::ReadBatchParams::from(new_range);
-
-    // lookup the ranges for this array in the offset table
-    let offset_of_original_params = match params {
+    // Recompute params so they align with the offset array
+    let value_params = match params {
         ReadBatchParams::Range(range) => {
-            range.start
-        }
-        ReadBatchParams::RangeTo(range) => {
-            0 // correct?
-        }
-        ReadBatchParams::RangeFrom(range) => {
-            range.start
-        }
-        p => panic!("Not implement for index")
-    };
-    let new_params = match params {
-        ReadBatchParams::Range(range) => {
-            ReadBatchParams::from(offset_arr.value(range.start - offset_of_original_params) as usize..offset_arr.value(range.end - offset_of_original_params) as usize)
+            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(range.end - range.start) as usize)
         }
         ReadBatchParams::RangeTo(RangeTo{end}) => {
-            ReadBatchParams::from(..offset_arr.value(*end - offset_of_original_params) as usize)
+            ReadBatchParams::from(..offset_arr.value(*end) as usize)
         }
         ReadBatchParams::RangeFrom(RangeFrom{start}) => {
-            ReadBatchParams::from(offset_arr.value(*start - offset_of_original_params) as usize..)
+            ReadBatchParams::from(offset_arr.value(0) as usize..)
         }
         ReadBatchParams::RangeFull => {
-            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1 - offset_of_original_params) as usize)
+            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize)
         }
         ReadBatchParams::Indices(_) => {
             return Err(Error::IO(
-                "Index lookup not supported for lists".to_string(),
+                "index lookup is not supported for lists".to_string(),
             ))
         }
     };
-    // let new_params= ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize);
+    println!("reader.read_list_array new_params {:?}", value_params);
 
-    //
-    // let new_params = match params {
-    //     ReadBatchParams::Range(r) => {
-    //         ReadBatchParams::from(offset_arr.value(r.start) as usize..offset_arr.value(r.end) as usize)
-    //     }
-    //     p => panic!("nope")
-    // };
-    // HERE - use offset_arr to recompute params before sending to read_array
-    println!("reader.read_list_array new_params {:?}", new_params);
-
-    let value_arrs = read_array(reader, &field.children[0], batch_id, &new_params).await?;
+    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
 }
 
