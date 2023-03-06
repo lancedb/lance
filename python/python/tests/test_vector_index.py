@@ -46,6 +46,7 @@ def create_table(nvec=10000, ndim=768):
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
+        .append_column("id", pa.array(range(nvec)))
     )
     return tbl
 
@@ -116,3 +117,30 @@ def test_flat(dataset):
 )
 def test_ann(indexed_dataset):
     print(run(indexed_dataset))
+
+
+@pytest.mark.skipif(
+    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    reason="no neon on GHA",
+)
+def test_use_index(dataset, tmp_path):
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+    )
+    q = np.random.randn(768)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+        },
+    )["id"].to_numpy()
+
+    actual = ann_ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
+    )["id"].to_numpy()
+
+    assert np.all(expected == actual)

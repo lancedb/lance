@@ -62,11 +62,15 @@ impl<'a> BinaryEncoder<'a> {
         let value_offset = self.writer.tell();
         let offsets = arr.value_offsets();
 
-        self.writer
-            .write_all(
-                &arr.value_data()[offsets[0].as_usize()..offsets[offsets.len() - 1].as_usize()],
+        let start = offsets[0].as_usize();
+        let end = offsets[offsets.len() - 1].as_usize();
+        let b = unsafe {
+            std::slice::from_raw_parts(
+                arr.data().buffers()[1].as_ptr().offset(start as isize),
+                end - start,
             )
-            .await?;
+        };
+        self.writer.write_all(b).await?;
         let offset = self.writer.tell();
 
         let start_offset = offsets[0];

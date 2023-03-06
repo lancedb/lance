@@ -9,6 +9,10 @@ on:
       - python/**
       - rust/**
       - protos/**
+      - .github/workflows/python.yml
+      - .github/workflows/build_linux_wheel/**
+      - .github/workflows/build_mac_wheel/**
+      - .github/workflows/run_tests/**
 jobs:
   linux:
     timeout-minutes: 30

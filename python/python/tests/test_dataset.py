@@ -12,13 +12,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+import os
 import time
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 import lance
 import pandas as pd
 import pyarrow as pa
+import pytest
 
 
 def test_dataset_overwrite(tmp_path: Path):
@@ -103,12 +106,59 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
-#
-# def test_filter(tmp_path: Path):
-#     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-#     base_dir = tmp_path / "test"
-#     lance.write_dataset(table, base_dir)
-#
-#     dataset = lance.dataset(base_dir)
-#     actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
-#     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
+def test_filter(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
+    assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
+
+
+def test_relative_paths(tmp_path: Path):
+    # relative paths get coerced to the full absolute path
+    current_dir = os.getcwd()
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    rel_uri = "test.lance"
+    try:
+        os.chdir(tmp_path)
+        lance.write_dataset(table, rel_uri)
+
+        # relative path works in the current dir
+        ds = lance.dataset(rel_uri)
+        assert ds.to_table() == table
+    finally:
+        os.chdir(current_dir)
+
+    # relative path doesn't work in the context of a different dir
+    with pytest.raises(ValueError):
+        ds = lance.dataset(rel_uri)
+
+    # relative path gets resolved to the right absolute path
+    ds = lance.dataset(tmp_path / rel_uri)
+    assert ds.to_table() == table
+
+
+def test_tilde_paths(tmp_path: Path):
+    # tilde paths get resolved to the right absolute path
+    tilde_uri = "~/test.lance"
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+
+    with mock.patch.dict(
+        os.environ, {"HOME": str(tmp_path), "USERPROFILE": str(tmp_path)}
+    ):
+        # NOTE: the resolution logic is a bit finicky
+        # link 1 - https://docs.rs/dirs/4.0.0/dirs/fn.home_dir.html
+        # link 2 - https://docs.python.org/3/library/os.path.html#os.path.expanduser
+        expected_abs_path = os.path.expanduser(tilde_uri)
+        assert expected_abs_path == os.fspath(tmp_path / "test.lance")
+
+        lance.write_dataset(table, tilde_uri)
+        # works in the current context
+        ds = lance.dataset(tilde_uri)
+        assert ds.to_table() == table
+
+    # works with the resolved absolute path
+    ds = lance.dataset(expected_abs_path)
+    assert ds.to_table() == table

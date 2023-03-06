@@ -49,4 +49,5 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = [
     "pytest",
+    "duckdb"
 ]

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator, Optional, Union
@@ -33,8 +34,7 @@ class LanceDataset(pa.dataset.Dataset):
     """A dataset in Lance format where the data is stored at the given uri"""
 
     def __init__(self, uri: Union[str, Path], version: Optional[int] = None):
-        if isinstance(uri, Path):
-            uri = str(uri.absolute())
+        uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
         self._ds = _Dataset(uri, version)
 
@@ -61,7 +61,10 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Not enabled just yet. Soon...
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -75,6 +78,25 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
+
+        For debugging ANN results, you can choose to not use the index
+        even if present by specifying `use_index=False`. For example,
+        the following will always return exact KNN results:
+
+        ```
+        dataset.to_table(nearest={
+            "column": "vector",
+            "k": 10,
+            "q": <query vector>,
+            "use_index": False
+        }
+        ```
         """
         return (
             ScannerBuilder(self)
@@ -109,7 +131,10 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Scan will return only the rows matching the filter.
+            Expression or str that is a valid SQL where clause.
+            Currently only >, <, >=, <=, ==, !=, |, & are supported.
+            is_null, is_valid, ~, and others are not yet supported.
+            Specifying these will result in an expression parsing error
         limit: int, default 0
             Fetch up to this many rows. All rows if 0 or unspecified.
         offset: int, default None
@@ -125,7 +150,11 @@ class LanceDataset(pa.dataset.Dataset):
                   "refine_factor": 1
                 }
 
-        See `scanner()` for more details.
+        Notes
+        -----
+        For now, if BOTH filter and nearest is specified, then:
+        1. nearest is executed first.
+        2. The results are filtered afterwards.
         """
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest
@@ -384,10 +413,6 @@ class ScannerBuilder:
         return self
 
     def filter(self, filter: Union[str, pa.compute.Expression]) -> ScannerBuilder:
-        if filter is not None:
-            raise NotImplementedError(
-                "Allllmost ready. For now, please do `to_table().filter(...)`"
-            )
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter
@@ -401,6 +426,7 @@ class ScannerBuilder:
         metric: Optional[str] = None,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
+        use_index: bool = True,
     ) -> ScannerBuilder:
         if column is None or q is None:
             self._nearest = None
@@ -426,6 +452,7 @@ class ScannerBuilder:
             "metric": metric,
             "nprobes": nprobes,
             "refine_factor": refine_factor,
+            "use_index": use_index,
         }
         return self
 
@@ -597,7 +624,7 @@ def write_dataset(
         "max_rows_per_file": max_rows_per_file,
         "max_rows_per_group": max_rows_per_group,
     }
-    if isinstance(uri, Path):
-        uri = str(uri.absolute())
-    _write_dataset(reader, str(uri), params)
-    return LanceDataset(str(uri))
+
+    uri = os.fspath(uri) if isinstance(uri, Path) else uri
+    _write_dataset(reader, uri, params)
+    return LanceDataset(uri)
