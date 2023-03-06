@@ -128,7 +128,7 @@ impl Dataset {
         Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
-    pub async fn checkout_manifest(
+    async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         manifest_path: &Path,

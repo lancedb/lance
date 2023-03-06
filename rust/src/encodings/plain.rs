@@ -171,7 +171,6 @@ impl<'a> PlainDecoder<'a> {
     /// Decode primitive values, from "offset" to "offset + length".
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
-        println!("PlainDecoder.decode_primitive start {} end {} length {}", start, end, self.length);
         if end > self.length {
             return Err(Error::IO(format!(
                 "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
@@ -201,8 +200,6 @@ impl<'a> PlainDecoder<'a> {
         start: usize,
         end: usize,
     ) -> Result<ArrayRef> {
-        println!("PlainDecoder.decode_fixed_size_list start {} end {}", start, end);
-
         if !items.data_type().is_fixed_stride() {
             return Err(Error::Schema(format!(
                 "Items for fixed size list should be primitives but found {}",
@@ -227,8 +224,6 @@ impl<'a> PlainDecoder<'a> {
         start: usize,
         end: usize,
     ) -> Result<ArrayRef> {
-        println!("PlainDecoder.decode_fixed_size_binary start {} end {}", start, end);
-
         let bytes_decoder = PlainDecoder::new(
             self.reader,
             &DataType::UInt8,
@@ -323,19 +318,15 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {
-        println!("AsyncIndex.get  data_type {} index start {} end {}", self.data_type, index.start, index.end);
         if index.is_empty() {
-            println!("Index is empty!");
             return Ok(new_empty_array(self.data_type));
         }
         match self.data_type {
             DataType::FixedSizeList(items, list_size) => {
-                println!("PlainDecoder.get: FixedSizeList");
                 self.decode_fixed_size_list(items, *list_size, index.start, index.end)
                     .await
             }
             DataType::FixedSizeBinary(stride) => {
-                println!("PlainDecoder.get: FixedSizeBinary");
                 self.decode_fixed_size_binary(*stride, index.start, index.end)
                     .await
             }

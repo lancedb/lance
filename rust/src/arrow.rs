@@ -148,10 +148,8 @@ pub trait ListArrayExt {
     fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
 }
 
-// this is one big list of all recordsin the array
 impl ListArrayExt for ListArray {
     fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
-        println!("ListArrayExt {:?} offsets {:?}", values, offsets);
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
             "item",
             values.data_type().clone(),
@@ -162,7 +160,6 @@ impl ListArrayExt for ListArray {
         .add_child_data(values.into_data())
         .build()?;
 
-        println!("ListArrayExt going to call from");
         Ok(Self::from(data))
     }
 }
@@ -174,8 +171,6 @@ pub trait LargeListArrayExt {
 
 impl LargeListArrayExt for LargeListArray {
     fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
-        println!("LargeListArrayExt {:?} offsets {:?}", values, offsets);
-
         let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
             "item",
             values.data_type().clone(),
@@ -214,8 +209,6 @@ pub trait FixedSizeListArrayExt {
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
     fn try_new<T: Array>(values: T, list_size: i32) -> Result<Self> {
-        println!("FixedSizeListArrayExt {:?} list_size {:?}", values, list_size);
-
         let list_type = DataType::FixedSizeList(
             Box::new(Field::new("item", values.data_type().clone(), true)),
             list_size,

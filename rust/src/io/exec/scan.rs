@@ -103,7 +103,6 @@ impl LanceStream {
                 for batch_id in 0..reader.num_batches() as i32 {
                     let rows_in_batch = reader.num_rows_in_batch(batch_id);
                     for start in (0..rows_in_batch).step_by(read_size) {
-                        println!("scan.try_new batch_id {}, start {} rows_in_batch {}", batch_id, start, rows_in_batch);
                         let result = r
                             .read_batch(
                                 batch_id,

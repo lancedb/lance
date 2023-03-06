@@ -21,8 +21,6 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
-extern crate core;
-
 pub mod arrow;
 pub mod datafusion;
 pub mod dataset;
