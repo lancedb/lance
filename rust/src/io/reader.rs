@@ -538,17 +538,12 @@ async fn read_large_list_array(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
     use super::*;
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::Float32Builder;
-    use arrow_array::{
-        builder::{Int32Builder, ListBuilder, StringBuilder},
-        cast::{as_primitive_array, as_string_array, as_struct_array},
-        types::UInt8Type,
-        DictionaryArray, Float32Array, Int64Array, NullArray,
-        StringArray, StructArray, UInt32Array, UInt8Array,
-    };
+    use arrow_array::{builder::{Int32Builder, ListBuilder, StringBuilder}, cast::{as_primitive_array, as_string_array, as_struct_array}, types::UInt8Type, DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray, UInt32Array, UInt8Array, Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -791,6 +786,13 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let params = ReadBatchParams::Range(10..20);
+
+        let mut expected_columns: Vec<ArrayRef> = Vec::new();
+        for c in struct_array.columns().iter() {
+            expected_columns.push(c.slice(10, 10));
+        }
+        let expected_struct = StructArray::from(expected_columns);
+
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
         assert_eq!(10, slice_of_batch.num_rows());
