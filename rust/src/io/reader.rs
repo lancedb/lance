@@ -469,13 +469,9 @@ async fn read_list_array(
 
     // We need to offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
-        ReadBatchParams::Range(range) => {
-            ReadBatchParams::from(range.start..(range.end + 1))
-        }
-        ReadBatchParams::RangeTo(range) => {
-            ReadBatchParams::from(..range.end + 1)
-        }
-        p => p.clone()
+        ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
+        ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
+        p => p.clone(),
     };
 
     let position_arr = read_fixed_stride_array(
@@ -494,18 +490,16 @@ async fn read_list_array(
 
     // Recompute params so they align with the offset array
     let value_params = match params {
-        ReadBatchParams::Range(range) => {
-            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(range.end - range.start) as usize)
-        }
-        ReadBatchParams::RangeTo(RangeTo{end}) => {
+        ReadBatchParams::Range(range) => ReadBatchParams::from(
+            offset_arr.value(0) as usize..offset_arr.value(range.end - range.start) as usize,
+        ),
+        ReadBatchParams::RangeTo(RangeTo { end }) => {
             ReadBatchParams::from(..offset_arr.value(*end) as usize)
         }
-        ReadBatchParams::RangeFrom(_) => {
-            ReadBatchParams::from(offset_arr.value(0) as usize..)
-        }
-        ReadBatchParams::RangeFull => {
-            ReadBatchParams::from(offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize)
-        }
+        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(offset_arr.value(0) as usize..),
+        ReadBatchParams::RangeFull => ReadBatchParams::from(
+            offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize,
+        ),
         ReadBatchParams::Indices(_) => {
             return Err(Error::IO(
                 "index lookup is not supported for lists".to_string(),
@@ -550,7 +544,13 @@ mod tests {
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::Float32Builder;
-    use arrow_array::{builder::{Int32Builder, ListBuilder, StringBuilder}, cast::{as_primitive_array, as_string_array, as_struct_array}, types::UInt8Type, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array, Array};
+    use arrow_array::{
+        builder::{Int32Builder, ListBuilder, StringBuilder},
+        cast::{as_primitive_array, as_string_array, as_struct_array},
+        types::UInt8Type,
+        Array, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader,
+        StringArray, StructArray, UInt32Array, UInt8Array,
+    };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
