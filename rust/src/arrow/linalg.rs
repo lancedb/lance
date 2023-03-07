@@ -17,10 +17,19 @@
 //!
 
 use std::cmp::min;
+use std::sync::Arc;
 
-use arrow::array::as_primitive_array;
+use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
+
+#[allow(unused_imports)]
+#[cfg(target_os = "macos")]
+use accelerate_src;
+
+#[allow(unused_imports)]
+#[cfg(target_os = "linux")]
+use openblas_src;
 
 use crate::{arrow::FixedSizeListArrayExt, Error, Result};
 
@@ -35,6 +44,113 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
     }
 
     mat
+}
+
+/// A 2-D matrix view on top of Arrow Arrays.
+///
+/// [MatrixView] does not own the data.
+#[derive(Debug)]
+pub struct MatrixView {
+    /// Underneath data array.
+    pub data: Arc<Float32Array>,
+
+    /// The number of
+    pub num_columns: usize,
+
+    /// Is this matrix transposed or not.
+    pub transpose: bool,
+}
+
+impl MatrixView {
+    /// Create a MatrixView from a
+    pub fn new(data: Arc<Float32Array>, num_columns: usize) -> Self {
+        Self {
+            data,
+            num_columns,
+            transpose: false,
+        }
+    }
+
+    /// Number of rows in the matrix
+    pub fn num_rows(&self) -> usize {
+        if self.transpose {
+            self.num_columns
+        } else {
+            self.data.len() / self.num_columns
+        }
+    }
+
+    pub fn num_columns(&self) -> usize {
+        if self.transpose {
+            self.data.len() / self.num_columns
+        } else {
+            self.num_columns
+        }
+    }
+
+    /// (Lazy) transpose of the matrix.
+    ///
+    pub fn transpose(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            num_columns: self.num_columns,
+            transpose: !self.transpose,
+        }
+    }
+
+    /// Dot multiply
+    pub fn dot(&self, rhs: &Self) -> Result<Self> {
+        use cblas::{sgemm, Layout, Transpose};
+
+        let m = self.num_rows() as i32;
+        let k = self.num_columns() as i32;
+        let n = rhs.num_columns() as i32;
+        if self.num_columns() != rhs.num_rows() {
+            return Err(Error::Arrow(format!(
+                "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
+                rhs.num_rows()
+            )));
+        }
+
+        let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
+        unsafe { c_builder.append_trusted_len_iter((0..n * m).map(|_| 0.0)) }
+
+        let (trans_a, lda) = if self.transpose {
+            (Transpose::Ordinary, m)
+        } else {
+            (Transpose::None, k)
+        };
+        let (trans_b, ldb) = if rhs.transpose {
+            (Transpose::Ordinary, k)
+        } else {
+            (Transpose::None, n)
+        };
+        unsafe {
+            sgemm(
+                Layout::RowMajor,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                1.0,
+                self.data.as_ref().values(),
+                lda,
+                rhs.data.as_ref().values(),
+                ldb,
+                0.0,
+                c_builder.values_slice_mut(),
+                n,
+            )
+        }
+
+        let data = Arc::new(c_builder.finish());
+        Ok(Self {
+            data,
+            num_columns: n as usize,
+            transpose: false,
+        })
+    }
 }
 
 /// Single Value Decomposition.
@@ -57,15 +173,6 @@ impl SingularValueDecomposition for FixedSizeListArray {
     type Sigma = Float32Array;
 
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
-        #[allow(unused_imports)]
-        {
-            #[cfg(target_os = "macos")]
-            use accelerate_src;
-
-            #[cfg(target_os = "linux")]
-            use openblas_src;
-        }
-
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesdd;
@@ -259,5 +366,43 @@ mod tests {
             expected_vt.as_slice(),
             epsilon = 0.0001,
         )
+    }
+
+    #[test]
+    fn test_matrix_dot() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::new(b_data, 2);
+
+        let c = a.dot(&b).unwrap();
+        assert_relative_eq!(
+            c.data.as_ref().values(),
+            vec![44.0, 50.0, 98.0, 113.0].as_slice(),
+        );
+    }
+
+    #[test]
+    fn test_dot_on_transposed_mat() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::new(b_data, 2);
+
+        let c_t = b.transpose().dot(&a.transpose()).unwrap();
+        assert_relative_eq!(
+            c_t.data.as_ref().values(),
+            vec![44.0, 98.0, 50.0, 113.0].as_slice(),
+        );
     }
 }
