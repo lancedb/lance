@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    Array, ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
+    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -466,17 +466,10 @@ async fn read_list_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    println!(
-        "read_list_array page info {} - {}",
-        page_info.position, page_info.length
-    );
 
     // We need to offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
-        ReadBatchParams::Range(range) => {
-            println!("read_list_array range {} - {}", range.start, range.end);
-            ReadBatchParams::from(range.start..(range.end + 1))
-        }
+        ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
         ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
         p => p.clone(),
     };
@@ -489,16 +482,9 @@ async fn read_list_array(
         positions_params,
     )
     .await?;
-    println!("read_list_array position array {:?}", position_arr);
 
     let positions = as_primitive_array(position_arr.as_ref());
-    // arrow::util::pretty::print_columns("item", position_arr.as_ref()).unwrap();
     let start_position: i32 = positions.value(0);
-    println!("read_list_array start_position {:?}", start_position);
-
-    // Compute offsets
-    let offset_arr = subtract_scalar(positions, start_position)?;
-    println!("read_list_array offset_arr {:?}", offset_arr);
 
     // Recompute params so they align with the offset array
     let value_params = match params {
@@ -519,9 +505,8 @@ async fn read_list_array(
         }
     };
 
-    println!("read_list_array values_params {:?}", value_params);
     let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
-    println!("read_list_array values_arrs {:?}", value_arrs);
+    let offset_arr = subtract_scalar(positions, start_position)?;
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
 }
 
@@ -553,10 +538,7 @@ async fn read_large_list_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ops::Deref;
 
-    use crate::dataset::{Dataset, WriteParams};
-    use arrow_array::builder::Float32Builder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
@@ -797,7 +779,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
 
-        let (arrow_schema, struct_array) = make_struct_of_list_array(3, 5);
+        let (arrow_schema, struct_array) = make_struct_of_list_array(3, 10);
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
@@ -828,8 +810,6 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let params = ReadBatchParams::Range(1..2);
         let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
-        assert_eq!(1, slice_of_batch.num_rows());
-        assert_eq!(1, expected_batch.num_rows());
         assert_eq!(expected_batch, slice_of_batch);
     }
 

@@ -171,7 +171,6 @@ impl<'a> PlainDecoder<'a> {
     /// Decode primitive values, from "offset" to "offset + length".
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
-        println!("decode_primitive: start {} end {}", start, end);
         if end > self.length {
             return Err(Error::IO(format!(
                 "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
@@ -184,7 +183,6 @@ impl<'a> PlainDecoder<'a> {
             end: self.position + byte_range.end,
         };
 
-        println!("decode_primitive: range {:?}", range);
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
