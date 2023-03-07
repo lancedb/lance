@@ -3,7 +3,7 @@ use std::fs::read;
 use std::mem::ManuallyDrop;
 use arrow::array::{ArrayData, Int32Array, make_array};
 use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
 
 // These objects are what you should use as arguments to your native
@@ -28,16 +28,28 @@ pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
         .expect("Couldn't get java string!")
         .into();
     let stream = FFI_ArrowArrayStream::empty();
-    let stream = Box::new(ManuallyDrop::new(stream));
-
-    let stream_ptr = &**stream as *const FFI_ArrowArrayStream;
+    let stream = Box::new(stream);
+    let stream_ptr = Box::into_raw(stream);
     let stream_ptr_long = stream_ptr as i64;
     let result = env.call_static_method(class, "fillStream",
                                         "(JLorg/apache/arrow/vector/ipc/ArrowReader;Lorg/apache/arrow/memory/BufferAllocator;)V",
                                         &[JValue::from(stream_ptr_long), JValue::from(&reader), JValue::from(&allocator)]);
     match result {
         Ok(_) => {
-            println!("java call rust call java via JNI OK!")
+            println!("java call rust call java via JNI OK!");
+            let reader = unsafe {
+                ArrowArrayStreamReader::from_raw(stream_ptr)
+            };
+            match reader {
+                Ok(reader) => {
+                    println!("get reader");
+                    for x in reader {
+                        println!("batch: {:?}", x)
+                    }
+                }
+                Err(_) => {}
+            }
+            // todo!("TODO TODO TODO")
         }
         Err(e) => {
             println!("error: {:?}", e)
