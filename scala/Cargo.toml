@@ -9,9 +9,11 @@ name = "jlance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "33.0.0", features = ["ffi"] }
+arrow = { version = "32.0.0", features = ["ffi","pyarrow"] }
 jni = "0.21.0"
 lance = { path = "../rust"}
+futures = "0.3"
+
 
 [build-dependencies]
 prost-build = "0.11"

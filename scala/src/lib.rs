@@ -4,8 +4,9 @@ use std::mem::ManuallyDrop;
 use arrow::array::{ArrayData, Int32Array, make_array};
 use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+use arrow::ipc::RecordBatch;
+use arrow::record_batch::RecordBatchReader;
 use jni::JNIEnv;
-
 // These objects are what you should use as arguments to your native
 // function. They carry extra lifetime information to prevent them escaping
 // this context and getting used after being GC'd.
@@ -15,6 +16,10 @@ use jni::objects::{JClass, JLongArray, JObject, JString, JValue, JValueGen};
 // can't return one of the objects with lifetime information because the
 // lifetime checker won't let us.
 use jni::sys::{jclass, jlong, jlongArray, jobjectArray, jstring};
+use lance::dataset::{
+    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
+};
+use futures::executor;
 
 #[no_mangle]
 pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
@@ -42,10 +47,17 @@ pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
             };
             match reader {
                 Ok(reader) => {
-                    println!("get reader");
-                    for x in reader {
-                        println!("batch: {:?}", x)
-                    }
+                    println!("got reader");
+                    let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(reader);
+                    // let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+                    println!("save to path {}", path);
+                    let result = async {
+                        LanceDataset::write(&mut batch_reader, path.as_str(), None).await.unwrap();
+                    };
+                    executor::block_on(result);
+                    // for x in reader {
+                    //     println!("batch: {:?}", x);
+                    // }
                 }
                 Err(_) => {}
             }
@@ -95,10 +107,11 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     match result {
         Ok(_) => {
             println!("OK!");
-            let array = unsafe {
-                ArrowArray::new(std::ptr::read(array_ptr), std::ptr::read(schema_ptr))
-            };
-            let array = make_array(ArrayData::try_from(array).unwrap());
+            //Available since arrow-rs 33, now we are in 32
+            // let array = unsafe {
+            //     ArrowArray::try_from_raw(std::ptr::read(array_ptr), std::ptr::read(schema_ptr))
+            // };
+            // let array = make_array(ArrayData::try_from(array).unwrap());
             println!("array: {:?}", array)
         }
         Err(e) => {

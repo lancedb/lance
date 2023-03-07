@@ -19,7 +19,7 @@ object Main {
 
   private def readDataExample(): Unit = {
     val readPath               = Paths.get("src/main/resources/prime_numbers.csv").toAbsolutePath.toUri.toString
-    val writePath              = ""
+    val writePath              = "/tmp/test.lance"
     println(s"read path: ${readPath}")
     val options                = new ScanOptions( /*batchSize*/ 32768)
     // TODO why would this Using supress exceptions?
