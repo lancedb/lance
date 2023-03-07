@@ -17,7 +17,7 @@ use jni::objects::{JClass, JLongArray, JObject, JString, JValue, JValueGen};
 use jni::sys::{jclass, jlong, jlongArray, jobjectArray, jstring};
 
 #[no_mangle]
-pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
+pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
     mut env: JNIEnv<'local>,
     class: JClass<'local>,
     path: JString<'local>,
@@ -45,7 +45,7 @@ pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
+pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
     mut env: JNIEnv<'local>,
     class: JClass<'local>,
     path: JString<'local>,
