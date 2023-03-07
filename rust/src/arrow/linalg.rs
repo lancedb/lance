@@ -226,7 +226,7 @@ mod tests {
             epsilon = 0.0001,
         );
 
-        // From `numpy.linagl.svd()`.
+        // Obtained from `numpy.linagl.svd()`.
         let expected_vt = vec![
             -0.25138279,
             -0.39684555,
