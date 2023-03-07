@@ -11,12 +11,12 @@ import java.io.FileInputStream
 import java.nio.file.{Files, Paths}
 import scala.util.Using
 
-object Main {
+object Example {
   def main(args: Array[String]): Unit = {
-    readDataExample()
+    readCsvSaveLanceExample()
   }
 
-  private def readDataExample(): Unit = {
+  private def readCsvSaveLanceExample(): Unit = {
     val readPath               = Paths.get("src/main/resources/prime_numbers.csv").toAbsolutePath.toUri.toString
     val writePath              = "/tmp/test.lance"
     println(s"read path: ${readPath}")
