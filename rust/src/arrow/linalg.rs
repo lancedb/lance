@@ -17,10 +17,19 @@
 //!
 
 use std::cmp::min;
+use std::sync::Arc;
 
-use arrow::array::as_primitive_array;
+use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
+
+#[allow(unused_imports)]
+#[cfg(target_os = "macos")]
+use accelerate_src;
+
+#[allow(unused_imports)]
+#[cfg(target_os = "linux")]
+use openblas_src;
 
 use crate::{arrow::FixedSizeListArrayExt, Error, Result};
 
@@ -35,6 +44,88 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
     }
 
     mat
+}
+
+/// A 2-D matrix view on top of Arrow Arrays.
+///
+/// [MatrixView] does not own the data.
+#[derive(Debug)]
+pub struct MatrixView {
+    /// Underneath data array.
+    pub data: Arc<Float32Array>,
+
+    /// The number of
+    pub num_columns: usize,
+
+    /// Is this matrix transposed or not.
+    transpose: bool,
+}
+
+impl MatrixView {
+
+    /// Create a MatrixView from a
+    pub fn new(data: Arc<Float32Array>, num_columns: usize) -> Self {
+        Self {
+            data,
+            num_columns,
+            transpose: false,
+        }
+    }
+
+    /// Number of rows in the matrix
+    pub fn num_rows(&self) -> usize {
+        self.data.len() / self.num_columns
+    }
+
+    pub fn num_columns(&self) -> usize {
+        self.num_columns
+    }
+
+    pub fn transpose(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            num_columns: self.num_columns,
+            transpose: !self.transpose,
+        }
+    }
+
+    /// Dot multiply
+    pub fn dot(&self, rhs: &MatrixView) -> Result<Self> {
+        use cblas::{sgemm, Layout};
+
+        let m = self.num_rows();
+        let k = self.num_columns();
+        let n = rhs.num_columns();
+        if self.num_columns() != rhs.num_rows() {
+            return Err(Error::Arrow(format!(
+                "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
+                rhs.num_rows()
+            )));
+        }
+
+        let mut c_builder = Float32Builder::with_capacity(m * n);
+        unsafe {
+            c_builder.append_trusted_len_iter((0..n * m).map(|v| v as f32))
+        }
+
+        todo!()
+    }
+}
+
+/// Dot multiply
+pub trait Dot {
+    type Output;
+
+    fn dot(&self, rhs: &Self) -> Self::Output;
+}
+
+
+impl Dot for FixedSizeListArray {
+    type Output = Result<Arc<FixedSizeListArray>>;
+
+    fn dot(&self, rhs: &Self) -> Self::Output {
+        todo!()
+    }
 }
 
 /// Single Value Decomposition.
@@ -57,15 +148,6 @@ impl SingularValueDecomposition for FixedSizeListArray {
     type Sigma = Float32Array;
 
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
-        #[allow(unused_imports)]
-        {
-            #[cfg(target_os = "macos")]
-            use accelerate_src;
-
-            #[cfg(target_os = "linux")]
-            use openblas_src;
-        }
-
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesdd;
