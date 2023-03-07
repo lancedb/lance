@@ -24,8 +24,8 @@ public class JNI {
         }
     }
 
-    public static void fillStream(long streamAddress, ArrowReader reader) {
-        Data.exportArrayStream(null, reader, ArrowArrayStream.wrap(streamAddress));
+    public static void fillStream(long streamAddress, ArrowReader reader,BufferAllocator allocator ) {
+        Data.exportArrayStream(allocator, reader, ArrowArrayStream.wrap(streamAddress));
     }
 
     native public static void saveToLance(String path, FieldVector vec, BufferAllocator allocator);

@@ -1,6 +1,9 @@
+use std::alloc::alloc;
+use std::fs::read;
 use std::mem::ManuallyDrop;
 use arrow::array::{ArrayData, Int32Array, make_array};
 use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi_stream::FFI_ArrowArrayStream;
 use jni::JNIEnv;
 
 // These objects are what you should use as arguments to your native
@@ -15,6 +18,34 @@ use jni::sys::{jclass, jlong, jlongArray, jobjectArray, jstring};
 
 #[no_mangle]
 pub extern "system" fn Java_lance_JNI_saveToLance<'local>(
+    mut env: JNIEnv<'local>,
+    class: JClass<'local>,
+    path: JString<'local>,
+    reader: JObject,
+    allocator: JObject) {
+    let path: String = env
+        .get_string(&path)
+        .expect("Couldn't get java string!")
+        .into();
+    let stream = FFI_ArrowArrayStream::empty();
+    let stream = Box::new(ManuallyDrop::new(stream));
+
+    let stream_ptr = &**stream as *const FFI_ArrowArrayStream;
+    let stream_ptr_long = stream_ptr as i64;
+    let result = env.call_static_method(class, "fillStream", "(JLorg/apache/arrow/vector/ipc/ArrowReader;)V",
+                                        &[JValue::from(stream_ptr_long), JValue::from(&reader), JValue::from(&allocator)]);
+    match result {
+        Ok(_) => {
+            println!("java call rust call java via JNI OK!")
+        }
+        Err(e) => {
+            println!("error: {:?}", e)
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
     mut env: JNIEnv<'local>,
     class: JClass<'local>,
     path: JString<'local>,

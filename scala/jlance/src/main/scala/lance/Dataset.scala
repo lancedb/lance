@@ -13,6 +13,7 @@ object Dataset {
   def writeDataset(path: String, allocator: BufferAllocator, reader: ArrowReader): Unit = {
     JNI.saveStreamToLance(path, reader, allocator)
   }
+
   def fromArrow(vec: FieldVector): Dataset                                        = {
     Dataset(vec)
   }
