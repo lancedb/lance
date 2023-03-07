@@ -795,10 +795,9 @@ mod tests {
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();
 
-
         let mut expected_columns: Vec<ArrayRef> = Vec::new();
         for c in struct_array.columns().iter() {
-            expected_columns.push(c.slice(10, 1));
+            expected_columns.push(c.slice(50, 1));
         }
 
         let expected_struct = match arrow_schema.fields[0].data_type() {
@@ -820,7 +819,7 @@ mod tests {
         );
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let params = ReadBatchParams::Range(10..11);
+        let params = ReadBatchParams::Range(50..51);
         let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
         assert_eq!(1, slice_of_batch.num_rows());
         assert_eq!(1, expected_batch.num_rows());
