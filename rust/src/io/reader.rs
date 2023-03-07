@@ -466,10 +466,14 @@ async fn read_list_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    println!("read_list_array page info {} - {}", page_info.position, page_info.length);
 
     // We need to offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
-        ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
+        ReadBatchParams::Range(range) => {
+            println!("read_list_array range {} - {}", range.start, range.end);
+            ReadBatchParams::from(range.start..(range.end + 1))
+        },
         ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
         p => p.clone(),
     };
@@ -481,12 +485,16 @@ async fn read_list_array(
         page_info.length,
         positions_params,
     )
-    .await?;
+        .await?;
+    println!("read_list_array position array {:?}", position_arr);
 
     let positions = as_primitive_array(position_arr.as_ref());
     let start_position: i32 = positions.value(0);
+    println!("read_list_array start_position {:?}", start_position);
+
     // Compute offsets
     let offset_arr = subtract_scalar(positions, start_position)?;
+    println!("read_list_array offset_arr {:?}", offset_arr);
 
     // Recompute params so they align with the offset array
     let value_params = match params {
@@ -507,7 +515,9 @@ async fn read_list_array(
         }
     };
 
+    println!("read_list_array values_params {:?}", value_params);
     let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
+    println!("read_list_array values_arrs {:?}", value_arrs);
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
 }
 
@@ -779,23 +789,42 @@ mod tests {
 
         let (arrow_schema, struct_array) = make_struct_of_list_array(100);
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         file_writer.write(&batch).await.unwrap();
         file_writer.finish().await.unwrap();
 
-        let params = ReadBatchParams::Range(10..20);
 
         let mut expected_columns: Vec<ArrayRef> = Vec::new();
         for c in struct_array.columns().iter() {
-            expected_columns.push(c.slice(10, 10));
+            expected_columns.push(c.slice(10, 1));
         }
-        let expected_struct = StructArray::from(expected_columns);
+
+        let expected_struct = match arrow_schema.fields[0].data_type() {
+            DataType::Struct(subfields) => {
+                subfields
+                    .iter()
+                    .zip(expected_columns)
+                    .map(|(f, d)| (f.clone(), d))
+                    .collect::<Vec<_>>()
+            }
+            _ => panic!("unexpected field")
+        };
+
+        let expected_struct_array = StructArray::from(expected_struct);
+        let expected_batch = RecordBatch::from(&StructArray::from(
+            vec![
+                (arrow_schema.fields[0].clone(), Arc::new(expected_struct_array) as ArrayRef)
+            ])
+        );
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let params = ReadBatchParams::Range(10..11);
         let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
-        assert_eq!(10, slice_of_batch.num_rows());
+        assert_eq!(1, slice_of_batch.num_rows());
+        assert_eq!(1, expected_batch.num_rows());
+        assert_eq!(expected_batch, slice_of_batch);
     }
 
     fn make_struct_of_list_array(rows: i32) -> (Arc<arrow_schema::Schema>, Arc<StructArray>) {
