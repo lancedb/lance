@@ -32,7 +32,8 @@ pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
 
     let stream_ptr = &**stream as *const FFI_ArrowArrayStream;
     let stream_ptr_long = stream_ptr as i64;
-    let result = env.call_static_method(class, "fillStream", "(JLorg/apache/arrow/vector/ipc/ArrowReader;)V",
+    let result = env.call_static_method(class, "fillStream",
+                                        "(JLorg/apache/arrow/vector/ipc/ArrowReader;Lorg/apache/arrow/memory/BufferAllocator;)V",
                                         &[JValue::from(stream_ptr_long), JValue::from(&reader), JValue::from(&allocator)]);
     match result {
         Ok(_) => {
