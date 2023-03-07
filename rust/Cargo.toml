@@ -63,7 +63,7 @@ cblas = "0.4.0"
 accelerate-src = "0.3.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-openblas-src = { version = "0.10.8", default-features= false, features = ["static"]}
+openblas-src = { version = "0.10.8", default-features= false, features = ["static", "cblas"]}
 
 [build-dependencies]
 prost-build = "0.11"
