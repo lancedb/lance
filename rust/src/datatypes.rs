@@ -8,7 +8,7 @@ use std::fmt::{self};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch};
+use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch, StructArray, ListArray, LargeListArray, Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -337,6 +337,27 @@ impl Field {
                 _ => {
                     panic!("Unsupported dictionary key type: {}", key_type);
                 }
+            },
+            DataType::Struct(mut subfields) => {
+                for (i, f) in subfields.iter_mut().enumerate() {
+                    let mut lance_field = self.children.iter_mut()
+                        .find(|c| c.name == f.name().to_string())
+                        .unwrap();
+                    let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
+                    lance_field.set_dictionary(struct_arr.column(i));
+                }
+            },
+            DataType::List(values) => {
+                // should this be self.children[0]?
+                let mut f = Field::try_from(values.as_ref()).unwrap();
+                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                f.set_dictionary(list_arr.values());
+            },
+            DataType::LargeList(values) => {
+                // should this be self.children[0]?
+                let mut f = Field::try_from(values.as_ref()).unwrap();
+                let list_arr = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+                f.set_dictionary(list_arr.values());
             },
             _ => {
                 // Add nested struct support.
