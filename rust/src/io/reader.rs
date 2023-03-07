@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
+    Array, ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
     UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -466,14 +466,17 @@ async fn read_list_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    println!("read_list_array page info {} - {}", page_info.position, page_info.length);
+    println!(
+        "read_list_array page info {} - {}",
+        page_info.position, page_info.length
+    );
 
     // We need to offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
         ReadBatchParams::Range(range) => {
             println!("read_list_array range {} - {}", range.start, range.end);
             ReadBatchParams::from(range.start..(range.end + 1))
-        },
+        }
         ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
         p => p.clone(),
     };
@@ -489,6 +492,7 @@ async fn read_list_array(
     println!("read_list_array position array {:?}", position_arr);
 
     let positions = as_primitive_array(position_arr.as_ref());
+    // arrow::util::pretty::print_columns("item", position_arr.as_ref()).unwrap();
     let start_position: i32 = positions.value(0);
     println!("read_list_array start_position {:?}", start_position);
 
@@ -499,14 +503,14 @@ async fn read_list_array(
     // Recompute params so they align with the offset array
     let value_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(
-            offset_arr.value(0) as usize..offset_arr.value(range.end - range.start) as usize,
+            positions.value(0) as usize..positions.value(range.end - range.start) as usize,
         ),
         ReadBatchParams::RangeTo(RangeTo { end }) => {
-            ReadBatchParams::from(..offset_arr.value(*end) as usize)
+            ReadBatchParams::from(..positions.value(*end) as usize)
         }
-        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(offset_arr.value(0) as usize..),
+        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(positions.value(0) as usize..),
         ReadBatchParams::RangeFull => ReadBatchParams::from(
-            offset_arr.value(0) as usize..offset_arr.value(offset_arr.len() - 1) as usize,
+            positions.value(0) as usize..positions.value(positions.len() - 1) as usize,
         ),
         ReadBatchParams::Indices(_) => {
             return Err(Error::IO(
@@ -548,12 +552,18 @@ async fn read_large_list_array(
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Deref;
     use super::*;
+    use std::ops::Deref;
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::Float32Builder;
-    use arrow_array::{builder::{Int32Builder, ListBuilder, StringBuilder}, cast::{as_primitive_array, as_string_array, as_struct_array}, types::UInt8Type, DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray, UInt32Array, UInt8Array, Array};
+    use arrow_array::{
+        builder::{Int32Builder, ListBuilder, StringBuilder},
+        cast::{as_primitive_array, as_string_array, as_struct_array},
+        types::UInt8Type,
+        Array, DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray,
+        UInt32Array, UInt8Array,
+    };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
 
@@ -769,7 +779,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
 
-        let (arrow_schema, struct_array) = make_struct_of_list_array(10);
+        let (arrow_schema, struct_array) = make_struct_of_list_array(10, 10);
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
 
@@ -787,7 +797,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
 
-        let (arrow_schema, struct_array) = make_struct_of_list_array(100);
+        let (arrow_schema, struct_array) = make_struct_of_list_array(3, 5);
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
@@ -797,36 +807,36 @@ mod tests {
 
         let mut expected_columns: Vec<ArrayRef> = Vec::new();
         for c in struct_array.columns().iter() {
-            expected_columns.push(c.slice(50, 1));
+            expected_columns.push(c.slice(1, 1));
         }
 
         let expected_struct = match arrow_schema.fields[0].data_type() {
-            DataType::Struct(subfields) => {
-                subfields
-                    .iter()
-                    .zip(expected_columns)
-                    .map(|(f, d)| (f.clone(), d))
-                    .collect::<Vec<_>>()
-            }
-            _ => panic!("unexpected field")
+            DataType::Struct(subfields) => subfields
+                .iter()
+                .zip(expected_columns)
+                .map(|(f, d)| (f.clone(), d))
+                .collect::<Vec<_>>(),
+            _ => panic!("unexpected field"),
         };
 
         let expected_struct_array = StructArray::from(expected_struct);
-        let expected_batch = RecordBatch::from(&StructArray::from(
-            vec![
-                (arrow_schema.fields[0].clone(), Arc::new(expected_struct_array) as ArrayRef)
-            ])
-        );
+        let expected_batch = RecordBatch::from(&StructArray::from(vec![(
+            arrow_schema.fields[0].clone(),
+            Arc::new(expected_struct_array) as ArrayRef,
+        )]));
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let params = ReadBatchParams::Range(50..51);
+        let params = ReadBatchParams::Range(1..2);
         let slice_of_batch = reader.read_batch(0, params, reader.schema()).await.unwrap();
         assert_eq!(1, slice_of_batch.num_rows());
         assert_eq!(1, expected_batch.num_rows());
         assert_eq!(expected_batch, slice_of_batch);
     }
 
-    fn make_struct_of_list_array(rows: i32) -> (Arc<arrow_schema::Schema>, Arc<StructArray>) {
+    fn make_struct_of_list_array(
+        rows: i32,
+        num_items: i32,
+    ) -> (Arc<arrow_schema::Schema>, Arc<StructArray>) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![
@@ -847,7 +857,7 @@ mod tests {
         let mut li_builder = ListBuilder::new(Int32Builder::new());
         let mut ls_builder = ListBuilder::new(StringBuilder::new());
         for i in 0..rows {
-            for j in 0..10 {
+            for j in 0..num_items {
                 li_builder.values().append_value(i * 10 + j);
                 ls_builder
                     .values()
