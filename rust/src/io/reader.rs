@@ -467,7 +467,7 @@ async fn read_list_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
 
-    // We need to offset the position array by 1 in order to include the upper bound of the last element
+    // Offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
         ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
