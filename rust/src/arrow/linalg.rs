@@ -16,6 +16,8 @@
 //!
 //!
 
+use std::cmp::min;
+
 use arrow::array::as_primitive_array;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
@@ -66,7 +68,7 @@ impl SingularValueDecomposition for FixedSizeListArray {
 
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
-        use lapack::sgesvd;
+        use lapack::sgesdd;
 
         if !matches!(self.value_type(), DataType::Float32) {
             return Err(Error::Arrow(format!(
@@ -94,13 +96,13 @@ impl SingularValueDecomposition for FixedSizeListArray {
         let mut work = vec![0_f32; 1];
         // Length of the workspace
         let lwork: i32 = -1;
-        // SGESVG return value.
+        let mut iwork = vec![0; 8 * min(m, m) as usize];
+        //  return value.
         let mut info: i32 = -1;
 
         // Query the optimal workspace size, will be stored in `work[0]`.
         unsafe {
-            sgesvd(
-                b'A',
+            sgesdd(
                 b'A',
                 m,
                 n,
@@ -113,18 +115,18 @@ impl SingularValueDecomposition for FixedSizeListArray {
                 m,
                 work.as_mut_slice(),
                 lwork,
+                iwork.as_mut_slice(),
                 &mut info,
             );
         }
         if info > 0 {
-            println!("Failed to compute sgesvd");
+            return Err(Error::Arrow("Failed to compute SVD".to_string()));
         }
 
         let lwork = work[0] as i32;
         let mut work = vec![0_f32; lwork as usize];
         unsafe {
-            sgesvd(
-                b'A',
+            sgesdd(
                 b'A',
                 m,
                 n,
@@ -137,6 +139,7 @@ impl SingularValueDecomposition for FixedSizeListArray {
                 n,
                 work.as_mut_slice(),
                 lwork,
+                iwork.as_mut_slice(),
                 &mut info,
             );
         }
@@ -162,6 +165,8 @@ mod tests {
 
     #[test]
     fn test_svd() {
+        // A 6 x 5 matrix, from
+        // https://www.intel.com/content/www/us/en/develop/documentation/onemkl-lapack-examples/top/least-squares-and-eigenvalue-problems/singular-value-decomposition/gesvd-function/sgesvd-example/lapacke-sgesvd-example-c-row.html
         let values = Float32Array::from_iter_values([
             8.79, 9.93, 9.83, 5.45, 3.16, 6.11, 6.91, 5.04, -0.27, 7.98, -9.15, -7.93, 4.86, 4.85,
             3.01, 9.57, 1.64, 8.83, 0.74, 5.80, -3.49, 4.02, 9.80, 10.00, 4.27, 9.84, 0.15, -8.99,
@@ -170,6 +175,7 @@ mod tests {
         let a = FixedSizeListArray::try_new(&values, 5).unwrap();
 
         let (u, sigma, vt) = a.svd().unwrap();
+        // Results obtained from `numpy.linalg.svd()`.
         let expected_u = vec![
             -0.59114238,
             0.26316781,
@@ -208,13 +214,11 @@ mod tests {
             -0.6525516,
             0.10910681,
         ];
-        as_primitive_array::<Float32Type>(u.values().as_ref())
-            .values()
-            .iter()
-            .zip(expected_u)
-            .for_each(|(actual, expect)| {
-                assert_relative_eq!(*actual, expect, epsilon = 0.0001);
-            });
+        assert_relative_eq!(
+            as_primitive_array::<Float32Type>(u.values().as_ref()).values(),
+            expected_u.as_slice(),
+            epsilon = 0.0001,
+        );
 
         assert_relative_eq!(
             sigma.values(),
@@ -222,6 +226,7 @@ mod tests {
             epsilon = 0.0001,
         );
 
+        // From `numpy.linagl.svd()`.
         let expected_vt = vec![
             -0.25138279,
             -0.39684555,
