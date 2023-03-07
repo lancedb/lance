@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Run cargo fmt
         run: cargo fmt --check
       - name: Run clippy
@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy
       - name: Run tests
         run: |
-          cargo build --all-features 
+          cargo build --all-features
           cargo test
   mac-build:
     runs-on: macos-12
