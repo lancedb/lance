@@ -1,19 +1,9 @@
-use arrow::array::{make_array, ArrayData, Int32Array};
-use arrow::ffi::{ArrowArray, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
-use arrow::ipc::RecordBatch;
 use arrow::record_batch::RecordBatchReader;
-use jni::objects::{JClass, JLongArray, JObject, JString, JValue, JValueGen};
-use jni::JNIEnv;
-use std::alloc::alloc;
-use std::fs::read;
-use std::mem::ManuallyDrop;
-
 use futures::executor;
-use jni::sys::{jclass, jlong, jlongArray, jobjectArray, jstring};
-use lance::dataset::{
-    scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
-};
+use jni::objects::{JClass, JObject, JString, JValue};
+use jni::JNIEnv;
+use lance::dataset::Dataset as LanceDataset;
 
 #[no_mangle]
 pub extern "system" fn Java_lance_JNI_saveStreamToLance<'local>(
