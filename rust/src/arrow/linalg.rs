@@ -73,11 +73,19 @@ impl MatrixView {
 
     /// Number of rows in the matrix
     pub fn num_rows(&self) -> usize {
-        self.data.len() / self.num_columns
+        if self.transpose {
+            self.num_columns
+        } else {
+            self.data.len() / self.num_columns
+        }
     }
 
     pub fn num_columns(&self) -> usize {
-        self.num_columns
+        if self.transpose {
+            self.data.len() / self.num_columns
+        } else {
+            self.num_columns
+        }
     }
 
     /// (Lazy) transpose of the matrix.
@@ -107,15 +115,15 @@ impl MatrixView {
         let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
         unsafe { c_builder.append_trusted_len_iter((0..n * m).map(|_| 0.0)) }
 
-        let trans_a = if self.transpose {
-            Transpose::Ordinary
+        let (trans_a, lda) = if self.transpose {
+            (Transpose::Ordinary, m)
         } else {
-            Transpose::None
+            (Transpose::None, k)
         };
-        let trans_b = if rhs.transpose {
-            Transpose::Ordinary
+        let (trans_b, ldb) = if rhs.transpose {
+            (Transpose::Ordinary, k)
         } else {
-            Transpose::None
+            (Transpose::None, n)
         };
         unsafe {
             sgemm(
@@ -127,9 +135,9 @@ impl MatrixView {
                 k,
                 1.0,
                 self.data.as_ref().values(),
-                k,
+                lda,
                 rhs.data.as_ref().values(),
-                n,
+                ldb,
                 0.0,
                 c_builder.values_slice_mut(),
                 n,
@@ -142,21 +150,6 @@ impl MatrixView {
             num_columns: n as usize,
             transpose: false,
         })
-    }
-}
-
-/// Dot multiply
-pub trait Dot {
-    type Output;
-
-    fn dot(&self, rhs: &Self) -> Self::Output;
-}
-
-impl Dot for FixedSizeListArray {
-    type Output = Result<Arc<FixedSizeListArray>>;
-
-    fn dot(&self, rhs: &Self) -> Self::Output {
-        todo!()
     }
 }
 
@@ -373,5 +366,43 @@ mod tests {
             expected_vt.as_slice(),
             epsilon = 0.0001,
         )
+    }
+
+    #[test]
+    fn test_matrix_dot() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::new(b_data, 2);
+
+        let c = a.dot(&b).unwrap();
+        assert_relative_eq!(
+            c.data.as_ref().values(),
+            vec![44.0, 50.0, 98.0, 113.0].as_slice(),
+        );
+    }
+
+    #[test]
+    fn test_dot_on_transposed_mat() {
+        // A[2,3]
+        let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+
+        // B[3,2]
+        let b_data = Arc::new(Float32Array::from_iter_values([
+            2.0, 3.0, 6.0, 7.0, 10.0, 11.0,
+        ]));
+        let b = MatrixView::new(b_data, 2);
+
+        let c_t = b.transpose().dot(&a.transpose()).unwrap();
+        assert_relative_eq!(
+            c_t.data.as_ref().values(),
+            vec![44.0, 98.0, 50.0, 113.0].as_slice(),
+        );
     }
 }
