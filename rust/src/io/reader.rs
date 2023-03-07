@@ -488,7 +488,7 @@ async fn read_list_array(
         page_info.length,
         positions_params,
     )
-        .await?;
+    .await?;
     println!("read_list_array position array {:?}", position_arr);
 
     let positions = as_primitive_array(position_arr.as_ref());
