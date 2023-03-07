@@ -13,7 +13,6 @@ import scala.util.Using
 
 object Main {
   def main(args: Array[String]): Unit = {
-    println("run run run")
     readDataExample()
   }
 
@@ -22,8 +21,6 @@ object Main {
     val writePath              = "/tmp/test.lance"
     println(s"read path: ${readPath}")
     val options                = new ScanOptions( /*batchSize*/ 32768)
-    // TODO why would this Using supress exceptions?
-    //    Using(new RootAllocator) { allocator =>
     val allocator              = new RootAllocator()
     println("allocator initialized")
     val factory                = new FileSystemDatasetFactory(allocator, NativeMemoryPool.getDefault, FileFormat.CSV, readPath)
@@ -33,21 +30,5 @@ object Main {
     val scanner                = dataset.newScan(options)
     println(s"schema: ${scanner.schema()}")
     JNI.saveStreamToLance(writePath, scanner.scanBatches(), allocator)
-  }
-
-  def generateDataExample(): Unit = {
-    println("Hello, World!")
-    Using(new RootAllocator()) { rootAllocator =>
-      Using(new IntVector("fixed-size-primitive-layout", rootAllocator)) { intVector =>
-        intVector.allocateNew(3)
-        intVector.set(0, 1)
-        intVector.setNull(1)
-        intVector.set(2, 2)
-        intVector.setValueCount(3)
-        println("Vector created in memory: " + intVector)
-        val path = "/tmp/example.lance"
-        lance.Dataset.fromArrow(intVector).saveToPath(path)
-      }
-    }
   }
 }

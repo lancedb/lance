@@ -7,13 +7,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/*
- * Class:     lance_JNI
- * Method:    saveToLance
- * Signature: (Ljava/lang/String;Lorg/apache/arrow/vector/FieldVector;Lorg/apache/arrow/memory/BufferAllocator;)V
- */
-JNIEXPORT void JNICALL Java_lance_JNI_saveToLance
-  (JNIEnv *, jclass, jstring, jobject, jobject);
 
 /*
  * Class:     lance_JNI
