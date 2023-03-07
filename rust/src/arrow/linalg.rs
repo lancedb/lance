@@ -58,11 +58,10 @@ pub struct MatrixView {
     pub num_columns: usize,
 
     /// Is this matrix transposed or not.
-    transpose: bool,
+    pub transpose: bool,
 }
 
 impl MatrixView {
-
     /// Create a MatrixView from a
     pub fn new(data: Arc<Float32Array>, num_columns: usize) -> Self {
         Self {
@@ -81,6 +80,8 @@ impl MatrixView {
         self.num_columns
     }
 
+    /// (Lazy) transpose of the matrix.
+    ///
     pub fn transpose(&self) -> Self {
         Self {
             data: self.data.clone(),
@@ -90,12 +91,12 @@ impl MatrixView {
     }
 
     /// Dot multiply
-    pub fn dot(&self, rhs: &MatrixView) -> Result<Self> {
-        use cblas::{sgemm, Layout};
+    pub fn dot(&self, rhs: &Self) -> Result<Self> {
+        use cblas::{sgemm, Layout, Transpose};
 
-        let m = self.num_rows();
-        let k = self.num_columns();
-        let n = rhs.num_columns();
+        let m = self.num_rows() as i32;
+        let k = self.num_columns() as i32;
+        let n = rhs.num_columns() as i32;
         if self.num_columns() != rhs.num_rows() {
             return Err(Error::Arrow(format!(
                 "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
@@ -103,12 +104,44 @@ impl MatrixView {
             )));
         }
 
-        let mut c_builder = Float32Builder::with_capacity(m * n);
+        let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
+        unsafe { c_builder.append_trusted_len_iter((0..n * m).map(|_| 0.0)) }
+
+        let trans_a = if self.transpose {
+            Transpose::Ordinary
+        } else {
+            Transpose::None
+        };
+        let trans_b = if rhs.transpose {
+            Transpose::Ordinary
+        } else {
+            Transpose::None
+        };
         unsafe {
-            c_builder.append_trusted_len_iter((0..n * m).map(|v| v as f32))
+            sgemm(
+                Layout::RowMajor,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                1.0,
+                self.data.as_ref().values(),
+                k,
+                rhs.data.as_ref().values(),
+                n,
+                0.0,
+                c_builder.values_slice_mut(),
+                n,
+            )
         }
 
-        todo!()
+        let data = Arc::new(c_builder.finish());
+        Ok(Self {
+            data,
+            num_columns: n as usize,
+            transpose: false,
+        })
     }
 }
 
@@ -118,7 +151,6 @@ pub trait Dot {
 
     fn dot(&self, rhs: &Self) -> Self::Output;
 }
-
 
 impl Dot for FixedSizeListArray {
     type Output = Result<Arc<FixedSizeListArray>>;
