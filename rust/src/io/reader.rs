@@ -541,7 +541,6 @@ mod tests {
 
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::StringDictionaryBuilder;
-    use arrow_array::types::{Int32Type, Int8Type};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
@@ -899,12 +898,11 @@ mod tests {
             Arc::new(dict_builder.finish()) as ArrayRef,
         )]));
 
-        let mut schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut batches = crate::arrow::RecordBatchBuffer::new(vec![batch.clone()]);
+        let batches = crate::arrow::RecordBatchBuffer::new(vec![batch.clone()]);
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(WriteParams::default()))
             .await

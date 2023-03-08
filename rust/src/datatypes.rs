@@ -342,7 +342,7 @@ impl Field {
             },
             DataType::Struct(mut subfields) => {
                 for (i, f) in subfields.iter_mut().enumerate() {
-                    let mut lance_field = self
+                    let lance_field = self
                         .children
                         .iter_mut()
                         .find(|c| c.name == f.name().to_string())
