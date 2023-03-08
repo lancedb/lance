@@ -299,6 +299,8 @@ impl SingularValueDecomposition for FixedSizeListArray {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use approx::assert_relative_eq;
     use arrow::datatypes::Float32Type;
 
@@ -438,5 +440,23 @@ mod tests {
             c_t.data.as_ref().values(),
             vec![44.0, 98.0, 50.0, 113.0].as_slice(),
         );
+    }
+
+    #[test]
+    fn test_sample_matrix() {
+        let a_data = Arc::new(Float32Array::from_iter((1..=20).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 2);
+
+        let samples = a.sample(5);
+        assert_eq!(samples.num_rows(), 5);
+
+        let all_values: HashSet<i64> = samples
+            .data
+            .as_ref()
+            .values()
+            .iter()
+            .map(|v| *v as i64)
+            .collect();
+        assert_eq!(all_values.len(), 5 * 2);
     }
 }
