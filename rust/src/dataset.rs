@@ -570,6 +570,7 @@ impl Dataset {
             let manifest = read_manifest(&self.object_store, path).await?;
             versions.push(Version::from(&manifest));
         }
+        versions.sort_by_key(|v| v.version);
         Ok(versions)
     }
 
