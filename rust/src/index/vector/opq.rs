@@ -19,8 +19,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeBinaryArray, Float32Array};
+use arrow_array::{FixedSizeBinaryArray, Float32Array, FixedSizeListArray};
 
+use crate::arrow::FixedSizeListArrayExt;
 use crate::arrow::linalg::MatrixView;
 use crate::Result;
 
@@ -66,12 +67,12 @@ impl OptimizedProductQuantizer {
     ) -> Result<FixedSizeBinaryArray> {
         let dim = data.num_columns();
         // Initialize R (rotation matrix)
-        let rotation = MatrixView::random(dim, dim);
+        let mut rotation = MatrixView::random(dim, dim);
         let train = data.clone();
         for i in 0..num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let train = train.dot(&rotation)?;
-            let pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+            rotation = self.train_once(&train, metric_type).await?;
         }
         todo!()
     }
@@ -79,11 +80,17 @@ impl OptimizedProductQuantizer {
     /// Train once and return the rotation matrix and PQ codebook.
     async fn train_once(&self, train: &MatrixView, metric_type: MetricType) -> Result<MatrixView> {
         let dim = train.num_columns();
-        let pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        let pq_code = pq.fit_transform(train, metric_type).await;
+        // TODO: make PQ::fit_transform work with MatrixView.
+        let fixed_list = FixedSizeListArray::try_new(train.data.as_ref(), dim as i32)?;
+        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+        let pq_code = pq.fit_transform(&fixed_list, metric_type).await?;
+        // Reconstruct Y
+        let
+
         todo!()
     }
 }
+
 
 #[cfg(test)]
 mod tests {}

@@ -285,6 +285,14 @@ impl ProductQuantizer {
         Arc::new(as_primitive_array(&arr).clone())
     }
 
+    /// Reconstruct a vector from its PQ code.
+    /// It only supports U8 for now.
+    pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
+        assert_eq!(code.len(), self.num_sub_vectors);
+        let codebook = self.codebook.as_ref().unwrap();
+        let
+    }
+
     /// Transform the vector array to PQ code array.
     async fn transform(
         &self,
@@ -417,7 +425,7 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-pub(crate) fn divide_to_subvectors(
+fn divide_to_subvectors(
     array: &FixedSizeListArray,
     m: i32,
 ) -> Vec<Arc<FixedSizeListArray>> {
