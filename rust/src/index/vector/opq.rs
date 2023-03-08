@@ -82,7 +82,7 @@ impl OptimizedProductQuantizer {
         let mut rotation = MatrixView::random(dim, dim);
         for _ in 0..num_iters {
             // Training data, this is the `X`, described in CVPR' 13
-            let train = data.dot(&rotation)?;
+            let train = train.dot(&rotation)?;
             rotation = self.train_once(&train, metric_type).await?;
         }
         self.rotation = Some(rotation);

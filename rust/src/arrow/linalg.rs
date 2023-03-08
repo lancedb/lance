@@ -316,7 +316,6 @@ mod tests {
     use std::collections::HashSet;
 
     use approx::assert_relative_eq;
-    use arrow::datatypes::Float32Type;
 
     use super::*;
 
