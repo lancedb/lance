@@ -127,7 +127,6 @@ impl<'a> DictionaryDecoder<'a> {
     }
 
     async fn decode_impl(&self, params: impl Into<ReadBatchParams>) -> Result<ArrayRef> {
-        println!("DictionaryDecoder.decode_impl {}", self.data_type);
         let index_type = if let DataType::Dictionary(key_type, _) = &self.data_type {
             assert!(key_type.as_ref().is_dictionary_key_type());
             key_type.as_ref()
@@ -138,7 +137,6 @@ impl<'a> DictionaryDecoder<'a> {
             )));
         };
 
-        println!("DictionaryDecoder.decode_impl {} {} {}", index_type, self.position, self.length);
         let decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
         let keys = decoder.get(params.into()).await?;
 
@@ -161,10 +159,7 @@ impl<'a> DictionaryDecoder<'a> {
         &self,
         index_array: ArrayRef,
     ) -> Result<ArrayRef> {
-        println!("make_dict_array: index_array {:?}", index_array);
         let keys: &PrimitiveArray<T> = as_primitive_array(index_array.as_ref());
-        println!("make_dict_array: keys {:?}", index_array);
-        println!("make_dict_array: value_array {:?}", self.value_arr);
         Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
     }
 }

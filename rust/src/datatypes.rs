@@ -8,7 +8,9 @@ use std::fmt::{self};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch, StructArray, ListArray, LargeListArray, Array};
+use arrow_array::{
+    cast::as_dictionary_array, Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -298,8 +300,6 @@ impl Field {
     /// Attach the Dictionary's value array, so that we can later serialize
     /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
-        println!("set_dictionary_values: field {} size {}", self, arr.len());
-        println!("set_dictionary_values: arr {:?}", arr);
         assert!(self.data_type().is_dictionary());
         self.dictionary = Some(Dictionary {
             offset: 0,
@@ -310,7 +310,6 @@ impl Field {
 
     fn set_dictionary(&mut self, arr: &ArrayRef) {
         let data_type = self.data_type();
-        println!("field {} data type {}", self, data_type);
         match data_type {
             DataType::Dictionary(key_type, _) => match key_type.as_ref() {
                 DataType::Int8 => {
@@ -343,25 +342,27 @@ impl Field {
             },
             DataType::Struct(mut subfields) => {
                 for (i, f) in subfields.iter_mut().enumerate() {
-                    let mut lance_field = self.children.iter_mut()
+                    let mut lance_field = self
+                        .children
+                        .iter_mut()
                         .find(|c| c.name == f.name().to_string())
                         .unwrap();
                     let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
                     lance_field.set_dictionary(struct_arr.column(i));
                 }
-            },
+            }
             DataType::List(values) => {
                 // should this be self.children[0]?
                 let mut f = Field::try_from(values.as_ref()).unwrap();
                 let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
                 f.set_dictionary(list_arr.values());
-            },
+            }
             DataType::LargeList(values) => {
                 // should this be self.children[0]?
                 let mut f = Field::try_from(values.as_ref()).unwrap();
                 let list_arr = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
                 f.set_dictionary(list_arr.values());
-            },
+            }
             _ => {
                 // Add nested struct support.
             }
@@ -490,15 +491,12 @@ impl Field {
 
     #[async_recursion]
     async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
-        println!("Field.load_dictionary: checking {}", self.name);
         if let DataType::Dictionary(_, value_type) = self.data_type() {
-            println!("Field.load_dictionary: found dict {} {}", self.name, self.data_type());
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {
                 use DataType::*;
                 match value_type.as_ref() {
                     Utf8 | Binary => {
-                        println!("Field.load_dictionary: {} reading values dict_info {:?}", self.name, dict_info);
                         dict_info.values = Some(
                             read_binary_array(
                                 reader,
@@ -510,7 +508,6 @@ impl Field {
                             )
                             .await?,
                         );
-                        println!("Field.load_dictionary: {} values {:?}", self.name, dict_info.values);
                     }
                     Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
                         dict_info.values = Some(

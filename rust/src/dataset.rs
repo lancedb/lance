@@ -174,11 +174,6 @@ impl Dataset {
         if let Some(batch) = peekable.peek() {
             if let Ok(b) = batch {
                 schema = Schema::try_from(b.schema().as_ref())?;
-                println!("dataset.write: calling set dictionary on {}", schema);
-                /// here - peak into 10 / 100 / all elements?
-                /**
-
-                **/
                 schema.set_dictionary(b)?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
@@ -627,7 +622,6 @@ async fn write_manifest_file(
 
 #[cfg(test)]
 mod tests {
-    use std::arch::asm;
     use super::*;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
@@ -1086,22 +1080,5 @@ mod tests {
             .await
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_scan_file() {
-        let dataset = Dataset::open("/Users/eto/dev/katniss/katniss-bench/data/tests/control/1678227611123.lance").await.unwrap();
-        let scanner = dataset.scan();
-
-        let stream = scanner.try_into_stream().await.unwrap();
-
-        stream.try_collect::<Vec<_>>().await.unwrap();
-            // .scan()
-            // .try_into_stream()
-            // .await
-            // .unwrap()
-            // .try_collect::<Vec<_>>()
-            // .await
-            // .unwrap();
     }
 }
