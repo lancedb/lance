@@ -539,15 +539,18 @@ async fn read_large_list_array(
 mod tests {
     use super::*;
 
+    use crate::dataset::{Dataset, WriteParams};
+    use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, NullArray, StringArray, StructArray,
-        UInt32Array, UInt8Array,
+        Array, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader,
+        StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
+    use tempfile::tempdir;
 
     use crate::io::FileWriter;
 
@@ -865,6 +868,59 @@ mod tests {
             ),
         ]));
         (arrow_schema, struct_array)
+    }
+
+    #[tokio::test]
+    async fn test_read_struct_of_dictionary_arrays() {
+        let test_dir = tempdir().unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            )]),
+            true,
+        )]));
+
+        let mut dict_builder = StringDictionaryBuilder::<UInt8Type>::new();
+        dict_builder.append("a").unwrap();
+        dict_builder.append("b").unwrap();
+        dict_builder.append("c").unwrap();
+
+        let struct_array = Arc::new(StructArray::from(vec![(
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+                false,
+            ),
+            Arc::new(dict_builder.finish()) as ArrayRef,
+        )]));
+
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let batches = crate::arrow::RecordBatchBuffer::new(vec![batch.clone()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let result = scan_dataset(test_uri).await.unwrap();
+        assert_eq!(batch, result.as_slice()[0]);
+    }
+
+    async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
+        let results = Dataset::open(uri)
+            .await?
+            .scan()
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(results)
     }
 
     #[tokio::test]

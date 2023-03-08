@@ -8,7 +8,9 @@ use std::fmt::{self};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{cast::as_dictionary_array, ArrayRef, RecordBatch};
+use arrow_array::{
+    cast::as_dictionary_array, Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -299,6 +301,7 @@ impl Field {
     /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
         assert!(self.data_type().is_dictionary());
+        // offset / length are set to 0 and recomputed when the dictionary is persisted to disk
         self.dictionary = Some(Dictionary {
             offset: 0,
             length: 0,
@@ -338,8 +341,19 @@ impl Field {
                     panic!("Unsupported dictionary key type: {}", key_type);
                 }
             },
+            DataType::Struct(mut subfields) => {
+                for (i, f) in subfields.iter_mut().enumerate() {
+                    let lance_field = self
+                        .children
+                        .iter_mut()
+                        .find(|c| c.name == f.name().to_string())
+                        .unwrap();
+                    let struct_arr = arr.as_any().downcast_ref::<StructArray>().unwrap();
+                    lance_field.set_dictionary(struct_arr.column(i));
+                }
+            }
             _ => {
-                // Add nested struct support.
+                // Add list / large list support.
             }
         }
     }
