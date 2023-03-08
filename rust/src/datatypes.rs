@@ -301,9 +301,10 @@ impl Field {
     /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
         assert!(self.data_type().is_dictionary());
+        // offset / length are set to 0 and recomputed when the dictionary is persisted to disk
         self.dictionary = Some(Dictionary {
             offset: 0,
-            length: arr.len(),
+            length: 0,
             values: Some(arr.clone()),
         });
     }
