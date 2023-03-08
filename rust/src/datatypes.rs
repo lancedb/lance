@@ -298,16 +298,19 @@ impl Field {
     /// Attach the Dictionary's value array, so that we can later serialize
     /// the dictionary to the manifest.
     pub(crate) fn set_dictionary_values(&mut self, arr: &ArrayRef) {
+        println!("set_dictionary_values: field {} size {}", self, arr.len());
+        println!("set_dictionary_values: arr {:?}", arr);
         assert!(self.data_type().is_dictionary());
         self.dictionary = Some(Dictionary {
             offset: 0,
-            length: 0,
+            length: arr.len(),
             values: Some(arr.clone()),
         });
     }
 
     fn set_dictionary(&mut self, arr: &ArrayRef) {
         let data_type = self.data_type();
+        println!("field {} data type {}", self, data_type);
         match data_type {
             DataType::Dictionary(key_type, _) => match key_type.as_ref() {
                 DataType::Int8 => {
@@ -487,12 +490,15 @@ impl Field {
 
     #[async_recursion]
     async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
+        println!("Field.load_dictionary: checking {}", self.name);
         if let DataType::Dictionary(_, value_type) = self.data_type() {
+            println!("Field.load_dictionary: found dict {} {}", self.name, self.data_type());
             assert!(self.dictionary.is_some());
             if let Some(dict_info) = self.dictionary.as_mut() {
                 use DataType::*;
                 match value_type.as_ref() {
                     Utf8 | Binary => {
+                        println!("Field.load_dictionary: {} reading values dict_info {:?}", self.name, dict_info);
                         dict_info.values = Some(
                             read_binary_array(
                                 reader,
@@ -504,6 +510,7 @@ impl Field {
                             )
                             .await?,
                         );
+                        println!("Field.load_dictionary: {} values {:?}", self.name, dict_info.values);
                     }
                     Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
                         dict_info.values = Some(
@@ -750,6 +757,7 @@ impl Schema {
     /// Load dictionary value array from manifest files.
     pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
         for field in self.fields.as_mut_slice() {
+            println!("Schema.load_dictionary: {}", field);
             field.load_dictionary(reader).await?;
         }
         Ok(())
