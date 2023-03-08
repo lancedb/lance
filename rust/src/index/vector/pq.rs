@@ -25,7 +25,6 @@ use arrow_select::take::take;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
