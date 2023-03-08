@@ -289,8 +289,17 @@ impl ProductQuantizer {
     /// It only supports U8 for now.
     pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
         assert_eq!(code.len(), self.num_sub_vectors);
-        let codebook = self.codebook.as_ref().unwrap();
-        let
+        let mut builder = Float32Builder::with_capacity(self.dimension);
+        let sub_vector_dim = self.dimension / self.num_sub_vectors;
+        for i in 0..code.len() {
+            let centroids = self.centroids(i);
+            let sub_code = code[i];
+            builder.append_slice(
+                &centroids.values()
+                    [sub_code as usize * sub_vector_dim..(sub_code as usize + 1) * sub_vector_dim],
+            );
+        }
+        Arc::new(builder.finish())
     }
 
     /// Transform the vector array to PQ code array.
@@ -343,15 +352,6 @@ impl ProductQuantizer {
 
         let values = UInt8Array::from_iter_values(pq_codebook_builder);
         FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
-    }
-
-    pub async fn fit(&mut self, data: &MatrixView, metric_type: MetricType) -> Result<()> {
-        // Dimension of dataset
-        let dim = data.num_columns();
-        assert!(dim % self.num_sub_vectors == 0);
-        let num_centroids = Self::num_centroids(self.num_bits);
-        let sub_vector_dimension = dim / self.num_sub_vectors;
-        todo!()
     }
 
     /// Train a [ProductQuantizer] using an array of vectors.
@@ -425,10 +425,7 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(
-    array: &FixedSizeListArray,
-    m: i32,
-) -> Vec<Arc<FixedSizeListArray>> {
+fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!array.is_empty());
 
     let sub_vector_length = (array.value_length() / m) as usize;

@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeBinaryArray, Float32Array, FixedSizeListArray};
+use arrow::array::{as_primitive_array, Float32Builder};
+use arrow_array::{Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, UInt8Array};
 
+use crate::arrow::linalg::*;
 use crate::arrow::FixedSizeListArrayExt;
-use crate::arrow::linalg::MatrixView;
 use crate::Result;
 
 use super::pq::ProductQuantizer;
@@ -66,10 +67,25 @@ impl OptimizedProductQuantizer {
         num_iters: usize,
     ) -> Result<FixedSizeBinaryArray> {
         let dim = data.num_columns();
+
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
+        // See in Faiss, it does not train more than `256*n_centroids` samples
+        let train = if data.num_rows() > num_centroids * 256 {
+            println!(
+                "Sample {} out of {} to train kmeans of {} dim, {} clusters",
+                256 * num_centroids,
+                data.num_rows(),
+                data.num_columns(),
+                num_centroids,
+            );
+            data.sample(num_centroids * 256)
+        } else {
+            data.clone()
+        };
+
         // Initialize R (rotation matrix)
         let mut rotation = MatrixView::random(dim, dim);
-        let train = data.clone();
-        for i in 0..num_iters {
+        for _ in 0..num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let train = train.dot(&rotation)?;
             rotation = self.train_once(&train, metric_type).await?;
@@ -81,16 +97,38 @@ impl OptimizedProductQuantizer {
     async fn train_once(&self, train: &MatrixView, metric_type: MetricType) -> Result<MatrixView> {
         let dim = train.num_columns();
         // TODO: make PQ::fit_transform work with MatrixView.
-        let fixed_list = FixedSizeListArray::try_new(train.data.as_ref(), dim as i32)?;
+        let fixed_list = FixedSizeListArray::try_new(train.data().as_ref(), dim as i32)?;
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
         let pq_code = pq.fit_transform(&fixed_list, metric_type).await?;
-        // Reconstruct Y
-        let
 
-        todo!()
+        // Reconstruct Y
+        let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
+        for i in 0..pq_code.len() {
+            let code_arr = pq_code.value(i);
+            let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
+            let reconstructed_vector = pq.reconstruct(code.values());
+            builder.append_slice(reconstructed_vector.values());
+        }
+        // Reconstructed vectors, `Y` in Section 3.1 in CVPR' 13.
+        let y_data = Arc::new(builder.finish());
+        let y = MatrixView::new(y_data, dim);
+        // Solving `min||RX - Y||` in Section 3.1 in CVPR' 13.
+        //
+        //  X * T(Y) = U * S * T(V)
+        //  R = V * T(U)
+        let x_yt = train.dot(&y.transpose())?;
+        let (u, _, vt) = x_yt.svd()?;
+        let rotation = vt.transpose().dot(&u.transpose())?;
+
+        Ok(rotation)
     }
 }
 
-
 #[cfg(test)]
-mod tests {}
+mod tests {
+
+    #[test]
+    fn test_train_opq() {
+
+    }
+}

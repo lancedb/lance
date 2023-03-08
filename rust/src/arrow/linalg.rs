@@ -23,9 +23,8 @@ use arrow::{
     array::{as_primitive_array, Float32Builder},
     datatypes::Float32Type,
 };
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
-use arrow_schema::DataType;
-use rand::{rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng, distributions::Standard};
+use arrow_array::{Array, Float32Array};
+use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
 #[allow(unused_imports)]
 #[cfg(target_os = "macos")]
@@ -35,7 +34,7 @@ use accelerate_src;
 #[cfg(target_os = "linux")]
 use openblas_src;
 
-use crate::{arrow::FixedSizeListArrayExt, Error, Result};
+use crate::{Error, Result};
 
 /// Transpose a matrix.
 fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
@@ -56,7 +55,7 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
 #[derive(Debug, Clone)]
 pub struct MatrixView {
     /// Underneath data array.
-    pub data: Arc<Float32Array>,
+    data: Arc<Float32Array>,
 
     /// The number of
     num_columns: usize,
@@ -105,6 +104,14 @@ impl MatrixView {
             self.data.len() / self.num_columns
         } else {
             self.num_columns
+        }
+    }
+
+    pub fn data(&self) -> Arc<Float32Array> {
+        if self.transpose {
+            Arc::new(transpose(self.data.as_ref().values(), self.num_columns()).into())
+        } else {
+            self.data.clone()
         }
     }
 
@@ -174,7 +181,7 @@ impl MatrixView {
 
     /// Sample `n` rows from the matrix.
     pub fn sample(&self, n: usize) -> Self {
-        let mut rng = SmallRng::from_entropy();
+        let rng = SmallRng::from_entropy();
         self.sample_with(n, rng)
     }
 
@@ -205,7 +212,7 @@ impl MatrixView {
 
 /// Single Value Decomposition.
 ///
-/// https://en.wikipedia.org/wiki/Singular_value_decomposition
+/// <https://en.wikipedia.org/wiki/Singular_value_decomposition>
 pub trait SingularValueDecomposition {
     /// Matrix type
     type Matrix;
@@ -218,7 +225,7 @@ pub trait SingularValueDecomposition {
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)>;
 }
 
-impl SingularValueDecomposition for FixedSizeListArray {
+impl SingularValueDecomposition for MatrixView {
     type Matrix = Self;
     type Sigma = Float32Array;
 
@@ -227,23 +234,14 @@ impl SingularValueDecomposition for FixedSizeListArray {
         /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesdd;
 
-        if !matches!(self.value_type(), DataType::Float32) {
-            return Err(Error::Arrow(format!(
-                "SVD only supports f32 type, got {}",
-                self.data_type()
-            )));
-        }
-
-        let m = self.len() as i32;
-        let n = self.value_length();
-        let values = self.values();
-        let flatten_values: &Float32Array = as_primitive_array(values.as_ref());
+        let m = self.num_rows() as i32;
+        let n = self.num_columns() as i32;
 
         // Solving: A = U * Sigma * Vt
         //
         // TODO: Lapacke requires a mutable reference of `A`.
         // How can we get mutable reference without copying data?
-        let mut a = transpose(flatten_values.values(), n as usize);
+        let mut a = transpose(self.data.values(), n as usize);
         // f32 array builder for matrix U.
         let mut u = vec![0.0; (m * m) as usize];
         // f32 array builder for matrix V_T
@@ -304,10 +302,10 @@ impl SingularValueDecomposition for FixedSizeListArray {
             return Err(Error::Arrow("Failed to compute SVD".to_string()));
         }
 
-        let u_values = Float32Array::from_iter_values(transpose(&u, m as usize));
-        let u = Self::try_new(&u_values, m)?;
-        let vt_values = Float32Array::from_iter_values(transpose(&vt, n as usize));
-        let vt = Self::try_new(&vt_values, n)?;
+        let u_values = Arc::new(Float32Array::from_iter_values(u));
+        let u = MatrixView::new(u_values, m as usize).transpose();
+        let vt_values = Arc::new(Float32Array::from_iter_values(vt));
+        let vt = MatrixView::new(vt_values, n as usize).transpose();
         let sigma = Float32Array::from_iter_values(sigma);
         Ok((u, sigma, vt))
     }
@@ -326,12 +324,12 @@ mod tests {
     fn test_svd() {
         // A 6 x 5 matrix, from
         // https://www.intel.com/content/www/us/en/develop/documentation/onemkl-lapack-examples/top/least-squares-and-eigenvalue-problems/singular-value-decomposition/gesvd-function/sgesvd-example/lapacke-sgesvd-example-c-row.html
-        let values = Float32Array::from_iter_values([
+        let values = Arc::new(Float32Array::from_iter_values([
             8.79, 9.93, 9.83, 5.45, 3.16, 6.11, 6.91, 5.04, -0.27, 7.98, -9.15, -7.93, 4.86, 4.85,
             3.01, 9.57, 1.64, 8.83, 0.74, 5.80, -3.49, 4.02, 9.80, 10.00, 4.27, 9.84, 0.15, -8.99,
             -6.02, -5.31,
-        ]);
-        let a = FixedSizeListArray::try_new(&values, 5).unwrap();
+        ]));
+        let a = MatrixView::new(values, 5);
 
         let (u, sigma, vt) = a.svd().unwrap();
         // Results obtained from `numpy.linalg.svd()`.
@@ -374,7 +372,7 @@ mod tests {
             0.10910681,
         ];
         assert_relative_eq!(
-            as_primitive_array::<Float32Type>(u.values().as_ref()).values(),
+            u.data().as_ref().values(),
             expected_u.as_slice(),
             epsilon = 0.0001,
         );
@@ -413,11 +411,7 @@ mod tests {
             -0.62652825,
             -0.43955169,
         ];
-        assert_relative_eq!(
-            as_primitive_array::<Float32Type>(vt.values().as_ref()).values(),
-            expected_vt.as_slice(),
-            epsilon = 0.0001,
-        )
+        assert_relative_eq!(vt.data().values(), expected_vt.as_slice(), epsilon = 0.0001,)
     }
 
     #[test]
