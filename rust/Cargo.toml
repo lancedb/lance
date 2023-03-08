@@ -24,14 +24,14 @@ categories = [
 
 [dependencies]
 bytes = "1.3"
-arrow-arith = "32.0"
-arrow-array = "32.0"
-arrow-buffer = "32.0"
-arrow-cast = "32.0.0"
-arrow-data = "32.0"
-arrow-ord = "32.0"
-arrow-schema = "32.0"
-arrow-select = "32.0"
+arrow-arith = "33.0"
+arrow-array = "33.0"
+arrow-buffer = "33.0"
+arrow-cast = "33.0.0"
+arrow-data = "33.0"
+arrow-ord = "33.0"
+arrow-schema = "33.0"
+arrow-select = "33.0"
 async-recursion = "1.0"
 async-trait = "0.1.60"
 byteorder = "1.4.3"
@@ -50,11 +50,11 @@ futures = "0.3"
 uuid = { version = "1.2", features = ["v4"] }
 path-absolutize = "3.0.14"
 shellexpand = "3.0.0"
-arrow = { version = "32.0.0", features = ["prettyprint"] }
+arrow = { version = "33.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 sqlparser = { git = "https://github.com/eto-ai/sqlparser-rs.git", branch = "lei/double_eq" }
 # TODO: use datafusion sub-modules to reduce build size?
-datafusion = { version = "18.0.0", default-features = false }
+datafusion = { version = "19.0.0", default-features = false }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 lapack = "0.19.0"
 cblas = "0.4.0"
