@@ -78,7 +78,7 @@ pub async fn flat_search(
                     Error::Schema(format!("column {} does not exist in dataset", query.column))
                 })?
                 .clone();
-            let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values();
+            let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
             let scores = tokio::task::spawn_blocking(move || {
                 mt.func()(&k, as_primitive_array(flatten_vectors.as_ref()), k.len()).unwrap()
             })
