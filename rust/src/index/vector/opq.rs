@@ -14,8 +14,6 @@
 
 //! Optimized Product Quantization
 //!
-//! [Optimized Product Quantization for Approximate Nearest Neighbor Search
-//! (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
 
 use std::sync::Arc;
 
@@ -27,6 +25,9 @@ use crate::arrow::{linalg::*, *};
 use crate::Result;
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
+///
+/// [Optimized Product Quantization for Approximate Nearest Neighbor Search
+/// (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
 pub struct OptimizedProductQuantizer {
     num_sub_vectors: usize,
 
@@ -35,6 +36,9 @@ pub struct OptimizedProductQuantizer {
 
     /// OPQ rotation
     rotation: Option<MatrixView>,
+
+    /// PQ
+    pq: Option<ProductQuantizer>,
 }
 
 impl OptimizedProductQuantizer {
@@ -51,6 +55,7 @@ impl OptimizedProductQuantizer {
             num_sub_vectors,
             num_bits,
             rotation: None,
+            pq: None,
         }
     }
 
@@ -79,18 +84,23 @@ impl OptimizedProductQuantizer {
         };
 
         // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::random(dim, dim);
+        let rotation = MatrixView::random(dim, dim);
         for _ in 0..num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let train = train.dot(&rotation)?;
-            rotation = self.train_once(&train, metric_type).await?;
+            let (rotation, pq) = self.train_once(&train, metric_type).await?;
+            self.rotation = Some(rotation);
+            self.pq = Some(pq);
         }
-        self.rotation = Some(rotation);
         Ok(())
     }
 
     /// Train once and return the rotation matrix and PQ codebook.
-    async fn train_once(&self, train: &MatrixView, metric_type: MetricType) -> Result<MatrixView> {
+    async fn train_once(
+        &self,
+        train: &MatrixView,
+        metric_type: MetricType,
+    ) -> Result<(MatrixView, ProductQuantizer)> {
         let dim = train.num_columns();
         // TODO: make PQ::fit_transform work with MatrixView.
         let fixed_list = FixedSizeListArray::try_new(train.data().as_ref(), dim as i32)?;
@@ -117,7 +127,7 @@ impl OptimizedProductQuantizer {
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
 
-        Ok(rotation)
+        Ok((rotation, pq))
     }
 }
 
@@ -140,6 +150,5 @@ mod tests {
 
         assert_eq!(opq.rotation.as_ref().unwrap().num_rows(), DIM);
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);
-
     }
 }
