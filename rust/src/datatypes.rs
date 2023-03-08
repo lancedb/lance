@@ -754,7 +754,6 @@ impl Schema {
     /// Load dictionary value array from manifest files.
     pub(crate) async fn load_dictionary<'a>(&mut self, reader: &dyn ObjectReader) -> Result<()> {
         for field in self.fields.as_mut_slice() {
-            println!("Schema.load_dictionary: {}", field);
             field.load_dictionary(reader).await?;
         }
         Ok(())
