@@ -17,15 +17,25 @@
 //! [Optimized Product Quantization for Approximate Nearest Neighbor Search
 //! (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
 
-use arrow_array::Float32Array;
+use std::sync::Arc;
+
+use arrow_array::{FixedSizeBinaryArray, Float32Array};
+
+use crate::arrow::linalg::MatrixView;
+use crate::Result;
+
+use super::pq::ProductQuantizer;
+use super::MetricType;
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
-pub struct OPQ {
-    rotation: Float32Array,
-    dimension: usize,
+pub struct OptimizedProductQuantizer {
+    num_sub_vectors: usize,
+
+    /// Number of bits to present centroids in each sub-vector.
+    num_bits: u32,
 }
 
-impl OPQ {
+impl OptimizedProductQuantizer {
     /// Train a Optimized Product Quantization.
     ///
     /// Parameters:
@@ -33,17 +43,44 @@ impl OPQ {
     /// - *data*: training dataset.
     /// - *dimension*: dimension of the training dataset.
     /// - *num_sub_vectors*: the number of sub vectors in the product quantization.
+    /// - *num_iterations*: The number of iterations to train on OPQ rotation matrix.
     pub async fn new(
         data: &Float32Array,
         dimension: usize,
         num_sub_vectors: usize,
-        num_iterations: usize,
+        num_bits: u32,
     ) -> Self {
         assert_eq!(data.len() % dimension, 0);
-
-        for i in 0..num_iterations {
-
+        Self {
+            num_sub_vectors,
+            num_bits,
         }
+    }
+
+    /// Train the opq
+    pub async fn train(
+        &mut self,
+        data: &MatrixView,
+        metric_type: MetricType,
+        num_iters: usize,
+    ) -> Result<FixedSizeBinaryArray> {
+        let dim = data.num_columns();
+        // Initialize R (rotation matrix)
+        let rotation = MatrixView::random(dim, dim);
+        let train = data.clone();
+        for i in 0..num_iters {
+            // Training data, this is the `X`, described in CVPR' 13
+            let train = train.dot(&rotation)?;
+            let pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+        }
+        todo!()
+    }
+
+    /// Train once and return the rotation matrix and PQ codebook.
+    async fn train_once(&self, train: &MatrixView, metric_type: MetricType) -> Result<MatrixView> {
+        let dim = train.num_columns();
+        let pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+        let pq_code = pq.fit_transform(train, metric_type).await;
         todo!()
     }
 }

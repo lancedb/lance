@@ -25,7 +25,7 @@ use arrow::{
 };
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
-use rand::{rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
+use rand::{rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng, distributions::Standard};
 
 #[allow(unused_imports)]
 #[cfg(target_os = "macos")]
@@ -59,15 +59,31 @@ pub struct MatrixView {
     pub data: Arc<Float32Array>,
 
     /// The number of
-    pub num_columns: usize,
+    num_columns: usize,
 
     /// Is this matrix transposed or not.
     pub transpose: bool,
 }
 
 impl MatrixView {
-    /// Create a MatrixView from a
+    /// Create a MatrixView from a f32 data.
     pub fn new(data: Arc<Float32Array>, num_columns: usize) -> Self {
+        Self {
+            data,
+            num_columns,
+            transpose: false,
+        }
+    }
+
+    /// Randomly initialize a matrix of shape `(num_rows, num_columns)`.
+    pub fn random(num_rows: usize, num_columns: usize) -> Self {
+        let mut rng = SmallRng::from_entropy();
+        let data = Arc::new(Float32Array::from_iter(
+            (&mut rng)
+                .sample_iter(Standard)
+                .take(num_columns * num_rows)
+                .collect::<Vec<f32>>(),
+        ));
         Self {
             data,
             num_columns,

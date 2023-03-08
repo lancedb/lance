@@ -25,6 +25,7 @@ use arrow_select::take::take;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
+use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
@@ -336,6 +337,15 @@ impl ProductQuantizer {
         FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
     }
 
+    pub async fn fit(&mut self, data: &MatrixView, metric_type: MetricType) -> Result<()> {
+        // Dimension of dataset
+        let dim = data.num_columns();
+        assert!(dim % self.num_sub_vectors == 0);
+        let num_centroids = Self::num_centroids(self.num_bits);
+        let sub_vector_dimension = dim / self.num_sub_vectors;
+        todo!()
+    }
+
     /// Train a [ProductQuantizer] using an array of vectors.
     pub async fn fit_transform(
         &mut self,
@@ -407,7 +417,10 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<Arc<FixedSizeListArray>> {
+pub(crate) fn divide_to_subvectors(
+    array: &FixedSizeListArray,
+    m: i32,
+) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!array.is_empty());
 
     let sub_vector_length = (array.value_length() / m) as usize;
