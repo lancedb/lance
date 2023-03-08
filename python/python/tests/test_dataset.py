@@ -52,7 +52,7 @@ def test_versions(tmp_path: Path):
 
     assert len(lance.dataset(base_dir).versions()) == 2
 
-    v2, v1 = lance.dataset(base_dir).versions()
+    v1, v2 = lance.dataset(base_dir).versions()
     assert v1["version"] == 1
     assert v2["version"] == 2
     assert isinstance(v1["timestamp"], datetime)
