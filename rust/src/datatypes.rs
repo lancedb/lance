@@ -351,20 +351,8 @@ impl Field {
                     lance_field.set_dictionary(struct_arr.column(i));
                 }
             }
-            DataType::List(values) => {
-                // should this be self.children[0]?
-                let mut f = Field::try_from(values.as_ref()).unwrap();
-                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
-                f.set_dictionary(list_arr.values());
-            }
-            DataType::LargeList(values) => {
-                // should this be self.children[0]?
-                let mut f = Field::try_from(values.as_ref()).unwrap();
-                let list_arr = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
-                f.set_dictionary(list_arr.values());
-            }
             _ => {
-                // Add nested struct support.
+                // Add list / large list support.
             }
         }
     }
