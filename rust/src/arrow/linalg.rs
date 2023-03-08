@@ -19,9 +19,13 @@
 use std::cmp::min;
 use std::sync::Arc;
 
-use arrow::array::{as_primitive_array, Float32Builder};
+use arrow::{
+    array::{as_primitive_array, Float32Builder},
+    datatypes::Float32Type,
+};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
+use rand::{rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
 #[allow(unused_imports)]
 #[cfg(target_os = "macos")]
@@ -49,7 +53,7 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
 /// A 2-D matrix view on top of Arrow Arrays.
 ///
 /// [MatrixView] does not own the data.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MatrixView {
     /// Underneath data array.
     pub data: Arc<Float32Array>,
@@ -150,6 +154,36 @@ impl MatrixView {
             num_columns: n as usize,
             transpose: false,
         })
+    }
+
+    /// Sample `n` rows from the matrix.
+    pub fn sample(&self, n: usize) -> Self {
+        let mut rng = SmallRng::from_entropy();
+        self.sample_with(n, rng)
+    }
+
+    /// Sample `n` rows with a random generator.
+    pub fn sample_with(&self, n: usize, mut rng: impl Rng) -> Self {
+        assert_eq!(
+            self.transpose, false,
+            "Does not support sampling on transposed matrix"
+        );
+        if n > self.num_rows() {
+            return self.clone();
+        }
+        let chosen = (0..self.num_rows()).choose_multiple(&mut rng, n);
+        let dim = self.num_columns();
+        let mut builder = Float32Builder::with_capacity(n * dim);
+        for idx in chosen.iter() {
+            let s = self.data.slice(idx * dim, dim);
+            builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
+        }
+        let data = Arc::new(builder.finish());
+        Self {
+            data,
+            num_columns: self.num_columns,
+            transpose: false,
+        }
     }
 }
 
@@ -265,6 +299,8 @@ impl SingularValueDecomposition for FixedSizeListArray {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use approx::assert_relative_eq;
     use arrow::datatypes::Float32Type;
 
@@ -404,5 +440,23 @@ mod tests {
             c_t.data.as_ref().values(),
             vec![44.0, 98.0, 50.0, 113.0].as_slice(),
         );
+    }
+
+    #[test]
+    fn test_sample_matrix() {
+        let a_data = Arc::new(Float32Array::from_iter((1..=20).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 2);
+
+        let samples = a.sample(5);
+        assert_eq!(samples.num_rows(), 5);
+
+        let all_values: HashSet<i64> = samples
+            .data
+            .as_ref()
+            .values()
+            .iter()
+            .map(|v| *v as i64)
+            .collect();
+        assert_eq!(all_values.len(), 5 * 2);
     }
 }
