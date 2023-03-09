@@ -21,9 +21,10 @@ use std::sync::Arc;
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
-    UInt64Array,
+    ArrayRef, ArrowPrimitiveType, Int64Array, LargeListArray, ListArray, NullArray, PrimitiveArray,
+    RecordBatch, StructArray, UInt64Array,
 };
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -459,6 +460,36 @@ async fn read_struct_array(
     Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
+/// Read the underneath value array for a var-length list or large list.
+async fn read_list_values<T: ArrowPrimitiveType>(
+    reader: &FileReader<'_>,
+    field: &Field,
+    batch_id: i32,
+    positions: &PrimitiveArray<T>,
+    params: &ReadBatchParams,
+) -> Result<ArrayRef> {
+    // Recompute params so they align with the offset array
+    let value_params = match params {
+        ReadBatchParams::Range(range) => ReadBatchParams::from(
+            positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
+        ),
+        ReadBatchParams::RangeTo(RangeTo { end }) => {
+            ReadBatchParams::from(..positions.value(*end).as_usize())
+        }
+        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(positions.value(0).as_usize()..),
+        ReadBatchParams::RangeFull => ReadBatchParams::from(
+            positions.value(0).as_usize()..positions.value(positions.len() - 1).as_usize(),
+        ),
+        ReadBatchParams::Indices(_) => {
+            return Err(Error::IO(
+                "index lookup is not supported for lists".to_string(),
+            ))
+        }
+    };
+
+    read_array(reader, &field.children[0], batch_id, &value_params).await
+}
+
 async fn read_list_array(
     reader: &FileReader<'_>,
     field: &Field,
@@ -487,25 +518,7 @@ async fn read_list_array(
     let start_position: i32 = positions.value(0);
 
     // Recompute params so they align with the offset array
-    let value_params = match params {
-        ReadBatchParams::Range(range) => ReadBatchParams::from(
-            positions.value(0) as usize..positions.value(range.end - range.start) as usize,
-        ),
-        ReadBatchParams::RangeTo(RangeTo { end }) => {
-            ReadBatchParams::from(..positions.value(*end) as usize)
-        }
-        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(positions.value(0) as usize..),
-        ReadBatchParams::RangeFull => ReadBatchParams::from(
-            positions.value(0) as usize..positions.value(positions.len() - 1) as usize,
-        ),
-        ReadBatchParams::Indices(_) => {
-            return Err(Error::IO(
-                "index lookup is not supported for lists".to_string(),
-            ))
-        }
-    };
-
-    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
+    let value_arrs = read_list_values(reader, field, batch_id, positions, params).await?;
     let offset_arr = subtract_scalar(positions, start_position)?;
     Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
 }
@@ -530,7 +543,7 @@ async fn read_large_list_array(
     let start_position = positions.value(0);
     // Compute offsets
     let offset_arr = subtract_scalar(positions, start_position)?;
-    let value_arrs = read_array(reader, &field.children[0], batch_id, params).await?;
+    let value_arrs = read_list_values(reader, field, batch_id, positions, params).await?;
 
     Ok(Arc::new(LargeListArray::try_new(value_arrs, &offset_arr)?))
 }
