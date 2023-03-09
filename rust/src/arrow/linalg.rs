@@ -218,7 +218,8 @@ impl MatrixView {
         let tau_size = min(m, n) as usize;
         let mut tau = vec![0.0; tau_size];
 
-        let data = self.data();
+        // Need to be column major for LAPACK
+        let data = self.transpose().data();
         let mut builder = Float32Builder::with_capacity(self.data.len());
         builder.append_slice(data.as_ref().values());
 
@@ -547,5 +548,14 @@ mod tests {
             .map(|v| *v as i64)
             .collect();
         assert_eq!(all_values.len(), 5 * 2);
+    }
+
+    #[test]
+    fn test_qr() {
+        let a_data = Arc::new(Float32Array::from_iter((1..=16).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 4);
+
+        let q = a.qr().unwrap();
+        println!("Q={:?}", q);
     }
 }
