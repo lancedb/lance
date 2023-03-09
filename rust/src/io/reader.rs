@@ -14,16 +14,18 @@
 
 //! Lance Data File Reader
 
-use std::io::Read;
 // Standard
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
+use arrow::array::PrimitiveBuilder;
+use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, ArrowPrimitiveType, GenericListArray, Int64Array, LargeListArray, ListArray,
-    NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, ArrowPrimitiveType, GenericListArray,
+    Int64Array, LargeListArray, ListArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    StructArray, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -462,13 +464,16 @@ async fn read_struct_array(
 }
 
 /// Read the underneath value array for a var-length list or large list.
-async fn read_list_values<T: ArrowPrimitiveType>(
+async fn read_list_values<T: ArrowNumericType>(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
     positions: &PrimitiveArray<T>,
     params: &ReadBatchParams,
-) -> Result<ArrayRef> {
+) -> Result<ArrayRef>
+where
+    T::Native: ArrowNativeTypeOp + OffsetSizeTrait,
+{
     // Recompute params so they align with the offset array
     let value_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(
@@ -488,23 +493,43 @@ async fn read_list_values<T: ArrowPrimitiveType>(
                 .values()
                 .iter()
                 .map(|i| (*i - first_idx).as_usize())
-                .map(|idx| positions.value(idx).as_usize()..positions.value(idx + 1).as_usize());
+                .map(|idx| positions.value(idx).as_usize()..positions.value(idx + 1).as_usize())
+                .collect::<Vec<_>>();
             let field = field.clone();
             let mut list_values: Vec<ArrayRef> = vec![];
-            for range in ranges {
-                list_values.push(read_array(reader, &field, batch_id, &range.into()).await?);
+            for range in ranges.iter() {
+                list_values.push(
+                    read_array(
+                        reader,
+                        &field.children[0],
+                        batch_id,
+                        &(range.clone()).into(),
+                    )
+                    .await?,
+                );
             }
 
             let value_refs = list_values
                 .iter()
                 .map(|arr| arr.as_ref())
                 .collect::<Vec<_>>();
-
-            return Ok(concat(value_refs.as_slice())?);
+            let mut offsets_builder = PrimitiveBuilder::<T>::new();
+            offsets_builder.append_value(T::Native::usize_as(0));
+            let mut off = 0_usize;
+            for range in ranges {
+                off += range.len();
+                offsets_builder.append_value(T::Native::usize_as(off));
+            }
+            let all_values = concat(value_refs.as_slice())?;
+            let offset_arr = offsets_builder.finish();
+            return Ok(Arc::new(GenericListArray::try_new(all_values, &offset_arr)?) as ArrayRef);
         }
     };
 
-    read_array(reader, &field, batch_id, &value_params).await
+    let start_position = positions.value(0);
+    let offset_arr = subtract_scalar(positions, start_position)?;
+    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
+    Ok(Arc::new(GenericListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
 }
 
 async fn read_list_array(
@@ -534,13 +559,8 @@ async fn read_list_array(
     .await?;
 
     let positions = as_primitive_array(position_arr.as_ref());
-    let start_position: i32 = positions.value(0);
-
     // Recompute params so they align with the offset array
-    let child_field = field.children[0].clone();
-    let value_arrs = read_list_values(reader, &child_field, batch_id, positions, params).await?;
-    let offset_arr = subtract_scalar(positions, start_position)?;
-    Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
+    Ok(read_list_values::<Int32Type>(reader, &field, batch_id, positions, params).await?)
 }
 
 // TODO: merge with [read_list_array]?
@@ -560,13 +580,8 @@ async fn read_large_list_array(
     )
     .await?;
     let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
-    let start_position = positions.value(0);
     // Compute offsets
-    let offset_arr = subtract_scalar(positions, start_position)?;
-    let child_field = field.children[0].clone();
-    let value_arrs = read_list_values(reader, &child_field, batch_id, positions, params).await?;
-
-    Ok(Arc::new(LargeListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
+    Ok(read_list_values::<Int64Type>(reader, &field, batch_id, positions, params).await?)
 }
 
 #[cfg(test)]

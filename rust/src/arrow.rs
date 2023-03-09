@@ -18,10 +18,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::as_struct_array;
+use arrow::{array::as_struct_array, datatypes::Int32Type};
 use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Int32Array, Int64Array,
-    LargeListArray, ListArray, RecordBatch, UInt8Array,
+    Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
+    Int32Array, Int64Array, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Schema};
@@ -128,7 +129,10 @@ impl DataTypeExt for DataType {
     }
 }
 
-pub trait ListArrayExt {
+pub trait ListArrayExt<Offset: ArrowNumericType>
+where
+    Offset::Native: OffsetSizeTrait,
+{
     /// Create an [`ListArray`] from values and offsets.
     ///
     /// ```
@@ -146,11 +150,17 @@ pub trait ListArrayExt {
     ///         Some(vec![Some(7), Some(8), Some(9)]),
     /// ]))
     /// ```
-    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<ListArray>;
+    fn try_new<T: Array>(
+        values: T,
+        offsets: &PrimitiveArray<Offset>,
+    ) -> Result<GenericListArray<Offset::Native>>;
 }
 
-impl ListArrayExt for ListArray {
-    fn try_new<T: Array>(values: T, offsets: &Int32Array) -> Result<Self> {
+impl<Offset: ArrowNumericType> ListArrayExt<Offset> for GenericListArray<Offset::Native>
+where
+    Offset::Native: OffsetSizeTrait,
+{
+    fn try_new<T: Array>(values: T, offsets: &PrimitiveArray<Offset>) -> Result<Self> {
         let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
             "item",
             values.data_type().clone(),
@@ -165,26 +175,26 @@ impl ListArrayExt for ListArray {
     }
 }
 
-// TODO: merge with ListArrayExt?;
-pub trait LargeListArrayExt {
-    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<LargeListArray>;
-}
+// // TODO: merge with ListArrayExt?;
+// pub trait LargeListArrayExt {
+//     fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<LargeListArray>;
+// }
 
-impl LargeListArrayExt for LargeListArray {
-    fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
-        let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
-            "item",
-            values.data_type().clone(),
-            true,
-        ))))
-        .len(offsets.len() - 1)
-        .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data())
-        .build()?;
+// impl LargeListArrayExt for LargeListArray {
+//     fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
+//         let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
+//             "item",
+//             values.data_type().clone(),
+//             true,
+//         ))))
+//         .len(offsets.len() - 1)
+//         .add_buffer(offsets.into_data().buffers()[0].clone())
+//         .add_child_data(values.into_data())
+//         .build()?;
 
-        Ok(Self::from(data))
-    }
-}
+//         Ok(Self::from(data))
+//     }
+// }
 
 pub trait FixedSizeListArrayExt {
     /// Create an [`FixedSizeListArray`] from values and list size.
