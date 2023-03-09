@@ -175,10 +175,10 @@ where
             )))
         };
         let data = ArrayDataBuilder::new(data_type)
-        .len(offsets.len() - 1)
-        .add_buffer(offsets.into_data().buffers()[0].clone())
-        .add_child_data(values.into_data())
-        .build()?;
+            .len(offsets.len() - 1)
+            .add_buffer(offsets.into_data().buffers()[0].clone())
+            .add_child_data(values.into_data())
+            .build()?;
 
         Ok(Self::from(data))
     }

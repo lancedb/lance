@@ -23,9 +23,8 @@ use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, ArrowPrimitiveType, GenericListArray,
-    Int64Array, LargeListArray, ListArray, NullArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StructArray, UInt64Array,
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, GenericListArray, Int64Array, NullArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -317,8 +316,8 @@ async fn read_array(
             }
             Struct(_) => read_struct_array(reader, field, batch_id, params).await,
             Dictionary(_, _) => read_dictionary_array(reader, field, batch_id, params).await,
-            List(_) => read_list_array(reader, field, batch_id, params).await,
-            LargeList(_) => read_large_list_array(reader, field, batch_id, params).await,
+            List(_) => read_list_array::<Int32Type>(reader, field, batch_id, params).await,
+            LargeList(_) => read_list_array::<Int64Type>(reader, field, batch_id, params).await,
             _ => {
                 unimplemented!("{}", format!("No support for {data_type} yet"));
             }
@@ -463,17 +462,37 @@ async fn read_struct_array(
     Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
-/// Read the underneath value array for a var-length list or large list.
-async fn read_list_values<T: ArrowNumericType>(
+async fn read_list_array<T: ArrowNumericType>(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
-    positions: &PrimitiveArray<T>,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef>
 where
     T::Native: ArrowNativeTypeOp + OffsetSizeTrait,
 {
+    // Offset the position array by 1 in order to include the upper bound of the last element
+    let positions_params = match params {
+        ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
+        ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
+        ReadBatchParams::Indices(indices) => {
+            (indices.value(0).as_usize()..indices.value(indices.len() - 1).as_usize() + 2).into()
+        }
+        p => p.clone(),
+    };
+
+    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
+    let position_arr = read_fixed_stride_array(
+        reader.object_reader.as_ref(),
+        &T::DATA_TYPE,
+        page_info.position,
+        page_info.length,
+        positions_params,
+    )
+    .await?;
+
+    let positions: &PrimitiveArray<T> = as_primitive_array(position_arr.as_ref());
+
     // Recompute params so they align with the offset array
     let value_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(
@@ -532,64 +551,11 @@ where
     Ok(Arc::new(GenericListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
 }
 
-async fn read_list_array(
-    reader: &FileReader<'_>,
-    field: &Field,
-    batch_id: i32,
-    params: &ReadBatchParams,
-) -> Result<ArrayRef> {
-    // Offset the position array by 1 in order to include the upper bound of the last element
-    let positions_params = match params {
-        ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
-        ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
-        ReadBatchParams::Indices(indices) => {
-            (indices.value(0).as_usize()..indices.value(indices.len() - 1).as_usize() + 2).into()
-        }
-        p => p.clone(),
-    };
-
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    let position_arr = read_fixed_stride_array(
-        reader.object_reader.as_ref(),
-        &DataType::Int32,
-        page_info.position,
-        page_info.length,
-        positions_params,
-    )
-    .await?;
-
-    let positions = as_primitive_array(position_arr.as_ref());
-    // Recompute params so they align with the offset array
-    Ok(read_list_values::<Int32Type>(reader, &field, batch_id, positions, params).await?)
-}
-
-// TODO: merge with [read_list_array]?
-async fn read_large_list_array(
-    reader: &FileReader<'_>,
-    field: &Field,
-    batch_id: i32,
-    params: &ReadBatchParams,
-) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    let position_arr = read_fixed_stride_array(
-        reader.object_reader.as_ref(),
-        &DataType::Int64,
-        page_info.position,
-        page_info.length,
-        params,
-    )
-    .await?;
-    let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
-    // Compute offsets
-    Ok(read_list_values::<Int64Type>(reader, &field, batch_id, positions, params).await?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::dataset::{Dataset, WriteParams};
-    use arrow::array::Float32Builder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
@@ -1073,7 +1039,7 @@ mod tests {
 
         // write to a lance file
         let store = ObjectStore::memory();
-        let path = Path::from("/takes");
+        let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         file_writer.write(&batch).await.unwrap();
@@ -1081,7 +1047,17 @@ mod tests {
 
         // read the file back
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.take(&[1, 3, 5], &schema).await.unwrap();
-        println!("Actual data: {:?}", actual);
+        let actual = reader.take(&[1, 3, 5, 9], &schema).await.unwrap();
+
+        let value_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(value_builder);
+        for i in [1, 3, 5, 9] {
+            for j in 0..10 {
+                list_builder.values().append_value(i * 10 + j);
+            }
+            list_builder.append(true);
+        }
+        let expect = list_builder.finish();
+        assert_eq!(actual.column_by_name("l").unwrap().as_ref(), &expect);
     }
 }
