@@ -23,8 +23,8 @@ use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, GenericListArray, Int64Array, NullArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt64Array,
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, GenericListArray, NullArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -462,6 +462,55 @@ async fn read_struct_array(
     Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
+async fn take_list_array<T: ArrowNumericType>(
+    reader: &FileReader<'_>,
+    field: &Field,
+    batch_id: i32,
+    positions: &PrimitiveArray<T>,
+    indices: &UInt32Array,
+) -> Result<ArrayRef>
+where
+    T::Native: ArrowNativeTypeOp + OffsetSizeTrait,
+{
+    let first_idx = indices.value(0);
+    // Range of values for each index
+    let ranges = indices
+        .values()
+        .iter()
+        .map(|i| (*i - first_idx).as_usize())
+        .map(|idx| positions.value(idx).as_usize()..positions.value(idx + 1).as_usize())
+        .collect::<Vec<_>>();
+    let field = field.clone();
+    let mut list_values: Vec<ArrayRef> = vec![];
+    // TODO: read them in parallel.
+    for range in ranges.iter() {
+        list_values.push(
+            read_array(
+                reader,
+                &field.children[0],
+                batch_id,
+                &(range.clone()).into(),
+            )
+            .await?,
+        );
+    }
+
+    let value_refs = list_values
+        .iter()
+        .map(|arr| arr.as_ref())
+        .collect::<Vec<_>>();
+    let mut offsets_builder = PrimitiveBuilder::<T>::new();
+    offsets_builder.append_value(T::Native::usize_as(0));
+    let mut off = 0_usize;
+    for range in ranges {
+        off += range.len();
+        offsets_builder.append_value(T::Native::usize_as(off));
+    }
+    let all_values = concat(value_refs.as_slice())?;
+    let offset_arr = offsets_builder.finish();
+    Ok(Arc::new(GenericListArray::try_new(all_values, &offset_arr)?) as ArrayRef)
+}
+
 async fn read_list_array<T: ArrowNumericType>(
     reader: &FileReader<'_>,
     field: &Field,
@@ -506,42 +555,7 @@ where
             positions.value(0).as_usize()..positions.value(positions.len() - 1).as_usize(),
         ),
         ReadBatchParams::Indices(indices) => {
-            let first_idx = indices.value(0);
-            // Range of values for each index
-            let ranges = indices
-                .values()
-                .iter()
-                .map(|i| (*i - first_idx).as_usize())
-                .map(|idx| positions.value(idx).as_usize()..positions.value(idx + 1).as_usize())
-                .collect::<Vec<_>>();
-            let field = field.clone();
-            let mut list_values: Vec<ArrayRef> = vec![];
-            for range in ranges.iter() {
-                list_values.push(
-                    read_array(
-                        reader,
-                        &field.children[0],
-                        batch_id,
-                        &(range.clone()).into(),
-                    )
-                    .await?,
-                );
-            }
-
-            let value_refs = list_values
-                .iter()
-                .map(|arr| arr.as_ref())
-                .collect::<Vec<_>>();
-            let mut offsets_builder = PrimitiveBuilder::<T>::new();
-            offsets_builder.append_value(T::Native::usize_as(0));
-            let mut off = 0_usize;
-            for range in ranges {
-                off += range.len();
-                offsets_builder.append_value(T::Native::usize_as(off));
-            }
-            let all_values = concat(value_refs.as_slice())?;
-            let offset_arr = offsets_builder.finish();
-            return Ok(Arc::new(GenericListArray::try_new(all_values, &offset_arr)?) as ArrayRef);
+            return take_list_array(reader, field, batch_id, positions, indices).await;
         }
     };
 

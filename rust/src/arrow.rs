@@ -18,11 +18,10 @@
 
 use std::sync::Arc;
 
-use arrow::{array::as_struct_array, datatypes::Int32Type};
+use arrow::array::as_struct_array;
 use arrow_array::{
     Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
-    Int32Array, Int64Array, LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, UInt8Array,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field, Schema};
