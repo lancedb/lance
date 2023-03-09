@@ -556,6 +556,7 @@ mod tests {
     use super::*;
 
     use crate::dataset::{Dataset, WriteParams};
+    use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
@@ -1017,25 +1018,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_lists() {
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
-            "l",
-            DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
-            false,
-        )]);
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "l",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+            ArrowField::new(
+                "ll",
+                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]);
 
         let value_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(value_builder);
+        let ll_value_builder = Int32Builder::new();
+        let mut large_list_builder = LargeListBuilder::new(ll_value_builder);
         for i in 0..100 {
             list_builder.values().append_value(i);
+            large_list_builder.values().append_value(i);
             if (i + 1) % 10 == 0 {
                 list_builder.append(true);
+                large_list_builder.append(true);
             }
         }
         let list_arr = Arc::new(list_builder.finish());
+        let large_list_arr = Arc::new(large_list_builder.finish());
 
-        let batch =
-            RecordBatch::try_new(Arc::new(arrow_schema.clone()), vec![list_arr as ArrayRef])
-                .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![list_arr as ArrayRef, large_list_arr as ArrayRef],
+        )
+        .unwrap();
 
         // write to a lance file
         let store = ObjectStore::memory();
@@ -1051,13 +1066,23 @@ mod tests {
 
         let value_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(value_builder);
+        let ll_value_builder = Int32Builder::new();
+        let mut large_list_builder = LargeListBuilder::new(ll_value_builder);
         for i in [1, 3, 5, 9] {
             for j in 0..10 {
                 list_builder.values().append_value(i * 10 + j);
+                large_list_builder.values().append_value(i * 10 + j);
             }
             list_builder.append(true);
+            large_list_builder.append(true);
         }
-        let expect = list_builder.finish();
-        assert_eq!(actual.column_by_name("l").unwrap().as_ref(), &expect);
+        let expected_list = list_builder.finish();
+        let expected_large_list = large_list_builder.finish();
+
+        assert_eq!(actual.column_by_name("l").unwrap().as_ref(), &expected_list);
+        assert_eq!(
+            actual.column_by_name("ll").unwrap().as_ref(),
+            &expected_large_list
+        );
     }
 }
