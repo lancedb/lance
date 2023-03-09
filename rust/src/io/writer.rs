@@ -378,6 +378,7 @@ mod tests {
         let large_list_offsets: Int64Array = (0..202).step_by(2).collect();
         let large_list_values =
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
+        println!("List offsets: {:?}", large_list_offsets);
         let large_list_arr =
             LargeListArray::try_new(large_list_values, &large_list_offsets).unwrap();
 

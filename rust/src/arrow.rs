@@ -129,7 +129,7 @@ impl DataTypeExt for DataType {
     }
 }
 
-pub trait ListArrayExt<Offset: ArrowNumericType>
+pub trait GenericListArrayExt<Offset: ArrowNumericType>
 where
     Offset::Native: OffsetSizeTrait,
 {
@@ -138,7 +138,7 @@ where
     /// ```
     /// use arrow_array::{Int32Array, Int64Array, ListArray};
     /// use arrow_array::types::Int64Type;
-    /// use lance::arrow::ListArrayExt;
+    /// use lance::arrow::GenericListArrayExt;
     ///
     /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
     /// let int_values = Int64Array::from_iter(0..10);
@@ -156,16 +156,25 @@ where
     ) -> Result<GenericListArray<Offset::Native>>;
 }
 
-impl<Offset: ArrowNumericType> ListArrayExt<Offset> for GenericListArray<Offset::Native>
+impl<Offset: ArrowNumericType> GenericListArrayExt<Offset> for GenericListArray<Offset::Native>
 where
     Offset::Native: OffsetSizeTrait,
 {
     fn try_new<T: Array>(values: T, offsets: &PrimitiveArray<Offset>) -> Result<Self> {
-        let data = ArrayDataBuilder::new(DataType::List(Box::new(Field::new(
-            "item",
-            values.data_type().clone(),
-            true,
-        ))))
+        let data_type = if Offset::Native::IS_LARGE {
+            DataType::LargeList(Box::new(Field::new(
+                "item",
+                values.data_type().clone(),
+                true,
+            )))
+        } else {
+            DataType::List(Box::new(Field::new(
+                "item",
+                values.data_type().clone(),
+                true,
+            )))
+        };
+        let data = ArrayDataBuilder::new(data_type)
         .len(offsets.len() - 1)
         .add_buffer(offsets.into_data().buffers()[0].clone())
         .add_child_data(values.into_data())
@@ -174,27 +183,6 @@ where
         Ok(Self::from(data))
     }
 }
-
-// // TODO: merge with ListArrayExt?;
-// pub trait LargeListArrayExt {
-//     fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<LargeListArray>;
-// }
-
-// impl LargeListArrayExt for LargeListArray {
-//     fn try_new<T: Array>(values: T, offsets: &Int64Array) -> Result<Self> {
-//         let data = ArrayDataBuilder::new(DataType::LargeList(Box::new(Field::new(
-//             "item",
-//             values.data_type().clone(),
-//             true,
-//         ))))
-//         .len(offsets.len() - 1)
-//         .add_buffer(offsets.into_data().buffers()[0].clone())
-//         .add_child_data(values.into_data())
-//         .build()?;
-
-//         Ok(Self::from(data))
-//     }
-// }
 
 pub trait FixedSizeListArrayExt {
     /// Create an [`FixedSizeListArray`] from values and list size.
