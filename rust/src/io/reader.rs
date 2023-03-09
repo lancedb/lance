@@ -18,14 +18,17 @@
 use std::ops::{Range, RangeTo};
 use std::sync::Arc;
 
+use arrow::array::PrimitiveBuilder;
+use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, Int64Array, LargeListArray, ListArray, NullArray, RecordBatch, StructArray,
-    UInt64Array,
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, GenericListArray, NullArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::concat::concat_batches;
+use arrow_select::concat::{concat, concat_batches};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use futures::stream::{self, Stream, TryStreamExt};
@@ -211,7 +214,7 @@ impl<'a> FileReader<'a> {
                 self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                     .await
             })
-            .buffered(8)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(ArrowSchema::from(projection));
@@ -313,8 +316,8 @@ async fn read_array(
             }
             Struct(_) => read_struct_array(reader, field, batch_id, params).await,
             Dictionary(_, _) => read_dictionary_array(reader, field, batch_id, params).await,
-            List(_) => read_list_array(reader, field, batch_id, params).await,
-            LargeList(_) => read_large_list_array(reader, field, batch_id, params).await,
+            List(_) => read_list_array::<Int32Type>(reader, field, batch_id, params).await,
+            LargeList(_) => read_list_array::<Int64Type>(reader, field, batch_id, params).await,
             _ => {
                 unimplemented!("{}", format!("No support for {data_type} yet"));
             }
@@ -459,80 +462,107 @@ async fn read_struct_array(
     Ok(Arc::new(StructArray::from(sub_arrays)))
 }
 
-async fn read_list_array(
+async fn take_list_array<T: ArrowNumericType>(
+    reader: &FileReader<'_>,
+    field: &Field,
+    batch_id: i32,
+    positions: &PrimitiveArray<T>,
+    indices: &UInt32Array,
+) -> Result<ArrayRef>
+where
+    T::Native: ArrowNativeTypeOp + OffsetSizeTrait,
+{
+    let first_idx = indices.value(0);
+    // Range of values for each index
+    let ranges = indices
+        .values()
+        .iter()
+        .map(|i| (*i - first_idx).as_usize())
+        .map(|idx| positions.value(idx).as_usize()..positions.value(idx + 1).as_usize())
+        .collect::<Vec<_>>();
+    let field = field.clone();
+    let mut list_values: Vec<ArrayRef> = vec![];
+    // TODO: read them in parallel.
+    for range in ranges.iter() {
+        list_values.push(
+            read_array(
+                reader,
+                &field.children[0],
+                batch_id,
+                &(range.clone()).into(),
+            )
+            .await?,
+        );
+    }
+
+    let value_refs = list_values
+        .iter()
+        .map(|arr| arr.as_ref())
+        .collect::<Vec<_>>();
+    let mut offsets_builder = PrimitiveBuilder::<T>::new();
+    offsets_builder.append_value(T::Native::usize_as(0));
+    let mut off = 0_usize;
+    for range in ranges {
+        off += range.len();
+        offsets_builder.append_value(T::Native::usize_as(off));
+    }
+    let all_values = concat(value_refs.as_slice())?;
+    let offset_arr = offsets_builder.finish();
+    Ok(Arc::new(GenericListArray::try_new(all_values, &offset_arr)?) as ArrayRef)
+}
+
+async fn read_list_array<T: ArrowNumericType>(
     reader: &FileReader<'_>,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
-) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-
+) -> Result<ArrayRef>
+where
+    T::Native: ArrowNativeTypeOp + OffsetSizeTrait,
+{
     // Offset the position array by 1 in order to include the upper bound of the last element
     let positions_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(range.start..(range.end + 1)),
         ReadBatchParams::RangeTo(range) => ReadBatchParams::from(..range.end + 1),
+        ReadBatchParams::Indices(indices) => {
+            (indices.value(0).as_usize()..indices.value(indices.len() - 1).as_usize() + 2).into()
+        }
         p => p.clone(),
     };
 
+    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
     let position_arr = read_fixed_stride_array(
         reader.object_reader.as_ref(),
-        &DataType::Int32,
+        &T::DATA_TYPE,
         page_info.position,
         page_info.length,
         positions_params,
     )
     .await?;
 
-    let positions = as_primitive_array(position_arr.as_ref());
-    let start_position: i32 = positions.value(0);
+    let positions: &PrimitiveArray<T> = as_primitive_array(position_arr.as_ref());
 
     // Recompute params so they align with the offset array
     let value_params = match params {
         ReadBatchParams::Range(range) => ReadBatchParams::from(
-            positions.value(0) as usize..positions.value(range.end - range.start) as usize,
+            positions.value(0).as_usize()..positions.value(range.end - range.start).as_usize(),
         ),
         ReadBatchParams::RangeTo(RangeTo { end }) => {
-            ReadBatchParams::from(..positions.value(*end) as usize)
+            ReadBatchParams::from(..positions.value(*end).as_usize())
         }
-        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(positions.value(0) as usize..),
+        ReadBatchParams::RangeFrom(_) => ReadBatchParams::from(positions.value(0).as_usize()..),
         ReadBatchParams::RangeFull => ReadBatchParams::from(
-            positions.value(0) as usize..positions.value(positions.len() - 1) as usize,
+            positions.value(0).as_usize()..positions.value(positions.len() - 1).as_usize(),
         ),
-        ReadBatchParams::Indices(_) => {
-            return Err(Error::IO(
-                "index lookup is not supported for lists".to_string(),
-            ))
+        ReadBatchParams::Indices(indices) => {
+            return take_list_array(reader, field, batch_id, positions, indices).await;
         }
     };
 
-    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
-    let offset_arr = subtract_scalar(positions, start_position)?;
-    Ok(Arc::new(ListArray::try_new(value_arrs, &offset_arr)?))
-}
-
-// TODO: merge with [read_list_array]?
-async fn read_large_list_array(
-    reader: &FileReader<'_>,
-    field: &Field,
-    batch_id: i32,
-    params: &ReadBatchParams,
-) -> Result<ArrayRef> {
-    let page_info = get_page_info(&reader.page_table, field, batch_id)?;
-    let position_arr = read_fixed_stride_array(
-        reader.object_reader.as_ref(),
-        &DataType::Int64,
-        page_info.position,
-        page_info.length,
-        params,
-    )
-    .await?;
-    let positions: &Int64Array = as_primitive_array(position_arr.as_ref());
     let start_position = positions.value(0);
-    // Compute offsets
     let offset_arr = subtract_scalar(positions, start_position)?;
-    let value_arrs = read_array(reader, &field.children[0], batch_id, params).await?;
-
-    Ok(Arc::new(LargeListArray::try_new(value_arrs, &offset_arr)?))
+    let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
+    Ok(Arc::new(GenericListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
 }
 
 #[cfg(test)]
@@ -540,6 +570,7 @@ mod tests {
     use super::*;
 
     use crate::dataset::{Dataset, WriteParams};
+    use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
@@ -997,5 +1028,75 @@ mod tests {
         let params = ReadBatchParams::RangeTo(..107);
         let arr = read_array(&reader, &schema.fields[1], 0, &params);
         assert!(arr.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take_lists() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "l",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+            ArrowField::new(
+                "ll",
+                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]);
+
+        let value_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(value_builder);
+        let ll_value_builder = Int32Builder::new();
+        let mut large_list_builder = LargeListBuilder::new(ll_value_builder);
+        for i in 0..100 {
+            list_builder.values().append_value(i);
+            large_list_builder.values().append_value(i);
+            if (i + 1) % 10 == 0 {
+                list_builder.append(true);
+                large_list_builder.append(true);
+            }
+        }
+        let list_arr = Arc::new(list_builder.finish());
+        let large_list_arr = Arc::new(large_list_builder.finish());
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![list_arr as ArrayRef, large_list_arr as ArrayRef],
+        )
+        .unwrap();
+
+        // write to a lance file
+        let store = ObjectStore::memory();
+        let path = Path::from("/take_list");
+        let schema: Schema = (&arrow_schema).try_into().unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        // read the file back
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[1, 3, 5, 9], &schema).await.unwrap();
+
+        let value_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(value_builder);
+        let ll_value_builder = Int32Builder::new();
+        let mut large_list_builder = LargeListBuilder::new(ll_value_builder);
+        for i in [1, 3, 5, 9] {
+            for j in 0..10 {
+                list_builder.values().append_value(i * 10 + j);
+                large_list_builder.values().append_value(i * 10 + j);
+            }
+            list_builder.append(true);
+            large_list_builder.append(true);
+        }
+        let expected_list = list_builder.finish();
+        let expected_large_list = large_list_builder.finish();
+
+        assert_eq!(actual.column_by_name("l").unwrap().as_ref(), &expected_list);
+        assert_eq!(
+            actual.column_by_name("ll").unwrap().as_ref(),
+            &expected_large_list
+        );
     }
 }
