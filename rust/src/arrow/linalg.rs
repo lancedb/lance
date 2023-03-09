@@ -208,6 +208,80 @@ impl MatrixView {
             transpose: false,
         }
     }
+
+    /// Compute the Q in QR decomposition.
+    pub(crate) fn qr(&self) -> Result<Self> {
+        use lapack::{sgeqrf, sorgqr};
+        // See faiss `matrix_qr()`.
+        let m = self.num_rows() as i32;
+        let n = self.num_columns() as i32;
+        let tau_size = min(m, n) as usize;
+        let mut tau = vec![0.0; tau_size];
+
+        let data = self.data();
+        let mut builder = Float32Builder::with_capacity(self.data.len());
+        builder.append_slice(data.as_ref().values());
+
+        let lwork: i32 = -1;
+        let mut info: i32 = 0;
+        let mut work = vec![0.0; 1];
+        unsafe {
+            sgeqrf(
+                m,
+                n,
+                builder.values_slice_mut(),
+                m,
+                tau.as_mut_slice(),
+                work.as_mut_slice(),
+                lwork,
+                &mut info,
+            );
+        }
+        if info != 0 {
+            return Err(Error::Arrow("failed to compute QR (sgeqrf) for matrix".to_string()));
+        }
+        let lwork = work[0] as i32;
+        let mut work = vec![0.0; lwork as usize];
+
+        unsafe {
+            sgeqrf(
+                m,
+                n,
+                builder.values_slice_mut(),
+                m,
+                tau.as_mut_slice(),
+                work.as_mut_slice(),
+                lwork,
+                &mut info,
+            );
+        }
+        if info != 0 {
+            return Err(Error::Arrow("failed to compute QR (sgeqrf) for matrix".to_string()));
+        }
+
+        unsafe {
+            sorgqr(
+                m,
+                n,
+                tau_size as i32,
+                builder.values_slice_mut(),
+                m,
+                tau.as_mut_slice(),
+                work.as_mut_slice(),
+                lwork,
+                &mut info,
+            )
+        }
+        if info != 0 {
+            return Err(Error::Arrow("Failed to compute QR (sorgqr) for matrix".to_string()));
+        }
+
+        Ok(Self {
+            data: Arc::new(builder.finish()),
+            num_columns: self.num_columns,
+            transpose: false,
+        })
+    }
 }
 
 /// Single Value Decomposition.
