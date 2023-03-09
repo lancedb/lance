@@ -238,7 +238,9 @@ impl MatrixView {
             );
         }
         if info != 0 {
-            return Err(Error::Arrow("failed to compute QR (sgeqrf) for matrix".to_string()));
+            return Err(Error::Arrow(
+                "failed to compute QR (sgeqrf) for matrix".to_string(),
+            ));
         }
         let lwork = work[0] as i32;
         let mut work = vec![0.0; lwork as usize];
@@ -256,7 +258,9 @@ impl MatrixView {
             );
         }
         if info != 0 {
-            return Err(Error::Arrow("failed to compute QR (sgeqrf) for matrix".to_string()));
+            return Err(Error::Arrow(
+                "failed to compute QR (sgeqrf) for matrix".to_string(),
+            ));
         }
 
         unsafe {
@@ -273,7 +277,9 @@ impl MatrixView {
             )
         }
         if info != 0 {
-            return Err(Error::Arrow("Failed to compute QR (sorgqr) for matrix".to_string()));
+            return Err(Error::Arrow(
+                "Failed to compute QR (sorgqr) for matrix".to_string(),
+            ));
         }
 
         Ok(Self {
