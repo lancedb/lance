@@ -95,7 +95,7 @@ impl MatrixView {
         let mut builder = Float32Builder::with_capacity(n * n);
         for i in 0..n {
             for j in 0..n {
-                builder.append_value(if i == j { 1.0} else {0.0});
+                builder.append_value(if i == j { 1.0 } else { 0.0 });
             }
         }
         Self {
