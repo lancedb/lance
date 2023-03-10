@@ -428,6 +428,7 @@ impl Dataset {
                     &index_id,
                     &ivf_params,
                     &pq_params,
+                    vec_params.dry_run,
                 )
                 .await?
             }

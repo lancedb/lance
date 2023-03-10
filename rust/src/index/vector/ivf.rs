@@ -39,11 +39,14 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     MetricType, Query, Transformer, VectorIndex,
 };
-use crate::arrow::{linalg::MatrixView, *};
 use crate::index::vector::opq::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
+};
+use crate::{
+    arrow::{linalg::MatrixView, *},
+    dataset::scanner::Scanner,
 };
 use crate::{
     dataset::{Dataset, ROW_ID},
@@ -217,7 +220,7 @@ pub struct IvfPQIndexMetadata {
     /// Product Quantizer
     pq: Arc<ProductQuantizer>,
 
-    /// Transforms to be applied before search.
+    /// File position of transforms.
     transforms: Vec<pb::Transform>,
 }
 
@@ -280,17 +283,24 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                     pb::index::Implementation::VectorIndex(vidx) => {
                         let num_stages = vidx.stages.len();
                         if num_stages != 2 && num_stages != 3 {
-                            return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
+                            return Err(Error::IO(format!(
+                                "Only support IVF_(O)PQ now: {:?}",
+                                vidx.stages.len()
+                            )));
                         };
-                        let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
+                        let opq = match vidx.stages[0].stage.as_ref().unwrap() {
+                            Stage::Transform(transform) => Ok(transform),
+                            _ => Err(Error::IO("Stage 0 only supports OPQ".to_string())),
+                        }?;
+                        let stage0 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let ivf = match stage0 {
                             Stage::Ivf(ivf_pb) => Ok(Ivf::try_from(ivf_pb)?),
                             _ => Err(Error::IO("Stage 0 only supports IVF".to_string())),
                         }?;
-                        let stage1 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
-                            Error::IO("VectorIndex stage 1 is missing".to_string())
+                        let stage1 = vidx.stages[2].stage.as_ref().ok_or_else(|| {
+                            Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let pq = match stage1 {
                             Stage::Pq(pq_proto) => Ok(Arc::new(pq_proto.into())),
@@ -310,7 +320,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                                 .into(),
                             ivf,
                             pq,
-                            transforms: vec![],
+                            transforms: vec![opq.clone()],
                         })
                     }
                 }?
@@ -597,6 +607,7 @@ pub async fn build_ivf_pq_index(
     uuid: &Uuid,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
+    dry_run: bool,
 ) -> Result<()> {
     println!(
         "Building vector index: IVF{},{}PQ{}, metric={}",
@@ -616,6 +627,12 @@ pub async fn build_ivf_pq_index(
 
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
+    // Train the OPQ rotation matrix.
+    let opq = train_opq(&training_data, pq_params).await?;
+
+    // Transform training data using OPQ matrix.
+    let training_data = opq.transform(&training_data).await?;
+
     // Train IVF partitions.
     let ivf_model = train_ivf_model(&training_data, ivf_params).await?;
 
@@ -634,7 +651,22 @@ pub async fn build_ivf_pq_index(
     scanner.project(&[column])?;
     scanner.with_row_id();
 
+    if dry_run {
+        // Dry run, print the trained sum of distance.
+        print_pq_summary(
+            &ivf_model,
+            &opq,
+            &pq,
+            &scanner,
+            column,
+            pq_params.metric_type,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let ivf = &ivf_model;
+    let opq_ref = &opq;
     let pq_ref = &pq;
     let metric_type = pq_params.metric_type;
 
@@ -649,6 +681,9 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
             let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            // Transform using OPQ matrix.
+            let vectors = opq_ref.transform(&vectors).await?;
+
             let i = ivf.clone();
             let part_id_and_residual = tokio::task::spawn_blocking(move || {
                 i.compute_partition_and_residual(&vectors, metric_type)
@@ -699,11 +734,47 @@ pub async fn build_ivf_pq_index(
         index_name,
         uuid,
         ivf_model,
+        opq,
         pq,
         ivf_params.metric_type,
         &batches,
     )
     .await
+}
+
+async fn print_pq_summary(
+    ivf: &Ivf,
+    opq: &OptimizedProductQuantizer,
+    pq: &ProductQuantizer,
+    scanner: &Scanner,
+    vec_column: &str,
+    metric_type: MetricType,
+) -> Result<()> {
+    let distances = scanner
+        .try_into_stream()
+        .await?
+        .map(|b| async move {
+            let batch = b?;
+            let arr = batch
+                .column_by_name(vec_column)
+                .ok_or_else(|| Error::IO(format!("Dataset does not have column {vec_column}")))?;
+            let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            // Transform using OPQ matrix.
+            let vectors = opq.transform(&vectors).await?;
+            let part_id_and_residual = ivf.compute_partition_and_residual(&vectors, metric_type)?;
+
+            let residual_col = part_id_and_residual
+                .column_by_name(RESIDUAL_COLUMN)
+                .unwrap();
+            let residual_data = as_fixed_size_list_array(&residual_col);
+            let error = pq.distortion(&residual_data.try_into()?, metric_type).await?;
+            Ok::<f64, Error>(error)
+        })
+        .buffered(num_cpus::get())
+        .try_collect::<Vec<_>>()
+        .await?;
+    println!("PQ error: {}", distances.iter().sum::<f64>());
+    Ok(())
 }
 
 /// Write index into the file.
@@ -713,6 +784,7 @@ async fn write_index_file(
     index_name: &str,
     uuid: &Uuid,
     mut ivf: Ivf,
+    mut opq: OptimizedProductQuantizer,
     pq: ProductQuantizer,
     metric_type: MetricType,
     batches: &[RecordBatch],
@@ -747,6 +819,12 @@ async fn write_index_file(
         }
     }
 
+    // Write OPQ matrix.
+    let pos = writer
+        .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
+        .await?;
+    opq.file_position = Some(pos);
+
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
@@ -755,7 +833,7 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq: pq.into(),
-        transforms: vec![],
+        transforms: vec![opq.try_into_pb()?],
     };
 
     let metadata = pb::Index::try_from(&metadata)?;
@@ -776,6 +854,20 @@ async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<P
     let mat: MatrixView = data.try_into()?;
     pq.train(&mat, params.metric_type, params.max_iters).await?;
     Ok(pq)
+}
+
+/// Train Optimized Product Quantization.
+async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
+    let mut opq = OptimizedProductQuantizer::new(
+        params.num_sub_vectors as usize,
+        params.num_bits as u32,
+        params.metric_type,
+        params.max_iters,
+    );
+
+    opq.train(data).await?;
+
+    Ok(opq)
 }
 
 /// Train IVF partitions using kmeans.

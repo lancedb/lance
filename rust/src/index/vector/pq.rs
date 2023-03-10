@@ -284,7 +284,7 @@ impl ProductQuantizer {
     }
 
     /// Reconstruct a vector from its PQ code.
-    /// It only supports U8 for now.
+    /// It only supports U8 code for now.
     pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
         assert_eq!(code.len(), self.num_sub_vectors);
         let mut builder = Float32Builder::with_capacity(self.dimension);
