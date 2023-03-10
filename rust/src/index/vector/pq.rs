@@ -284,6 +284,23 @@ impl ProductQuantizer {
         Arc::new(as_primitive_array(&arr).clone())
     }
 
+    /// Reconstruct a vector from its PQ code.
+    /// It only supports U8 for now.
+    pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
+        assert_eq!(code.len(), self.num_sub_vectors);
+        let mut builder = Float32Builder::with_capacity(self.dimension);
+        let sub_vector_dim = self.dimension / self.num_sub_vectors;
+        for i in 0..code.len() {
+            let centroids = self.centroids(i);
+            let sub_code = code[i];
+            builder.append_slice(
+                &centroids.values()
+                    [sub_code as usize * sub_vector_dim..(sub_code as usize + 1) * sub_vector_dim],
+            );
+        }
+        Arc::new(builder.finish())
+    }
+
     /// Transform the vector array to PQ code array.
     async fn transform(
         &self,
