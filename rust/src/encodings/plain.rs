@@ -130,7 +130,7 @@ impl<'a> PlainEncoder<'a> {
                 .as_ref(),
             items.data_type(),
         )
-        .await
+            .await
     }
 }
 
@@ -243,7 +243,14 @@ impl<'a> PlainDecoder<'a> {
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        // TODO: optimize boolean access
+        //group then concat
+        //at least 1 bit in 1 byte
+        let density_threhold = 8;
+        //bio-devide by value
+        todo!()
+    }
+
+    async fn take_boolean_simple(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         let start = indices.value(0) as usize;
         let end = indices.value(indices.len() - 1) as usize;
         let array = self.get(start..end + 1).await?;
