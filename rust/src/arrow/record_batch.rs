@@ -47,6 +47,18 @@ impl RecordBatchBuffer {
     }
 
     pub fn finish(&self) -> Result<RecordBatch> {
+        // TODO arrow concat here concat_batches messes up the dictionaries
+        // FIX write multiple arrays in the same group
+            //  group -> lance layout grouping rows together, each encoder write 1 group
+            //  group has multiple column, each page is one column
+            //  in arrow
+            //     RecordBatch == group
+            //     Column == Page
+            //  here just return the vec / list of batches
+            //  this is for later / not needed
+            //      but each batch should have at most "params.max_rows_per_group" rows
+            //      if not move to another batch
+            //      do a slice_window without copying the data
         Ok(concat_batches(&self.schema(), self.batches.iter())?)
     }
 }

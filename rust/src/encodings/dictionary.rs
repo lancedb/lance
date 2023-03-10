@@ -57,6 +57,7 @@ impl<'a> DictionaryEncoder<'a> {
         let dict_arr = as_dictionary_array::<T>(arr);
 
         let mut plain_encoder = PlainEncoder::new(self.writer, dict_arr.data_type());
+        println!("write_typed_array: {:?}", dict_arr.keys());
         plain_encoder.encode(dict_arr.keys()).await?;
         Ok(pos)
     }
@@ -138,9 +139,11 @@ impl<'a> DictionaryDecoder<'a> {
         };
 
         let decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
+        // It blows up here!
         let keys = decoder.get(params.into()).await?;
 
-        match index_type {
+        println!("decode_impl keys {:?}", keys);
+        let a = match index_type {
             DataType::Int8 => self.make_dict_array::<Int8Type>(keys).await,
             DataType::Int16 => self.make_dict_array::<Int16Type>(keys).await,
             DataType::Int32 => self.make_dict_array::<Int32Type>(keys).await,
@@ -152,7 +155,9 @@ impl<'a> DictionaryDecoder<'a> {
             _ => Err(Error::Arrow(format!(
                 "Dictionary encoding does not support index type: {index_type}",
             ))),
-        }
+        };
+        println!("array created");
+        a
     }
 
     async fn make_dict_array<T: ArrowDictionaryKeyType + Sync + Send>(

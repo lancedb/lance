@@ -214,6 +214,10 @@ impl<'a> FileWriter<'a> {
 
         // Write the dictionary keys.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
+        println!("write_dictionary_arr values {:?}", array);
+        if array.len() != array.null_count() {
+            println!("dict {} has values", field);
+        }
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);

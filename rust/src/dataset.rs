@@ -239,6 +239,9 @@ impl Dataset {
                 if writer.is_none() {
                     writer = new_writer!();
                 };
+
+                // HERE writer needs to handle multiple batches returned by buffer.finish()
+                // start by changing plain_encoder / binary_encoder
                 writer.as_mut().unwrap().write(&buffer.finish()?).await?;
                 buffer = RecordBatchBuffer::empty();
             }

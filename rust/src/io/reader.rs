@@ -287,10 +287,15 @@ async fn read_batch(
                 .iter()
                 .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset)),
         ));
-        batch = batch.try_with_column(
+        let batch_result = batch.try_with_column(
             ArrowField::new("_rowid", DataType::UInt64, false),
-            row_id_arr,
-        )?;
+            row_id_arr.clone(),
+        );
+        batch_result.as_ref().err().map(|e| println!("{} {:?}", e, row_id_arr.clone()));
+        // if let Err(error) = batch_result {
+        //     println!("{}", error.to_string().clone())
+        // }
+        let batch = batch_result?;
     }
     Ok(batch)
 }
@@ -305,6 +310,8 @@ async fn read_array(
     let data_type = field.data_type();
 
     use DataType::*;
+
+    println!("read_array {}", field);
 
     if data_type.is_fixed_stride() {
         _read_fixed_stride_array(reader, field, batch_id, params).await
@@ -427,6 +434,7 @@ async fn read_dictionary_array(
     batch_id: i32,
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
+    println!("read_dictionary_array {}", field);
     let page_info = get_page_info(&reader.page_table, field, batch_id)?;
     let data_type = field.data_type();
     let decoder = DictionaryDecoder::new(
@@ -443,7 +451,14 @@ async fn read_dictionary_array(
             .unwrap()
             .clone(),
     );
-    decoder.get(params.clone()).await
+    println!("read_dictionary_array decoder {:?}", decoder);
+    let a_result = decoder.get(params.clone()).await;
+
+    let a = a_result.unwrap();
+    if a.clone().len() != a.clone().null_count() {
+        println!("dict {} has values", field);
+    }
+    Ok(a)
 }
 
 async fn read_struct_array(
@@ -923,6 +938,7 @@ mod tests {
             dict_builder.append("a").unwrap();
             dict_builder.append("b").unwrap();
             dict_builder.append("c").unwrap();
+            dict_builder.append("d").unwrap();
 
             let struct_array = Arc::new(StructArray::from(vec![(
                 ArrowField::new(
@@ -934,6 +950,7 @@ mod tests {
             )]));
 
             let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+            println!("{:?}", batch);
             batches.push(batch);
         }
 
@@ -947,6 +964,13 @@ mod tests {
 
         let result = scan_dataset(test_uri).await.unwrap();
         // assert_eq!(batch, result.as_slice()[0]);
+    }
+
+    #[tokio::test]
+    async fn test_impulse_labs() {
+        let test_uri = "/Users/eto/dev/katniss/katniss-bench/lance-fs-ingestor.lance";
+        let result = scan_dataset(test_uri).await.unwrap();
+        println!("{}", result.len());
     }
 
     async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
