@@ -1,28 +1,27 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! IVF - Inverted File index.
 
 use std::sync::Arc;
 
-use arrow_arith::aggregate::{max, min};
-use arrow_arith::arithmetic::subtract_dyn;
-use arrow_array::builder::Float32Builder;
+use arrow_arith::{
+    aggregate::{max, min},
+    arithmetic::subtract_dyn,
+};
 use arrow_array::{
+    builder::Float32Builder,
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
     UInt32Array,
@@ -39,8 +38,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
-use rand::SeedableRng;
-use rand::{rngs::SmallRng, Rng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
@@ -48,6 +46,7 @@ use super::{
     MetricType, Query, VectorIndex,
 };
 use crate::arrow::*;
+use crate::index::vector::opq::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
@@ -478,8 +477,8 @@ impl TryFrom<&pb::Ivf> for Ivf {
     }
 }
 
-pub struct IvfPqIndexBuilder<'a> {
-    dataset: &'a Dataset,
+pub struct IvfPqIndexBuilder {
+    dataset: Arc<Dataset>,
 
     /// Unique id of the index.
     uuid: Uuid,
@@ -507,9 +506,9 @@ pub struct IvfPqIndexBuilder<'a> {
     kmeans_max_iters: u32,
 }
 
-impl<'a> IvfPqIndexBuilder<'a> {
-    pub fn try_new(
-        dataset: &'a Dataset,
+impl IvfPqIndexBuilder {
+    pub async fn try_new(
+        dataset: Arc<Dataset>,
         uuid: Uuid,
         name: &str,
         column: &str,
@@ -523,6 +522,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
         let DataType::FixedSizeList(_, d) = field.data_type() else {
             return Err(Error::IO(format!("Column {column} is not a vector type")));
         };
+        let num_rows = dataset.count_rows().await?;
         Ok(Self {
             dataset,
             uuid,
@@ -535,29 +535,6 @@ impl<'a> IvfPqIndexBuilder<'a> {
             nbits: 8,
             kmeans_max_iters: 100,
         })
-    }
-
-    fn sanity_check(&self) -> Result<()> {
-        // Step 1. Sanity check
-        let Some(field) = self.dataset.schema().field(&self.column) else {
-    return Err(Error::IO(format!(
-        "Building index: column {} does not exist in dataset: {:?}",
-        self.column, self.dataset
-    )));
-};
-        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-            if !matches!(elem_type.data_type(), DataType::Float32) {
-                return Err(
-            Error::Index(
-                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-                elem_type.data_type())));
-            }
-        } else {
-            return Err(Error::Index(
-        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-        field.data_type())));
-        }
-        Ok(())
     }
 
     /// Train IVF partitions using kmeans.
@@ -578,10 +555,129 @@ impl<'a> IvfPqIndexBuilder<'a> {
             .await?,
         ))
     }
+
+    /// A guess of the sample size to train IVF / PQ / OPQ.
+    fn sample_size_hint(&self) -> usize {
+        let n_clusters = std::cmp::max(
+            self.num_partitions as usize,
+            ProductQuantizer::num_centroids(self.nbits),
+        );
+        n_clusters * 256
+    }
+}
+
+fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Err(Error::IO(format!(
+            "Building index: column {} does not exist in dataset: {:?}",
+            column, dataset
+        )));
+    };
+    if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
+        if !matches!(elem_type.data_type(), DataType::Float32) {
+            return Err(
+        Error::Index(
+            format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+            elem_type.data_type())));
+        }
+    } else {
+        return Err(Error::Index(format!(
+            "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+            field.data_type()
+        )));
+    }
+    Ok(())
+}
+
+/// Parameters to build IVF partitions
+pub struct IvfBuildParams {
+    /// Number of partitions to build.
+    pub num_partitions: usize,
+
+    /// Metric type, L2 or Cosine.
+    pub metric_type: MetricType,
+
+    // ---- kmeans parameters
+    /// Number of iterations to run kmeans.
+    pub num_iters: usize,
+}
+
+/// Parameters for building product quantization.
+pub struct PQBuildParams {
+    /// Number of subvectors to build PQ code
+    pub num_sub_vectors: usize,
+
+    /// The number of bits to present one PQ centroid.
+    pub num_bits: usize,
+
+    /// Metric type, L2 or Cosine.
+    pub metric_type: MetricType,
+
+    /// Train as optimized product quantization.
+    pub use_opq: bool,
+
+    /// The max number of iterations for kmeans training.
+    pub max_iters: usize,
+}
+
+async fn maybe_sample_training_data(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+) -> Result<FixedSizeListArray> {
+    let projection = dataset.schema().project(&[&column])?;
+    let batch = dataset.sample(sample_size_hint, &projection).await?;
+    let array = batch.column_by_name(column).ok_or(Error::Index(format!(
+        "Sample training data: column {} does not exist in return",
+        column
+    )))?;
+    Ok(as_fixed_size_list_array(array).clone())
+}
+
+/// Build IVF(PQ) index
+pub async fn build_ivf_pq_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &Uuid,
+    ivf_params: &IvfBuildParams,
+    pq_params: &PQBuildParams,
+) -> Result<()> {
+    println!(
+        "Building vector index: IVF{},PQ{}, metric={}",
+        ivf_params.num_partitions, pq_params.num_sub_vectors, ivf_params.metric_type,
+    );
+
+    sanity_check(dataset, column)?;
+
+    // Maximum to train 256 vectors per centroids, see Faiss.
+    let sample_size_hint = std::cmp::max(
+        ivf_params.num_partitions,
+        ProductQuantizer::num_centroids(pq_params.num_bits as u32),
+    ) * 256;
+
+    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
+    let opq = train_opq(&training_data, pq_params)?;
+
+    todo!()
+}
+
+fn train_opq(
+    data: &FixedSizeListArray,
+    params: &PQBuildParams,
+) -> Result<OptimizedProductQuantizer> {
+    let opq = OptimizedProductQuantizer::new(
+        params.num_sub_vectors as usize,
+        params.num_bits as u32,
+        params.metric_type,
+        params.max_iters,
+    );
+
+    Ok(opq)
 }
 
 #[async_trait]
-impl IndexBuilder for IvfPqIndexBuilder<'_> {
+impl IndexBuilder for IvfPqIndexBuilder {
     fn index_type() -> IndexType {
         IndexType::Vector
     }
@@ -594,7 +690,15 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         );
 
         // Step 1. Sanity check
-        self.sanity_check()?;
+        sanity_check(self.dataset.as_ref(), &self.column)?;
+
+        // Make with row id to build inverted index, and sampling
+        let sample_size = self.sample_size_hint();
+        let dataset = self.dataset.clone();
+        // let projection = dataset.schema().project(&[&self.column])?;
+        // let training_data = dataset.sample(sample_size, &projection).await;
+        // let training_data =
+        //     sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
 
         // First, scan the dataset to train IVF models.
         let mut ivf_model = self.train_ivf_model().await?;
@@ -603,7 +707,8 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
-        // Assign parition ID and compute residual vectors.
+
+        // Assign parition ID and compute residual vectors. cxc
         let partitioned_batches = ivf_model.partition(&scanner, self.metric_type).await?;
 
         // Train PQ
@@ -685,9 +790,6 @@ async fn train_kmeans_model(
     max_iterations: u32,
     rng: impl Rng,
     metric_type: MetricType,
-    // metric_type: Arc<
-    //     dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
-    // >,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);

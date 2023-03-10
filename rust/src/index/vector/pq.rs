@@ -416,6 +416,7 @@ impl From<&ProductQuantizer> for pb::Pq {
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
             codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+            opq: None,
         }
     }
 }

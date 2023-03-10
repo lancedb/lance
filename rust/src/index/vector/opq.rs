@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, UInt8Array};
+use async_trait::async_trait;
 
+use super::Transformer;
 use super::{pq::ProductQuantizer, MetricType};
 use crate::arrow::{linalg::*, *};
 use crate::Result;
@@ -37,8 +39,11 @@ pub struct OptimizedProductQuantizer {
     /// OPQ rotation
     rotation: Option<MatrixView>,
 
-    /// PQ
-    pq: Option<ProductQuantizer>,
+    /// The metric to compute the distance.
+    metric_type: MetricType,
+
+    /// Number of iterations to train OPQ.
+    num_iters: usize,
 }
 
 impl OptimizedProductQuantizer {
@@ -50,50 +55,19 @@ impl OptimizedProductQuantizer {
     /// - *dimension*: dimension of the training dataset.
     /// - *num_sub_vectors*: the number of sub vectors in the product quantization.
     /// - *num_iterations*: The number of iterations to train on OPQ rotation matrix.
-    pub fn new(num_sub_vectors: usize, num_bits: u32) -> Self {
+    pub fn new(
+        num_sub_vectors: usize,
+        num_bits: u32,
+        metric_type: MetricType,
+        num_iters: usize,
+    ) -> Self {
         Self {
             num_sub_vectors,
             num_bits,
             rotation: None,
-            pq: None,
+            metric_type,
+            num_iters,
         }
-    }
-
-    /// Train the opq
-    pub async fn train(
-        &mut self,
-        data: &MatrixView,
-        metric_type: MetricType,
-        num_iters: usize,
-    ) -> Result<()> {
-        let dim = data.num_columns();
-
-        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
-        // See in Faiss, it does not train more than `256*n_centroids` samples
-        let train = if data.num_rows() > num_centroids * 256 {
-            println!(
-                "Sample {} out of {} to train kmeans of {} dim, {} clusters",
-                256 * num_centroids,
-                data.num_rows(),
-                data.num_columns(),
-                num_centroids,
-            );
-            data.sample(num_centroids * 256)
-        } else {
-            data.clone()
-        };
-
-        // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::identity(dim);
-        for _ in 0..num_iters {
-            // Training data, this is the `X`, described in CVPR' 13
-            let train = train.dot(&rotation)?;
-            let (rot, pq) = self.train_once(&train, metric_type).await?;
-            rotation = rot;
-            self.pq = Some(pq);
-        }
-        self.rotation = Some(rotation);
-        Ok(())
     }
 
     /// Train once and return the rotation matrix and PQ codebook.
@@ -132,6 +106,45 @@ impl OptimizedProductQuantizer {
     }
 }
 
+#[async_trait]
+impl Transformer for OptimizedProductQuantizer {
+    async fn train(&mut self, data: &MatrixView) -> Result<()> {
+        let dim = data.num_columns();
+
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
+        // See in Faiss, it does not train more than `256*n_centroids` samples
+        let train = if data.num_rows() > num_centroids * 256 {
+            println!(
+                "Sample {} out of {} to train kmeans of {} dim, {} clusters",
+                256 * num_centroids,
+                data.num_rows(),
+                data.num_columns(),
+                num_centroids,
+            );
+            data.sample(num_centroids * 256)
+        } else {
+            data.clone()
+        };
+
+        // Initialize R (rotation matrix)
+        let mut rotation = MatrixView::identity(dim);
+        for _ in 0..self.num_iters {
+            // Training data, this is the `X`, described in CVPR' 13
+            let train = train.dot(&rotation)?;
+            let (rot, _) = self.train_once(&train, self.metric_type).await?;
+            rotation = rot;
+        }
+        self.rotation = Some(rotation);
+        Ok(())
+    }
+
+    /// Apply OPQ transform
+    async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
+        let rotation = self.rotation.as_ref().unwrap();
+        rotation.dot(data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,8 +159,8 @@ mod tests {
         let data = Arc::new(Float32Array::from_iter((0..12800).map(|v| v as f32)));
         let matrix = MatrixView::new(data, DIM);
 
-        let mut opq = OptimizedProductQuantizer::new(4, 8);
-        opq.train(&matrix, MetricType::L2, 10).await.unwrap();
+        let mut opq = OptimizedProductQuantizer::new(4, 8, MetricType::L2, 10);
+        opq.train(&matrix).await.unwrap();
 
         assert_eq!(opq.rotation.as_ref().unwrap().num_rows(), DIM);
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);

@@ -138,7 +138,7 @@ pub trait GenericListArrayExt<Offset: ArrowNumericType>
 where
     Offset::Native: OffsetSizeTrait,
 {
-    /// Create an [`ListArray`] from values and offsets.
+    /// Create an [`GenericListArray`] from values and offsets.
     ///
     /// ```
     /// use arrow_array::{Int32Array, Int64Array, ListArray};

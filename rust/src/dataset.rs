@@ -277,7 +277,7 @@ impl Dataset {
         let base = object_store.base_path().clone();
         Ok(Self {
             object_store,
-            base,
+            base: base.into(),
             manifest: Arc::new(manifest.clone()),
         })
     }
@@ -381,15 +381,21 @@ impl Dataset {
                     }
                 }
 
+                let projection = self.schema().project(&[column])?;
+                let training_data = self
+                    .sample(vec_params.num_partitions as usize * 256, &projection)
+                    .await?;
+
                 let builder = IvfPqIndexBuilder::try_new(
-                    self,
+                    Arc::new(self.clone()),
                     index_id,
                     &index_name,
                     column,
                     vec_params.num_partitions,
                     vec_params.num_sub_vectors,
                     vec_params.metric_type,
-                )?;
+                )
+                .await?;
                 builder.build().await?
             }
         }
@@ -519,6 +525,14 @@ impl Dataset {
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
+    }
+
+    /// Sample `n` rows from the dataset.
+    pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+        use rand::seq::IteratorRandom;
+        let num_rows = self.count_rows().await?;
+        let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
+        Ok(self.take(&ids[..], &projection).await?)
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {

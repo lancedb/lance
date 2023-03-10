@@ -57,6 +57,14 @@ message IVF {
   repeated uint32 lengths = 3;
 }
 
+// Optimized Product Quantization rotation matrix.
+//
+// It is a `[pq.dimension, pq.dimension]` float32 matrix.
+message OPQMatrix {
+  // The file offset where the rotation matrix is stored.
+  uint64 position = 1;
+};
+
 // Product Quantization.
 message PQ {
   // The number of bits to present a centroid.
@@ -70,6 +78,9 @@ message PQ {
 
   // Codebook. `dimension * 2 ^ num_bits` of float32s.
   repeated float codebook = 4;
+
+  /// File offset where the rotation matrix is stored.
+  optional OPQMatrix opq = 5;
 }
 
 // Flat Index
