@@ -90,6 +90,21 @@ impl MatrixView {
         }
     }
 
+    /// Create a identity matrix, with number of rows `n`.
+    pub fn identity(n: usize) -> Self {
+        let mut builder = Float32Builder::with_capacity(n * n);
+        for i in 0..n {
+            for j in 0..n {
+                builder.append_value(if i == j { 1.0} else {0.0});
+            }
+        }
+        Self {
+            data: Arc::new(builder.finish()),
+            num_columns: n,
+            transpose: false,
+        }
+    }
+
     /// Number of rows in the matrix
     pub fn num_rows(&self) -> usize {
         if self.transpose {
@@ -207,87 +222,6 @@ impl MatrixView {
             num_columns: self.num_columns,
             transpose: false,
         }
-    }
-
-    /// Compute the Q in QR decomposition.
-    pub(crate) fn qr(&self) -> Result<Self> {
-        use lapack::{sgeqrf, sorgqr};
-        // See faiss `matrix_qr()`.
-        let m = self.num_rows() as i32;
-        let n = self.num_columns() as i32;
-        let tau_size = min(m, n) as usize;
-        let mut tau = vec![0.0; tau_size];
-
-        // Need to be column major for LAPACK
-        let data = self.transpose().data();
-        let mut builder = Float32Builder::with_capacity(self.data.len());
-        builder.append_slice(data.as_ref().values());
-
-        let lwork: i32 = -1;
-        let mut info: i32 = 0;
-        let mut work = vec![0.0; 1];
-        unsafe {
-            sgeqrf(
-                m,
-                n,
-                builder.values_slice_mut(),
-                m,
-                tau.as_mut_slice(),
-                work.as_mut_slice(),
-                lwork,
-                &mut info,
-            );
-        }
-        if info != 0 {
-            return Err(Error::Arrow(
-                "failed to compute QR (sgeqrf) for matrix".to_string(),
-            ));
-        }
-        let lwork = work[0] as i32;
-        let mut work = vec![0.0; lwork as usize];
-
-        unsafe {
-            sgeqrf(
-                m,
-                n,
-                builder.values_slice_mut(),
-                m,
-                tau.as_mut_slice(),
-                work.as_mut_slice(),
-                lwork,
-                &mut info,
-            );
-        }
-        if info != 0 {
-            return Err(Error::Arrow(
-                "failed to compute QR (sgeqrf) for matrix".to_string(),
-            ));
-        }
-
-        unsafe {
-            sorgqr(
-                m,
-                n,
-                tau_size as i32,
-                builder.values_slice_mut(),
-                m,
-                tau.as_mut_slice(),
-                work.as_mut_slice(),
-                lwork,
-                &mut info,
-            )
-        }
-        if info != 0 {
-            return Err(Error::Arrow(
-                "Failed to compute QR (sorgqr) for matrix".to_string(),
-            ));
-        }
-
-        Ok(Self {
-            data: Arc::new(builder.finish()),
-            num_columns: self.num_columns,
-            transpose: false,
-        })
     }
 }
 
@@ -548,14 +482,5 @@ mod tests {
             .map(|v| *v as i64)
             .collect();
         assert_eq!(all_values.len(), 5 * 2);
-    }
-
-    #[test]
-    fn test_qr() {
-        let a_data = Arc::new(Float32Array::from_iter((1..=16).map(|v| v as f32)));
-        let a = MatrixView::new(a_data, 4);
-
-        let q = a.qr().unwrap();
-        println!("Q={:?}", q);
     }
 }
