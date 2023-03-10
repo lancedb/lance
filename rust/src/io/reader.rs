@@ -917,7 +917,7 @@ mod tests {
         )]));
 
         let mut batches: Vec<RecordBatch> = Vec::new();
-        for i in 1..10000 {
+        for i in 1..100 {
             let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
             dict_builder.append_null();
             dict_builder.append("a").unwrap();

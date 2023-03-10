@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Additional utility for [`RecordBatch`]
 //!
@@ -70,3 +67,50 @@ impl Iterator for RecordBatchBuffer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow::{array::StringDictionaryBuilder, datatypes::Int32Type};
+    use arrow_array::{StructArray, ArrayRef};
+    use arrow_schema::{Schema as ArrowSchema, Field as ArrowField, DataType};
+
+    #[test]
+    fn test_batch_dict_arrays() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            )]),
+            true,
+        )]));
+
+        let batches: Vec<RecordBatch> = (0..10).map(|v| {
+            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+            dict_builder.append_null();
+            dict_builder.append("a").unwrap();
+            dict_builder.append("b").unwrap();
+            dict_builder.append("c").unwrap();
+
+            let struct_array = Arc::new(StructArray::from(vec![(
+                ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+                Arc::new(dict_builder.finish()) as ArrayRef,
+            )]));
+
+            RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap()
+        }).collect();
+        let buffer = RecordBatchBuffer::new(batches);
+        let batch = buffer.finish().unwrap();
+        println!("Batch is: {:?}", batch);
+    }
+}
+
