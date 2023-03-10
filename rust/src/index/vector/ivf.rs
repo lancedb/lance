@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! IVF - Inverted File index.
 
@@ -48,6 +45,7 @@ use super::{
     MetricType, Query, VectorIndex,
 };
 use crate::arrow::*;
+use crate::index::vector::opq::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
@@ -538,7 +536,6 @@ impl<'a> IvfPqIndexBuilder<'a> {
     }
 
     fn sanity_check(&self) -> Result<()> {
-        // Step 1. Sanity check
         let Some(field) = self.dataset.schema().field(&self.column) else {
     return Err(Error::IO(format!(
         "Building index: column {} does not exist in dataset: {:?}",
@@ -578,6 +575,21 @@ impl<'a> IvfPqIndexBuilder<'a> {
             .await?,
         ))
     }
+
+    /// Train optional transform.
+    async fn train_opq(&self) -> Result<OptimizedProductQuantizer> {
+        let mut scanner = self.dataset.scan();
+        scanner.project(&[&self.column])?;
+
+        let opq = OptimizedProductQuantizer::new(
+            self.num_sub_vectors as usize,
+            self.nbits,
+            self.metric_type,
+            100,
+        );
+
+        Ok(opq)
+    }
 }
 
 #[async_trait]
@@ -596,6 +608,9 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         // Step 1. Sanity check
         self.sanity_check()?;
 
+        // Train transformers
+        self.train_opq().await?;
+
         // First, scan the dataset to train IVF models.
         let mut ivf_model = self.train_ivf_model().await?;
 
@@ -603,7 +618,8 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
         scanner.with_row_id();
-        // Assign parition ID and compute residual vectors.
+
+        // Assign parition ID and compute residual vectors. cxc
         let partitioned_batches = ivf_model.partition(&scanner, self.metric_type).await?;
 
         // Train PQ
@@ -685,9 +701,6 @@ async fn train_kmeans_model(
     max_iterations: u32,
     rng: impl Rng,
     metric_type: MetricType,
-    // metric_type: Arc<
-    //     dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync,
-    // >,
 ) -> Result<Arc<FixedSizeListArray>> {
     let schema = scanner.schema()?;
     assert_eq!(schema.fields.len(), 1);

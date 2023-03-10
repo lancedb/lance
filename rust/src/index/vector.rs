@@ -32,6 +32,7 @@ mod pq;
 
 use super::IndexParams;
 use crate::{
+    arrow::linalg::MatrixView,
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
     Error, Result,
 };
@@ -77,6 +78,21 @@ pub trait VectorIndex {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
+}
+
+/// Transformer on vectors.
+#[async_trait]
+pub trait Transformer {
+    /// Train the transformer.
+    ///
+    /// Parameters:
+    /// - *data*: training vectors.
+    async fn train(&mut self, data: &MatrixView) -> Result<()>;
+
+    /// Apply transform on the matrix `data`.
+    ///
+    /// Returns a new Matrix instead.
+    async fn transform(&self, data: &MatrixView) -> Result<MatrixView>;
 }
 
 /// Distance metrics type.
