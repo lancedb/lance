@@ -506,7 +506,6 @@ pub struct IvfPqIndexBuilder {
     kmeans_max_iters: u32,
 }
 
-
 impl IvfPqIndexBuilder {
     pub async fn try_new(
         dataset: Arc<Dataset>,
@@ -599,7 +598,6 @@ pub struct IvfBuildParams {
     pub metric_type: MetricType,
 
     // ---- kmeans parameters
-
     /// Number of iterations to run kmeans.
     pub num_iters: usize,
 }
@@ -622,6 +620,20 @@ pub struct PQBuildParams {
     pub max_iters: usize,
 }
 
+async fn maybe_sample_training_data(
+    dataset: &Dataset,
+    column: &str,
+    sample_size_hint: usize,
+) -> Result<FixedSizeListArray> {
+    let projection = dataset.schema().project(&[&column])?;
+    let batch = dataset.sample(sample_size_hint, &projection).await?;
+    let array = batch.column_by_name(column).ok_or(Error::Index(format!(
+        "Sample training data: column {} does not exist in return",
+        column
+    )))?;
+    Ok(as_fixed_size_list_array(array).clone())
+}
+
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -636,15 +648,24 @@ pub async fn build_ivf_pq_index(
     );
 
     sanity_check(dataset, column)?;
-    let projection = dataset.schema().project(&[&column])?;
-    let training_data = dataset.sample(256, &projection).await?;
 
-    
+    // Maximum to train 256 vectors per centroids, see Faiss.
+    let sample_size_hint = std::cmp::max(
+        ivf_params.num_partitions,
+        ProductQuantizer::num_centroids(pq_params.num_bits as u32),
+    ) * 256;
+
+    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
+    let opq = train_opq(&training_data, pq_params)?;
 
     todo!()
 }
 
-fn train_opq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
+fn train_opq(
+    data: &FixedSizeListArray,
+    params: &PQBuildParams,
+) -> Result<OptimizedProductQuantizer> {
     let opq = OptimizedProductQuantizer::new(
         params.num_sub_vectors as usize,
         params.num_bits as u32,
