@@ -382,7 +382,9 @@ impl Dataset {
                 }
 
                 let projection = self.schema().project(&[column])?;
-                let training_data = self.sample(vec_params.num_partitions as usize * 256, &projection).await?;
+                let training_data = self
+                    .sample(vec_params.num_partitions as usize * 256, &projection)
+                    .await?;
 
                 let builder = IvfPqIndexBuilder::try_new(
                     Arc::new(self.clone()),

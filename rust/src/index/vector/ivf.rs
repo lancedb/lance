@@ -491,8 +491,6 @@ pub struct IvfPqIndexBuilder {
 
     dimension: usize,
 
-    num_rows: usize,
-
     /// Metric type.
     metric_type: MetricType,
 
@@ -507,6 +505,7 @@ pub struct IvfPqIndexBuilder {
     /// Max iterations to train a k-mean model.
     kmeans_max_iters: u32,
 }
+
 
 impl IvfPqIndexBuilder {
     pub async fn try_new(
@@ -534,32 +533,9 @@ impl IvfPqIndexBuilder {
             metric_type,
             num_partitions,
             num_sub_vectors,
-            num_rows,
             nbits: 8,
             kmeans_max_iters: 100,
         })
-    }
-
-    fn sanity_check(&self) -> Result<()> {
-        let Some(field) = self.dataset.schema().field(&self.column) else {
-    return Err(Error::IO(format!(
-        "Building index: column {} does not exist in dataset: {:?}",
-        self.column, self.dataset
-    )));
-};
-        if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-            if !matches!(elem_type.data_type(), DataType::Float32) {
-                return Err(
-            Error::Index(
-                format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-                elem_type.data_type())));
-            }
-        } else {
-            return Err(Error::Index(
-        format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-        field.data_type())));
-        }
-        Ok(())
     }
 
     /// Train IVF partitions using kmeans.
@@ -581,23 +557,6 @@ impl IvfPqIndexBuilder {
         ))
     }
 
-    /// Train OPQ
-    async fn train_opq(&self) -> Result<OptimizedProductQuantizer> {
-        let mut scanner = self.dataset.scan();
-        scanner.project(&[&self.column])?;
-
-        let opq = OptimizedProductQuantizer::new(
-            self.num_sub_vectors as usize,
-            self.nbits,
-            self.metric_type,
-            100,
-        );
-
-        // TODO: sample the dataset
-
-        Ok(opq)
-    }
-
     /// A guess of the sample size to train IVF / PQ / OPQ.
     fn sample_size_hint(&self) -> usize {
         let n_clusters = std::cmp::max(
@@ -608,14 +567,92 @@ impl IvfPqIndexBuilder {
     }
 }
 
-/// Sample `n` vectors from the vector column in the dataset
-async fn sample_vector_column(dataset: Arc<Dataset>, col: &str, n: usize) -> Result<RecordBatch> {
-    use rand::seq::IteratorRandom;
-    let num_rows = dataset.count_rows().await?;
-    // let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-    let ids = vec![1, 2, 3];
-    let projection = dataset.schema().project(&[col])?;
-    Ok(dataset.take(&ids[..], &projection).await?)
+fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
+    let Some(field) = dataset.schema().field(column) else {
+        return Err(Error::IO(format!(
+            "Building index: column {} does not exist in dataset: {:?}",
+            column, dataset
+        )));
+    };
+    if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
+        if !matches!(elem_type.data_type(), DataType::Float32) {
+            return Err(
+        Error::Index(
+            format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+            elem_type.data_type())));
+        }
+    } else {
+        return Err(Error::Index(format!(
+            "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
+            field.data_type()
+        )));
+    }
+    Ok(())
+}
+
+/// Parameters to build IVF partitions
+pub struct IvfBuildParams {
+    /// Number of partitions to build.
+    pub num_partitions: usize,
+
+    /// Metric type, L2 or Cosine.
+    pub metric_type: MetricType,
+
+    // ---- kmeans parameters
+
+    /// Number of iterations to run kmeans.
+    pub num_iters: usize,
+}
+
+/// Parameters for building product quantization.
+pub struct PQBuildParams {
+    /// Number of subvectors to build PQ code
+    pub num_sub_vectors: usize,
+
+    /// The number of bits to present one PQ centroid.
+    pub num_bits: usize,
+
+    /// Metric type, L2 or Cosine.
+    pub metric_type: MetricType,
+
+    /// Train as optimized product quantization.
+    pub use_opq: bool,
+
+    /// The max number of iterations for kmeans training.
+    pub max_iters: usize,
+}
+
+/// Build IVF(PQ) index
+pub async fn build_ivf_pq_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &Uuid,
+    ivf_params: &IvfBuildParams,
+    pq_params: &PQBuildParams,
+) -> Result<()> {
+    println!(
+        "Building vector index: IVF{},PQ{}, metric={}",
+        ivf_params.num_partitions, pq_params.num_sub_vectors, ivf_params.metric_type,
+    );
+
+    sanity_check(dataset, column)?;
+    let projection = dataset.schema().project(&[&column])?;
+    let training_data = dataset.sample(256, &projection).await?;
+
+    
+
+    todo!()
+}
+
+fn train_opq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
+    let opq = OptimizedProductQuantizer::new(
+        params.num_sub_vectors as usize,
+        params.num_bits as u32,
+        params.metric_type,
+        params.max_iters,
+    );
+
+    Ok(opq)
 }
 
 #[async_trait]
@@ -632,7 +669,7 @@ impl IndexBuilder for IvfPqIndexBuilder {
         );
 
         // Step 1. Sanity check
-        self.sanity_check()?;
+        sanity_check(self.dataset.as_ref(), &self.column)?;
 
         // Make with row id to build inverted index, and sampling
         let sample_size = self.sample_size_hint();
@@ -641,9 +678,6 @@ impl IndexBuilder for IvfPqIndexBuilder {
         // let training_data = dataset.sample(sample_size, &projection).await;
         // let training_data =
         //     sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
-
-        // Train transformers
-        self.train_opq().await?;
 
         // First, scan the dataset to train IVF models.
         let mut ivf_model = self.train_ivf_model().await?;
