@@ -131,7 +131,7 @@ impl Transformer for OptimizedProductQuantizer {
         for _ in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let train = train.dot(&rotation)?;
-            let (rot, pq) = self.train_once(&train, self.metric_type).await?;
+            let (rot, _) = self.train_once(&train, self.metric_type).await?;
             rotation = rot;
         }
         self.rotation = Some(rotation);

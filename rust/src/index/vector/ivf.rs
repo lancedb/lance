@@ -14,7 +14,6 @@
 
 //! IVF - Inverted File index.
 
-use core::slice::SlicePattern;
 use std::sync::Arc;
 
 use arrow_arith::{
@@ -613,9 +612,10 @@ impl IvfPqIndexBuilder {
 async fn sample_vector_column(dataset: Arc<Dataset>, col: &str, n: usize) -> Result<RecordBatch> {
     use rand::seq::IteratorRandom;
     let num_rows = dataset.count_rows().await?;
-    let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
+    // let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
+    let ids = vec![1, 2, 3];
     let projection = dataset.schema().project(&[col])?;
-    dataset.take(&ids[..], &projection).await
+    Ok(dataset.take(&ids[..], &projection).await?)
 }
 
 #[async_trait]
@@ -636,8 +636,11 @@ impl IndexBuilder for IvfPqIndexBuilder {
 
         // Make with row id to build inverted index, and sampling
         let sample_size = self.sample_size_hint();
-        let training_data =
-            sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
+        let dataset = self.dataset.clone();
+        // let projection = dataset.schema().project(&[&self.column])?;
+        // let training_data = dataset.sample(sample_size, &projection).await;
+        // let training_data =
+        //     sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
 
         // Train transformers
         self.train_opq().await?;
