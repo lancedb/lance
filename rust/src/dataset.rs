@@ -382,7 +382,7 @@ impl Dataset {
                 }
 
                 let builder = IvfPqIndexBuilder::try_new(
-                    self,
+                    Arc::new(self.clone()),
                     index_id,
                     &index_name,
                     column,

@@ -476,8 +476,8 @@ impl TryFrom<&pb::Ivf> for Ivf {
     }
 }
 
-pub struct IvfPqIndexBuilder<'a> {
-    dataset: &'a Dataset,
+pub struct IvfPqIndexBuilder {
+    dataset: Arc<Dataset>,
 
     /// Unique id of the index.
     uuid: Uuid,
@@ -505,9 +505,9 @@ pub struct IvfPqIndexBuilder<'a> {
     kmeans_max_iters: u32,
 }
 
-impl<'a> IvfPqIndexBuilder<'a> {
+impl IvfPqIndexBuilder {
     pub fn try_new(
-        dataset: &'a Dataset,
+        dataset: Arc<Dataset>,
         uuid: Uuid,
         name: &str,
         column: &str,
@@ -576,7 +576,7 @@ impl<'a> IvfPqIndexBuilder<'a> {
         ))
     }
 
-    /// Train optional transform.
+    /// Train OPQ
     async fn train_opq(&self) -> Result<OptimizedProductQuantizer> {
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
@@ -588,12 +588,23 @@ impl<'a> IvfPqIndexBuilder<'a> {
             100,
         );
 
+        // TODO: sample the dataset
+
         Ok(opq)
+    }
+
+    /// Take samples
+    fn sample(&self) -> usize {
+        let n_clusters = std::cmp::max(
+            self.num_partitions as usize,
+            ProductQuantizer::num_centroids(self.nbits),
+        );
+        n_clusters * 256
     }
 }
 
 #[async_trait]
-impl IndexBuilder for IvfPqIndexBuilder<'_> {
+impl IndexBuilder for IvfPqIndexBuilder {
     fn index_type() -> IndexType {
         IndexType::Vector
     }
@@ -607,6 +618,13 @@ impl IndexBuilder for IvfPqIndexBuilder<'_> {
 
         // Step 1. Sanity check
         self.sanity_check()?;
+
+        // Make with row id to build inverted index, and sampling
+        let mut scanner = self.dataset.scan();
+        scanner.project(&[&self.column])?;
+        scanner.with_row_id();
+
+        let samples =
 
         // Train transformers
         self.train_opq().await?;

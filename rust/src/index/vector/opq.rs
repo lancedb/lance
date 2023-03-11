@@ -141,6 +141,7 @@ impl Transformer for OptimizedProductQuantizer {
         Ok(())
     }
 
+    /// Apply OPQ transform
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
         let rotation = self.rotation.as_ref().unwrap();
         rotation.dot(data)
