@@ -243,10 +243,21 @@ impl<'a> PlainDecoder<'a> {
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        //group then concat
-        //at least 1 bit in 1 byte
-        let density_threhold = 8;
-        //bio-devide by value
+        let block_size = self.reader.prefetch_size() as u32;
+
+        let mut chunk_ranges = vec![];
+        let mut start: u32 = 0;
+        for j in 0..(indices.len() - 1) as u32 {
+            if indices.value(j as usize + 1)
+                > indices.value(start as usize) + block_size * 8
+            {
+                let next_start = j + 1;
+                chunk_ranges.push(start..next_start);
+                start = next_start;
+            }
+        }
+        // Remaining
+        chunk_ranges.push(start..indices.len() as u32);
         todo!()
     }
 
