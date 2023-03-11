@@ -68,7 +68,7 @@ impl<'a> PlainEncoder<'a> {
         self.encode_internal(array, self.data_type).await
     }
 
-    pub async fn encode_many(&mut self, array: Box<[&dyn Array]>) -> Result<usize> {
+    pub async fn encode_many(&mut self, array: &[&dyn Array]) -> Result<usize> {
         self.encode_internal_many(array, self.data_type).await
     }
 
@@ -82,7 +82,7 @@ impl<'a> PlainEncoder<'a> {
     }
 
     #[async_recursion]
-    async fn encode_internal_many(&mut self, array: Box<[&'async_recursion dyn Array]>, data_type: &DataType) -> Result<usize> {
+    async fn encode_internal_many(&mut self, array: &[&'async_recursion dyn Array], data_type: &DataType) -> Result<usize> {
         if let DataType::FixedSizeList(items, _) = data_type {
             // to this later
             self.encode_fixed_size_list(array[0], items).await
@@ -125,7 +125,7 @@ impl<'a> PlainEncoder<'a> {
 
     /// Encode array of primitive values.
     // GC here [Array]
-    async fn encode_primitive_many(&mut self, array: Box<[&dyn Array]>) -> Result<usize> {
+    async fn encode_primitive_many(&mut self, array: &[&dyn Array]) -> Result<usize> {
         // GC how can we guarantee that all arrays have the same type?
         let offset = self.writer.tell();
 
@@ -457,7 +457,7 @@ mod tests {
             // for i in 0..10 {
             //     arrs.push( make_array_(&t, &buffer).await);
             // };
-            test_round_trip_many(Box::new([arr]) , t).await;
+            test_round_trip_many(&[arr], t).await;
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
@@ -487,13 +487,15 @@ mod tests {
         assert_eq!(expected.as_ref(), actual);
     }
 
-    async fn test_round_trip_many(expected: Box<[ArrayRef]>, data_type: DataType) {
+    async fn test_round_trip_many(expected: &[ArrayRef], data_type: DataType) {
         let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
         // GC - less verbose way to make Box<[&ArrayRef]> -> Box<[dyn Array]> ?
+
+        // expected: &[ArrayRef]
         let expected_encoder = expected.iter().map(|e| e.as_ref()).collect();
 
         assert_eq!(encoder.encode_many(expected_encoder).await.unwrap(), 0);
