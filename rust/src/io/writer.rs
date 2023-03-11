@@ -126,10 +126,15 @@ impl<'a> FileWriter<'a> {
     /// Write a [RecordBatch] to the open file.
     ///
     /// Returns [Err] if the schema does not match with the batch.
+    ///
+    // GC - here receive a [RecordBatch]
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.schema.fields.as_slice() {
             let column_id = batch.schema().index_of(&field.name)?;
+            // GC - here loop through all columns - YEAP
             let array = batch.column(column_id);
+            // GC - do we need to merge many arrays together or should we pass along [ArrayRef]?
+            // Nope, we pass it along
             self.write_array(field, array).await?;
         }
         self.metadata.push_batch_length(batch.num_rows() as i32);
@@ -185,9 +190,11 @@ impl<'a> FileWriter<'a> {
     }
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
+    // GC Here should we have [ArrayRef]?
     async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
+        // GC if [ArrayRef], when do we merge to a single ArrayRef? NOPE we don't merge them in memory at all
         let pos = encoder.encode(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);

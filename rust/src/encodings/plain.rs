@@ -68,12 +68,26 @@ impl<'a> PlainEncoder<'a> {
         self.encode_internal(array, self.data_type).await
     }
 
+    pub async fn encode_many(&mut self, array: Box<[&dyn Array]>) -> Result<usize> {
+        self.encode_internal_many(array, self.data_type).await
+    }
+
     #[async_recursion]
     async fn encode_internal(&mut self, array: &dyn Array, data_type: &DataType) -> Result<usize> {
         if let DataType::FixedSizeList(items, _) = data_type {
             self.encode_fixed_size_list(array, items).await
         } else {
             self.encode_primitive(array).await
+        }
+    }
+
+    #[async_recursion]
+    async fn encode_internal_many(&mut self, array: Box<[&'async_recursion dyn Array]>, data_type: &DataType) -> Result<usize> {
+        if let DataType::FixedSizeList(items, _) = data_type {
+            // to this later
+            self.encode_fixed_size_list(array[0], items).await
+        } else {
+            self.encode_primitive_many(array).await
         }
     }
 
@@ -105,6 +119,35 @@ impl<'a> PlainEncoder<'a> {
                 )
             };
             self.writer.write_all(slice).await?;
+        }
+        Ok(offset)
+    }
+
+    /// Encode array of primitive values.
+    // GC here [Array]
+    async fn encode_primitive_many(&mut self, array: Box<[&dyn Array]>) -> Result<usize> {
+        // GC how can we guarantee that all arrays have the same type?
+        let offset = self.writer.tell();
+
+        // GC if array is empty, should we just return offset?
+
+        // GC - handle booleans
+        if matches!(array[0].data_type(), DataType::Boolean) {
+            let boolean_arr = as_boolean_array(array[0]);
+            self.encode_boolean(boolean_arr).await?;
+        } else {
+            let byte_width = array[0].data_type().byte_width();
+            for a in array.iter() {
+                let data = a.data();
+                let slice = unsafe {
+                    from_raw_parts(
+                        data.buffers()[0].as_ptr().add(a.offset() * byte_width),
+                        a.len() * byte_width,
+                    )
+                };
+                self.writer.write_all(slice).await?;
+                println!("Position: {} slice len {}", self.writer.tell(), slice.len());
+            }
         }
         Ok(offset)
     }
@@ -408,7 +451,13 @@ mod tests {
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let arr = make_array_(&t, &buffer).await;
-            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+            test_round_trip(Arc::new(arr.clone()) as ArrayRef, t.clone()).await;
+
+            // let arrs:Vec<dyn Array> = Vec::new();
+            // for i in 0..10 {
+            //     arrs.push( make_array_(&t, &buffer).await);
+            // };
+            test_round_trip_many(Box::new([arr]) , t).await;
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
@@ -436,6 +485,28 @@ mod tests {
         let arr = decoder.decode().await.unwrap();
         let actual = arr.as_ref();
         assert_eq!(expected.as_ref(), actual);
+    }
+
+    async fn test_round_trip_many(expected: Box<[ArrayRef]>, data_type: DataType) {
+        let store = ObjectStore::new(":memory:").await.unwrap();
+        let path = Path::from("/foo");
+        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
+
+        // GC - less verbose way to make Box<[&ArrayRef]> -> Box<[dyn Array]> ?
+        let expected_encoder = expected.iter().map(|e| e.as_ref()).collect();
+
+        assert_eq!(encoder.encode_many(expected_encoder).await.unwrap(), 0);
+        object_writer.shutdown().await.unwrap();
+
+        let reader = store.open(&path).await.unwrap();
+        assert!(reader.size().await.unwrap() > 0);
+        // Expected size is the total of all arrays
+        let expected_size = expected.iter().map(|e| e.len()).sum();
+        let decoder = PlainDecoder::new(reader.as_ref(), &data_type, 0, expected_size).unwrap();
+        let arr = decoder.decode().await.unwrap();
+        let actual = arr.as_ref();
+        assert_eq!(expected[0].as_ref(), actual);
     }
 
     #[tokio::test]
