@@ -14,12 +14,15 @@
 
 //! IVF - Inverted File index.
 
+use core::slice::SlicePattern;
 use std::sync::Arc;
 
-use arrow_arith::aggregate::{max, min};
-use arrow_arith::arithmetic::subtract_dyn;
-use arrow_array::builder::Float32Builder;
+use arrow_arith::{
+    aggregate::{max, min},
+    arithmetic::subtract_dyn,
+};
 use arrow_array::{
+    builder::Float32Builder,
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
     UInt32Array,
@@ -36,8 +39,7 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
-use rand::SeedableRng;
-use rand::{rngs::SmallRng, Rng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
@@ -490,6 +492,8 @@ pub struct IvfPqIndexBuilder {
 
     dimension: usize,
 
+    num_rows: usize,
+
     /// Metric type.
     metric_type: MetricType,
 
@@ -506,7 +510,7 @@ pub struct IvfPqIndexBuilder {
 }
 
 impl IvfPqIndexBuilder {
-    pub fn try_new(
+    pub async fn try_new(
         dataset: Arc<Dataset>,
         uuid: Uuid,
         name: &str,
@@ -521,6 +525,7 @@ impl IvfPqIndexBuilder {
         let DataType::FixedSizeList(_, d) = field.data_type() else {
             return Err(Error::IO(format!("Column {column} is not a vector type")));
         };
+        let num_rows = dataset.count_rows().await?;
         Ok(Self {
             dataset,
             uuid,
@@ -530,6 +535,7 @@ impl IvfPqIndexBuilder {
             metric_type,
             num_partitions,
             num_sub_vectors,
+            num_rows,
             nbits: 8,
             kmeans_max_iters: 100,
         })
@@ -593,14 +599,23 @@ impl IvfPqIndexBuilder {
         Ok(opq)
     }
 
-    /// Take samples
-    fn sample(&self) -> usize {
+    /// A guess of the sample size to train IVF / PQ / OPQ.
+    fn sample_size_hint(&self) -> usize {
         let n_clusters = std::cmp::max(
             self.num_partitions as usize,
             ProductQuantizer::num_centroids(self.nbits),
         );
         n_clusters * 256
     }
+}
+
+/// Sample `n` vectors from the vector column in the dataset
+async fn sample_vector_column(dataset: Arc<Dataset>, col: &str, n: usize) -> Result<RecordBatch> {
+    use rand::seq::IteratorRandom;
+    let num_rows = dataset.count_rows().await?;
+    let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
+    let projection = dataset.schema().project(&[col])?;
+    dataset.take(&ids[..], &projection).await
 }
 
 #[async_trait]
@@ -620,11 +635,9 @@ impl IndexBuilder for IvfPqIndexBuilder {
         self.sanity_check()?;
 
         // Make with row id to build inverted index, and sampling
-        let mut scanner = self.dataset.scan();
-        scanner.project(&[&self.column])?;
-        scanner.with_row_id();
-
-        let samples =
+        let sample_size = self.sample_size_hint();
+        let training_data =
+            sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
 
         // Train transformers
         self.train_opq().await?;

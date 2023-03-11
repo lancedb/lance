@@ -389,7 +389,8 @@ impl Dataset {
                     vec_params.num_partitions,
                     vec_params.num_sub_vectors,
                     vec_params.metric_type,
-                )?;
+                )
+                .await?;
                 builder.build().await?
             }
         }

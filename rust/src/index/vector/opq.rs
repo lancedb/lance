@@ -39,11 +39,10 @@ pub struct OptimizedProductQuantizer {
     /// OPQ rotation
     rotation: Option<MatrixView>,
 
-    /// PQ
-    pq: Option<ProductQuantizer>,
-
+    /// The metric to compute the distance.
     metric_type: MetricType,
 
+    /// Number of iterations to train OPQ.
     num_iters: usize,
 }
 
@@ -66,7 +65,6 @@ impl OptimizedProductQuantizer {
             num_sub_vectors,
             num_bits,
             rotation: None,
-            pq: None,
             metric_type,
             num_iters,
         }
@@ -135,7 +133,6 @@ impl Transformer for OptimizedProductQuantizer {
             let train = train.dot(&rotation)?;
             let (rot, pq) = self.train_once(&train, self.metric_type).await?;
             rotation = rot;
-            self.pq = Some(pq);
         }
         self.rotation = Some(rotation);
         Ok(())
