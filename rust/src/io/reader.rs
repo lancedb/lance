@@ -966,13 +966,6 @@ mod tests {
         // assert_eq!(batch, result.as_slice()[0]);
     }
 
-    #[tokio::test]
-    async fn test_impulse_labs() {
-        let test_uri = "/Users/eto/dev/katniss/katniss-bench/lance-fs-ingestor.lance";
-        let result = scan_dataset(test_uri).await.unwrap();
-        println!("{}", result.len());
-    }
-
     async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
         let results = Dataset::open(uri)
             .await?
