@@ -43,9 +43,9 @@ use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
-    MetricType, Query, VectorIndex,
+    MetricType, Query, Transformer, VectorIndex,
 };
-use crate::arrow::*;
+use crate::arrow::{linalg::MatrixView, *};
 use crate::index::vector::opq::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
@@ -624,14 +624,27 @@ async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
-) -> Result<FixedSizeListArray> {
+) -> Result<MatrixView> {
+    let num_rows = dataset.count_rows().await?;
     let projection = dataset.schema().project(&[&column])?;
-    let batch = dataset.sample(sample_size_hint, &projection).await?;
+    let batch = if num_rows > sample_size_hint {
+        dataset.sample(sample_size_hint, &projection).await?
+    } else {
+        let mut scanner = dataset.scan();
+        scanner.project(&[column])?;
+        let batches = scanner
+            .try_into_stream()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
+    };
     let array = batch.column_by_name(column).ok_or(Error::Index(format!(
         "Sample training data: column {} does not exist in return",
         column
     )))?;
-    Ok(as_fixed_size_list_array(array).clone())
+    let fixed_size_array = as_fixed_size_list_array(array);
+    fixed_size_array.try_into()
 }
 
 /// Build IVF(PQ) index
@@ -657,21 +670,20 @@ pub async fn build_ivf_pq_index(
 
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
-    let opq = train_opq(&training_data, pq_params)?;
+    let opq = train_opq(&training_data, pq_params).await?;
 
     todo!()
 }
 
-fn train_opq(
-    data: &FixedSizeListArray,
-    params: &PQBuildParams,
-) -> Result<OptimizedProductQuantizer> {
-    let opq = OptimizedProductQuantizer::new(
+async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
+    let mut opq = OptimizedProductQuantizer::new(
         params.num_sub_vectors as usize,
         params.num_bits as u32,
         params.metric_type,
         params.max_iters,
     );
+
+    opq.train(data).await?;
 
     Ok(opq)
 }
