@@ -131,6 +131,15 @@ impl MatrixView {
         }
     }
 
+    pub fn row(&self, i: usize) -> Option<Float32Array> {
+        if i >= self.num_rows() {
+            None
+        } else {
+            let slice_arr = self.data.slice(i * self.num_columns(), self.num_columns());
+            Some(as_primitive_array(slice_arr.as_ref()).clone())
+        }
+    }
+
     /// (Lazy) transpose of the matrix.
     ///
     pub fn transpose(&self) -> Self {
@@ -230,7 +239,7 @@ impl TryFrom<&FixedSizeListArray> for MatrixView {
     type Error = Error;
 
     fn try_from(fsl: &FixedSizeListArray) -> Result<Self> {
-        if !matches!(fsl.data_type(), DataType::Float32) {
+        if !matches!(fsl.value_type(), DataType::Float32) {
             return Err(Error::Arrow(format!(
                 "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
                 fsl.data_type()

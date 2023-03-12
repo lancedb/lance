@@ -377,29 +377,19 @@ impl Ivf {
                 let arr = batch.column_by_name(column_name).ok_or_else(|| {
                     Error::IO(format!("Dataset does not have column {column_name}"))
                 })?;
-                let vectors = as_fixed_size_list_array(arr).clone();
-                // let vec = vectors.clone();
-                let values = self.centroids.values();
-                let centroids = as_primitive_array(values.as_ref()).clone();
-                let partition_ids = tokio::task::spawn_blocking(move || {
-                    let dist_func = metric_type.func();
-                    (0..vectors.len())
-                        .map(|idx| {
-                            let arr = vectors.value(idx);
-                            let f: &Float32Array = as_primitive_array(&arr);
-                            Ok(argmin(dist_func(f, &centroids, f.len())?.as_ref()).unwrap())
-                        })
-                        .collect::<Result<Vec<u32>>>()
+                let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+                let centroids = self.centroids.as_ref().try_into()?;
+                let partition_column = tokio::task::spawn_blocking(move || {
+                    compute_residual_matrix(&vectors, &centroids, metric_type)
                 })
                 .await??;
-                let partition_column = Arc::new(UInt32Array::from(partition_ids));
                 let batch_with_part_id = batch.try_with_column(
                     ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
                     partition_column,
                 )?;
                 Ok::<RecordBatch, Error>(batch_with_part_id)
             })
-            .buffer_unordered(16)
+            .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -647,6 +637,38 @@ async fn maybe_sample_training_data(
     fixed_size_array.try_into()
 }
 
+/// Compute residual matrix.
+///
+/// Parameters
+/// - *data*: input matrix to compute residual.
+/// - *centroids*: the centroids to compute residual vectors.
+/// - *metric_type*: the metric type to compute distance.
+fn compute_residual_matrix(
+    data: &MatrixView,
+    centroids: &MatrixView,
+    metric_type: MetricType,
+) -> Result<Arc<Float32Array>> {
+    assert_eq!(centroids.num_columns(), data.num_columns());
+    let dist_func = metric_type.func();
+
+    let dim = data.num_columns();
+    let mut builder = Float32Builder::with_capacity(data.data().len());
+    for i in 0..data.num_rows() {
+        let row = data.row(i).unwrap();
+        let part_id = argmin(
+            dist_func(&row, centroids.data().as_ref(), dim)
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let centroid = centroids.row(part_id as usize).unwrap();
+        let residual = subtract_dyn(&row, &centroid)?;
+        let f32_residual_array: &Float32Array = as_primitive_array(&residual);
+        builder.append_slice(f32_residual_array.values());
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
 /// Build IVF(PQ) index
 pub async fn build_ivf_pq_index(
     dataset: &Dataset,
@@ -679,7 +701,7 @@ pub async fn build_ivf_pq_index(
     // Train IVF partitions.
     let mut ivf_model = train_ivf_model(&training_data, ivf_params).await?;
 
-    // Compute the residual vector.
+    // Compute the residual vector for training PQ
 
     todo!()
 }
