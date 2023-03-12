@@ -258,12 +258,10 @@ impl<'a> PlainDecoder<'a> {
         }
         // Remaining
         chunk_ranges.push(start..indices.len() as u32);
-        println!("chunk ranges {:?}", chunk_ranges);
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
-                println!("request: {:?}", request);
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
@@ -276,15 +274,6 @@ impl<'a> PlainDecoder<'a> {
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
         Ok(concat(&references)?)
-    }
-
-    async fn take_boolean_simple(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        let start = indices.value(0) as usize;
-        let end = indices.value(indices.len() - 1) as usize;
-        let array = self.get(start..end + 1).await?;
-        let array_byte_boundray = (start / 8 * 8) as u32;
-        let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
-        Ok(take(array.as_ref(), &shifted_indices, None)?)
     }
 }
 
