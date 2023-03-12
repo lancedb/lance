@@ -36,6 +36,7 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use arrow_select::concat::concat;
 use arrow_select::take::take;
+use arrow_select::window::shift;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -258,15 +259,17 @@ impl<'a> PlainDecoder<'a> {
         }
         // Remaining
         chunk_ranges.push(start..indices.len() as u32);
+
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
+
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
                 let array_byte_boundray = (start / 8 * 8) as u32;
-                let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
+                let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
             .buffered(8)
@@ -312,7 +315,6 @@ impl<'a> Decoder for PlainDecoder<'a> {
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
-
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
@@ -748,5 +750,37 @@ mod tests {
             actual.column_by_name("b").unwrap().as_ref(),
             &BooleanArray::from(vec![false, false, true, false, true])
         );
+    }
+
+    #[tokio::test]
+    async fn test_take_boolean_beyond_chunk() {
+        let store = ObjectStore::memory_small_prefetch();
+        // let store = ObjectStore::memory();
+        let path = Path::from("/take_bools");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
+
+        println!(
+            "actual: {:?}", actual
+        )
+        // assert_eq!(
+        //     actual.column_by_name("b").unwrap().as_ref(),
+        //     &BooleanArray::from(vec![false, false, true, false, true])
+        // );
     }
 }
