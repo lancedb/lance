@@ -26,30 +26,30 @@ use std::sync::Arc;
 
 use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
-    FixedSizeListArray, UInt32Array, UInt8Array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, make_array,
+    new_empty_array, UInt32Array, UInt8Array,
 };
+use arrow_array::cast::as_primitive_array;
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use arrow_select::concat::concat;
 use arrow_select::take::take;
-use arrow_select::window::shift;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
-use super::Decoder;
 use crate::arrow::*;
 use crate::encodings::AsyncIndex;
+use crate::Error;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
-use crate::Error;
+
+use super::Decoder;
 
 /// Encoder for plain encoding.
 ///
@@ -412,10 +412,11 @@ mod tests {
     use object_store::path::Path;
     use rand::prelude::*;
 
-    use super::*;
     use crate::datatypes::Schema;
-    use crate::io::object_writer::ObjectWriter;
     use crate::io::{FileReader, FileWriter, ObjectStore};
+    use crate::io::object_writer::ObjectWriter;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
