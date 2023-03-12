@@ -131,7 +131,7 @@ impl<'a> PlainEncoder<'a> {
                 .as_ref(),
             items.data_type(),
         )
-        .await
+            .await
     }
 }
 
@@ -245,11 +245,13 @@ impl<'a> PlainDecoder<'a> {
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         let block_size = self.reader.prefetch_size() as u32;
+        let boolean_block_size = block_size * 8;
 
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
         for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1) > indices.value(start as usize) + block_size * 8 {
+            if (indices.value(j as usize + 1) / boolean_block_size) >
+                (indices.value(start as usize) / boolean_block_size) {
                 let next_start = j + 1;
                 chunk_ranges.push(start..next_start);
                 start = next_start;
