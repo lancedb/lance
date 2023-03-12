@@ -403,7 +403,7 @@ impl ProductQuantizer {
         data: &FixedSizeListArray,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        self.train(data, metric_type).await?;
+        self.train(data, metric_type, 50).await?;
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
         self.transform(&sub_vectors, metric_type).await
