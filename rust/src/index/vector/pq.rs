@@ -353,12 +353,13 @@ impl ProductQuantizer {
         FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
     }
 
-    /// Train a [ProductQuantizer] using an array of vectors.
-    pub async fn fit_transform(
+    /// Train [`ProductQuantizer`] using vectors.
+    pub async fn train(
         &mut self,
         data: &FixedSizeListArray,
         metric_type: MetricType,
-    ) -> Result<FixedSizeListArray> {
+        max_iters: usize,
+    ) -> Result<()> {
         assert!(data.value_length() % self.num_sub_vectors as i32 == 0);
         assert_eq!(data.value_type(), DataType::Float32);
         assert_eq!(data.null_count(), 0);
@@ -380,7 +381,7 @@ impl ProductQuantizer {
                 flatten_array,
                 sub_vector_dimension,
                 num_centroids,
-                25,
+                max_iters as u32,
                 rng.clone(),
                 metric_type,
             )
@@ -392,6 +393,19 @@ impl ProductQuantizer {
         }
         let pd_centroids = codebook_builder.finish();
         self.codebook = Some(Arc::new(pd_centroids));
+
+        Ok(())
+    }
+
+    /// Train a [ProductQuantizer] using an array of vectors.
+    pub async fn fit_transform(
+        &mut self,
+        data: &FixedSizeListArray,
+        metric_type: MetricType,
+    ) -> Result<FixedSizeListArray> {
+        self.train(data, metric_type).await?;
+
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
         self.transform(&sub_vectors, metric_type).await
     }
 }

@@ -702,6 +702,24 @@ pub async fn build_ivf_pq_index(
     let mut ivf_model = train_ivf_model(&training_data, ivf_params).await?;
 
     // Compute the residual vector for training PQ
+    let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
+    let residual_data =
+        compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
+    let pq_training_data =
+        FixedSizeListArray::try_new(residual_data.as_ref(), training_data.num_columns() as i32)?;
+
+    // Train PQ
+    let mut pq = ProductQuantizer::new(
+        pq_params.num_sub_vectors,
+        pq_params.num_bits as u32,
+        training_data.num_columns(),
+    );
+    pq.train(
+        &pq_training_data,
+        pq_params.metric_type,
+        pq_params.max_iters,
+    )
+    .await?;
 
     todo!()
 }
