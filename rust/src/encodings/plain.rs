@@ -131,7 +131,7 @@ impl<'a> PlainEncoder<'a> {
                 .as_ref(),
             items.data_type(),
         )
-        .await
+            .await
     }
 }
 
@@ -270,7 +270,7 @@ impl<'a> PlainDecoder<'a> {
                 let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
-            .buffered(8)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
