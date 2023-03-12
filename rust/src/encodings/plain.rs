@@ -315,6 +315,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
+
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
@@ -775,12 +776,9 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
 
-        println!(
-            "actual: {:?}", actual
-        )
-        // assert_eq!(
-        //     actual.column_by_name("b").unwrap().as_ref(),
-        //     &BooleanArray::from(vec![false, false, true, false, true])
-        // );
+        assert_eq!(
+            actual.column_by_name("b").unwrap().as_ref(),
+            &BooleanArray::from(vec![false, false, true, false, true])
+        );
     }
 }
