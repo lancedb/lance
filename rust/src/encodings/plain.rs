@@ -26,11 +26,11 @@ use std::sync::Arc;
 
 use arrow::array::{as_boolean_array, BooleanBuilder};
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, make_array,
-    new_empty_array, UInt32Array, UInt8Array,
-};
 use arrow_array::cast::as_primitive_array;
+use arrow_array::{
+    make_array, new_empty_array, Array, ArrayRef, BooleanArray, FixedSizeBinaryArray,
+    FixedSizeListArray, UInt32Array, UInt8Array,
+};
 use arrow_buffer::{bit_util, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -43,11 +43,11 @@ use tokio::io::AsyncWriteExt;
 
 use crate::arrow::*;
 use crate::encodings::AsyncIndex;
-use crate::Error;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
+use crate::Error;
 
 use super::Decoder;
 
@@ -131,7 +131,7 @@ impl<'a> PlainEncoder<'a> {
                 .as_ref(),
             items.data_type(),
         )
-            .await
+        .await
     }
 }
 
@@ -413,8 +413,8 @@ mod tests {
     use rand::prelude::*;
 
     use crate::datatypes::Schema;
-    use crate::io::{FileReader, FileWriter, ObjectStore};
     use crate::io::object_writer::ObjectWriter;
+    use crate::io::{FileReader, FileWriter, ObjectStore};
 
     use super::*;
 
@@ -754,8 +754,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_boolean_beyond_chunk() {
-        let store = ObjectStore::memory_small_prefetch();
-        // let store = ObjectStore::memory();
+        let store = ObjectStore::memory();
+        store.set_prefetch_size(256);
         let path = Path::from("/take_bools");
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(

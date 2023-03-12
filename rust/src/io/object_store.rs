@@ -132,15 +132,6 @@ impl ObjectStore {
         }
     }
 
-    pub(crate) fn memory_small_prefetch() -> Self {
-        Self {
-            inner: Arc::new(InMemory::new()),
-            scheme: String::from("memory"),
-            base_path: Path::from("/"),
-            prefetch_size: 256,
-        }
-    }
-
     pub fn prefetch_size(&self) -> usize {
         self.prefetch_size
     }
