@@ -131,7 +131,7 @@ impl<'a> PlainEncoder<'a> {
                 .as_ref(),
             items.data_type(),
         )
-            .await
+        .await
     }
 }
 
@@ -249,9 +249,7 @@ impl<'a> PlainDecoder<'a> {
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
         for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1)
-                > indices.value(start as usize) + block_size * 8
-            {
+            if indices.value(j as usize + 1) > indices.value(start as usize) + block_size * 8 {
                 let next_start = j + 1;
                 chunk_ranges.push(start..next_start);
                 start = next_start;
