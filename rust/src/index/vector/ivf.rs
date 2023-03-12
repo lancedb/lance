@@ -598,8 +598,8 @@ pub struct IvfBuildParams {
     pub metric_type: MetricType,
 
     // ---- kmeans parameters
-    /// Number of iterations to run kmeans.
-    pub num_iters: usize,
+    /// Max number of iterations to train kmeans.
+    pub max_iters: usize,
 }
 
 /// Parameters for building product quantization.
@@ -670,11 +670,21 @@ pub async fn build_ivf_pq_index(
 
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
+    // Train the OPQ rotation matrix.
     let opq = train_opq(&training_data, pq_params).await?;
+
+    // Transform training data using OPQ matrix.
+    let training_data = opq.transform(&training_data).await?;
+
+    // Train IVF partitions.
+    let mut ivf_model = train_ivf_model(&training_data, ivf_params).await?;
+
+    // Compute the residual vector.
 
     todo!()
 }
 
+/// Train Optimized Product Quantization.
 async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
     let mut opq = OptimizedProductQuantizer::new(
         params.num_sub_vectors as usize,
@@ -686,6 +696,25 @@ async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<Optimize
     opq.train(data).await?;
 
     Ok(opq)
+}
+
+/// Train IVF partitions using kmeans.
+async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<Ivf> {
+    let rng = SmallRng::from_entropy();
+
+    let centroids = super::kmeans::train_kmeans(
+        data.data().as_ref(),
+        data.num_columns(),
+        params.num_partitions,
+        params.max_iters as u32,
+        rng,
+        params.metric_type,
+    )
+    .await?;
+    Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new(
+        centroids,
+        data.num_columns() as i32,
+    )?)))
 }
 
 #[async_trait]
