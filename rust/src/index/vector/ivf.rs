@@ -512,7 +512,6 @@ impl IvfPqIndexBuilder {
         let DataType::FixedSizeList(_, d) = field.data_type() else {
             return Err(Error::IO(format!("Column {column} is not a vector type")));
         };
-        let num_rows = dataset.count_rows().await?;
         Ok(Self {
             dataset,
             uuid,
@@ -544,15 +543,6 @@ impl IvfPqIndexBuilder {
             )
             .await?,
         ))
-    }
-
-    /// A guess of the sample size to train IVF / PQ / OPQ.
-    fn sample_size_hint(&self) -> usize {
-        let n_clusters = std::cmp::max(
-            self.num_partitions as usize,
-            ProductQuantizer::num_centroids(self.nbits),
-        );
-        n_clusters * 256
     }
 }
 
@@ -711,22 +701,25 @@ pub async fn build_ivf_pq_index(
     // The final train of PQ sub-vectors
     let pq = train_pq(&pq_training_data, pq_params).await?;
 
+    // Transform all data (in memory for now)
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?;
+    scanner.with_row_id();
+
+
+
     todo!()
 }
 
-
+/// Train product quantization over (OPQ-rotated) residual vectors.
 async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<ProductQuantizer> {
     let mut pq = ProductQuantizer::new(
         params.num_sub_vectors,
         params.num_bits as u32,
         data.value_length() as usize,
     );
-    pq.train(
-        &data,
-        params.metric_type,
-        params.max_iters,
-    )
-    .await?;
+    pq.train(&data, params.metric_type, params.max_iters)
+        .await?;
     Ok(pq)
 }
 
@@ -779,13 +772,7 @@ impl IndexBuilder for IvfPqIndexBuilder {
         // Step 1. Sanity check
         sanity_check(self.dataset.as_ref(), &self.column)?;
 
-        // Make with row id to build inverted index, and sampling
-        let sample_size = self.sample_size_hint();
-        let dataset = self.dataset.clone();
-        // let projection = dataset.schema().project(&[&self.column])?;
-        // let training_data = dataset.sample(sample_size, &projection).await;
-        // let training_data =
-        //     sample_vector_column(self.dataset.clone(), &self.column, sample_size).await?;
+        // Make with row id to build inverted index, and sampling).await?;
 
         // First, scan the dataset to train IVF models.
         let mut ivf_model = self.train_ivf_model().await?;
