@@ -708,20 +708,26 @@ pub async fn build_ivf_pq_index(
     let pq_training_data =
         FixedSizeListArray::try_new(residual_data.as_ref(), training_data.num_columns() as i32)?;
 
-    // Train PQ
-    let mut pq = ProductQuantizer::new(
-        pq_params.num_sub_vectors,
-        pq_params.num_bits as u32,
-        training_data.num_columns(),
-    );
-    pq.train(
-        &pq_training_data,
-        pq_params.metric_type,
-        pq_params.max_iters,
-    )
-    .await?;
+    // The final train of PQ sub-vectors
+    let pq = train_pq(&pq_training_data, pq_params).await?;
 
     todo!()
+}
+
+
+async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<ProductQuantizer> {
+    let mut pq = ProductQuantizer::new(
+        params.num_sub_vectors,
+        params.num_bits as u32,
+        data.value_length() as usize,
+    );
+    pq.train(
+        &data,
+        params.metric_type,
+        params.max_iters,
+    )
+    .await?;
+    Ok(pq)
 }
 
 /// Train Optimized Product Quantization.
