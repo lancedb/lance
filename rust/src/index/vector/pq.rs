@@ -26,6 +26,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
 use crate::arrow::*;
+use crate::arrow::linalg::MatrixView;
 use crate::index::pb;
 use crate::index::vector::kmeans::train_kmeans;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
@@ -400,12 +401,13 @@ impl ProductQuantizer {
     /// Train a [ProductQuantizer] using an array of vectors.
     pub async fn fit_transform(
         &mut self,
-        data: &FixedSizeListArray,
+        mat: &MatrixView,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        self.train(data, metric_type, 50).await?;
+        let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
+        self.train(&data, metric_type, 50).await?;
 
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
+        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors as i32);
         self.transform(&sub_vectors, metric_type).await
     }
 }
@@ -430,7 +432,6 @@ impl From<&ProductQuantizer> for pb::Pq {
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
             codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
-            opq: None,
         }
     }
 }
