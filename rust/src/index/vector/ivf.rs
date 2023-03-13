@@ -615,12 +615,25 @@ pub async fn build_ivf_pq_index(
             let residual_data = as_fixed_size_list_array(&residual_col);
             let pq_code = pq_ref.transform(&residual_data, metric_type).await?;
 
-            part_id_and_residual
-                .try_with_column(batch.schema().field_with_name(column)?.clone(), arr.clone())?
-                .try_with_column(
-                    ArrowField::new(PQ_CODE_COLUMN, pq_code.data_type().clone(), false),
-                    Arc::new(pq_code),
-                )
+            let row_ids = batch.column_by_name(ROW_ID).expect("Expect row id").clone();
+            let part_ids = part_id_and_residual
+                .column_by_name(PARTITION_ID_COLUMN)
+                .expect("Expect partition ids column")
+                .clone();
+
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
+                ArrowField::new(
+                    PQ_CODE_COLUMN,
+                    DataType::FixedSizeList(
+                        Box::new(ArrowField::new("item", DataType::UInt8, true)),
+                        pq_params.num_sub_vectors as i32,
+                    ),
+                    false,
+                ),
+            ]));
+            RecordBatch::try_new(schema.clone(), vec![row_ids, part_ids, Arc::new(pq_code)])
         })
         .buffered(num_cpus::get())
         .try_collect::<Vec<_>>()
