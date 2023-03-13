@@ -126,18 +126,32 @@ impl<'a> FileWriter<'a> {
     /// Write a [RecordBatch] to the open file.
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    ///
-    // GC - here receive a [RecordBatch]
     pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.schema.fields.as_slice() {
             let column_id = batch.schema().index_of(&field.name)?;
-            // GC - here loop through all columns - YEAP
             let array = batch.column(column_id);
-            // GC - do we need to merge many arrays together or should we pass along [ArrayRef]?
-            // Nope, we pass it along
             self.write_array(field, array).await?;
         }
         self.metadata.push_batch_length(batch.num_rows() as i32);
+        self.batch_id += 1;
+        Ok(())
+    }
+
+    // GC - here receive a [RecordBatch]
+    pub async fn write_multi(&mut self, batch: &[&RecordBatch]) -> Result<()> {
+        for field in self.schema.fields.iter() {
+            // TODO Return error if empty
+            let column_id = batch.first().unwrap().schema().index_of(&field.name)?;
+            // GC - here loop through all columns - YEAP
+            let arrs = batch.iter().map(|b| b.column(column_id)).collect::<Vec<_>>();
+            // let array = batch.column(column_id);
+            // GC - do we need to merge many arrays together or should we pass along [ArrayRef]?
+            // Nope, we pass it along
+            self.write_array_multi(field, arrs.as_slice()).await?;
+        }
+        // Right thing to do here?
+        // self.metadata.push_batch_length(batch.num_rows() as i32);
+        self.metadata.push_batch_length(batch.len() as i32);
         self.batch_id += 1;
         Ok(())
     }
@@ -158,6 +172,35 @@ impl<'a> FileWriter<'a> {
 
     #[async_recursion]
     async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+        let data_type = array.data_type();
+        match data_type {
+            DataType::Null => self.write_null_array(field, array).await,
+            dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
+            dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
+            DataType::Dictionary(key_type, _) => {
+                self.write_dictionary_arr(field, array, key_type).await
+            }
+            dt if dt.is_struct() => {
+                let struct_arr = as_struct_array(array);
+                self.write_struct_array(field, struct_arr).await
+            }
+            DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
+                self.write_fixed_stride_array(field, array).await
+            }
+            DataType::List(_) => self.write_list_array(field, array).await,
+            DataType::LargeList(_) => self.write_large_list_array(field, array).await,
+            _ => {
+                return Err(Error::Schema(format!(
+                    "FileWriter::write: unsupported data type: {data_type}"
+                )))
+            }
+        }
+    }
+
+    #[async_recursion]
+    async fn write_array_multi(&mut self, field: &Field, arrs: &[&ArrayRef]) -> Result<()> {
+        // TODO
+        let array = arrs.first().unwrap();
         let data_type = array.data_type();
         match data_type {
             DataType::Null => self.write_null_array(field, array).await,
@@ -226,6 +269,22 @@ impl<'a> FileWriter<'a> {
             println!("dict {} has values", field);
         }
         let pos = encoder.encode(array).await?;
+        let page_info = PageInfo::new(pos, array.len());
+        self.page_table.set(field.id, self.batch_id, page_info);
+        Ok(())
+    }
+
+    async fn write_dictionary_arr_multi(
+        &mut self,
+        field: &Field,
+        array: &[&dyn Array],
+        key_type: &DataType,
+    ) -> Result<()> {
+        assert_eq!(field.encoding, Some(Encoding::Dictionary));
+
+        // Write the dictionary keys.
+        let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
+        let pos = encoder.encode_multi(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())

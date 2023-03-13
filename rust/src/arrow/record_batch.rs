@@ -15,11 +15,13 @@
 //! Additional utility for [`RecordBatch`]
 //!
 
+use std::ops::Deref;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 use arrow_select::concat::concat_batches;
+use crate::dataset::Dataset;
 
-use crate::Result;
+use crate::{Error, Result};
 
 #[derive(Debug)]
 pub struct RecordBatchBuffer {
@@ -43,7 +45,11 @@ impl RecordBatchBuffer {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
 
-    pub fn finish(&self) -> Result<RecordBatch> {
+    pub fn finish(&self) -> std::result::Result<RecordBatch, Error> {
+        Ok(concat_batches(&self.schema(), self.batches.iter())?)
+    }
+
+    pub fn finish_multi(&self) -> std::result::Result<&[RecordBatch], Error> {
         // TODO arrow concat here concat_batches messes up the dictionaries
         // FIX write multiple arrays in the same group
             //  group -> lance layout grouping rows together, each encoder write 1 group
@@ -56,7 +62,9 @@ impl RecordBatchBuffer {
             //      but each batch should have at most "params.max_rows_per_group" rows
             //      if not move to another batch
             //      do a slice_window without copying the data
-        Ok(concat_batches(&self.schema(), self.batches.iter())?)
+        // let batch_slice = self.batches.iter().map(|b| b.clone()).collect::<Vec<_>>().as_slice();
+        // Ok(concat_batches(&self.schema(), self.batches.iter())?)
+        Ok(self.batches.as_slice())
     }
 }
 
@@ -89,9 +97,10 @@ mod tests {
     use arrow::{array::StringDictionaryBuilder, datatypes::Int32Type};
     use arrow_array::{StructArray, ArrayRef};
     use arrow_schema::{Schema as ArrowSchema, Field as ArrowField, DataType};
+    use futures::TryStreamExt;
 
-    #[test]
-    fn test_batch_dict_arrays() {
+    #[tokio::test]
+    async fn test_batch_dict_arrays() {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![ArrowField::new(
@@ -121,8 +130,9 @@ mod tests {
             RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap()
         }).collect();
         let buffer = RecordBatchBuffer::new(batches);
-        let batch = buffer.finish().unwrap();
+        let batch = buffer.finish_multi().unwrap();
         println!("Batch is: {:?}", batch);
+        // should not be incrementing
     }
 }
 

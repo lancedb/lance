@@ -242,7 +242,9 @@ impl Dataset {
 
                 // HERE writer needs to handle multiple batches returned by buffer.finish()
                 // start by changing plain_encoder / binary_encoder
-                writer.as_mut().unwrap().write(&buffer.finish()?).await?;
+                let batches = buffer.finish_multi()?;
+                let batches_ref = batches.iter().map(|b| b).collect::<Vec<_>>();
+                writer.as_mut().unwrap().write_multi(batches_ref.as_slice()).await?;
                 buffer = RecordBatchBuffer::empty();
             }
             if let Some(w) = writer.as_mut() {

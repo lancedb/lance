@@ -28,6 +28,7 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
+use arrow_schema::DataType::{Int16, Int32, Int64, Int8, UInt16, UInt32, UInt64, UInt8};
 use async_trait::async_trait;
 
 use super::plain::PlainEncoder;
@@ -60,6 +61,45 @@ impl<'a> DictionaryEncoder<'a> {
         println!("write_typed_array: {:?}", dict_arr.keys());
         plain_encoder.encode_single(dict_arr.keys()).await?;
         Ok(pos)
+    }
+
+    async fn write_typed_array_multi<T: ArrowDictionaryKeyType>(
+        &mut self,
+        arrs: &[&dyn Array],
+    ) -> Result<usize> {
+        let pos = self.writer.tell();
+
+        // TODO
+        let data_type = arrs.first().unwrap().data_type();
+        let mut plain_encoder = PlainEncoder::new(self.writer, data_type);
+
+        let keys = arrs.iter().map(|a|{
+           let dict_arr = as_dictionary_array::<T>(*a);
+           dict_arr.keys() as &dyn Array
+        }).collect::<Vec<_>>();
+
+        // println!("write_typed_array: {:?}", keys);
+        plain_encoder.encode(keys.as_slice()).await?;
+        Ok(pos)
+    }
+
+    pub(crate) async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize> {
+        use DataType::*;
+
+        match self.key_type {
+            UInt8 => self.write_typed_array_multi::<UInt8Type>(array).await,
+            UInt16 => self.write_typed_array_multi::<UInt16Type>(array).await,
+            UInt32 => self.write_typed_array_multi::<UInt32Type>(array).await,
+            UInt64 => self.write_typed_array_multi::<UInt64Type>(array).await,
+            Int8 => self.write_typed_array_multi::<Int8Type>(array).await,
+            Int16 => self.write_typed_array_multi::<Int16Type>(array).await,
+            Int32 => self.write_typed_array_multi::<Int32Type>(array).await,
+            Int64 => self.write_typed_array_multi::<Int64Type>(array).await,
+            _ => Err(Error::Schema(format!(
+                "DictionaryEncoder: unsupported key type: {:?}",
+                self.key_type
+            ))),
+        }
     }
 }
 
