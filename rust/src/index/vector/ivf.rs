@@ -949,7 +949,8 @@ impl KMeansModel {
             &params,
         )
         .await;
-        Ok(as_fixed_size_list_array(model.centroids.as_ref()).clone())
+        let values = model.centroids.as_ref();
+        FixedSizeListArray::try_new(values, dimension as i32)
     }
 
     async fn maybe_sample_training_data(
