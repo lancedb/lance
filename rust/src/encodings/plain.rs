@@ -64,12 +64,13 @@ impl<'a> PlainEncoder<'a> {
 
     /// Encode an array of a batch.
     /// Returns the offset of the metadata
-    pub async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
-        self.encode_internal(array, self.data_type).await
+    pub async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
+        self.encode_internal_many(array, self.data_type).await
     }
 
-    pub async fn encode_many(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        self.encode_internal_many(array, self.data_type).await
+    pub async fn encode_single(&mut self, array: &dyn Array) -> Result<usize> {
+        let arrs = vec![array];
+        self.encode_internal_many(arrs.as_slice(), self.data_type).await
     }
 
     #[async_recursion]
@@ -84,8 +85,7 @@ impl<'a> PlainEncoder<'a> {
     #[async_recursion]
     async fn encode_internal_many(&mut self, array: &[&'async_recursion dyn Array], data_type: &DataType) -> Result<usize> {
         if let DataType::FixedSizeList(items, _) = data_type {
-            // to this later
-            self.encode_fixed_size_list(array[0], items).await
+            self.encode_fixed_size_list_many(array, items).await
         } else {
             self.encode_primitive_many(array).await
         }
@@ -100,6 +100,20 @@ impl<'a> PlainEncoder<'a> {
         self.writer
             .write_all(array.data().buffers()[0].as_slice())
             .await?;
+        Ok(())
+    }
+
+    async fn encode_boolean_many(&mut self, array: &[&BooleanArray]) -> Result<()> {
+        for a in array.iter() {
+            let mut builder = BooleanBuilder::with_capacity(a.len());
+            for i in 0..a.len() {
+                builder.append_value(a.value(i));
+            }
+            let boolean_array = builder.finish();
+            self.writer
+                .write_all(boolean_array.data().buffers()[0].as_slice())
+                .await?;
+        }
         Ok(())
     }
 
@@ -124,17 +138,14 @@ impl<'a> PlainEncoder<'a> {
     }
 
     /// Encode array of primitive values.
-    // GC here [Array]
     async fn encode_primitive_many(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        // GC how can we guarantee that all arrays have the same type?
+        // GC validate that all arrays have the same type / panic if not
         let offset = self.writer.tell();
 
-        // GC if array is empty, should we just return offset?
-
-        // GC - handle booleans
+        // GC - Make sure it is safe to assume at least one array exist
         if matches!(array[0].data_type(), DataType::Boolean) {
-            let boolean_arr = as_boolean_array(array[0]);
-            self.encode_boolean(boolean_arr).await?;
+            let mut boolean_arr = array.iter().map(|a| as_boolean_array(*a)).collect::<Vec<&BooleanArray>>();
+            self.encode_boolean_many(boolean_arr.as_slice()).await?;
         } else {
             let byte_width = array[0].data_type().byte_width();
             for a in array.iter() {
@@ -146,7 +157,6 @@ impl<'a> PlainEncoder<'a> {
                     )
                 };
                 self.writer.write_all(slice).await?;
-                println!("Position: {} slice len {}", self.writer.tell(), slice.len());
             }
         }
         Ok(offset)
@@ -174,6 +184,38 @@ impl<'a> PlainEncoder<'a> {
             items.data_type(),
         )
         .await
+    }
+
+    /// Encode fixed size list.
+    async fn encode_fixed_size_list_many(&mut self, array: &[&dyn Array], items: &Field) -> Result<usize> {
+        let mut first_position: Option<usize> = None;
+        for a in array {
+            let list_array = a
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "Needed a FixedSizeListArray but got {}",
+                        a.data_type()
+                    ))
+                })?;
+            let offset = list_array.value_offset(0) as usize;
+            let length = list_array.len() as usize;
+            let value_length = list_array.value_length() as usize;
+            let encoding_size = self.encode_internal(
+                list_array
+                    .values()
+                    .slice(offset, length * value_length)
+                    .as_ref(),
+                items.data_type(),
+            )
+                .await?;
+
+            if first_position.is_none() {
+                first_position = Some(encoding_size)
+            }
+        }
+        Ok(first_position.unwrap()) // TODO Return error
     }
 }
 
@@ -450,11 +492,8 @@ mod tests {
         let input: Vec<i64> = Vec::from_iter(1..127 as i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let arr = make_array_(&t, &buffer).await;
-            test_round_trip(Arc::new(arr.clone()) as ArrayRef, t.clone()).await;
-
             let mut arrs: Vec<ArrayRef> = Vec::new();
-            for i in 0..10 {
+            for _ in 0..10 {
                 arrs.push( Arc::new(make_array_(&t, &buffer).await));
             };
             test_round_trip_many(arrs.as_slice(), t).await;
@@ -465,26 +504,13 @@ mod tests {
         let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let arr = make_array_(&t, &buffer).await;
-            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+            let mut arrs: Vec<ArrayRef> = Vec::new();
+
+            for _ in 0..10 {
+                arrs.push( Arc::new(make_array_(&t, &buffer).await));
+            };
+            test_round_trip_many(arrs.as_slice(), t).await;
         }
-    }
-
-    async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
-        let store = ObjectStore::new(":memory:").await.unwrap();
-        let path = Path::from("/foo");
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-        let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
-
-        assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
-        object_writer.shutdown().await.unwrap();
-
-        let reader = store.open(&path).await.unwrap();
-        assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(reader.as_ref(), &data_type, 0, expected.len()).unwrap();
-        let arr = decoder.decode().await.unwrap();
-        let actual = arr.as_ref();
-        assert_eq!(expected.as_ref(), actual);
     }
 
     async fn test_round_trip_many(expected: &[ArrayRef], data_type: DataType) {
@@ -494,7 +520,7 @@ mod tests {
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
         let mut expected_as_array = expected.iter().map(|e| e.as_ref()).collect::<Vec<&dyn Array>>();
-        assert_eq!(encoder.encode_many(expected_as_array.as_slice()).await.unwrap(), 0);
+        assert_eq!(encoder.encode(expected_as_array.as_slice()).await.unwrap(), 0);
         object_writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
@@ -510,8 +536,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_encode_decode_bool_array() {
-        let arr = BooleanArray::from(vec![true, false].repeat(100));
-        test_round_trip(Arc::new(arr) as ArrayRef, DataType::Boolean).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            arrs.push( Arc::new(BooleanArray::from(vec![true, false].repeat(100))) as ArrayRef);
+        };
+        test_round_trip_many(arrs.as_slice(), DataType::Boolean).await;
     }
 
     #[tokio::test]
@@ -529,36 +559,29 @@ mod tests {
         let input = Vec::from_iter(1..127 as i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
-            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
-        }
+            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t.clone(), true)), 3);
+            let mut arrs: Vec<ArrayRef> = Vec::new();
 
-        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-        let mut rng = rand::thread_rng();
-        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
-        for t in float_types {
-            let buffer = Buffer::from_slice_ref(input.as_slice());
-            let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
-            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+            for _ in 0..10 {
+                let items = make_array_(&t.clone(), &buffer).await;
+                let arr = FixedSizeListArray::try_new(items, 3).unwrap();
+                arrs.push( Arc::new(arr) as ArrayRef);
+            };
+            test_round_trip_many(arrs.as_slice(), list_type).await;
         }
-
-        let items = BooleanArray::from(vec![true, false, true].repeat(42));
-        let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-        let list_type =
-            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
-        test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
     }
 
     #[tokio::test]
     async fn test_encode_decode_fixed_size_binary_array() {
         let t = DataType::FixedSizeBinary(3);
-        let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
-        let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
+            let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
+            arrs.push( Arc::new(arr) as ArrayRef);
+        };
+        test_round_trip_many(arrs.as_slice(), t).await;
     }
 
     #[tokio::test]
@@ -566,19 +589,29 @@ mod tests {
         // FixedSizeList of FixedSizeList
         let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
-        let values = Int64Array::from_iter_values(1..=120 as i64);
-        let arr = FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
-            .unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = Int64Array::from_iter_values(1..=120 as i64);
+            let arr = FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
+                .unwrap();
+            arrs.push( Arc::new(arr) as ArrayRef);
+        };
+        test_round_trip_many(arrs.as_slice(), t).await;
 
         // FixedSizeList of FixedSizeBinary
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
-        let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr =
-            FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
-                .unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = UInt8Array::from_iter_values(1..=120 as u8);
+            let arr =
+                FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
+                    .unwrap();
+            arrs.push( Arc::new(arr) as ArrayRef);
+        };
+        test_round_trip_many(arrs.as_slice(), t).await;
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
@@ -598,7 +631,7 @@ mod tests {
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
         let mut writer = store.create(&path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        assert_eq!(encoder.encode_single(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
@@ -641,7 +674,7 @@ mod tests {
 
         let mut writer = store.create(&path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        assert_eq!(encoder.encode_single(&array).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();

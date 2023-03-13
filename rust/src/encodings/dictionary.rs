@@ -58,7 +58,7 @@ impl<'a> DictionaryEncoder<'a> {
 
         let mut plain_encoder = PlainEncoder::new(self.writer, dict_arr.data_type());
         println!("write_typed_array: {:?}", dict_arr.keys());
-        plain_encoder.encode(dict_arr.keys()).await?;
+        plain_encoder.encode_single(dict_arr.keys()).await?;
         Ok(pos)
     }
 }
@@ -220,7 +220,7 @@ mod tests {
         {
             let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
             let mut encoder = PlainEncoder::new(&mut object_writer, arr.keys().data_type());
-            pos = encoder.encode(arr.keys()).await.unwrap();
+            pos = encoder.encode_single(arr.keys()).await.unwrap();
             object_writer.shutdown().await.unwrap();
         }
 

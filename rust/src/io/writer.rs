@@ -57,7 +57,7 @@ pub async fn write_manifest(
                 let pos = match data_type {
                     dt if dt.is_numeric() => {
                         let mut encoder = PlainEncoder::new(writer, dt);
-                        encoder.encode(value_arr).await?
+                        encoder.encode_single(value_arr).await?
                     }
                     dt if dt.is_binary_like() => {
                         let mut encoder = BinaryEncoder::new(writer);
@@ -195,7 +195,7 @@ impl<'a> FileWriter<'a> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
         // GC if [ArrayRef], when do we merge to a single ArrayRef? NOPE we don't merge them in memory at all
-        let pos = encoder.encode(array).await?;
+        let pos = encoder.encode_single(array).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
