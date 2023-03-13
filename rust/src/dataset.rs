@@ -391,6 +391,7 @@ impl Dataset {
                     index_id,
                     &index_name,
                     column,
+                    self.count_rows().await?,
                     vec_params.num_partitions,
                     vec_params.num_sub_vectors,
                     vec_params.metric_type,

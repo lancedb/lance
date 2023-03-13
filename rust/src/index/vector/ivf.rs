@@ -55,6 +55,7 @@ use crate::io::{
 use crate::{
     dataset::{scanner::Scanner, Dataset, ROW_ID},
     index::{pb, pb::vector_index_stage::Stage, IndexBuilder, IndexType},
+    utils::kmeans::{KMeansParams, KMeans},
 };
 use crate::{Error, Result};
 
@@ -514,6 +515,9 @@ pub struct IvfPqIndexBuilder {
     /// Vector column to search for.
     column: String,
 
+    /// total number of rows in the dataset
+    num_rows: usize,
+
     dimension: usize,
 
     /// Metric type.
@@ -537,6 +541,7 @@ impl IvfPqIndexBuilder {
         uuid: Uuid,
         name: &str,
         column: &str,
+        num_rows: usize,
         num_partitions: u32,
         num_sub_vectors: u32,
         metric_type: MetricType,
@@ -552,6 +557,7 @@ impl IvfPqIndexBuilder {
             uuid,
             name: name.to_string(),
             column: column.to_string(),
+            num_rows,
             dimension: d as usize,
             metric_type,
             num_partitions,
@@ -563,21 +569,22 @@ impl IvfPqIndexBuilder {
 
     /// Train IVF partitions using kmeans.
     async fn train_ivf_model(&self) -> Result<Ivf> {
+        // Train IVF partitions using kmeans.
         let mut scanner = self.dataset.scan();
         scanner.project(&[&self.column])?;
-
         let rng = SmallRng::from_entropy();
-        Ok(Ivf::new(
-            train_kmeans_model(
-                &scanner,
-                self.dimension,
-                self.num_partitions as usize,
-                self.kmeans_max_iters,
-                rng.clone(),
-                self.metric_type,
-            )
-            .await?,
-        ))
+        let params = IvfBuildParams {
+            max_iters: self.kmeans_max_iters as usize,
+            metric_type: self.metric_type,
+            num_partitions: self.num_partitions as usize
+        };
+
+        let mut rng = SmallRng::from_entropy();
+
+        let model = KMeansModel::new(params.num_partitions, params.max_iters as u32, params.metric_type);
+        let centroids = model.train(&scanner, self.dimension, self.num_rows, &mut rng).await?;
+
+        Ok(Ivf::new(Arc::new(centroids)))
     }
 }
 
@@ -893,38 +900,81 @@ impl IndexBuilder for IvfPqIndexBuilder {
     }
 }
 
-async fn train_kmeans_model(
-    scanner: &Scanner,
-    dimension: usize,
-    k: usize,
+
+/// Streaming Kmeans model
+pub struct KMeansModel {
+    /// Number of centroids needed for this model
+    num_centroids: usize,
+    /// Maximum number of iterations to train
     max_iterations: u32,
-    rng: impl Rng,
+    /// the distance metric to use
     metric_type: MetricType,
-) -> Result<Arc<FixedSizeListArray>> {
-    let schema = scanner.schema()?;
-    assert_eq!(schema.fields.len(), 1);
-    let column_name = schema.fields[0].name();
-    // Copy all to memory for now, optimize later.
-    let batches = scanner
-        .try_into_stream()
-        .await?
-        .try_collect::<Vec<_>>()
-        .await?;
-    let mut arr_list = vec![];
-    for batch in batches {
-        let arr = batch.column_by_name(column_name).unwrap();
-        let list_arr = as_fixed_size_list_array(&arr);
-        arr_list.push(list_arr.values().clone());
+}
+
+impl KMeansModel {
+    pub fn new(num_centroids: usize, max_iterations: u32, metric_type: MetricType) -> Self {
+        KMeansModel {
+            num_centroids,
+            max_iterations,
+            metric_type
+        }
     }
 
-    let arrays = arr_list.iter().map(|l| l.as_ref()).collect::<Vec<_>>();
+    pub async fn train(&self, scanner: &Scanner, dimension: usize, size: usize, rng: &mut impl Rng) -> Result<FixedSizeListArray> {
+        let num_samples_target = self.num_centroids * 256;
+        let training_samples = self.maybe_sample_training_data(scanner, size, num_samples_target, rng).await?;
 
-    let all_vectors = concat(&arrays)?;
-    let values: &Float32Array = as_primitive_array(&all_vectors);
-    let centroids =
-        super::kmeans::train_kmeans(values, dimension, k, max_iterations, rng, metric_type).await?;
-    Ok(Arc::new(FixedSizeListArray::try_new(
-        centroids,
-        dimension as i32,
-    )?))
+        let params = KMeansParams {
+            max_iters: self.max_iterations,
+            metric_type: self.metric_type,
+            ..Default::default()
+        };
+        let model = KMeans::new_with_params(training_samples.data().as_ref(), dimension,
+                                            self.num_centroids, &params).await;
+        Ok(as_fixed_size_list_array(model.centroids.as_ref()).clone())
+    }
+
+    async fn maybe_sample_training_data(&self, scanner: &Scanner,
+                                        num_rows: usize,
+                                        sample_size_hint: usize,
+                                        rng: &mut impl Rng) -> Result<MatrixView> {
+        let schema = scanner.schema()?;
+        assert_eq!(schema.fields.len(), 1);
+        let column_name = schema.fields[0].name();
+        let p = (self.num_centroids as f64 * 256.0) / num_rows as f64;
+        // Copy all to memory for now, optimize later.
+        let values: Result<Vec<Arc<dyn Array>>> = scanner
+            .try_into_stream()
+            .await?
+            .map_ok(|b| {
+                match b.column_by_name(column_name) {
+                    Some(c) => {
+                        let fixed_list = as_fixed_size_list_array(c);
+                        if num_rows > sample_size_hint {
+                            let samples: Arc<dyn Array> = Arc::new(sample(fixed_list, rng, p)?);
+                            Ok(samples)
+                        } else {
+                            let samples: Arc<dyn Array> = Arc::new(fixed_list.clone());
+                            Ok(samples)
+                        }
+                    }
+                    _ => Err(Error::Schema("vector column not found".to_string()))
+                }
+            })
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .collect();
+
+        let all_vectors = concat(values?.iter().map(|v| v.as_ref()).collect::<Vec<_>>().as_slice())?;
+        let fixed_size_array = as_fixed_size_list_array(all_vectors.as_ref());
+        fixed_size_array.try_into()
+    }
+}
+
+fn sample(arr: &FixedSizeListArray, rng: &mut (impl Rng + Sized), prob: f64) -> Result<FixedSizeListArray> {
+    let indices: Vec<usize> = (0..arr.len()).filter(|_| rng.gen_bool(prob)).collect();
+    let taken: Vec<Arc<dyn Array>> = indices.iter().map(|&i| arr.value(i).clone()).collect::<Vec<_>>();
+    let values = concat(taken.iter().map(|v| v.as_ref()).collect::<Vec<_>>().as_slice())?;
+    FixedSizeListArray::try_new(values, arr.value_length())
 }
