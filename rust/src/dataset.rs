@@ -36,10 +36,8 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::index::{
-    vector::{ivf::IvfPqIndexBuilder, VectorIndexParams},
-    IndexBuilder, IndexParams, IndexType,
-};
+use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams, PQBuildParams};
+use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
@@ -381,22 +379,27 @@ impl Dataset {
                     }
                 }
 
-                let projection = self.schema().project(&[column])?;
-                let training_data = self
-                    .sample(vec_params.num_partitions as usize * 256, &projection)
-                    .await?;
-
-                let builder = IvfPqIndexBuilder::try_new(
-                    Arc::new(self.clone()),
-                    index_id,
-                    &index_name,
+                let ivf_params = IvfBuildParams {
+                    num_partitions: vec_params.num_partitions as usize,
+                    metric_type: vec_params.metric_type,
+                    max_iters: 50,
+                };
+                let pq_params = PQBuildParams {
+                    num_sub_vectors: vec_params.num_sub_vectors as usize,
+                    num_bits: 8,
+                    metric_type: vec_params.metric_type,
+                    use_opq: true,
+                    max_iters: 100,
+                };
+                build_ivf_pq_index(
+                    self,
                     column,
-                    vec_params.num_partitions,
-                    vec_params.num_sub_vectors,
-                    vec_params.metric_type,
+                    &index_name,
+                    &index_id,
+                    &ivf_params,
+                    &pq_params,
                 )
-                .await?;
-                builder.build().await?
+                .await?
             }
         }
 

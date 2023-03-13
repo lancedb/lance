@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, UInt8Array};
 use async_trait::async_trait;
 
 use super::Transformer;
 use super::{pq::ProductQuantizer, MetricType};
-use crate::arrow::{linalg::*, *};
+use crate::arrow::linalg::*;
 use crate::Result;
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
@@ -37,7 +37,7 @@ pub struct OptimizedProductQuantizer {
     num_bits: u32,
 
     /// OPQ rotation
-    rotation: Option<MatrixView>,
+    pub rotation: Option<MatrixView>,
 
     /// The metric to compute the distance.
     metric_type: MetricType,
@@ -77,10 +77,8 @@ impl OptimizedProductQuantizer {
         metric_type: MetricType,
     ) -> Result<(MatrixView, ProductQuantizer)> {
         let dim = train.num_columns();
-        // TODO: make PQ::fit_transform work with MatrixView.
-        let fixed_list = FixedSizeListArray::try_new(train.data().as_ref(), dim as i32)?;
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        let pq_code = pq.fit_transform(&fixed_list, metric_type).await?;
+        let pq_code = pq.fit_transform(&train, metric_type).await?;
 
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
@@ -141,7 +139,7 @@ impl Transformer for OptimizedProductQuantizer {
     /// Apply OPQ transform
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
         let rotation = self.rotation.as_ref().unwrap();
-        rotation.dot(data)
+        Ok(rotation.dot(&data.transpose())?.transpose())
     }
 }
 

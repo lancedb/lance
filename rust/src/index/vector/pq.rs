@@ -15,25 +15,23 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, Array, FixedSizeListArray, Float32Array,
-    RecordBatch,
+    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
+    Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
+use super::MetricType;
+use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
-use crate::index::pb;
-use crate::index::vector::kmeans::train_kmeans;
+use crate::index::{pb, vector::kmeans::train_kmeans};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::utils::distance::compute::normalize;
 use crate::utils::distance::l2::l2_distance;
 use crate::Result;
-
-use super::MetricType;
 
 /// Product Quantization Index.
 ///
@@ -223,7 +221,7 @@ pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
 
     /// Vector dimension.
-    dimension: usize,
+    pub dimension: usize,
 
     /// PQ codebook
     ///
@@ -302,11 +300,13 @@ impl ProductQuantizer {
     }
 
     /// Transform the vector array to PQ code array.
-    async fn transform(
+    pub async fn transform(
         &self,
-        sub_vectors: &[Arc<FixedSizeListArray>],
+        data: &FixedSizeListArray,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
+        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors as i32);
+
         assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
         let vectors = sub_vectors.to_vec();
@@ -400,13 +400,13 @@ impl ProductQuantizer {
     /// Train a [ProductQuantizer] using an array of vectors.
     pub async fn fit_transform(
         &mut self,
-        data: &FixedSizeListArray,
+        mat: &MatrixView,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        self.train(data, metric_type, 50).await?;
+        let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
+        self.train(&data, metric_type, 50).await?;
 
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
-        self.transform(&sub_vectors, metric_type).await
+        self.transform(&data, metric_type).await
     }
 }
 
