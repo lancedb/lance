@@ -202,6 +202,7 @@ impl<'a> PlainEncoder<'a> {
             let offset = list_array.value_offset(0) as usize;
             let length = list_array.len() as usize;
             let value_length = list_array.value_length() as usize;
+            // TODO make this work with self.encode_internal_many
             let encoding_size = self.encode_internal(
                 list_array
                     .values()
@@ -472,10 +473,11 @@ mod tests {
     use object_store::path::Path;
     use rand::prelude::*;
 
-    use super::*;
     use crate::datatypes::Schema;
-    use crate::io::object_writer::ObjectWriter;
     use crate::io::{FileReader, FileWriter, ObjectStore};
+    use crate::io::object_writer::ObjectWriter;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
