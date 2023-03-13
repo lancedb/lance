@@ -790,9 +790,11 @@ impl IndexBuilder for IvfPqIndexBuilder {
             ProductQuantizer::new(self.num_sub_vectors as usize, self.nbits, self.dimension);
         let batch = concat_batches(&partitioned_batches[0].schema(), &partitioned_batches)?;
         let residual_vector = batch.column_by_name(RESIDUAL_COLUMN).unwrap();
+        let data: &Float32Array = as_primitive_array(residual_vector);
+        let resid_mat = MatrixView::new(Arc::new(data.clone()), self.dimension);
 
         let pq_code = pq
-            .fit_transform(as_fixed_size_list_array(residual_vector), self.metric_type)
+            .fit_transform(&resid_mat, self.metric_type)
             .await?;
 
         const PQ_CODE_COLUMN: &str = "__pq_code";

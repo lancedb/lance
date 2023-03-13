@@ -76,11 +76,8 @@ impl OptimizedProductQuantizer {
         train: &MatrixView,
         metric_type: MetricType,
     ) -> Result<(MatrixView, ProductQuantizer)> {
-        let dim = train.num_columns();
-        // TODO: make PQ::fit_transform work with MatrixView.
-        let fixed_list = FixedSizeListArray::try_new(train.data().as_ref(), dim as i32)?;
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        let pq_code = pq.fit_transform(&fixed_list, metric_type).await?;
+        let pq_code = pq.fit_transform(&train, metric_type).await?;
 
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
