@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_take_boolean_beyond_chunk() {
-        let store = ObjectStore::memory();
+        let mut store = ObjectStore::memory();
         store.set_prefetch_size(256);
         let path = Path::from("/take_bools");
 
