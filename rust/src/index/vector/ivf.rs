@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::UInt32Builder;
 use arrow_arith::{
     aggregate::{max, min},
     arithmetic::subtract_dyn,
@@ -357,6 +358,40 @@ impl Ivf {
     fn add_partition(&mut self, offset: usize, len: u32) {
         self.offsets.push(offset);
         self.lengths.push(len);
+    }
+
+    /// Compute the partition ID and residual vectors.
+    ///
+    /// Parameters
+    /// - *data*: input matrix to compute residual.
+    /// - *metric_type*: the metric type to compute distance.
+    pub fn compute_partition_and_residual(
+        &self,
+        data: &MatrixView,
+        metric_type: MetricType,
+    ) -> Result<RecordBatch> {
+        let mut part_id_builder = UInt32Builder::with_capacity(data.num_rows());
+        let mut residual_builder =
+            Float32Builder::with_capacity(data.num_columns() * data.num_rows());
+
+        let dim = data.num_columns();
+        let dist_func = metric_type.func();
+        let centroids: MatrixView = self.centroids.as_ref().try_into()?;
+        for i in 0..data.num_rows() {
+            let vector = data.row(i).unwrap();
+            let part_id = argmin(
+                dist_func(&vector, centroids.data().as_ref(), dim)
+                    .unwrap()
+                    .as_ref(),
+            )
+            .unwrap();
+            part_id_builder.append_value(part_id);
+            let cent = centroids.row(part_id as usize).unwrap();
+            let residual = subtract_dyn(&vector, &cent)?;
+            let resi_arr: &Float32Array = as_primitive_array(&residual);
+            residual_builder.append_slice(resi_arr.values());
+        }
+        todo!()
     }
 
     /// Scan the dataset and assign the partition ID for each row.
@@ -701,12 +736,13 @@ pub async fn build_ivf_pq_index(
     // The final train of PQ sub-vectors
     let pq = train_pq(&pq_training_data, pq_params).await?;
 
-    // Transform all data (in memory for now)
+    // Transform data and sort by partition ids.
     let mut scanner = dataset.scan();
     scanner.project(&[column])?;
     scanner.with_row_id();
 
-
+    let ivf = &ivf_model;
+    let metric_type = pq_params.metric_type;
 
     todo!()
 }
@@ -793,9 +829,7 @@ impl IndexBuilder for IvfPqIndexBuilder {
         let data: &Float32Array = as_primitive_array(residual_vector);
         let resid_mat = MatrixView::new(Arc::new(data.clone()), self.dimension);
 
-        let pq_code = pq
-            .fit_transform(&resid_mat, self.metric_type)
-            .await?;
+        let pq_code = pq.fit_transform(&resid_mat, self.metric_type).await?;
 
         const PQ_CODE_COLUMN: &str = "__pq_code";
         let pq_code_batch = RecordBatch::try_new(

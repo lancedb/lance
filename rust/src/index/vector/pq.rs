@@ -15,26 +15,23 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, Array, FixedSizeListArray, Float32Array,
-    RecordBatch,
+    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
+    Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{ArrayRef, UInt64Array, UInt8Array};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use crate::arrow::*;
+use super::MetricType;
 use crate::arrow::linalg::MatrixView;
-use crate::index::pb;
-use crate::index::vector::kmeans::train_kmeans;
+use crate::arrow::*;
+use crate::index::{pb, vector::kmeans::train_kmeans};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::utils::distance::compute::normalize;
 use crate::utils::distance::l2::l2_distance;
 use crate::Result;
-
-use super::MetricType;
 
 /// Product Quantization Index.
 ///
@@ -432,6 +429,7 @@ impl From<&ProductQuantizer> for pb::Pq {
             num_sub_vectors: pq.num_sub_vectors as u32,
             dimension: pq.dimension as u32,
             codebook: pq.codebook.as_ref().unwrap().values().to_vec(),
+            opq: None,
         }
     }
 }

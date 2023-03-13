@@ -76,6 +76,7 @@ impl OptimizedProductQuantizer {
         train: &MatrixView,
         metric_type: MetricType,
     ) -> Result<(MatrixView, ProductQuantizer)> {
+        let dim = train.num_columns();
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
         let pq_code = pq.fit_transform(&train, metric_type).await?;
 
