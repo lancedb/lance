@@ -24,6 +24,7 @@ use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
+use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
 use crate::Result;
 use crate::{arrow::*, Error};
@@ -79,6 +80,9 @@ pub struct KMeans {
     pub k: usize,
 
     pub metric_type: MetricType,
+
+    /// the sum of distance from the training samples to centroids.
+    pub distance_sum: f32
 }
 
 /// Initialize using kmean++, and returns the centroids of k clusters.
@@ -228,6 +232,7 @@ impl KMeanMembership {
             dimension,
             k: self.k,
             metric_type: self.metric_type,
+            distance_sum: self.distance_sum(),
         })
     }
 
@@ -273,6 +278,22 @@ impl KMeans {
         }
     }
 
+    /// Initialize a [`KMeans`] with random centroids.
+    ///
+    /// Parameters
+    /// - *data*: training data. provided to do samplings.
+    /// - *k*: the number of clusters.
+    /// - *metric_type*: the metric type to calculate distance.
+    /// - *rng*: random generator.
+    pub async fn init_random(
+        data: &MatrixView,
+        k: usize,
+        metric_type: MetricType,
+        rng: impl Rng,
+    ) -> Self {
+        kmeans_random_init(&data.data(), data.num_columns(), k, rng, metric_type).await
+    }
+
     /// Train a KMeans model on data with `k` clusters.
     pub async fn new(data: &Float32Array, dimension: usize, k: usize, max_iters: u32) -> Self {
         let params = KMeansParams {
@@ -296,11 +317,11 @@ impl KMeans {
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
+        let mat = MatrixView::new(data.clone(), dimension);
         for _ in 1..=params.redos {
             let mut kmeans = match params.init {
                 KMeanInit::Random => {
-                    kmeans_random_init(data.as_ref(), dimension, k, rng.clone(), params.metric_type)
-                        .await
+                    Self::init_random(&mat, k, params.metric_type, rng.clone()).await
                 }
                 KMeanInit::KMeanPlusPlus => {
                     kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
@@ -332,6 +353,18 @@ impl KMeans {
         }
 
         best_kmeans
+    }
+
+    /// Train for one iteration.
+    ///
+    /// Parameters
+    ///
+    /// - *data*: training data / samples.
+    ///
+    /// Returns a new KMeans
+    pub async fn train_once(&self, data: &MatrixView) -> Result<Self> {
+        let membership = self.compute_membership(data.data().clone()).await;
+        membership.to_kmeans().await
     }
 
     /// Recompute the membership of each vector.
