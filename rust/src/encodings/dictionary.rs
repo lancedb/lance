@@ -223,18 +223,22 @@ mod tests {
         encodings::plain::PlainEncoder,
         io::{object_writer::ObjectWriter, ObjectStore},
     };
-    use arrow_array::{Array, GenericStringArray, StringArray};
+    use arrow_array::{Array, GenericStringArray, Int16Array, Int8Array, StringArray};
     use arrow_array::types::Utf8Type;
     use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
-        // let values = vec!["a", "b", "b", "a", "c"];
-        let arr1: DictionaryArray<T> = vec!["a", "b"].into_iter().collect();
-        let arr2: DictionaryArray<T> = vec!["b", "c"].into_iter().collect();
+        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")].into_iter().collect();
 
-        let arr1_ref = arr1.keys() as &dyn Array;
-        let arr2_ref = arr2.keys() as &dyn Array;
-        let arrs: Vec<&dyn Array> = vec![arr1_ref, arr2_ref];
+        let keys1: PrimitiveArray<Int32Type> = vec![Some(0), Some(1)].into_iter().collect();
+        let arr1: DictionaryArray<Int32Type> = DictionaryArray::try_new(&keys1, &value_array).unwrap();
+
+        let keys2: PrimitiveArray<Int32Type> = vec![Some(1), Some(3)].into_iter().collect();
+        let arr2: DictionaryArray<Int32Type> = DictionaryArray::try_new(&keys2, &value_array).unwrap();
+
+        let keys1_ref = arr1.keys() as &dyn Array;
+        let keys2_ref = arr2.keys() as &dyn Array;
+        let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
         let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
@@ -248,7 +252,6 @@ mod tests {
         }
 
         let reader = store.open(&path).await.unwrap();
-        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c")].into_iter().collect();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,
@@ -258,10 +261,10 @@ mod tests {
         );
 
         let decoded_data = decoder.decode().await.unwrap();
-        let expected_data : DictionaryArray<T> = vec!["a", "b", "b", "c"].into_iter().collect();
+        let expected_data : DictionaryArray<Int32Type> = vec!["a", "b", "b", "d"].into_iter().collect();
         assert_eq!(
             &expected_data,
-            decoded_data.as_any().downcast_ref::<DictionaryArray<T>>().unwrap()
+            decoded_data.as_any().downcast_ref::<DictionaryArray<Int32Type>>().unwrap()
         );
     }
 
