@@ -680,7 +680,7 @@ async fn write_index_file(
     index_name: &str,
     uuid: &Uuid,
     mut ivf: Ivf,
-    opq: OptimizedProductQuantizer,
+    mut opq: OptimizedProductQuantizer,
     pq: ProductQuantizer,
     metric_type: MetricType,
     batches: &[RecordBatch],
@@ -719,6 +719,7 @@ async fn write_index_file(
     let pos = writer
         .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
         .await?;
+    opq.file_position = Some(pos);
 
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),

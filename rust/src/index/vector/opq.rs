@@ -41,7 +41,7 @@ pub struct OptimizedProductQuantizer {
     pub rotation: Option<MatrixView>,
 
     /// The offset where the matrix is stored in the index file.
-    file_position: Option<usize>,
+    pub file_position: Option<usize>,
 
     /// The metric to compute the distance.
     metric_type: MetricType,
