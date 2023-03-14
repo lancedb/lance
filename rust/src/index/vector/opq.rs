@@ -18,14 +18,14 @@
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, UInt8Array};
+use arrow_array::{Array, Float32Array, UInt8Array};
+use arrow_schema::DataType;
 use async_trait::async_trait;
 
 use super::{pq::ProductQuantizer, MetricType, Transformer};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
-use crate::io::object_reader::ObjectReader;
-use crate::io::FileReader;
+use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::{Error, Result};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
@@ -77,9 +77,22 @@ impl OptimizedProductQuantizer {
         }
     }
 
+    /// Load the optimized product quantizer.
     pub async fn load(reader: &dyn ObjectReader, position: usize, shape: &[usize]) -> Result<Self> {
         let dim = shape[0];
-        todo!()
+        let length = dim * dim;
+        let data =
+            read_fixed_stride_array(reader, &DataType::Float32, position, length, ..).await?;
+        let f32_data: Float32Array = as_primitive_array(data.as_ref()).clone();
+        let rotation = Some(MatrixView::new(Arc::new(f32_data), dim));
+        Ok(Self {
+            num_sub_vectors: 0,
+            num_bits: 0,
+            rotation,
+            file_position: None,
+            metric_type: MetricType::L2,
+            num_iters: 0,
+        })
     }
 
     /// Train once and return the rotation matrix and PQ codebook.

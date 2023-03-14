@@ -102,19 +102,22 @@ impl<'a> IvfPQIndex<'a> {
         let reader_ref = reader.as_ref();
         let transforms = stream::iter(index_metadata.transforms)
             .map(|tf| async move {
-                Ok::<Arc<dyn Transformer>, Error>(Arc::new(OptimizedProductQuantizer::load(
-                    reader_ref,
-                    tf.position as usize,
-                    tf.shape
-                        .iter()
-                        .map(|s| *s as usize)
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .await?))
+                Ok::<Arc<dyn Transformer>, Error>(Arc::new(
+                    OptimizedProductQuantizer::load(
+                        reader_ref,
+                        tf.position as usize,
+                        tf.shape
+                            .iter()
+                            .map(|s| *s as usize)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                    .await?,
+                ))
             })
             .buffered(4)
-            .try_collect::<Vec<Arc<dyn Transformer>>>().await?;
+            .try_collect::<Vec<Arc<dyn Transformer>>>()
+            .await?;
 
         Ok(Self {
             reader,
