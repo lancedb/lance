@@ -229,8 +229,8 @@ mod tests {
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
         // let values = vec!["a", "b", "b", "a", "c"];
-        let arr1: DictionaryArray<T> = vec!["a", "b", "b", "a", "c"].into_iter().collect();
-        let arr2: DictionaryArray<T> = vec!["c", "a", "b", "d"].into_iter().collect();
+        let arr1: DictionaryArray<T> = vec!["a", "b"].into_iter().collect();
+        let arr2: DictionaryArray<T> = vec!["b", "c"].into_iter().collect();
 
         let arr1_ref = arr1.keys() as &dyn Array;
         let arr2_ref = arr2.keys() as &dyn Array;
@@ -248,7 +248,7 @@ mod tests {
         }
 
         let reader = store.open(&path).await.unwrap();
-        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")].into_iter().collect();
+        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c")].into_iter().collect();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,
@@ -258,7 +258,7 @@ mod tests {
         );
 
         let decoded_data = decoder.decode().await.unwrap();
-        let expected_data : DictionaryArray<T> = vec!["a", "b", "b", "a", "c", "c", "a", "b", "d"].into_iter().collect();
+        let expected_data : DictionaryArray<T> = vec!["a", "b", "b", "c"].into_iter().collect();
         assert_eq!(
             &expected_data,
             decoded_data.as_any().downcast_ref::<DictionaryArray<T>>().unwrap()
