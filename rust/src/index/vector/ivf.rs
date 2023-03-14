@@ -155,12 +155,18 @@ impl<'a> IvfPQIndex<'a> {
 #[async_trait]
 impl VectorIndex for IvfPQIndex<'_> {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let mut mat = MatrixView::new(query.key.clone(), query.key.len());
+        for transform in self.transforms.iter() {
+            mat = transform.transform(&mat).await?;
+        }
+        let key = mat.data();
+        let key_ref = key.as_ref();
         let partition_ids = self
             .ivf
-            .find_partitions(&query.key, query.nprobs, self.metric_type)?;
+            .find_partitions(key_ref, query.nprobs, self.metric_type)?;
         let candidates = stream::iter(partition_ids.values())
             .then(|part_id| async move {
-                self.search_in_partition(*part_id as usize, &query.key, query.k)
+                self.search_in_partition(*part_id as usize, key_ref, query.k)
                     .await
             })
             .collect::<Vec<_>>()
@@ -276,7 +282,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                             return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                         };
                         let opq = match vidx.stages[0].stage.as_ref().unwrap() {
-                            Stage::Transform(transform) => Ok(()),
+                            Stage::Transform(transform) => Ok(transform),
                             _ => Err(Error::IO("Stage 0 only supports OPQ".to_string())),
                         }?;
                         let stage0 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
@@ -307,7 +313,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                                 .into(),
                             ivf,
                             pq,
-                            transforms: vec![],
+                            transforms: vec![opq.clone()],
                         })
                     }
                 }?
