@@ -41,7 +41,14 @@ impl From<Encoding> for pb::Encoding {
 #[async_trait]
 pub trait Encoder {
     /// Write an array, and returns the file offset of the beginning of the batch.
+    #[deprecated]
     async fn encode(&mut self, array: &dyn Array) -> Result<usize>;
+
+    /// Write an array, and returns the file offset of the beginning of the batch.
+    async fn encode_single(&mut self, array: &dyn Array) -> Result<usize>;
+
+    /// Write an array of Array, and returns the file offset of the beginning of the batch.
+    async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize>;
 }
 
 /// Decoder - Read Arrow Data.

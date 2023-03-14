@@ -43,7 +43,8 @@ use tokio::io::AsyncWriteExt;
 
 use super::Decoder;
 use crate::arrow::*;
-use crate::encodings::AsyncIndex;
+use crate::encodings::{AsyncIndex, Encoder};
+use crate::encodings::binary::BinaryEncoder;
 use crate::error::Result;
 use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
@@ -219,6 +220,22 @@ impl<'a> PlainEncoder<'a> {
         Ok(first_position.unwrap()) // TODO Return error
     }
 }
+//
+// impl<'a> Encoder for PlainEncoder<'a> {
+//     async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+//         self.encode_single(array).await
+//     }
+//
+//     async fn encode_single(&mut self, array: &dyn Array) -> Result<usize> {
+//         let arrs = vec![array];
+//         self.encode_internal_many(arrs.as_slice(), self.data_type).await
+//     }
+//
+//     async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize> {
+//         self.encode_internal_many(array, self.data_type).await
+//     }
+// }
+
 
 /// Decoder for plain encoding.
 pub struct PlainDecoder<'a> {

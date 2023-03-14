@@ -33,6 +33,7 @@ use arrow_schema::DataType;
 use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use prost::encoding::fixed64::encode;
 use tokio::io::AsyncWriteExt;
 
 use super::Encoder;
@@ -91,6 +92,10 @@ impl<'a> BinaryEncoder<'a> {
 #[async_trait]
 impl<'a> Encoder for BinaryEncoder<'a> {
     async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+        self.encode_single(array).await
+    }
+
+    async fn encode_single(&mut self, array: &dyn Array) -> Result<usize> {
         match array.data_type() {
             DataType::Utf8 => self.encode_typed_arr::<Utf8Type>(array).await,
             DataType::Binary => self.encode_typed_arr::<BinaryType>(array).await,
@@ -103,6 +108,10 @@ impl<'a> Encoder for BinaryEncoder<'a> {
                 )))
             }
         }
+    }
+
+    async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize> {
+        Ok(0)
     }
 }
 

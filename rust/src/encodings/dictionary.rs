@@ -52,19 +52,6 @@ impl<'a> DictionaryEncoder<'a> {
 
     async fn write_typed_array<T: ArrowDictionaryKeyType>(
         &mut self,
-        arr: &dyn Array,
-    ) -> Result<usize> {
-        let pos = self.writer.tell();
-        let dict_arr = as_dictionary_array::<T>(arr);
-
-        let mut plain_encoder = PlainEncoder::new(self.writer, dict_arr.data_type());
-        println!("write_typed_array: {:?}", dict_arr.keys());
-        plain_encoder.encode_single(dict_arr.keys()).await?;
-        Ok(pos)
-    }
-
-    async fn write_typed_array_multi<T: ArrowDictionaryKeyType>(
-        &mut self,
         arrs: &[&dyn Array],
     ) -> Result<usize> {
         let pos = self.writer.tell();
@@ -82,30 +69,20 @@ impl<'a> DictionaryEncoder<'a> {
         plain_encoder.encode(keys.as_slice()).await?;
         Ok(pos)
     }
-
-    pub(crate) async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        use DataType::*;
-
-        match self.key_type {
-            UInt8 => self.write_typed_array_multi::<UInt8Type>(array).await,
-            UInt16 => self.write_typed_array_multi::<UInt16Type>(array).await,
-            UInt32 => self.write_typed_array_multi::<UInt32Type>(array).await,
-            UInt64 => self.write_typed_array_multi::<UInt64Type>(array).await,
-            Int8 => self.write_typed_array_multi::<Int8Type>(array).await,
-            Int16 => self.write_typed_array_multi::<Int16Type>(array).await,
-            Int32 => self.write_typed_array_multi::<Int32Type>(array).await,
-            Int64 => self.write_typed_array_multi::<Int64Type>(array).await,
-            _ => Err(Error::Schema(format!(
-                "DictionaryEncoder: unsupported key type: {:?}",
-                self.key_type
-            ))),
-        }
-    }
 }
 
 #[async_trait]
 impl<'a> Encoder for DictionaryEncoder<'a> {
     async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+         self.encode_single(array).await
+    }
+
+    async fn encode_single(&mut self, array: &dyn Array) -> Result<usize> {
+        let arrs = vec![array];
+        self.encode_multi(arrs.as_slice()).await
+    }
+
+    async fn encode_multi(&mut self, array: &[&dyn Array]) -> Result<usize> {
         use DataType::*;
 
         match self.key_type {
@@ -246,12 +223,18 @@ mod tests {
         encodings::plain::PlainEncoder,
         io::{object_writer::ObjectWriter, ObjectStore},
     };
-    use arrow_array::Array;
+    use arrow_array::{Array, GenericStringArray, StringArray};
+    use arrow_array::types::Utf8Type;
     use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
-        let values = vec!["a", "b", "b", "a", "c"];
-        let arr: DictionaryArray<T> = values.into_iter().collect();
+        // let values = vec!["a", "b", "b", "a", "c"];
+        let arr1: DictionaryArray<T> = vec!["a", "b", "b", "a", "c"].into_iter().collect();
+        let arr2: DictionaryArray<T> = vec!["c", "a", "b", "d"].into_iter().collect();
+
+        let arr1_ref = arr1.keys() as &dyn Array;
+        let arr2_ref = arr2.keys() as &dyn Array;
+        let arrs: Vec<&dyn Array> = vec![arr1_ref, arr2_ref];
 
         let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
@@ -259,27 +242,26 @@ mod tests {
         let pos;
         {
             let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut object_writer, arr.keys().data_type());
-            pos = encoder.encode_single(arr.keys()).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
+            pos = encoder.encode(arrs.as_slice()).await.unwrap();
             object_writer.shutdown().await.unwrap();
         }
 
         let reader = store.open(&path).await.unwrap();
+        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")].into_iter().collect();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,
-            arr.len(),
-            arr.data_type(),
-            arr.values().clone(),
+            arr1.len() + arr2.len(),
+            arr1.data_type(),
+            Arc::new(value_array)
         );
 
-        let expected_data = decoder.decode().await.unwrap();
+        let decoded_data = decoder.decode().await.unwrap();
+        let expected_data : DictionaryArray<T> = vec!["a", "b", "b", "a", "c", "c", "a", "b", "d"].into_iter().collect();
         assert_eq!(
-            &arr,
-            expected_data
-                .as_any()
-                .downcast_ref::<DictionaryArray<T>>()
-                .unwrap()
+            &expected_data,
+            decoded_data.as_any().downcast_ref::<DictionaryArray<T>>().unwrap()
         );
     }
 
