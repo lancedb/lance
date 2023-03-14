@@ -67,6 +67,9 @@ pub struct IvfPQIndex<'a> {
     pq: Arc<ProductQuantizer>,
 
     metric_type: MetricType,
+
+    /// Transform applys to each vector.
+    transforms: Vec<Arc<dyn Transformer>>,
 }
 
 impl<'a> IvfPQIndex<'a> {
@@ -96,11 +99,29 @@ impl<'a> IvfPQIndex<'a> {
         };
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
+        let reader_ref = reader.as_ref();
+        let transforms = stream::iter(index_metadata.transforms)
+            .map(|tf| async move {
+                Ok::<Arc<dyn Transformer>, Error>(Arc::new(OptimizedProductQuantizer::load(
+                    reader_ref,
+                    tf.position as usize,
+                    tf.shape
+                        .iter()
+                        .map(|s| *s as usize)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+                .await?))
+            })
+            .buffered(4)
+            .try_collect::<Vec<Arc<dyn Transformer>>>().await?;
+
         Ok(Self {
             reader,
             ivf: index_metadata.ivf,
             pq: index_metadata.pq,
             metric_type: index_metadata.metric_type,
+            transforms,
         })
     }
 
@@ -187,7 +208,7 @@ pub struct IvfPQIndexMetadata {
     pq: Arc<ProductQuantizer>,
 
     /// File position of transforms.
-    transforms: Vec<Box<dyn Transformer>>,
+    transforms: Vec<pb::Transform>,
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -200,7 +221,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
             .iter()
             .map(|tf| {
                 Ok(pb::VectorIndexStage {
-                    stage: Some(pb::vector_index_stage::Stage::Transform(tf.try_into_pb()?)),
+                    stage: Some(pb::vector_index_stage::Stage::Transform(tf.clone())),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -251,14 +272,18 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                         if num_stages != 2 || num_stages != 3 {
                             return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                         };
-                        let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
+                        let opq = match vidx.stages[0].stage.as_ref().unwrap() {
+                            Stage::Transform(transform) => Ok(()),
+                            _ => Err(Error::IO("Stage 0 only supports OPQ".to_string())),
+                        }?;
+                        let stage0 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let ivf = match stage0 {
                             Stage::Ivf(ivf_pb) => Ok(Ivf::try_from(ivf_pb)?),
                             _ => Err(Error::IO("Stage 0 only supports IVF".to_string())),
                         }?;
-                        let stage1 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
+                        let stage1 = vidx.stages[2].stage.as_ref().ok_or_else(|| {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let pq = match stage1 {
@@ -729,7 +754,7 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq: pq.into(),
-        transforms: vec![Box::new(opq)],
+        transforms: vec![opq.try_into_pb()?],
     };
 
     let metadata = pb::Index::try_from(&metadata)?;

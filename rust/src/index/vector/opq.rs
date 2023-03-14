@@ -24,6 +24,8 @@ use async_trait::async_trait;
 use super::{pq::ProductQuantizer, MetricType, Transformer};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
+use crate::io::object_reader::ObjectReader;
+use crate::io::FileReader;
 use crate::{Error, Result};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
@@ -73,6 +75,11 @@ impl OptimizedProductQuantizer {
             metric_type,
             num_iters,
         }
+    }
+
+    pub async fn load(reader: &dyn ObjectReader, position: usize, shape: &[usize]) -> Result<Self> {
+        let dim = shape[0];
+        todo!()
     }
 
     /// Train once and return the rotation matrix and PQ codebook.
