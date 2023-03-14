@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use super::{pq::ProductQuantizer, MetricType, Transformer};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
-use crate::{Result, Error};
+use crate::{Error, Result};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
@@ -146,6 +146,10 @@ impl Transformer for OptimizedProductQuantizer {
         let rotation = self.rotation.as_ref().unwrap();
         Ok(rotation.dot(&data.transpose())?.transpose())
     }
+
+    fn try_into_pb(&self) -> Result<Transform> {
+        self.try_into()
+    }
 }
 
 impl TryFrom<&OptimizedProductQuantizer> for Transform {
@@ -153,13 +157,13 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 
     fn try_from(opq: &OptimizedProductQuantizer) -> Result<Self> {
         if opq.file_position.is_none() {
-            return Err(Error::Index("OPQ has not been persisted yet".to_string()))
+            return Err(Error::Index("OPQ has not been persisted yet".to_string()));
         }
-        if opq.rotation.is_none() {
-            return Err(Error::Index("OPQ is not trained".to_string()));
-        }
-        let rotation = opq.rotation.as_ref().ok_or(Err(Error::Index("OPQ is not trained".to_string())))?;
-        Ok(Transform{
+        let rotation = opq
+            .rotation
+            .as_ref()
+            .ok_or(Error::Index("OPQ is not trained".to_string()))?;
+        Ok(Transform {
             position: opq.file_position.unwrap() as u64,
             shape: vec![rotation.num_rows() as u32, rotation.num_columns() as u32],
             r#type: TransformType::Opq.into(),

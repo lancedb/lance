@@ -30,7 +30,7 @@ mod kmeans;
 mod opq;
 mod pq;
 
-use super::IndexParams;
+use super::{pb, IndexParams};
 use crate::{
     arrow::linalg::MatrixView,
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
@@ -82,7 +82,7 @@ pub trait VectorIndex {
 
 /// Transformer on vectors.
 #[async_trait]
-pub trait Transformer : std::fmt::Debug {
+pub trait Transformer: std::fmt::Debug {
     /// Train the transformer.
     ///
     /// Parameters:
@@ -93,6 +93,11 @@ pub trait Transformer : std::fmt::Debug {
     ///
     /// Returns a new Matrix instead.
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView>;
+
+    /// Try to convert into protobuf.
+    ///
+    /// TODO: can we use TryFrom/TryInto as trait constrats?
+    fn try_into_pb(&self) -> Result<pb::Transform>;
 }
 
 /// Distance metrics type.

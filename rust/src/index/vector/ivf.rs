@@ -186,7 +186,7 @@ pub struct IvfPQIndexMetadata {
     /// Product Quantizer
     pq: Arc<ProductQuantizer>,
 
-    /// File position of the optimized product quantizer transform.
+    /// File position of transforms.
     transforms: Vec<Box<dyn Transformer>>,
 }
 
@@ -194,7 +194,28 @@ pub struct IvfPQIndexMetadata {
 impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
     type Error = Error;
 
-    fn try_from(idx: &IvfPQIndexMetadata) -> std::result::Result<Self, Self::Error> {
+    fn try_from(idx: &IvfPQIndexMetadata) -> Result<Self> {
+        let mut stages: Vec<pb::VectorIndexStage> = idx
+            .transforms
+            .iter()
+            .map(|tf| {
+                Ok(pb::VectorIndexStage {
+                    stage: Some(pb::vector_index_stage::Stage::Transform(tf.try_into_pb()?)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        stages.extend_from_slice(&[
+            pb::VectorIndexStage {
+                stage: Some(pb::vector_index_stage::Stage::Ivf(pb::Ivf::try_from(
+                    &idx.ivf,
+                )?)),
+            },
+            pb::VectorIndexStage {
+                stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
+            },
+        ]);
+
         Ok(Self {
             name: idx.name.clone(),
             columns: vec![idx.column.clone()],
@@ -203,19 +224,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
             implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
                 spec_version: 1,
                 dimension: idx.dimension,
-                stages: vec![
-                    pb::VectorIndexStage {
-                        stage: Some(pb::vector_index_stage::Stage::Transform(pb::Transform))
-                    },
-                    pb::VectorIndexStage {
-                        stage: Some(pb::vector_index_stage::Stage::Ivf(pb::Ivf::try_from(
-                            &idx.ivf,
-                        )?)),
-                    },
-                    pb::VectorIndexStage {
-                        stage: Some(pb::vector_index_stage::Stage::Pq(idx.pq.as_ref().into())),
-                    },
-                ],
+                stages,
                 metric_type: match idx.metric_type {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
@@ -238,8 +247,9 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
             if let Some(idx_impl) = idx.implementation.as_ref() {
                 match idx_impl {
                     pb::index::Implementation::VectorIndex(vidx) => {
-                        if vidx.stages.len() != 2 {
-                            return Err(Error::IO("Only support IVF_PQ now".to_string()));
+                        let num_stages = vidx.stages.len();
+                        if num_stages != 2 || num_stages != 3 {
+                            return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                         };
                         let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
@@ -269,6 +279,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                                 .into(),
                             ivf,
                             pq,
+                            transforms: vec![],
                         })
                     }
                 }?
@@ -706,7 +717,7 @@ async fn write_index_file(
 
     // Write OPQ matrix.
     let pos = writer
-        .write_plain_encoded_array(opq.rotation.unwrap().data().as_ref())
+        .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
         .await?;
 
     let metadata = IvfPQIndexMetadata {
@@ -717,6 +728,7 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq: pq.into(),
+        transforms: vec![Box::new(opq)],
     };
 
     let metadata = pb::Index::try_from(&metadata)?;
