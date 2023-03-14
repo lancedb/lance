@@ -405,7 +405,6 @@ impl ProductQuantizer {
     ) -> Result<FixedSizeListArray> {
         let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
         self.train(&data, metric_type, 50).await?;
-
         self.transform(&data, metric_type).await
     }
 }

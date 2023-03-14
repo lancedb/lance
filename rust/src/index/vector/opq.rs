@@ -21,15 +21,16 @@ use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, UInt8Array};
 use async_trait::async_trait;
 
-use super::Transformer;
-use super::{pq::ProductQuantizer, MetricType};
+use super::{pq::ProductQuantizer, MetricType, Transformer};
 use crate::arrow::linalg::*;
-use crate::Result;
+use crate::index::pb::{Transform, TransformType};
+use crate::{Result, Error};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
 /// (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
+#[derive(Debug)]
 pub struct OptimizedProductQuantizer {
     num_sub_vectors: usize,
 
@@ -38,6 +39,9 @@ pub struct OptimizedProductQuantizer {
 
     /// OPQ rotation
     pub rotation: Option<MatrixView>,
+
+    /// The offset where the matrix is stored in the index file.
+    file_position: Option<usize>,
 
     /// The metric to compute the distance.
     metric_type: MetricType,
@@ -65,6 +69,7 @@ impl OptimizedProductQuantizer {
             num_sub_vectors,
             num_bits,
             rotation: None,
+            file_position: None,
             metric_type,
             num_iters,
         }
@@ -140,6 +145,25 @@ impl Transformer for OptimizedProductQuantizer {
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
         let rotation = self.rotation.as_ref().unwrap();
         Ok(rotation.dot(&data.transpose())?.transpose())
+    }
+}
+
+impl TryFrom<&OptimizedProductQuantizer> for Transform {
+    type Error = Error;
+
+    fn try_from(opq: &OptimizedProductQuantizer) -> Result<Self> {
+        if opq.file_position.is_none() {
+            return Err(Error::Index("OPQ has not been persisted yet".to_string()))
+        }
+        if opq.rotation.is_none() {
+            return Err(Error::Index("OPQ is not trained".to_string()));
+        }
+        let rotation = opq.rotation.as_ref().ok_or(Err(Error::Index("OPQ is not trained".to_string())))?;
+        Ok(Transform{
+            position: opq.file_position.unwrap() as u64,
+            shape: vec![rotation.num_rows() as u32, rotation.num_columns() as u32],
+            r#type: TransformType::Opq.into(),
+        })
     }
 }
 

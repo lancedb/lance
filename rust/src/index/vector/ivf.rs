@@ -185,6 +185,9 @@ pub struct IvfPQIndexMetadata {
 
     /// Product Quantizer
     pq: Arc<ProductQuantizer>,
+
+    /// File position of the optimized product quantizer transform.
+    transforms: Vec<Box<dyn Transformer>>,
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -201,6 +204,9 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 spec_version: 1,
                 dimension: idx.dimension,
                 stages: vec![
+                    pb::VectorIndexStage {
+                        stage: Some(pb::vector_index_stage::Stage::Transform(pb::Transform))
+                    },
                     pb::VectorIndexStage {
                         stage: Some(pb::vector_index_stage::Stage::Ivf(pb::Ivf::try_from(
                             &idx.ivf,
@@ -551,8 +557,11 @@ pub async fn build_ivf_pq_index(
     pq_params: &PQBuildParams,
 ) -> Result<()> {
     println!(
-        "Building vector index: IVF{},PQ{}, metric={}",
-        ivf_params.num_partitions, pq_params.num_sub_vectors, ivf_params.metric_type,
+        "Building vector index: IVF{},{}PQ{}, metric={}",
+        ivf_params.num_partitions,
+        if pq_params.use_opq { "O" } else { "" },
+        pq_params.num_sub_vectors,
+        ivf_params.metric_type,
     );
 
     sanity_check(dataset, column)?;

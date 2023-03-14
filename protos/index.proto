@@ -57,14 +57,6 @@ message IVF {
   repeated uint32 lengths = 3;
 }
 
-// Optimized Product Quantization rotation matrix.
-//
-// It is a `[pq.dimension, pq.dimension]` float32 matrix.
-message OPQMatrix {
-  // The file offset where the rotation matrix is stored.
-  uint64 position = 1;
-};
-
 // Product Quantization.
 message PQ {
   // The number of bits to present a centroid.
@@ -78,9 +70,23 @@ message PQ {
 
   // Codebook. `dimension * 2 ^ num_bits` of float32s.
   repeated float codebook = 4;
+}
 
-  /// File offset where the rotation matrix is stored.
-  optional OPQMatrix opq = 5;
+// Transform type
+enum TransformType {
+  OPQ = 0;
+}
+
+// A transform matrix to apply to a vector or vectors.
+message Transform {
+  // The file offset the matrix is stored
+  uint64 position = 1;
+
+  // Data shape of the matrix, [rows, cols].
+  repeated uint32 shape = 2;
+
+  // Transform type.
+  TransformType type = 3;
 }
 
 // Flat Index
@@ -95,6 +101,8 @@ message VectorIndexStage {
     IVF ivf = 2;
     // Product Quantization
     PQ pq = 3;
+    // Transformer
+    Transform transform = 4;
   }
 }
 

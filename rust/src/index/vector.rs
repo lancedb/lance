@@ -82,7 +82,7 @@ pub trait VectorIndex {
 
 /// Transformer on vectors.
 #[async_trait]
-pub trait Transformer {
+pub trait Transformer : std::fmt::Debug {
     /// Train the transformer.
     ///
     /// Parameters:
