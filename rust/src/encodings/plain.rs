@@ -41,7 +41,6 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
-use super::Decoder;
 use crate::arrow::*;
 use crate::encodings::AsyncIndex;
 use crate::error::Result;
@@ -49,6 +48,8 @@ use crate::io::object_reader::ObjectReader;
 use crate::io::object_writer::ObjectWriter;
 use crate::io::ReadBatchParams;
 use crate::Error;
+
+use super::Decoder;
 
 /// Encoder for plain encoding.
 ///
@@ -243,13 +244,40 @@ impl<'a> PlainDecoder<'a> {
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        // TODO: optimize boolean access
-        let start = indices.value(0) as usize;
-        let end = indices.value(indices.len() - 1) as usize;
-        let array = self.get(start..end + 1).await?;
-        let array_byte_boundray = (start / 8 * 8) as u32;
-        let shifted_indices = subtract_scalar(indices, array_byte_boundray)?;
-        Ok(take(array.as_ref(), &shifted_indices, None)?)
+        let block_size = self.reader.prefetch_size() as u32;
+        let boolean_block_size = block_size * 8;
+
+        let mut chunk_ranges = vec![];
+        let mut start: u32 = 0;
+        for j in 0..(indices.len() - 1) as u32 {
+            if (indices.value(j as usize + 1) / boolean_block_size)
+                > (indices.value(start as usize) / boolean_block_size)
+            {
+                let next_start = j + 1;
+                chunk_ranges.push(start..next_start);
+                start = next_start;
+            }
+        }
+        // Remaining
+        chunk_ranges.push(start..indices.len() as u32);
+
+        let arrays = stream::iter(chunk_ranges)
+            .map(|cr| async move {
+                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let request: &UInt32Array = as_primitive_array(&index_chunk);
+
+                let start = request.value(0);
+                let end = request.value(request.len() - 1);
+                let array = self.get(start as usize..end as usize + 1).await?;
+                let array_byte_boundray = (start / 8 * 8) as u32;
+                let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
+                Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+        Ok(concat(&references)?)
     }
 }
 
@@ -387,10 +415,11 @@ mod tests {
     use object_store::path::Path;
     use rand::prelude::*;
 
-    use super::*;
     use crate::datatypes::Schema;
     use crate::io::object_writer::ObjectWriter;
     use crate::io::{FileReader, FileWriter, ObjectStore};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
@@ -719,6 +748,35 @@ mod tests {
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.take(&[2, 4, 5, 8, 20], &schema).await.unwrap();
+
+        assert_eq!(
+            actual.column_by_name("b").unwrap().as_ref(),
+            &BooleanArray::from(vec![false, false, true, false, true])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_boolean_beyond_chunk() {
+        let mut store = ObjectStore::memory();
+        store.set_prefetch_size(256);
+        let path = Path::from("/take_bools");
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            DataType::Boolean,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+
+        let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.take(&[2, 4, 5, 8, 4555], &schema).await.unwrap();
 
         assert_eq!(
             actual.column_by_name("b").unwrap().as_ref(),
