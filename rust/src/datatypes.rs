@@ -913,6 +913,10 @@ mod tests {
                 "timestamp:ns:-",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
             ),
+            (
+                "timestamp:s:America/New_York",
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".to_string())),
+            ),
             ("time32:s", DataType::Time32(TimeUnit::Second)),
             ("time32:ms", DataType::Time32(TimeUnit::Millisecond)),
             ("time64:us", DataType::Time64(TimeUnit::Microsecond)),
