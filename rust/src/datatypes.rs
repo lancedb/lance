@@ -58,6 +58,16 @@ fn timeunit_to_str(unit: &TimeUnit) -> &'static str {
     }
 }
 
+fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
+    match unit {
+        "s" => Ok(TimeUnit::Second),
+        "ms" => Ok(TimeUnit::Millisecond),
+        "us" => Ok(TimeUnit::Microsecond),
+        "ns" => Ok(TimeUnit::Nanosecond),
+        _ => Err(Error::Arrow(format!("Unsupported TimeUnit: {unit}"))),
+    }
+}
+
 impl TryFrom<&DataType> for LogicalType {
     type Error = Error;
 
@@ -86,7 +96,13 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Date64 => "date64:ms".to_string(),
             DataType::Time32(tu) => format!("time32:{}", timeunit_to_str(tu)),
             DataType::Time64(tu) => format!("time64:{}", timeunit_to_str(tu)),
-            DataType::Timestamp(tu, _) => format!("timestamp:{}", timeunit_to_str(tu)),
+            DataType::Timestamp(tu, tz) => format!(
+                "timestamp:{}:{}",
+                timeunit_to_str(tu),
+                tz.as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or("-".to_string())
+            ),
             DataType::Duration(tu) => format!("duration:{}", timeunit_to_str(tu)),
             DataType::Struct(_) => "struct".to_string(),
             DataType::Dictionary(key_type, value_type) => {
@@ -112,7 +128,7 @@ impl TryFrom<&DataType> for LogicalType {
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
-            _ => return Err(Error::Schema(format!("Unsupport data type: {:?}", dt))),
+            _ => return Err(Error::Schema(format!("Unsupported data type: {:?}", dt))),
         };
 
         Ok(Self(type_str))
@@ -148,10 +164,6 @@ impl TryFrom<&LogicalType> for DataType {
             "time32:ms" => Some(Time32(TimeUnit::Millisecond)),
             "time64:us" => Some(Time64(TimeUnit::Microsecond)),
             "time64:ns" => Some(Time64(TimeUnit::Nanosecond)),
-            "timestamp:s" => Some(Timestamp(TimeUnit::Second, None)),
-            "timestamp:ms" => Some(Timestamp(TimeUnit::Millisecond, None)),
-            "timestamp:us" => Some(Timestamp(TimeUnit::Microsecond, None)),
-            "timestamp:ns" => Some(Timestamp(TimeUnit::Nanosecond, None)),
             "duration:s" => Some(Duration(TimeUnit::Second)),
             "duration:ms" => Some(Duration(TimeUnit::Millisecond)),
             "duration:us" => Some(Duration(TimeUnit::Microsecond)),
@@ -218,6 +230,19 @@ impl TryFrom<&LogicalType> for DataType {
                                 "Only Decimal128 and Decimal256 is supported. Found {bits}"
                             )))
                         }
+                    }
+                }
+                "timestamp" => {
+                    if splits.len() != 3 {
+                        Err(Error::Schema(format!("Unsupported timestamp type: {}", lt)))
+                    } else {
+                        let timeunit = parse_timeunit(splits[1])?;
+                        let tz = if splits[2] == "-" {
+                            None
+                        } else {
+                            Some(splits[2].to_string())
+                        };
+                        Ok(Timestamp(timeunit, tz))
                     }
                 }
                 _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
@@ -875,17 +900,17 @@ mod tests {
             ("float32", DataType::Float32),
             ("float64", DataType::Float64),
             ("decimal128:7:3", DataType::Decimal128(7, 3)),
-            ("timestamp:s", DataType::Timestamp(TimeUnit::Second, None)),
+            ("timestamp:s:-", DataType::Timestamp(TimeUnit::Second, None)),
             (
-                "timestamp:ms",
+                "timestamp:ms:-",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
             ),
             (
-                "timestamp:us",
+                "timestamp:us:-",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
             ),
             (
-                "timestamp:ns",
+                "timestamp:ns:-",
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
             ),
             ("time32:s", DataType::Time32(TimeUnit::Second)),

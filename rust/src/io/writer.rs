@@ -285,7 +285,8 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        LargeListArray, ListArray, NullArray, StringArray, UInt8Array,
+        LargeListArray, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -436,6 +437,44 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
         schema.set_dictionary(&batch).unwrap();
 
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(actual, batch);
+    }
+
+    #[tokio::test]
+    async fn test_write_temporal_types() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts_notz",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            ArrowField::new(
+                "ts_tz",
+                DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some("America/Los_Angeles".to_string()),
+                ),
+                false,
+            ),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(TimestampSecondArray::from(vec![11111111, 22222222])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![3333333, 4444444])
+                    .with_timezone("America/Los_Angeles"),
+            ),
+        ];
+        let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
+
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
