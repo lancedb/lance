@@ -51,20 +51,29 @@ impl<'a> DictionaryEncoder<'a> {
 
     async fn write_typed_array<T: ArrowDictionaryKeyType>(
         &mut self,
-        arr: &dyn Array,
+        arrs: &[&dyn Array],
     ) -> Result<usize> {
+        assert!(!arrs.is_empty());
+        let data_type = arrs[0].data_type();
         let pos = self.writer.tell();
-        let dict_arr = as_dictionary_array::<T>(arr);
+        let mut plain_encoder = PlainEncoder::new(self.writer, data_type);
 
-        let mut plain_encoder = PlainEncoder::new(self.writer, dict_arr.data_type());
-        plain_encoder.encode(dict_arr.keys()).await?;
+        let keys = arrs
+            .iter()
+            .map(|a| {
+                let dict_arr = as_dictionary_array::<T>(*a);
+                dict_arr.keys() as &dyn Array
+            })
+            .collect::<Vec<_>>();
+
+        plain_encoder.encode(keys.as_slice()).await?;
         Ok(pos)
     }
 }
 
 #[async_trait]
 impl<'a> Encoder for DictionaryEncoder<'a> {
-    async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
+    async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
         use DataType::*;
 
         match self.key_type {
@@ -201,12 +210,28 @@ mod tests {
         encodings::plain::PlainEncoder,
         io::{object_writer::ObjectWriter, ObjectStore},
     };
-    use arrow_array::Array;
+    use arrow_array::{Array, StringArray};
+    use arrow_buffer::ArrowNativeType;
     use object_store::path::Path;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {
-        let values = vec!["a", "b", "b", "a", "c"];
-        let arr: DictionaryArray<T> = values.into_iter().collect();
+        let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")]
+            .into_iter()
+            .collect();
+
+        let keys1: PrimitiveArray<T> = vec![T::Native::from_usize(0), T::Native::from_usize(1)]
+            .into_iter()
+            .collect();
+        let arr1: DictionaryArray<T> = DictionaryArray::try_new(&keys1, &value_array).unwrap();
+
+        let keys2: PrimitiveArray<T> = vec![T::Native::from_usize(1), T::Native::from_usize(3)]
+            .into_iter()
+            .collect();
+        let arr2: DictionaryArray<T> = DictionaryArray::try_new(&keys2, &value_array).unwrap();
+
+        let keys1_ref = arr1.keys() as &dyn Array;
+        let keys2_ref = arr2.keys() as &dyn Array;
+        let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
         let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
@@ -214,8 +239,8 @@ mod tests {
         let pos;
         {
             let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-            let mut encoder = PlainEncoder::new(&mut object_writer, arr.keys().data_type());
-            pos = encoder.encode(arr.keys()).await.unwrap();
+            let mut encoder = PlainEncoder::new(&mut object_writer, arr1.keys().data_type());
+            pos = encoder.encode(arrs.as_slice()).await.unwrap();
             object_writer.shutdown().await.unwrap();
         }
 
@@ -223,15 +248,16 @@ mod tests {
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,
-            arr.len(),
-            arr.data_type(),
-            arr.values().clone(),
+            arr1.len() + arr2.len(),
+            arr1.data_type(),
+            Arc::new(value_array),
         );
 
-        let expected_data = decoder.decode().await.unwrap();
+        let decoded_data = decoder.decode().await.unwrap();
+        let expected_data: DictionaryArray<T> = vec!["a", "b", "b", "d"].into_iter().collect();
         assert_eq!(
-            &arr,
-            expected_data
+            &expected_data,
+            decoded_data
                 .as_any()
                 .downcast_ref::<DictionaryArray<T>>()
                 .unwrap()

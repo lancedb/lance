@@ -57,11 +57,11 @@ pub async fn write_manifest(
                 let pos = match data_type {
                     dt if dt.is_numeric() => {
                         let mut encoder = PlainEncoder::new(writer, dt);
-                        encoder.encode(value_arr).await?
+                        encoder.encode(&[value_arr]).await?
                     }
                     dt if dt.is_binary_like() => {
                         let mut encoder = BinaryEncoder::new(writer);
-                        encoder.encode(value_arr).await?
+                        encoder.encode(&[value_arr]).await?
                     }
                     _ => {
                         return Err(Error::IO(format!(
@@ -188,7 +188,7 @@ impl<'a> FileWriter<'a> {
     async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
         let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
-        let pos = encoder.encode(array).await?;
+        let pos = encoder.encode(&[array]).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
@@ -198,7 +198,7 @@ impl<'a> FileWriter<'a> {
     async fn write_binary_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::VarBinary));
         let mut encoder = BinaryEncoder::new(&mut self.object_writer);
-        let pos = encoder.encode(array).await?;
+        let pos = encoder.encode(&[array]).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
@@ -214,7 +214,7 @@ impl<'a> FileWriter<'a> {
 
         // Write the dictionary keys.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
-        let pos = encoder.encode(array).await?;
+        let pos = encoder.encode(&[array]).await?;
         let page_info = PageInfo::new(pos, array.len());
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
