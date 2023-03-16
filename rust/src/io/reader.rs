@@ -572,6 +572,7 @@ mod tests {
     use crate::dataset::{Dataset, WriteParams};
     use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
@@ -605,7 +606,7 @@ mod tests {
         ];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
         for _ in 0..5 {
-            file_writer.write(&batch).await.unwrap();
+            file_writer.write(&[&batch]).await.unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -647,7 +648,7 @@ mod tests {
                 )),
             ];
             let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-            file_writer.write(&batch).await.unwrap();
+            file_writer.write(&[&batch]).await.unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -714,7 +715,7 @@ mod tests {
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         for batch in batches.iter() {
-            file_writer.write(&batch).await.unwrap();
+            file_writer.write(&[&batch]).await.unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -763,7 +764,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -800,7 +801,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -818,7 +819,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let mut expected_columns: Vec<ArrayRef> = Vec::new();
@@ -909,38 +910,45 @@ mod tests {
             "s",
             DataType::Struct(vec![ArrowField::new(
                 "d",
-                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
-                false,
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
             )]),
             true,
         )]));
 
-        let mut dict_builder = StringDictionaryBuilder::<UInt8Type>::new();
-        dict_builder.append("a").unwrap();
-        dict_builder.append("b").unwrap();
-        dict_builder.append("c").unwrap();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        for _ in 1..2 {
+            let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+            dict_builder.append("a").unwrap();
+            dict_builder.append("b").unwrap();
+            dict_builder.append("c").unwrap();
+            dict_builder.append("d").unwrap();
 
-        let struct_array = Arc::new(StructArray::from(vec![(
-            ArrowField::new(
-                "d",
-                DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
-                false,
-            ),
-            Arc::new(dict_builder.finish()) as ArrayRef,
-        )]));
+            let struct_array = Arc::new(StructArray::from(vec![(
+                ArrowField::new(
+                    "d",
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                    true,
+                ),
+                Arc::new(dict_builder.finish()) as ArrayRef,
+            )]));
 
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+            let batch =
+                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
+            batches.push(batch);
+        }
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let batches = crate::arrow::RecordBatchBuffer::new(vec![batch.clone()]);
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(WriteParams::default()))
+        let batch_buffer = crate::arrow::RecordBatchBuffer::new(batches.clone());
+        let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(batch_buffer);
+        Dataset::write(&mut batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
-        let result = scan_dataset(test_uri).await.unwrap();
-        assert_eq!(batch, result.as_slice()[0]);
+        let _result = scan_dataset(test_uri).await.unwrap();
+
+        assert_eq!(batches, _result);
     }
 
     async fn scan_dataset(uri: &str) -> Result<Vec<RecordBatch>> {
@@ -974,7 +982,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/takes");
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         // read the file back
@@ -1071,7 +1079,7 @@ mod tests {
         let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         // read the file back

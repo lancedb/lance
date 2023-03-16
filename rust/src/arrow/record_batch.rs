@@ -20,7 +20,6 @@
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
-use arrow_select::concat::concat_batches;
 
 use crate::Result;
 
@@ -46,8 +45,8 @@ impl RecordBatchBuffer {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
 
-    pub fn finish(&self) -> Result<RecordBatch> {
-        Ok(concat_batches(&self.schema(), self.batches.iter())?)
+    pub fn finish(&self) -> Result<Vec<RecordBatch>> {
+        Ok(self.batches.clone())
     }
 }
 
