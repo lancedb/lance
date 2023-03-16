@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, TryFutureExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
@@ -236,12 +237,15 @@ impl LocalTake {
         input: SendableRecordBatchStream,
         dataset: Arc<Dataset>,
         schema: Arc<Schema>,
+        ann_schema: Option<Arc<Schema>>, // TODO add input/output schema contract to exec nodes and remove this
         drop_row_id: bool,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(4);
-
         let inner_schema = Schema::try_from(input.schema().as_ref())?;
-        let take_schema = schema.exclude(&inner_schema)?;
+        let mut take_schema = schema.exclude(&inner_schema)?;
+        if ann_schema.is_some() {
+            take_schema = take_schema.exclude(&ann_schema.unwrap())?;
+        }
         let projection = schema.clone();
 
         let _bg_thread = tokio::spawn(async move {
@@ -252,9 +256,6 @@ impl LocalTake {
                 .then(|(b, (dataset, take_schema, projection))| async move {
                     // TODO: need to cache the fragments.
                     let batch = b?;
-                    if take_schema.fields.is_empty() {
-                        return Ok(batch);
-                    };
                     let projection_schema = ArrowSchema::from(projection.as_ref());
                     if batch.num_rows() == 0 {
                         return Ok(RecordBatch::new_empty(Arc::new(projection_schema)));
@@ -262,12 +263,15 @@ impl LocalTake {
 
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-                    let remaining_columns =
-                        dataset.take_rows(row_ids.values(), &take_schema).await?;
-
-                    let batch = batch
-                        .merge(&remaining_columns)?
-                        .project_by_schema(&projection_schema)?;
+                    let batch = if take_schema.fields.is_empty() {
+                        batch.project_by_schema(&projection_schema)?
+                    } else {
+                        let remaining_columns =
+                            dataset.take_rows(row_ids.values(), &take_schema).await?;
+                        batch
+                            .merge(&remaining_columns)?
+                            .project_by_schema(&projection_schema)?
+                    };
 
                     if !drop_row_id {
                         Ok(batch.try_with_column(
@@ -333,6 +337,7 @@ pub struct LocalTakeExec {
     dataset: Arc<Dataset>,
     input: Arc<dyn ExecutionPlan>,
     schema: Arc<Schema>,
+    ann_schema: Option<Arc<Schema>>,
     drop_row_id: bool,
 }
 
@@ -341,6 +346,7 @@ impl LocalTakeExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
         schema: Arc<Schema>,
+        ann_schema: Option<Arc<Schema>>,
         drop_row_id: bool,
     ) -> Self {
         assert!(input.schema().column_with_name(ROW_ID).is_some());
@@ -348,6 +354,7 @@ impl LocalTakeExec {
             dataset,
             input,
             schema,
+            ann_schema,
             drop_row_id,
         }
     }
@@ -387,6 +394,7 @@ impl ExecutionPlan for LocalTakeExec {
             input: children[0].clone(),
             dataset: self.dataset.clone(),
             schema: self.schema.clone(),
+            ann_schema: self.ann_schema.clone(),
             drop_row_id: self.drop_row_id,
         }))
     }
@@ -401,6 +409,7 @@ impl ExecutionPlan for LocalTakeExec {
             input_stream,
             self.dataset.clone(),
             self.schema.clone(),
+            self.ann_schema.clone(),
             self.drop_row_id,
         )?))
     }

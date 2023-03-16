@@ -30,6 +30,7 @@ import time
 import lance
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from lance.vector import vec_to_table
 
@@ -70,11 +71,10 @@ def run(ds):
     q = np.random.randn(768)
     project = [None, ["price"], ["vector"], ["vector", "meta"]]
     refine = [None, 1, 2]
-    # filters = [None, pc.field("price") > 50.0]
+    filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:
-
         expected_columns = []
         if columns is None:
             expected_columns.extend(ds.schema.names)
@@ -84,26 +84,29 @@ def run(ds):
             if c not in expected_columns:
                 expected_columns.append(c)
 
-        for rf in refine:
-            # for filter_ in filters:
-            start = time.time()
-            rs = ds.to_table(
-                columns=columns,
-                # filter=filter_,
-                nearest={
-                    "column": "vector",
-                    "q": q,
-                    "k": 10,
-                    "nprobes": 1,
-                    "refine_factor": rf,
-                },
-            )
-            end = time.time()
-            times.append(end - start)
-            assert rs.column_names == expected_columns
-            assert len(rs) == 10
-            scores = rs["score"].to_numpy()
-            assert (scores.max() - scores.min()) > 1e-6
+        for filter_ in filters:
+            for rf in refine:
+                start = time.time()
+                rs = ds.to_table(
+                    columns=columns,
+                    nearest={
+                        "column": "vector",
+                        "q": q,
+                        "k": 10,
+                        "nprobes": 1,
+                        "refine_factor": rf,
+                    },
+                    filter=filter_,
+                )
+                end = time.time()
+                times.append(end - start)
+                assert rs.column_names == expected_columns
+                if filter_ is not None and "price" in (columns or []):
+                    inmem = pa.dataset.dataset(rs)
+                    assert len(inmem.to_table(filter=filter_)) == len(rs)
+                assert len(rs) == 10
+                scores = rs["score"].to_numpy()
+                assert (scores.max() - scores.min()) > 1e-6
     return times
 
 
