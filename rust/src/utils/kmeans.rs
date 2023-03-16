@@ -15,9 +15,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::Float32Builder;
 use arrow_arith::arithmetic::{add, divide_scalar};
-use arrow_array::{cast::as_primitive_array, new_empty_array, Array, Float32Array};
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
+};
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
@@ -36,6 +37,7 @@ pub enum KMeanInit {
     KMeanPlusPlus,
 }
 
+/// KMean Training Parameters
 #[derive(Debug)]
 pub struct KMeansParams {
     /// Max number of iterations.
@@ -48,8 +50,10 @@ pub struct KMeansParams {
     /// Run kmeans multiple times and pick the best one.
     pub redos: usize,
 
+    /// Init methods.
     pub init: KMeanInit,
 
+    /// The metric to calculate distance.
     pub metric_type: MetricType,
 }
 
@@ -80,9 +84,6 @@ pub struct KMeans {
     pub k: usize,
 
     pub metric_type: MetricType,
-
-    /// the sum of distance from the training samples to centroids.
-    pub distance_sum: f32
 }
 
 /// Initialize using kmean++, and returns the centroids of k clusters.
@@ -153,7 +154,7 @@ async fn kmeans_random_init(
     kmeans
 }
 
-struct KMeanMembership {
+pub struct KMeanMembership {
     /// Previous centroids.
     ///
     /// `k * dimension` f32 matrix.
@@ -182,18 +183,18 @@ impl KMeanMembership {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
         let data = self.data.clone();
-        let previous_centroids = self.centroids.clone();
+
         // New centroids for each cluster
         let means = stream::iter(0..self.k)
             .zip(repeat_with(|| {
                 (
                     data.clone(),
                     cluster_ids.clone(),
-                    previous_centroids.clone(),
+                    self.centroids.clone(),
                 )
             }))
             .map(
-                |(cluster, (data, cluster_ids, previous_centroids))| async move {
+                |(cluster, (data, cluster_ids, prev_centroids))| async move {
                     tokio::task::spawn_blocking(move || {
                         let mut sum = Float32Array::from_iter_values(
                             (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
@@ -210,7 +211,7 @@ impl KMeanMembership {
                             divide_scalar(&sum, total).unwrap()
                         } else {
                             eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
-                            let prev_centroids = previous_centroids.slice(cluster * dimension, dimension);
+                            let prev_centroids = prev_centroids.slice(cluster * dimension, dimension);
                             as_primitive_array(prev_centroids.as_ref()).clone()
                         }
                     })
@@ -232,7 +233,6 @@ impl KMeanMembership {
             dimension,
             k: self.k,
             metric_type: self.metric_type,
-            distance_sum: self.distance_sum(),
         })
     }
 
@@ -329,23 +329,20 @@ impl KMeans {
                 }
             };
 
-            let mut last_membership = kmeans.compute_membership(data.clone()).await;
+            let mut dist_sum: f32 = f32::MAX;
+            let mut stddev: f32 = f32::MAX;
             for _ in 1..=params.max_iters {
-                let new_kmeans = last_membership.to_kmeans().await.unwrap();
-                let new_membership = new_kmeans.compute_membership(data.clone()).await;
-                if (new_membership.distance_sum() - last_membership.distance_sum()).abs()
-                    / last_membership.distance_sum()
-                    < params.tolerance
-                {
-                    kmeans = new_kmeans;
-                    last_membership = new_membership;
+                let last_membership = kmeans.train_once(&mat).await;
+                let last_dist_sum = last_membership.distance_sum();
+                if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
+                    stddev = last_membership.hist_stddev();
+                    dist_sum = last_dist_sum;
                     break;
                 }
-                kmeans = new_kmeans;
-                last_membership = new_membership;
+                dist_sum = last_dist_sum;
+                kmeans = last_membership.to_kmeans().await.unwrap();
             }
             // Optimize for balanced clusters instead of minimal distance.
-            let stddev = last_membership.hist_stddev();
             if stddev < best_stddev {
                 best_kmeans = kmeans;
                 best_stddev = stddev;
@@ -362,9 +359,8 @@ impl KMeans {
     /// - *data*: training data / samples.
     ///
     /// Returns a new KMeans
-    pub async fn train_once(&self, data: &MatrixView) -> Result<Self> {
-        let membership = self.compute_membership(data.data().clone()).await;
-        membership.to_kmeans().await
+    pub async fn train_once(&self, data: &MatrixView) -> KMeanMembership {
+        self.compute_membership(data.data().clone()).await
     }
 
     /// Recompute the membership of each vector.
