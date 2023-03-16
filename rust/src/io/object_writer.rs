@@ -84,7 +84,7 @@ impl ObjectWriter {
     /// Returns the file position if success.
     pub async fn write_plain_encoded_array(&mut self, array: &dyn Array) -> Result<usize> {
         let mut encoder = PlainEncoder::new(self, array.data_type());
-        encoder.encode(array).await
+        encoder.encode(&[array]).await
     }
 
     /// Write magics to the tail of a file before closing the file.

@@ -63,14 +63,18 @@ impl<'a> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 
-    /// Encode an array of a batch.
+    /// Encode an slice of an Array of a batch.
     /// Returns the offset of the metadata
-    pub async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
-        self.encode_internal(array, self.data_type).await
+    pub async fn encode(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        self.encode_internal(arrays, self.data_type).await
     }
 
     #[async_recursion]
-    async fn encode_internal(&mut self, array: &dyn Array, data_type: &DataType) -> Result<usize> {
+    async fn encode_internal(
+        &mut self,
+        array: &[&dyn Array],
+        data_type: &DataType,
+    ) -> Result<usize> {
         if let DataType::FixedSizeList(items, _) = data_type {
             self.encode_fixed_size_list(array, items).await
         } else {
@@ -78,57 +82,82 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
-    async fn encode_boolean(&mut self, array: &BooleanArray) -> Result<()> {
-        let mut builder = BooleanBuilder::with_capacity(array.len());
-        for i in 0..array.len() {
-            builder.append_value(array.value(i));
+    async fn encode_boolean(&mut self, arrays: &[&BooleanArray]) -> Result<()> {
+        let capacity: usize = arrays.iter().map(|a| a.len()).sum();
+        let mut builder = BooleanBuilder::with_capacity(capacity);
+
+        for i in 0..arrays.len() {
+            for j in 0..arrays[i].len() {
+                builder.append_value(arrays[i].value(j));
+            }
         }
-        let array = builder.finish();
+
+        let boolean_array = builder.finish();
         self.writer
-            .write_all(array.data().buffers()[0].as_slice())
+            .write_all(boolean_array.data().buffers()[0].as_slice())
             .await?;
         Ok(())
     }
 
-    /// Encode primitive values.
-    async fn encode_primitive(&mut self, array: &dyn Array) -> Result<usize> {
+    /// Encode array of primitive values.
+    async fn encode_primitive(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        assert!(!arrays.is_empty());
+        let data_type = arrays[0].data_type();
         let offset = self.writer.tell();
-        let data = array.data();
-        if matches!(array.data_type(), DataType::Boolean) {
-            let boolean_arr = as_boolean_array(array);
-            self.encode_boolean(boolean_arr).await?;
+
+        if matches!(data_type, DataType::Boolean) {
+            let boolean_arr = arrays
+                .iter()
+                .map(|a| as_boolean_array(*a))
+                .collect::<Vec<&BooleanArray>>();
+            self.encode_boolean(boolean_arr.as_slice()).await?;
         } else {
-            let byte_width = array.data_type().byte_width();
-            let slice = unsafe {
-                from_raw_parts(
-                    data.buffers()[0].as_ptr().add(array.offset() * byte_width),
-                    array.len() * byte_width,
-                )
-            };
-            self.writer.write_all(slice).await?;
+            let byte_width = data_type.byte_width();
+            for a in arrays.iter() {
+                let data = a.data();
+                let slice = unsafe {
+                    from_raw_parts(
+                        data.buffers()[0].as_ptr().add(a.offset() * byte_width),
+                        a.len() * byte_width,
+                    )
+                };
+                self.writer.write_all(slice).await?;
+            }
         }
         Ok(offset)
     }
 
     /// Encode fixed size list.
-    async fn encode_fixed_size_list(&mut self, array: &dyn Array, items: &Field) -> Result<usize> {
-        let list_array = array
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                Error::Schema(format!(
-                    "Needed a FixedSizeListArray but got {}",
-                    array.data_type()
-                ))
-            })?;
-        let offset = list_array.value_offset(0) as usize;
-        let length = list_array.len() as usize;
-        let value_length = list_array.value_length() as usize;
+    async fn encode_fixed_size_list(
+        &mut self,
+        arrays: &[&dyn Array],
+        items: &Field,
+    ) -> Result<usize> {
+        let mut value_arrs: Vec<ArrayRef> = Vec::new();
+
+        for array in arrays {
+            let list_array = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "Needed a FixedSizeListArray but got {}",
+                        array.data_type()
+                    ))
+                })?;
+            let offset = list_array.value_offset(0) as usize;
+            let length = list_array.len() as usize;
+            let value_length = list_array.value_length() as usize;
+            let value_array = list_array.values().slice(offset, length * value_length);
+            value_arrs.push(value_array);
+        }
+
         self.encode_internal(
-            list_array
-                .values()
-                .slice(offset, length * value_length)
-                .as_ref(),
+            value_arrs
+                .iter()
+                .map(|a| a.as_ref())
+                .collect::<Vec<_>>()
+                .as_slice(),
             items.data_type(),
         )
         .await
@@ -407,6 +436,7 @@ impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
     use std::sync::Arc;
 
     use arrow::compute::concat_batches;
@@ -436,8 +466,11 @@ mod tests {
         let input: Vec<i64> = Vec::from_iter(1..127 as i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let arr = make_array_(&t, &buffer).await;
-            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+            let mut arrs: Vec<ArrayRef> = Vec::new();
+            for _ in 0..10 {
+                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+            }
+            test_round_trip(arrs.as_slice(), t).await;
         }
 
         let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
@@ -445,32 +478,52 @@ mod tests {
         let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
         for t in float_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let arr = make_array_(&t, &buffer).await;
-            test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+            let mut arrs: Vec<ArrayRef> = Vec::new();
+
+            for _ in 0..10 {
+                arrs.push(Arc::new(make_array_(&t, &buffer).await));
+            }
+            test_round_trip(arrs.as_slice(), t).await;
         }
     }
 
-    async fn test_round_trip(expected: ArrayRef, data_type: DataType) {
+    async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
         let store = ObjectStore::new(":memory:").await.unwrap();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
 
-        assert_eq!(encoder.encode(expected.as_ref()).await.unwrap(), 0);
+        let expected_as_array = expected
+            .iter()
+            .map(|e| e.as_ref())
+            .collect::<Vec<&dyn Array>>();
+        assert_eq!(
+            encoder.encode(expected_as_array.as_slice()).await.unwrap(),
+            0
+        );
         object_writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
-        let decoder = PlainDecoder::new(reader.as_ref(), &data_type, 0, expected.len()).unwrap();
+        // Expected size is the total of all arrays
+        let expected_size = expected.iter().map(|e| e.len()).sum();
+        let decoder = PlainDecoder::new(reader.as_ref(), &data_type, 0, expected_size).unwrap();
         let arr = decoder.decode().await.unwrap();
         let actual = arr.as_ref();
-        assert_eq!(expected.as_ref(), actual);
+        let expected_merged = concat(expected_as_array.as_slice()).unwrap();
+        assert_eq!(expected_merged.deref(), actual);
+        assert_eq!(expected_size, actual.len());
     }
 
     #[tokio::test]
     async fn test_encode_decode_bool_array() {
-        let arr = BooleanArray::from(vec![true, false].repeat(100));
-        test_round_trip(Arc::new(arr) as ArrayRef, DataType::Boolean).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            // It is important that the boolean array length is < 8 so we can test if the Arrays are merged correctly
+            arrs.push(Arc::new(BooleanArray::from(vec![true, true, true])) as ArrayRef);
+        }
+        test_round_trip(arrs.as_slice(), DataType::Boolean).await;
     }
 
     #[tokio::test]
@@ -488,36 +541,30 @@ mod tests {
         let input = Vec::from_iter(1..127 as i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
-            let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
-            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
-        }
+            let list_type =
+                DataType::FixedSizeList(Box::new(Field::new("item", t.clone(), true)), 3);
+            let mut arrs: Vec<ArrayRef> = Vec::new();
 
-        let float_types = vec![DataType::Float16, DataType::Float32, DataType::Float64];
-        let mut rng = rand::thread_rng();
-        let input: Vec<f64> = (1..127).map(|_| rng.gen()).collect();
-        for t in float_types {
-            let buffer = Buffer::from_slice_ref(input.as_slice());
-            let items = make_array_(&t, &buffer).await;
-            let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-            let list_type = DataType::FixedSizeList(Box::new(Field::new("item", t, true)), 3);
-            test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
+            for _ in 0..10 {
+                let items = make_array_(&t.clone(), &buffer).await;
+                let arr = FixedSizeListArray::try_new(items, 3).unwrap();
+                arrs.push(Arc::new(arr) as ArrayRef);
+            }
+            test_round_trip(arrs.as_slice(), list_type).await;
         }
-
-        let items = BooleanArray::from(vec![true, false, true].repeat(42));
-        let arr = FixedSizeListArray::try_new(items, 3).unwrap();
-        let list_type =
-            DataType::FixedSizeList(Box::new(Field::new("item", DataType::Boolean, true)), 3);
-        test_round_trip(Arc::new(arr) as ArrayRef, list_type).await;
     }
 
     #[tokio::test]
     async fn test_encode_decode_fixed_size_binary_array() {
         let t = DataType::FixedSizeBinary(3);
-        let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
-        let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
+            let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
+            arrs.push(Arc::new(arr) as ArrayRef);
+        }
+        test_round_trip(arrs.as_slice(), t).await;
     }
 
     #[tokio::test]
@@ -525,19 +572,30 @@ mod tests {
         // FixedSizeList of FixedSizeList
         let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
-        let values = Int64Array::from_iter_values(1..=120 as i64);
-        let arr = FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
-            .unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = Int64Array::from_iter_values(1..=120 as i64);
+            let arr =
+                FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
+                    .unwrap();
+            arrs.push(Arc::new(arr) as ArrayRef);
+        }
+        test_round_trip(arrs.as_slice(), t).await;
 
         // FixedSizeList of FixedSizeBinary
         let inner = DataType::FixedSizeBinary(2);
         let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
-        let values = UInt8Array::from_iter_values(1..=120 as u8);
-        let arr =
-            FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
-                .unwrap();
-        test_round_trip(Arc::new(arr) as ArrayRef, t).await;
+        let mut arrs: Vec<ArrayRef> = Vec::new();
+
+        for _ in 0..10 {
+            let values = UInt8Array::from_iter_values(1..=120 as u8);
+            let arr =
+                FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
+                    .unwrap();
+            arrs.push(Arc::new(arr) as ArrayRef);
+        }
+        test_round_trip(arrs.as_slice(), t).await;
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
@@ -557,7 +615,7 @@ mod tests {
         let array = Int32Array::from_iter_values([0, 1, 2, 3, 4, 5]);
         let mut writer = store.create(&path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
@@ -600,7 +658,7 @@ mod tests {
 
         let mut writer = store.create(&path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut writer, array.data_type());
-        assert_eq!(encoder.encode(&array).await.unwrap(), 0);
+        assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();

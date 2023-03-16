@@ -20,6 +20,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
@@ -53,53 +54,67 @@ impl<'a> BinaryEncoder<'a> {
         Self { writer }
     }
 
-    async fn encode_typed_arr<T: ByteArrayType>(&mut self, array: &dyn Array) -> Result<usize> {
-        let arr = array
-            .as_any()
-            .downcast_ref::<GenericByteArray<T>>()
-            .unwrap();
+    async fn encode_typed_arr<T: ByteArrayType>(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
+        let capacity: usize = arrs.iter().map(|a| a.len()).sum();
+        let mut buffers: Vec<&[u8]> = Vec::new();
+        let mut pos_builder: PrimitiveBuilder<Int64Type> =
+            PrimitiveBuilder::with_capacity(capacity);
 
-        let value_offset = self.writer.tell();
-        let offsets = arr.value_offsets();
+        let mut value_offset: usize = self.writer.tell();
+        for array in arrs {
+            let arr = array
+                .as_any()
+                .downcast_ref::<GenericByteArray<T>>()
+                .unwrap();
 
-        let start = offsets[0].as_usize();
-        let end = offsets[offsets.len() - 1].as_usize();
-        let b = unsafe {
-            std::slice::from_raw_parts(
-                arr.data().buffers()[1].as_ptr().offset(start as isize),
-                end - start,
-            )
-        };
-        self.writer.write_all(b).await?;
-        let offset = self.writer.tell();
+            let offsets = arr.value_offsets();
 
-        let start_offset = offsets[0];
-        // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
-        let positions = PrimitiveArray::<Int64Type>::from_iter(
-            offsets
-                .iter()
-                .map(|o| (((*o - start_offset).as_usize() + value_offset) as i64)),
-        );
+            let start = offsets[0].as_usize();
+            let end = offsets[offsets.len() - 1].as_usize();
+            let b = unsafe {
+                std::slice::from_raw_parts(
+                    arr.data().buffers()[1].as_ptr().offset(start as isize),
+                    end - start,
+                )
+            };
+            buffers.push(b);
+
+            let start_offset = offsets[0];
+            // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
+            offsets.iter().for_each(|o| {
+                let new_offset = ((*o - start_offset).as_usize() + value_offset) as i64;
+                pos_builder.append_value(new_offset);
+            });
+            value_offset = (pos_builder.values_slice()[pos_builder.len() - 1] + 1) as usize;
+        }
+
+        for buf in buffers {
+            self.writer.write_all(buf).await?;
+        }
+
+        let positions_offset = self.writer.tell();
+        let pos_array = pos_builder.finish();
         self.writer
-            .write_all(positions.data().buffers()[0].as_slice())
+            .write_all(pos_array.data().buffers()[0].as_slice())
             .await?;
-
-        Ok(offset)
+        Ok(positions_offset)
     }
 }
 
 #[async_trait]
 impl<'a> Encoder for BinaryEncoder<'a> {
-    async fn encode(&mut self, array: &dyn Array) -> Result<usize> {
-        match array.data_type() {
-            DataType::Utf8 => self.encode_typed_arr::<Utf8Type>(array).await,
-            DataType::Binary => self.encode_typed_arr::<BinaryType>(array).await,
-            DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(array).await,
-            DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(array).await,
+    async fn encode(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
+        assert!(!arrs.is_empty());
+        let data_type = arrs[0].data_type();
+        match data_type {
+            DataType::Utf8 => self.encode_typed_arr::<Utf8Type>(arrs).await,
+            DataType::Binary => self.encode_typed_arr::<BinaryType>(arrs).await,
+            DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
+            DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
                 return Err(crate::Error::IO(format!(
                     "Binary encoder does not support {}",
-                    array.data_type()
+                    data_type
                 )))
             }
         }
@@ -378,6 +393,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_select::concat::concat;
 
     use arrow_array::{
         new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
@@ -390,46 +406,61 @@ mod tests {
     async fn write_test_data<O: OffsetSizeTrait>(
         store: &ObjectStore,
         path: &Path,
-        arr: &GenericStringArray<O>,
+        arr: &[&GenericStringArray<O>],
     ) -> Result<usize> {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
-        // Write some gabage to reset "tell()".
+        // Write some garbage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
-        let pos = encoder.encode(&arr).await.unwrap();
+
+        let arrs = arr.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
+        let pos = encoder.encode(arrs.as_slice()).await.unwrap();
         object_writer.shutdown().await.unwrap();
         Ok(pos)
     }
 
-    async fn test_round_trips<O: OffsetSizeTrait>(arr: &GenericStringArray<O>) {
+    async fn test_round_trips<O: OffsetSizeTrait>(arrs: &[&GenericStringArray<O>]) {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, arr).await.unwrap();
+        let pos = write_test_data(&store, &path, arrs).await.unwrap();
         let reader = store.open(&path).await.unwrap();
+        let read_len = arrs.iter().map(|a| a.len()).sum();
         let decoder =
-            BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, arr.len(), true);
+            BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, read_len, true);
         let actual_arr = decoder.decode().await.unwrap();
+
+        let arrs_ref = arrs.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
+        let expected = concat(arrs_ref.as_slice()).unwrap();
         assert_eq!(
             actual_arr
                 .as_any()
                 .downcast_ref::<GenericStringArray<O>>()
                 .unwrap(),
-            arr
+            expected
+                .as_any()
+                .downcast_ref::<GenericStringArray<O>>()
+                .unwrap(),
         );
     }
 
     #[tokio::test]
     async fn test_write_binary_data() {
-        test_round_trips(&StringArray::from(vec!["a", "b", "cd", "efg"])).await;
-        test_round_trips(&StringArray::from(vec![Some("a"), None, Some("cd"), None])).await;
+        test_round_trips(&[&StringArray::from(vec!["a", "b", "cd", "efg"])]).await;
+        test_round_trips(&[&StringArray::from(vec![Some("a"), None, Some("cd"), None])]).await;
 
-        test_round_trips(&LargeStringArray::from(vec!["a", "b", "cd", "efg"])).await;
-        test_round_trips(&LargeStringArray::from(vec![
+        test_round_trips(&[&LargeStringArray::from(vec!["a", "b", "cd", "efg"])]).await;
+        test_round_trips(&[&LargeStringArray::from(vec![
             Some("a"),
             None,
             Some("cd"),
             None,
-        ]))
+        ])])
+        .await;
+        test_round_trips(&[
+            &LargeStringArray::from(vec![Some("a"), Some("b")]),
+            &LargeStringArray::from(vec![Some("c")]),
+            &LargeStringArray::from(vec![Some("d"), Some("e")]),
+        ])
         .await;
     }
 
@@ -443,7 +474,7 @@ mod tests {
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
-        let pos = encoder.encode(&data).await.unwrap();
+        let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
@@ -485,7 +516,7 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, &data).await.unwrap();
+        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -506,7 +537,7 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let pos = write_test_data(&store, &path, &data).await.unwrap();
+        let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
@@ -543,7 +574,7 @@ mod tests {
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         for i in 0..10 {
             let pos = encoder
-                .encode(data.slice(i * 10, 10).as_ref())
+                .encode(&[data.slice(i * 10, 10).as_ref()])
                 .await
                 .unwrap();
             assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));
