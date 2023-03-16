@@ -359,6 +359,13 @@ impl KMeans {
     /// - *data*: training data / samples.
     ///
     /// Returns a new KMeans
+    ///
+    /// ```rust,ignore
+    /// for i in 0..max_iters {
+    ///   let membership = kmeans.train_once(&mat).await;
+    ///   let kmeans = membership.to_kmeans();
+    /// }
+    /// ```
     pub async fn train_once(&self, data: &MatrixView) -> KMeanMembership {
         self.compute_membership(data.data().clone()).await
     }
