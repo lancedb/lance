@@ -130,14 +130,14 @@ impl<'a> FileWriter<'a> {
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batch: &[&RecordBatch]) -> Result<()> {
         for field in self.schema.fields.iter() {
-            let arrs = batch
+            let arrs: Result<Vec<_>> = batch
                 .iter()
                 .map(|b| {
-                    let column_id = b.schema().index_of(&field.name).unwrap(); // remove unwrap
-                    b.column(column_id)
+                    let column_id = b.schema().index_of(&field.name)?;
+                    Ok(b.column(column_id))
                 })
-                .collect::<Vec<_>>();
-            self.write_array(field, arrs.as_slice()).await?;
+                .collect();
+            self.write_array(field, arrs?.as_slice()).await?;
         }
         let batch_length = batch.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
