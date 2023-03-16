@@ -16,7 +16,6 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 from unittest import mock
 
 import lance

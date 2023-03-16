@@ -16,7 +16,6 @@
 //!
 
 use std::collections::BTreeMap;
-use std::fmt::Write;
 use std::sync::Arc;
 use std::time::SystemTime;
 
