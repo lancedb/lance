@@ -302,10 +302,10 @@ impl ProductQuantizer {
     /// Transform the vector array to PQ code array.
     pub async fn transform(
         &self,
-        data: &FixedSizeListArray,
+        data: &MatrixView,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors as i32);
+        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
 
         assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -356,17 +356,16 @@ impl ProductQuantizer {
     /// Train [`ProductQuantizer`] using vectors.
     pub async fn train(
         &mut self,
-        data: &FixedSizeListArray,
+        data: &MatrixView,
         metric_type: MetricType,
         max_iters: usize,
     ) -> Result<()> {
-        assert!(data.value_length() % self.num_sub_vectors as i32 == 0);
-        assert_eq!(data.value_type(), DataType::Float32);
-        assert_eq!(data.null_count(), 0);
+        assert!(data.num_columns() % self.num_sub_vectors == 0);
+        assert_eq!(data.data().null_count(), 0);
 
-        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors as i32);
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         let num_centroids = 2_usize.pow(self.num_bits);
-        let dimension = data.value_length() as usize;
+        let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
@@ -403,9 +402,8 @@ impl ProductQuantizer {
         mat: &MatrixView,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
-        self.train(&data, metric_type, 50).await?;
-        self.transform(&data, metric_type).await
+        self.train(mat, metric_type, 50).await?;
+        self.transform(mat, metric_type).await
     }
 }
 
@@ -437,19 +435,19 @@ impl From<&ProductQuantizer> for pb::Pq {
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
-fn divide_to_subvectors(array: &FixedSizeListArray, m: i32) -> Vec<Arc<FixedSizeListArray>> {
-    assert!(!array.is_empty());
+fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArray>> {
+    assert!(!data.num_rows() > 0);
 
-    let sub_vector_length = (array.value_length() / m) as usize;
-    let capacity = array.len() * sub_vector_length;
+    let sub_vector_length = (data.num_columns() / m) as usize;
+    let capacity = data.num_rows() * sub_vector_length;
     let mut subarrays = vec![];
 
     // TODO: very intensive memory copy involved!!! But this is on the write path.
     // Optimize for memory copy later.
     for i in 0..m as usize {
         let mut builder = Float32Builder::with_capacity(capacity);
-        for j in 0..array.len() {
-            let arr = array.value(j);
+        for j in 0..data.num_rows() {
+            let arr = data.row(j).unwrap();
             let row: &Float32Array = as_primitive_array(&arr);
             let start = i * sub_vector_length;
 
@@ -475,7 +473,7 @@ mod tests {
     fn test_divide_to_subvectors() {
         let values = Float32Array::from_iter((0..320).map(|v| v as f32));
         // A [10, 32] array.
-        let mat = FixedSizeListArray::try_new(values, 32).unwrap();
+        let mat = MatrixView::new(values.into(), 32);
         let sub_vectors = divide_to_subvectors(&mat, 4);
         assert_eq!(sub_vectors.len(), 4);
         assert_eq!(sub_vectors[0].len(), 10);
