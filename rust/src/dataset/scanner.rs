@@ -33,7 +33,7 @@ use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
-use crate::datatypes::Schema;
+use crate::datatypes::{Field, Schema};
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
@@ -216,22 +216,35 @@ impl Scanner {
     pub fn schema(&self) -> Result<SchemaRef> {
         if self.nearest.as_ref().is_some() {
             let q = self.nearest.as_ref().unwrap();
-            let column: ArrowField = self
-                .dataset
-                .schema()
-                .field(q.column.as_str())
-                .ok_or_else(|| {
-                    Error::Schema(format!("Vector column {} not found in schema", q.column))
-                })?
-                .into();
+            let vector_schema = self.dataset.schema().project(&[&q.column])?;
             let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![column, score]);
-            let vector_search_columns = &Schema::try_from(&score_schema)?;
-            let merged = self.projections.merge(vector_search_columns);
+            let score_schema = ArrowSchema::new(vec![score]);
+
+            let merged = self
+                .projections
+                .merge(&vector_schema)
+                .merge(&Schema::try_from(&score_schema)?);
             Ok(SchemaRef::new(ArrowSchema::from(&merged)))
         } else {
             Ok(Arc::new(ArrowSchema::from(&self.projections)))
         }
+    }
+
+    fn scanner_output_schema(&self) -> Result<Arc<Schema>> {
+        if self.nearest.as_ref().is_some() {
+            let merged = self.projections.merge(&self.vector_search_schema()?);
+            Ok(Arc::new(merged))
+        } else {
+            Ok(Arc::new(self.projections.clone()))
+        }
+    }
+
+    fn vector_search_schema(&self) -> Result<Schema> {
+        let q = self.nearest.as_ref().unwrap();
+        let vector_schema = self.dataset.schema().project(&[&q.column])?;
+        let score = ArrowField::new("score", Float32, false);
+        let score_schema = Schema::try_from(&ArrowSchema::new(vec![score]))?;
+        Ok(vector_schema.merge(&score_schema))
     }
 
     /// Create a stream of this Scanner.
@@ -267,14 +280,14 @@ impl Scanner {
                     }
                 }
 
-                let knn_node = self.ann(q, &index);
+                let knn_node = self.ann(q, &index); // score, _rowid
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
                 let knn_node_with_vector = self.take(knn_node, &with_vector, false);
                 let knn_node = if q.refine_factor.is_some() {
                     self.flat_knn(knn_node_with_vector, q)
                 } else {
                     knn_node_with_vector
-                };
+                }; // vector, score, _rowid
 
                 let knn_node = if let Some(filter_expression) = filter_expr {
                     let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
@@ -282,14 +295,20 @@ impl Scanner {
                         .iter()
                         .map(|c| c.as_str())
                         .collect::<Vec<_>>();
-                    let filter_projection = Arc::new(self.dataset.schema().project(&columns_refs)?);
+                    let filter_projection = self.dataset.schema().project(&columns_refs)?;
+
                     let take_node = Arc::new(GlobalTakeExec::new(
                         self.dataset.clone(),
-                        filter_projection,
+                        Arc::new(filter_projection),
                         knn_node,
                         false,
                     ));
-                    self.filter_node(filter_expression, take_node, false)?
+                    self.filter_node(
+                        filter_expression,
+                        take_node,
+                        false,
+                        Some(Arc::new(self.vector_search_schema()?)),
+                    )?
                 } else {
                     knn_node
                 };
@@ -313,7 +332,7 @@ impl Scanner {
                 )?,
             );
             let scan = self.scan(true, filter_schema);
-            self.filter_node(filter, scan, true)?
+            self.filter_node(filter, scan, true, None)?
         } else {
             self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
@@ -388,12 +407,15 @@ impl Scanner {
         filter: Arc<dyn PhysicalExpr>,
         input: Arc<dyn ExecutionPlan>,
         drop_row_id: bool,
+        ann_schema: Option<Arc<Schema>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
+        let output_schema = self.scanner_output_schema()?;
         Ok(Arc::new(LocalTakeExec::new(
             filter_node,
             self.dataset.clone(),
-            Arc::new(self.projections.clone()),
+            output_schema,
+            ann_schema,
             drop_row_id,
         )))
     }
@@ -518,7 +540,6 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("i > 50").unwrap();
-        println!("Filter is: {:?}", scan.filter);
         assert_eq!(scan.filter, Some("i > 50".to_string()));
 
         let batches = scan
@@ -530,7 +551,6 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        println!("Batches: {:?}\n", batches);
         let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
 
         let expected_batch = RecordBatch::try_new(

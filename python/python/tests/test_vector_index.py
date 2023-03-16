@@ -96,7 +96,7 @@ def run(ds):
                         "nprobes": 1,
                         "refine_factor": rf,
                     },
-                    filter=filter_
+                    filter=filter_,
                 )
                 end = time.time()
                 times.append(end - start)
