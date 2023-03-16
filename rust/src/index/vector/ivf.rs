@@ -655,7 +655,9 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(RESIDUAL_COLUMN)
                 .unwrap();
             let residual_data = as_fixed_size_list_array(&residual_col);
-            let pq_code = pq_ref.transform(&residual_data.try_into()?, metric_type).await?;
+            let pq_code = pq_ref
+                .transform(&residual_data.try_into()?, metric_type)
+                .await?;
 
             let row_ids = batch.column_by_name(ROW_ID).expect("Expect row id").clone();
             let part_ids = part_id_and_residual
@@ -762,8 +764,7 @@ async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<P
         data.value_length() as usize,
     );
     let mat: MatrixView = data.try_into()?;
-    pq.train(&mat, params.metric_type, params.max_iters)
-        .await?;
+    pq.train(&mat, params.metric_type, params.max_iters).await?;
     Ok(pq)
 }
 
