@@ -16,6 +16,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import lance
@@ -37,6 +38,21 @@ def test_dataset_overwrite(tmp_path: Path):
 
     ds_v1 = lance.dataset(base_dir, version=1)
     assert ds_v1.to_table() == table1
+
+
+def test_dataset_append(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    # verify append works even if no dataset existed at the uri
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert dataset.to_table() == table
+
+    # verify appending batches with a different schema doesn't work
+    table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
+    with pytest.raises(OSError):
+        lance.write_dataset(table2, base_dir, mode="append")
 
 
 def test_versions(tmp_path: Path):
