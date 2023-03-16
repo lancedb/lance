@@ -241,7 +241,7 @@ impl Dataset {
                 };
 
                 let batches = buffer.finish()?;
-                let batches_ref = batches.iter().map(|b| b).collect::<Vec<_>>();
+                let batches_ref = batches.iter().collect::<Vec<_>>();
                 writer
                     .as_mut()
                     .unwrap()

@@ -125,6 +125,7 @@ impl<'a> FileWriter<'a> {
     }
 
     /// Write a [RecordBatch] to the open file.
+    /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batch: &[&RecordBatch]) -> Result<()> {
@@ -255,15 +256,12 @@ impl<'a> FileWriter<'a> {
         for child in &field.children {
             let mut arrs: Vec<&ArrayRef> = Vec::new();
             for struct_array in arrays {
-                if let Some(arr) = struct_array.column_by_name(&child.name) {
-                    arrs.push(arr);
-                } else {
-                    return Err(Error::Schema(format!(
-                        "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
-                        child.name,
-                        struct_array.data_type()
-                    )));
-                }
+                let arr = struct_array.column_by_name(&child.name).ok_or(Error::Schema(format!(
+                    "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                    child.name,
+                    struct_array.data_type()
+                )))?;
+                arrs.push(arr);
             }
             self.write_array(child, arrs.as_slice()).await?;
         }
