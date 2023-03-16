@@ -20,6 +20,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
@@ -54,8 +55,10 @@ impl<'a> BinaryEncoder<'a> {
     }
 
     async fn encode_typed_arr<T: ByteArrayType>(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
+        let capacity: usize = arrs.iter().map(|a| a.len()).sum();
         let mut buffers: Vec<&[u8]> = Vec::new();
-        let mut positions: Vec<PrimitiveArray<Int64Type>> = Vec::new();
+        let mut pos_builder: PrimitiveBuilder<Int64Type> =
+            PrimitiveBuilder::with_capacity(capacity);
 
         let mut value_offset: usize = self.writer.tell();
         for array in arrs {
@@ -64,7 +67,6 @@ impl<'a> BinaryEncoder<'a> {
                 .downcast_ref::<GenericByteArray<T>>()
                 .unwrap();
 
-            // let value_offset = self.writer.tell();
             let offsets = arr.value_offsets();
 
             let start = offsets[0].as_usize();
@@ -79,13 +81,11 @@ impl<'a> BinaryEncoder<'a> {
 
             let start_offset = offsets[0];
             // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
-            let p = PrimitiveArray::<Int64Type>::from_iter(
-                offsets
-                    .iter()
-                    .map(|o| (((*o - start_offset).as_usize() + value_offset) as i64)),
-            );
-            value_offset = (p.value(p.len() - 1) + 1) as usize;
-            positions.push(p);
+            offsets.iter().for_each(|o| {
+                let new_offset = ((*o - start_offset).as_usize() + value_offset) as i64;
+                pos_builder.append_value(new_offset);
+            });
+            value_offset = (pos_builder.values_slice()[pos_builder.len() - 1] + 1) as usize;
         }
 
         for buf in buffers {
@@ -93,11 +93,10 @@ impl<'a> BinaryEncoder<'a> {
         }
 
         let positions_offset = self.writer.tell();
-        for p in positions.iter() {
-            self.writer
-                .write_all(p.data().buffers()[0].as_slice())
-                .await?;
-        }
+        let pos_array = pos_builder.finish();
+        self.writer
+            .write_all(pos_array.data().buffers()[0].as_slice())
+            .await?;
         Ok(positions_offset)
     }
 }

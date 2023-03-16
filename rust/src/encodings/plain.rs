@@ -63,16 +63,16 @@ impl<'a> PlainEncoder<'a> {
         PlainEncoder { writer, data_type }
     }
 
-    /// Encode an array of a batch.
+    /// Encode an slice of an Array of a batch.
     /// Returns the offset of the metadata
-    pub async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        self.encode_internal(array, self.data_type).await
+    pub async fn encode(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        self.encode_internal(arrays, self.data_type).await
     }
 
     #[async_recursion]
     async fn encode_internal(
         &mut self,
-        array: &[&'async_recursion dyn Array],
+        array: &[&dyn Array],
         data_type: &DataType,
     ) -> Result<usize> {
         if let DataType::FixedSizeList(items, _) = data_type {
@@ -82,13 +82,13 @@ impl<'a> PlainEncoder<'a> {
         }
     }
 
-    async fn encode_boolean(&mut self, array: &[&BooleanArray]) -> Result<()> {
-        let capacity = array.iter().map(|a| a.len()).sum::<usize>();
+    async fn encode_boolean(&mut self, arrays: &[&BooleanArray]) -> Result<()> {
+        let capacity: usize = arrays.iter().map(|a| a.len()).sum();
         let mut builder = BooleanBuilder::with_capacity(capacity);
 
-        for i in 0..array.len() {
-            for j in 0..array[i].len() {
-                builder.append_value(array[i].value(j));
+        for i in 0..arrays.len() {
+            for j in 0..arrays[i].len() {
+                builder.append_value(arrays[i].value(j));
             }
         }
 
@@ -100,20 +100,20 @@ impl<'a> PlainEncoder<'a> {
     }
 
     /// Encode array of primitive values.
-    async fn encode_primitive(&mut self, array: &[&dyn Array]) -> Result<usize> {
-        assert!(!array.is_empty());
-        let data_type = array[0].data_type();
+    async fn encode_primitive(&mut self, arrays: &[&dyn Array]) -> Result<usize> {
+        assert!(!arrays.is_empty());
+        let data_type = arrays[0].data_type();
         let offset = self.writer.tell();
 
         if matches!(data_type, DataType::Boolean) {
-            let boolean_arr = array
+            let boolean_arr = arrays
                 .iter()
                 .map(|a| as_boolean_array(*a))
                 .collect::<Vec<&BooleanArray>>();
             self.encode_boolean(boolean_arr.as_slice()).await?;
         } else {
             let byte_width = data_type.byte_width();
-            for a in array.iter() {
+            for a in arrays.iter() {
                 let data = a.data();
                 let slice = unsafe {
                     from_raw_parts(
@@ -130,12 +130,12 @@ impl<'a> PlainEncoder<'a> {
     /// Encode fixed size list.
     async fn encode_fixed_size_list(
         &mut self,
-        arrs: &[&dyn Array],
+        arrays: &[&dyn Array],
         items: &Field,
     ) -> Result<usize> {
         let mut value_arrs: Vec<ArrayRef> = Vec::new();
 
-        for array in arrs {
+        for array in arrays {
             let list_array = array
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
@@ -520,7 +520,8 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            arrs.push(Arc::new(BooleanArray::from(vec![true, false].repeat(100))) as ArrayRef);
+            // It is important that the boolean array length is < 8 so we can test if the Arrays are merged correctly
+            arrs.push(Arc::new(BooleanArray::from(vec![true, true, true])) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), DataType::Boolean).await;
     }
