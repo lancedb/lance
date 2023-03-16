@@ -212,22 +212,10 @@ impl Scanner {
         self
     }
 
-    /// The schema of the output, a.k.a, projection schema.
+    /// The Arrow schema of the output, including projections and vector / score
     pub fn schema(&self) -> Result<SchemaRef> {
-        if self.nearest.as_ref().is_some() {
-            let q = self.nearest.as_ref().unwrap();
-            let vector_schema = self.dataset.schema().project(&[&q.column])?;
-            let score = ArrowField::new("score", Float32, false);
-            let score_schema = ArrowSchema::new(vec![score]);
-
-            let merged = self
-                .projections
-                .merge(&vector_schema)
-                .merge(&Schema::try_from(&score_schema)?);
-            Ok(SchemaRef::new(ArrowSchema::from(&merged)))
-        } else {
-            Ok(Arc::new(ArrowSchema::from(&self.projections)))
-        }
+        self.scanner_output_schema()
+            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))
     }
 
     fn scanner_output_schema(&self) -> Result<Arc<Schema>> {
