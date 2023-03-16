@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
@@ -126,13 +127,19 @@ impl<'a> FileWriter<'a> {
     /// Write a [RecordBatch] to the open file.
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    pub async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        for field in self.schema.fields.as_slice() {
-            let column_id = batch.schema().index_of(&field.name)?;
-            let array = batch.column(column_id);
-            self.write_array(field, array).await?;
+    pub async fn write(&mut self, batch: &[&RecordBatch]) -> Result<()> {
+        for field in self.schema.fields.iter() {
+            let arrs = batch
+                .iter()
+                .map(|b| {
+                    let column_id = b.schema().index_of(&field.name).unwrap(); // remove unwrap
+                    b.column(column_id)
+                })
+                .collect::<Vec<_>>();
+            self.write_array(field, arrs.as_slice()).await?;
         }
-        self.metadata.push_batch_length(batch.num_rows() as i32);
+        let batch_length = batch.iter().map(|b| b.num_rows() as i32).sum();
+        self.metadata.push_batch_length(batch_length);
         self.batch_id += 1;
         Ok(())
     }
@@ -152,24 +159,36 @@ impl<'a> FileWriter<'a> {
     }
 
     #[async_recursion]
-    async fn write_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
-        let data_type = array.data_type();
+    async fn write_array(&mut self, field: &Field, arrs: &[&ArrayRef]) -> Result<()> {
+        assert!(!arrs.is_empty());
+        let data_type = arrs[0].data_type();
+        let arrs_ref = arrs.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
+
         match data_type {
-            DataType::Null => self.write_null_array(field, array).await,
-            dt if dt.is_fixed_stride() => self.write_fixed_stride_array(field, array).await,
-            dt if dt.is_binary_like() => self.write_binary_array(field, array).await,
+            DataType::Null => self.write_null_array(field, arrs_ref.as_slice()).await,
+            dt if dt.is_fixed_stride() => {
+                self.write_fixed_stride_array(field, arrs_ref.as_slice())
+                    .await
+            }
+            dt if dt.is_binary_like() => self.write_binary_array(field, arrs_ref.as_slice()).await,
             DataType::Dictionary(key_type, _) => {
-                self.write_dictionary_arr(field, array, key_type).await
+                self.write_dictionary_arr(field, arrs_ref.as_slice(), key_type)
+                    .await
             }
             dt if dt.is_struct() => {
-                let struct_arr = as_struct_array(array);
-                self.write_struct_array(field, struct_arr).await
+                let struct_arrays = arrs.iter().map(|a| as_struct_array(a)).collect::<Vec<_>>();
+                self.write_struct_array(field, struct_arrays.as_slice())
+                    .await
             }
             DataType::FixedSizeList(_, _) | DataType::FixedSizeBinary(_) => {
-                self.write_fixed_stride_array(field, array).await
+                self.write_fixed_stride_array(field, arrs_ref.as_slice())
+                    .await
             }
-            DataType::List(_) => self.write_list_array(field, array).await,
-            DataType::LargeList(_) => self.write_large_list_array(field, array).await,
+            DataType::List(_) => self.write_list_array(field, arrs_ref.as_slice()).await,
+            DataType::LargeList(_) => {
+                self.write_large_list_array(field, arrs_ref.as_slice())
+                    .await
+            }
             _ => {
                 return Err(Error::Schema(format!(
                     "FileWriter::write: unsupported data type: {data_type}"
@@ -178,28 +197,34 @@ impl<'a> FileWriter<'a> {
         }
     }
 
-    async fn write_null_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
-        let page_info = PageInfo::new(self.object_writer.tell(), array.len());
+    async fn write_null_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+        let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
+        let page_info = PageInfo::new(self.object_writer.tell(), arrs_length as usize);
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
 
     /// Write fixed size array, including, primtiives, fixed size binary, and fixed size list.
-    async fn write_fixed_stride_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+    async fn write_fixed_stride_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Plain));
-        let mut encoder = PlainEncoder::new(&mut self.object_writer, array.data_type());
-        let pos = encoder.encode(&[array]).await?;
-        let page_info = PageInfo::new(pos, array.len());
+        assert!(!arrs.is_empty());
+        let data_type = arrs[0].data_type();
+
+        let mut encoder = PlainEncoder::new(&mut self.object_writer, data_type);
+        let pos = encoder.encode(arrs).await?;
+        let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
+        let page_info = PageInfo::new(pos, arrs_length as usize);
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
 
     /// Write var-length binary arrays.
-    async fn write_binary_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
+    async fn write_binary_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::VarBinary));
         let mut encoder = BinaryEncoder::new(&mut self.object_writer);
-        let pos = encoder.encode(&[array]).await?;
-        let page_info = PageInfo::new(pos, array.len());
+        let pos = encoder.encode(arrs).await?;
+        let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
+        let page_info = PageInfo::new(pos, arrs_length as usize);
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
@@ -207,53 +232,83 @@ impl<'a> FileWriter<'a> {
     async fn write_dictionary_arr(
         &mut self,
         field: &Field,
-        array: &ArrayRef,
+        arrs: &[&dyn Array],
         key_type: &DataType,
     ) -> Result<()> {
         assert_eq!(field.encoding, Some(Encoding::Dictionary));
 
         // Write the dictionary keys.
         let mut encoder = DictionaryEncoder::new(&mut self.object_writer, key_type);
-        let pos = encoder.encode(&[array]).await?;
-        let page_info = PageInfo::new(pos, array.len());
+        let pos = encoder.encode(arrs).await?;
+        let arrs_length: i32 = arrs.iter().map(|a| a.len() as i32).sum();
+        let page_info = PageInfo::new(pos, arrs_length as usize);
         self.page_table.set(field.id, self.batch_id, page_info);
         Ok(())
     }
 
     #[async_recursion]
-    async fn write_struct_array(&mut self, field: &Field, array: &StructArray) -> Result<()> {
-        assert_eq!(array.num_columns(), field.children.len());
+    async fn write_struct_array(&mut self, field: &Field, arrays: &[&StructArray]) -> Result<()> {
+        arrays
+            .iter()
+            .for_each(|a| assert_eq!(a.num_columns(), field.children.len()));
+
         for child in &field.children {
-            if let Some(arr) = array.column_by_name(&child.name) {
-                self.write_array(child, arr).await?;
-            } else {
-                return Err(Error::Schema(format!(
-                    "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
-                    child.name,
-                    array.data_type()
-                )));
+            let mut arrs: Vec<&ArrayRef> = Vec::new();
+            for struct_array in arrays {
+                if let Some(arr) = struct_array.column_by_name(&child.name) {
+                    arrs.push(arr);
+                } else {
+                    return Err(Error::Schema(format!(
+                        "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                        child.name,
+                        struct_array.data_type()
+                    )));
+                }
             }
+            self.write_array(child, arrs.as_slice()).await?;
         }
         Ok(())
     }
 
-    async fn write_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
-        let list_arr = as_list_array(array);
-        let offsets: Int32Array = list_arr.value_offsets().iter().copied().collect();
-        assert!(!offsets.is_empty());
-        let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
-        self.write_fixed_stride_array(field, &offsets).await?;
-        self.write_array(&field.children[0], list_arr.values())
+    async fn write_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+        let mut list_arrs: Vec<&ArrayRef> = Vec::new();
+        let mut offsets: Vec<ArrayRef> = Vec::new();
+
+        for array in arrs {
+            let list_arr = as_list_array(*array);
+            let value_offsets: Int32Array = list_arr.value_offsets().iter().copied().collect();
+            assert!(!value_offsets.is_empty());
+            let offsets_arr =
+                Arc::new(subtract_scalar(&value_offsets, value_offsets.value(0))?) as ArrayRef;
+            list_arrs.push(list_arr.values());
+            offsets.push(offsets_arr);
+        }
+
+        let offsets_ref = offsets.iter().map(|l| l.deref()).collect::<Vec<_>>();
+        self.write_fixed_stride_array(field, offsets_ref.as_slice())
+            .await?;
+        self.write_array(&field.children[0], list_arrs.as_slice())
             .await
     }
 
-    async fn write_large_list_array(&mut self, field: &Field, array: &ArrayRef) -> Result<()> {
-        let list_arr = as_large_list_array(array);
-        let offsets: Int64Array = list_arr.value_offsets().iter().copied().collect();
-        assert!(!offsets.is_empty());
-        let offsets = Arc::new(subtract_scalar(&offsets, offsets.value(0))?) as ArrayRef;
-        self.write_fixed_stride_array(field, &offsets).await?;
-        self.write_array(&field.children[0], list_arr.values())
+    async fn write_large_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+        let mut list_arrs: Vec<&ArrayRef> = Vec::new();
+        let mut offsets: Vec<ArrayRef> = Vec::new();
+
+        for array in arrs {
+            let list_arr = as_large_list_array(*array);
+            let value_offsets: Int64Array = list_arr.value_offsets().iter().copied().collect();
+            assert!(!value_offsets.is_empty());
+            let offsets_arr =
+                Arc::new(subtract_scalar(&value_offsets, value_offsets.value(0))?) as ArrayRef;
+            list_arrs.push(list_arr.values());
+            offsets.push(offsets_arr);
+        }
+
+        let offsets_ref = offsets.iter().map(|l| l.deref()).collect::<Vec<_>>();
+        self.write_fixed_stride_array(field, offsets_ref.as_slice())
+            .await?;
+        self.write_array(&field.children[0], list_arrs.as_slice())
             .await
     }
 
@@ -440,7 +495,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -478,7 +533,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
