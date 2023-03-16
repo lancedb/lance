@@ -208,15 +208,16 @@ pub struct IvfPQIndexMetadata {
     /// The version of dataset where this index was built.
     dataset_version: u64,
 
+    /// Metric to compute distance
     metric_type: MetricType,
 
-    // Ivf related
+    /// IVF model
     ivf: Ivf,
 
     /// Product Quantizer
     pq: Arc<ProductQuantizer>,
 
-    /// File position of transforms.
+    /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
 }
 
@@ -281,19 +282,15 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                         if num_stages != 2 || num_stages != 3 {
                             return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                         };
-                        let opq = match vidx.stages[0].stage.as_ref().unwrap() {
-                            Stage::Transform(transform) => Ok(transform),
-                            _ => Err(Error::IO("Stage 0 only supports OPQ".to_string())),
-                        }?;
-                        let stage0 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
+                        let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
                             Error::IO("VectorIndex stage 0 is missing".to_string())
                         })?;
                         let ivf = match stage0 {
                             Stage::Ivf(ivf_pb) => Ok(Ivf::try_from(ivf_pb)?),
                             _ => Err(Error::IO("Stage 0 only supports IVF".to_string())),
                         }?;
-                        let stage1 = vidx.stages[2].stage.as_ref().ok_or_else(|| {
-                            Error::IO("VectorIndex stage 0 is missing".to_string())
+                        let stage1 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
+                            Error::IO("VectorIndex stage 1 is missing".to_string())
                         })?;
                         let pq = match stage1 {
                             Stage::Pq(pq_proto) => Ok(Arc::new(pq_proto.into())),
@@ -313,7 +310,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                                 .into(),
                             ivf,
                             pq,
-                            transforms: vec![opq.clone()],
+                            transforms: vec![],
                         })
                     }
                 }?
@@ -619,12 +616,6 @@ pub async fn build_ivf_pq_index(
 
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
-    // Train the OPQ rotation matrix.
-    let opq = train_opq(&training_data, pq_params).await?;
-
-    // Transform training data using OPQ matrix.
-    let training_data = opq.transform(&training_data).await?;
-
     // Train IVF partitions.
     let ivf_model = train_ivf_model(&training_data, ivf_params).await?;
 
@@ -644,7 +635,6 @@ pub async fn build_ivf_pq_index(
     scanner.with_row_id();
 
     let ivf = &ivf_model;
-    let opq_ref = &opq;
     let pq_ref = &pq;
     let metric_type = pq_params.metric_type;
 
@@ -659,8 +649,6 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
             let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
-            // Transform using OPQ matrix.
-            let vectors = opq_ref.transform(&vectors).await?;
             let part_id_and_residual = ivf.compute_partition_and_residual(&vectors, metric_type)?;
 
             let residual_col = part_id_and_residual
@@ -699,7 +687,6 @@ pub async fn build_ivf_pq_index(
         index_name,
         uuid,
         ivf_model,
-        opq,
         pq,
         ivf_params.metric_type,
         &batches,
@@ -714,7 +701,6 @@ async fn write_index_file(
     index_name: &str,
     uuid: &Uuid,
     mut ivf: Ivf,
-    mut opq: OptimizedProductQuantizer,
     pq: ProductQuantizer,
     metric_type: MetricType,
     batches: &[RecordBatch],
@@ -749,12 +735,6 @@ async fn write_index_file(
         }
     }
 
-    // Write OPQ matrix.
-    let pos = writer
-        .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
-        .await?;
-    opq.file_position = Some(pos);
-
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
@@ -763,7 +743,7 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq: pq.into(),
-        transforms: vec![opq.try_into_pb()?],
+        transforms: vec![],
     };
 
     let metadata = pb::Index::try_from(&metadata)?;
