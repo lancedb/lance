@@ -27,7 +27,6 @@ use datafusion::physical_plan::{
     ExecutionPlan, RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
-use futures::{FutureExt, TryFutureExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 

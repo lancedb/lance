@@ -237,7 +237,14 @@ impl Dataset {
                 if writer.is_none() {
                     writer = new_writer!();
                 };
-                writer.as_mut().unwrap().write(&buffer.finish()?).await?;
+
+                let batches = buffer.finish()?;
+                let batches_ref = batches.iter().collect::<Vec<_>>();
+                writer
+                    .as_mut()
+                    .unwrap()
+                    .write(batches_ref.as_slice())
+                    .await?;
                 buffer = RecordBatchBuffer::empty();
             }
             if let Some(w) = writer.as_mut() {
@@ -251,7 +258,13 @@ impl Dataset {
             if writer.is_none() {
                 writer = new_writer!();
             };
-            writer.as_mut().unwrap().write(&buffer.finish()?).await?;
+            let batches = buffer.finish()?;
+            let batches_ref = batches.iter().map(|b| b).collect::<Vec<_>>();
+            writer
+                .as_mut()
+                .unwrap()
+                .write(batches_ref.as_slice())
+                .await?;
         }
         if let Some(w) = writer.as_mut() {
             // Drop the last writer.

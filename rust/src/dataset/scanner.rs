@@ -33,7 +33,7 @@ use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
-use crate::datatypes::{Field, Schema};
+use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};

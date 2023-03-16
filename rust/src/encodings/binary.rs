@@ -25,7 +25,7 @@ use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
     types::{BinaryType, ByteArrayType, Int64Type, LargeBinaryType, LargeUtf8Type, Utf8Type},
-    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, PrimitiveArray, UInt32Array,
+    Array, ArrayRef, GenericByteArray, Int64Array, OffsetSizeTrait, UInt32Array,
 };
 use arrow_buffer::{bit_util, ArrowNativeType, MutableBuffer};
 use arrow_cast::cast::cast;

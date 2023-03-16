@@ -712,7 +712,7 @@ mod tests {
         for i in (0..1000).step_by(4) {
             let data = array.slice(i, 4);
             file_writer
-                .write(&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap())
+                .write(&[&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
                 .await
                 .unwrap();
         }
@@ -740,7 +740,7 @@ mod tests {
         for i in 0..10 {
             let data = array.slice(i * 12, 12); // one and half byte
             file_writer
-                .write(&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap())
+                .write(&[&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
                 .await
                 .unwrap();
         }
@@ -769,10 +769,11 @@ mod tests {
             let data = fixed_size_list.slice(i, 4);
             let slice: &FixedSizeListArray = as_fixed_size_list_array(data.as_ref());
             file_writer
-                .write(
-                    &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(slice.clone())])
-                        .unwrap(),
+                .write(&[&RecordBatch::try_new(
+                    arrow_schema.clone(),
+                    vec![Arc::new(slice.clone())],
                 )
+                .unwrap()])
                 .await
                 .unwrap();
         }
@@ -801,7 +802,7 @@ mod tests {
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -830,7 +831,7 @@ mod tests {
         let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
-        file_writer.write(&batch).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
