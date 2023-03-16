@@ -279,7 +279,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                 match idx_impl {
                     pb::index::Implementation::VectorIndex(vidx) => {
                         let num_stages = vidx.stages.len();
-                        if num_stages != 2 || num_stages != 3 {
+                        if num_stages != 2 && num_stages != 3 {
                             return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                         };
                         let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
