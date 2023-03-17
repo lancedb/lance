@@ -872,6 +872,7 @@ async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<I
 
     let centroids = super::kmeans::train_kmeans(
         data.data().as_ref(),
+        None,
         data.num_columns(),
         params.num_partitions,
         params.max_iters as u32,

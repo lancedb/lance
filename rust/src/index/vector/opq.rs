@@ -99,13 +99,13 @@ impl OptimizedProductQuantizer {
     async fn train_once(
         &self,
         train: &MatrixView,
+        pq: &mut ProductQuantizer,
         metric_type: MetricType,
-    ) -> Result<(MatrixView, ProductQuantizer)> {
+    ) -> Result<MatrixView> {
         let dim = train.num_columns();
-        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
 
-        // let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
-        pq.train(&train, metric_type, 50).await?;
+        // Iteratively train PQ.
+        pq.train(&train, metric_type, 2).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
@@ -128,7 +128,7 @@ impl OptimizedProductQuantizer {
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
 
-        Ok((rotation, pq))
+        Ok(rotation)
     }
 }
 
@@ -152,12 +152,13 @@ impl Transformer for OptimizedProductQuantizer {
             data.clone()
         };
 
+        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
         // Initialize R (rotation matrix)
         let mut rotation = MatrixView::identity(dim);
-        for _ in 0..self.num_iters {
+        for i in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let train = train.dot(&rotation)?;
-            let (rot, _) = self.train_once(&train, self.metric_type).await?;
+            let rot = self.train_once(&train, &mut pq, self.metric_type).await?;
             rotation = rot;
         }
         self.rotation = Some(rotation);

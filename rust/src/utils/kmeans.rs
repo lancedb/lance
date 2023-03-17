@@ -55,6 +55,9 @@ pub struct KMeansParams {
 
     /// The metric to calculate distance.
     pub metric_type: MetricType,
+
+    /// Centroids to continous training.
+    pub centroids: Option<Arc<Float32Array>>,
 }
 
 impl Default for KMeansParams {
@@ -65,6 +68,7 @@ impl Default for KMeansParams {
             redos: 1,
             init: KMeanInit::Random,
             metric_type: MetricType::L2,
+            centroids: None,
         }
     }
 }
@@ -278,6 +282,21 @@ impl KMeans {
         }
     }
 
+    /// Create a KMean with existing centroids.
+    fn with_centroids(
+        centroids: Arc<Float32Array>,
+        k: usize,
+        dimension: usize,
+        metric_type: MetricType,
+    ) -> Self {
+        Self {
+            centroids,
+            dimension,
+            k,
+            metric_type,
+        }
+    }
+
     /// Initialize a [`KMeans`] with random centroids.
     ///
     /// Parameters
@@ -313,7 +332,11 @@ impl KMeans {
     ) -> Self {
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());
-        let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
+        let mut best_kmeans = if let Some(centroids) = params.centroids.as_ref() {
+            Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+        } else {
+            Self::empty(k, dimension, params.metric_type)
+        };
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
@@ -342,7 +365,7 @@ impl KMeans {
                 dist_sum = last_dist_sum;
             }
             // Optimize for balanced clusters instead of minimal distance.
-            if stddev < best_stddev {
+            if stddev <= best_stddev {
                 best_kmeans = kmeans;
                 best_stddev = stddev;
             }
