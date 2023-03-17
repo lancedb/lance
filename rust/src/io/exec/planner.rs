@@ -357,6 +357,34 @@ mod tests {
     }
 
     #[test]
+    fn test_not_like() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("s").not_like(lit("str-4"));
+        // single quote
+        let expr = planner.parse_filter("s NOT LIKE 'str-4'").unwrap();
+        assert_eq!(expr, expected);
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..10).map(|v| format!("str-{}", v)),
+            ))],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                true, true, true, true, false, true, true, true, true, true
+            ])
+        );
+    }
+
+    #[test]
     fn test_sql_is_in() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
 
