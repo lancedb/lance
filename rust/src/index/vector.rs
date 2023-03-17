@@ -37,6 +37,8 @@ use crate::{
     Error, Result,
 };
 
+const MAX_ITERATIONS: usize = 50;
+
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
 pub struct Query {
@@ -171,11 +173,17 @@ pub struct VectorIndexParams {
     /// the number of bits to present the centroids used in PQ.
     pub nbits: u8,
 
+    /// Use Optimized Product Quantizer.
+    pub use_opq: bool,
+
     /// the number of sub vectors used in PQ.
     pub num_sub_vectors: u32,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
+
+    /// Max number of iterations to train a KMean model
+    pub max_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -186,17 +194,22 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
+    ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
     pub fn ivf_pq(
         num_partitions: u32,
         nbits: u8,
         num_sub_vectors: u32,
+        use_opq: bool,
         metric_type: MetricType,
+        max_iterations: usize,
     ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
+            use_opq,
             metric_type,
+            max_iterations,
         }
     }
 }
@@ -207,7 +220,9 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
+            use_opq: true,
             metric_type: MetricType::L2,
+            max_iterations: MAX_ITERATIONS,  // Faiss
         }
     }
 }

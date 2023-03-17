@@ -395,14 +395,14 @@ impl Dataset {
                 let ivf_params = IvfBuildParams {
                     num_partitions: vec_params.num_partitions as usize,
                     metric_type: vec_params.metric_type,
-                    max_iters: 50,
+                    max_iters: vec_params.max_iterations,
                 };
                 let pq_params = PQBuildParams {
                     num_sub_vectors: vec_params.num_sub_vectors as usize,
                     num_bits: 8,
                     metric_type: vec_params.metric_type,
-                    use_opq: true,
-                    max_iters: 100,
+                    use_opq: vec_params.use_opq,
+                    max_iters: vec_params.max_iterations,
                 };
                 build_ivf_pq_index(
                     self,
