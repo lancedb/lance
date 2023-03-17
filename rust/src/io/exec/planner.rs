@@ -33,6 +33,7 @@ use sqlparser::{
     },
     dialect::GenericDialect,
     parser::Parser,
+    tokenizer::{Token, Tokenizer},
 };
 
 use crate::{datafusion::logical_expr::resolve_expr, datatypes::Schema, Error, Result};
@@ -187,7 +188,22 @@ impl Planner {
         let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
         let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, sql.as_str())?;
+        let mut tokenizer = Tokenizer::new(&dialect, &sql);
+        let tokens = tokenizer
+            .tokenize()?
+            .iter()
+            .map(|tok| {
+                if tok == &Token::DoubleEq {
+                    Token::Eq
+                } else {
+                    tok.clone()
+                }
+            })
+            .collect();
+
+        let stmts = Parser::new(&dialect)
+            .with_tokens(tokens)
+            .parse_statements()?;
         if stmts.len() != 1 {
             return Err(Error::IO(format!("Filter is not valid: {filter}")));
         }
