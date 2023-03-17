@@ -161,6 +161,7 @@ impl Dataset {
 
         // Read expected manifest path for the dataset
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
         // Read schema for the input batches
         let mut peekable = batches.peekable();
@@ -180,16 +181,12 @@ impl Dataset {
 
         // Running checks for the different write modes
         // create + dataset already exists = error
-        if object_store.exists(&latest_manifest_path).await?
-            && matches!(params.mode, WriteMode::Create)
-        {
+        if flag_dataset_exists && matches!(params.mode, WriteMode::Create) {
             return Err(Error::IO(format!("Dataset already exists: {uri}")));
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
-        if !object_store.exists(&latest_manifest_path).await?
-            && matches!(params.mode, WriteMode::Append)
-        {
+        if !flag_dataset_exists && matches!(params.mode, WriteMode::Append) {
             eprintln!("Warning: No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
