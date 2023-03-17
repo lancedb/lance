@@ -106,7 +106,7 @@ impl OptimizedProductQuantizer {
         // Iteratively train PQ.
         // train 4 times per iteration, see Faiss.
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        pq.train(&train, metric_type, 4).await?;
+        pq.train(&train, metric_type, 10).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         println!("PQ distortion: {}", pq.distortion(&train, metric_type).await?);

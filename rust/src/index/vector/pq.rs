@@ -381,7 +381,6 @@ impl ProductQuantizer {
 
     /// Train [`ProductQuantizer`] using vectors.
     ///
-    /// This method can be called repeatly, and it will start training from the previous codebook.
     pub async fn train(
         &mut self,
         data: &MatrixView,
@@ -401,11 +400,11 @@ impl ProductQuantizer {
 
         // TODO: parallel training.
         for i in 0..sub_vectors.len() {
-            // Centroids for one sub vector.
             let sub_vec = &sub_vectors[i];
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
             let previous_centroids = self.centroids(i);
+            // Centroids for one sub vector.
             let centroids = train_kmeans(
                 flatten_array,
                 previous_centroids,
@@ -451,7 +450,7 @@ impl From<&ProductQuantizer> for pb::Pq {
     }
 }
 
-/// Divide a 2D vector in [`FixedSizeListArray`] to `m` sub-vectors.
+/// Divide a 2D vector in [`MatrixView`] to `m` sub-vectors.
 ///
 /// For example, for a `[1024x1M]` matrix, when `n = 8`, this function divides
 /// the matrix into  `[128x1M; 8]` vector of matrix.
@@ -471,9 +470,7 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
             let row: &Float32Array = as_primitive_array(&arr);
             let start = i * sub_vector_length;
 
-            for k in start..start + sub_vector_length {
-                builder.append_value(row.value(k));
-            }
+            builder.append_slice(&row.values()[start..start + sub_vector_length]);
         }
         let values = builder.finish();
         let sub_array =
