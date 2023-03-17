@@ -87,9 +87,15 @@ def test_compound(dataset):
                 compound
             )
 
-def test_match(dataset):
-    result = dataset.to_table(filter="str LIKE 'aa%'")
-    print(result)
+
+def test_match(tmp_path):
+    array = pa.array(["aaa", "bbb", "abc", "bca", "cab", "cba"])
+    table = pa.Table.from_arrays([array], names=["str"])
+    dataset = lance.write_dataset(table, tmp_path / "test_match")
+
+    dataset = lance.dataset(tmp_path / "test_match")
+    result = dataset.to_table(filter="str LIKE 'a%'").to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["aaa", "abc"]}))
 
 
 def create_table_for_duckdb(nvec=10000, ndim=768):
