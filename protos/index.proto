@@ -72,6 +72,23 @@ message PQ {
   repeated float codebook = 4;
 }
 
+// Transform type
+enum TransformType {
+  OPQ = 0;
+}
+
+// A transform matrix to apply to a vector or vectors.
+message Transform {
+  // The file offset the matrix is stored
+  uint64 position = 1;
+
+  // Data shape of the matrix, [rows, cols].
+  repeated uint32 shape = 2;
+
+  // Transform type.
+  TransformType type = 3;
+}
+
 // Flat Index
 message Flat {}
 
@@ -84,6 +101,8 @@ message VectorIndexStage {
     IVF ivf = 2;
     // Product Quantization
     PQ pq = 3;
+    // Transformer
+    Transform transform = 4;
   }
 }
 

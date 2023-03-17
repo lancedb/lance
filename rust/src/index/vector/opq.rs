@@ -18,16 +18,21 @@
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, Float32Array, UInt8Array};
+use arrow_schema::DataType;
+use async_trait::async_trait;
 
-use super::{pq::ProductQuantizer, MetricType};
-use crate::arrow::{linalg::*, *};
-use crate::Result;
+use super::{pq::ProductQuantizer, MetricType, Transformer};
+use crate::arrow::linalg::*;
+use crate::index::pb::{Transform, TransformType};
+use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::{Error, Result};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
 /// (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
+#[derive(Debug)]
 pub struct OptimizedProductQuantizer {
     num_sub_vectors: usize,
 
@@ -35,10 +40,16 @@ pub struct OptimizedProductQuantizer {
     num_bits: u32,
 
     /// OPQ rotation
-    rotation: Option<MatrixView>,
+    pub rotation: Option<MatrixView>,
 
-    /// PQ
-    pq: Option<ProductQuantizer>,
+    /// The offset where the matrix is stored in the index file.
+    pub file_position: Option<usize>,
+
+    /// The metric to compute the distance.
+    metric_type: MetricType,
+
+    /// Number of iterations to train OPQ.
+    num_iters: usize,
 }
 
 impl OptimizedProductQuantizer {
@@ -50,50 +61,38 @@ impl OptimizedProductQuantizer {
     /// - *dimension*: dimension of the training dataset.
     /// - *num_sub_vectors*: the number of sub vectors in the product quantization.
     /// - *num_iterations*: The number of iterations to train on OPQ rotation matrix.
-    pub fn new(num_sub_vectors: usize, num_bits: u32) -> Self {
+    pub fn new(
+        num_sub_vectors: usize,
+        num_bits: u32,
+        metric_type: MetricType,
+        num_iters: usize,
+    ) -> Self {
         Self {
             num_sub_vectors,
             num_bits,
             rotation: None,
-            pq: None,
+            file_position: None,
+            metric_type,
+            num_iters,
         }
     }
 
-    /// Train the opq
-    pub async fn train(
-        &mut self,
-        data: &MatrixView,
-        metric_type: MetricType,
-        num_iters: usize,
-    ) -> Result<()> {
-        let dim = data.num_columns();
-
-        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
-        // See in Faiss, it does not train more than `256*n_centroids` samples
-        let train = if data.num_rows() > num_centroids * 256 {
-            println!(
-                "Sample {} out of {} to train kmeans of {} dim, {} clusters",
-                256 * num_centroids,
-                data.num_rows(),
-                data.num_columns(),
-                num_centroids,
-            );
-            data.sample(num_centroids * 256)
-        } else {
-            data.clone()
-        };
-
-        // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::identity(dim);
-        for _ in 0..num_iters {
-            // Training data, this is the `X`, described in CVPR' 13
-            let train = train.dot(&rotation)?;
-            let (rot, pq) = self.train_once(&train, metric_type).await?;
-            rotation = rot;
-            self.pq = Some(pq);
-        }
-        self.rotation = Some(rotation);
-        Ok(())
+    /// Load the optimized product quantizer.
+    pub async fn load(reader: &dyn ObjectReader, position: usize, shape: &[usize]) -> Result<Self> {
+        let dim = shape[0];
+        let length = dim * dim;
+        let data =
+            read_fixed_stride_array(reader, &DataType::Float32, position, length, ..).await?;
+        let f32_data: Float32Array = as_primitive_array(data.as_ref()).clone();
+        let rotation = Some(MatrixView::new(Arc::new(f32_data), dim));
+        Ok(Self {
+            num_sub_vectors: 0,
+            num_bits: 0,
+            rotation,
+            file_position: None,
+            metric_type: MetricType::L2,
+            num_iters: 0,
+        })
     }
 
     /// Train once and return the rotation matrix and PQ codebook.
@@ -103,10 +102,11 @@ impl OptimizedProductQuantizer {
         metric_type: MetricType,
     ) -> Result<(MatrixView, ProductQuantizer)> {
         let dim = train.num_columns();
-        // TODO: make PQ::fit_transform work with MatrixView.
-        let fixed_list = FixedSizeListArray::try_new(train.data().as_ref(), dim as i32)?;
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        let pq_code = pq.fit_transform(&fixed_list, metric_type).await?;
+
+        // let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
+        pq.train(&train, metric_type, 50).await?;
+        let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
@@ -132,6 +132,68 @@ impl OptimizedProductQuantizer {
     }
 }
 
+#[async_trait]
+impl Transformer for OptimizedProductQuantizer {
+    async fn train(&mut self, data: &MatrixView) -> Result<()> {
+        let dim = data.num_columns();
+
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits);
+        // See in Faiss, it does not train more than `256*n_centroids` samples
+        let train = if data.num_rows() > num_centroids * 256 {
+            println!(
+                "Sample {} out of {} to train kmeans of {} dim, {} clusters",
+                256 * num_centroids,
+                data.num_rows(),
+                data.num_columns(),
+                num_centroids,
+            );
+            data.sample(num_centroids * 256)
+        } else {
+            data.clone()
+        };
+
+        // Initialize R (rotation matrix)
+        let mut rotation = MatrixView::identity(dim);
+        for _ in 0..self.num_iters {
+            // Training data, this is the `X`, described in CVPR' 13
+            let train = train.dot(&rotation)?;
+            let (rot, _) = self.train_once(&train, self.metric_type).await?;
+            rotation = rot;
+        }
+        self.rotation = Some(rotation);
+        Ok(())
+    }
+
+    /// Apply OPQ transform
+    async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
+        let rotation = self.rotation.as_ref().unwrap();
+        Ok(rotation.dot(&data.transpose())?.transpose())
+    }
+
+    fn try_into_pb(&self) -> Result<Transform> {
+        self.try_into()
+    }
+}
+
+impl TryFrom<&OptimizedProductQuantizer> for Transform {
+    type Error = Error;
+
+    fn try_from(opq: &OptimizedProductQuantizer) -> Result<Self> {
+        if opq.file_position.is_none() {
+            return Err(Error::Index("OPQ has not been persisted yet".to_string()));
+        }
+        let rotation = opq
+            .rotation
+            .as_ref()
+            .ok_or(Error::Index("OPQ is not trained".to_string()))?;
+        Ok(Transform {
+            position: opq.file_position.unwrap() as u64,
+            shape: vec![rotation.num_rows() as u32, rotation.num_columns() as u32],
+            r#type: TransformType::Opq.into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,8 +208,8 @@ mod tests {
         let data = Arc::new(Float32Array::from_iter((0..12800).map(|v| v as f32)));
         let matrix = MatrixView::new(data, DIM);
 
-        let mut opq = OptimizedProductQuantizer::new(4, 8);
-        opq.train(&matrix, MetricType::L2, 10).await.unwrap();
+        let mut opq = OptimizedProductQuantizer::new(4, 8, MetricType::L2, 10);
+        opq.train(&matrix).await.unwrap();
 
         assert_eq!(opq.rotation.as_ref().unwrap().num_rows(), DIM);
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);

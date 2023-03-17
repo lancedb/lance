@@ -30,11 +30,14 @@ mod kmeans;
 mod opq;
 mod pq;
 
-use super::IndexParams;
+use super::{pb, IndexParams};
 use crate::{
+    arrow::linalg::MatrixView,
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
     Error, Result,
 };
+
+const MAX_ITERATIONS: usize = 50;
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -77,6 +80,26 @@ pub trait VectorIndex {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
+}
+
+/// Transformer on vectors.
+#[async_trait]
+pub trait Transformer: std::fmt::Debug + Sync + Send {
+    /// Train the transformer.
+    ///
+    /// Parameters:
+    /// - *data*: training vectors.
+    async fn train(&mut self, data: &MatrixView) -> Result<()>;
+
+    /// Apply transform on the matrix `data`.
+    ///
+    /// Returns a new Matrix instead.
+    async fn transform(&self, data: &MatrixView) -> Result<MatrixView>;
+
+    /// Try to convert into protobuf.
+    ///
+    /// TODO: can we use TryFrom/TryInto as trait constrats?
+    fn try_into_pb(&self) -> Result<pb::Transform>;
 }
 
 /// Distance metrics type.
@@ -150,11 +173,17 @@ pub struct VectorIndexParams {
     /// the number of bits to present the centroids used in PQ.
     pub nbits: u8,
 
+    /// Use Optimized Product Quantizer.
+    pub use_opq: bool,
+
     /// the number of sub vectors used in PQ.
     pub num_sub_vectors: u32,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
+
+    /// Max number of iterations to train a KMean model
+    pub max_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -165,17 +194,22 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
+    ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
     pub fn ivf_pq(
         num_partitions: u32,
         nbits: u8,
         num_sub_vectors: u32,
+        use_opq: bool,
         metric_type: MetricType,
+        max_iterations: usize,
     ) -> Self {
         Self {
             num_partitions,
             nbits,
             num_sub_vectors,
+            use_opq,
             metric_type,
+            max_iterations,
         }
     }
 }
@@ -186,7 +220,9 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
+            use_opq: true,
             metric_type: MetricType::L2,
+            max_iterations: MAX_ITERATIONS, // Faiss
         }
     }
 }

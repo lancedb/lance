@@ -36,10 +36,8 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::index::{
-    vector::{ivf::IvfPqIndexBuilder, VectorIndexParams},
-    IndexBuilder, IndexParams, IndexType,
-};
+use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams, PQBuildParams};
+use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
@@ -290,7 +288,7 @@ impl Dataset {
         let base = object_store.base_path().clone();
         Ok(Self {
             object_store,
-            base,
+            base: base.into(),
             manifest: Arc::new(manifest.clone()),
         })
     }
@@ -394,16 +392,27 @@ impl Dataset {
                     }
                 }
 
-                let builder = IvfPqIndexBuilder::try_new(
+                let ivf_params = IvfBuildParams {
+                    num_partitions: vec_params.num_partitions as usize,
+                    metric_type: vec_params.metric_type,
+                    max_iters: vec_params.max_iterations,
+                };
+                let pq_params = PQBuildParams {
+                    num_sub_vectors: vec_params.num_sub_vectors as usize,
+                    num_bits: 8,
+                    metric_type: vec_params.metric_type,
+                    use_opq: vec_params.use_opq,
+                    max_iters: vec_params.max_iterations,
+                };
+                build_ivf_pq_index(
                     self,
-                    index_id,
-                    &index_name,
                     column,
-                    vec_params.num_partitions,
-                    vec_params.num_sub_vectors,
-                    vec_params.metric_type,
-                )?;
-                builder.build().await?
+                    &index_name,
+                    &index_id,
+                    &ivf_params,
+                    &pq_params,
+                )
+                .await?
             }
         }
 
@@ -532,6 +541,14 @@ impl Dataset {
         let struct_arr: StructArray = one_batch.into();
         let reordered = take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
+    }
+
+    /// Sample `n` rows from the dataset.
+    pub(crate) async fn sample(&self, n: usize, projection: &Schema) -> Result<RecordBatch> {
+        use rand::seq::IteratorRandom;
+        let num_rows = self.count_rows().await?;
+        let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
+        Ok(self.take(&ids[..], &projection).await?)
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {

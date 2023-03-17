@@ -181,7 +181,7 @@ async fn create_index(
             &[&col],
             lance::index::IndexType::Vector,
             name.clone(),
-            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, mt),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, true, mt, 50),
             false,
         )
         .await
