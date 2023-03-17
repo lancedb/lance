@@ -104,6 +104,12 @@ impl From<sqlparser::parser::ParserError> for Error {
     }
 }
 
+impl From<sqlparser::tokenizer::TokenizerError> for Error {
+    fn from(e: sqlparser::tokenizer::TokenizerError) -> Self {
+        Self::IO(e.to_string())
+    }
+}
+
 impl From<Error> for datafusion::error::DataFusionError {
     fn from(e: Error) -> Self {
         Self::Execution(e.to_string())

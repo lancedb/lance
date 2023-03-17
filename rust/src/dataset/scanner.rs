@@ -29,7 +29,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
-use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
@@ -37,6 +36,7 @@ use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
+use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
 /// Column name for the meta row ID.
@@ -117,13 +117,7 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        let sql = format!("SELECT 1 FROM t WHERE {filter}");
-
-        let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, sql.as_str())?;
-        if stmts.len() != 1 {
-            return Err(Error::IO(format!("Filter is not valid: {filter}")));
-        }
+        parse_sql_filter(filter)?;
         self.filter = Some(filter.to_string());
         Ok(self)
     }

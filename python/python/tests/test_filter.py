@@ -10,23 +10,12 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-#  Copyright 2023 Lance Developers
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+
 
 """Tests for predicate pushdown"""
 
 import random
-import string
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -58,7 +47,7 @@ def create_table(nrows=100):
 
 
 @pytest.fixture()
-def dataset(tmp_path):
+def dataset(tmp_path: Path):
     tbl = create_table()
     yield lance.write_dataset(tbl, tmp_path)
 
@@ -97,6 +86,16 @@ def test_compound(dataset):
             assert dataset.to_table(filter=compound) == dataset.to_table().filter(
                 compound
             )
+
+
+def test_match(tmp_path: Path):
+    array = pa.array(["aaa", "bbb", "abc", "bca", "cab", "cba"])
+    table = pa.Table.from_arrays([array], names=["str"])
+    dataset = lance.write_dataset(table, tmp_path / "test_match")
+
+    dataset = lance.dataset(tmp_path / "test_match")
+    result = dataset.to_table(filter="str LIKE 'a%'").to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["aaa", "abc"]}))
 
 
 def create_table_for_duckdb(nvec=10000, ndim=768):
