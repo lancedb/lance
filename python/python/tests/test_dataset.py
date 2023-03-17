@@ -39,6 +39,21 @@ def test_dataset_overwrite(tmp_path: Path):
     assert ds_v1.to_table() == table1
 
 
+def test_dataset_append(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    # verify append works even if no dataset existed at the uri
+    lance.write_dataset(table, base_dir, mode="append")
+    dataset = lance.dataset(base_dir)
+    assert dataset.to_table() == table
+
+    # verify appending batches with a different schema doesn't work
+    table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
+    with pytest.raises(OSError):
+        lance.write_dataset(table2, base_dir, mode="append")
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
