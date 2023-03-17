@@ -60,3 +60,37 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     let expr = selection.ok_or_else(|| Error::IO(format!("Filter is not valid: {filter}")))?;
     Ok(expr.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use sqlparser::ast::{BinaryOperator, Ident, Value};
+
+    #[test]
+    fn test_double_equal() {
+        let expr = parse_sql_filter("a == b").unwrap();
+        assert_eq!(
+            Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("a"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::new("b")))
+            },
+            expr
+        );
+    }
+
+    #[test]
+    fn test_like() {
+        let expr = parse_sql_filter("a LIKE 'abc%'").unwrap();
+        assert_eq!(
+            Expr::Like {
+                negated: false,
+                expr: Box::new(Expr::Identifier(Ident::new("a"))),
+                pattern: Box::new(Expr::Value(Value::SingleQuotedString("abc%".to_string()))),
+                escape_char: None
+            },
+            expr
+        );
+    }
+}
