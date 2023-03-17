@@ -21,7 +21,6 @@ use arrow_array::{
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
 use super::MetricType;
@@ -31,7 +30,7 @@ use crate::index::{pb, vector::kmeans::train_kmeans};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::utils::distance::compute::normalize;
 use crate::utils::distance::l2::l2_distance;
-use crate::Result;
+use crate::{Error, Result};
 
 /// Product Quantization Index.
 ///
@@ -305,51 +304,38 @@ impl ProductQuantizer {
         data: &MatrixView,
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
-        let sub_vectors = divide_to_subvectors(&data, self.num_sub_vectors);
-
-        assert_eq!(sub_vectors.len(), self.num_sub_vectors);
-
-        let vectors = sub_vectors.to_vec();
-        let all_centroids = (0..sub_vectors.len())
+        let all_centroids = (0..self.num_sub_vectors)
             .map(|idx| self.centroids(idx))
             .collect::<Vec<_>>();
-        let pq_code = stream::iter(vectors)
-            .zip(stream::iter(all_centroids))
-            .map(|(vec, centroid)| async move {
-                tokio::task::spawn_blocking(move || {
-                    let dist_func = metric_type.func();
-                    // TODO Use tiling to improve cache efficiency.
-                    (0..vec.len())
-                        .map(|i| {
-                            let value = vec.value(i);
-                            let vector: &Float32Array = as_primitive_array(value.as_ref());
-                            let id = argmin(
-                                dist_func(vector, centroid.as_ref(), vector.len())
-                                    .unwrap()
-                                    .as_ref(),
-                            )
-                            .unwrap() as u8;
-                            id
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await
-            })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let dist_func = metric_type.func();
 
-        // Need to transpose pq_code to column oriented.
-        let capacity = sub_vectors.len() * sub_vectors[0].len();
-        let mut pq_codebook_builder: Vec<u8> = vec![0; capacity];
-        for i in 0..pq_code.len() {
-            let vec = pq_code[i].as_slice();
-            for j in 0..vec.len() {
-                pq_codebook_builder[j * self.num_sub_vectors + i] = vec[j];
+        let flatten_data = data.data();
+        let num_sub_vectors = self.num_sub_vectors;
+        let dim = self.dimension;
+        let num_rows = data.num_rows();
+        let values = tokio::task::spawn_blocking(move || {
+            let capacity = num_sub_vectors * num_rows;
+            let mut builder: Vec<u8> = vec![0; capacity];
+            // Dimension of each sub-vector.
+            let sub_dim = dim / num_sub_vectors;
+            for i in 0..num_rows {
+                let row_offset = i * dim;
+                for sub_idx in 0..num_sub_vectors {
+                    let offset = row_offset + sub_idx * sub_dim;
+                    let sub_vector = flatten_data.slice(offset, sub_dim);
+                    let centroids = all_centroids[sub_idx].as_ref();
+                    let code = argmin(
+                        dist_func(as_primitive_array(sub_vector.as_ref()), centroids, sub_dim)?
+                            .as_ref(),
+                    )
+                    .unwrap();
+                    builder[i * num_sub_vectors + sub_idx] = code as u8;
+                }
             }
-        }
+            Ok::<UInt8Array, Error>(UInt8Array::from_iter_values(builder))
+        })
+        .await??;
 
-        let values = UInt8Array::from_iter_values(pq_codebook_builder);
         FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
     }
 

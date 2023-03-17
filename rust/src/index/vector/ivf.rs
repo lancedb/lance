@@ -649,17 +649,27 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
             let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            let now = std::time::Instant::now();
             let part_id_and_residual = ivf.compute_partition_and_residual(&vectors, metric_type)?;
+            // println!(
+            //     "Compute partition and residual: {} ms",
+            //     now.elapsed().as_millis()
+            // );
 
             let residual_col = part_id_and_residual
                 .column_by_name(RESIDUAL_COLUMN)
                 .unwrap();
             let residual_data = as_fixed_size_list_array(&residual_col);
+            let now = std::time::Instant::now();
             let pq_code = pq_ref
                 .transform(&residual_data.try_into()?, metric_type)
                 .await?;
+            // println!("PQ transform: {} ms", now.elapsed().as_millis());
 
-            let row_ids = batch.column_by_name(ROW_ID).expect("Expect row id").clone();
+            let row_ids = batch
+                .column_by_name(ROW_ID)
+                .expect("Expect row id column")
+                .clone();
             let part_ids = part_id_and_residual
                 .column_by_name(PARTITION_ID_COLUMN)
                 .expect("Expect partition ids column")
