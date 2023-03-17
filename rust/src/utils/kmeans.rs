@@ -162,15 +162,15 @@ pub struct KMeanMembership {
     /// Previous centroids.
     ///
     /// `k * dimension` f32 matrix.
-    centroids: Arc<Float32Array>,
+    pub centroids: Arc<Float32Array>,
 
     /// Reference to the input vectors, with dimension `dimension`.
-    data: Arc<Float32Array>,
+    pub data: Arc<Float32Array>,
 
     dimension: usize,
 
     /// Cluster Id for each vector.
-    cluster_ids: Vec<u32>,
+    pub cluster_ids: Vec<u32>,
 
     /// Distance between each vector, to its corresponding centroids.
     distances: Vec<f32>,
@@ -183,7 +183,7 @@ pub struct KMeanMembership {
 
 impl KMeanMembership {
     /// Reconstruct a KMeans model from the membership.
-    async fn to_kmeans(&self) -> Result<KMeans> {
+    pub async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
         let data = self.data.clone();

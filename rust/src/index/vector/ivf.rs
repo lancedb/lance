@@ -39,7 +39,7 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     MetricType, Query, Transformer, VectorIndex,
 };
-use crate::index::vector::opq::*;
+use crate::{index::vector::opq::*, arrow::{linalg::MatrixView, as_fixed_size_list_array}};
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
@@ -158,22 +158,19 @@ impl VectorIndex for IvfPQIndex<'_> {
         for transform in self.transforms.iter() {
             mat = transform.transform(&mat).await?;
         }
+        assert_eq!(mat.num_rows(), 1);
         let key = mat.data();
         let key_ref = key.as_ref();
         let partition_ids = self
             .ivf
             .find_partitions(key_ref, query.nprobs, self.metric_type)?;
-        let candidates = stream::iter(partition_ids.values())
+        let batches = stream::iter(partition_ids.values())
             .then(|part_id| async move {
                 self.search_in_partition(*part_id as usize, key_ref, query.k)
                     .await
             })
-            .collect::<Vec<_>>()
-            .await;
-        let mut batches = vec![];
-        for b in candidates {
-            batches.push(b?);
-        }
+            .try_collect::<Vec<_>>()
+            .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
         let score_col = batch.column_by_name("score").ok_or_else(|| {
@@ -633,7 +630,8 @@ pub async fn build_ivf_pq_index(
     let ivf_model = train_ivf_model(&training_data, ivf_params).await?;
 
     // Compute the residual vector for training PQ
-    let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
+    let ivf_centroids: MatrixView = ivf_model.centroids.as_ref().try_into()?;
+    let training_data = MatrixView::new(ivf_centroids.data().clone(), ivf_centroids.num_columns());
     let residual_data =
         compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
     let pq_training_data =
@@ -763,13 +761,15 @@ async fn print_pq_summary(
                 .column_by_name(RESIDUAL_COLUMN)
                 .unwrap();
             let residual_data = as_fixed_size_list_array(&residual_col);
-            let error = pq.distortion(&residual_data.try_into()?, metric_type).await?;
-            Ok::<f64, Error>(error)
+            let distortion = pq
+                .distortion(&residual_data.try_into()?, metric_type)
+                .await?;
+            Ok::<f64, Error>(distortion)
         })
         .buffered(num_cpus::get())
         .try_collect::<Vec<_>>()
         .await?;
-    println!("PQ error: {}", distances.iter().sum::<f64>());
+    println!("PQ distortion: {}", distances.iter().sum::<f64>());
     Ok(())
 }
 
@@ -816,9 +816,11 @@ async fn write_index_file(
     }
 
     // Write OPQ matrix.
+    assert!(opq.rotation.as_ref().unwrap().transpose == false);
     let pos = writer
         .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
         .await?;
+    println!("Write OPQ matrix position: {} len={}", pos, opq.rotation.as_ref().unwrap().data().len());
     opq.file_position = Some(pos);
 
     let metadata = IvfPQIndexMetadata {

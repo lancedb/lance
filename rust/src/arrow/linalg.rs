@@ -132,6 +132,7 @@ impl MatrixView {
     }
 
     pub fn row(&self, i: usize) -> Option<Float32Array> {
+        assert!(self.transpose == false);
         if i >= self.num_rows() {
             None
         } else {

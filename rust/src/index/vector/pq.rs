@@ -425,16 +425,6 @@ impl ProductQuantizer {
 
         Ok(())
     }
-
-    /// Train a [ProductQuantizer] using an array of vectors.
-    pub async fn fit_transform(
-        &mut self,
-        mat: &MatrixView,
-        metric_type: MetricType,
-    ) -> Result<FixedSizeListArray> {
-        self.train(mat, metric_type, 50).await?;
-        self.transform(mat, metric_type).await
-    }
 }
 
 impl From<&pb::Pq> for ProductQuantizer {
