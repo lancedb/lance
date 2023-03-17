@@ -29,8 +29,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
-use sqlparser::tokenizer::{Token, Tokenizer};
-use sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;

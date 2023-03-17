@@ -26,17 +26,14 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use sqlparser::{
-    ast::{
-        BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, SetExpr,
-        Statement, Value,
-    },
-    dialect::GenericDialect,
-    parser::Parser,
-    tokenizer::{Token, Tokenizer},
+use sqlparser::ast::{
+    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, Value,
 };
 
-use crate::{datafusion::logical_expr::resolve_expr, datatypes::Schema, Error, Result};
+use crate::{
+    datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
+    Result,
+};
 
 pub struct Planner {
     schema: SchemaRef,
@@ -185,40 +182,9 @@ impl Planner {
     /// Create Logical [Expr] from a SQL filter clause.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
-        let dialect = GenericDialect {};
-        let mut tokenizer = Tokenizer::new(&dialect, &sql);
-        let tokens = tokenizer
-            .tokenize()?
-            .iter()
-            .map(|tok| {
-                if tok == &Token::DoubleEq {
-                    Token::Eq
-                } else {
-                    tok.clone()
-                }
-            })
-            .collect();
-
-        let stmts = Parser::new(&dialect)
-            .with_tokens(tokens)
-            .parse_statements()?;
-        if stmts.len() != 1 {
-            return Err(Error::IO(format!("Filter is not valid: {filter}")));
-        }
-        let selection = if let Statement::Query(query) = &stmts[0] {
-            if let SetExpr::Select(s) = query.body.as_ref() {
-                s.selection.as_ref()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let expr = selection.ok_or_else(|| Error::IO(format!("Filter is not valid: {filter}")))?;
-
-        let expr = self.parse_sql_expr(expr)?;
+        let ast_expr = parse_sql_filter(filter)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         resolve_expr(&expr, &schema)
     }
