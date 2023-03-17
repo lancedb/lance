@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use arrow_arith::aggregate::min;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
@@ -296,6 +297,43 @@ impl ProductQuantizer {
             );
         }
         Arc::new(builder.finish())
+    }
+
+    /// Compute the quantization distortion (E).
+    ///
+    /// Quantization distortion is the difference between the centroids
+    /// from the PQ code to the actual vector.
+    pub async fn distortion(&self, data: &MatrixView, metric_type: MetricType) -> Result<f64> {
+        let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
+        debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
+
+        let vectors = sub_vectors.to_vec();
+        let all_centroids = (0..sub_vectors.len())
+            .map(|idx| self.centroids(idx))
+            .collect::<Vec<_>>();
+        let distortion = stream::iter(vectors)
+            .zip(stream::iter(all_centroids))
+            .map(|(vec, centroid)| async move {
+                tokio::task::spawn_blocking(move || {
+                    let dist_func = metric_type.func();
+                    (0..vec.len())
+                        .map(|i| {
+                            let value = vec.value(i);
+                            let vector: &Float32Array = as_primitive_array(value.as_ref());
+                            let distances =
+                                dist_func(vector, centroid.as_ref(), vector.len()).unwrap();
+                            min(distances.as_ref()).unwrap_or(0.0)
+                        })
+                        .sum::<f32>() as f64 // in case of overflow
+                })
+                .await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?
+            .iter()
+            .sum::<f64>();
+        Ok(distortion)
     }
 
     /// Transform the vector array to PQ code array.
