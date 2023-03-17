@@ -222,7 +222,7 @@ impl Default for VectorIndexParams {
             num_sub_vectors: 16,
             use_opq: true,
             metric_type: MetricType::L2,
-            max_iterations: MAX_ITERATIONS,  // Faiss
+            max_iterations: MAX_ITERATIONS, // Faiss
         }
     }
 }
