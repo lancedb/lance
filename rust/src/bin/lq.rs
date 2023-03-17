@@ -188,8 +188,8 @@ async fn create_index(
         }
     };
 
-    let params =
-        VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, true, mt, 50).dry_run(dry_run);
+    let params = VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, true, mt, 50)
+        .dry_run(dry_run);
     dataset
         .create_index(
             &[&col],

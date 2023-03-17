@@ -45,11 +45,7 @@ use crate::io::{
     read_message_from_buf, read_metadata_offset,
 };
 use crate::{
-    arrow::{linalg::MatrixView, *},
-    dataset::scanner::Scanner,
-};
-use crate::{
-    dataset::{Dataset, ROW_ID},
+    dataset::{scanner::Scanner, Dataset, ROW_ID},
     index::{pb, pb::vector_index_stage::Stage},
 };
 use crate::{Error, Result};
