@@ -334,13 +334,12 @@ impl KMeans {
             for _ in 1..=params.max_iters {
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
+                stddev = last_membership.hist_stddev();
+                kmeans = last_membership.to_kmeans().await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
-                    stddev = last_membership.hist_stddev();
-                    dist_sum = last_dist_sum;
                     break;
                 }
                 dist_sum = last_dist_sum;
-                kmeans = last_membership.to_kmeans().await.unwrap();
             }
             // Optimize for balanced clusters instead of minimal distance.
             if stddev < best_stddev {
