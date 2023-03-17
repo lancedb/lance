@@ -47,7 +47,7 @@ def create_table(nrows=100):
 
 
 @pytest.fixture()
-def dataset(tmp_path):
+def dataset(tmp_path: Path):
     tbl = create_table()
     yield lance.write_dataset(tbl, tmp_path)
 
@@ -88,7 +88,7 @@ def test_compound(dataset):
             )
 
 
-def test_match(tmp_path):
+def test_match(tmp_path: Path):
     array = pa.array(["aaa", "bbb", "abc", "bca", "cab", "cba"])
     table = pa.Table.from_arrays([array], names=["str"])
     dataset = lance.write_dataset(table, tmp_path / "test_match")
