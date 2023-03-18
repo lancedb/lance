@@ -11,10 +11,19 @@
 <a href="https://discord.gg/zMM32dvNtd">Discord</a> •
 <a href="https://twitter.com/etodotai">Twitter</a>
 
-![CI](https://github.com/eto-ai/lance/actions/workflows/rust.yml/badge.svg)
-[![Docs](https://img.shields.io/badge/docs-passing-brightgreen)](https://eto-ai.github.io/lance/)
-![crates.io](https://img.shields.io/crates/v/lance.svg)
-![Python versions](https://img.shields.io/pypi/pyversions/pylance)
+[CI]: https://github.com/eto-ai/lance/actions/workflows/rust.yml
+[CI Badge]: https://github.com/eto-ai/lance/actions/workflows/rust.yml/badge.svg
+[Docs]: https://eto-ai.github.io/lance/
+[Docs Badge]: https://img.shields.io/badge/docs-passing-brightgreen
+[crates.io]: https://crates.io/crates/lance
+[crates.io badge]: https://img.shields.io/crates/v/lance.svg
+[Python versions]: https://pypi.org/project/pylance/
+[Python versions badge]: https://img.shields.io/pypi/pyversions/pylance
+
+[![CI Badge]][CI]
+[![Docs Badge]][Docs]
+[![crates.io badge]][crates.io]
+[![Python versions badge]][Python versions]
 
 </p>
 </div>
