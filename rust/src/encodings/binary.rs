@@ -20,7 +20,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
+use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
@@ -61,7 +61,7 @@ impl<'a> BinaryEncoder<'a> {
             PrimitiveBuilder::with_capacity(capacity);
 
         let mut value_offset: usize = self.writer.tell();
-        for array in arrs {
+        for (a_idx, array) in arrs.iter().enumerate() {
             let arr = array
                 .as_any()
                 .downcast_ref::<GenericByteArray<T>>()
@@ -81,11 +81,19 @@ impl<'a> BinaryEncoder<'a> {
 
             let start_offset = offsets[0];
             // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
-            offsets.iter().for_each(|o| {
+            offsets.iter().enumerate().for_each(|(o_idx, o)| {
                 let new_offset = ((*o - start_offset).as_usize() + value_offset) as i64;
-                pos_builder.append_value(new_offset);
+
+                // Each GenericByteArray of len X has a corresponding offset array of len X + 1
+                // Since we are merging multiple arrays together, we only need to copy the "extra"
+                //    element of the last array
+                if (offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
+                    pos_builder.append_value(new_offset);
+                } else {
+                    // The next offset array should start where this one ends
+                    value_offset = new_offset as usize;
+                }
             });
-            value_offset = (pos_builder.values_slice()[pos_builder.len() - 1] + 1) as usize;
         }
 
         for buf in buffers {
@@ -447,7 +455,12 @@ mod tests {
     async fn test_write_binary_data() {
         test_round_trips(&[&StringArray::from(vec!["a", "b", "cd", "efg"])]).await;
         test_round_trips(&[&StringArray::from(vec![Some("a"), None, Some("cd"), None])]).await;
-
+        test_round_trips(&[
+            &StringArray::from(vec![Some("a"), None, Some("cd"), None]),
+            &StringArray::from(vec![Some("f"), None, Some("gh"), None]),
+            &StringArray::from(vec![Some("t"), None, Some("uv"), None]),
+        ])
+        .await;
         test_round_trips(&[&LargeStringArray::from(vec!["a", "b", "cd", "efg"])]).await;
         test_round_trips(&[&LargeStringArray::from(vec![
             Some("a"),
