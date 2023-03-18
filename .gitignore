@@ -85,3 +85,6 @@ wheelhouse
 target
 Cargo.lock
 data
+
+# c++ lsp
+.ccls-cache/
