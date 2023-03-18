@@ -159,8 +159,8 @@ impl Transformer for OptimizedProductQuantizer {
         let mut rotation = MatrixView::identity(dim);
         for _ in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
-            let train = train.dot(&rotation)?;
-            let rot = self.train_once(&train, self.metric_type).await?;
+            let rotated_data = train.dot(&rotation)?;
+            let rot = self.train_once(&rotated_data, self.metric_type).await?;
             rotation = rot;
         }
         self.rotation = Some(rotation);
