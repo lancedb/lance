@@ -365,8 +365,12 @@ impl ProductQuantizer {
                     let sub_vector = flatten_data.slice(offset, sub_dim);
                     let centroids = all_centroids[sub_idx].as_ref();
                     let code = argmin(
-                        dist_func(as_primitive_array(sub_vector.as_ref()), centroids, sub_dim)?
-                            .as_ref(),
+                        dist_func(
+                            as_primitive_array(sub_vector.as_ref()),
+                            centroids.unwrap(),
+                            sub_dim,
+                        )?
+                        .as_ref(),
                     )
                     .unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;

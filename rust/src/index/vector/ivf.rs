@@ -39,10 +39,14 @@ use super::{
     pq::{PQIndex, ProductQuantizer},
     MetricType, Query, Transformer, VectorIndex,
 };
-use crate::{index::vector::opq::*, arrow::{linalg::MatrixView, as_fixed_size_list_array}};
+use crate::arrow::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
+};
+use crate::{
+    arrow::{as_fixed_size_list_array, linalg::MatrixView},
+    index::vector::opq::*,
 };
 use crate::{
     dataset::{scanner::Scanner, Dataset, ROW_ID},
@@ -820,7 +824,11 @@ async fn write_index_file(
     let pos = writer
         .write_plain_encoded_array(opq.rotation.as_ref().unwrap().data().as_ref())
         .await?;
-    println!("Write OPQ matrix position: {} len={}", pos, opq.rotation.as_ref().unwrap().data().len());
+    println!(
+        "Write OPQ matrix position: {} len={}",
+        pos,
+        opq.rotation.as_ref().unwrap().data().len()
+    );
     opq.file_position = Some(pos);
 
     let metadata = IvfPQIndexMetadata {

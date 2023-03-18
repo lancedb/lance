@@ -96,11 +96,7 @@ impl OptimizedProductQuantizer {
     }
 
     /// Train once and return the rotation matrix and PQ codebook.
-    async fn train_once(
-        &self,
-        train: &MatrixView,
-        metric_type: MetricType,
-    ) -> Result<MatrixView> {
+    async fn train_once(&self, train: &MatrixView, metric_type: MetricType) -> Result<MatrixView> {
         let dim = train.num_columns();
 
         // Iteratively train PQ.
@@ -109,7 +105,10 @@ impl OptimizedProductQuantizer {
         pq.train(&train, metric_type, 10).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
-        println!("PQ distortion: {}", pq.distortion(&train, metric_type).await?);
+        println!(
+            "PQ distortion: {}",
+            pq.distortion(&train, metric_type).await?
+        );
 
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
