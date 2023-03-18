@@ -322,7 +322,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
 }
 
 /// Ivf Model
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Ivf {
     /// Centroids of each partition.
     ///
@@ -649,7 +649,11 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
             let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
-            let part_id_and_residual = ivf.compute_partition_and_residual(&vectors, metric_type)?;
+            let i = ivf.clone();
+            let part_id_and_residual = tokio::task::spawn_blocking(move || {
+                i.compute_partition_and_residual(&vectors, metric_type)
+            })
+            .await??;
 
             let residual_col = part_id_and_residual
                 .column_by_name(RESIDUAL_COLUMN)
@@ -659,7 +663,10 @@ pub async fn build_ivf_pq_index(
                 .transform(&residual_data.try_into()?, metric_type)
                 .await?;
 
-            let row_ids = batch.column_by_name(ROW_ID).expect("Expect row id").clone();
+            let row_ids = batch
+                .column_by_name(ROW_ID)
+                .expect("Expect row id column")
+                .clone();
             let part_ids = part_id_and_residual
                 .column_by_name(PARTITION_ID_COLUMN)
                 .expect("Expect partition ids column")
@@ -677,7 +684,10 @@ pub async fn build_ivf_pq_index(
                     false,
                 ),
             ]));
-            RecordBatch::try_new(schema.clone(), vec![row_ids, part_ids, Arc::new(pq_code)])
+            Ok::<RecordBatch, Error>(RecordBatch::try_new(
+                schema.clone(),
+                vec![row_ids, part_ids, Arc::new(pq_code)],
+            )?)
         })
         .buffered(num_cpus::get())
         .try_collect::<Vec<_>>()
