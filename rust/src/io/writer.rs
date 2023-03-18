@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::Deref;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::subtract_scalar;
+use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray};
+use arrow_array::types::{Int32Type, Int64Type};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use object_store::path::Path;
@@ -271,43 +271,63 @@ impl<'a> FileWriter<'a> {
     }
 
     async fn write_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+        let capacity: usize = arrs.iter().map(|a| a.len()).sum();
         let mut list_arrs: Vec<&ArrayRef> = Vec::new();
-        let mut offsets: Vec<ArrayRef> = Vec::new();
+        let mut pos_builder: PrimitiveBuilder<Int32Type> =
+            PrimitiveBuilder::with_capacity(capacity);
 
-        for array in arrs {
+        let mut initial_offset: usize = 0;
+        for (a_idx, array) in arrs.iter().enumerate() {
             let list_arr = as_list_array(*array);
-            let value_offsets: Int32Array = list_arr.value_offsets().iter().copied().collect();
-            assert!(!value_offsets.is_empty());
-            let offsets_arr =
-                Arc::new(subtract_scalar(&value_offsets, value_offsets.value(0))?) as ArrayRef;
             list_arrs.push(list_arr.values());
-            offsets.push(offsets_arr);
+
+            let value_offsets = list_arr.value_offsets();
+            assert!(!value_offsets.is_empty());
+            let start_offset = value_offsets[0];
+            value_offsets.iter().enumerate().for_each(|(o_idx, o)| {
+                let new_offset = ((*o - start_offset) + initial_offset as i32) as i32;
+
+                if (value_offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
+                    pos_builder.append_value(new_offset);
+                } else {
+                    initial_offset = new_offset as usize;
+                }
+            });
         }
 
-        let offsets_ref = offsets.iter().map(|l| l.deref()).collect::<Vec<_>>();
-        self.write_fixed_stride_array(field, offsets_ref.as_slice())
-            .await?;
+        let positions: &dyn Array = &pos_builder.finish();
+        self.write_fixed_stride_array(field, &[positions]).await?;
         self.write_array(&field.children[0], list_arrs.as_slice())
             .await
     }
 
     async fn write_large_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
+        let capacity: usize = arrs.iter().map(|a| a.len()).sum();
         let mut list_arrs: Vec<&ArrayRef> = Vec::new();
-        let mut offsets: Vec<ArrayRef> = Vec::new();
+        let mut pos_builder: PrimitiveBuilder<Int64Type> =
+            PrimitiveBuilder::with_capacity(capacity);
 
-        for array in arrs {
+        let mut initial_offset: usize = 0;
+        for (a_idx, array) in arrs.iter().enumerate() {
             let list_arr = as_large_list_array(*array);
-            let value_offsets: Int64Array = list_arr.value_offsets().iter().copied().collect();
-            assert!(!value_offsets.is_empty());
-            let offsets_arr =
-                Arc::new(subtract_scalar(&value_offsets, value_offsets.value(0))?) as ArrayRef;
             list_arrs.push(list_arr.values());
-            offsets.push(offsets_arr);
+
+            let value_offsets = list_arr.value_offsets();
+            assert!(!value_offsets.is_empty());
+            let start_offset = value_offsets[0];
+            value_offsets.iter().enumerate().for_each(|(o_idx, o)| {
+                let new_offset = (*o - start_offset) + initial_offset as i64;
+
+                if (value_offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
+                    pos_builder.append_value(new_offset);
+                } else {
+                    initial_offset = new_offset as usize;
+                }
+            });
         }
 
-        let offsets_ref = offsets.iter().map(|l| l.deref()).collect::<Vec<_>>();
-        self.write_fixed_stride_array(field, offsets_ref.as_slice())
-            .await?;
+        let positions: &dyn Array = &pos_builder.finish();
+        self.write_fixed_stride_array(field, &[positions]).await?;
         self.write_array(&field.children[0], list_arrs.as_slice())
             .await
     }

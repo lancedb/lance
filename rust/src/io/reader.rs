@@ -796,17 +796,25 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
 
-        let (arrow_schema, struct_array) = make_struct_of_list_array(10, 10);
+        let arrow_schema = make_schema_of_list_array();
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap();
+
+        let batches = (0..3)
+            .map(|_| {
+                let struct_array = make_struct_of_list_array(10, 10);
+                RecordBatch::try_new(arrow_schema.clone(), vec![struct_array]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let batches_ref = batches.iter().collect::<Vec<_>>();
 
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(batches_ref.as_slice()).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
-        assert_eq!(batch, actual_batch);
+        let expected = concat_batches(&arrow_schema, batches_ref).unwrap();
+        assert_eq!(expected, actual_batch);
     }
 
     #[tokio::test]
@@ -814,7 +822,8 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/null_strings");
 
-        let (arrow_schema, struct_array) = make_struct_of_list_array(3, 10);
+        let arrow_schema = make_schema_of_list_array();
+        let struct_array = make_struct_of_list_array(3, 10);
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
@@ -848,11 +857,8 @@ mod tests {
         assert_eq!(expected_batch, slice_of_batch);
     }
 
-    fn make_struct_of_list_array(
-        rows: i32,
-        num_items: i32,
-    ) -> (Arc<arrow_schema::Schema>, Arc<StructArray>) {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+    fn make_schema_of_list_array() -> Arc<arrow_schema::Schema> {
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![
                 ArrowField::new(
@@ -865,23 +871,34 @@ mod tests {
                     DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
                     true,
                 ),
+                ArrowField::new(
+                    "ll",
+                    DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    false,
+                ),
             ]),
             true,
-        )]));
+        )]))
+    }
 
+    fn make_struct_of_list_array(rows: i32, num_items: i32) -> Arc<StructArray> {
         let mut li_builder = ListBuilder::new(Int32Builder::new());
         let mut ls_builder = ListBuilder::new(StringBuilder::new());
+        let ll_value_builder = Int32Builder::new();
+        let mut large_list_builder = LargeListBuilder::new(ll_value_builder);
         for i in 0..rows {
             for j in 0..num_items {
                 li_builder.values().append_value(i * 10 + j);
                 ls_builder
                     .values()
                     .append_value(format!("str-{}", i * 10 + j));
+                large_list_builder.values().append_value(i * 10 + j);
             }
             li_builder.append(true);
             ls_builder.append(true);
+            large_list_builder.append(true);
         }
-        let struct_array = Arc::new(StructArray::from(vec![
+        Arc::new(StructArray::from(vec![
             (
                 ArrowField::new(
                     "li",
@@ -898,8 +915,15 @@ mod tests {
                 ),
                 Arc::new(ls_builder.finish()) as ArrayRef,
             ),
-        ]));
-        (arrow_schema, struct_array)
+            (
+                ArrowField::new(
+                    "ll",
+                    DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    false,
+                ),
+                Arc::new(large_list_builder.finish()) as ArrayRef,
+            ),
+        ]))
     }
 
     #[tokio::test]
