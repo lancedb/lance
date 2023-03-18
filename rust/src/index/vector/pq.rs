@@ -23,6 +23,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use rand::SeedableRng;
+use futures::{stream, StreamExt, TryStreamExt};
 
 use super::MetricType;
 use crate::arrow::linalg::MatrixView;
