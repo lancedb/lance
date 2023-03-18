@@ -333,7 +333,7 @@ impl ProductQuantizer {
             .await?
             .iter()
             .sum::<f64>();
-        Ok(distortion)
+        Ok(distortion / data.num_rows() as f64)
     }
 
     /// Transform the vector array to PQ code array.
