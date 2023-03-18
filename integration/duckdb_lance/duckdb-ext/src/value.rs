@@ -30,7 +30,7 @@ impl From<duckdb_value> for Value {
 
 impl Drop for Value {
     fn drop(&mut self) {
-        if self.ptr.is_null() {
+        if !self.ptr.is_null() {
             unsafe {
                 duckdb_destroy_value(&mut self.ptr);
             }

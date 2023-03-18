@@ -18,24 +18,22 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    logical_expr::{col, BinaryExpr, Operator},
+    logical_expr::{col, BinaryExpr, Like, Operator},
     physical_plan::{
-        expressions::{InListExpr, IsNotNullExpr, IsNullExpr, Literal, NotExpr},
+        expressions::{InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr},
         PhysicalExpr,
     },
     prelude::Expr,
     scalar::ScalarValue,
 };
-use sqlparser::{
-    ast::{
-        BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, SetExpr,
-        Statement, Value,
-    },
-    dialect::GenericDialect,
-    parser::Parser,
+use sqlparser::ast::{
+    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, Value,
 };
 
-use crate::{datafusion::logical_expr::resolve_expr, datatypes::Schema, Error, Result};
+use crate::{
+    datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
+    Result,
+};
 
 pub struct Planner {
     schema: SchemaRef,
@@ -173,6 +171,17 @@ impl Planner {
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
             SQLExpr::Function(func) => self.parse_function(func),
+            SQLExpr::Like {
+                negated,
+                expr,
+                pattern,
+                escape_char,
+            } => Ok(Expr::Like(Like::new(
+                *negated,
+                Box::new(self.parse_sql_expr(expr)?),
+                Box::new(self.parse_sql_expr(pattern)?),
+                *escape_char,
+            ))),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"
@@ -184,25 +193,9 @@ impl Planner {
     /// Create Logical [Expr] from a SQL filter clause.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
-        let dialect = GenericDialect {};
-        let stmts = Parser::parse_sql(&dialect, sql.as_str())?;
-        if stmts.len() != 1 {
-            return Err(Error::IO(format!("Filter is not valid: {filter}")));
-        }
-        let selection = if let Statement::Query(query) = &stmts[0] {
-            if let SetExpr::Select(s) = query.body.as_ref() {
-                s.selection.as_ref()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let expr = selection.ok_or_else(|| Error::IO(format!("Filter is not valid: {filter}")))?;
-
-        let expr = self.parse_sql_expr(expr)?;
+        let ast_expr = parse_sql_filter(filter)?;
+        let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         resolve_expr(&expr, &schema)
     }
@@ -235,6 +228,12 @@ impl Planner {
                     .collect::<Result<Vec<_>>>()?,
                 *negated,
                 self.schema.as_ref(),
+            )),
+            Expr::Like(expr) => Arc::new(LikeExpr::new(
+                expr.negated,
+                true,
+                self.create_physical_expr(expr.expr.as_ref())?,
+                self.create_physical_expr(expr.pattern.as_ref())?,
             )),
             _ => {
                 return Err(Error::IO(format!(
@@ -318,6 +317,90 @@ mod tests {
                     ),
                 ])),
             ],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, false, true, true, false, false, false, false
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sql_like() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("s").like(lit("str-4"));
+        // single quote
+        let expr = planner.parse_filter("s LIKE 'str-4'").unwrap();
+        assert_eq!(expr, expected);
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..10).map(|v| format!("str-{}", v)),
+            ))],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, false, true, false, false, false, false, false
+            ])
+        );
+    }
+
+    #[test]
+    fn test_not_like() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("s").not_like(lit("str-4"));
+        // single quote
+        let expr = planner.parse_filter("s NOT LIKE 'str-4'").unwrap();
+        assert_eq!(expr, expected);
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..10).map(|v| format!("str-{}", v)),
+            ))],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                true, true, true, true, false, true, true, true, true, true
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sql_is_in() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("s").in_list(vec![lit("str-4"), lit("str-5")], false);
+        // single quote
+        let expr = planner.parse_filter("s IN ('str-4', 'str-5')").unwrap();
+        assert_eq!(expr, expected);
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..10).map(|v| format!("str-{}", v)),
+            ))],
         )
         .unwrap();
         let predicates = physical_expr.evaluate(&batch).unwrap();
