@@ -335,7 +335,7 @@ impl ProductQuantizer {
             .await?
             .iter()
             .sum::<f64>();
-        Ok(distortion / data.num_rows() as f64)
+        Ok(distortion)
     }
 
     /// Transform the vector array to PQ code array.
@@ -424,7 +424,11 @@ impl ProductQuantizer {
                 }
             }
         }
-        todo!()
+
+        let pd_centroids = builder.finish();
+        self.codebook = Some(Arc::new(pd_centroids));
+
+        Ok(())
     }
 
     /// Train [`ProductQuantizer`] using vectors.

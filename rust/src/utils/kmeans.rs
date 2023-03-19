@@ -342,13 +342,19 @@ impl KMeans {
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
         for _ in 1..=params.redos {
-            let mut kmeans = match params.init {
-                KMeanInit::Random => {
-                    Self::init_random(&mat, k, params.metric_type, rng.clone()).await
-                }
-                KMeanInit::KMeanPlusPlus => {
-                    kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
-                        .await
+            let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
+                println!("Continous training with existing centroids.");
+                Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+            } else {
+                println!("Training with new centroids.");
+                match params.init {
+                    KMeanInit::Random => {
+                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await
+                    }
+                    KMeanInit::KMeanPlusPlus => {
+                        kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
+                            .await
+                    }
                 }
             };
 
