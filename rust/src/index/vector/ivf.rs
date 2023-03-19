@@ -635,7 +635,7 @@ pub async fn build_ivf_pq_index(
 
     // Compute the residual vector for training PQ
     let ivf_centroids: MatrixView = ivf_model.centroids.as_ref().try_into()?;
-    let training_data = MatrixView::new(ivf_centroids.data().clone(), ivf_centroids.num_columns());
+    let training_data = MatrixView::new(training_data.data(), training_data.num_columns());
     let residual_data =
         compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
     let pq_training_data =
