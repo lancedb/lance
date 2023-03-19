@@ -93,6 +93,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = filter {
+            println!("filter: {}", f.as_str());
             scanner
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

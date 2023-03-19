@@ -255,6 +255,7 @@ impl LocalTake {
                 .then(|(b, (dataset, take_schema, projection))| async move {
                     // TODO: need to cache the fragments.
                     let batch = b?;
+                    println!("filtered data {:?}", batch);
                     let projection_schema = ArrowSchema::from(projection.as_ref());
                     if batch.num_rows() == 0 {
                         return Ok(RecordBatch::new_empty(Arc::new(projection_schema)));

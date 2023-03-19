@@ -69,9 +69,10 @@ def indexed_dataset(tmp_path):
 
 def run(ds):
     q = np.random.randn(768)
-    project = [None, ["price"], ["vector"], ["vector", "meta"]]
+    project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
-    filters = [None, pc.field("price") > 50.0]
+    filters = [None, "price > 50.0"]
+    test_filters = [None, pc.field("price") > 50.0]
     times = []
 
     for columns in project:
@@ -84,7 +85,7 @@ def run(ds):
             if c not in expected_columns:
                 expected_columns.append(c)
 
-        for filter_ in filters:
+        for i, filter_ in enumerate(filters):
             for rf in refine:
                 start = time.time()
                 rs = ds.to_table(
@@ -101,10 +102,11 @@ def run(ds):
                 end = time.time()
                 times.append(end - start)
                 assert rs.column_names == expected_columns
-                if filter_ is not None and "price" in (columns or []):
+                if filter_ is not None:
                     inmem = pa.dataset.dataset(rs)
-                    assert len(inmem.to_table(filter=filter_)) == len(rs)
-                assert len(rs) == 10
+                    assert len(inmem.to_table(filter=test_filters[i])) == len(rs)
+                else:
+                    assert len(rs) == 10
                 scores = rs["score"].to_numpy()
                 assert (scores.max() - scores.min()) > 1e-6
     return times
