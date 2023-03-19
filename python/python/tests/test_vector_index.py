@@ -37,7 +37,7 @@ from lance.vector import vec_to_table
 
 def create_table(nvec=10000, ndim=768):
     mat = np.random.randn(nvec, ndim)
-    price = (np.random.rand(nvec) + 1) * 100
+    price = np.random.rand(nvec) * 100
 
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
