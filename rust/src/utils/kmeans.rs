@@ -332,21 +332,15 @@ impl KMeans {
     ) -> Self {
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());
-        let mut best_kmeans = if let Some(centroids) = params.centroids.as_ref() {
-            Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
-        } else {
-            Self::empty(k, dimension, params.metric_type)
-        };
+        let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
         let mut best_stddev = f32::MAX;
 
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
         for _ in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
-                println!("Continous training with existing centroids.");
                 Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
             } else {
-                println!("Training with new centroids.");
                 match params.init {
                     KMeanInit::Random => {
                         Self::init_random(&mat, k, params.metric_type, rng.clone()).await

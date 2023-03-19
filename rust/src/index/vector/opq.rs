@@ -106,7 +106,7 @@ impl OptimizedProductQuantizer {
 
         // Iteratively train PQ.
         // train 4 times per iteration, see Faiss.
-        pq.train(&train, metric_type, 4).await?;
+        pq.train(&train, metric_type, 1).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         println!(
@@ -133,6 +133,11 @@ impl OptimizedProductQuantizer {
         let x_yt = train.transpose().dot(&y.transpose())?;
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
+        println!(
+            "OPQ ratation: num_columns: {}, num_rows: {}",
+            rotation.num_columns(),
+            rotation.num_rows()
+        );
 
         Ok((rotation, pq_code))
     }

@@ -620,7 +620,7 @@ pub async fn build_ivf_pq_index(
     let sample_size_hint = std::cmp::max(
         ivf_params.num_partitions,
         ProductQuantizer::num_centroids(pq_params.num_bits as u32),
-    ) * 256;
+    ) * 1024;
 
     let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 

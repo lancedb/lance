@@ -416,7 +416,7 @@ mod tests {
             -0.6525516,
             0.10910681,
         ];
-        assert_relative_eq!(u.data().values(), expected_u.as_slice(), epsilon = 0.0001,);
+        assert_relative_eq!(u.data().values(), expected_u.as_slice(), epsilon = 0.0001);
 
         assert_relative_eq!(
             sigma.values(),
@@ -424,7 +424,6 @@ mod tests {
             epsilon = 0.0001,
         );
 
-        // Obtained from `numpy.linagl.svd()`.
         let expected_vt = vec![
             -0.25138279,
             -0.39684555,
@@ -452,7 +451,7 @@ mod tests {
             -0.62652825,
             -0.43955169,
         ];
-        assert_relative_eq!(vt.data().values(), expected_vt.as_slice(), epsilon = 0.0001,)
+        assert_relative_eq!(vt.data().values(), expected_vt.as_slice(), epsilon = 0.0001)
     }
 
     #[test]
