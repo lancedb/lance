@@ -421,14 +421,52 @@ impl ProductQuantizer {
         Ok(())
     }
 
-    /// Train a [ProductQuantizer] using an array of vectors.
-    pub async fn fit_transform(
+    /// Reset the centroids from the OPQ training.
+    pub fn reset_centroids(
         &mut self,
-        mat: &MatrixView,
-        metric_type: MetricType,
-    ) -> Result<FixedSizeListArray> {
-        self.train(mat, metric_type, 50).await?;
-        self.transform(mat, metric_type).await
+        data: &MatrixView,
+        pq_code: &FixedSizeListArray,
+    ) -> Result<()> {
+        assert_eq!(data.num_rows(), pq_code.len());
+
+        let num_centroids = 2_usize.pow(self.num_bits);
+        let mut builder = Float32Builder::with_capacity(num_centroids * self.dimension);
+        let sub_vector_dim = self.dimension / self.num_sub_vectors;
+        for sub_idx in 0..self.num_sub_vectors {
+            for i in 0..num_centroids {
+                let mut sum = vec![0.0_f32; sub_vector_dim];
+                let mut count = 0;
+                for j in 0..data.num_rows() {
+                    let code_row = pq_code.value(j);
+                    let code: &UInt8Array = as_primitive_array(code_row.as_ref());
+                    if code.value(sub_idx) == i as u8 {
+                        // Sub-vector of the j-th vector.
+                        let sub_vector = data.data().slice(
+                            j * self.dimension + sub_idx * sub_vector_dim,
+                            sub_vector_dim,
+                        );
+                        let sub_vector: &Float32Array = as_primitive_array(sub_vector.as_ref());
+                        for k in 0..sub_vector.len() {
+                            sum[k] += sub_vector.value(k);
+                        }
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    for k in 0..sum.len() {
+                        sum[k] /= count as f32;
+                    }
+                    builder.append_slice(sum.as_slice());
+                } else {
+                    builder.append_slice(vec![f32::MAX; sub_vector_dim].as_slice());
+                }
+            }
+        }
+
+        let pd_centroids = builder.finish();
+        self.codebook = Some(Arc::new(pd_centroids));
+
+        Ok(())
     }
 }
 
