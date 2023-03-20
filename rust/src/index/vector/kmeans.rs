@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
 };
@@ -26,6 +28,7 @@ use crate::{
 /// Train KMeans model and returns the centroids of each cluster.
 pub async fn train_kmeans(
     array: &Float32Array,
+    centroids: Option<Arc<Float32Array>>,
     dimension: usize,
     k: usize,
     max_iterations: u32,
@@ -62,6 +65,7 @@ pub async fn train_kmeans(
     let params = KMeansParams {
         max_iters: max_iterations,
         metric_type,
+        centroids,
         ..Default::default()
     };
     let model = KMeans::new_with_params(&data, dimension, k, &params).await;

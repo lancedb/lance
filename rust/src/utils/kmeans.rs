@@ -47,7 +47,7 @@ pub struct KMeansParams {
     /// threshold, stop the training.
     pub tolerance: f32,
 
-    /// Run kmeans multiple times and pick the best one.
+    /// Run kmeans multiple times and pick the best (balanced) one.
     pub redos: usize,
 
     /// Init methods.
@@ -55,6 +55,10 @@ pub struct KMeansParams {
 
     /// The metric to calculate distance.
     pub metric_type: MetricType,
+
+    /// Centroids to continuous training. If present, it will continuously train
+    /// from the given centroids. If None, it will initialize centroids via init method.
+    pub centroids: Option<Arc<Float32Array>>,
 }
 
 impl Default for KMeansParams {
@@ -65,6 +69,7 @@ impl Default for KMeansParams {
             redos: 1,
             init: KMeanInit::Random,
             metric_type: MetricType::L2,
+            centroids: None,
         }
     }
 }
@@ -278,6 +283,22 @@ impl KMeans {
         }
     }
 
+    /// Create a [`KMeans`] with existing centroids.
+    /// It is useful for continuing training.
+    fn with_centroids(
+        centroids: Arc<Float32Array>,
+        k: usize,
+        dimension: usize,
+        metric_type: MetricType,
+    ) -> Self {
+        Self {
+            centroids,
+            dimension,
+            k,
+            metric_type,
+        }
+    }
+
     /// Initialize a [`KMeans`] with random centroids.
     ///
     /// Parameters
@@ -319,13 +340,18 @@ impl KMeans {
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
         for _ in 1..=params.redos {
-            let mut kmeans = match params.init {
-                KMeanInit::Random => {
-                    Self::init_random(&mat, k, params.metric_type, rng.clone()).await
-                }
-                KMeanInit::KMeanPlusPlus => {
-                    kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
-                        .await
+            let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
+                // Use existing centroids.
+                KMeans::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+            } else {
+                match params.init {
+                    KMeanInit::Random => {
+                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await
+                    }
+                    KMeanInit::KMeanPlusPlus => {
+                        kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
+                            .await
+                    }
                 }
             };
 
