@@ -7,6 +7,7 @@ on:
     paths:
       - ./integration/duckdb_lance/*
       - .github/workflows/duckdb.yml
+      - ./rust/*
 jobs:
   Linux:
     runs-on: ubuntu-22.04
