@@ -125,7 +125,7 @@ impl MatrixView {
 
     pub fn data(&self) -> Arc<Float32Array> {
         if self.transpose {
-            Arc::new(transpose(self.data.as_ref().values(), self.num_columns()).into())
+            Arc::new(transpose(self.data.values(), self.num_rows()).into())
         } else {
             self.data.clone()
         }
@@ -186,9 +186,9 @@ impl MatrixView {
                 n,
                 k,
                 1.0,
-                self.data.as_ref().values(),
+                self.data.values(),
                 lda,
-                rhs.data.as_ref().values(),
+                rhs.data.values(),
                 ldb,
                 0.0,
                 c_builder.values_slice_mut(),
@@ -285,7 +285,8 @@ impl SingularValueDecomposition for MatrixView {
         //
         // TODO: Lapacke requires a mutable reference of `A`.
         // How can we get mutable reference without copying data?
-        let mut a = transpose(self.data.values(), n as usize);
+        // Convert A to column-major matrix.
+        let mut a = self.transpose().data().values().to_vec();
         // f32 array builder for matrix U.
         let mut u = vec![0.0; (m * m) as usize];
         // f32 array builder for matrix V_T
@@ -296,7 +297,7 @@ impl SingularValueDecomposition for MatrixView {
         // Length of the workspace
         let lwork: i32 = -1;
         let mut iwork = vec![0; 8 * min(m, m) as usize];
-        //  return value.
+        // Return value.
         let mut info: i32 = -1;
 
         // Query the optimal workspace size, will be stored in `work[0]`.
@@ -414,11 +415,7 @@ mod tests {
             -0.6525516,
             0.10910681,
         ];
-        assert_relative_eq!(
-            u.data().as_ref().values(),
-            expected_u.as_slice(),
-            epsilon = 0.0001,
-        );
+        assert_relative_eq!(u.data().values(), expected_u.as_slice(), epsilon = 0.0001,);
 
         assert_relative_eq!(
             sigma.values(),
@@ -470,10 +467,7 @@ mod tests {
         let b = MatrixView::new(b_data, 2);
 
         let c = a.dot(&b).unwrap();
-        assert_relative_eq!(
-            c.data.as_ref().values(),
-            vec![44.0, 50.0, 98.0, 113.0].as_slice(),
-        );
+        assert_relative_eq!(c.data.values(), vec![44.0, 50.0, 98.0, 113.0].as_slice(),);
     }
 
     #[test]
@@ -489,10 +483,7 @@ mod tests {
         let b = MatrixView::new(b_data, 2);
 
         let c_t = b.transpose().dot(&a.transpose()).unwrap();
-        assert_relative_eq!(
-            c_t.data.as_ref().values(),
-            vec![44.0, 98.0, 50.0, 113.0].as_slice(),
-        );
+        assert_relative_eq!(c_t.data.values(), vec![44.0, 98.0, 50.0, 113.0].as_slice(),);
     }
 
     #[test]
@@ -503,13 +494,27 @@ mod tests {
         let samples = a.sample(5);
         assert_eq!(samples.num_rows(), 5);
 
-        let all_values: HashSet<i64> = samples
-            .data
-            .as_ref()
-            .values()
-            .iter()
-            .map(|v| *v as i64)
-            .collect();
+        let all_values: HashSet<i64> = samples.data.values().iter().map(|v| *v as i64).collect();
         assert_eq!(all_values.len(), 5 * 2);
+    }
+
+    #[test]
+    fn test_transpose() {
+        let a_data = Arc::new(Float32Array::from_iter((1..=12).map(|v| v as f32)));
+        let a = MatrixView::new(a_data, 3);
+        assert_eq!(a.num_rows(), 4);
+        assert_eq!(a.num_columns(), 3);
+        assert_eq!(
+            a.data().values(),
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        );
+
+        let a_t = a.transpose();
+        assert_eq!(a_t.num_rows(), 3);
+        assert_eq!(a_t.num_columns(), 4);
+        assert_eq!(
+            a_t.data().values(),
+            &[1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0]
+        );
     }
 }
