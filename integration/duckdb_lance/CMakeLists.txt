@@ -62,5 +62,6 @@ target_link_libraries(${LIB_NAME}
 if (APPLE)
         target_link_libraries(${LIB_NAME}
                 "-framework CoreFoundation"
-                "-framework Security")
+                "-framework Security"
+                "-framework Accelerate")
 endif()
