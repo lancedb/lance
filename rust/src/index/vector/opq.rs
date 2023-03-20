@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, Float32Array, UInt8Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
@@ -99,14 +99,14 @@ impl OptimizedProductQuantizer {
     /// Train once and return the rotation matrix and PQ codebook.
     async fn train_once(
         &self,
+        pq: &mut ProductQuantizer,
         train: &MatrixView,
         metric_type: MetricType,
-    ) -> Result<(MatrixView, ProductQuantizer)> {
+    ) -> Result<(MatrixView, FixedSizeListArray)> {
         let dim = train.num_columns();
-        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
 
-        // let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
-        pq.train(&train, metric_type, 50).await?;
+        // Train few times to get a better rotation matrix. See Faiss.
+        pq.train(&train, metric_type, 4).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
@@ -129,7 +129,7 @@ impl OptimizedProductQuantizer {
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
 
-        Ok((rotation, pq))
+        Ok((rotation, pq_code))
     }
 }
 
@@ -153,13 +153,21 @@ impl Transformer for OptimizedProductQuantizer {
             data.clone()
         };
 
+        // Use 10 iterations to get the initialized centroids.
+        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+        pq.train(&train, self.metric_type, 10).await?;
+        let mut pq_code = pq.transform(&train, self.metric_type).await?;
+
         // Initialize R (rotation matrix)
         let mut rotation = MatrixView::identity(dim);
         for _ in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
-            let train = train.dot(&rotation)?;
-            let (rot, _) = self.train_once(&train, self.metric_type).await?;
-            rotation = rot;
+            let rotated_data = train.dot(&rotation)?;
+            // Reset the pq centroids after rotation.
+            pq.reset_centroids(&rotated_data, &pq_code)?;
+            (rotation, pq_code) = self
+                .train_once(&mut pq, &rotated_data, self.metric_type)
+                .await?;
         }
         self.rotation = Some(rotation);
         Ok(())
@@ -167,8 +175,13 @@ impl Transformer for OptimizedProductQuantizer {
 
     /// Apply OPQ transform
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
-        let rotation = self.rotation.as_ref().unwrap();
-        Ok(rotation.dot(&data.transpose())?.transpose())
+        let result = self
+            .rotation
+            .as_ref()
+            .unwrap()
+            .dot(&data.transpose())?
+            .transpose();
+        Ok(MatrixView::new(result.data(), result.num_columns()))
     }
 
     /// Write the OPQ rotation matrix to disk.
