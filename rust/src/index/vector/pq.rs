@@ -97,7 +97,9 @@ impl<'a> PQIndex<'a> {
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
-            let subvec_centroids = self.pq.centroids(i);
+            let subvec_centroids = self.pq.centroids(i).ok_or_else(|| {
+                Error::Index("PQIndex::l2_scores: PQ is not initialized".to_string())
+            })?;
             let distances = l2_distance(
                 as_primitive_array(&from),
                 &subvec_centroids,
@@ -135,7 +137,9 @@ impl<'a> PQIndex<'a> {
         for i in 0..self.num_sub_vectors {
             let slice = key.slice(i * sub_vector_length, sub_vector_length);
             let key_sub_vector: &Float32Array = as_primitive_array(slice.as_ref());
-            let sub_vector_centroids = self.pq.centroids(i);
+            let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| {
+                Error::Index("PQIndex::cosine_scores: PQ is not initialized".to_string())
+            })?;
             let xy = sub_vector_centroids
                 .as_ref()
                 .values()
@@ -268,9 +272,11 @@ impl ProductQuantizer {
     /// Get the centroids for one sub-vector.
     ///
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
-    pub fn centroids(&self, sub_vector_idx: usize) -> Arc<Float32Array> {
+    pub fn centroids(&self, sub_vector_idx: usize) -> Option<Arc<Float32Array>> {
         assert!(sub_vector_idx < self.num_sub_vectors);
-        assert!(self.codebook.is_some());
+        if self.codebook.is_none() {
+            return None;
+        };
 
         let num_centroids = Self::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
@@ -279,18 +285,17 @@ impl ProductQuantizer {
             sub_vector_idx * num_centroids * sub_vector_width,
             num_centroids * sub_vector_width,
         );
-        // TODO: return reference instead of Arc?
-        Arc::new(as_primitive_array(&arr).clone())
+        Some(Arc::new(as_primitive_array(&arr).clone()))
     }
 
     /// Reconstruct a vector from its PQ code.
-    /// It only supports U8 for now.
+    /// It only supports U8 PQ code for now.
     pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
         assert_eq!(code.len(), self.num_sub_vectors);
         let mut builder = Float32Builder::with_capacity(self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
         for i in 0..code.len() {
-            let centroids = self.centroids(i);
+            let centroids = self.centroids(i).unwrap();
             let sub_code = code[i];
             builder.append_slice(
                 &centroids.values()
@@ -310,7 +315,7 @@ impl ProductQuantizer {
 
         let vectors = sub_vectors.to_vec();
         let all_centroids = (0..sub_vectors.len())
-            .map(|idx| self.centroids(idx))
+            .map(|idx| self.centroids(idx).unwrap())
             .collect::<Vec<_>>();
         let distortion = stream::iter(vectors)
             .zip(stream::iter(all_centroids))
@@ -344,7 +349,7 @@ impl ProductQuantizer {
         metric_type: MetricType,
     ) -> Result<FixedSizeListArray> {
         let all_centroids = (0..self.num_sub_vectors)
-            .map(|idx| self.centroids(idx))
+            .map(|idx| self.centroids(idx).unwrap())
             .collect::<Vec<_>>();
         let dist_func = metric_type.func();
 
@@ -397,12 +402,15 @@ impl ProductQuantizer {
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.
-        for sub_vec in &sub_vectors {
+        for i in 0..sub_vectors.len() {
             // Centroids for one sub vector.
+            let sub_vec = &sub_vectors[i];
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
+            let prev_centroids = self.centroids(i);
             let centroids = train_kmeans(
                 flatten_array,
+                prev_centroids,
                 sub_vector_dimension,
                 num_centroids,
                 max_iters as u32,
@@ -557,5 +565,36 @@ mod tests {
                 8
             )
         );
+    }
+
+    #[tokio::test]
+    async fn test_train_pq_iteratively() {
+        let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
+        // A 16-dim array.
+        let dim = 16;
+        let mat = MatrixView::new(values.into(), dim);
+        let mut pq = ProductQuantizer::new(2, 8, dim);
+        pq.train(&mat, MetricType::L2, 1).await.unwrap();
+
+        // Init centroids
+        let centroids = pq.codebook.as_ref().unwrap().clone();
+
+        // Keep training 10 times
+        pq.train(&mat, MetricType::L2, 10).await.unwrap();
+
+        let mut actual_pq = ProductQuantizer {
+            num_bits: 8,
+            num_sub_vectors: 2,
+            dimension: dim,
+            codebook: Some(centroids),
+        };
+        // Iteratively train for 10 times.
+        for _ in 0..10 {
+            let code = actual_pq.transform(&mat, MetricType::L2).await.unwrap();
+            actual_pq.reset_centroids(&mat, &code).unwrap();
+            actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
+        }
+
+        assert_eq!(pq.codebook, actual_pq.codebook);
     }
 }
