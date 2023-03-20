@@ -271,9 +271,9 @@ impl Scanner {
                     knn_node_with_vector
                 }; // vector, score, _rowid
 
-                let knn_node = filter_expr.map(|f| {
-                    self.filter_knn(knn_node.clone(), f)
-                }).unwrap_or(Ok(knn_node))?; // vector, score, _rowid
+                let knn_node = filter_expr
+                    .map(|f| self.filter_knn(knn_node.clone(), f))
+                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
                 self.take(knn_node, projection, true)
             } else {
                 let vector_scan_projection =
@@ -281,9 +281,9 @@ impl Scanner {
                 let scan_node = self.scan(true, vector_scan_projection);
                 let knn_node = self.flat_knn(scan_node, q);
 
-                let knn_node = filter_expr.map(|f| {
-                    self.filter_knn(knn_node.clone(), f)
-                }).unwrap_or(Ok(knn_node))?; // vector, score, _rowid
+                let knn_node = filter_expr
+                    .map(|f| self.filter_knn(knn_node.clone(), f))
+                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
                 self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
@@ -315,7 +315,11 @@ impl Scanner {
         ))
     }
 
-    fn filter_knn(&self, knn_node: Arc<dyn ExecutionPlan>, filter_expression: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn ExecutionPlan>> {
+    fn filter_knn(
+        &self,
+        knn_node: Arc<dyn ExecutionPlan>,
+        filter_expression: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
         let columns_refs = columns_in_filter
             .iter()
