@@ -555,10 +555,10 @@ pub async fn build_ivf_pq_index(
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
     // Pre-transforms
-    let mut transforms = vec![];
+    let mut transforms: Vec<Box<dyn Transformer>> = vec![];
     if pq_params.use_opq {
         let opq = train_opq(&training_data, pq_params).await?;
-        transforms.push(opq);
+        transforms.push(Box::new(opq));
     }
 
     // Transform training data if necessary.
@@ -600,9 +600,12 @@ pub async fn build_ivf_pq_index(
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
             let mut vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+
+            // Transform the vectors if pre-transforms are used.
             for transform in transform_ref.iter() {
                 vectors = transform.transform(&vectors).await?;
             }
+
             let i = ivf.clone();
             let part_id_and_residual = tokio::task::spawn_blocking(move || {
                 i.compute_partition_and_residual(&vectors, metric_type)
@@ -652,6 +655,7 @@ pub async fn build_ivf_pq_index(
         column,
         index_name,
         uuid,
+        &transforms,
         ivf_model,
         pq,
         ivf_params.metric_type,
@@ -660,12 +664,14 @@ pub async fn build_ivf_pq_index(
     .await
 }
 
-/// Write index into the file.
+/// Write the index to the index file.
+///
 async fn write_index_file(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
     uuid: &Uuid,
+    transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
     pq: ProductQuantizer,
     metric_type: MetricType,
@@ -701,6 +707,13 @@ async fn write_index_file(
         }
     }
 
+    // Convert [`Transformer`] to metadata.
+    let mut transforms = vec![];
+    for t in transformers {
+        let t = t.save(&mut writer).await?;
+        transforms.push(t);
+    }
+
     let metadata = IvfPQIndexMetadata {
         name: index_name.to_string(),
         column: column.to_string(),
@@ -709,7 +722,7 @@ async fn write_index_file(
         metric_type,
         ivf,
         pq: pq.into(),
-        transforms: vec![],
+        transforms,
     };
 
     let metadata = pb::Index::try_from(&metadata)?;

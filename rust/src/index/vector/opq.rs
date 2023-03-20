@@ -26,13 +26,14 @@ use super::{pq::ProductQuantizer, MetricType, Transformer};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
 /// (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OptimizedProductQuantizer {
     num_sub_vectors: usize,
 
@@ -170,8 +171,18 @@ impl Transformer for OptimizedProductQuantizer {
         Ok(rotation.dot(&data.transpose())?.transpose())
     }
 
-    fn try_into_pb(&self) -> Result<Transform> {
-        self.try_into()
+    /// Write the OPQ rotation matrix to disk.
+    async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform> {
+        let mut this = self.clone();
+        if this.rotation.is_none() {
+            return Err(Error::Index("OPQ is not trained".to_string()));
+        };
+        let rotation = this.rotation.as_ref().unwrap();
+        let position = writer
+            .write_plain_encoded_array(rotation.data().as_ref())
+            .await?;
+        this.file_position = Some(position);
+        (&this).try_into()
     }
 }
 
