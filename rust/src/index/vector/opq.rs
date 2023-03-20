@@ -109,11 +109,6 @@ impl OptimizedProductQuantizer {
         pq.train(&train, metric_type, 1).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
-        println!(
-            "PQ distortion: {}",
-            pq.distortion(&train, metric_type).await?
-        );
-
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
         for i in 0..pq_code.len() {
@@ -133,11 +128,6 @@ impl OptimizedProductQuantizer {
         let x_yt = train.transpose().dot(&y.transpose())?;
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
-        println!(
-            "OPQ ratation: num_columns: {}, num_rows: {}",
-            rotation.num_columns(),
-            rotation.num_rows()
-        );
 
         Ok((rotation, pq_code))
     }

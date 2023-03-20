@@ -183,8 +183,9 @@ impl VectorIndex for IvfPQIndex<'_> {
                 batch.schema()
             ))
         })?;
-        let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
-
+        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
+        // TODO: use merge sort.
+        let refined_index = sort_to_indices(score_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &refined_index, None)?;
         Ok(as_struct_array(&taken_scores).into())
