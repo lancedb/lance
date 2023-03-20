@@ -20,7 +20,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
 
 use arrow_arith::arithmetic::subtract_scalar;
-use arrow_array::builder::PrimitiveBuilder;
+use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::{
     cast::as_primitive_array,
     new_empty_array,
@@ -56,12 +56,12 @@ impl<'a> BinaryEncoder<'a> {
 
     async fn encode_typed_arr<T: ByteArrayType>(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
         let capacity: usize = arrs.iter().map(|a| a.len()).sum();
-        let mut buffers: Vec<&[u8]> = Vec::new();
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
-            PrimitiveBuilder::with_capacity(capacity);
+            PrimitiveBuilder::with_capacity(capacity + 1);
 
-        let mut value_offset: usize = self.writer.tell();
-        for (a_idx, array) in arrs.iter().enumerate() {
+        let mut last_offset: usize = self.writer.tell();
+        pos_builder.append_value(last_offset as i64);
+        for array in arrs.iter() {
             let arr = array
                 .as_any()
                 .downcast_ref::<GenericByteArray<T>>()
@@ -77,27 +77,14 @@ impl<'a> BinaryEncoder<'a> {
                     end - start,
                 )
             };
-            buffers.push(b);
+            self.writer.write_all(b).await?;
 
-            let start_offset = offsets[0];
-            // Did not use `add_scalar(positions, value_offset)`, so we can save a memory copy.
-            offsets.iter().enumerate().for_each(|(o_idx, o)| {
-                let new_offset = ((*o - start_offset).as_usize() + value_offset) as i64;
-
-                // Each GenericByteArray of len X has a corresponding offset array of len X + 1
-                // Since we are merging multiple arrays together, we only need to copy the "extra"
-                //    element of the last array
-                if (offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
-                    pos_builder.append_value(new_offset);
-                } else {
-                    // The next offset array should start where this one ends
-                    value_offset = new_offset as usize;
-                }
-            });
-        }
-
-        for buf in buffers {
-            self.writer.write_all(buf).await?;
+            offsets
+                .iter()
+                .skip(1)
+                .map(|b| b.as_usize() + last_offset)
+                .for_each(|o| pos_builder.append_value(o as i64));
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
 
         let positions_offset = self.writer.tell();
