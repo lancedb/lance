@@ -463,6 +463,9 @@ pub struct PQBuildParams {
 
     /// The max number of iterations for kmeans training.
     pub max_iters: usize,
+
+    /// Max number of iterations to train OPQ, if `use_opq` is true.
+    pub max_opq_iters: usize,
 }
 
 async fn maybe_sample_training_data(
@@ -549,7 +552,19 @@ pub async fn build_ivf_pq_index(
         ProductQuantizer::num_centroids(pq_params.num_bits as u32),
     ) * 256;
 
-    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
+    // Pre-transforms
+    let mut transforms = vec![];
+    if pq_params.use_opq {
+        let opq = train_opq(&training_data, pq_params).await?;
+        transforms.push(opq);
+    }
+
+    // Transform training data if necessary.
+    for transform in transforms.iter() {
+        training_data = transform.transform(&training_data).await?;
+    }
 
     // Train IVF partitions.
     let ivf_model = train_ivf_model(&training_data, ivf_params).await?;
@@ -572,6 +587,7 @@ pub async fn build_ivf_pq_index(
     let ivf = &ivf_model;
     let pq_ref = &pq;
     let metric_type = pq_params.metric_type;
+    let transform_ref = &transforms;
 
     // Scan the dataset and compute residual, pq with with partition ID.
     // For now, it loads all data into memory.
@@ -583,7 +599,10 @@ pub async fn build_ivf_pq_index(
             let arr = batch
                 .column_by_name(column)
                 .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
-            let vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            let mut vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
+            for transform in transform_ref.iter() {
+                vectors = transform.transform(&vectors).await?;
+            }
             let i = ivf.clone();
             let part_id_and_residual = tokio::task::spawn_blocking(move || {
                 i.compute_partition_and_residual(&vectors, metric_type)
@@ -711,6 +730,20 @@ async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<P
     let mat: MatrixView = data.try_into()?;
     pq.train(&mat, params.metric_type, params.max_iters).await?;
     Ok(pq)
+}
+
+/// Train Optimized Product Quantization.
+async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
+    let mut opq = OptimizedProductQuantizer::new(
+        params.num_sub_vectors as usize,
+        params.num_bits as u32,
+        params.metric_type,
+        params.max_opq_iters,
+    );
+
+    opq.train(data).await?;
+
+    Ok(opq)
 }
 
 /// Train IVF partitions using kmeans.

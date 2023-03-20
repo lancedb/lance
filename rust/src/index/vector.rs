@@ -45,8 +45,12 @@ use crate::{
 pub use traits::*;
 
 const MAX_ITERATIONS: usize = 50;
+/// Maximum number of iterations for OPQ.
+/// See OPQ paper for details.
+const MAX_OPQ_ITERATIONS: usize = 100;
 const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
+
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -152,6 +156,9 @@ pub struct VectorIndexParams {
 
     /// Max number of iterations to train a KMean model
     pub max_iterations: usize,
+
+    /// Max number of iterations to train a OPQ model.
+    pub max_opq_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -178,6 +185,7 @@ impl VectorIndexParams {
             use_opq,
             metric_type,
             max_iterations,
+            max_opq_iterations: max_iterations,
         }
     }
 }
@@ -191,6 +199,7 @@ impl Default for VectorIndexParams {
             use_opq: true,
             metric_type: MetricType::L2,
             max_iterations: MAX_ITERATIONS, // Faiss
+            max_opq_iterations: MAX_OPQ_ITERATIONS,
         }
     }
 }

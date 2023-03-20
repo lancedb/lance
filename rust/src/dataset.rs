@@ -418,8 +418,9 @@ impl Dataset {
                     num_sub_vectors: vec_params.num_sub_vectors as usize,
                     num_bits: 8,
                     metric_type: vec_params.metric_type,
-                    use_opq: vec_params.use_opq,
                     max_iters: vec_params.max_iterations,
+                    use_opq: vec_params.use_opq,
+                    max_opq_iters: vec_params.max_opq_iterations,
                 };
                 build_ivf_pq_index(
                     self,
