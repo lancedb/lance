@@ -265,11 +265,12 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader};
+    use arrow::compute::{max, min};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
     use crate::arrow::{linalg::MatrixView, *};
-    use crate::dataset::Dataset;
+    use crate::dataset::{Dataset, ROW_ID};
     use crate::index::{
         vector::{ivf::IVFIndex, open_index, opq::OPQIndex, VectorIndexParams},
         IndexType,
@@ -344,6 +345,22 @@ mod tests {
         } else {
             assert!(index.as_any().is::<IVFIndex>());
         }
+
+        let query = Query {
+            column: "vector".to_string(),
+            k: 4,
+            nprobes: 10,
+            refine_factor: None,
+            metric_type: MetricType::L2,
+            use_index: true,
+            key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
+        };
+        let results = index.search(&query).await.unwrap();
+
+        let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
+        assert_eq!(row_ids.len(), 4);
+        assert!(row_ids.values().contains(&10));
+        assert_eq!(min(row_ids).unwrap() + 3, max(row_ids).unwrap());
     }
 
     #[tokio::test]
