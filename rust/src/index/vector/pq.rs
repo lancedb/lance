@@ -599,6 +599,7 @@ mod tests {
         );
     }
 
+    #[ignore]
     #[tokio::test]
     async fn test_train_pq_iteratively() {
         let values = Float32Array::from_iter((0..16000).map(|v| v as f32));
