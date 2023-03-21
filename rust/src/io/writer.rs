@@ -14,10 +14,11 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::PrimitiveBuilder;
+use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
 use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use object_store::path::Path;
@@ -276,23 +277,20 @@ impl<'a> FileWriter<'a> {
         let mut pos_builder: PrimitiveBuilder<Int32Type> =
             PrimitiveBuilder::with_capacity(capacity);
 
-        let mut initial_offset: usize = 0;
-        for (a_idx, array) in arrs.iter().enumerate() {
+        let mut last_offset: usize = 0;
+        pos_builder.append_value(last_offset as i32);
+        for array in arrs.iter() {
             let list_arr = as_list_array(*array);
             list_arrs.push(list_arr.values());
 
-            let value_offsets = list_arr.value_offsets();
-            assert!(!value_offsets.is_empty());
-            let start_offset = value_offsets[0];
-            value_offsets.iter().enumerate().for_each(|(o_idx, o)| {
-                let new_offset = ((*o - start_offset) + initial_offset as i32) as i32;
-
-                if (value_offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
-                    pos_builder.append_value(new_offset);
-                } else {
-                    initial_offset = new_offset as usize;
-                }
-            });
+            let offsets = list_arr.value_offsets();
+            assert!(!offsets.is_empty());
+            offsets
+                .iter()
+                .skip(1)
+                .map(|b| b.as_usize() + last_offset)
+                .for_each(|o| pos_builder.append_value(o as i32));
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
@@ -307,23 +305,20 @@ impl<'a> FileWriter<'a> {
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
             PrimitiveBuilder::with_capacity(capacity);
 
-        let mut initial_offset: usize = 0;
-        for (a_idx, array) in arrs.iter().enumerate() {
+        let mut last_offset: usize = 0;
+        pos_builder.append_value(last_offset as i64);
+        for array in arrs.iter() {
             let list_arr = as_large_list_array(*array);
             list_arrs.push(list_arr.values());
 
-            let value_offsets = list_arr.value_offsets();
-            assert!(!value_offsets.is_empty());
-            let start_offset = value_offsets[0];
-            value_offsets.iter().enumerate().for_each(|(o_idx, o)| {
-                let new_offset = (*o - start_offset) + initial_offset as i64;
-
-                if (value_offsets.len() != o_idx + 1) || (arrs.len() == a_idx + 1) {
-                    pos_builder.append_value(new_offset);
-                } else {
-                    initial_offset = new_offset as usize;
-                }
-            });
+            let offsets = list_arr.value_offsets();
+            assert!(!offsets.is_empty());
+            offsets
+                .iter()
+                .skip(1)
+                .map(|b| b.as_usize() + last_offset)
+                .for_each(|o| pos_builder.append_value(o as i64));
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();

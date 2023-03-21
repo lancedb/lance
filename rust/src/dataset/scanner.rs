@@ -271,36 +271,19 @@ impl Scanner {
                     knn_node_with_vector
                 }; // vector, score, _rowid
 
-                let knn_node = if let Some(filter_expression) = filter_expr {
-                    let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
-                    let columns_refs = columns_in_filter
-                        .iter()
-                        .map(|c| c.as_str())
-                        .collect::<Vec<_>>();
-                    let filter_projection = self.dataset.schema().project(&columns_refs)?;
-
-                    let take_node = Arc::new(GlobalTakeExec::new(
-                        self.dataset.clone(),
-                        Arc::new(filter_projection),
-                        knn_node,
-                        false,
-                    ));
-                    self.filter_node(
-                        filter_expression,
-                        take_node,
-                        false,
-                        Some(Arc::new(self.vector_search_schema()?)),
-                    )?
-                } else {
-                    knn_node
-                };
-
+                let knn_node = filter_expr
+                    .map(|f| self.filter_knn(knn_node.clone(), f))
+                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
                 self.take(knn_node, projection, true)
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
                 let knn_node = self.flat_knn(scan_node, q);
+
+                let knn_node = filter_expr
+                    .map(|f| self.filter_knn(knn_node.clone(), f))
+                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
                 self.take(knn_node, projection, true)
             }
         } else if let Some(filter) = filter_expr {
@@ -330,6 +313,32 @@ impl Scanner {
         Ok(RecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
+    }
+
+    fn filter_knn(
+        &self,
+        knn_node: Arc<dyn ExecutionPlan>,
+        filter_expression: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
+        let columns_refs = columns_in_filter
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>();
+        let filter_projection = self.dataset.schema().project(&columns_refs)?;
+
+        let take_node = Arc::new(GlobalTakeExec::new(
+            self.dataset.clone(),
+            Arc::new(filter_projection),
+            knn_node,
+            false,
+        ));
+        self.filter_node(
+            filter_expression,
+            take_node,
+            false,
+            Some(Arc::new(self.vector_search_schema()?)),
+        )
     }
 
     /// Create an Execution plan with a scan node

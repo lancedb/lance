@@ -37,7 +37,7 @@ from lance.vector import vec_to_table
 
 def create_table(nvec=10000, ndim=768):
     mat = np.random.randn(nvec, ndim)
-    price = (np.random.rand(nvec) + 1) * 100
+    price = np.random.rand(nvec) * 100
 
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
@@ -69,7 +69,7 @@ def indexed_dataset(tmp_path):
 
 def run(ds):
     q = np.random.randn(768)
-    project = [None, ["price"], ["vector"], ["vector", "meta"]]
+    project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
     times = []
@@ -101,12 +101,13 @@ def run(ds):
                 end = time.time()
                 times.append(end - start)
                 assert rs.column_names == expected_columns
-                if filter_ is not None and "price" in (columns or []):
+                if filter_ is not None:
                     inmem = pa.dataset.dataset(rs)
                     assert len(inmem.to_table(filter=filter_)) == len(rs)
-                assert len(rs) == 10
-                scores = rs["score"].to_numpy()
-                assert (scores.max() - scores.min()) > 1e-6
+                else:
+                    assert len(rs) == 10
+                    scores = rs["score"].to_numpy()
+                    assert (scores.max() - scores.min()) > 1e-6
     return times
 
 
