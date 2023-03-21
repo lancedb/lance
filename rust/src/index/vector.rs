@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Vector Index for Fast Approximate Nearest Neighbor (ANN) Search
 //!
@@ -21,23 +18,35 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow_array::{Float32Array, RecordBatch};
-use async_trait::async_trait;
+use arrow_array::Float32Array;
 
 pub mod flat;
 pub mod ivf;
 mod kmeans;
 mod opq;
 mod pq;
+mod traits;
+
+use self::{
+    ivf::{IVFIndex, IvfPQIndexMetadata},
+    pq::PQIndex,
+};
 
 use super::{pb, IndexParams};
 use crate::{
-    arrow::linalg::MatrixView,
+    dataset::Dataset,
+    io::{
+        object_reader::{read_message, ObjectReader},
+        read_message_from_buf, read_metadata_offset,
+    },
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
     Error, Result,
 };
+pub use traits::*;
 
 const MAX_ITERATIONS: usize = 50;
+const SCORE_COL: &str = "score";
+const INDEX_FILE_NAME: &str = "index.idx";
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -59,47 +68,6 @@ pub struct Query {
 
     /// Whether to use an ANN index if available
     pub use_index: bool,
-}
-
-/// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
-#[async_trait]
-pub trait VectorIndex {
-    /// Search the vector for nearest neighbors.
-    ///
-    /// It returns a [RecordBatch] with Schema of:
-    ///
-    /// ```
-    /// use arrow_schema::{Schema, Field, DataType};
-    ///
-    /// Schema::new(vec![
-    ///   Field::new("_rowid", DataType::UInt64, false),
-    ///   Field::new("score", DataType::Float32, false),
-    /// ]);
-    /// ```
-    ///
-    /// *WARNINGS*:
-    ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query) -> Result<RecordBatch>;
-}
-
-/// Transformer on vectors.
-#[async_trait]
-pub trait Transformer: std::fmt::Debug + Sync + Send {
-    /// Train the transformer.
-    ///
-    /// Parameters:
-    /// - *data*: training vectors.
-    async fn train(&mut self, data: &MatrixView) -> Result<()>;
-
-    /// Apply transform on the matrix `data`.
-    ///
-    /// Returns a new Matrix instead.
-    async fn transform(&self, data: &MatrixView) -> Result<MatrixView>;
-
-    /// Try to convert into protobuf.
-    ///
-    /// TODO: can we use TryFrom/TryInto as trait constrats?
-    fn try_into_pb(&self) -> Result<pb::Transform>;
 }
 
 /// Distance metrics type.
@@ -157,8 +125,8 @@ impl TryFrom<&str> for MetricType {
 
     fn try_from(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "l2" | "euclidean" => Ok(MetricType::L2),
-            "cosine" => Ok(MetricType::Cosine),
+            "l2" | "euclidean" => Ok(Self::L2),
+            "cosine" => Ok(Self::Cosine),
             _ => Err(Error::Index(format!("Metric type '{s}' is not supported"))),
         }
     }
@@ -231,4 +199,41 @@ impl IndexParams for VectorIndexParams {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Open the Vector index on dataset, specified by the `uuid`.
+pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+    let index_dir = dataset.indices_dir().child(uuid);
+    let index_file = index_dir.child(INDEX_FILE_NAME);
+
+    let object_store = dataset.object_store();
+    let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
+
+    let file_size = reader.size().await?;
+    let prefetch_size = object_store.prefetch_size();
+    let begin = if file_size < prefetch_size {
+        0
+    } else {
+        file_size - prefetch_size
+    };
+    let tail_bytes = reader.get_range(begin..file_size).await?;
+    let metadata_pos = read_metadata_offset(&tail_bytes)?;
+    let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
+        // We have not read the metadata bytes yet.
+        read_message(reader.as_ref(), metadata_pos).await?
+    } else {
+        let offset = tail_bytes.len() - (file_size - metadata_pos);
+        read_message_from_buf(&tail_bytes.slice(offset..))?
+    };
+    let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
+
+    let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
+    let ivf_index = Arc::new(IVFIndex::new(
+        index_metadata.ivf,
+        reader,
+        pq_index,
+        index_metadata.metric_type,
+    ));
+
+    Ok(ivf_index)
 }
