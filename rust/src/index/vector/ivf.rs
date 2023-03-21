@@ -41,7 +41,7 @@ use crate::arrow::{linalg::MatrixView, *};
 use crate::io::object_reader::ObjectReader;
 use crate::{
     dataset::{Dataset, ROW_ID},
-    index::{pb, pb::vector_index_stage::Stage},
+    index::{pb, pb::vector_index_stage::Stage as PbStage},
 };
 use crate::{Error, Result};
 
@@ -209,49 +209,49 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
         }
         assert_eq!(idx.index_type, pb::IndexType::Vector as i32);
 
-        let metadata =
-            if let Some(idx_impl) = idx.implementation.as_ref() {
-                match idx_impl {
-                    pb::index::Implementation::VectorIndex(vidx) => {
-                        let num_stages = vidx.stages.len();
-                        if num_stages != 2 && num_stages != 3 {
-                            return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
-                        };
-                        let stage0 = vidx.stages[0].stage.as_ref().ok_or_else(|| {
-                            Error::IO("VectorIndex stage 0 is missing".to_string())
-                        })?;
-                        let ivf = match stage0 {
-                            Stage::Ivf(ivf_pb) => Ok(Ivf::try_from(ivf_pb)?),
-                            _ => Err(Error::IO("Stage 0 only supports IVF".to_string())),
-                        }?;
-                        let stage1 = vidx.stages[1].stage.as_ref().ok_or_else(|| {
-                            Error::IO("VectorIndex stage 1 is missing".to_string())
-                        })?;
-                        let pq = match stage1 {
-                            Stage::Pq(pq_proto) => Ok(Arc::new(pq_proto.into())),
-                            _ => Err(Error::IO("Stage 1 only supports PQ".to_string())),
-                        }?;
-
-                        Ok::<Self, Error>(Self {
-                            name: idx.name.clone(),
-                            column: idx.columns[0].clone(),
-                            dimension: vidx.dimension,
-                            dataset_version: idx.dataset_version,
-                            metric_type: pb::VectorMetricType::from_i32(vidx.metric_type)
-                                .ok_or(Error::Index(format!(
-                                    "Unsupported metric type value: {}",
-                                    vidx.metric_type
-                                )))?
-                                .into(),
-                            ivf,
-                            pq,
-                            transforms: vec![],
-                        })
+        let metadata = if let Some(idx_impl) = idx.implementation.as_ref() {
+            match idx_impl {
+                pb::index::Implementation::VectorIndex(vidx) => {
+                    let num_stages = vidx.stages.len();
+                    if num_stages != 2 && num_stages != 3 {
+                        return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
+                    };
+                    let mut stages: Vec<Arc<dyn Stage>> = vec![];
+                    for stg in vidx.stages.iter() {
+                        match stg.stage.as_ref() {
+                            Some(PbStage::Transform(tf)) => {
+                                stages.push(Arc::new(tf.clone()));
+                            }
+                            Some(PbStage::Ivf(ivf_pb)) => {
+                                stages.push(Arc::new(Ivf::try_from(ivf_pb)?));
+                            }
+                            Some(PbStage::Pq(pq_proto)) => {
+                                stages.push(Arc::new(pq_proto.into()));
+                            }
+                            _ => {}
+                        }
                     }
-                }?
-            } else {
-                return Err(Error::IO("Invalid protobuf".to_string()));
-            };
+
+                    Ok::<Self, Error>(Self {
+                        name: idx.name.clone(),
+                        column: idx.columns[0].clone(),
+                        dimension: vidx.dimension,
+                        dataset_version: idx.dataset_version,
+                        metric_type: pb::VectorMetricType::from_i32(vidx.metric_type)
+                            .ok_or(Error::Index(format!(
+                                "Unsupported metric type value: {}",
+                                vidx.metric_type
+                            )))?
+                            .into(),
+                        ivf,
+                        pq,
+                        transforms: vec![],
+                    })
+                }
+            }?
+        } else {
+            return Err(Error::IO("Invalid protobuf".to_string()));
+        };
         Ok(metadata)
     }
 }

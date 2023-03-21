@@ -55,13 +55,17 @@ const INDEX_FILE_NAME: &str = "index.idx";
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
 pub struct Query {
+    /// The column to be searched.
     pub column: String,
+
     /// The vector to be searched.
     pub key: Arc<Float32Array>,
+
     /// Top k results to return.
     pub k: usize,
-    /// The number of probs to load and search.
-    pub nprobs: usize,
+
+    /// The number of probes to load and search.
+    pub nprobes: usize,
 
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
