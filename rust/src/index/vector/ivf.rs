@@ -35,21 +35,16 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    pq::{PQIndex, ProductQuantizer},
-    LoadableVectorIndex, MetricType, Query, VectorIndex,
+    pq::ProductQuantizer, LoadableVectorIndex, MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::arrow::{linalg::MatrixView, *};
-use crate::io::{
-    object_reader::{read_message, ObjectReader},
-    read_message_from_buf, read_metadata_offset,
-};
+use crate::io::object_reader::ObjectReader;
 use crate::{
     dataset::{Dataset, ROW_ID},
     index::{pb, pb::vector_index_stage::Stage},
 };
 use crate::{Error, Result};
 
-const INDEX_FILE_NAME: &str = "index.idx";
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";
@@ -68,7 +63,7 @@ pub struct IVFIndex {
 }
 
 impl IVFIndex {
-    fn new(
+    pub(crate) fn new(
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
         sub_index: Arc<dyn LoadableVectorIndex>,
@@ -131,58 +126,6 @@ impl VectorIndex for IVFIndex {
     }
 }
 
-/// IVF PQ Index.
-pub struct IvfPQIndex {
-    /// The vector index pipeline.
-    index: Arc<dyn VectorIndex>,
-}
-
-impl IvfPQIndex {
-    /// Open the IvfPQ index on dataset, specified by the index `name`.
-    pub async fn new(dataset: &Dataset, uuid: &str) -> Result<Self> {
-        let index_dir = dataset.indices_dir().child(uuid);
-        let index_file = index_dir.child(INDEX_FILE_NAME);
-
-        let object_store = dataset.object_store();
-        let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
-
-        let file_size = reader.size().await?;
-        let prefetch_size = object_store.prefetch_size();
-        let begin = if file_size < prefetch_size {
-            0
-        } else {
-            file_size - prefetch_size
-        };
-        let tail_bytes = reader.get_range(begin..file_size).await?;
-        let metadata_pos = read_metadata_offset(&tail_bytes)?;
-        let proto: pb::Index = if metadata_pos < file_size - tail_bytes.len() {
-            // We have not read the metadata bytes yet.
-            read_message(reader.as_ref(), metadata_pos).await?
-        } else {
-            let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_message_from_buf(&tail_bytes.slice(offset..))?
-        };
-        let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
-
-        let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
-        let ivf_index = Arc::new(IVFIndex::new(
-            index_metadata.ivf,
-            reader,
-            pq_index,
-            index_metadata.metric_type,
-        ));
-
-        Ok(Self { index: ivf_index })
-    }
-}
-
-#[async_trait]
-impl VectorIndex for IvfPQIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        self.index.search(query).await
-    }
-}
-
 /// Ivf PQ index metadata.
 ///
 /// It contains the on-disk data for a IVF PQ index.
@@ -201,13 +144,13 @@ pub struct IvfPQIndexMetadata {
     dataset_version: u64,
 
     /// Metric to compute distance
-    metric_type: MetricType,
+    pub(crate) metric_type: MetricType,
 
     /// IVF model
-    ivf: Ivf,
+    pub(crate) ivf: Ivf,
 
     /// Product Quantizer
-    pq: Arc<ProductQuantizer>,
+    pub(crate) pq: Arc<ProductQuantizer>,
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
@@ -315,7 +258,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
 
 /// Ivf Model
 #[derive(Debug, Clone)]
-struct Ivf {
+pub(crate) struct Ivf {
     /// Centroids of each partition.
     ///
     /// It is a 2-D `(num_partitions * dimension)` of float32 array, 64-bit aligned via Arrow

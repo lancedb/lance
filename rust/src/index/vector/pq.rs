@@ -330,8 +330,8 @@ impl ProductQuantizer {
         for (i, sub_code) in code.iter().enumerate() {
             let centroids = self.centroids(i).unwrap();
             builder.append_slice(
-                &centroids.values()
-                    [*sub_code as usize * sub_vector_dim..(*sub_code as usize + 1) * sub_vector_dim],
+                &centroids.values()[*sub_code as usize * sub_vector_dim
+                    ..(*sub_code as usize + 1) * sub_vector_dim],
             );
         }
         Arc::new(builder.finish())

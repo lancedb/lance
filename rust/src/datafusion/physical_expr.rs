@@ -98,11 +98,6 @@ impl PartialEq<dyn Any> for Column {
     }
 }
 
-/// Create a column expression.
-pub fn col(name: &str) -> Arc<dyn PhysicalExpr> {
-    Arc::new(Column::new(name.to_string()))
-}
-
 struct ColumnVisitor {
     columns: Vec<String>,
 }
