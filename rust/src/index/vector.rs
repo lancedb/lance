@@ -27,14 +27,15 @@ mod opq;
 mod pq;
 mod traits;
 
-use self::{
-    ivf::{IVFIndex, IvfPQIndexMetadata},
-    pq::PQIndex,
-};
+use self::{ivf::IVFIndex, pq::PQIndex};
 
 use super::{pb, IndexParams};
 use crate::{
     dataset::Dataset,
+    index::{
+        pb::vector_index_stage::Stage,
+        vector::{ivf::Ivf, pq::ProductQuantizer},
+    },
     io::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
@@ -50,7 +51,6 @@ const MAX_ITERATIONS: usize = 50;
 const MAX_OPQ_ITERATIONS: usize = 100;
 const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
-
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
@@ -238,15 +238,86 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
         let offset = tail_bytes.len() - (file_size - metadata_pos);
         read_message_from_buf(&tail_bytes.slice(offset..))?
     };
-    let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
-    let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
-    let ivf_index = Arc::new(IVFIndex::new(
-        index_metadata.ivf,
-        reader,
-        pq_index,
-        index_metadata.metric_type,
-    ));
+    if proto.columns.len() != 1 {
+        return Err(Error::Index(
+            "VectorIndex only supports 1 column".to_string(),
+        ));
+    }
+    assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
 
-    Ok(ivf_index)
+    let Some(idx_impl) = proto.implementation.as_ref() else {
+        return Err(Error::Index("Invalid protobuf for VectorIndex metadata".to_string()));
+    };
+
+    let vec_idx = match idx_impl {
+        pb::index::Implementation::VectorIndex(vi) => vi,
+    };
+
+    let num_stages = vec_idx.stages.len();
+    if num_stages != 2 && num_stages != 3 {
+        return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
+    };
+
+    let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
+        .ok_or(Error::Index(format!(
+            "Unsupported metric type value: {}",
+            vec_idx.metric_type
+        )))?
+        .into();
+
+    let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+    for stg in vec_idx.stages.iter().rev() {
+        match stg.stage.as_ref() {
+            Some(Stage::Transform(tf)) => {
+                // stages.push(Arc::new(tf.clone()));
+            }
+            Some(Stage::Ivf(ivf_pb)) => {
+                if last_stage.is_none() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                }
+                let ivf = Ivf::try_from(ivf_pb)?;
+                last_stage = Some(Arc::new(IVFIndex::new(
+                    ivf,
+                    reader.clone(),
+                    last_stage.as_ref()
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Arc<dyn LoadableVectorIndex>>()
+                        .ok_or_else(|| {
+                            Error::Index(format!(
+                                "Expected a LoadableVectorIndex, got: {:?}",
+                                last_stage
+                            ))
+                        })?
+                        .clone(),
+                    metric_type,
+                )));
+
+                // stages.push(Arc::new(Ivf::try_from(ivf_pb)?));
+            }
+            Some(Stage::Pq(pq_proto)) => {
+                if last_stage.is_some() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                };
+                let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
+                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+            }
+            _ => {}
+        }
+    }
+
+    if last_stage.is_none() {
+        return Err(Error::Index(format!(
+            "Invalid index stages: {:?}",
+            vec_idx.stages
+        )));
+    }
+    Ok(last_stage.unwrap())
 }

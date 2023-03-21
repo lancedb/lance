@@ -14,7 +14,7 @@
 
 //! IVF - Inverted File index.
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
@@ -35,13 +35,17 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    pq::ProductQuantizer, LoadableVectorIndex, MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    opq::OptimizedProductQuantizer, pq::ProductQuantizer, LoadableVectorIndex, MetricType, Query,
+    VectorIndex, INDEX_FILE_NAME,
 };
-use crate::arrow::{linalg::MatrixView, *};
 use crate::io::object_reader::ObjectReader;
 use crate::{
+    arrow::{linalg::MatrixView, *},
+    index::vector::Transformer,
+};
+use crate::{
     dataset::{Dataset, ROW_ID},
-    index::{pb, pb::vector_index_stage::Stage as PbStage},
+    index::pb,
 };
 use crate::{Error, Result};
 
@@ -77,9 +81,7 @@ impl IVFIndex {
             metric_type,
         }
     }
-}
 
-impl IVFIndex {
     async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
         let offset = self.ivf.offsets[partition_id];
         let length = self.ivf.lengths[partition_id] as usize;
@@ -97,12 +99,18 @@ impl IVFIndex {
     }
 }
 
+impl std::fmt::Debug for IVFIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Ivf({}) -> {:?}", self.metric_type, self.sub_index)
+    }
+}
+
 #[async_trait]
 impl VectorIndex for IVFIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        let partition_ids = self
-            .ivf
-            .find_partitions(&query.key, query.nprobs, self.metric_type)?;
+        let partition_ids =
+            self.ivf
+                .find_partitions(&query.key, query.nprobes, self.metric_type)?;
         let candidates = stream::iter(partition_ids.values())
             .then(|part_id| async move { self.search_in_partition(*part_id as usize, query).await })
             .collect::<Vec<_>>()
@@ -124,6 +132,10 @@ impl VectorIndex for IVFIndex {
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &refined_index, None)?;
         Ok(as_struct_array(&taken_scores).into())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -198,62 +210,6 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 },
             })),
         })
-    }
-}
-
-impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
-    type Error = Error;
-
-    fn try_from(idx: &pb::Index) -> Result<Self> {
-        if idx.columns.len() != 1 {
-            return Err(Error::Schema("IVF_PQ only supports 1 column".to_string()));
-        }
-        assert_eq!(idx.index_type, pb::IndexType::Vector as i32);
-
-        let metadata = if let Some(idx_impl) = idx.implementation.as_ref() {
-            match idx_impl {
-                pb::index::Implementation::VectorIndex(vidx) => {
-                    let num_stages = vidx.stages.len();
-                    if num_stages != 2 && num_stages != 3 {
-                        return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
-                    };
-                    let mut stages: Vec<Arc<dyn VectorIndex>> = vec![];
-                    for stg in vidx.stages.iter() {
-                        match stg.stage.as_ref() {
-                            Some(PbStage::Transform(tf)) => {
-                                stages.push(Arc::new(tf.clone()));
-                            }
-                            Some(PbStage::Ivf(ivf_pb)) => {
-                                stages.push(Arc::new(Ivf::try_from(ivf_pb)?));
-                            }
-                            Some(PbStage::Pq(pq_proto)) => {
-                                stages.push(Arc::new(pq_proto.into()));
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    Ok::<Self, Error>(Self {
-                        name: idx.name.clone(),
-                        column: idx.columns[0].clone(),
-                        dimension: vidx.dimension,
-                        dataset_version: idx.dataset_version,
-                        metric_type: pb::VectorMetricType::from_i32(vidx.metric_type)
-                            .ok_or(Error::Index(format!(
-                                "Unsupported metric type value: {}",
-                                vidx.metric_type
-                            )))?
-                            .into(),
-                        ivf,
-                        pq,
-                        transforms: vec![],
-                    })
-                }
-            }?
-        } else {
-            return Err(Error::IO("Invalid protobuf".to_string()));
-        };
-        Ok(metadata)
     }
 }
 

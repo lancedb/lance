@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_arith::aggregate::min;
@@ -38,6 +39,7 @@ use crate::{Error, Result};
 
 /// Product Quantization Index.
 ///
+#[derive(Debug)]
 pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
@@ -214,6 +216,10 @@ impl VectorIndex for PQIndex {
             ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -13,6 +13,9 @@
 // limitations under the License.
 
 //! Flat Vector Index.
+//!
+
+use std::any::Any;
 
 use arrow::array::as_primitive_array;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
@@ -115,5 +118,9 @@ impl VectorIndex for FlatIndex<'_> {
             .try_into_stream()
             .await?;
         flat_search(stream, params).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        todo!()
     }
 }
