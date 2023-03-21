@@ -56,11 +56,11 @@ const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";
 
 /// IVF Index.
-pub struct IVFIndex<'a> {
+pub struct IVFIndex {
     /// Ivf model
     ivf: Ivf,
 
-    reader: &'a dyn ObjectReader,
+    reader: Arc<dyn ObjectReader>,
 
     /// Index in each partition.
     sub_index: Arc<dyn VectorIndex>,
@@ -68,14 +68,33 @@ pub struct IVFIndex<'a> {
     metric_type: MetricType,
 }
 
-impl IVFIndex<'_> {
+impl IVFIndex {
+    fn new(
+        ivf: Ivf,
+        reader: Arc<dyn ObjectReader>,
+        sub_index: Arc<dyn VectorIndex>,
+        metric_type: MetricType,
+    ) -> Self {
+        Self {
+            ivf,
+            reader,
+            sub_index,
+            metric_type,
+        }
+    }
+}
+
+impl IVFIndex {
     async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
         let offset = self.ivf.offsets[partition_id];
         let length = self.ivf.lengths[partition_id] as usize;
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
 
-        let part_index = self.sub_index.load(self.reader, offset, length).await?;
+        let part_index = self
+            .sub_index
+            .load(self.reader.as_ref(), offset, length)
+            .await?;
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();
@@ -84,7 +103,7 @@ impl IVFIndex<'_> {
 }
 
 #[async_trait]
-impl VectorIndex for IVFIndex<'_> {
+impl VectorIndex for IVFIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         let partition_ids = self
             .ivf
@@ -123,26 +142,22 @@ impl VectorIndex for IVFIndex<'_> {
 }
 
 /// IVF PQ Index.
-pub struct IvfPQIndex<'a> {
-    reader: Box<dyn ObjectReader + 'a>,
-
+pub struct IvfPQIndex {
     /// The vector index pipeline.
     index: Arc<dyn VectorIndex>,
-
-    metric_type: MetricType,
 
     /// Transform applys to each vector.
     transforms: Vec<Arc<dyn Transformer>>,
 }
 
-impl<'a> IvfPQIndex<'a> {
+impl IvfPQIndex {
     /// Open the IvfPQ index on dataset, specified by the index `name`.
-    pub async fn new(dataset: &'a Dataset, uuid: &str) -> Result<IvfPQIndex<'a>> {
+    pub async fn new(dataset: &Dataset, uuid: &str) -> Result<Self> {
         let index_dir = dataset.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
 
         let object_store = dataset.object_store();
-        let reader = object_store.open(&index_file).await?;
+        let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
 
         let file_size = reader.size().await?;
         let prefetch_size = object_store.prefetch_size();
@@ -182,25 +197,32 @@ impl<'a> IvfPQIndex<'a> {
             .try_collect::<Vec<Arc<dyn Transformer>>>()
             .await?;
 
-        Ok(Self {
+        let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
+        let ivf_index = Arc::new(IVFIndex::new(
+            index_metadata.ivf,
             reader,
-            metric_type: index_metadata.metric_type,
+            pq_index,
+            index_metadata.metric_type,
+        ));
+
+        Ok(Self {
+            index: ivf_index,
             transforms,
         })
     }
 }
 
 #[async_trait]
-impl VectorIndex for IvfPQIndex<'_> {
+impl VectorIndex for IvfPQIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         self.index.search(query).await
     }
 
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
-        offset: usize,
-        length: usize,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
         panic!("IvfPQIndex does not support load");
     }

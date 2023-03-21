@@ -51,7 +51,7 @@ pub struct PQIndex {
     pub dimension: usize,
 
     /// Product quantizer.
-    pub pq: ProductQuantizer,
+    pub pq: Arc<ProductQuantizer>,
 
     /// PQ code
     pub code: Option<Arc<UInt8Array>>,
@@ -63,29 +63,18 @@ pub struct PQIndex {
     metric_type: MetricType,
 }
 
-impl<'a> PQIndex {
+impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub async fn new(
-        pq: ProductQuantizer,
-        metric_type: MetricType,
-    ) -> Result<PQIndex> {
-        let pq_code_length = pq.num_sub_vectors * length;
-        let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
-
-        let row_id_offset = offset + pq_code_length /* *1 */;
-        let row_ids =
-            read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
-
-        Ok(Self {
+    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+        Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
-            code: Arc::new(as_primitive_array(&pq_code).clone()),
-            row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+            code: None,
+            row_ids: None,
             pq,
             metric_type,
-        })
+        }
     }
 
     fn fast_l2_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
@@ -110,6 +99,8 @@ impl<'a> PQIndex {
 
         Ok(Arc::new(Float32Array::from_iter(
             self.code
+                .as_ref()
+                .unwrap()
                 .values()
                 .chunks_exact(self.num_sub_vectors)
                 .map(|c| {
@@ -166,6 +157,8 @@ impl<'a> PQIndex {
 
         Ok(Arc::new(Float32Array::from_iter(
             self.code
+                .as_ref()
+                .unwrap()
                 .values()
                 .chunks_exact(self.num_sub_vectors)
                 .map(|c| {
@@ -196,7 +189,15 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        assert_eq!(self.code.len() % self.num_sub_vectors, 0);
+        if self.code.is_none() || self.row_ids.is_none() {
+            return Err(Error::Index(
+                "PQIndex::search: PQ is not initialized".to_string(),
+            ));
+        }
+
+        let code = self.code.as_ref().unwrap();
+        let row_ids = self.row_ids.as_ref().unwrap();
+        assert_eq!(code.len() % self.num_sub_vectors, 0);
 
         let scores = if self.metric_type == MetricType::L2 {
             self.fast_l2_scores(&query.key)?
@@ -206,7 +207,7 @@ impl VectorIndex for PQIndex {
 
         let indices = sort_to_indices(&scores, None, Some(query.k))?;
         let scores = take(&scores, &indices, None)?;
-        let row_ids = take(self.row_ids.as_ref(), &indices, None)?;
+        let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(SCORE_COL, DataType::Float32, false),
@@ -234,9 +235,9 @@ impl VectorIndex for PQIndex {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
-            code: Arc::new(as_primitive_array(&pq_code).clone()),
-            row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
-            pq: self.pq,
+            code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
+            row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
+            pq: self.pq.clone(),
             metric_type: self.metric_type,
         }))
     }
