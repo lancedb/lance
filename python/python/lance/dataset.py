@@ -308,11 +308,14 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
-
         If `index_type` is "IVF_PQ", then the following parameters are required:
 
         - **num_partitions**: the number of partitions of IVF (Inverted File Index).
         - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+
+        Optional parameters for "IVF_PQ":
+        - **use_opq**: whether to use OPQ (Optimized Product Quantization).
+        - **max_opq_iterations**: the maximum number of iterations for training OPQ.
 
         For SIMD, the vector dimensions / num_sub_vectors must be a multiple of the stride
         depending on the platform (4, 8, 16). An error is raised if this alignment
