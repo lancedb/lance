@@ -34,7 +34,11 @@ use crate::{
     dataset::Dataset,
     index::{
         pb::vector_index_stage::Stage,
-        vector::{ivf::Ivf, pq::ProductQuantizer, opq::{OPQIndex, OptimizedProductQuantizer}},
+        vector::{
+            ivf::Ivf,
+            opq::{OPQIndex, OptimizedProductQuantizer},
+            pq::ProductQuantizer,
+        },
     },
     io::{
         object_reader::{read_message, ObjectReader},
@@ -292,7 +296,7 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
                             last_stage.as_ref().unwrap().clone(),
                             opq,
                         )));
-                    },
+                    }
                 }
             }
             Some(Stage::Ivf(ivf_pb)) => {

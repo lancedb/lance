@@ -265,13 +265,13 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
-    use arrow_array::{Float32Array, RecordBatchReader, FixedSizeListArray};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
     use crate::arrow::{linalg::MatrixView, *};
     use crate::dataset::Dataset;
     use crate::index::{
-        vector::{open_index, VectorIndexParams, opq::OPQIndex},
+        vector::{ivf::IVFIndex, open_index, opq::OPQIndex, VectorIndexParams},
         IndexType,
     };
 
@@ -288,8 +288,7 @@ mod tests {
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);
     }
 
-    #[tokio::test]
-    async fn test_build_index_with_opq() {
+    async fn test_build_index(with_opq: bool) {
         let tmp_dir = tempfile::tempdir().unwrap();
 
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -319,7 +318,7 @@ mod tests {
             .unwrap();
         let column = "vector";
 
-        let params = VectorIndexParams::ivf_pq(4, 8, 4, true, MetricType::L2, 3);
+        let params = VectorIndexParams::ivf_pq(4, 8, 4, with_opq, MetricType::L2, 3);
         let dataset = dataset
             .create_index(&[column], IndexType::Vector, None, &params, true)
             .await
@@ -334,13 +333,26 @@ mod tests {
         let uuid = index_file.file_name().to_str().unwrap().to_string();
 
         let index = open_index(&dataset, &uuid).await.unwrap();
-        println!("Index is: {:?}", index);
 
-        let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();
-        assert!(opq_idx.opq.rotation.is_some());
+        if with_opq {
+            let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();
+            assert!(opq_idx.opq.rotation.is_some());
 
-        let rotation = opq_idx.opq.rotation.as_ref().unwrap();
-        assert_eq!(rotation.num_rows(), 64);
-        assert_eq!(rotation.num_columns(), 64);
+            let rotation = opq_idx.opq.rotation.as_ref().unwrap();
+            assert_eq!(rotation.num_rows(), 64);
+            assert_eq!(rotation.num_columns(), 64);
+        } else {
+            assert!(index.as_any().is::<IVFIndex>());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_opq() {
+        test_build_index(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_build_index_without_opq() {
+        test_build_index(false).await;
     }
 }
