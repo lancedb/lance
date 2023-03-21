@@ -38,7 +38,7 @@ use crate::{Error, Result};
 
 /// Product Quantization Index.
 ///
-pub struct PQIndex<'a> {
+pub struct PQIndex {
     /// Number of bits for the centroids.
     ///
     /// Only support 8, as one of `u8` byte now.
@@ -51,26 +51,24 @@ pub struct PQIndex<'a> {
     pub dimension: usize,
 
     /// Product quantizer.
-    pub pq: &'a ProductQuantizer,
+    pub pq: ProductQuantizer,
 
     /// PQ code
-    pub code: Arc<UInt8Array>,
+    pub code: Option<Arc<UInt8Array>>,
 
     /// ROW Id used to refer to the actual row in dataset.
-    pub row_ids: Arc<UInt64Array>,
+    pub row_ids: Option<Arc<UInt64Array>>,
 
+    /// Metric type.
     metric_type: MetricType,
 }
 
-impl<'a> PQIndex<'a> {
+impl<'a> PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub async fn load(
-        reader: &dyn ObjectReader,
-        pq: &'a ProductQuantizer,
+    pub async fn new(
+        pq: ProductQuantizer,
         metric_type: MetricType,
-        offset: usize,
-        length: usize,
-    ) -> Result<PQIndex<'a>> {
+    ) -> Result<PQIndex> {
         let pq_code_length = pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
@@ -194,7 +192,7 @@ impl<'a> PQIndex<'a> {
 }
 
 #[async_trait]
-impl VectorIndex for PQIndex<'_> {
+impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     async fn search(&self, query: &Query) -> Result<RecordBatch> {

@@ -126,11 +126,8 @@ impl VectorIndex for IVFIndex<'_> {
 pub struct IvfPQIndex<'a> {
     reader: Box<dyn ObjectReader + 'a>,
 
-    /// Ivf file.
-    ivf: Ivf,
-
-    /// Number of bits used for product quantization centroids.
-    pq: Arc<ProductQuantizer>,
+    /// The vector index pipeline.
+    index: Arc<dyn VectorIndex>,
 
     metric_type: MetricType,
 
@@ -187,73 +184,16 @@ impl<'a> IvfPQIndex<'a> {
 
         Ok(Self {
             reader,
-            ivf: index_metadata.ivf,
-            pq: index_metadata.pq,
             metric_type: index_metadata.metric_type,
             transforms,
         })
-    }
-
-    async fn search_in_partition(
-        &self,
-        partition_id: usize,
-        key: &Float32Array,
-        k: usize,
-    ) -> Result<RecordBatch> {
-        let offset = self.ivf.offsets[partition_id];
-        let length = self.ivf.lengths[partition_id] as usize;
-        let partition_centroids = self.ivf.centroids.value(partition_id);
-        let residual_key = subtract_dyn(key, &partition_centroids)?;
-
-        // TODO: Keep PQ index in LRU
-        let pq_index = PQIndex::load(
-            self.reader.as_ref(),
-            self.pq.as_ref(),
-            self.metric_type,
-            offset,
-            length,
-        )
-        .await?;
-        pq_index.search(as_primitive_array(&residual_key), k)
     }
 }
 
 #[async_trait]
 impl VectorIndex for IvfPQIndex<'_> {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        let mut mat = MatrixView::new(query.key.clone(), query.key.len());
-        for transform in self.transforms.iter() {
-            mat = transform.transform(&mat).await?;
-        }
-        let key = mat.data();
-        let key_ref = key.as_ref();
-        let partition_ids = self
-            .ivf
-            .find_partitions(key_ref, query.nprobs, self.metric_type)?;
-        let candidates = stream::iter(partition_ids.values())
-            .then(|part_id| async move {
-                self.search_in_partition(*part_id as usize, key_ref, query.k)
-                    .await
-            })
-            .collect::<Vec<_>>()
-            .await;
-        let mut batches = vec![];
-        for b in candidates {
-            batches.push(b?);
-        }
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
-
-        let score_col = batch.column_by_name("score").ok_or_else(|| {
-            Error::IO(format!(
-                "score column does not exist in batch: {}",
-                batch.schema()
-            ))
-        })?;
-        let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
-
-        let struct_arr = StructArray::from(batch);
-        let taken_scores = take(&struct_arr, &refined_index, None)?;
-        Ok(as_struct_array(&taken_scores).into())
+        self.index.search(query).await
     }
 
     async fn load(
