@@ -35,8 +35,8 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    opq::OptimizedProductQuantizer, pq::ProductQuantizer, LoadableVectorIndex, MetricType, Query,
-    VectorIndex, INDEX_FILE_NAME,
+    opq::OptimizedProductQuantizer, pq::ProductQuantizer, MetricType, Query, VectorIndex,
+    INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
 use crate::{
@@ -61,25 +61,31 @@ pub struct IVFIndex {
     reader: Arc<dyn ObjectReader>,
 
     /// Index in each partition.
-    sub_index: Arc<dyn LoadableVectorIndex>,
+    sub_index: Arc<dyn VectorIndex>,
 
     metric_type: MetricType,
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
-        sub_index: Arc<dyn LoadableVectorIndex>,
+        sub_index: Arc<dyn VectorIndex>,
         metric_type: MetricType,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        if !sub_index.is_loadable() {
+            return Err(Error::Index(format!(
+                "IVF sub index must be loadable, got: {:?}",
+                sub_index
+            )));
+        }
+        Ok(Self {
             ivf,
             reader,
             sub_index,
             metric_type,
-        }
+        })
     }
 
     async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
@@ -136,6 +142,19 @@ impl VectorIndex for IVFIndex {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("Flat index does not support load".to_string()))
     }
 }
 
@@ -734,79 +753,4 @@ async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<I
         centroids,
         data.num_columns() as i32,
     )?)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_schema::Field as ArrowField;
-
-    #[tokio::test]
-    async fn test_build_index_with_opq() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "vector",
-            DataType::Int32,
-            false,
-        )]));
-
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
-        let dataset = Dataset::open("tests/data").unwrap();
-        let column = "vector";
-        let index_name = "ivfpq";
-        let uuid = Uuid::new_v4();
-        let pq_params = PQBuildParams {
-            num_sub_vectors: 8,
-            num_bits: 8,
-            max_iters: 10,
-            metric_type: MetricType::L2,
-        };
-        let opq_params = OPQBuildParams {
-            num_sub_vectors: 8,
-            num_bits: 8,
-            max_iters: 10,
-            max_opq_iters: 10,
-            metric_type: MetricType::L2,
-        };
-        let ivf_params = IvfBuildParams {
-            num_partitions: 8,
-            max_iters: 10,
-            metric_type: MetricType::L2,
-        };
-        let transformers = vec![];
-        let index = build_index(
-            &dataset,
-            column,
-            index_name,
-            uuid,
-            pq_params,
-            opq_params,
-            ivf_params,
-            &transformers,
-        )
-        .await
-        .unwrap();
-        assert_eq!(index.name(), index_name);
-        assert_eq!(index.column(), column);
-        assert_eq!(index.dataset_version(), dataset.version().version);
-        assert_eq!(index.metric_type(), MetricType::L2);
-        assert_eq!(index.num_partitions(), 8);
-        assert_eq!(index.num_vectors(), 1000);
-        assert_eq!(index.dimension(), 128);
-        assert_eq!(index.num_sub_vectors(), 8);
-        assert_eq!(index.num_bits(), 8);
-        assert_eq!(index.num_centroids(), 8);
-        assert_eq!(index.num_transforms(), 0);
-    }
 }

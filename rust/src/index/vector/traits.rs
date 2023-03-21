@@ -49,23 +49,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
 
     fn as_any(&self) -> &dyn Any;
-}
 
-/// A [`VectorIndex`] that can be loaded on-demand, usually as a IVF partition.
-#[async_trait]
-pub trait LoadableVectorIndex: VectorIndex {
-    /// Load the index from the reader.
-    ///
-    /// Parameters:
-    /// - *reader*: the object reader.
-    /// - *offset*: the offset of the index in file.
-    /// - *length*: the number of vectors in the partition.
+    fn is_loadable(&self) -> bool;
+
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn LoadableVectorIndex>>;
+    ) -> Result<Arc<dyn VectorIndex>>;
 }
 
 /// Transformer on vectors.

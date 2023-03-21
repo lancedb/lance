@@ -34,7 +34,7 @@ use crate::{
     dataset::Dataset,
     index::{
         pb::vector_index_stage::Stage,
-        vector::{ivf::Ivf, pq::ProductQuantizer},
+        vector::{ivf::Ivf, pq::ProductQuantizer, opq::{OPQIndex, OptimizedProductQuantizer}},
     },
     io::{
         object_reader::{read_message, ObjectReader},
@@ -270,7 +270,30 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
             Some(Stage::Transform(tf)) => {
-                // stages.push(Arc::new(tf.clone()));
+                if last_stage.is_none() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                }
+                match tf.r#type() {
+                    pb::TransformType::Opq => {
+                        let opq = OptimizedProductQuantizer::load(
+                            reader.as_ref(),
+                            tf.position as usize,
+                            tf.shape
+                                .iter()
+                                .map(|s| *s as usize)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                        )
+                        .await?;
+                        last_stage = Some(Arc::new(OPQIndex::new(
+                            last_stage.as_ref().unwrap().clone(),
+                            opq,
+                        )));
+                    },
+                }
             }
             Some(Stage::Ivf(ivf_pb)) => {
                 if last_stage.is_none() {
@@ -280,25 +303,12 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
                     )));
                 }
                 let ivf = Ivf::try_from(ivf_pb)?;
-                last_stage = Some(Arc::new(IVFIndex::new(
+                last_stage = Some(Arc::new(IVFIndex::try_new(
                     ivf,
                     reader.clone(),
-                    last_stage
-                        .as_ref()
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<Arc<dyn LoadableVectorIndex>>()
-                        .ok_or_else(|| {
-                            Error::Index(format!(
-                                "Expected a LoadableVectorIndex, got: {:?}",
-                                last_stage
-                            ))
-                        })?
-                        .clone(),
+                    last_stage.unwrap(),
                     metric_type,
-                )));
-
-                // stages.push(Arc::new(Ivf::try_from(ivf_pb)?));
+                )?));
             }
             Some(Stage::Pq(pq_proto)) => {
                 if last_stage.is_some() {

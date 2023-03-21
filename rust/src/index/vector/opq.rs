@@ -15,14 +15,16 @@
 //! Optimized Product Quantization
 //!
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt8Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
-use super::{pq::ProductQuantizer, MetricType, Transformer};
+use super::Query;
+use super::{pq::ProductQuantizer, MetricType, Transformer, VectorIndex};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
@@ -199,6 +201,47 @@ impl Transformer for OptimizedProductQuantizer {
     }
 }
 
+#[derive(Debug)]
+pub struct OPQIndex {
+    sub_index: Arc<dyn VectorIndex>,
+
+    opq: OptimizedProductQuantizer,
+}
+
+impl OPQIndex {
+    pub fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
+        Self { sub_index, opq }
+    }
+}
+
+#[async_trait]
+impl VectorIndex for OPQIndex {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let mat = MatrixView::new(query.key.clone(), query.key.len());
+        let transformed = self.opq.transform(&mat).await?;
+        let mut transformed_query = query.clone();
+        transformed_query.key = transformed.data();
+        self.sub_index.search(&transformed_query).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("OPQ does not support load".to_string()))
+    }
+}
+
 impl TryFrom<&OptimizedProductQuantizer> for Transform {
     type Error = Error;
 
@@ -222,9 +265,15 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
-    use arrow_array::Float32Array;
+    use arrow_array::{Float32Array, RecordBatchReader, FixedSizeListArray};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
-    use crate::arrow::linalg::MatrixView;
+    use crate::arrow::{linalg::MatrixView, *};
+    use crate::dataset::Dataset;
+    use crate::index::{
+        vector::{open_index, VectorIndexParams, opq::OPQIndex},
+        IndexType,
+    };
 
     #[tokio::test]
     async fn test_train_opq() {
@@ -237,5 +286,61 @@ mod tests {
 
         assert_eq!(opq.rotation.as_ref().unwrap().num_rows(), DIM);
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_opq() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                Box::new(ArrowField::new("item", DataType::Float32, true)),
+                64,
+            ),
+            true,
+        )]));
+
+        let vectors = Float32Array::from_iter_values((0..32000).map(|x| x as f32));
+        let vectors = FixedSizeListArray::try_new(vectors, 64).unwrap();
+        let batch = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(vectors)],
+        )
+        .unwrap()
+        .into()]);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
+        Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(tmp_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let column = "vector";
+
+        let params = VectorIndexParams::ivf_pq(4, 8, 4, true, MetricType::L2, 3);
+        let dataset = dataset
+            .create_index(&[column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let index_file = std::fs::read_dir(tmp_dir.path().join("_indices"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        println!("{:?}", index_file.path());
+        let uuid = index_file.file_name().to_str().unwrap().to_string();
+
+        let index = open_index(&dataset, &uuid).await.unwrap();
+        println!("Index is: {:?}", index);
+
+        let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();
+        assert!(opq_idx.opq.rotation.is_some());
+
+        let rotation = opq_idx.opq.rotation.as_ref().unwrap();
+        assert_eq!(rotation.num_rows(), 64);
+        assert_eq!(rotation.num_columns(), 64);
     }
 }
