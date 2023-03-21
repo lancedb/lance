@@ -16,7 +16,7 @@ Install using cargo:
 
 ```shell
 cargo install lance
-``` 
+```
 
 ## Examples
 
@@ -25,7 +25,7 @@ cargo install lance
 Suppose `batches` is an Arrow RecordBatchBuffer:
 
 ```rust
-use ::lance::dataset::write::WriteParams;
+use ::lance::dataset::WriteParams;
 use ::lance::dataset::Dataset;
 
 let mut write_params = WriteParams::default();
@@ -80,16 +80,16 @@ We call this "Zero copy versioning" in Lance. It makes versioning data easy with
 ### 2. Cloud storage is now the default
 
 Remote object storage is the default now for data science and machine learning and the performance characteristics of cloud are fundamentally different.<br/>
-Lance format is optimized to be cloud native. Common operations like filter-then-take can be order of magnitude faster 
+Lance format is optimized to be cloud native. Common operations like filter-then-take can be order of magnitude faster
 using Lance than Parquet, especially for ML data.
-   
+
 ### 3. Vectors must be a first class citizen, not a separate thing
 
 The majority of reasonable scale workflows should not require the added complexity and cost of a
 specialized database just to compute vector similarity. Lance integrates optimized vector indices
 into a columnar format so no additional infrastructure is required to get low latency top-K similarity search.
 
-### 4. Open standards is a requirement 
+### 4. Open standards is a requirement
 
 The DS/ML ecosystem is incredibly rich and data *must be* easily accessible across different languages, tools, and environments.
 Lance makes Apache Arrow integration its primary interface, which means conversions to/from is 2 lines of code, your
