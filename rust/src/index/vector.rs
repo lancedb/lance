@@ -283,7 +283,8 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
                 last_stage = Some(Arc::new(IVFIndex::new(
                     ivf,
                     reader.clone(),
-                    last_stage.as_ref()
+                    last_stage
+                        .as_ref()
                         .unwrap()
                         .as_any()
                         .downcast_ref::<Arc<dyn LoadableVectorIndex>>()
