@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::fmt::{self};
 
+use arrow_array::cast::{as_large_list_array, as_list_array};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
@@ -378,15 +379,15 @@ impl Field {
                 }
             }
             DataType::List(_) => {
-                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                let list_arr = as_list_array(arr);
                 self.children[0].set_dictionary(list_arr.values());
             }
             DataType::LargeList(_) => {
-                let list_arr = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+                let list_arr = as_large_list_array(arr);
                 self.children[0].set_dictionary(list_arr.values());
             }
             _ => {
-                // Add list / large list support. - should we panic?
+                // Field types that don't support dictionaries
             }
         }
     }

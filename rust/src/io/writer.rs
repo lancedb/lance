@@ -558,13 +558,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dictionary_first_element_file() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new(
-                "d",
-                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                true,
-            )
-        ]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+            true,
+        )]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
         let dict_vec = (0..100)
@@ -573,9 +571,7 @@ mod tests {
             .collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(dict_arr),
-        ];
+        let columns: Vec<ArrayRef> = vec![Arc::new(dict_arr)];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
         schema.set_dictionary(&batch).unwrap();
 
