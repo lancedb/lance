@@ -82,13 +82,23 @@ pub trait VectorIndex: Send + Sync {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
+}
 
+/// A [`VectorIndex`] that can be loaded on-demand, usually as a IVF partition.
+#[async_trait]
+pub trait LoadableVectorIndex: VectorIndex {
+    /// Load the index from the reader.
+    ///
+    /// Parameters:
+    /// - *reader*: the object reader.
+    /// - *offset*: the offset of the index in file.
+    /// - *length*: the number of vectors in the partition.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn VectorIndex>>;
+    ) -> Result<Arc<dyn LoadableVectorIndex>>;
 }
 
 /// Transformer on vectors.

@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::{MetricType, Query, VectorIndex};
+use super::{MetricType, Query, VectorIndex, LoadableVectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
@@ -215,14 +215,17 @@ impl VectorIndex for PQIndex {
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
     }
+}
 
+#[async_trait]
+impl LoadableVectorIndex for PQIndex {
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
+    ) -> Result<Arc<dyn LoadableVectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;

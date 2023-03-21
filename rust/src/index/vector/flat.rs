@@ -14,8 +14,6 @@
 
 //! Flat Vector Index.
 
-use std::sync::Arc;
-
 use arrow::array::as_primitive_array;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
@@ -27,7 +25,6 @@ use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 use super::{Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
-use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
 /// Flat Vector Index.
@@ -118,16 +115,5 @@ impl VectorIndex for FlatIndex<'_> {
             .try_into_stream()
             .await?;
         flat_search(stream, params).await
-    }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index(
-            "FlatIndex does not support load on demand".to_string(),
-        ))
     }
 }

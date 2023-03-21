@@ -36,10 +36,9 @@ use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
-    MetricType, Query, Transformer, VectorIndex,
+    MetricType, Query, VectorIndex, LoadableVectorIndex,
 };
 use crate::arrow::{linalg::MatrixView, *};
-use crate::index::vector::opq::*;
 use crate::io::{
     object_reader::{read_message, ObjectReader},
     read_message_from_buf, read_metadata_offset,
@@ -63,7 +62,7 @@ pub struct IVFIndex {
     reader: Arc<dyn ObjectReader>,
 
     /// Index in each partition.
-    sub_index: Arc<dyn VectorIndex>,
+    sub_index: Arc<dyn LoadableVectorIndex>,
 
     metric_type: MetricType,
 }
@@ -72,7 +71,7 @@ impl IVFIndex {
     fn new(
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
-        sub_index: Arc<dyn VectorIndex>,
+        sub_index: Arc<dyn LoadableVectorIndex>,
         metric_type: MetricType,
     ) -> Self {
         Self {
@@ -130,17 +129,6 @@ impl VectorIndex for IVFIndex {
         let taken_scores = take(&struct_arr, &refined_index, None)?;
         Ok(as_struct_array(&taken_scores).into())
     }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index(
-            "IvfIndex does not support load on demand".to_string(),
-        ))
-    }
 }
 
 /// IVF PQ Index.
@@ -192,17 +180,6 @@ impl IvfPQIndex {
 impl VectorIndex for IvfPQIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         self.index.search(query).await
-    }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index(
-            "IvfPQ index does not support load on demand".to_string(),
-        ))
     }
 }
 
