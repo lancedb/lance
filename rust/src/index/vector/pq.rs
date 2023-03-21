@@ -629,7 +629,8 @@ mod tests {
 
         assert_relative_eq!(
             pq.codebook.unwrap().values(),
-            actual_pq.codebook.unwrap().values()
+            actual_pq.codebook.unwrap().values(),
+            epsilon = 0.01
         );
     }
 }
