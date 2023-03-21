@@ -327,12 +327,11 @@ impl ProductQuantizer {
         assert_eq!(code.len(), self.num_sub_vectors);
         let mut builder = Float32Builder::with_capacity(self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
-        for i in 0..code.len() {
+        for (i, sub_code) in code.iter().enumerate() {
             let centroids = self.centroids(i).unwrap();
-            let sub_code = code[i];
             builder.append_slice(
                 &centroids.values()
-                    [sub_code as usize * sub_vector_dim..(sub_code as usize + 1) * sub_vector_dim],
+                    [*sub_code as usize * sub_vector_dim..(*sub_code as usize + 1) * sub_vector_dim],
             );
         }
         Arc::new(builder.finish())
@@ -435,9 +434,8 @@ impl ProductQuantizer {
         let rng = rand::rngs::SmallRng::from_entropy();
 
         // TODO: parallel training.
-        for i in 0..sub_vectors.len() {
+        for (i, sub_vec) in sub_vectors.iter().enumerate() {
             // Centroids for one sub vector.
-            let sub_vec = &sub_vectors[i];
             let values = sub_vec.values();
             let flatten_array: &Float32Array = as_primitive_array(&values);
             let prev_centroids = self.centroids(i);
@@ -542,13 +540,13 @@ impl From<&ProductQuantizer> for pb::Pq {
 fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArray>> {
     assert!(!data.num_rows() > 0);
 
-    let sub_vector_length = (data.num_columns() / m) as usize;
+    let sub_vector_length = data.num_columns() / m;
     let capacity = data.num_rows() * sub_vector_length;
     let mut subarrays = vec![];
 
     // TODO: very intensive memory copy involved!!! But this is on the write path.
     // Optimize for memory copy later.
-    for i in 0..m as usize {
+    for i in 0..m {
         let mut builder = Float32Builder::with_capacity(capacity);
         for j in 0..data.num_rows() {
             let arr = data.row(j).unwrap();
