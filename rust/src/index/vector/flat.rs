@@ -122,10 +122,12 @@ impl VectorIndex for FlatIndex<'_> {
 
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
-        offset: usize,
-        length: usize,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        panic!("FlatIndex does not support load");
+        Err(Error::Index(
+            "FlatIndex does not support load on demand".to_string(),
+        ))
     }
 }

@@ -133,11 +133,13 @@ impl VectorIndex for IVFIndex {
 
     async fn load(
         &self,
-        reader: &dyn ObjectReader,
-        offset: usize,
-        length: usize,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        panic!("IvfIndex does not support load");
+        Err(Error::Index(
+            "IvfIndex does not support load on demand".to_string(),
+        ))
     }
 }
 
@@ -145,9 +147,6 @@ impl VectorIndex for IVFIndex {
 pub struct IvfPQIndex {
     /// The vector index pipeline.
     index: Arc<dyn VectorIndex>,
-
-    /// Transform applys to each vector.
-    transforms: Vec<Arc<dyn Transformer>>,
 }
 
 impl IvfPQIndex {
@@ -177,26 +176,6 @@ impl IvfPQIndex {
         };
         let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
-        let reader_ref = reader.as_ref();
-        let transforms = stream::iter(index_metadata.transforms)
-            .map(|tf| async move {
-                Ok::<Arc<dyn Transformer>, Error>(Arc::new(
-                    OptimizedProductQuantizer::load(
-                        reader_ref,
-                        tf.position as usize,
-                        tf.shape
-                            .iter()
-                            .map(|s| *s as usize)
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                    )
-                    .await?,
-                ))
-            })
-            .buffered(4)
-            .try_collect::<Vec<Arc<dyn Transformer>>>()
-            .await?;
-
         let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
         let ivf_index = Arc::new(IVFIndex::new(
             index_metadata.ivf,
@@ -205,10 +184,7 @@ impl IvfPQIndex {
             index_metadata.metric_type,
         ));
 
-        Ok(Self {
-            index: ivf_index,
-            transforms,
-        })
+        Ok(Self { index: ivf_index })
     }
 }
 
@@ -224,7 +200,9 @@ impl VectorIndex for IvfPQIndex {
         _offset: usize,
         _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        panic!("IvfPQIndex does not support load");
+        Err(Error::Index(
+            "IvfPQ index does not support load on demand".to_string(),
+        ))
     }
 }
 
