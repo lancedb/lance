@@ -39,6 +39,7 @@ use crate::{
 };
 
 const MAX_ITERATIONS: usize = 50;
+const SCORE_COL: &str = "score";
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]

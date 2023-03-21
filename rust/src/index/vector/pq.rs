@@ -22,13 +22,15 @@ use arrow_array::{
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
+use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::MetricType;
+use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
-use crate::index::{pb, vector::kmeans::train_kmeans};
+use crate::dataset::ROW_ID;
+use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::utils::distance::compute::normalize;
 use crate::utils::distance::l2::l2_distance;
@@ -189,27 +191,56 @@ impl<'a> PQIndex<'a> {
                 }),
         )))
     }
+}
 
+#[async_trait]
+impl VectorIndex for PQIndex<'_> {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
-    pub fn search(&self, key: &Float32Array, k: usize) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
         assert_eq!(self.code.len() % self.num_sub_vectors, 0);
 
         let scores = if self.metric_type == MetricType::L2 {
-            self.fast_l2_scores(key)?
+            self.fast_l2_scores(&query.key)?
         } else {
-            self.cosine_scores(key)?
+            self.cosine_scores(&query.key)?
         };
 
-        let indices = sort_to_indices(&scores, None, Some(k))?;
+        let indices = sort_to_indices(&scores, None, Some(query.k))?;
         let scores = take(&scores, &indices, None)?;
         let row_ids = take(self.row_ids.as_ref(), &indices, None)?;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("score", DataType::Float32, false),
-            ArrowField::new("_rowid", DataType::UInt64, false),
+            ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
+    }
+
+    /// Load a PQ index (page) from the disk.
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        offset: usize,
+        length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        let pq_code_length = self.pq.num_sub_vectors * length;
+        let pq_code =
+            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+
+        let row_id_offset = offset + pq_code_length /* *1 */;
+        let row_ids =
+            read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
+
+        Ok(Arc::new(Self {
+            nbits: self.pq.num_bits,
+            num_sub_vectors: self.pq.num_sub_vectors,
+            dimension: self.pq.dimension,
+            code: Arc::new(as_primitive_array(&pq_code).clone()),
+            row_ids: Arc::new(as_primitive_array(&row_ids).clone()),
+            pq: self.pq,
+            metric_type: self.metric_type,
+        }))
     }
 }
 
