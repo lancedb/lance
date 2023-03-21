@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::{MetricType, Query, VectorIndex, LoadableVectorIndex};
+use super::{LoadableVectorIndex, MetricType, Query, VectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;

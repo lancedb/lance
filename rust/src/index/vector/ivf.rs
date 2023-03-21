@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use super::{
     pq::{PQIndex, ProductQuantizer},
-    MetricType, Query, VectorIndex, LoadableVectorIndex,
+    LoadableVectorIndex, MetricType, Query, VectorIndex,
 };
 use crate::arrow::{linalg::MatrixView, *};
 use crate::io::{
