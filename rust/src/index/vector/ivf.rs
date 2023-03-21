@@ -55,6 +55,73 @@ const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
 const RESIDUAL_COLUMN: &str = "__residual_vector";
 const PQ_CODE_COLUMN: &str = "__pq_code";
 
+/// IVF Index.
+pub struct IVFIndex<'a> {
+    /// Ivf model
+    ivf: Ivf,
+
+    reader: &'a dyn ObjectReader,
+
+    /// Index in each partition.
+    sub_index: Arc<dyn VectorIndex>,
+
+    metric_type: MetricType,
+}
+
+impl IVFIndex<'_> {
+    async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
+        let offset = self.ivf.offsets[partition_id];
+        let length = self.ivf.lengths[partition_id] as usize;
+        let partition_centroids = self.ivf.centroids.value(partition_id);
+        let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
+
+        let part_index = self.sub_index.load(self.reader, offset, length).await?;
+        // Query in partition.
+        let mut part_query = query.clone();
+        part_query.key = as_primitive_array(&residual_key).clone().into();
+        part_index.search(&part_query).await
+    }
+}
+
+#[async_trait]
+impl VectorIndex for IVFIndex<'_> {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let partition_ids = self
+            .ivf
+            .find_partitions(&query.key, query.nprobs, self.metric_type)?;
+        let candidates = stream::iter(partition_ids.values())
+            .then(|part_id| async move { self.search_in_partition(*part_id as usize, query).await })
+            .collect::<Vec<_>>()
+            .await;
+        let mut batches = vec![];
+        for b in candidates {
+            batches.push(b?);
+        }
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+
+        let score_col = batch.column_by_name("score").ok_or_else(|| {
+            Error::IO(format!(
+                "score column does not exist in batch: {}",
+                batch.schema()
+            ))
+        })?;
+        let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
+
+        let struct_arr = StructArray::from(batch);
+        let taken_scores = take(&struct_arr, &refined_index, None)?;
+        Ok(as_struct_array(&taken_scores).into())
+    }
+
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        offset: usize,
+        length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        panic!("IvfIndex does not support load");
+    }
+}
+
 /// IVF PQ Index.
 pub struct IvfPQIndex<'a> {
     reader: Box<dyn ObjectReader + 'a>,
@@ -187,6 +254,15 @@ impl VectorIndex for IvfPQIndex<'_> {
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &refined_index, None)?;
         Ok(as_struct_array(&taken_scores).into())
+    }
+
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        offset: usize,
+        length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        panic!("IvfPQIndex does not support load");
     }
 }
 

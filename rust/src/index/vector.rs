@@ -33,6 +33,7 @@ mod pq;
 use super::{pb, IndexParams};
 use crate::{
     arrow::linalg::MatrixView,
+    io::object_reader::ObjectReader,
     utils::distance::{cosine::cosine_distance, l2::l2_distance},
     Error, Result,
 };
@@ -63,7 +64,7 @@ pub struct Query {
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
-pub trait VectorIndex {
+pub trait VectorIndex: Send + Sync {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
@@ -80,6 +81,13 @@ pub trait VectorIndex {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
+
+    async fn load(
+        &self,
+        reader: &dyn ObjectReader,
+        offset: usize,
+        length: usize,
+    ) -> Result<Arc<dyn VectorIndex>>;
 }
 
 /// Transformer on vectors.
