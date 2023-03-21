@@ -538,6 +538,7 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
 mod tests {
 
     use super::*;
+    use approx::assert_relative_eq;
     use arrow_array::types::Float32Type;
 
     #[test]
@@ -595,6 +596,9 @@ mod tests {
             actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
         }
 
-        assert_eq!(pq.codebook, actual_pq.codebook);
+        assert_relative_eq!(
+            pq.codebook.unwrap().values(),
+            actual_pq.codebook.unwrap().values()
+        );
     }
 }

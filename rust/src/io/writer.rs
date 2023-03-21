@@ -307,7 +307,7 @@ impl<'a> FileWriter<'a> {
 
         let mut last_offset: usize = 0;
         pos_builder.append_value(last_offset as i64);
-        for (a_idx, array) in arrs.iter().enumerate() {
+        for array in arrs.iter() {
             let list_arr = as_large_list_array(*array);
             list_arrs.push(list_arr.values());
 
