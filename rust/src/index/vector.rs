@@ -204,7 +204,7 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
-            use_opq: true,
+            use_opq: false,
             metric_type: MetricType::L2,
             max_iterations: MAX_ITERATIONS, // Faiss
             max_opq_iterations: MAX_OPQ_ITERATIONS,

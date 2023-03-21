@@ -48,10 +48,14 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
 
+    /// As any.
     fn as_any(&self) -> &dyn Any;
 
+    /// If the index is loadable by IVF, so it can be a sub-index that
+    /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
 
+    /// Load the index from the reader on-demand.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
