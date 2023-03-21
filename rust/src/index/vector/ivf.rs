@@ -63,6 +63,7 @@ pub struct IVFIndex {
 }
 
 impl IVFIndex {
+    /// Create a new IVF index.
     pub(crate) fn new(
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
@@ -216,7 +217,7 @@ impl TryFrom<&pb::Index> for IvfPQIndexMetadata {
                     if num_stages != 2 && num_stages != 3 {
                         return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
                     };
-                    let mut stages: Vec<Arc<dyn Stage>> = vec![];
+                    let mut stages: Vec<Arc<dyn VectorIndex>> = vec![];
                     for stg in vidx.stages.iter() {
                         match stg.stage.as_ref() {
                             Some(PbStage::Transform(tf)) => {
