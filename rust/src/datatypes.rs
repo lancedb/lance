@@ -8,7 +8,9 @@ use std::fmt::{self};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{cast::as_dictionary_array, Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{
+    cast::as_dictionary_array, Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -375,8 +377,16 @@ impl Field {
                     lance_field.set_dictionary(struct_arr.column(i));
                 }
             }
+            DataType::List(_) => {
+                let list_arr = arr.as_any().downcast_ref::<ListArray>().unwrap();
+                self.children[0].set_dictionary(list_arr.values());
+            }
+            DataType::LargeList(_) => {
+                let list_arr = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+                self.children[0].set_dictionary(list_arr.values());
+            }
             _ => {
-                // Add list / large list support.
+                // Add list / large list support. - should we panic?
             }
         }
     }

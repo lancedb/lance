@@ -41,7 +41,7 @@ pub async fn write_manifest(
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
-    for field_id in 1..max_field_id + 1 {
+    for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() {
                 let dict_info = field.dictionary.as_mut().ok_or_else(|| {
@@ -415,6 +415,24 @@ mod tests {
                 true,
             ),
             ArrowField::new(
+                "l_dict",
+                DataType::List(Box::new(ArrowField::new(
+                    "item",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    true,
+                ))),
+                true,
+            ),
+            ArrowField::new(
+                "large_l_dict",
+                DataType::LargeList(Box::new(ArrowField::new(
+                    "item",
+                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                    true,
+                ))),
+                true,
+            ),
+            ArrowField::new(
                 "s",
                 DataType::Struct(vec![
                     ArrowField::new("si", DataType::Int64, true),
@@ -451,6 +469,24 @@ mod tests {
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
         let large_list_arr =
             LargeListArray::try_new(large_list_values, &large_list_offsets).unwrap();
+
+        let list_dict_offsets = (0..202).step_by(2).collect();
+        let list_dict_vec = (0..200)
+            .into_iter()
+            .map(|n| ["a", "b", "c"][n % 3])
+            .collect::<Vec<_>>();
+        let list_dict_arr: DictionaryArray<UInt32Type> = list_dict_vec.into_iter().collect();
+        let list_dict_arr = ListArray::try_new(list_dict_arr, &list_dict_offsets).unwrap();
+
+        let large_list_dict_offsets: Int64Array = (0..202).step_by(2).collect();
+        let large_list_dict_vec = (0..200)
+            .into_iter()
+            .map(|n| ["a", "b", "c"][n % 3])
+            .collect::<Vec<_>>();
+        let large_list_dict_arr: DictionaryArray<UInt32Type> =
+            large_list_dict_vec.into_iter().collect();
+        let large_list_dict_arr =
+            LargeListArray::try_new(large_list_dict_arr, &large_list_dict_offsets).unwrap();
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(NullArray::new(100)),
@@ -491,6 +527,8 @@ mod tests {
             Arc::new(fixed_size_binary_arr),
             Arc::new(list_arr),
             Arc::new(large_list_arr),
+            Arc::new(list_dict_arr),
+            Arc::new(large_list_dict_arr),
             Arc::new(StructArray::from(vec![
                 (
                     ArrowField::new("si", DataType::Int64, true),
