@@ -557,6 +557,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dictionary_first_element_file() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            )
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let dict_vec = (0..100)
+            .into_iter()
+            .map(|n| ["a", "b", "c"][n % 3])
+            .collect::<Vec<_>>();
+        let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(dict_arr),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+        schema.set_dictionary(&batch).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(actual, batch);
+    }
+
+    #[tokio::test]
     async fn test_write_temporal_types() {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(
