@@ -31,6 +31,8 @@ use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
+const OPQ_PQ_INIT_ITERATIONS: usize = 10;
+
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
@@ -133,14 +135,14 @@ impl OptimizedProductQuantizer {
 
         Ok((rotation, pq_code))
     }
+}
 
-    /// Initialize rotation matrix.
-    fn init_rotation(&self, dimension: usize) -> Result<MatrixView> {
-        let mat = MatrixView::random(dimension, dimension);
-        let (u, _, vt) = mat.svd()?;
-        let r = vt.transpose().dot(&u.transpose())?;
-        Ok(r)
-    }
+/// Initialize rotation matrix.
+fn init_rotation(dimension: usize) -> Result<MatrixView> {
+    let mat = MatrixView::random(dimension, dimension);
+    let (u, _, vt) = mat.svd()?;
+    let r = vt.transpose().dot(&u.transpose())?;
+    Ok(r)
 }
 
 #[async_trait]
@@ -165,11 +167,12 @@ impl Transformer for OptimizedProductQuantizer {
 
         // Use 10 iterations to get the initialized centroids.
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        pq.train(&train, self.metric_type, 10).await?;
+        pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
+            .await?;
         let mut pq_code = pq.transform(&train, self.metric_type).await?;
 
         // Initialize R (rotation matrix)
-        let mut rotation = self.init_rotation(dim)?;
+        let mut rotation = init_rotation(dim)?;
         for i in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let rotated_data = train.dot(&rotation)?;
@@ -295,6 +298,7 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
+    use approx::assert_relative_eq;
     use arrow::compute::{max, min};
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -401,5 +405,18 @@ mod tests {
     #[tokio::test]
     async fn test_build_index_without_opq() {
         test_build_index(false).await;
+    }
+
+    #[test]
+    fn test_init_rotation() {
+        let r = init_rotation(64).unwrap();
+        // r * r^T = I
+        let i = r.transpose().dot(&r).unwrap();
+
+        assert_relative_eq!(
+            i.data().values(),
+            MatrixView::identity(64).data().values(),
+            epsilon = 0.001
+        );
     }
 }
