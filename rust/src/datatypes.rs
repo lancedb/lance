@@ -9,9 +9,7 @@ use arrow_array::cast::{as_large_list_array, as_list_array};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{
-    cast::as_dictionary_array, Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray,
-};
+use arrow_array::{cast::as_dictionary_array, Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
