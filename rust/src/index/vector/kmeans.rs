@@ -32,6 +32,7 @@ pub async fn train_kmeans(
     dimension: usize,
     k: usize,
     max_iterations: u32,
+    redos: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> Result<Float32Array> {
@@ -66,6 +67,7 @@ pub async fn train_kmeans(
         max_iters: max_iterations,
         metric_type,
         centroids,
+        redos,
         ..Default::default()
     };
     let model = KMeans::new_with_params(&data, dimension, k, &params).await;

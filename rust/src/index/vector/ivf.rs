@@ -119,9 +119,10 @@ impl VectorIndex for IVFIndex {
             self.ivf
                 .find_partitions(&query.key, query.nprobes, self.metric_type)?;
         assert!(partition_ids.len() <= query.nprobes as usize);
-        let batches = stream::iter(partition_ids.values())
-            .then(|part_id| async move { self.search_in_partition(*part_id as usize, query).await })
-            .buffer_unordered(10)
+        let part_ids = partition_ids.values().to_vec();
+        let batches = stream::iter(part_ids)
+            .map(|part_id| async move { self.search_in_partition(part_id as usize, query).await })
+            .buffer_unordered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -738,13 +739,14 @@ async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<Optimize
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
-
+    const REDOS: usize = 3;
     let centroids = super::kmeans::train_kmeans(
         data.data().as_ref(),
         None,
         data.num_columns(),
         params.num_partitions,
         params.max_iters as u32,
+        REDOS,
         rng,
         params.metric_type,
     )

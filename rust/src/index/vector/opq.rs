@@ -209,7 +209,6 @@ impl Transformer for OptimizedProductQuantizer {
     }
 }
 
-#[derive(Debug)]
 pub struct OPQIndex {
     sub_index: Arc<dyn VectorIndex>,
 
@@ -219,6 +218,21 @@ pub struct OPQIndex {
 impl OPQIndex {
     pub fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
         Self { sub_index, opq }
+    }
+}
+
+impl std::fmt::Debug for OPQIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OPQIndex(dim={}) -> {:?}",
+            self.opq
+                .rotation
+                .as_ref()
+                .map(|m| m.num_columns())
+                .unwrap_or(0),
+            self.sub_index
+        )
     }
 }
 
