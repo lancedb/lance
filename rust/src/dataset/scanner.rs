@@ -159,7 +159,7 @@ impl Scanner {
             column: column.to_string(),
             key: Arc::new(q.clone()),
             k,
-            nprobs: 1,
+            nprobes: 1,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
@@ -169,7 +169,7 @@ impl Scanner {
 
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
-            q.nprobs = n;
+            q.nprobes = n;
         }
         self
     }

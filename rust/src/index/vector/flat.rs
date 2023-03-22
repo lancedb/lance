@@ -13,6 +13,10 @@
 // limitations under the License.
 
 //! Flat Vector Index.
+//!
+
+use std::any::Any;
+use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
@@ -25,6 +29,7 @@ use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 use super::{Query, VectorIndex};
 use crate::arrow::*;
 use crate::dataset::Dataset;
+use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
 
 /// Flat Vector Index.
@@ -115,5 +120,23 @@ impl VectorIndex for FlatIndex<'_> {
             .try_into_stream()
             .await?;
         flat_search(stream, params).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        // Can not use `self` because of the lifetime.
+        todo!()
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("Flat index does not support load".to_string()))
     }
 }

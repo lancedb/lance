@@ -258,6 +258,13 @@ impl Dataset {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
+        if let Some(o) = kwargs.get_item("use_opq") {
+            params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
+        };
+        if let Some(o) = kwargs.get_item("max_opq_iterations") {
+            params.max_opq_iterations = PyAny::downcast::<PyInt>(o)?.extract()?
+        };
+
         params.metric_type =
             MetricType::try_from(metric_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
 

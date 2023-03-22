@@ -15,17 +15,22 @@
 //! Traits for vector index.
 //!
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 
 use super::Query;
-use crate::{arrow::linalg::MatrixView, index::pb, io::object_reader::ObjectReader, Result};
+use crate::{
+    arrow::linalg::MatrixView,
+    index::pb::Transform,
+    io::{object_reader::ObjectReader, object_writer::ObjectWriter},
+    Result,
+};
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
-pub trait VectorIndex: Send + Sync {
+pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
@@ -42,23 +47,21 @@ pub trait VectorIndex: Send + Sync {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
-}
 
-/// A [`VectorIndex`] that can be loaded on-demand, usually as a IVF partition.
-#[async_trait]
-pub trait LoadableVectorIndex: VectorIndex {
-    /// Load the index from the reader.
-    ///
-    /// Parameters:
-    /// - *reader*: the object reader.
-    /// - *offset*: the offset of the index in file.
-    /// - *length*: the number of vectors in the partition.
+    /// As any.
+    fn as_any(&self) -> &dyn Any;
+
+    /// If the index is loadable by IVF, so it can be a sub-index that
+    /// is loaded on demand by IVF.
+    fn is_loadable(&self) -> bool;
+
+    /// Load the index from the reader on-demand.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn LoadableVectorIndex>>;
+    ) -> Result<Arc<dyn VectorIndex>>;
 }
 
 /// Transformer on vectors.
@@ -75,8 +78,5 @@ pub trait Transformer: std::fmt::Debug + Sync + Send {
     /// Returns a new Matrix instead.
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView>;
 
-    /// Try to convert into protobuf.
-    ///
-    /// TODO: can we use TryFrom/TryInto as trait constrats?
-    fn try_into_pb(&self) -> Result<pb::Transform>;
+    async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform>;
 }

@@ -27,14 +27,19 @@ mod opq;
 mod pq;
 mod traits;
 
-use self::{
-    ivf::{IVFIndex, IvfPQIndexMetadata},
-    pq::PQIndex,
-};
+use self::{ivf::IVFIndex, pq::PQIndex};
 
 use super::{pb, IndexParams};
 use crate::{
     dataset::Dataset,
+    index::{
+        pb::vector_index_stage::Stage,
+        vector::{
+            ivf::Ivf,
+            opq::{OPQIndex, OptimizedProductQuantizer},
+            pq::ProductQuantizer,
+        },
+    },
     io::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
@@ -45,19 +50,26 @@ use crate::{
 pub use traits::*;
 
 const MAX_ITERATIONS: usize = 50;
+/// Maximum number of iterations for OPQ.
+/// See OPQ paper for details.
+const MAX_OPQ_ITERATIONS: usize = 100;
 const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
 
 /// Query parameters for the vector indices
 #[derive(Debug, Clone)]
 pub struct Query {
+    /// The column to be searched.
     pub column: String,
+
     /// The vector to be searched.
     pub key: Arc<Float32Array>,
+
     /// Top k results to return.
     pub k: usize,
-    /// The number of probs to load and search.
-    pub nprobs: usize,
+
+    /// The number of probes to load and search.
+    pub nprobes: usize,
 
     /// If presented, apply a refine step.
     /// TODO: should we support fraction / float number here?
@@ -152,6 +164,9 @@ pub struct VectorIndexParams {
 
     /// Max number of iterations to train a KMean model
     pub max_iterations: usize,
+
+    /// Max number of iterations to train a OPQ model.
+    pub max_opq_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -178,6 +193,7 @@ impl VectorIndexParams {
             use_opq,
             metric_type,
             max_iterations,
+            max_opq_iterations: max_iterations,
         }
     }
 }
@@ -188,9 +204,10 @@ impl Default for VectorIndexParams {
             num_partitions: 32,
             nbits: 8,
             num_sub_vectors: 16,
-            use_opq: true,
+            use_opq: false,
             metric_type: MetricType::L2,
             max_iterations: MAX_ITERATIONS, // Faiss
+            max_opq_iterations: MAX_OPQ_ITERATIONS,
         }
     }
 }
@@ -225,15 +242,97 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
         let offset = tail_bytes.len() - (file_size - metadata_pos);
         read_message_from_buf(&tail_bytes.slice(offset..))?
     };
-    let index_metadata = IvfPQIndexMetadata::try_from(&proto)?;
 
-    let pq_index = Arc::new(PQIndex::new(index_metadata.pq, index_metadata.metric_type));
-    let ivf_index = Arc::new(IVFIndex::new(
-        index_metadata.ivf,
-        reader,
-        pq_index,
-        index_metadata.metric_type,
-    ));
+    if proto.columns.len() != 1 {
+        return Err(Error::Index(
+            "VectorIndex only supports 1 column".to_string(),
+        ));
+    }
+    assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
 
-    Ok(ivf_index)
+    let Some(idx_impl) = proto.implementation.as_ref() else {
+        return Err(Error::Index("Invalid protobuf for VectorIndex metadata".to_string()));
+    };
+
+    let vec_idx = match idx_impl {
+        pb::index::Implementation::VectorIndex(vi) => vi,
+    };
+
+    let num_stages = vec_idx.stages.len();
+    if num_stages != 2 && num_stages != 3 {
+        return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
+    };
+
+    let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
+        .ok_or(Error::Index(format!(
+            "Unsupported metric type value: {}",
+            vec_idx.metric_type
+        )))?
+        .into();
+
+    let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+    for stg in vec_idx.stages.iter().rev() {
+        match stg.stage.as_ref() {
+            Some(Stage::Transform(tf)) => {
+                if last_stage.is_none() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                }
+                match tf.r#type() {
+                    pb::TransformType::Opq => {
+                        let opq = OptimizedProductQuantizer::load(
+                            reader.as_ref(),
+                            tf.position as usize,
+                            tf.shape
+                                .iter()
+                                .map(|s| *s as usize)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                        )
+                        .await?;
+                        last_stage = Some(Arc::new(OPQIndex::new(
+                            last_stage.as_ref().unwrap().clone(),
+                            opq,
+                        )));
+                    }
+                }
+            }
+            Some(Stage::Ivf(ivf_pb)) => {
+                if last_stage.is_none() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                }
+                let ivf = Ivf::try_from(ivf_pb)?;
+                last_stage = Some(Arc::new(IVFIndex::try_new(
+                    ivf,
+                    reader.clone(),
+                    last_stage.unwrap(),
+                    metric_type,
+                )?));
+            }
+            Some(Stage::Pq(pq_proto)) => {
+                if last_stage.is_some() {
+                    return Err(Error::Index(format!(
+                        "Invalid vector index stages: {:?}",
+                        vec_idx.stages
+                    )));
+                };
+                let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
+                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+            }
+            _ => {}
+        }
+    }
+
+    if last_stage.is_none() {
+        return Err(Error::Index(format!(
+            "Invalid index stages: {:?}",
+            vec_idx.stages
+        )));
+    }
+    Ok(last_stage.unwrap())
 }

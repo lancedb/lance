@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_arith::aggregate::min;
@@ -26,7 +27,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::{LoadableVectorIndex, MetricType, Query, VectorIndex};
+use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
@@ -61,6 +62,16 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+}
+
+impl std::fmt::Debug for PQIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PQ(m={}, nbits={}, {})",
+            self.num_sub_vectors, self.nbits, self.metric_type
+        )
+    }
 }
 
 impl PQIndex {
@@ -215,17 +226,22 @@ impl VectorIndex for PQIndex {
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
     }
-}
 
-#[async_trait]
-impl LoadableVectorIndex for PQIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_loadable(&self) -> bool {
+        true
+    }
+
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn LoadableVectorIndex>> {
+    ) -> Result<Arc<dyn VectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;

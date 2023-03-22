@@ -389,7 +389,7 @@ mod tests {
                 column: "vector".to_string(),
                 key: Arc::new(as_primitive_array(&q).clone()),
                 k: 10,
-                nprobs: 0,
+                nprobes: 0,
                 refine_factor: None,
                 metric_type: MetricType::L2,
                 use_index: false,
