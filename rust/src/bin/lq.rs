@@ -78,6 +78,9 @@ enum Commands {
         /// Distance metric type. Only support 'l2' and 'cosine'.
         #[arg(short = 'm', long, value_name = "DISTANCE")]
         metric_type: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        use_opq: bool,
     },
 }
 
@@ -130,6 +133,7 @@ async fn main() -> Result<()> {
             num_partitions,
             num_sub_vectors,
             metric_type,
+            use_opq,
         } => {
             let dataset = Dataset::open(uri).await.unwrap();
             match action {
@@ -142,6 +146,7 @@ async fn main() -> Result<()> {
                         num_partitions,
                         num_sub_vectors,
                         metric_type,
+                        *use_opq,
                     )
                     .await
                 }
@@ -158,6 +163,7 @@ async fn create_index(
     num_partitions: &u32,
     num_sub_vectors: &u32,
     metric_type: &Option<String>,
+    use_opq: bool,
 ) -> Result<()> {
     let col = column
         .as_ref()
@@ -178,7 +184,7 @@ async fn create_index(
             &[&col],
             lance::index::IndexType::Vector,
             name.clone(),
-            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, true, mt, 50),
+            &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, use_opq, mt, 50),
             false,
         )
         .await
