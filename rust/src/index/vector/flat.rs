@@ -123,6 +123,7 @@ impl VectorIndex for FlatIndex<'_> {
     }
 
     fn as_any(&self) -> &dyn Any {
+        // Can not use `self` because of the lifetime.
         todo!()
     }
 
