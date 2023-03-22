@@ -101,7 +101,8 @@ impl IVFIndex {
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();
-        part_index.search(&part_query).await
+        let batch = part_index.search(&part_query).await?;
+        Ok(batch)
     }
 }
 
@@ -117,14 +118,11 @@ impl VectorIndex for IVFIndex {
         let partition_ids =
             self.ivf
                 .find_partitions(&query.key, query.nprobes, self.metric_type)?;
-        let candidates = stream::iter(partition_ids.values())
+        assert!(partition_ids.len() <= query.nprobes as usize);
+        let batches = stream::iter(partition_ids.values())
             .then(|part_id| async move { self.search_in_partition(*part_id as usize, query).await })
-            .collect::<Vec<_>>()
-            .await;
-        let mut batches = vec![];
-        for b in candidates {
-            batches.push(b?);
-        }
+            .try_collect::<Vec<_>>()
+            .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
         let score_col = batch.column_by_name("score").ok_or_else(|| {
@@ -133,10 +131,11 @@ impl VectorIndex for IVFIndex {
                 batch.schema()
             ))
         })?;
-        let refined_index = sort_to_indices(score_col, None, Some(query.k))?;
 
+        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let selection = sort_to_indices(score_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);
-        let taken_scores = take(&struct_arr, &refined_index, None)?;
+        let taken_scores = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_scores).into())
     }
 

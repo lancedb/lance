@@ -359,13 +359,11 @@ impl Scanner {
     }
 
     /// Create an Execution plan to do indexed ANN search
-    fn ann(&self, q: &Query, index: &&Index) -> Arc<dyn ExecutionPlan> {
-        let mut inner_query = q.clone();
-        inner_query.k = q.k * q.refine_factor.unwrap_or(1) as usize;
+    fn ann(&self, q: &Query, index: &Index) -> Arc<dyn ExecutionPlan> {
         Arc::new(KNNIndexExec::new(
             self.dataset.clone(),
             &index.uuid.to_string(),
-            &inner_query,
+            q,
         ))
     }
 

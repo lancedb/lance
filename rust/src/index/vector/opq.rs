@@ -163,7 +163,6 @@ impl Transformer for OptimizedProductQuantizer {
         // Initialize R (rotation matrix)
         let mut rotation = MatrixView::identity(dim);
         for i in 0..self.num_iters {
-            println!("Training OPQ iteration {}/{}", i + 1, self.num_iters);
             // Training data, this is the `X`, described in CVPR' 13
             let rotated_data = train.dot(&rotation)?;
             // Reset the pq centroids after rotation.
@@ -171,6 +170,14 @@ impl Transformer for OptimizedProductQuantizer {
             (rotation, pq_code) = self
                 .train_once(&mut pq, &rotated_data, self.metric_type)
                 .await?;
+            if (i + 1) % 5 == 0 {
+                println!(
+                    "Training OPQ iteration {}/{}, PQ distortion={}",
+                    i + 1,
+                    self.num_iters,
+                    pq.distortion(&rotated_data, self.metric_type).await?
+                );
+            }
         }
         self.rotation = Some(rotation);
         Ok(())
