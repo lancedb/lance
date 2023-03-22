@@ -121,6 +121,7 @@ impl VectorIndex for IVFIndex {
         assert!(partition_ids.len() <= query.nprobes as usize);
         let batches = stream::iter(partition_ids.values())
             .then(|part_id| async move { self.search_in_partition(*part_id as usize, query).await })
+            .buffer_unordered(10)
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
