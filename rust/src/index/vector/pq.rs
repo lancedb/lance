@@ -450,7 +450,7 @@ impl ProductQuantizer {
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
         let rng = rand::rngs::SmallRng::from_entropy();
 
-        const REDOS: usize = 3;
+        const REDOS: usize = 1;
         // TODO: parallel training.
         for (i, sub_vec) in sub_vectors.iter().enumerate() {
             // Centroids for one sub vector.

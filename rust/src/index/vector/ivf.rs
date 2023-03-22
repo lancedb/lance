@@ -740,7 +740,7 @@ async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<Optimize
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
-    const REDOS: usize = 3;
+    const REDOS: usize = 1;
     let centroids = super::kmeans::train_kmeans(
         data.data().as_ref(),
         None,
