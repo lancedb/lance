@@ -110,7 +110,7 @@ impl OptimizedProductQuantizer {
         let dim = train.num_columns();
 
         // Train few times to get a better rotation matrix. See Faiss.
-        pq.train(&train, metric_type, 4).await?;
+        pq.train(&train, metric_type, 1).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
@@ -165,7 +165,7 @@ impl Transformer for OptimizedProductQuantizer {
             data.clone()
         };
 
-        // Use 10 iterations to get the initialized centroids.
+        // Run a few iterations to get the initialized centroids.
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
         pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
             .await?;
