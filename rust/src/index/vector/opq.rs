@@ -31,6 +31,8 @@ use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
 
+const OPQ_PQ_INIT_ITERATIONS: usize = 10;
+
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
@@ -108,7 +110,7 @@ impl OptimizedProductQuantizer {
         let dim = train.num_columns();
 
         // Train few times to get a better rotation matrix. See Faiss.
-        pq.train(&train, metric_type, 4).await?;
+        pq.train(&train, metric_type, 1).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
@@ -135,6 +137,14 @@ impl OptimizedProductQuantizer {
     }
 }
 
+/// Initialize rotation matrix.
+fn init_rotation(dimension: usize) -> Result<MatrixView> {
+    let mat = MatrixView::random(dimension, dimension);
+    let (u, _, vt) = mat.svd()?;
+    let r = vt.transpose().dot(&u.transpose())?;
+    Ok(r)
+}
+
 #[async_trait]
 impl Transformer for OptimizedProductQuantizer {
     async fn train(&mut self, data: &MatrixView) -> Result<()> {
@@ -155,14 +165,15 @@ impl Transformer for OptimizedProductQuantizer {
             data.clone()
         };
 
-        // Use 10 iterations to get the initialized centroids.
+        // Run a few iterations to get the initialized centroids.
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
-        pq.train(&train, self.metric_type, 10).await?;
+        pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
+            .await?;
         let mut pq_code = pq.transform(&train, self.metric_type).await?;
 
         // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::identity(dim);
-        for _ in 0..self.num_iters {
+        let mut rotation = init_rotation(dim)?;
+        for i in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let rotated_data = train.dot(&rotation)?;
             // Reset the pq centroids after rotation.
@@ -170,6 +181,14 @@ impl Transformer for OptimizedProductQuantizer {
             (rotation, pq_code) = self
                 .train_once(&mut pq, &rotated_data, self.metric_type)
                 .await?;
+            if (i + 1) % 5 == 0 {
+                println!(
+                    "Training OPQ iteration {}/{}, PQ distortion={}",
+                    i + 1,
+                    self.num_iters,
+                    pq.distortion(&rotated_data, self.metric_type).await?
+                );
+            }
         }
         self.rotation = Some(rotation);
         Ok(())
@@ -201,7 +220,6 @@ impl Transformer for OptimizedProductQuantizer {
     }
 }
 
-#[derive(Debug)]
 pub struct OPQIndex {
     sub_index: Arc<dyn VectorIndex>,
 
@@ -211,6 +229,21 @@ pub struct OPQIndex {
 impl OPQIndex {
     pub fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
         Self { sub_index, opq }
+    }
+}
+
+impl std::fmt::Debug for OPQIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OPQIndex(dim={}) -> {:?}",
+            self.opq
+                .rotation
+                .as_ref()
+                .map(|m| m.num_columns())
+                .unwrap_or(0),
+            self.sub_index
+        )
     }
 }
 
@@ -265,6 +298,7 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
+    use approx::assert_relative_eq;
     use arrow::compute::{max, min};
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
@@ -371,5 +405,19 @@ mod tests {
     #[tokio::test]
     async fn test_build_index_without_opq() {
         test_build_index(false).await;
+    }
+
+    #[test]
+    fn test_init_rotation() {
+        let dim: usize = 64;
+        let r = init_rotation(dim).unwrap();
+        // R^T * R = I
+        let i = r.transpose().dot(&r).unwrap();
+
+        assert_relative_eq!(
+            i.data().values(),
+            MatrixView::identity(dim).data().values(),
+            epsilon = 0.001
+        );
     }
 }
