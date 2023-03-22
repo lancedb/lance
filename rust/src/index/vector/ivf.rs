@@ -134,6 +134,7 @@ impl VectorIndex for IVFIndex {
             ))
         })?;
 
+        // TODO: Use a heap sort to get the top-k.
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
         let selection = sort_to_indices(score_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);

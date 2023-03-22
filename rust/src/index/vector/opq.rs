@@ -409,13 +409,14 @@ mod tests {
 
     #[test]
     fn test_init_rotation() {
-        let r = init_rotation(64).unwrap();
-        // r * r^T = I
+        let dim: usize = 64;
+        let r = init_rotation(dim).unwrap();
+        // R^T * R = I
         let i = r.transpose().dot(&r).unwrap();
 
         assert_relative_eq!(
             i.data().values(),
-            MatrixView::identity(64).data().values(),
+            MatrixView::identity(dim).data().values(),
             epsilon = 0.001
         );
     }
