@@ -133,6 +133,14 @@ impl OptimizedProductQuantizer {
 
         Ok((rotation, pq_code))
     }
+
+    /// Initialize rotation matrix.
+    fn init_rotation(&self, dimension: usize) -> Result<MatrixView> {
+        let mat = MatrixView::random(dimension, dimension);
+        let (u, _, vt) = mat.svd()?;
+        let r = vt.transpose().dot(&u.transpose())?;
+        Ok(r)
+    }
 }
 
 #[async_trait]
@@ -161,7 +169,7 @@ impl Transformer for OptimizedProductQuantizer {
         let mut pq_code = pq.transform(&train, self.metric_type).await?;
 
         // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::identity(dim);
+        let mut rotation = self.init_rotation(dim)?;
         for i in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
             let rotated_data = train.dot(&rotation)?;
