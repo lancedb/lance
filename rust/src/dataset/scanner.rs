@@ -275,7 +275,7 @@ impl Scanner {
 
                 let knn_node = self.ann(q, &index); // score, _rowid
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
-                let knn_node_with_vector = self.take(knn_node, &with_vector, false)?;
+                let knn_node_with_vector = self.take(knn_node, &with_vector)?;
                 let knn_node = if q.refine_factor.is_some() {
                     self.flat_knn(knn_node_with_vector, q)
                 } else {
@@ -285,7 +285,7 @@ impl Scanner {
                 let knn_node = filter_expr
                     .map(|f| self.filter_knn(knn_node.clone(), f))
                     .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection, true)?
+                self.take(knn_node, projection)?
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
@@ -295,7 +295,7 @@ impl Scanner {
                 let knn_node = filter_expr
                     .map(|f| self.filter_knn(knn_node.clone(), f))
                     .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection, true)?
+                self.take(knn_node, projection)?
             }
         } else if let Some(filter) = filter_expr {
             let columns_in_filter = column_names_in_expr(filter.as_ref());
@@ -385,7 +385,6 @@ impl Scanner {
         &self,
         input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
-        drop_row_id: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
