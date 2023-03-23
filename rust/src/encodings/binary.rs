@@ -79,10 +79,11 @@ impl<'a> BinaryEncoder<'a> {
             };
             self.writer.write_all(b).await?;
 
+            let start_offset = offsets[0].as_usize();
             offsets
                 .iter()
                 .skip(1)
-                .map(|b| b.as_usize() + last_offset)
+                .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i64));
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
