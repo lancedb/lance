@@ -25,9 +25,9 @@ use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
-use crate::{arrow::*, Error};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
+use crate::{arrow::*, Error};
 
 /// Dataset Take Node.
 ///
@@ -38,51 +38,54 @@ pub struct Take {
     rx: Receiver<Result<RecordBatch>>,
     _bg_thread: JoinHandle<()>,
 
-    schema: Arc<Schema>,
+    output_schema: SchemaRef,
 }
 
 impl Take {
     /// Create a Take node with
     ///
     ///  - Dataset: the dataset to read from
-    ///  - extra: projection schema for take node.
-    ///  - child: the upstream ExedNode to feed data in.
-    fn new(dataset: Arc<Dataset>, schema: Arc<Schema>, child: SendableRecordBatchStream) -> Self {
+    ///  - extra: extra columns to take
+    ///  - output_schema: the output schema of the take node.
+    ///  - child: the upstream stream to feed data in.
+    fn new(
+        dataset: Arc<Dataset>,
+        extra: Arc<Schema>,
+        output_schema: SchemaRef,
+        child: SendableRecordBatchStream,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
-        let projection = schema.clone();
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = child
-                .zip(stream::repeat_with(|| {
-                    (dataset.clone(), projection.clone())
-                }))
-                .then(|(batch, (dataset, projection))| async move {
+                .zip(stream::repeat_with(|| (dataset.clone(), extra.clone())))
+                .then(|(batch, (dataset, extra))| async move {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
                     let row_ids: &UInt64Array = as_primitive_array(row_id_arr);
-                    let rows = if projection.fields.is_empty() {
+                    let rows = if extra.fields.is_empty() {
                         batch
                     } else {
                         dataset
-                            .take_rows(row_ids.values(), &projection)
+                            .take_rows(row_ids.values(), &extra)
                             .await?
                             .merge(&batch)?
                     };
                     Ok::<RecordBatch, Error>(rows)
                 })
                 .map(|r| {
-                    r.map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+                    r.map_err(|e| DataFusionError::Execution(e.to_string()))
                 })
                 .try_for_each(|b| async {
                     if tx.is_closed() {
                         eprintln!("ExecNode(Take): channel closed");
-                        return Err(datafusion::error::DataFusionError::Execution(
+                        return Err(DataFusionError::Execution(
                             "ExecNode(Take): channel closed".to_string(),
                         ));
                     }
                     if let Err(e) = tx.send(Ok(b)).await {
                         eprintln!("ExecNode(Take): {}", e);
-                        return Err(datafusion::error::DataFusionError::Execution(
+                        return Err(DataFusionError::Execution(
                             "ExecNode(Take): channel closed".to_string(),
                         ));
                     }
@@ -100,7 +103,7 @@ impl Take {
         Self {
             rx,
             _bg_thread: bg_thread,
-            schema,
+            output_schema,
         }
     }
 }
@@ -115,7 +118,7 @@ impl Stream for Take {
 
 impl RecordBatchStream for Take {
     fn schema(&self) -> SchemaRef {
-        Arc::new(self.schema.as_ref().into())
+        self.output_schema.clone()
     }
 }
 
@@ -218,6 +221,7 @@ impl ExecutionPlan for TakeExec {
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
             self.extra_schema.clone(),
+            self.schema(),
             input_stream,
         )))
     }
@@ -426,13 +430,127 @@ impl ExecutionPlan for LocalTakeExec {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_take_schema() {
-        let schema = ArrowSchema::new(vec![
+    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatchReader, StringArray};
+    use tempfile::tempdir;
+
+    use crate::{dataset::WriteParams, io::exec::LanceScanExec};
+
+    async fn create_dataset() -> Arc<Dataset> {
+        let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("f", DataType::Float32, false),
-            Field::new("s", DataType::UInt8, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+
+        // Write 3 batches.
+        let expected_batches: Vec<RecordBatch> = (0..3)
+            .map(|batch_id| {
+                let value_range = batch_id * 10..batch_id * 10 + 10;
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int32Array::from_iter_values(value_range.clone())),
+                    Arc::new(Float32Array::from_iter(
+                        value_range.clone().map(|v| v as f32),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        value_range.clone().map(|v| format!("str-{v}")),
+                    )),
+                ];
+                RecordBatch::try_new(schema.clone(), columns).unwrap()
+            })
+            .collect();
+        let batches = RecordBatchBuffer::new(expected_batches.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut params = WriteParams::default();
+        params.max_rows_per_group = 10;
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut reader, test_uri, Some(params))
+            .await
+            .unwrap();
+
+        Arc::new(Dataset::open(test_uri).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_take_schema() {
+        let dataset = create_dataset().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+
+        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
+        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
+
+        // With row id
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            scan_schema.clone(),
+            10,
+            10,
+            true,
+        ));
+        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let schema = take_exec.schema();
+        assert_eq!(
+            schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
+            vec!["i", "_rowid", "s"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_no_extra_columns() {
+        let dataset = create_dataset().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Int32, false),
         ]);
-        let batch = RecordBatch::new_empty(schema.into());
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+
+        // Extra column is already read.
+        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
+        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
+
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            scan_schema.clone(),
+            10,
+            10,
+            true,
+        ));
+        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let schema = take_exec.schema();
+        assert_eq!(
+            schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
+            vec!["i", "s", "_rowid"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_no_row_id() {
+        let dataset = create_dataset().await;
+
+        let scan_arrow_schema = ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("s", DataType::Int32, false),
+        ]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+
+        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
+        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
+
+        // No row ID
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            scan_schema.clone(),
+            10,
+            10,
+            false,
+        ));
+        assert!(TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).is_err());
     }
 }
