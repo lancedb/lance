@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
-use arrow_schema::DataType::Float32;
+use arrow_schema::DataType::{self, Float32};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
     context::SessionState,
@@ -31,11 +31,14 @@ use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
+use crate::arrow::*;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec, TakeExec};
+use crate::io::exec::{
+    KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec, ProjectionExec, TakeExec,
+};
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -208,8 +211,16 @@ impl Scanner {
 
     /// The Arrow schema of the output, including projections and vector / score
     pub fn schema(&self) -> Result<SchemaRef> {
-        self.scanner_output_schema()
-            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))
+        let schema = self
+            .scanner_output_schema()
+            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))?;
+        if self.with_row_id {
+            let row_id = ArrowField::new(ROW_ID, DataType::UInt64, false);
+            let schema = schema.as_ref().try_with_column(row_id)?;
+            Ok(schema.into())
+        } else {
+            Ok(schema)
+        }
     }
 
     fn scanner_output_schema(&self) -> Result<Arc<Schema>> {
@@ -305,6 +316,9 @@ impl Scanner {
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
+
+        let project_schema = Schema::try_from(self.schema()?.as_ref())?;
+        plan = Arc::new(ProjectionExec::try_new(plan, project_schema.into())?);
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();

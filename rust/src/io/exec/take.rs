@@ -16,8 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::cast::as_primitive_array;
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
@@ -73,9 +72,7 @@ impl Take {
                     };
                     Ok::<RecordBatch, Error>(rows)
                 })
-                .map(|r| {
-                    r.map_err(|e| DataFusionError::Execution(e.to_string()))
-                })
+                .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                 .try_for_each(|b| async {
                     if tx.is_closed() {
                         eprintln!("ExecNode(Take): channel closed");
@@ -159,9 +156,11 @@ impl TakeExec {
         let input_schema = Schema::try_from(input.schema().as_ref())?;
         let output_schema = input_schema.merge(&extra_schema);
 
+        let remaining_schema = extra_schema.exclude(&input_schema)?;
+
         Ok(Self {
             dataset,
-            extra_schema,
+            extra_schema: Arc::new(remaining_schema),
             input,
             output_schema,
         })
