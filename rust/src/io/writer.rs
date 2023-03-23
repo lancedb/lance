@@ -278,13 +278,18 @@ impl<'a> FileWriter<'a> {
             PrimitiveBuilder::with_capacity(capacity);
 
         let mut last_offset: usize = 0;
-        pos_builder.append_value(last_offset as i32);
-        for array in arrs.iter() {
+        for (idx, array) in arrs.iter().enumerate() {
             let list_arr = as_list_array(*array);
             list_arrs.push(list_arr.values());
 
             let offsets = list_arr.value_offsets();
             let start_offset = offsets[0].as_usize();
+
+            if idx == 0 {
+                last_offset = start_offset;
+                pos_builder.append_value(last_offset as i32);
+            }
+
             assert!(!offsets.is_empty());
             offsets
                 .iter()
@@ -307,14 +312,19 @@ impl<'a> FileWriter<'a> {
             PrimitiveBuilder::with_capacity(capacity);
 
         let mut last_offset: usize = 0;
-        pos_builder.append_value(last_offset as i64);
-        for array in arrs.iter() {
+        for (idx, array) in arrs.iter().enumerate() {
             let list_arr = as_large_list_array(*array);
             list_arrs.push(list_arr.values());
 
             let offsets = list_arr.value_offsets();
-            let start_offset = offsets[0].as_usize();
             assert!(!offsets.is_empty());
+            let start_offset = offsets[0].as_usize();
+
+            if idx == 0 {
+                last_offset = start_offset;
+                pos_builder.append_value(last_offset as i64);
+            }
+
             offsets
                 .iter()
                 .skip(1)
