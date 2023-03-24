@@ -256,7 +256,10 @@ impl KNNIndexStream {
 
 impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 }
 
