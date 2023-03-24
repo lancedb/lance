@@ -858,14 +858,6 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
-    fn get_exec_columns(plan: &dyn ExecutionPlan) -> Vec<String> {
-        plan.schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect::<Vec<_>>()
-    }
-
     #[tokio::test]
     async fn test_simple_scan_plan() {
         let test_dir = tempdir().unwrap();
@@ -876,21 +868,21 @@ mod test {
         let plan = scan.create_plan().await.unwrap();
 
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(get_exec_columns(plan.as_ref()), ["i", "s", "vec"]);
+        assert_eq!(plan.schema().field_names(), ["i", "s", "vec"]);
 
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(get_exec_columns(scan.as_ref()), ["i", "s", "vec"]);
+        assert_eq!(plan.schema().field_names(), ["i", "s", "vec"]);
 
         let mut scan = dataset.scan();
         scan.project(&["s"]).unwrap();
         let plan = scan.create_plan().await.unwrap();
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(get_exec_columns(plan.as_ref()), ["s"]);
+        assert_eq!(plan.schema().field_names(), ["s"]);
 
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(get_exec_columns(scan.as_ref()), ["s"]);
+        assert_eq!(scan.schema().field_names(), ["s"]);
     }
 
     #[tokio::test]
@@ -905,24 +897,10 @@ mod test {
         let plan = scan.create_plan().await.unwrap();
 
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(
-            plan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["i", "_rowid"]
-        );
+        assert_eq!(plan.schema().field_names(), &["i", "_rowid"]);
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(
-            scan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["i", "_rowid"]
-        );
+        assert_eq!(scan.schema().field_names(), &["i", "_rowid"]);
     }
 
     /// Test scan with filter.
@@ -947,49 +925,19 @@ mod test {
         let plan = scan.create_plan().await.unwrap();
 
         assert!(plan.as_any().is::<ProjectionExec>());
-        assert_eq!(
-            plan.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["s"]
-        );
+        assert_eq!(plan.schema().field_names(), ["s"]);
 
         let take = &plan.children()[0];
         assert!(take.as_any().is::<TakeExec>());
-        assert_eq!(
-            take.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["i", "_rowid", "s"]
-        );
+        assert_eq!(take.schema().field_names(), ["i", "_rowid", "s"]);
 
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(
-            filter
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["i", "_rowid"]
-        );
+        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
 
         let scan = &filter.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
-        assert_eq!(
-            filter
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>(),
-            vec!["i", "_rowid"]
-        );
+        assert_eq!(filter.schema().field_names(), ["i", "_rowid"]);
     }
 
     /// Test KNN with index
@@ -1024,7 +972,10 @@ mod test {
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i", "s"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["score", "_rowid", "vec", "i", "s"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1037,13 +988,13 @@ mod test {
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
-            get_exec_columns(filter.as_ref()),
+            filter.schema().field_names(),
             ["score", "_rowid", "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1056,7 +1007,7 @@ mod test {
         // TODO: Two continuous take execs, we can merge them into one.
         let take = &take.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1068,7 +1019,7 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(get_exec_columns(knn.as_ref()), ["score", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), ["score", "_rowid"]);
     }
 
     /// Test KNN index with refine factor
@@ -1105,7 +1056,10 @@ mod test {
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i", "s"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["score", "_rowid", "vec", "i", "s"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1118,13 +1072,13 @@ mod test {
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
         assert_eq!(
-            get_exec_columns(filter.as_ref()),
+            filter.schema().field_names(),
             ["score", "_rowid", "vec", "i"]
         );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec", "i"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1140,7 +1094,7 @@ mod test {
 
         let take = &flat.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec"]);
+        assert_eq!(take.schema().field_names(), ["score", "_rowid", "vec"]);
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1152,6 +1106,6 @@ mod test {
 
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
-        assert_eq!(get_exec_columns(knn.as_ref()), ["score", "_rowid"]);
+        assert_eq!(knn.schema().field_names(), ["score", "_rowid"]);
     }
 }
