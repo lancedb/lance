@@ -391,29 +391,6 @@ impl Scanner {
         }
     }
 
-<<<<<<< HEAD
-    fn filter_knn(
-        &self,
-        knn_node: Arc<dyn ExecutionPlan>,
-        filter_expression: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let columns_in_filter = column_names_in_expr(filter_expression.as_ref());
-        let columns_refs = columns_in_filter
-            .iter()
-            .map(|c| c.as_str())
-            .collect::<Vec<_>>();
-        let filter_projection = self.dataset.schema().project(&columns_refs)?;
-
-        let take_node = Arc::new(TakeExec::try_new(
-            self.dataset.clone(),
-            knn_node,
-            Arc::new(filter_projection),
-        )?);
-        self.filter_node(filter_expression, take_node)
-    }
-
-=======
->>>>>>> b330654 (separate create plan)
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
@@ -460,25 +437,7 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
-    }
-<<<<<<< HEAD
-
-    fn filter_node(
-        &self,
-        filter: Arc<dyn PhysicalExpr>,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
-        let output_schema = self.output_schema()?;
-        Ok(Arc::new(LocalTakeExec::new(
-            filter_node,
-            self.dataset.clone(),
-            filter_node,
-            output_schema,
-        )?))
-    }
-=======
->>>>>>> b330654 (separate create plan)
+    }=
 }
 
 /// ScannerStream is a container to wrap different types of ExecNode.
