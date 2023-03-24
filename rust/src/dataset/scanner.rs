@@ -968,6 +968,70 @@ mod test {
         );
     }
 
+    /// Test scan with filter.
+    ///
+    /// Query:
+    ///
+    /// ```
+    /// SELECT s FROM dataset WHERE i > 10 and i < 20
+    /// ```
+    ///
+    /// Expected plan:
+    ///  scan(i) -> filter(i) -> take(s) -> projection(s)
+    #[tokio::test]
+    async fn test_scan_with_filter() {
+        let dataset = create_dataset().await;
+        let mut scan = dataset.scan();
+        scan.project(&["s"]).unwrap();
+        scan.filter("i > 10 and i < 20").unwrap();
+        let plan = scan.create_plan().await.unwrap();
+
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["s"]
+        );
+
+        let take = &plan.children()[0];
+        assert!(take.as_any().is::<TakeExec>());
+        assert_eq!(
+            take.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "_rowid", "s"]
+        );
+
+        let filter = &take.children()[0];
+        assert!(filter.as_any().is::<FilterExec>());
+        assert_eq!(
+            filter
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "_rowid"]
+        );
+
+        let scan = &filter.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(
+            filter
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "_rowid"]
+        );
+    }
+
     // #[tokio::test]
     // async fn test_filter_plan() {
     //     let dataset = create_dataset().await;
