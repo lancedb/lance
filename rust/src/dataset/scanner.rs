@@ -215,6 +215,7 @@ impl Scanner {
         Ok(schema)
     }
 
+    /// The output schema of the Scanner, in Lance Schema format.
     fn output_schema(&self) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
