@@ -23,9 +23,9 @@ use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
-use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::{
-    limit::GlobalLimitExec, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+    filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, PhysicalExpr,
+    SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
@@ -36,9 +36,7 @@ use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{
-    KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec, ProjectionExec, TakeExec,
-};
+use crate::io::exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, ProjectionExec, TakeExec};
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -308,7 +306,7 @@ impl Scanner {
                 )?,
             );
             let scan = self.scan(true, filter_schema);
-            self.filter_node(filter, scan, true, None)?
+            self.filter_node(filter, scan)?
         } else {
             self.scan(with_row_id, Arc::new(self.projections.clone()))
         };
@@ -346,12 +344,7 @@ impl Scanner {
             knn_node,
             Arc::new(filter_projection),
         )?);
-        self.filter_node(
-            filter_expression,
-            take_node,
-            false,
-            Some(Arc::new(self.vector_search_schema()?)),
-        )
+        self.filter_node(filter_expression, take_node)
     }
 
     /// Create an Execution plan with a scan node
@@ -406,18 +399,14 @@ impl Scanner {
         &self,
         filter: Arc<dyn PhysicalExpr>,
         input: Arc<dyn ExecutionPlan>,
-        drop_row_id: bool,
-        ann_schema: Option<Arc<Schema>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
         let output_schema = self.scanner_output_schema()?;
-        Ok(Arc::new(LocalTakeExec::new(
-            filter_node,
+        Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
+            filter_node,
             output_schema,
-            ann_schema,
-            drop_row_id,
-        )))
+        )?))
     }
 }
 

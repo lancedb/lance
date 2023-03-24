@@ -24,4 +24,4 @@ pub use knn::*;
 pub use planner::Planner;
 pub(crate) use projection::ProjectionExec;
 pub use scan::LanceScanExec;
-pub(crate) use take::{LocalTakeExec, TakeExec};
+pub(crate) use take::TakeExec;
