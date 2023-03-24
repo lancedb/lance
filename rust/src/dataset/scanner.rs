@@ -640,9 +640,9 @@ mod test {
                         schema.clone(),
                         vec![
                             Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
-                            Arc::new(StringArray::from_iter_values((i * 80..(i + 1) * 80).map(
-                                |v| format!("s-{}", v),
-                            ))),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 80..(i + 1) * 80).map(|v| format!("s-{}", v)),
+                            )),
                             Arc::new(vectors),
                         ],
                     )
