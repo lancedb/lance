@@ -620,6 +620,7 @@ mod test {
     async fn create_vector_dataset(path: &str, build_index: bool) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
             ArrowField::new(
                 "vec",
                 DataType::FixedSizeList(
@@ -639,6 +640,9 @@ mod test {
                         schema.clone(),
                         vec![
                             Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
+                            Arc::new(StringArray::from_iter_values((i * 80..(i + 1) * 80).map(
+                                |v| format!("s-{}", v),
+                            ))),
                             Arc::new(vectors),
                         ],
                     )
@@ -699,6 +703,7 @@ mod test {
                 batch.schema().as_ref(),
                 &ArrowSchema::new(vec![
                     ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new("s", DataType::Utf8, true),
                     ArrowField::new(
                         "vec",
                         DataType::FixedSizeList(
@@ -731,6 +736,7 @@ mod test {
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.nearest("vec", &key, 5).unwrap();
         scan.filter("i > 100").unwrap();
+        scan.project(&["i"]).unwrap();
         scan.refine(5);
 
         let results = scan
@@ -798,6 +804,7 @@ mod test {
             batch.schema().as_ref(),
             &ArrowSchema::new(vec![
                 ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new("s", DataType::Utf8, true),
                 ArrowField::new(
                     "vec",
                     DataType::FixedSizeList(
