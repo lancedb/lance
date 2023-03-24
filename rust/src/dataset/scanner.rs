@@ -1131,10 +1131,10 @@ mod test {
             vec!["i"]
         );
 
+        // Flat refine step
         let flat = &take.children()[0];
         assert!(flat.as_any().is::<KNNFlatExec>());
 
-        // TODO: Two continuous take execs, we can merge them into one.
         let take = &flat.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
         assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec"]);
