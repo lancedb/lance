@@ -152,7 +152,9 @@ impl ExecutionPlan for KNNFlatExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
-        fields.push(Field::new(SCORE_COL, DataType::Float32, false));
+        if !input_schema.field_with_name(SCORE_COL).is_ok() {
+            fields.push(Field::new(SCORE_COL, DataType::Float32, false));
+        }
 
         Arc::new(Schema::new_with_metadata(
             fields,

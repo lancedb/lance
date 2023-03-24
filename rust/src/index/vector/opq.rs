@@ -364,7 +364,6 @@ mod tests {
             .next()
             .unwrap()
             .unwrap();
-        println!("{:?}", index_file.path());
         let uuid = index_file.file_name().to_str().unwrap().to_string();
 
         let index = open_index(&dataset, &uuid).await.unwrap();
@@ -390,7 +389,6 @@ mod tests {
             key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
         };
         let results = index.search(&query).await.unwrap();
-
         let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
         assert_eq!(row_ids.len(), 4);
         assert!(row_ids.values().contains(&10));

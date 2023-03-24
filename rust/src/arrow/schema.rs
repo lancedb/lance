@@ -20,6 +20,8 @@ use arrow_schema::{ArrowError, Field, Schema};
 pub trait SchemaExt {
     /// Create a new [`Schema`] with one extra field.
     fn try_with_column(&self, field: Field) -> std::result::Result<Schema, ArrowError>;
+
+    fn field_names(&self) -> Vec<&String>;
 }
 
 impl SchemaExt for Schema {
@@ -34,5 +36,9 @@ impl SchemaExt for Schema {
         let mut fields = self.fields.clone();
         fields.push(field);
         Ok(Schema::new_with_metadata(fields, self.metadata.clone()))
+    }
+
+    fn field_names(&self) -> Vec<&String> {
+        self.fields().iter().map(|f| f.name()).collect()
     }
 }
