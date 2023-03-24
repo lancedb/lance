@@ -686,6 +686,21 @@ mod test {
 
         assert_eq!(results.len(), 1);
         let batch = &results[0];
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(batch.schema().as_ref(), &ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    32,
+                ),
+                true,
+            ),
+            ArrowField::new("score", DataType::Float32, false),
+        ]));
+
         let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
         let column_i = batch.column_by_name("i").unwrap();
         let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
