@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
-use arrow_schema::DataType::{self, Float32};
+use arrow_schema::DataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
     context::SessionState,
@@ -215,30 +215,31 @@ impl Scanner {
     }
 
     fn output_schema(&self) -> Result<Arc<Schema>> {
-        let schema = if self.nearest.as_ref().is_some() {
-            self.projections.merge(&self.vector_search_schema()?)
+        let mut extra_columns = vec![];
+
+        if let Some(q) = self.nearest.as_ref() {
+            let vector_field = self
+                .dataset
+                .schema()
+                .field(&q.column)
+                .ok_or(Error::IO(format!("Column {} not found", q.column)))?;
+            let vector_field = ArrowField::try_from(vector_field).map_err(|e| {
+                Error::IO(format!("Failed to convert vector field: {}", e.to_string()))
+            })?;
+            extra_columns.push(vector_field);
+            extra_columns.push(ArrowField::new("score", DataType::Float32, false));
+        };
+        if self.with_row_id {
+            extra_columns.push(ArrowField::new(ROW_ID, DataType::UInt64, false));
+        }
+
+        let schema = if !extra_columns.is_empty() {
+            let extra_schema = Schema::try_from(&ArrowSchema::new(extra_columns))?;
+            self.projections.merge(&extra_schema)
         } else {
             self.projections.clone()
         };
-        if self.with_row_id {
-            let row_id_schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-                ROW_ID,
-                DataType::UInt64,
-                false,
-            )]))?;
-            let schema = schema.merge(&row_id_schema);
-            Ok(schema.into())
-        } else {
-            Ok(schema.into())
-        }
-    }
-
-    fn vector_search_schema(&self) -> Result<Schema> {
-        let q = self.nearest.as_ref().unwrap();
-        let vector_schema = self.dataset.schema().project(&[&q.column])?;
-        let score = ArrowField::new("score", Float32, false);
-        let score_schema = Schema::try_from(&ArrowSchema::new(vec![score]))?;
-        Ok(vector_schema.merge(&score_schema))
+        Ok(Arc::new(schema))
     }
 
     /// Create a stream of this Scanner.
@@ -361,6 +362,9 @@ impl Scanner {
 
         // Stage 2: filter
         if let Some(expr) = filter_expr.as_ref() {
+            let columns_in_filter = column_names_in_expr(expr.as_ref());
+            let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+            let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
             todo!("filter")
         }
 

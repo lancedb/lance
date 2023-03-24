@@ -2,7 +2,7 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt::Formatter;
+use std::fmt::{Formatter, Debug};
 use std::fmt::{self};
 
 use arrow_array::cast::{as_large_list_array, as_list_array};
@@ -717,7 +717,13 @@ impl Schema {
     }
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
-    pub fn exclude(&self, other: &Self) -> Result<Self> {
+    pub fn exclude<T: TryInto<Self> + Debug>(&self, other: T) -> Result<Self> {
+        let other = other.try_into().map_err(|_| {
+            Error::Schema(format!(
+                "The other schema {:?} is not compatible with this schema",
+                other
+            ))
+        })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
@@ -854,6 +860,13 @@ impl From<&Schema> for ArrowSchema {
             fields: schema.fields.iter().map(ArrowField::from).collect(),
             metadata: schema.metadata.clone(),
         }
+    }
+}
+
+/// Convert Lance Schema to Arrow Schema
+impl From<&Schema> for Schema {
+    fn from(schema: &Schema) -> Self {
+        schema.clone()
     }
 }
 
