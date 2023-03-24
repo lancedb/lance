@@ -440,16 +440,23 @@ impl Stream for RecordBatchStream {
 #[cfg(test)]
 mod test {
 
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use super::*;
 
+    use arrow::array::as_primitive_array;
     use arrow::compute::concat_batches;
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatchReader, StringArray};
+    use arrow::datatypes::Int32Type;
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, RecordBatchReader, StringArray,
+    };
     use arrow_schema::DataType;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::IndexType;
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     #[tokio::test]
@@ -608,5 +615,84 @@ mod test {
             .await
             .unwrap();
         expected_batches
+    }
+
+    #[tokio::test]
+    async fn test_refine_factor() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    32,
+                ),
+                true,
+            ),
+        ]));
+
+        let batches = RecordBatchBuffer::new(
+            (0..5)
+                .map(|i| {
+                    let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
+                    let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 80..(i + 1) * 80)),
+                            Arc::new(vectors),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+
+        let mut params = WriteParams::default();
+        params.max_rows_per_group = 10;
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = Dataset::write(&mut reader, test_uri, Some(params))
+            .await
+            .unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.refine(5);
+
+        let results = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
+        let column_i = batch.column_by_name("i").unwrap();
+        let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(expected_i, actual_i);
     }
 }

@@ -138,12 +138,6 @@ impl KNNFlatExec {
                 query.column
             )));
         };
-        if schema.field_with_name(SCORE_COL).is_ok() {
-            return Err(Error::IO(format!(
-                "KNNFlatExec node: input schema already has a column named {}",
-                SCORE_COL
-            )));
-        }
 
         Ok(Self { input, query })
     }
@@ -154,7 +148,7 @@ impl ExecutionPlan for KNNFlatExec {
         self
     }
 
-    /// Flat KNN inherants the schema from input node, and add one score column.
+    /// Flat KNN inherits the schema from input node, and add one score column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();

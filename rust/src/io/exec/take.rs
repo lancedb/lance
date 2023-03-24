@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
@@ -226,6 +226,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatchReader, StringArray};
+    use arrow_schema::{DataType, Field};
     use tempfile::tempdir;
 
     use crate::{dataset::WriteParams, io::exec::LanceScanExec};
