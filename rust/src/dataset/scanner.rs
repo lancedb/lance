@@ -24,8 +24,7 @@ use datafusion::execution::{
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
 use datafusion::physical_plan::{
-    filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, PhysicalExpr,
-    SendableRecordBatchStream,
+    filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
@@ -35,7 +34,9 @@ use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, ProjectionExec, TakeExec};
+use crate::io::exec::{
+    KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
+};
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -373,11 +374,11 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, &index); // score, _rowid
+            let knn_node = self.ann(q, &index)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(knn_node_with_vector, q)
+                self.flat_knn(knn_node_with_vector, q)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
@@ -387,7 +388,7 @@ impl Scanner {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(scan_node, q))
+            Ok(self.flat_knn(scan_node, q)?)
         }
     }
 
@@ -437,7 +438,7 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
-    }=
+    }
 }
 
 /// ScannerStream is a container to wrap different types of ExecNode.
@@ -473,8 +474,6 @@ mod test {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::*;
-
     use arrow::array::as_primitive_array;
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
@@ -485,12 +484,9 @@ mod test {
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
-    use crate::index::vector::VectorIndexParams;
-    use crate::index::IndexType;
     use super::*;
     use crate::arrow::*;
-    use crate::index::IndexType;
-    use crate::index::vector::VectorIndexParams;
+    use crate::index::{vector::VectorIndexParams, IndexType};
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     #[tokio::test]
@@ -859,7 +855,7 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_i, actual_i);
-
+    }
 
     fn get_exec_columns(plan: &dyn ExecutionPlan) -> Vec<String> {
         plan.schema()
@@ -1039,7 +1035,10 @@ mod test {
 
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(get_exec_columns(filter.as_ref()), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(
+            get_exec_columns(filter.as_ref()),
+            ["score", "_rowid", "vec", "i"]
+        );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
@@ -1082,7 +1081,7 @@ mod test {
     async fn test_knn_with_refine() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri, true).await;
+        let dataset = create_vector_dataset(test_uri, true).await;
 
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
@@ -1117,7 +1116,10 @@ mod test {
 
         let filter = &take.children()[0];
         assert!(filter.as_any().is::<FilterExec>());
-        assert_eq!(get_exec_columns(filter.as_ref()), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(
+            get_exec_columns(filter.as_ref()),
+            ["score", "_rowid", "vec", "i"]
+        );
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
