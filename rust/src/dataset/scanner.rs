@@ -1070,4 +1070,85 @@ mod test {
         assert!(knn.as_any().is::<KNNIndexExec>());
         assert_eq!(get_exec_columns(knn.as_ref()), ["score", "_rowid"]);
     }
+
+    /// Test KNN index with refine factor
+    ///
+    /// Query: nearest(vec, [...], 10, refine_factor=10) + filter(i > 10 and i < 20)
+    ///
+    /// Expected plan:
+    ///  KNNIndex(vec) -> Take(vec) -> KNNFlat(vec, 10) -> Take(i) -> Filter(i)
+    ///     -> take(s, vec) -> projection(s, vec, score)
+    #[tokio::test]
+    async fn test_knn_with_refine() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri, true).await;
+
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.nearest("vec", &key, 10).unwrap();
+        scan.refine(10);
+        scan.project(&["s"]).unwrap();
+        scan.filter("i > 10 and i < 20").unwrap();
+
+        let plan = scan.create_plan().await.unwrap();
+
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["s", "vec", "score"]
+        );
+
+        let take = &plan.children()[0];
+        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
+        assert_eq!(get_exec_columns(take), ["score", "_rowid", "i", "s", "vec"]);
+        assert_eq!(
+            take.extra_schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s"]
+        );
+
+        let filter = &take.children()[0];
+        assert!(filter.as_any().is::<FilterExec>());
+        assert_eq!(get_exec_columns(filter.as_ref()), ["score", "_rowid", "vec", "i"]);
+
+        let take = &filter.children()[0];
+        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
+        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i"]);
+        assert_eq!(
+            take.extra_schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["i"]
+        );
+
+        let flat = &take.children()[0];
+        assert!(flat.as_any().is::<KNNFlatExec>());
+
+        // TODO: Two continuous take execs, we can merge them into one.
+        let take = &flat.children()[0];
+        let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
+        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec"]);
+        assert_eq!(
+            take.extra_schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vec"]
+        );
+
+        let knn = &take.children()[0];
+        assert!(knn.as_any().is::<KNNIndexExec>());
+        assert_eq!(get_exec_columns(knn.as_ref()), ["score", "_rowid"]);
+    }
 }
