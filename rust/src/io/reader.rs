@@ -1153,13 +1153,13 @@ mod tests {
         let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),
             Some(vec![Some(3), Some(4)]),
-            Some((0..1_000_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..200).map(|n| Some(n)).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
         let large_list_array = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(10), Some(11)]),
             Some(vec![Some(12), Some(13)]),
-            Some((0..1_000_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..200).map(|n| Some(n)).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
 
