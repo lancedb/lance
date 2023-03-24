@@ -327,6 +327,47 @@ impl Scanner {
         ))
     }
 
+    /// Create [`ExecutionPlan`] for Scan.
+    ///
+    /// An ExecutionPlan is a graph of operators that can be executed.
+    ///
+    /// The following plans are supported:
+    ///
+    ///  - **Plain scan without filter or limits.**
+    ///
+    ///  ```
+    ///  Scan(projections)
+    ///  ```
+    ///
+    ///  - **Scan with filter and/or limits.**
+    ///
+    ///  ```
+    ///  Scan(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    ///  ```
+    ///
+    ///  - **Use KNN Index (with filter and/or limits)**
+    ///
+    /// ```
+    /// KNNIndex() -> Take(vector) -> FlatRefine()
+    ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    /// ```
+    ///
+    /// - **Use KNN flat (brute force) with filter and/or limits**
+    ///
+    /// ```
+    /// Scan(vector) -> FlatKNN()
+    ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    /// ```
+    fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
     fn filter_knn(
         &self,
         knn_node: Arc<dyn ExecutionPlan>,
