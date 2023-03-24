@@ -1151,13 +1151,16 @@ mod tests {
         let path = Path::from("/lists");
 
         let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-            Some(vec![Some(1), Some(1)]),
-            Some(vec![Some(2), Some(2)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3), Some(4)]),
+            Some((0..1_000_000).map(|n| Some(n)).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
+        println!("test: list_array: {:?}", list_array);
         let large_list_array = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
-            Some(vec![Some(11), Some(11)]),
-            Some(vec![Some(12), Some(12)]),
+            Some(vec![Some(10), Some(11)]),
+            Some(vec![Some(12), Some(13)]),
+            Some((0..1_000_000).map(|n| Some(n)).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
 
@@ -1171,6 +1174,10 @@ mod tests {
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
         file_writer.write(&[&batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
+
+        // Make sure the big array was not written to the file
+        let file_size_bytes = store.size(&path).await.unwrap();
+        assert!(file_size_bytes < 1_000);
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();

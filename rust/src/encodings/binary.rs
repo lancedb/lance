@@ -466,6 +466,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_binary_data_with_offset() {
+        test_round_trips(&[StringArray::from(vec![Some("d"), Some("e")])
+            .slice(1, 1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()])
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_range_query() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
