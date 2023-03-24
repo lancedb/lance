@@ -331,7 +331,7 @@ impl Scanner {
                 // Not all columns for filter are ready, so we need to take them first
                 plan = self.take(plan, &remaining_schema)?;
             }
-            plan  = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
+            plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
 
         // Stage 3: limit / offset

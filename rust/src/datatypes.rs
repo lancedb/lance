@@ -2,8 +2,8 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt::{Formatter, Debug};
 use std::fmt::{self};
+use std::fmt::{Debug, Formatter};
 
 use arrow_array::cast::{as_large_list_array, as_list_array};
 use arrow_array::types::{
@@ -719,9 +719,7 @@ impl Schema {
     /// Exclude the fields from `other` Schema, and returns a new Schema.
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
         let other = schema.try_into().map_err(|_| {
-            Error::Schema(
-                "The other schema is not compatible with this schema"
-                .to_string())
+            Error::Schema("The other schema is not compatible with this schema".to_string())
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
