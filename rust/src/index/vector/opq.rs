@@ -389,10 +389,8 @@ mod tests {
             key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
         };
         let results = index.search(&query).await.unwrap();
-        println!("{:?}", results);
         let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
         assert_eq!(row_ids.len(), 4);
-        println!("{:?}", row_ids.values());
         assert!(row_ids.values().contains(&10));
         assert_eq!(min(row_ids).unwrap() + 3, max(row_ids).unwrap());
     }
