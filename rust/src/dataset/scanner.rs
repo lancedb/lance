@@ -1104,7 +1104,7 @@ mod test {
 
         let take = &plan.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(get_exec_columns(take), ["score", "_rowid", "i", "s", "vec"]);
+        assert_eq!(get_exec_columns(take), ["score", "_rowid", "vec", "i", "s"]);
         assert_eq!(
             take.extra_schema
                 .fields
