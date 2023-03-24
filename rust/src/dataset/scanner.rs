@@ -319,7 +319,7 @@ impl Scanner {
             self.scan(true, filter_schema)
         } else {
             // Scan without filter or limits
-            self.scan(self.with_row_id, self.output_schema()?)
+            self.scan(self.with_row_id, self.projections.clone().into())
         };
 
         // Stage 2: filter
@@ -345,7 +345,7 @@ impl Scanner {
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema)?;
         }
-        plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
+        plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
 
         Ok(plan)
     }
@@ -856,4 +856,7 @@ mod test {
             .collect();
         assert_eq!(expected_i, actual_i);
     }
+
+    #[tokio::test]
+    async fn test_simple_scan_plan() {}
 }
