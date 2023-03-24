@@ -31,9 +31,8 @@ use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
-use crate::arrow::*;
 use crate::datafusion::physical_expr::column_names_in_expr;
-use crate::datatypes::{Field, Schema};
+use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, ProjectionExec, TakeExec};
@@ -351,16 +350,9 @@ impl Scanner {
         // Stage 1: source
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
             self.knn().await?
-        } else if let Some(expr) = filter_expr {
+        } else if let Some(expr) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(expr.as_ref());
-            let filter_schema = Arc::new(
-                self.dataset.schema().project(
-                    &columns_in_filter
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>(),
-                )?,
-            );
+            let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
             self.scan(self.with_row_id, filter_schema)
         } else {
             // Scan without filter or limits
@@ -368,11 +360,16 @@ impl Scanner {
         };
 
         // Stage 2: filter
+        if let Some(expr) = filter_expr.as_ref() {
+            todo!("filter")
+        }
 
         // Stage 3: limit / offset
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
+
+        // Stage 4: take remaining columns / projection
 
         Ok(plan)
     }
