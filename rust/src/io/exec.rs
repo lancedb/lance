@@ -17,6 +17,8 @@ mod planner;
 mod projection;
 mod scan;
 mod take;
+#[cfg(test)]
+pub(crate) mod testing;
 
 pub use knn::*;
 pub use planner::Planner;

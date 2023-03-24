@@ -273,11 +273,11 @@ impl Scanner {
                     }
                 }
 
-                let knn_node = self.ann(q, &index); // score, _rowid
+                let knn_node = self.ann(q, &index)?; // score, _rowid
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
                 let knn_node_with_vector = self.take(knn_node, &with_vector)?;
                 let knn_node = if q.refine_factor.is_some() {
-                    self.flat_knn(knn_node_with_vector, q)
+                    self.flat_knn(knn_node_with_vector, q)?
                 } else {
                     knn_node_with_vector
                 }; // vector, score, _rowid
@@ -290,7 +290,7 @@ impl Scanner {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                 let scan_node = self.scan(true, vector_scan_projection);
-                let knn_node = self.flat_knn(scan_node, q);
+                let knn_node = self.flat_knn(scan_node, q)?;
 
                 let knn_node = filter_expr
                     .map(|f| self.filter_knn(knn_node.clone(), f))
@@ -367,17 +367,17 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Arc<dyn ExecutionPlan> {
-        Arc::new(KNNFlatExec::new(input, q.clone()))
+    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
     }
 
     /// Create an Execution plan to do indexed ANN search
-    fn ann(&self, q: &Query, index: &Index) -> Arc<dyn ExecutionPlan> {
-        Arc::new(KNNIndexExec::new(
+    fn ann(&self, q: &Query, index: &Index) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
             &index.uuid.to_string(),
             q,
-        ))
+        )?))
     }
 
     /// Take row indices produced by input plan from the dataset (with projection)
