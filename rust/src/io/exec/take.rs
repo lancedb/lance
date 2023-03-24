@@ -44,12 +44,12 @@ impl Take {
     /// Create a Take node with
     ///
     ///  - Dataset: the dataset to read from
-    ///  - extra: extra columns to take
+    ///  - projection: extra columns to take from the dataset.
     ///  - output_schema: the output schema of the take node.
     ///  - child: the upstream stream to feed data in.
     fn new(
         dataset: Arc<Dataset>,
-        extra: Arc<Schema>,
+        projection: Arc<Schema>,
         output_schema: SchemaRef,
         child: SendableRecordBatchStream,
     ) -> Self {
@@ -57,7 +57,9 @@ impl Take {
 
         let bg_thread = tokio::spawn(async move {
             if let Err(e) = child
-                .zip(stream::repeat_with(|| (dataset.clone(), extra.clone())))
+                .zip(stream::repeat_with(|| {
+                    (dataset.clone(), projection.clone())
+                }))
                 .then(|(batch, (dataset, extra))| async move {
                     let batch = batch?;
                     let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
