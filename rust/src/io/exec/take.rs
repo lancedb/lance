@@ -131,7 +131,9 @@ impl RecordBatchStream for Take {
 pub(crate) struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
-    extra_schema: Arc<Schema>,
+
+    pub(crate) extra_schema: Arc<Schema>,
+
     input: Arc<dyn ExecutionPlan>,
 
     /// Output schema is the merged schema between input schema and extra schema.
