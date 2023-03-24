@@ -368,6 +368,12 @@ impl Scanner {
         };
 
         // Stage 2: filter
+
+        // Stage 3: limit / offset
+        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
+            plan = self.limit_node(plan);
+        }
+
         Ok(plan)
     }
 
