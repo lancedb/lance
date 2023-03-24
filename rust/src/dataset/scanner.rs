@@ -617,8 +617,7 @@ mod test {
         expected_batches
     }
 
-    #[tokio::test]
-    async fn test_refine_factor() {
+    async fn create_vector_dataset(path: &str, build_index: bool) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new(
@@ -652,25 +651,84 @@ mod test {
         params.max_rows_per_group = 10;
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
 
+
+        let dataset = Dataset::write(&mut reader, path, Some(params))
+            .await
+            .unwrap();
+
+        if build_index {
+            let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+            dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+
+        Dataset::open(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_knn_nodes() {
+        for build_index in &[true, false] {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let dataset = create_vector_dataset(test_uri, *build_index).await;
+            let mut scan = dataset.scan();
+            let key: Float32Array = (32..64).map(|v| v as f32).collect();
+            scan.nearest("vec", &key, 5).unwrap();
+            scan.refine(5);
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            assert_eq!(batch.num_rows(), 5);
+            assert_eq!(
+                batch.schema().as_ref(),
+                &ArrowSchema::new(vec![
+                    ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new(
+                        "vec",
+                        DataType::FixedSizeList(
+                            Box::new(ArrowField::new("item", DataType::Float32, true)),
+                            32,
+                        ),
+                        true,
+                    ),
+                    ArrowField::new("score", DataType::Float32, false),
+                ])
+            );
+
+            let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_refine_factor() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = Dataset::write(&mut reader, test_uri, Some(params))
-            .await
-            .unwrap();
 
-        let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
-        dataset
-            .create_index(
-                &["vec"],
-                IndexType::Vector,
-                Some("idx".to_string()),
-                &params,
-                true,
-            )
-            .await
-            .unwrap();
-
-        let dataset = Dataset::open(test_uri).await.unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
         scan.nearest("vec", &key, 5).unwrap();
@@ -688,18 +746,21 @@ mod test {
         let batch = &results[0];
 
         assert_eq!(batch.num_rows(), 5);
-        assert_eq!(batch.schema().as_ref(), &ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int32, true),
-            ArrowField::new(
-                "vec",
-                DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
-                    32,
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Box::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
                 ),
-                true,
-            ),
-            ArrowField::new("score", DataType::Float32, false),
-        ]));
+                ArrowField::new("score", DataType::Float32, false),
+            ])
+        );
 
         let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
         let column_i = batch.column_by_name("i").unwrap();
