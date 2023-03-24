@@ -717,12 +717,11 @@ impl Schema {
     }
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
-    pub fn exclude<T: TryInto<Self> + Debug>(&self, other: T) -> Result<Self> {
-        let other = other.try_into().map_err(|_| {
-            Error::Schema(format!(
-                "The other schema {:?} is not compatible with this schema",
-                other
-            ))
+    pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
+        let other = schema.try_into().map_err(|_| {
+            Error::Schema(
+                "The other schema is not compatible with this schema"
+                .to_string())
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {

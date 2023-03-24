@@ -246,45 +246,7 @@ impl Scanner {
     ///
     /// TODO: implement as IntoStream/IntoIterator.
     pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
-        let with_row_id = self.with_row_id;
-        let projection = &self.projections;
-
-        let filter_expr = if let Some(filter) = self.filter.as_ref() {
-            let planner = crate::io::exec::Planner::new(Arc::new(self.dataset.schema().into()));
-            let logical_expr = planner.parse_filter(filter)?;
-            Some(planner.create_physical_expr(&logical_expr)?)
-        } else {
-            None
-        };
-
-        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
-            let knn_node = self.knn().await?;
-            let knn_node = filter_expr
-                .map(|f| self.filter_knn(knn_node.clone(), f))
-                .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-            self.take(knn_node, projection)?
-        } else if let Some(filter) = filter_expr {
-            let columns_in_filter = column_names_in_expr(filter.as_ref());
-            let filter_schema = Arc::new(
-                self.dataset.schema().project(
-                    &columns_in_filter
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>(),
-                )?,
-            );
-            let scan = self.scan(true, filter_schema);
-            self.filter_node(filter, scan)?
-        } else {
-            self.scan(with_row_id, Arc::new(self.projections.clone()))
-        };
-
-        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
-            plan = self.limit_node(plan);
-        }
-
-        let project_schema = Schema::try_from(self.schema()?.as_ref())?;
-        plan = Arc::new(ProjectionExec::try_new(plan, project_schema.into())?);
+        let plan = self.create_plan().await?;
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
@@ -354,18 +316,22 @@ impl Scanner {
         } else if let Some(expr) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(expr.as_ref());
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-            self.scan(self.with_row_id, filter_schema)
+            self.scan(true, filter_schema)
         } else {
             // Scan without filter or limits
             self.scan(self.with_row_id, self.output_schema()?)
         };
 
         // Stage 2: filter
-        if let Some(expr) = filter_expr.as_ref() {
-            let columns_in_filter = column_names_in_expr(expr.as_ref());
+        if let Some(predicates) = filter_expr.as_ref() {
+            let columns_in_filter = column_names_in_expr(predicates.as_ref());
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
             let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
-            todo!("filter")
+            if !remaining_schema.fields.is_empty() {
+                // Not all columns for filter are ready, so we need to take them first
+                plan = self.take(plan, &remaining_schema)?;
+            }
+            plan  = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
 
         // Stage 3: limit / offset
@@ -374,6 +340,12 @@ impl Scanner {
         }
 
         // Stage 4: take remaining columns / projection
+        let output_schema = self.output_schema()?;
+        let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
+        if !remaining_schema.fields.is_empty() {
+            plan = self.take(plan, &remaining_schema)?;
+        }
+        plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
         Ok(plan)
     }
@@ -419,6 +391,7 @@ impl Scanner {
         }
     }
 
+<<<<<<< HEAD
     fn filter_knn(
         &self,
         knn_node: Arc<dyn ExecutionPlan>,
@@ -439,6 +412,8 @@ impl Scanner {
         self.filter_node(filter_expression, take_node)
     }
 
+=======
+>>>>>>> b330654 (separate create plan)
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
@@ -486,6 +461,7 @@ impl Scanner {
             self.limit.map(|l| l as usize),
         ))
     }
+<<<<<<< HEAD
 
     fn filter_node(
         &self,
@@ -501,6 +477,8 @@ impl Scanner {
             output_schema,
         )?))
     }
+=======
+>>>>>>> b330654 (separate create plan)
 }
 
 /// ScannerStream is a container to wrap different types of ExecNode.
