@@ -692,7 +692,10 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(Error::Schema(format!("Column {} does not exist", col.as_ref())));
+                return Err(Error::Schema(format!(
+                    "Column {} does not exist",
+                    col.as_ref()
+                )));
             }
         }
 

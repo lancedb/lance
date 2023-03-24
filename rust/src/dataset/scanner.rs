@@ -257,48 +257,12 @@ impl Scanner {
             None
         };
 
-        let mut plan: Arc<dyn ExecutionPlan> = if let Some(q) = self.nearest.as_ref() {
-            let column_id = self.dataset.schema().field_id(q.column.as_str())?;
-            let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
-            let indices = if use_index {
-                self.dataset.load_indices().await?
-            } else {
-                vec![]
-            };
-            let qcol_index = indices.iter().find(|i| i.fields.contains(&column_id));
-            if let Some(index) = qcol_index {
-                // There is an index built for the column.
-                // We will use the index.
-                if let Some(rf) = q.refine_factor {
-                    if rf == 0 {
-                        return Err(Error::IO("Refine factor can not be zero".to_string()));
-                    }
-                }
-
-                let knn_node = self.ann(q, &index)?; // score, _rowid
-                let with_vector = self.dataset.schema().project(&[&q.column])?;
-                let knn_node_with_vector = self.take(knn_node, &with_vector)?;
-                let knn_node = if q.refine_factor.is_some() {
-                    self.flat_knn(knn_node_with_vector, q)?
-                } else {
-                    knn_node_with_vector
-                }; // vector, score, _rowid
-
-                let knn_node = filter_expr
-                    .map(|f| self.filter_knn(knn_node.clone(), f))
-                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection)?
-            } else {
-                let vector_scan_projection =
-                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                let scan_node = self.scan(true, vector_scan_projection);
-                let knn_node = self.flat_knn(scan_node, q)?;
-
-                let knn_node = filter_expr
-                    .map(|f| self.filter_knn(knn_node.clone(), f))
-                    .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection)?
-            }
+        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
+            let knn_node = self.knn().await?;
+            let knn_node = filter_expr
+                .map(|f| self.filter_knn(knn_node.clone(), f))
+                .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
+            self.take(knn_node, projection)?
         } else if let Some(filter) = filter_expr {
             let columns_in_filter = column_names_in_expr(filter.as_ref());
             let filter_schema = Arc::new(
@@ -339,13 +303,13 @@ impl Scanner {
     ///
     ///  - **Plain scan without filter or limits.**
     ///
-    ///  ```
+    ///  ```ignore
     ///  Scan(projections)
     ///  ```
     ///
     ///  - **Scan with filter and/or limits.**
     ///
-    ///  ```
+    ///  ```ignore
     ///  Scan(filtered_cols) -> Filter(expr)
     ///     -> (*LimitExec(limit, offset))
     ///     -> Take(remaining_cols) -> Projection()
@@ -353,7 +317,7 @@ impl Scanner {
     ///
     ///  - **Use KNN Index (with filter and/or limits)**
     ///
-    /// ```
+    /// ```ignore
     /// KNNIndex() -> Take(vector) -> FlatRefine()
     ///     -> Take(filtered_cols) -> Filter(expr)
     ///     -> (*LimitExec(limit, offset))
@@ -362,7 +326,7 @@ impl Scanner {
     ///
     /// - **Use KNN flat (brute force) with filter and/or limits**
     ///
-    /// ```
+    /// ```ignore
     /// Scan(vector) -> FlatKNN()
     ///     -> Take(filtered_cols) -> Filter(expr)
     ///     -> (*LimitExec(limit, offset))
@@ -420,8 +384,32 @@ impl Scanner {
         } else {
             vec![]
         };
-        let idx = indices.iter().find(|i| i.fields.contains(&column_id));
-        todo!()
+        let knn_idx = indices.iter().find(|i| i.fields.contains(&column_id));
+        if let Some(index) = knn_idx {
+            // There is an index built for the column.
+            // We will use the index.
+            if let Some(rf) = q.refine_factor {
+                if rf == 0 {
+                    return Err(Error::IO("Refine factor can not be zero".to_string()));
+                }
+            }
+
+            let knn_node = self.ann(q, &index); // score, _rowid
+            let with_vector = self.dataset.schema().project(&[&q.column])?;
+            let knn_node_with_vector = self.take(knn_node, &with_vector)?;
+            let knn_node = if q.refine_factor.is_some() {
+                self.flat_knn(knn_node_with_vector, q)
+            } else {
+                knn_node_with_vector
+            }; // vector, score, _rowid
+            Ok(knn_node)
+        } else {
+            // No index found. use flat search.
+            let vector_scan_projection =
+                Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+            let scan_node = self.scan(true, vector_scan_projection);
+            Ok(self.flat_knn(scan_node, q))
+        }
     }
 
     fn filter_knn(
