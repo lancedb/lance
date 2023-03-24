@@ -33,7 +33,7 @@ use futures::stream::{Stream, StreamExt};
 use super::Dataset;
 use crate::arrow::*;
 use crate::datafusion::physical_expr::column_names_in_expr;
-use crate::datatypes::Schema;
+use crate::datatypes::{Field, Schema};
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{KNNFlatExec, KNNIndexExec, LanceScanExec, ProjectionExec, TakeExec};
@@ -210,23 +210,27 @@ impl Scanner {
     /// The Arrow schema of the output, including projections and vector / score
     pub fn schema(&self) -> Result<SchemaRef> {
         let schema = self
-            .scanner_output_schema()
+            .output_schema()
             .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))?;
-        if self.with_row_id {
-            let row_id = ArrowField::new(ROW_ID, DataType::UInt64, false);
-            let schema = schema.as_ref().try_with_column(row_id)?;
-            Ok(schema.into())
-        } else {
-            Ok(schema)
-        }
+        Ok(schema)
     }
 
-    fn scanner_output_schema(&self) -> Result<Arc<Schema>> {
-        if self.nearest.as_ref().is_some() {
-            let merged = self.projections.merge(&self.vector_search_schema()?);
-            Ok(Arc::new(merged))
+    fn output_schema(&self) -> Result<Arc<Schema>> {
+        let schema = if self.nearest.as_ref().is_some() {
+            self.projections.merge(&self.vector_search_schema()?)
         } else {
-            Ok(Arc::new(self.projections.clone()))
+            self.projections.clone()
+        };
+        if self.with_row_id {
+            let row_id_schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )]))?;
+            let schema = schema.merge(&row_id_schema);
+            Ok(schema.into())
+        } else {
+            Ok(schema.into())
         }
     }
 
@@ -364,7 +368,59 @@ impl Scanner {
     ///     -> (*LimitExec(limit, offset))
     ///     -> Take(remaining_cols) -> Projection()
     /// ```
-    fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    ///
+    /// In general, a plan has 4 stages:
+    ///
+    /// 1. Source (from dataset Scan or from index)
+    /// 2. Filter
+    /// 3. Limit / Offset
+    /// 4. Take remaining columns / Projection
+    async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_expr = if let Some(filter) = self.filter.as_ref() {
+            let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+            let logical_expr = planner.parse_filter(filter)?;
+            Some(planner.create_physical_expr(&logical_expr)?)
+        } else {
+            None
+        };
+
+        // Stage 1: source
+        let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
+            self.knn().await?
+        } else if let Some(expr) = filter_expr {
+            let columns_in_filter = column_names_in_expr(expr.as_ref());
+            let filter_schema = Arc::new(
+                self.dataset.schema().project(
+                    &columns_in_filter
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                )?,
+            );
+            self.scan(self.with_row_id, filter_schema)
+        } else {
+            // Scan without filter or limits
+            self.scan(self.with_row_id, self.output_schema()?)
+        };
+
+        // Stage 2: filter
+        Ok(plan)
+    }
+
+    //
+    async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(q) = self.nearest.as_ref() else {
+            return Err(Error::IO("No nearest query".to_string()));
+        };
+
+        let column_id = self.dataset.schema().field_id(q.column.as_str())?;
+        let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
+        let indices = if use_index {
+            self.dataset.load_indices().await?
+        } else {
+            vec![]
+        };
+        let idx = indices.iter().find(|i| i.fields.contains(&column_id));
         todo!()
     }
 
@@ -442,8 +498,9 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let filter_node = Arc::new(FilterExec::try_new(filter, input)?);
-        let output_schema = self.scanner_output_schema()?;
-        Ok(Arc::new(TakeExec::try_new(
+        let output_schema = self.output_schema()?;
+        Ok(Arc::new(LocalTakeExec::new(
+            filter_node,
             self.dataset.clone(),
             filter_node,
             output_schema,

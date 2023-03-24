@@ -679,10 +679,10 @@ impl Schema {
     /// let schema = Schema::from(...);
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
-    pub fn project(&self, columns: &[&str]) -> Result<Self> {
+    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
-            let split = (*col).split('.').collect::<Vec<_>>();
+            let split = col.as_ref().split('.').collect::<Vec<_>>();
             let first = split[0];
             if let Some(field) = self.field(first) {
                 let projected_field = field.project(&split[1..])?;
@@ -692,7 +692,7 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(Error::Schema(format!("Column {} does not exist", col)));
+                return Err(Error::Schema(format!("Column {} does not exist", col.as_ref())));
             }
         }
 
