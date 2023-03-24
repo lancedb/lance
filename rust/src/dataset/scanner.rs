@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::{Float32Array, RecordBatch};
-use arrow_schema::DataType::Float32;
+use arrow_schema::DataType::{self, Float32};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use datafusion::execution::{
     context::SessionState,
@@ -31,11 +31,14 @@ use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
 
 use super::Dataset;
+use crate::arrow::*;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
 use crate::format::Index;
 use crate::index::vector::{MetricType, Query};
-use crate::io::exec::{GlobalTakeExec, KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec};
+use crate::io::exec::{
+    KNNFlatExec, KNNIndexExec, LanceScanExec, LocalTakeExec, ProjectionExec, TakeExec,
+};
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -208,8 +211,16 @@ impl Scanner {
 
     /// The Arrow schema of the output, including projections and vector / score
     pub fn schema(&self) -> Result<SchemaRef> {
-        self.scanner_output_schema()
-            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))
+        let schema = self
+            .scanner_output_schema()
+            .map(|s| SchemaRef::new(ArrowSchema::from(s.as_ref())))?;
+        if self.with_row_id {
+            let row_id = ArrowField::new(ROW_ID, DataType::UInt64, false);
+            let schema = schema.as_ref().try_with_column(row_id)?;
+            Ok(schema.into())
+        } else {
+            Ok(schema)
+        }
     }
 
     fn scanner_output_schema(&self) -> Result<Arc<Schema>> {
@@ -264,7 +275,7 @@ impl Scanner {
 
                 let knn_node = self.ann(q, &index); // score, _rowid
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
-                let knn_node_with_vector = self.take(knn_node, &with_vector, false);
+                let knn_node_with_vector = self.take(knn_node, &with_vector)?;
                 let knn_node = if q.refine_factor.is_some() {
                     self.flat_knn(knn_node_with_vector, q)
                 } else {
@@ -274,7 +285,7 @@ impl Scanner {
                 let knn_node = filter_expr
                     .map(|f| self.filter_knn(knn_node.clone(), f))
                     .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection, true)
+                self.take(knn_node, projection)?
             } else {
                 let vector_scan_projection =
                     Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
@@ -284,7 +295,7 @@ impl Scanner {
                 let knn_node = filter_expr
                     .map(|f| self.filter_knn(knn_node.clone(), f))
                     .unwrap_or(Ok(knn_node))?; // vector, score, _rowid
-                self.take(knn_node, projection, true)
+                self.take(knn_node, projection)?
             }
         } else if let Some(filter) = filter_expr {
             let columns_in_filter = column_names_in_expr(filter.as_ref());
@@ -305,6 +316,9 @@ impl Scanner {
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
         }
+
+        let project_schema = Schema::try_from(self.schema()?.as_ref())?;
+        plan = Arc::new(ProjectionExec::try_new(plan, project_schema.into())?);
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
@@ -327,12 +341,11 @@ impl Scanner {
             .collect::<Vec<_>>();
         let filter_projection = self.dataset.schema().project(&columns_refs)?;
 
-        let take_node = Arc::new(GlobalTakeExec::new(
+        let take_node = Arc::new(TakeExec::try_new(
             self.dataset.clone(),
-            Arc::new(filter_projection),
             knn_node,
-            false,
-        ));
+            Arc::new(filter_projection),
+        )?);
         self.filter_node(
             filter_expression,
             take_node,
@@ -372,14 +385,12 @@ impl Scanner {
         &self,
         input: Arc<dyn ExecutionPlan>,
         projection: &Schema,
-        drop_row_id: bool,
-    ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(GlobalTakeExec::new(
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
-            Arc::new(projection.clone()),
             input,
-            drop_row_id,
-        ))
+            Arc::new(projection.clone()),
+        )?))
     }
 
     /// Global offset-limit of the result of the input plan
