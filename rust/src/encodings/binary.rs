@@ -79,10 +79,11 @@ impl<'a> BinaryEncoder<'a> {
             };
             self.writer.write_all(b).await?;
 
+            let start_offset = offsets[0].as_usize();
             offsets
                 .iter()
                 .skip(1)
-                .map(|b| b.as_usize() + last_offset)
+                .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i64));
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
@@ -390,6 +391,7 @@ mod tests {
     use super::*;
     use arrow_select::concat::concat;
 
+    use arrow_array::cast::as_string_array;
     use arrow_array::{
         new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
         OffsetSizeTrait, StringArray,
@@ -462,6 +464,13 @@ mod tests {
             &LargeStringArray::from(vec![Some("d"), Some("e")]),
         ])
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_write_binary_data_with_offset() {
+        let slice = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
+        let array = as_string_array(slice.as_ref());
+        test_round_trips(&[array]).await;
     }
 
     #[tokio::test]

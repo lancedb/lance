@@ -577,8 +577,8 @@ mod tests {
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
-        Array, DictionaryArray, Float32Array, Int64Array, NullArray, RecordBatchReader,
-        StringArray, StructArray, UInt32Array, UInt8Array,
+        Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
+        RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use futures::StreamExt;
@@ -1130,5 +1130,56 @@ mod tests {
             actual.column_by_name("ll").unwrap().as_ref(),
             &expected_large_list
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_array_with_offsets() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "l",
+                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+            ArrowField::new(
+                "ll",
+                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                false,
+            ),
+        ]);
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/lists");
+
+        let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3), Some(4)]),
+            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+        ])
+        .slice(1, 1);
+        let large_list_array = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(10), Some(11)]),
+            Some(vec![Some(12), Some(13)]),
+            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+        ])
+        .slice(1, 1);
+
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema.clone()),
+            vec![Arc::new(list_array), Arc::new(large_list_array)],
+        )
+        .unwrap();
+
+        let schema: Schema = (&arrow_schema).try_into().unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&[&batch.clone()]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        // Make sure the big array was not written to the file
+        let file_size_bytes = store.size(&path).await.unwrap();
+        assert!(file_size_bytes < 1_000);
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(batch, actual_batch);
     }
 }

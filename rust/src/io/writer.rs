@@ -273,7 +273,7 @@ impl<'a> FileWriter<'a> {
 
     async fn write_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
         let capacity: usize = arrs.iter().map(|a| a.len()).sum();
-        let mut list_arrs: Vec<&ArrayRef> = Vec::new();
+        let mut list_arrs: Vec<ArrayRef> = Vec::new();
         let mut pos_builder: PrimitiveBuilder<Int32Type> =
             PrimitiveBuilder::with_capacity(capacity);
 
@@ -281,27 +281,33 @@ impl<'a> FileWriter<'a> {
         pos_builder.append_value(last_offset as i32);
         for array in arrs.iter() {
             let list_arr = as_list_array(*array);
-            list_arrs.push(list_arr.values());
-
             let offsets = list_arr.value_offsets();
+
             assert!(!offsets.is_empty());
+            let start_offset = offsets[0].as_usize();
+            let end_offset = offsets[offsets.len() - 1].as_usize();
+
+            let list_values = list_arr.values();
+            let sliced_values = list_values.slice(start_offset, end_offset - start_offset);
+            list_arrs.push(sliced_values);
+
             offsets
                 .iter()
                 .skip(1)
-                .map(|b| b.as_usize() + last_offset)
+                .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i32));
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
         self.write_fixed_stride_array(field, &[positions]).await?;
-        self.write_array(&field.children[0], list_arrs.as_slice())
-            .await
+        let arrs = list_arrs.iter().collect::<Vec<_>>();
+        self.write_array(&field.children[0], arrs.as_slice()).await
     }
 
     async fn write_large_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
         let capacity: usize = arrs.iter().map(|a| a.len()).sum();
-        let mut list_arrs: Vec<&ArrayRef> = Vec::new();
+        let mut list_arrs: Vec<ArrayRef> = Vec::new();
         let mut pos_builder: PrimitiveBuilder<Int64Type> =
             PrimitiveBuilder::with_capacity(capacity);
 
@@ -309,22 +315,29 @@ impl<'a> FileWriter<'a> {
         pos_builder.append_value(last_offset as i64);
         for array in arrs.iter() {
             let list_arr = as_large_list_array(*array);
-            list_arrs.push(list_arr.values());
-
             let offsets = list_arr.value_offsets();
+
             assert!(!offsets.is_empty());
+            let start_offset = offsets[0].as_usize();
+            let end_offset = offsets[offsets.len() - 1].as_usize();
+
+            let sliced_values = list_arr
+                .values()
+                .slice(start_offset, end_offset - start_offset);
+            list_arrs.push(sliced_values);
+
             offsets
                 .iter()
                 .skip(1)
-                .map(|b| b.as_usize() + last_offset)
+                .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i64));
             last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
         self.write_fixed_stride_array(field, &[positions]).await?;
-        self.write_array(&field.children[0], list_arrs.as_slice())
-            .await
+        let arrs = list_arrs.iter().collect::<Vec<_>>();
+        self.write_array(&field.children[0], arrs.as_slice()).await
     }
 
     async fn write_footer(&mut self) -> Result<()> {
