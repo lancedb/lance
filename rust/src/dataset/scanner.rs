@@ -487,6 +487,8 @@ mod test {
 
     use crate::index::vector::VectorIndexParams;
     use crate::index::IndexType;
+    use super::*;
+    use crate::arrow::*;
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     #[tokio::test]
@@ -647,7 +649,11 @@ mod test {
         expected_batches
     }
 
+<<<<<<< HEAD
     async fn create_vector_dataset(path: &str, build_index: bool) -> Dataset {
+=======
+    async fn create_dataset() -> Arc<Dataset> {
+>>>>>>> e0c6aed (add test for scan with row id)
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", DataType::Int32, true),
             ArrowField::new("s", DataType::Utf8, true),
@@ -661,6 +667,7 @@ mod test {
             ),
         ]));
 
+<<<<<<< HEAD
         let batches = RecordBatchBuffer::new(
             (0..5)
                 .map(|i| {
@@ -855,8 +862,123 @@ mod test {
             .copied()
             .collect();
         assert_eq!(expected_i, actual_i);
+=======
+        let vector_data = Float32Array::from_iter_values((0..3200).map(|v| v as f32));
+        let vector = FixedSizeListArray::try_new(&vector_data, 32).unwrap();
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|v| format!("s-{}", v)),
+                )),
+                Arc::new(vector),
+            ],
+        )
+        .unwrap()]);
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut params = WriteParams::default();
+        params.max_rows_per_group = 100;
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut reader, test_uri, Some(params))
+            .await
+            .unwrap();
+        Arc::new(Dataset::open(test_uri).await.unwrap())
+>>>>>>> e0c6aed (add test for scan with row id)
     }
 
     #[tokio::test]
-    async fn test_simple_scan_plan() {}
+    async fn test_simple_scan_plan() {
+        let dataset = create_dataset().await;
+        let scan = dataset.scan();
+        let plan = scan.create_plan().await.unwrap();
+
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "s", "vec"]
+        );
+        let scan = &plan.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(
+            scan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "s", "vec"]
+        );
+
+        let mut scan = dataset.scan();
+        scan.project(&["s"]).unwrap();
+        let plan = scan.create_plan().await.unwrap();
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["s"]
+        );
+        let scan = &plan.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(
+            scan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["s"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_row_id() {
+        let dataset = create_dataset().await;
+        let mut scan = dataset.scan();
+        scan.project(&["i"]).unwrap();
+        scan.with_row_id();
+        let plan = scan.create_plan().await.unwrap();
+
+        assert!(plan.as_any().is::<ProjectionExec>());
+        assert_eq!(
+            plan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "_rowid"]
+        );
+        let scan = &plan.children()[0];
+        assert!(scan.as_any().is::<LanceScanExec>());
+        assert_eq!(
+            scan.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name())
+                .collect::<Vec<_>>(),
+            vec!["i", "_rowid"]
+        );
+    }
+
+    // #[tokio::test]
+    // async fn test_filter_plan() {
+    //     let dataset = create_dataset().await;
+    //     let mut scan = dataset.scan();
+    //     scan.filter("i > 50").unwrap();
+    //     let plan = scan.create_plan().await.unwrap();
+
+    //     println!("Plan is {:?}", plan);
+    //     assert!(plan.as_any().is::<TakeExec>());
+    //     let filter = plan.as_any().downcast_ref::<TakeExec>().unwrap();
+    //     // assert!(filter.input.as_any().is::<LanceScanExec>());
+    //     // assert_eq!(filter.predicate, "i > 50".to_string());
+    // }
 }
