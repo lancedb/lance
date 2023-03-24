@@ -391,6 +391,7 @@ mod tests {
     use super::*;
     use arrow_select::concat::concat;
 
+    use arrow_array::cast::as_string_array;
     use arrow_array::{
         new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
         OffsetSizeTrait, StringArray,
@@ -467,12 +468,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_binary_data_with_offset() {
-        test_round_trips(&[StringArray::from(vec![Some("d"), Some("e")])
-            .slice(1, 1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap()])
-        .await;
+        let slice = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
+        let array = as_string_array(slice.as_ref());
+        test_round_trips(&[array]).await;
     }
 
     #[tokio::test]
