@@ -51,8 +51,16 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
                 )));
             }
         },
-        Expr::Literal(ScalarValue::Utf8(_))
-        | Expr::Literal(ScalarValue::Boolean(_))
+        Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
+            DataType::Utf8 => Ok(expr.clone()),
+            DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
+            _ => {
+                return Err(Error::IO(format!(
+                    "DataType '{data_type:?}' does not match to the value: {expr}"
+                )));
+            }
+        },
+        Expr::Literal(ScalarValue::Boolean(_))
         | Expr::Literal(ScalarValue::Null) => Ok(expr.clone()),
         _ => Err(Error::IO(format!(
             "DataType '{data_type:?}' does not match to the value: {expr}"
@@ -108,4 +116,29 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    use arrow_schema::{Field, Schema as ArrowSchema};
+
+    #[test]
+    fn test_resolve_large_utf8() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::LargeUtf8, false)]);
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("a".to_string().into())),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(ScalarValue::Utf8(Some("a".to_string())))),
+        });
+
+        let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
+        match resolved {
+            Expr::BinaryExpr(be) => {
+                assert_eq!(
+                    be.right.as_ref(),
+                    &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())))
+                )
+            }
+            _ => assert!(false, "Expected BinaryExpr"),
+        };
+    }
+}
