@@ -60,8 +60,9 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
                 )));
             }
         },
-        Expr::Literal(ScalarValue::Boolean(_))
-        | Expr::Literal(ScalarValue::Null) => Ok(expr.clone()),
+        Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
+            Ok(expr.clone())
+        }
         _ => Err(Error::IO(format!(
             "DataType '{data_type:?}' does not match to the value: {expr}"
         ))),
