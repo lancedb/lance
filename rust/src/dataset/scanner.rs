@@ -474,12 +474,14 @@ mod test {
 
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::vec;
 
     use arrow::array::as_primitive_array;
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, RecordBatchReader, StringArray,
+        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, RecordBatchReader,
+        StringArray,
     };
     use arrow_schema::DataType;
     use futures::TryStreamExt;
@@ -1107,5 +1109,54 @@ mod test {
         let knn = &take.children()[0];
         assert!(knn.as_any().is::<KNNIndexExec>());
         assert_eq!(knn.schema().field_names(), ["score", "_rowid"]);
+    }
+
+    #[tokio::test]
+    async fn test_filter_on_large_utf8() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "ls",
+            DataType::LargeUtf8,
+            true,
+        )]));
+
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeStringArray::from_iter_values(
+                (0..10).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap()]);
+
+        let write_params = WriteParams::default();
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scan = dataset.scan();
+        scan.filter("ls = 's-8'").unwrap();
+
+        let batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeStringArray::from_iter_values(
+                (8..9).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap();
+
+        assert_eq!(batch, &expected);
     }
 }
