@@ -1112,7 +1112,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_large_utf_filter() {
+    async fn test_filter_on_large_utf8() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
