@@ -24,4 +24,4 @@ A workable way so far
 ----------
 The ``Libraries`` tab of the cluster on Databricks web console seems use a differently customized version of ``pip`` that can install ``pylance`` as well as other packages that depends on ``pyspark``. Because it's a black box, we don't know what exactly it does when the packages have some conflicts with the preinstalled ones in DBR, to install ``pylance`` as well as the important dependencies like ``pyarrow`` and ``pandas`` is a good security measure. The recommended versions are in `pyproject.toml <https://github.com/eto-ai/lance/blob/main/python/pyproject.toml>`_.
 
-TODO: add a pic
+.. image:: install_on_dbr.png
