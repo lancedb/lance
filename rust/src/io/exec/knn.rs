@@ -31,7 +31,8 @@ use tokio::task::JoinHandle;
 use crate::dataset::scanner::RecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::flat::flat_search;
-use crate::index::vector::{open_index, Query};
+use crate::index::vector::{open_index, Query, SCORE_COL};
+use crate::{Error, Result};
 
 /// KNN node for post-filtering.
 pub struct KNNFlatStream {
@@ -91,9 +92,17 @@ impl DFRecordBatchStream for KNNFlatStream {
     }
 }
 
-/// Physical [ExecutionPlan] for Flat KNN node.
+/// [ExecutionPlan] for Flat KNN (bruteforce) search.
+///
+/// Preconditions:
+/// - `input` schema must contains `query.column`,
+/// - The column must be a vector.
+/// - `input` schema does not have "score" column.
 pub struct KNNFlatExec {
+    /// Input node.
     input: Arc<dyn ExecutionPlan>,
+
+    /// The query to execute.
     query: Query,
 }
 
@@ -108,8 +117,29 @@ impl std::fmt::Debug for KNNFlatExec {
 }
 
 impl KNNFlatExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, query: Query) -> Self {
-        Self { input, query }
+    /// Create a new [KNNFlatExec] node.
+    ///
+    /// Returns an error if the preconditions are not met.
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
+        let schema = input.schema();
+        let field = schema.field_with_name(&query.column).map_err(|_| {
+            Error::IO(format!(
+                "KNNFlatExec node: query column {} not found in input schema",
+                query.column
+            ))
+        })?;
+        let is_vector = match field.data_type() {
+            DataType::FixedSizeList(item, _) => item.as_ref().data_type() == &DataType::Float32,
+            _ => false,
+        };
+        if !is_vector {
+            return Err(Error::IO(format!(
+                "KNNFlatExec node: query column {} is not a vector",
+                query.column
+            )));
+        };
+
+        Ok(Self { input, query })
     }
 }
 
@@ -118,11 +148,18 @@ impl ExecutionPlan for KNNFlatExec {
         self
     }
 
+    /// Flat KNN inherits the schema from input node, and add one score column.
     fn schema(&self) -> arrow_schema::SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("score", DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
-        ]))
+        let input_schema = self.input.schema();
+        let mut fields = input_schema.fields().to_vec();
+        if !input_schema.field_with_name(SCORE_COL).is_ok() {
+            fields.push(Field::new(SCORE_COL, DataType::Float32, false));
+        }
+
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ))
     }
 
     fn output_partitioning(&self) -> Partitioning {
@@ -154,7 +191,10 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn statistics(&self) -> Statistics {
-        todo!()
+        Statistics {
+            num_rows: Some(self.query.k as usize),
+            ..Default::default()
+        }
     }
 }
 
@@ -212,7 +252,10 @@ impl KNNIndexStream {
 
 impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
-        todo!()
+        Arc::new(Schema::new(vec![
+            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(ROW_ID, DataType::UInt16, false),
+        ]))
     }
 }
 
@@ -226,8 +269,11 @@ impl Stream for KNNIndexStream {
 
 /// [ExecutionPlan] for KNNIndex node.
 pub struct KNNIndexExec {
+    /// Dataset to read from.
     dataset: Arc<Dataset>,
+    /// The UUID of the index.
     index_name: String,
+    /// The vector query to execute.
     query: Query,
 }
 
@@ -242,12 +288,21 @@ impl std::fmt::Debug for KNNIndexExec {
 }
 
 impl KNNIndexExec {
-    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
-        Self {
+    /// Create a new [KNNIndexExec].
+    pub fn try_new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Result<Self> {
+        let schema = dataset.schema();
+        if schema.field(query.column.as_str()).is_none() {
+            return Err(Error::IO(format!(
+                "KNNIndexExec node: query column {} does not exist in dataset.",
+                query.column
+            )));
+        };
+
+        Ok(Self {
             dataset,
             index_name: index_name.to_string(),
             query: query.clone(),
-        }
+        })
     }
 }
 
@@ -258,7 +313,7 @@ impl ExecutionPlan for KNNIndexExec {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("score", DataType::Float32, false),
+            Field::new(SCORE_COL, DataType::Float32, false),
             Field::new(ROW_ID, DataType::UInt16, false),
         ]))
     }
@@ -296,7 +351,10 @@ impl ExecutionPlan for KNNIndexExec {
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
-        todo!()
+        Statistics {
+            num_rows: Some(self.query.k * self.query.refine_factor.unwrap_or(1) as usize),
+            ..Default::default()
+        }
     }
 }
 
@@ -316,6 +374,7 @@ mod tests {
     use crate::arrow::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::vector::MetricType;
+    use crate::io::exec::testing::TestingExec;
     use crate::utils::testing::generate_random_array;
 
     #[tokio::test]
@@ -399,5 +458,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(expected, results[0]);
+    }
+
+    #[test]
+    fn test_create_knn_flat() {
+        let dim: usize = 128;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("key", DataType::Int32, false),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                true,
+            ),
+            ArrowField::new("uri", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::new_empty(schema.clone());
+
+        let query = Query {
+            column: "vector".to_string(),
+            key: Arc::new(generate_random_array(dim)),
+            k: 10,
+            nprobes: 0,
+            refine_factor: None,
+            metric_type: MetricType::L2,
+            use_index: false,
+        };
+
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
+        let idx = KNNFlatExec::try_new(input, query).unwrap();
+        assert_eq!(
+            idx.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                ArrowField::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Box::new(ArrowField::new("item", DataType::Float32, true)),
+                        dim as i32,
+                    ),
+                    true,
+                ),
+                ArrowField::new("uri", DataType::Utf8, true),
+                ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ])
+        );
     }
 }

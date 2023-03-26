@@ -465,6 +465,7 @@ async fn maybe_sample_training_data(
             .await?;
         concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
     };
+
     let array = batch.column_by_name(column).ok_or(Error::Index(format!(
         "Sample training data: column {} does not exist in return",
         column
