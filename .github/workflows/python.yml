@@ -15,7 +15,7 @@ on:
       - .github/workflows/run_tests/**
 jobs:
   linux:
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       matrix:
         python-minor-version: [ "8", "9", "10", "11" ]
@@ -48,7 +48,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
     - uses: ./.github/workflows/run_tests
   mac:
-    timeout-minutes: 30
+    timeout-minutes: 45
     runs-on: "macos-12"
     defaults:
       run:

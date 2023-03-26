@@ -15,24 +15,29 @@
 //! Optimized Product Quantization
 //!
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, Float32Array, UInt8Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
-use super::{pq::ProductQuantizer, MetricType, Transformer};
+use super::Query;
+use super::{pq::ProductQuantizer, MetricType, Transformer, VectorIndex};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::io::object_writer::ObjectWriter;
 use crate::{Error, Result};
+
+const OPQ_PQ_INIT_ITERATIONS: usize = 10;
 
 /// Rotation matrix `R` described in Optimized Product Quantization.
 ///
 /// [Optimized Product Quantization for Approximate Nearest Neighbor Search
 /// (CVPR' 13)](https://www.microsoft.com/en-us/research/wp-content/uploads/2013/11/pami13opq.pdf)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OptimizedProductQuantizer {
     num_sub_vectors: usize,
 
@@ -98,14 +103,14 @@ impl OptimizedProductQuantizer {
     /// Train once and return the rotation matrix and PQ codebook.
     async fn train_once(
         &self,
+        pq: &mut ProductQuantizer,
         train: &MatrixView,
         metric_type: MetricType,
-    ) -> Result<(MatrixView, ProductQuantizer)> {
+    ) -> Result<(MatrixView, FixedSizeListArray)> {
         let dim = train.num_columns();
-        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
 
-        // let data = FixedSizeListArray::try_new(mat.data().as_ref(), mat.num_columns() as i32)?;
-        pq.train(&train, metric_type, 50).await?;
+        // Train few times to get a better rotation matrix. See Faiss.
+        pq.train(&train, metric_type, 1).await?;
         let pq_code = pq.transform(&train, metric_type).await?;
 
         // Reconstruct Y
@@ -128,8 +133,16 @@ impl OptimizedProductQuantizer {
         let (u, _, vt) = x_yt.svd()?;
         let rotation = vt.transpose().dot(&u.transpose())?;
 
-        Ok((rotation, pq))
+        Ok((rotation, pq_code))
     }
+}
+
+/// Initialize rotation matrix.
+fn init_rotation(dimension: usize) -> Result<MatrixView> {
+    let mat = MatrixView::random(dimension, dimension);
+    let (u, _, vt) = mat.svd()?;
+    let r = vt.transpose().dot(&u.transpose())?;
+    Ok(r)
 }
 
 #[async_trait]
@@ -152,13 +165,30 @@ impl Transformer for OptimizedProductQuantizer {
             data.clone()
         };
 
+        // Run a few iterations to get the initialized centroids.
+        let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
+        pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
+            .await?;
+        let mut pq_code = pq.transform(&train, self.metric_type).await?;
+
         // Initialize R (rotation matrix)
-        let mut rotation = MatrixView::identity(dim);
-        for _ in 0..self.num_iters {
+        let mut rotation = init_rotation(dim)?;
+        for i in 0..self.num_iters {
             // Training data, this is the `X`, described in CVPR' 13
-            let train = train.dot(&rotation)?;
-            let (rot, _) = self.train_once(&train, self.metric_type).await?;
-            rotation = rot;
+            let rotated_data = train.dot(&rotation)?;
+            // Reset the pq centroids after rotation.
+            pq.reset_centroids(&rotated_data, &pq_code)?;
+            (rotation, pq_code) = self
+                .train_once(&mut pq, &rotated_data, self.metric_type)
+                .await?;
+            if (i + 1) % 5 == 0 {
+                println!(
+                    "Training OPQ iteration {}/{}, PQ distortion={}",
+                    i + 1,
+                    self.num_iters,
+                    pq.distortion(&rotated_data, self.metric_type).await?
+                );
+            }
         }
         self.rotation = Some(rotation);
         Ok(())
@@ -166,12 +196,82 @@ impl Transformer for OptimizedProductQuantizer {
 
     /// Apply OPQ transform
     async fn transform(&self, data: &MatrixView) -> Result<MatrixView> {
-        let rotation = self.rotation.as_ref().unwrap();
-        Ok(rotation.dot(&data.transpose())?.transpose())
+        let result = self
+            .rotation
+            .as_ref()
+            .unwrap()
+            .dot(&data.transpose())?
+            .transpose();
+        Ok(MatrixView::new(result.data(), result.num_columns()))
     }
 
-    fn try_into_pb(&self) -> Result<Transform> {
-        self.try_into()
+    /// Write the OPQ rotation matrix to disk.
+    async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform> {
+        let mut this = self.clone();
+        if this.rotation.is_none() {
+            return Err(Error::Index("OPQ is not trained".to_string()));
+        };
+        let rotation = this.rotation.as_ref().unwrap();
+        let position = writer
+            .write_plain_encoded_array(rotation.data().as_ref())
+            .await?;
+        this.file_position = Some(position);
+        (&this).try_into()
+    }
+}
+
+pub struct OPQIndex {
+    sub_index: Arc<dyn VectorIndex>,
+
+    opq: OptimizedProductQuantizer,
+}
+
+impl OPQIndex {
+    pub fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
+        Self { sub_index, opq }
+    }
+}
+
+impl std::fmt::Debug for OPQIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OPQIndex(dim={}) -> {:?}",
+            self.opq
+                .rotation
+                .as_ref()
+                .map(|m| m.num_columns())
+                .unwrap_or(0),
+            self.sub_index
+        )
+    }
+}
+
+#[async_trait]
+impl VectorIndex for OPQIndex {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let mat = MatrixView::new(query.key.clone(), query.key.len());
+        let transformed = self.opq.transform(&mat).await?;
+        let mut transformed_query = query.clone();
+        transformed_query.key = transformed.data();
+        self.sub_index.search(&transformed_query).await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("OPQ does not support load".to_string()))
     }
 }
 
@@ -198,9 +298,17 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 mod tests {
     use super::*;
 
-    use arrow_array::Float32Array;
+    use approx::assert_relative_eq;
+    use arrow::compute::{max, min};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
-    use crate::arrow::linalg::MatrixView;
+    use crate::arrow::{linalg::MatrixView, *};
+    use crate::dataset::{Dataset, ROW_ID};
+    use crate::index::{
+        vector::{ivf::IVFIndex, open_index, opq::OPQIndex, VectorIndexParams},
+        IndexType,
+    };
 
     #[tokio::test]
     async fn test_train_opq() {
@@ -213,5 +321,101 @@ mod tests {
 
         assert_eq!(opq.rotation.as_ref().unwrap().num_rows(), DIM);
         assert_eq!(opq.rotation.as_ref().unwrap().num_columns(), DIM);
+    }
+
+    async fn test_build_index(with_opq: bool) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(
+                Box::new(ArrowField::new("item", DataType::Float32, true)),
+                64,
+            ),
+            true,
+        )]));
+
+        let vectors = Float32Array::from_iter_values((0..32000).map(|x| x as f32));
+        let vectors = FixedSizeListArray::try_new(vectors, 64).unwrap();
+        let batch = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(vectors)],
+        )
+        .unwrap()
+        .into()]);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
+        Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(tmp_dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let column = "vector";
+
+        let params = VectorIndexParams::ivf_pq(4, 8, 4, with_opq, MetricType::L2, 3);
+        let dataset = dataset
+            .create_index(&[column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let index_file = std::fs::read_dir(tmp_dir.path().join("_indices"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let uuid = index_file.file_name().to_str().unwrap().to_string();
+
+        let index = open_index(&dataset, &uuid).await.unwrap();
+
+        if with_opq {
+            let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();
+            assert!(opq_idx.opq.rotation.is_some());
+
+            let rotation = opq_idx.opq.rotation.as_ref().unwrap();
+            assert_eq!(rotation.num_rows(), 64);
+            assert_eq!(rotation.num_columns(), 64);
+        } else {
+            assert!(index.as_any().is::<IVFIndex>());
+        }
+
+        let query = Query {
+            column: "vector".to_string(),
+            k: 4,
+            nprobes: 10,
+            refine_factor: None,
+            metric_type: MetricType::L2,
+            use_index: true,
+            key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
+        };
+        let results = index.search(&query).await.unwrap();
+        let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
+        assert_eq!(row_ids.len(), 4);
+        assert!(row_ids.values().contains(&10));
+        assert_eq!(min(row_ids).unwrap() + 3, max(row_ids).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_build_index_with_opq() {
+        test_build_index(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_build_index_without_opq() {
+        test_build_index(false).await;
+    }
+
+    #[test]
+    fn test_init_rotation() {
+        let dim: usize = 64;
+        let r = init_rotation(dim).unwrap();
+        // R^T * R = I
+        let i = r.transpose().dot(&r).unwrap();
+
+        assert_relative_eq!(
+            i.data().values(),
+            MatrixView::identity(dim).data().values(),
+            epsilon = 0.001
+        );
     }
 }

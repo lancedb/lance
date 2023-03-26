@@ -108,6 +108,7 @@ impl Planner {
             Value::UnQuotedString(_) => todo!(),
             Value::SingleQuotedByteStringLiteral(_) => todo!(),
             Value::DoubleQuotedByteStringLiteral(_) => todo!(),
+            Value::RawStringLiteral(_) => todo!(),
         })
     }
 
@@ -115,7 +116,7 @@ impl Planner {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
             _ => Err(Error::IO(format!(
-                "Unsuppoted function args: {:?}",
+                "Unsupported function args: {:?}",
                 func_args
             ))),
         }

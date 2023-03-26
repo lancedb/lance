@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.3.16"
+version = "0.3.18"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
@@ -52,7 +52,7 @@ path-absolutize = "3.0.14"
 shellexpand = "3.0.0"
 arrow = { version = "33.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
-sqlparser = { git = "https://github.com/eto-ai/sqlparser-rs.git", branch = "lei/double_eq" }
+sqlparser-lance = "0.32.0"
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion = { version = "19.0.0", default-features = false }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }

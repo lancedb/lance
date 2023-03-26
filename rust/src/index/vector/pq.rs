@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_arith::aggregate::min;
@@ -26,7 +27,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::{LoadableVectorIndex, MetricType, Query, VectorIndex};
+use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
@@ -61,6 +62,16 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+}
+
+impl std::fmt::Debug for PQIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PQ(m={}, nbits={}, {})",
+            self.num_sub_vectors, self.nbits, self.metric_type
+        )
+    }
 }
 
 impl PQIndex {
@@ -205,7 +216,8 @@ impl VectorIndex for PQIndex {
             self.cosine_scores(&query.key)?
         };
 
-        let indices = sort_to_indices(&scores, None, Some(query.k))?;
+        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let indices = sort_to_indices(&scores, None, Some(limit))?;
         let scores = take(&scores, &indices, None)?;
         let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
@@ -215,17 +227,22 @@ impl VectorIndex for PQIndex {
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
     }
-}
 
-#[async_trait]
-impl LoadableVectorIndex for PQIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn is_loadable(&self) -> bool {
+        true
+    }
+
     /// Load a PQ index (page) from the disk.
     async fn load(
         &self,
         reader: &dyn ObjectReader,
         offset: usize,
         length: usize,
-    ) -> Result<Arc<dyn LoadableVectorIndex>> {
+    ) -> Result<Arc<dyn VectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors * length;
         let pq_code =
             read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
@@ -433,6 +450,7 @@ impl ProductQuantizer {
         let mut codebook_builder = Float32Builder::with_capacity(num_centroids * dimension);
         let rng = rand::rngs::SmallRng::from_entropy();
 
+        const REDOS: usize = 1;
         // TODO: parallel training.
         for (i, sub_vec) in sub_vectors.iter().enumerate() {
             // Centroids for one sub vector.
@@ -445,6 +463,7 @@ impl ProductQuantizer {
                 sub_vector_dimension,
                 num_centroids,
                 max_iters as u32,
+                REDOS,
                 rng.clone(),
                 metric_type,
             )
@@ -471,34 +490,39 @@ impl ProductQuantizer {
         let num_centroids = 2_usize.pow(self.num_bits);
         let mut builder = Float32Builder::with_capacity(num_centroids * self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
-        for sub_idx in 0..self.num_sub_vectors {
-            for i in 0..num_centroids {
-                let mut sum = vec![0.0_f32; sub_vector_dim];
-                let mut count = 0;
-                for j in 0..data.num_rows() {
-                    let code_row = pq_code.value(j);
-                    let code: &UInt8Array = as_primitive_array(code_row.as_ref());
-                    if code.value(sub_idx) == i as u8 {
-                        // Sub-vector of the j-th vector.
-                        let sub_vector = data.data().slice(
-                            j * self.dimension + sub_idx * sub_vector_dim,
-                            sub_vector_dim,
-                        );
-                        let sub_vector: &Float32Array = as_primitive_array(sub_vector.as_ref());
-                        for k in 0..sub_vector.len() {
-                            sum[k] += sub_vector.value(k);
-                        }
-                        count += 1;
-                    }
+        let mut sum = vec![0.0_f32; self.dimension * num_centroids];
+        // Counts of each subvector x centroids.
+        // counts[sub_vector][centroid]
+        let mut counts = vec![0; self.num_sub_vectors * num_centroids];
+
+        let sum_stride = sub_vector_dim * num_centroids;
+
+        for i in 0..data.num_rows() {
+            let code_arr = pq_code.value(i);
+            let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
+            for sub_vec_id in 0..code.len() {
+                let centroid = code.value(sub_vec_id) as usize;
+                let sub_vector = data.data().slice(
+                    i * self.dimension + sub_vec_id * sub_vector_dim,
+                    sub_vector_dim,
+                );
+                counts[sub_vec_id * num_centroids + centroid] += 1;
+                let sub_vector: &Float32Array = as_primitive_array(sub_vector.as_ref());
+                for k in 0..sub_vector.len() {
+                    sum[sub_vec_id * sum_stride + centroid * sub_vector_dim + k] +=
+                        sub_vector.value(k);
                 }
-                if count > 0 {
-                    for k in 0..sum.len() {
-                        sum[k] /= count as f32;
-                    }
-                    builder.append_slice(sum.as_slice());
-                } else {
-                    builder.append_slice(vec![f32::MAX; sub_vector_dim].as_slice());
+            }
+        }
+        for (i, cnt) in counts.iter().enumerate() {
+            if *cnt > 0 {
+                let s = sum[i * sub_vector_dim..(i + 1) * sub_vector_dim].as_mut();
+                for k in 0..s.len() {
+                    s[k] /= *cnt as f32;
                 }
+                builder.append_slice(s);
+            } else {
+                builder.append_slice(vec![f32::MAX; sub_vector_dim].as_slice());
             }
         }
 

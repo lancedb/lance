@@ -2,16 +2,14 @@
 
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fmt::Formatter;
 use std::fmt::{self};
+use std::fmt::{Debug, Formatter};
 
 use arrow_array::cast::{as_large_list_array, as_list_array};
 use arrow_array::types::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow_array::{
-    cast::as_dictionary_array, Array, ArrayRef, LargeListArray, ListArray, RecordBatch, StructArray,
-};
+use arrow_array::{cast::as_dictionary_array, Array, ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use async_recursion::async_recursion;
 
@@ -681,10 +679,10 @@ impl Schema {
     /// let schema = Schema::from(...);
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
-    pub fn project(&self, columns: &[&str]) -> Result<Self> {
+    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
-            let split = (*col).split('.').collect::<Vec<_>>();
+            let split = col.as_ref().split('.').collect::<Vec<_>>();
             let first = split[0];
             if let Some(field) = self.field(first) {
                 let projected_field = field.project(&split[1..])?;
@@ -694,7 +692,10 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(Error::Schema(format!("Column {} does not exist", col)));
+                return Err(Error::Schema(format!(
+                    "Column {} does not exist",
+                    col.as_ref()
+                )));
             }
         }
 
@@ -716,7 +717,10 @@ impl Schema {
     }
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
-    pub fn exclude(&self, other: &Self) -> Result<Self> {
+    pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
+        let other = schema.try_into().map_err(|_| {
+            Error::Schema("The other schema is not compatible with this schema".to_string())
+        })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
             if let Some(other_field) = other.field(&field.name) {
@@ -853,6 +857,13 @@ impl From<&Schema> for ArrowSchema {
             fields: schema.fields.iter().map(ArrowField::from).collect(),
             metadata: schema.metadata.clone(),
         }
+    }
+}
+
+/// Convert Lance Schema to Arrow Schema
+impl From<&Schema> for Schema {
+    fn from(schema: &Schema) -> Self {
+        schema.clone()
     }
 }
 
