@@ -53,7 +53,7 @@ const MAX_ITERATIONS: usize = 50;
 /// Maximum number of iterations for OPQ.
 /// See OPQ paper for details.
 const MAX_OPQ_ITERATIONS: usize = 100;
-const SCORE_COL: &str = "score";
+pub(crate) const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
 
 /// Query parameters for the vector indices
