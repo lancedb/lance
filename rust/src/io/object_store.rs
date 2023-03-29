@@ -93,7 +93,7 @@ impl ObjectStore {
             .await
     }
 
-    pub fn new_from_path(str_path: &str) -> Result<Self> {
+    fn new_from_path(str_path: &str) -> Result<Self> {
         let expanded = tilde(str_path).to_string();
         let absolute_path = StdPath::new(expanded.as_str()).absolutize()?;
         let absolute_path_str = absolute_path
@@ -108,7 +108,7 @@ impl ObjectStore {
         })
     }
 
-    pub async fn new_from_url(url: Url) -> Result<Self> {
+    async fn new_from_url(url: Url) -> Result<Self> {
         match url.scheme() {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(url.to_string().as_str()).await?,
