@@ -77,3 +77,31 @@ jobs:
         restore-keys: ${{ runner.os }}-cargo-
     - uses: ./.github/workflows/build_mac_wheel
     - uses: ./.github/workflows/run_tests
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: powershell
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+      - name: Setup cache
+        uses: actions/cache@v3
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - uses: ./.github/workflows/build_windows_wheel
+        with:
+          vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
+      - uses: ./.github/workflows/run_tests

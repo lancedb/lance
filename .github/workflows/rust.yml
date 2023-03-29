@@ -53,3 +53,56 @@ jobs:
         run: |
           cargo build --all-features
           cargo test
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: rust
+    env:
+      VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup cache
+        uses: actions/cache@v3
+        continue-on-error: false
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**\Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: 'Setup vcpkg cache'
+        shell: 'bash'
+        run: |
+          `vcpkg fetch nuget | tail -n 1` \
+            sources add \
+            -source "https://nuget.pkg.github.com/eto-ai/index.json" \
+            -storepasswordincleartext \
+            -name "GitHub" \
+            -username "eto-ai" \
+            -password "${{ secrets.VCPKG_GITHUB_PACKAGES }}"
+          `vcpkg fetch nuget | tail -n 1` \
+            setapikey "${{ secrets.VCPKG_GITHUB_PACKAGES }}" \
+            -source "https://nuget.pkg.github.com/eto.ai/index.json"
+      - name: Setup Dependencies with vcpkg
+        run: |
+          vcpkg install openblas --triplet x64-windows-static-md
+      - name: Install Protoc v21.12
+        working-directory: C:\
+        run: |
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+          7z x protoc.zip
+        shell: powershell
+      - name: Run tests
+        run: |
+          $env:PATH = 'C:\protoc\bin;' + $env:PATH          
+          $env:GITHUB_PATH = 'C:\protoc\bin;' + $env:GITHUB_PATH
+          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          cargo build --all-features
+          cargo test
