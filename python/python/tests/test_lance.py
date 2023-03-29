@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 import os
+import platform
 
 import lance
 import numpy as np
@@ -130,7 +131,7 @@ def test_create_index(tmp_path):
 
 
 @pytest.mark.skipif(
-    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
     reason="no neon on GHA",
 )
 def test_simd_alignment(tmp_path):

@@ -65,15 +65,24 @@ accelerate-src = "0.3.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 openblas-src = { version = "0.10.8", default-features= false, features = ["static", "cblas"]}
 
+[target.'cfg(target_os = "windows")'.dependencies]
+openblas-src = { version = "0.10.8", default-features= false, features = ["system"]}
+
 [build-dependencies]
 prost-build = "0.11"
 
 [dev-dependencies]
 clap = { version = "4.1.1", features = ["derive"] }
 criterion = { version = "0.4", features = ["async", "async_tokio"] }
-pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 tempfile = "3.3.0"
 approx = "0.5.1"
+dirs = "5.0.0"
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+
+[target.'cfg(target_os = "unix")'.dev-dependencies]
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 
 [features]
 cli = ["clap"]
