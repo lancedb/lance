@@ -21,11 +21,13 @@ use std::sync::Arc;
 use arrow_array::Float32Array;
 
 pub mod flat;
+mod graph;
 pub mod ivf;
 mod kmeans;
 mod opq;
 mod pq;
 mod traits;
+mod vamana;
 
 use self::{ivf::IVFIndex, pq::PQIndex};
 
