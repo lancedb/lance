@@ -212,18 +212,35 @@ impl KNNIndexStream {
         let q = query.clone();
         let name = index_name.to_string();
         let bg_thread = tokio::spawn(async move {
-            let index = match open_index(dataset.as_ref(), &name).await {
-                Ok(idx) => idx,
+            let mut index = dataset.index_cache.get(&name).clone();
+
+            let idx = match open_index(dataset.as_ref(), &name).await {
+                Ok(idx) => {
+                    dataset.index_cache.insert(name, idx.clone());
+                    /**
+                    error[E0596]: cannot borrow data in an `Arc` as mutable
+                       --> src/io/exec/knn.rs:219:21
+                        |
+                    219 |                     dataset.index_cache.insert(name, idx.clone());
+                        |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot borrow as mutable
+                        |
+                        = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `Arc<Dataset>`
+                    **/
+                    idx
+                },
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
                         "Failed to open vector index: {name}: {e}"
                     ))))
-                    .await
-                    .expect("KNNFlat failed to send message");
+                        .await
+                        .expect("KNNFlat failed to send message");
                     return;
                 }
             };
-            let result = match index.search(&q).await {
+
+            let idx2 = index.or_else(|| Some(&idx)).unwrap();
+
+            let result = match idx2.search(&q).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(

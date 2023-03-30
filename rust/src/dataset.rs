@@ -15,8 +15,9 @@
 //! Lance Dataset
 //!
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::iter::Map;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use arrow_array::{
@@ -46,6 +47,7 @@ use crate::utils::distance::simd_alignment;
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
+use crate::index::vector::VectorIndex;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
@@ -58,6 +60,9 @@ pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     base: Path,
     pub(crate) manifest: Arc<Manifest>,
+
+    // ctx
+    pub index_cache: HashMap<String, Arc<dyn VectorIndex>>,
 }
 
 /// Dataset Version
@@ -143,6 +148,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
+            index_cache: HashMap::new()
         })
     }
 
@@ -307,6 +313,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
+            index_cache: HashMap::new()
         })
     }
 
@@ -448,6 +455,7 @@ impl Dataset {
             object_store: self.object_store.clone(),
             base: self.base.clone(),
             manifest: Arc::new(new_manifest),
+            index_cache: HashMap::new()
         })
     }
 
