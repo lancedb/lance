@@ -76,6 +76,7 @@ jobs:
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
           args: "--release"
+          vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/upload_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
