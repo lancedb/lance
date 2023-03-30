@@ -155,7 +155,7 @@ def test_relative_paths(tmp_path: Path):
         ds = lance.dataset(rel_uri)
 
     # relative path gets resolved to the right absolute path
-    ds = lance.dataset(os.path.join(tmp_path, rel_uri))
+    ds = lance.dataset(tmp_path / rel_uri)
     assert ds.to_table() == table
 
 
