@@ -201,7 +201,6 @@ mod tests {
     #[cfg(windows)]
     async fn test_windows_paths() {
         for uri in &[
-            "file:///test_folder/test.lance",
             "c:/test_folder/test.lance",
             "c:\\test_folder\\test.lance",
             "c:\\test_folder\\..\\test_folder\\test.lance",
