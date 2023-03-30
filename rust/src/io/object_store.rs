@@ -198,6 +198,20 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(windows)]
+    async fn test_windows_paths() {
+        for uri in &[
+            "file:///test_folder/test.lance",
+            "c:/test_folder/test.lance",
+            "c:\\test_folder\\test.lance",
+            "c:\\test_folder\\..\\test_folder\\test.lance",
+        ] {
+            let store = ObjectStore::new(uri).await.unwrap();
+            assert_eq!(store.base_path().to_string(), "C:/test_folder/test.lance");
+        }
+    }
+
+    #[tokio::test]
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         let store = ObjectStore::new(uri).await.unwrap();
