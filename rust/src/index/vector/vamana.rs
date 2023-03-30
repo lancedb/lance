@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
 use arrow::datatypes::UInt64Type;
-use arrow_array::UInt64Array;
 use futures::{stream, StreamExt, TryStreamExt};
+use rand::Rng;
+use rand::distributions::Uniform;
 
-use super::graph::Vertex;
+use super::graph::{Vertex, Graph};
 use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::{Error, Result};
@@ -44,7 +45,7 @@ impl VamanaBuilder {
     ///  - dataset: the dataset to index
     ///  - r: the number of neighbors to connect to
     ///
-    async fn try_init(dataset: Arc<Dataset>, r: usize) -> Result<Self> {
+    async fn try_init(dataset: Arc<Dataset>, r: usize, mut rng: impl Rng) -> Result<Self> {
         let total = dataset.count_rows().await?;
         let scanner = dataset
             .scan()
@@ -56,6 +57,7 @@ impl VamanaBuilder {
         let batches = scanner.try_collect::<Vec<_>>().await?;
         let mut vertices = Vec::new();
         let mut vectex_id = 0;
+        let ra = &mut rng;
         for batch in batches {
             let row_id = as_primitive_array::<UInt64Type>(
                 batch
@@ -63,9 +65,13 @@ impl VamanaBuilder {
                     .ok_or(Error::Index("row_id not found".to_string()))?,
             );
             for i in 0..row_id.len() {
+                let neighbors = ra
+                    .sample_iter(&Uniform::new(0, total as u32))
+                    .take(r)
+                    .collect::<Vec<_>>();
                 vertices.push(Vertex {
                     id: vectex_id,
-                    neighbors: Vec::new(),
+                    neighbors,
                     auxilary: VemanaData {
                         row_id: row_id.value(i),
                     },
@@ -78,6 +84,16 @@ impl VamanaBuilder {
             dataset,
             vertices,
         })
+    }
+}
+
+impl Graph<VemanaData> for VamanaBuilder {
+    fn vertex(&self, id: u32) -> &Vertex<VemanaData> {
+        &self.vertices[id as usize]
+    }
+
+    fn distance(&self, from: u32, to: u32) -> f32 {
+        todo!()
     }
 }
 
@@ -129,6 +145,11 @@ mod tests {
         let uri = tmp_dir.path().to_str().unwrap();
         let dataset = create_dataset(uri, 200, 64).await;
 
-        let inited_graph = VamanaBuilder::try_init(dataset, 10).await.unwrap();
+        let mut rng = rand::thread_rng();
+        let inited_graph = VamanaBuilder::try_init(dataset, 10, rng).await.unwrap();
+
+        for vertex in inited_graph.vertices {
+            assert_eq!(vertex.neighbors.len(), 10);
+        }
     }
 }

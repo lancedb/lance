@@ -22,3 +22,10 @@ pub struct Vertex<T> {
 
     pub auxilary: T,
 }
+
+pub(crate) trait Graph<T> {
+
+    fn vertex(&self, id: u32) -> &Vertex<T>;
+
+    fn distance(&self, from: u32, to: u32) -> f32;
+}
