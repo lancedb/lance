@@ -23,6 +23,7 @@
 #  limitations under the License.
 
 import os
+import platform
 import random
 import string
 import time
@@ -116,7 +117,7 @@ def test_flat(dataset):
 
 
 @pytest.mark.skipif(
-    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
     reason="no neon on GHA",
 )
 def test_ann(indexed_dataset):
@@ -124,7 +125,7 @@ def test_ann(indexed_dataset):
 
 
 @pytest.mark.skipif(
-    (os.uname().sysname == "Darwin") and (os.uname().machine != "arm64"),
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
     reason="no neon on GHA",
 )
 def test_use_index(dataset, tmp_path):

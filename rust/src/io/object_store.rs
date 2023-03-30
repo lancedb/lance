@@ -17,15 +17,17 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
+use std::path::Path as StdPath;
 use std::sync::Arc;
 
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
+use futures::{future, TryFutureExt};
 use object_store::local::LocalFileSystem;
-use path_absolutize::*;
+use path_absolutize::Absolutize;
 use shellexpand::tilde;
-use url::{ParseError, Url};
+use url::Url;
 
 use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
@@ -83,43 +85,40 @@ impl ObjectStore {
             return Ok(Self::memory());
         };
 
-        let parsed = match Url::parse(uri) {
-            Ok(u) => u,
-            Err(ParseError::RelativeUrlWithoutBase) => {
-                let str_path = tilde(uri).to_string();
-                let path = std::path::Path::new(&str_path);
-                return Ok(Self {
-                    inner: Arc::new(LocalFileSystem::new()),
-                    scheme: String::from("file"),
-                    base_path: Path::from(path.absolutize()?.to_str().unwrap()),
-                    prefetch_size: 4 * 1024,
-                });
-            }
-            Err(e) => {
-                eprintln!("Parse err: {e}");
-                return Err(Error::IO(format!("URI parse error: {e}")));
-            }
-        };
+        // Try to parse the provided string as a Url, if that fails treat it as local FS
+        future::ready(Url::parse(uri))
+            .map_err(Error::from)
+            .and_then(|url| Self::new_from_url(url))
+            .or_else(|_| future::ready(Self::new_from_path(uri)))
+            .await
+    }
 
-        let scheme: String;
-        let object_store: Arc<dyn OSObjectStore> = match parsed.scheme() {
-            "s3" => {
-                scheme = "s3".to_string();
-                build_s3_object_store(uri).await?
-            }
-            "file" => {
-                scheme = "flle".to_string();
-                Arc::new(LocalFileSystem::new())
-            }
-            &_ => todo!(),
-        };
-
+    fn new_from_path(str_path: &str) -> Result<Self> {
+        let expanded = tilde(str_path).to_string();
+        let absolute_path = StdPath::new(expanded.as_str()).absolutize()?;
+        let absolute_path_str = absolute_path
+            .to_str()
+            .ok_or(Error::IO(format!("can't convert path {}", str_path)))?;
+        let url = Url::from_file_path(absolute_path_str).unwrap();
         Ok(Self {
-            inner: object_store,
-            scheme,
-            base_path: Path::from(parsed.path()),
+            inner: Arc::new(LocalFileSystem::new()),
+            scheme: String::from("flle"),
+            base_path: Path::from(url.path()),
             prefetch_size: 64 * 1024,
         })
+    }
+
+    async fn new_from_url(url: Url) -> Result<Self> {
+        match url.scheme() {
+            "s3" => Ok(Self {
+                inner: build_s3_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("s3"),
+                base_path: Path::from(url.path()),
+                prefetch_size: 64 * 1024,
+            }),
+            "file" => Self::new_from_path(url.path()),
+            s => Err(Error::IO(format!("Unknown scheme {}", s))),
+        }
     }
 
     /// Create a in-memory object store directly.
@@ -181,6 +180,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_uri_expansion() {
         // test tilde and absolute path expansion
         for uri in &["./bar/foo.lance", "../bar/foo.lance", "~/foo.lance"] {
@@ -195,5 +195,40 @@ mod tests {
         let store = ObjectStore::new(uri).await.unwrap();
         // +1 for the leading slash Path.as_ref() doesn't read back
         assert!(store.base_path().as_ref().len() + 1 == uri.len());
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_windows_paths() {
+        for uri in &[
+            "c:/test_folder/test.lance",
+            "c:\\test_folder\\test.lance",
+            "c:\\test_folder\\..\\test_folder\\test.lance",
+        ] {
+            let store = ObjectStore::new(uri).await.unwrap();
+            assert_eq!(store.base_path().to_string(), "C:/test_folder/test.lance");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tilde_expansion() {
+        let uri = "~/foo.lance";
+        let store = ObjectStore::new(uri).await.unwrap();
+
+        // dir uses the platform-specific path separators
+        //    /home/eto/foo.lance
+        //    C:\Users\Administrator\foo.lance
+        let mut dir = dirs::home_dir().unwrap();
+        dir.push("foo.lance");
+        // dir_to_url always uses /
+        //    file:///Users/eto/foo.lance
+        //    file:///C:/Users/Administrator/foo.lance
+        let dir_to_url = Url::from_file_path(dir).unwrap();
+        // We are only interested in the path part of the URL, and we drop the first /
+        //    Users/eto/foo.lance
+        //    C:/Users/Administrator/foo.lance
+        let expected_path = &dir_to_url.path()[1..];
+
+        assert_eq!(store.base_path().to_string(), expected_path);
     }
 }

@@ -84,6 +84,12 @@ impl From<object_store::path::Error> for Error {
     }
 }
 
+impl From<url::ParseError> for Error {
+    fn from(e: url::ParseError) -> Self {
+        Self::IO(e.to_string())
+    }
+}
+
 impl std::error::Error for Error {}
 
 impl From<Error> for ArrowError {

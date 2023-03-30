@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import os
+import platform
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +84,7 @@ def test_asof_checkout(tmp_path: Path):
 
     lance.write_dataset(table, base_dir)
     assert len(lance.dataset(base_dir).versions()) == 1
+    time.sleep(0.01)
     ts_1 = datetime.now()
     time.sleep(0.01)
 
@@ -157,6 +159,10 @@ def test_relative_paths(tmp_path: Path):
     assert ds.to_table() == table
 
 
+@pytest.mark.skipif(
+    (platform.system() == "Windows"),
+    reason="mocking user's home folder it not working",
+)
 def test_tilde_paths(tmp_path: Path):
     # tilde paths get resolved to the right absolute path
     tilde_uri = "~/test.lance"
