@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter::Map;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use arrow_array::{
@@ -26,6 +26,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
+use futures::lock::Mutex;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
@@ -55,14 +56,14 @@ const INDICES_DIR: &str = "_indices";
 const DATA_DIR: &str = "data";
 
 /// Lance Dataset
-#[derive(Debug, Clone)]
+#[derive(Debug,Clone)]
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     base: Path,
     pub(crate) manifest: Arc<Manifest>,
 
     // ctx
-    pub index_cache: HashMap<String, Arc<dyn VectorIndex>>,
+    pub index_cache: Arc<Mutex<HashMap<String, Arc<dyn VectorIndex>>>>,
 }
 
 /// Dataset Version
@@ -148,7 +149,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
-            index_cache: HashMap::new()
+            index_cache: Arc::new(Mutex::new(HashMap::new()))
         })
     }
 
@@ -313,7 +314,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
-            index_cache: HashMap::new()
+            index_cache: Arc::new(Mutex::new(HashMap::new()))
         })
     }
 
@@ -455,7 +456,7 @@ impl Dataset {
             object_store: self.object_store.clone(),
             base: self.base.clone(),
             manifest: Arc::new(new_manifest),
-            index_cache: HashMap::new()
+            index_cache: Arc::new(Mutex::new(HashMap::new()))
         })
     }
 

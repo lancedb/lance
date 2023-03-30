@@ -16,6 +16,7 @@
 //!
 
 use std::any::Any;
+use std::ops::Index;
 use std::sync::Arc;
 
 use arrow_array::Float32Array;
@@ -220,6 +221,14 @@ impl IndexParams for VectorIndexParams {
 
 /// Open the Vector index on dataset, specified by the `uuid`.
 pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+    let cache = dataset.index_cache.lock().await;
+    let index = cache.get(uuid);
+
+    if index.is_some() {
+        return Ok(index.unwrap().clone())
+    }
+    drop(cache);
+
     let index_dir = dataset.indices_dir().child(uuid);
     let index_file = index_dir.child(INDEX_FILE_NAME);
 
@@ -334,5 +343,9 @@ pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorI
             vec_idx.stages
         )));
     }
-    Ok(last_stage.unwrap())
+
+    let index = last_stage.unwrap();
+    let mut cache = dataset.index_cache.lock().await;
+    cache.insert(uuid.to_string(), index.clone()); // TODO no clone
+    Ok(index)
 }
