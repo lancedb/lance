@@ -170,7 +170,6 @@ impl Dataset {
             Some(Dataset::open(uri).await?)
         };
 
-
         // Read schema for the input batches
         let mut peekable = batches.peekable();
         let mut schema: Schema;
@@ -204,11 +203,6 @@ impl Dataset {
         let params = params; // discard mut
 
         // append + input schema different from existing schema = error
-        let latest_manifest = if matches!(params.mode, WriteMode::Create) {
-            None
-        } else {
-            Some(read_manifest(&object_store, &latest_manifest_path).await?)
-        };
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
                 let m = d.manifest.as_ref();
