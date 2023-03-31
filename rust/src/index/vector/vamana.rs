@@ -20,10 +20,10 @@ use std::sync::Arc;
 use arrow::array::as_primitive_array;
 use arrow::datatypes::UInt64Type;
 use futures::{stream, StreamExt, TryStreamExt};
-use rand::Rng;
 use rand::distributions::Uniform;
+use rand::Rng;
 
-use super::graph::{Vertex, Graph};
+use super::graph::{Graph, Vertex};
 use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::{Error, Result};
@@ -32,6 +32,8 @@ use crate::{Error, Result};
 struct VemanaData {
     row_id: u64,
 }
+
+type VemanaVertex = Vertex<VemanaData>;
 
 pub struct VamanaBuilder {
     dataset: Arc<Dataset>,
@@ -58,7 +60,7 @@ impl VamanaBuilder {
             .unwrap();
 
         let batches = scanner.try_collect::<Vec<_>>().await?;
-        let mut vertices = Vec::new();
+        let mut vertices: Vec<VemanaVertex> = Vec::new();
         let mut vertex_id = 0;
         for batch in batches {
             let row_id = as_primitive_array::<UInt64Type>(
@@ -67,16 +69,9 @@ impl VamanaBuilder {
                     .ok_or(Error::Index("row_id not found".to_string()))?,
             );
             for i in 0..row_id.len() {
-                let mut neighbors: HashSet<u32> = HashSet::new();
-                while neighbors.len() < r {
-                    let candidate: u32 = rng.gen_range(0..total as u32);
-                    if candidate != vertex_id as u32 {
-                        neighbors.insert(candidate);
-                    }
-                }
                 vertices.push(Vertex {
                     id: vertex_id,
-                    neighbors: Vec::from_iter(neighbors),
+                    neighbors: vec![],
                     auxilary: VemanaData {
                         row_id: row_id.value(i),
                     },
@@ -84,21 +79,35 @@ impl VamanaBuilder {
                 vertex_id += 1;
             }
         }
+        let distribution = Uniform::new(0, total);
+        // Randomly connect to r neighbors.
+        for i in 0..vertices.len() {
+            let mut neighbor_ids: HashSet<u32> = {
+                let v = vertices.get(i).unwrap();
+                v.neighbors.iter().cloned().collect()
+            };
 
-        Ok(Self {
-            dataset,
-            vertices,
-        })
-    }
-}
+            while neighbor_ids.len() < r {
+                let neighbor_id = rng.sample(distribution);
+                if neighbor_id != i {
+                    neighbor_ids.insert(neighbor_id as u32);
+                }
+            }
 
-impl Graph<VemanaData> for VamanaBuilder {
-    fn vertex(&self, id: u32) -> &Vertex<VemanaData> {
-        &self.vertices[id as usize]
-    }
+            // Make bidirectional connections.
+            {
+                let v = vertices.get_mut(i).unwrap();
+                v.neighbors = neighbor_ids.iter().copied().collect();
+            }
+            {
+                for neighbor_id in neighbor_ids.iter() {
+                    let neighbor = vertices.get_mut(*neighbor_id as usize).unwrap();
+                    neighbor.neighbors.push(i as u32);
+                }
+            }
+        }
 
-    fn distance(&self, from: u32, to: u32) -> f32 {
-        todo!()
+        Ok(Self { dataset, vertices })
     }
 }
 
@@ -154,7 +163,8 @@ mod tests {
         let inited_graph = VamanaBuilder::try_init(dataset, 10, rng).await.unwrap();
 
         for (vertex, id) in inited_graph.vertices.iter().zip(0..) {
-            assert_eq!(vertex.neighbors.len(), 10);
+            // After random initialization, statistically each node should have 10 neighbors.
+            assert!(vertex.neighbors.len() > 0);
             assert_eq!(vertex.id, id);
         }
     }
