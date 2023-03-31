@@ -161,15 +161,6 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(object_store.base_path());
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        let dataset = if matches!(params.mode, WriteMode::Create) {
-            if flag_dataset_exists {
-                return Err(Error::IO(format!("Dataset already exists: {uri}")));
-            }
-            None
-        } else {
-            Some(Dataset::open(uri).await?)
-        };
-
         // Read schema for the input batches
         let mut peekable = batches.peekable();
         let mut schema: Schema;
@@ -201,6 +192,12 @@ impl Dataset {
             };
         }
         let params = params; // discard mut
+
+        let dataset = if matches!(params.mode, WriteMode::Create) {
+            None
+        } else {
+            Some(Dataset::open(uri).await?)
+        };
 
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
