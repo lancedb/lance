@@ -14,6 +14,7 @@
 
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
@@ -58,9 +59,7 @@ impl VamanaBuilder {
 
         let batches = scanner.try_collect::<Vec<_>>().await?;
         let mut vertices = Vec::new();
-        let mut vectex_id = 0;
-        let ra = &mut rng;
-        let distribution = Uniform::new(0, total as u32);
+        let mut vertex_id = 0;
         for batch in batches {
             let row_id = as_primitive_array::<UInt64Type>(
                 batch
@@ -68,18 +67,21 @@ impl VamanaBuilder {
                     .ok_or(Error::Index("row_id not found".to_string()))?,
             );
             for i in 0..row_id.len() {
-                let neighbors = ra
-                    .sample_iter(&distribution)
-                    .take(r)
-                    .collect::<Vec<_>>();
+                let mut neighbors: HashSet<u32> = HashSet::new();
+                while neighbors.len() < r {
+                    let candidate: u32 = rng.gen_range(0..total as u32);
+                    if candidate != vertex_id as u32 {
+                        neighbors.insert(candidate);
+                    }
+                }
                 vertices.push(Vertex {
-                    id: vectex_id,
-                    neighbors,
+                    id: vertex_id,
+                    neighbors: Vec::from_iter(neighbors),
                     auxilary: VemanaData {
                         row_id: row_id.value(i),
                     },
                 });
-                vectex_id += 1;
+                vertex_id += 1;
             }
         }
 
