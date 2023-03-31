@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
 use arrow::datatypes::UInt64Type;
+use arrow_array::Float32Array;
+use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::distributions::Uniform;
 use rand::Rng;
@@ -26,6 +28,8 @@ use rand::Rng;
 use super::graph::{Graph, Vertex};
 use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
+use crate::io::object_writer::ObjectWriter;
+use crate::utils::distance::l2::l2_distance;
 use crate::{Error, Result};
 
 #[derive(Debug)]
@@ -35,13 +39,15 @@ struct VemanaData {
 
 type VemanaVertex = Vertex<VemanaData>;
 
-pub struct VamanaBuilder {
+pub struct Vamana {
     dataset: Arc<Dataset>,
+
+    column: String,
 
     vertices: Vec<Vertex<VemanaData>>,
 }
 
-impl VamanaBuilder {
+impl Vamana {
     /// Randomly initialize the graph.
     ///
     /// Parameters
@@ -50,7 +56,12 @@ impl VamanaBuilder {
     ///  - r: the number of neighbors to connect to.
     ///  - rng: the random number generator.
     ///
-    async fn try_init(dataset: Arc<Dataset>, r: usize, mut rng: impl Rng) -> Result<Self> {
+    async fn try_init(
+        dataset: Arc<Dataset>,
+        column: &str,
+        r: usize,
+        mut rng: impl Rng,
+    ) -> Result<Self> {
         let total = dataset.count_rows().await?;
         let scanner = dataset
             .scan()
@@ -72,7 +83,7 @@ impl VamanaBuilder {
                 vertices.push(Vertex {
                     id: vertex_id,
                     neighbors: vec![],
-                    auxilary: VemanaData {
+                    aux_data: VemanaData {
                         row_id: row_id.value(i),
                     },
                 });
@@ -107,7 +118,43 @@ impl VamanaBuilder {
             }
         }
 
-        Ok(Self { dataset, vertices })
+        Ok(Self {
+            dataset,
+            column: column.to_string(),
+            vertices,
+        })
+    }
+
+    /// Build Vamana Graph from a dataset.
+    pub async fn try_new(
+        dataset: Arc<Dataset>,
+        column: &str,
+        r: usize,
+        alpha: f32,
+    ) -> Result<Self> {
+        let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
+        Ok(graph)
+    }
+
+    fn get_vector(&self, row_id: usize) -> Result<Arc<Float32Array>> {
+        todo!()
+    }
+}
+
+#[async_trait]
+impl Graph for Vamana {
+    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        let row_id_a = self.vertices[a].aux_data.row_id;
+        let row_id_b = self.vertices[b].aux_data.row_id;
+        let vector_a = self.get_vector(row_id_a as usize).unwrap();
+        let vector_b = self.get_vector(row_id_b as usize).unwrap();
+
+        let dist = l2_distance(&vector_a, &vector_b, vector_a.len())?;
+        Ok(dist.values()[0])
+    }
+
+    fn serialize(&self, writer: &ObjectWriter) -> Result<()> {
+        todo!()
     }
 }
 
@@ -160,10 +207,10 @@ mod tests {
         let dataset = create_dataset(uri, 200, 64).await;
 
         let rng = rand::thread_rng();
-        let inited_graph = VamanaBuilder::try_init(dataset, 10, rng).await.unwrap();
+        let inited_graph = Vamana::try_init(dataset, "vector", 10, rng).await.unwrap();
 
         for (vertex, id) in inited_graph.vertices.iter().zip(0..) {
-            // After random initialization, statistically each node should have 10 neighbors.
+            // Statistically， each node should have 10 neighbors.
             assert!(vertex.neighbors.len() > 0);
             assert_eq!(vertex.id, id);
         }

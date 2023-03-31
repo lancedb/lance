@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use async_trait::async_trait;
+
+use crate::io::object_writer::ObjectWriter;
+use crate::Result;
+
 /// A vertex in graph.
 #[derive(Debug)]
 pub struct Vertex<T> {
@@ -21,11 +26,14 @@ pub struct Vertex<T> {
     /// neighbors
     pub neighbors: Vec<u32>,
 
-    pub auxilary: T,
+    pub(crate) aux_data: T,
 }
 
-pub(crate) trait Graph<T> {
-    fn vertex(&self, id: u32) -> &Vertex<T>;
+#[async_trait]
+pub(crate) trait Graph {
+    /// Distance between two vertices.
+    fn distance(&self, a: usize, b: usize) -> Result<f32>;
 
-    fn distance(&self, from: u32, to: u32) -> f32;
+    /// Serialize to disk.
+    fn serialize(&self, writer: &ObjectWriter) -> Result<()>;
 }
