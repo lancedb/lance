@@ -27,6 +27,7 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::{Error, Result};
 
+#[derive(Debug)]
 struct VemanaData {
     row_id: u64,
 }
@@ -43,7 +44,8 @@ impl VamanaBuilder {
     /// Parameters
     /// ----------
     ///  - dataset: the dataset to index
-    ///  - r: the number of neighbors to connect to
+    ///  - r: the number of neighbors to connect to.
+    ///  - rng: the random number generator.
     ///
     async fn try_init(dataset: Arc<Dataset>, r: usize, mut rng: impl Rng) -> Result<Self> {
         let total = dataset.count_rows().await?;
@@ -58,6 +60,7 @@ impl VamanaBuilder {
         let mut vertices = Vec::new();
         let mut vectex_id = 0;
         let ra = &mut rng;
+        let distribution = Uniform::new(0, total as u32);
         for batch in batches {
             let row_id = as_primitive_array::<UInt64Type>(
                 batch
@@ -66,7 +69,7 @@ impl VamanaBuilder {
             );
             for i in 0..row_id.len() {
                 let neighbors = ra
-                    .sample_iter(&Uniform::new(0, total as u32))
+                    .sample_iter(&distribution)
                     .take(r)
                     .collect::<Vec<_>>();
                 vertices.push(Vertex {
@@ -145,11 +148,12 @@ mod tests {
         let uri = tmp_dir.path().to_str().unwrap();
         let dataset = create_dataset(uri, 200, 64).await;
 
-        let mut rng = rand::thread_rng();
+        let rng = rand::thread_rng();
         let inited_graph = VamanaBuilder::try_init(dataset, 10, rng).await.unwrap();
 
-        for vertex in inited_graph.vertices {
+        for (vertex, id) in inited_graph.vertices.iter().zip(0..) {
             assert_eq!(vertex.neighbors.len(), 10);
+            assert_eq!(vertex.id, id);
         }
     }
 }

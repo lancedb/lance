@@ -13,6 +13,7 @@
 // limitations under the License.
 
 /// A vertex in graph.
+#[derive(Debug)]
 pub struct Vertex<T> {
     /// Vertex ID
     pub id: u32,
