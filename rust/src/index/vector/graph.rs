@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use ordered_float::OrderedFloat;
 
-use crate::io::object_writer::ObjectWriter;
 use crate::Result;
 
 /// A vertex in graph.
@@ -29,11 +29,46 @@ pub struct Vertex<T> {
     pub(crate) aux_data: T,
 }
 
+/// A Graph-backed by Lance dataset and index.
+
 #[async_trait]
 pub(crate) trait Graph {
     /// Distance between two vertices.
-    fn distance(&self, a: usize, b: usize) -> Result<f32>;
+    async fn distance(&self, a: usize, b: usize) -> Result<f32>;
 
-    /// Serialize to disk.
-    fn serialize(&self, writer: &ObjectWriter) -> Result<()>;
+    async fn neighbors(&self, id: usize) -> Result<Vec<usize>>;
+}
+
+pub(crate) struct VertexWithDistance {
+    pub id: usize,
+    pub distance: OrderedFloat<f32>,
+}
+
+impl VertexWithDistance {
+    pub fn new(id: usize, distance: f32) -> Self {
+        Self {
+            id,
+            distance: OrderedFloat(distance),
+        }
+    }
+}
+
+impl PartialEq for VertexWithDistance {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance.eq(&other.distance)
+    }
+}
+
+impl Eq for VertexWithDistance {}
+
+impl PartialOrd for VertexWithDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.distance.partial_cmp(&other.distance)
+    }
+}
+
+impl Ord for VertexWithDistance {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance.cmp(&other.distance)
+    }
 }

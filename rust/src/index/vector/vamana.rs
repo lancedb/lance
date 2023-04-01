@@ -14,7 +14,7 @@
 
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
@@ -22,13 +22,13 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::Float32Array;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
+use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::Rng;
 
-use super::graph::{Graph, Vertex};
+use super::graph::{Graph, Vertex, VertexWithDistance};
 use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
-use crate::io::object_writer::ObjectWriter;
 use crate::utils::distance::l2::l2_distance;
 use crate::{Error, Result};
 
@@ -136,25 +136,96 @@ impl Vamana {
         Ok(graph)
     }
 
-    fn get_vector(&self, row_id: usize) -> Result<Arc<Float32Array>> {
-        todo!()
+    /// Get the vector at the given row id.
+    async fn get_vector(&self, row_id: usize) -> Result<Arc<Float32Array>> {
+        let projection = self.dataset.schema().project(&[&self.column])?;
+        let rows = self
+            .dataset
+            .take_rows(&[row_id as u64], &projection)
+            .await?;
+        if rows.num_rows() != 1 {
+            return Err(Error::Index(format!(
+                "expected 1 row, got {}",
+                rows.num_rows()
+            )));
+        }
+        let array = rows.column(0);
+        let fs_array = as_fixed_size_list_array(array);
+        let float_array = fs_array.value(0);
+        let float_array: &Float32Array = as_primitive_array(float_array.as_ref());
+        Ok(Arc::new(float_array.clone()))
+    }
+
+    /// Distance from the query vector to the vector at the given idx.
+    async fn distance_to(&self, query: &Float32Array, idx: usize) -> Result<f32> {
+        let vector = self.get_vector(idx).await?;
+        let dists = l2_distance(query, vector.as_ref(), query.len())?;
+        Ok(dists.values()[0])
+    }
+
+    /// Greedy search.
+    ///
+    /// Algorithm 1 in the paper.
+    async fn greedy_search(
+        &self,
+        start: usize,
+        query: &Float32Array,
+        k: usize,
+        queue_size: usize, // L in the paper.
+    ) -> Result<Vec<usize>> {
+        let mut visited: HashSet<usize> = HashSet::new();
+
+        let mut candidates: BTreeMap<OrderedFloat<f32>, usize> = BTreeMap::new();
+        let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
+        heap.push(VertexWithDistance {
+            id: start,
+            distance: OrderedFloat(0.0),
+        });
+        while !heap.is_empty() {
+            let p = heap.pop().unwrap();
+            if visited.contains(&p.id) {
+                continue;
+            }
+            visited.insert(p.id);
+            for neighbor_id in self.neighbors(p.id).await?.iter() {
+                if visited.contains(&neighbor_id) {
+                    // Already visited.
+                    continue;
+                }
+                let dist = self.distance_to(query, *neighbor_id).await?;
+                heap.push(VertexWithDistance {
+                    id: *neighbor_id,
+                    distance: OrderedFloat(dist),
+                });
+                candidates.insert(OrderedFloat(dist), *neighbor_id);
+                if candidates.len() > queue_size {
+                    candidates.pop_last();
+                }
+            }
+        }
+
+        Ok(candidates.iter().take(k).map(|(_, id)| *id).collect())
     }
 }
 
 #[async_trait]
 impl Graph for Vamana {
-    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let row_id_a = self.vertices[a].aux_data.row_id;
         let row_id_b = self.vertices[b].aux_data.row_id;
-        let vector_a = self.get_vector(row_id_a as usize).unwrap();
-        let vector_b = self.get_vector(row_id_b as usize).unwrap();
+        let vector_a = self.get_vector(row_id_a as usize).await.unwrap();
+        let vector_b = self.get_vector(row_id_b as usize).await.unwrap();
 
         let dist = l2_distance(&vector_a, &vector_b, vector_a.len())?;
         Ok(dist.values()[0])
     }
 
-    fn serialize(&self, writer: &ObjectWriter) -> Result<()> {
-        todo!()
+    async fn neighbors(&self, id: usize) -> Result<Vec<usize>> {
+        Ok(self.vertices[id]
+            .neighbors
+            .iter()
+            .map(|id| *id as usize)
+            .collect())
     }
 }
 
