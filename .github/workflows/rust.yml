@@ -90,6 +90,9 @@ jobs:
             -source "https://nuget.pkg.github.com/eto.ai/index.json"
       - name: Setup Dependencies with vcpkg
         run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
           vcpkg install openblas --triplet x64-windows-static-md
           vcpkg install lapack --triplet x64-windows
       - name: Install Protoc v21.12
