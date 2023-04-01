@@ -206,6 +206,17 @@ impl Vamana {
 
         Ok(candidates.iter().take(k).map(|(_, id)| *id).collect())
     }
+
+    /// Algorithm 2 in the paper.
+    async fn prune(
+        &self,
+        id: usize,
+        visited: &mut HashSet<usize>,
+        alpha: f32,
+        r: usize,
+    ) -> Result<()> {
+        todo!()
+    }
 }
 
 #[async_trait]
