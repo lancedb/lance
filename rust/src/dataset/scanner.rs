@@ -32,7 +32,7 @@ use futures::stream::{Stream, StreamExt};
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
-use crate::format::Index;
+use crate::format::{Fragment, Index};
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
@@ -378,26 +378,64 @@ impl Scanner {
             let knn_node = self.ann(q, &index)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
-            let knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(knn_node_with_vector, q)?
+            let mut knn_node = if q.refine_factor.is_some() {
+                self.flat_knn(vec![knn_node_with_vector], q)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
+
+            let version = index.dataset_version;
+            if version != self.dataset.version().version {
+                let uri = self.dataset.base.to_string();
+                let ds = Dataset::checkout(uri.as_str(), version).await?;
+                let max_fragment_id_idx = ds.manifest.fragments.iter()
+                    .map(|f| f.id).max()
+                    .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
+                let max_fragment_id_ds = self.dataset.manifest.fragments.iter()
+                    .map(|f| f.id).max()
+                    .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
+                if max_fragment_id_idx < max_fragment_id_ds {
+                    // appended since index
+                    // No index found. use flat search.
+                    let vector_scan_projection =
+                        Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+                    let scan_node = self.scan_fragments(
+                        true, vector_scan_projection,
+                        max_fragment_id_idx + 1, max_fragment_id_ds + 1
+                    );
+                    let topk_appended = self.flat_knn(vec![scan_node], q)?;
+                    knn_node = self.flat_knn(vec![topk_appended, knn_node], q)?;
+                }
+            }
+
             Ok(knn_node)
         } else {
             // No index found. use flat search.
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(scan_node, q)?)
+            Ok(self.flat_knn(vec![scan_node], q)?)
         }
     }
 
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+        self.scan_internal(with_row_id, projection, self.dataset.fragments().clone())
+    }
+
+    fn scan_fragments(&self, with_row_id: bool, projection: Arc<Schema>, start: u64, end: u64) -> Arc<dyn ExecutionPlan> {
+        let fragments = self.dataset.fragments().clone()
+            .iter()
+            .filter(|&f| f.id >= start && f.id < end)
+            .map(|f| f.clone())
+            .collect();
+        self.scan_internal(with_row_id, projection, Arc::new(fragments))
+    }
+
+    fn scan_internal(&self, with_row_id: bool, projection: Arc<Schema>, fragments: Arc<Vec<Fragment>>) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
-            self.dataset.fragments().clone(),
+            fragments,
             projection,
             self.batch_size,
             PREFETCH_SIZE,
@@ -406,8 +444,8 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
+    fn flat_knn(&self, inputs: Vec<Arc<dyn ExecutionPlan>>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(KNNFlatExec::try_new(inputs, q.clone())?))
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -446,12 +484,18 @@ impl Scanner {
 #[pin_project::pin_project]
 pub struct RecordBatchStream {
     #[pin]
-    exec_node: SendableRecordBatchStream,
+    inputs: Vec<SendableRecordBatchStream>,
+    #[pin]
+    curr: usize
 }
 
 impl RecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        Self { exec_node }
+        Self { inputs: vec![exec_node], curr: 0 }
+    }
+
+    pub fn from_vec(nodes: Vec<SendableRecordBatchStream>) -> Self {
+        Self { inputs: nodes, curr: 0 }
     }
 }
 
@@ -459,10 +503,23 @@ impl Stream for RecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let curr = self.curr;
         let mut this = self.project();
-        match this.exec_node.poll_next_unpin(cx) {
+        match this.inputs[curr].poll_next_unpin(cx) {
             Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::IO(e.to_string()))))
+                match result {
+                    Some(rs) => {
+                        Poll::Ready(Some(rs.map_err(|e| Error::IO(e.to_string()))))
+                    }
+                    None => {
+                        if curr == this.inputs.len() - 1 {
+                            Poll::Ready(None)
+                        } else {
+                            self.curr += 1;
+                            self.poll_next(cx)
+                        }
+                    }
+                }
             }
             Poll::Pending => Poll::Pending,
         }

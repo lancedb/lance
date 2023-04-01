@@ -24,7 +24,9 @@ use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use futures::SinkExt;
 use futures::stream::Stream;
+use futures::stream::StreamExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -44,18 +46,28 @@ pub struct KNNFlatStream {
 impl KNNFlatStream {
     /// Construct a [KNNFlat] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
+        let stream = RecordBatchStream::new(child);
+        KNNFlatStream::from_stream(stream, query)
+    }
+
+    pub(crate) fn from_vec(children: Vec<SendableRecordBatchStream>, query: &Query) -> Self {
+        let stream = RecordBatchStream::from_vec(children);
+        KNNFlatStream::from_stream(stream, query)
+    }
+
+    fn from_stream(stream: RecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batch = match flat_search(RecordBatchStream::new(child), &q).await {
+            let batch = match flat_search(stream, &q).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
                         "Failed to compute scores: {e}"
                     ))))
-                    .await
-                    .expect("KNNFlat failed to send message");
+                        .await
+                        .expect("KNNFlat failed to send message");
                     return;
                 }
             };
@@ -100,7 +112,7 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema does not have "score" column.
 pub struct KNNFlatExec {
     /// Input node.
-    input: Arc<dyn ExecutionPlan>,
+    inputs: Vec<Arc<dyn ExecutionPlan>>,
 
     /// The query to execute.
     query: Query,
@@ -120,8 +132,8 @@ impl KNNFlatExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
-        let schema = input.schema();
+    pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
+        let schema = inputs[0].schema(); // TODO validate schema
         let field = schema.field_with_name(&query.column).map_err(|_| {
             Error::IO(format!(
                 "KNNFlatExec node: query column {} not found in input schema",
@@ -139,7 +151,7 @@ impl KNNFlatExec {
             )));
         };
 
-        Ok(Self { input, query })
+        Ok(Self { inputs, query })
     }
 }
 
@@ -150,7 +162,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     /// Flat KNN inherits the schema from input node, and add one score column.
     fn schema(&self) -> arrow_schema::SchemaRef {
-        let input_schema = self.input.schema();
+        let input_schema = self.inputs[0].schema();
         let mut fields = input_schema.fields().to_vec();
         if !input_schema.field_with_name(SCORE_COL).is_ok() {
             fields.push(Field::new(SCORE_COL, DataType::Float32, false));
@@ -163,15 +175,15 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
+        self.inputs[0].output_partitioning()
     }
 
     fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.input.output_ordering()
+        self.inputs[0].output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+        self.inputs.clone()
     }
 
     fn with_new_children(
@@ -186,8 +198,13 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
+
+        let streams: DataFusionResult<Vec<SendableRecordBatchStream>> = self.inputs.iter()
+            .map(|node| node.execute(partition, context.clone()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect();
+        Ok(Box::pin(KNNFlatStream::from_vec(streams?, &self.query)))
     }
 
     fn statistics(&self) -> Statistics {

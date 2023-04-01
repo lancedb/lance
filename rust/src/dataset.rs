@@ -56,7 +56,7 @@ const DATA_DIR: &str = "data";
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
-    base: Path,
+    pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
 }
 
