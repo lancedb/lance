@@ -15,6 +15,7 @@
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
@@ -208,13 +209,47 @@ impl Vamana {
     }
 
     /// Algorithm 2 in the paper.
-    async fn prune(
+    async fn robust_prune(
         &self,
         id: usize,
-        visited: &mut HashSet<usize>,
+        mut visited: HashSet<usize>,
         alpha: f32,
         r: usize,
     ) -> Result<()> {
+        visited.remove(&id);
+        let neighbors = self.neighbors(id).await?;
+        visited.extend(neighbors.iter());
+
+        let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
+        for p in visited.iter() {
+            let dist = self.distance(id, *p).await?;
+            heap.push(VertexWithDistance {
+                id: *p,
+                distance: OrderedFloat(dist),
+            });
+        }
+
+        let mut new_neighbours: Vec<usize> = vec![];
+        while !visited.is_empty() {
+            let p = heap.pop().unwrap();
+            new_neighbours.push(p.id);
+            if new_neighbours.len() >= r {
+                break;
+            }
+
+            let mut to_remove: HashSet<usize> = HashSet::new();
+            for pv in visited.iter() {
+                let dist_prime = self.distance(p.id, *pv).await?;
+                let dist_query = self.distance(id, *pv).await?;
+
+                if alpha * dist_prime <= dist_query {
+                    to_remove.insert(*pv);
+                }
+            }
+            for pv in to_remove.iter() {
+                visited.remove(pv);
+            }
+        }
         todo!()
     }
 }
