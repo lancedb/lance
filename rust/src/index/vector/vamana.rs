@@ -26,6 +26,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use super::graph::{Graph, Vertex, VertexWithDistance};
 use crate::arrow::*;
@@ -44,56 +45,6 @@ type VemanaVertex = Vertex<VemanaData>;
 ///
 #[async_trait]
 pub(crate) trait Vamana: Graph {
-    /// Algorithm 2 in the paper.
-    async fn robust_prune(
-        &self,
-        id: usize,
-        mut visited: HashSet<usize>,
-        alpha: f32,
-        r: usize,
-    ) -> Result<()> {
-        visited.remove(&id);
-        let neighbors = self.neighbors(id).await?;
-        visited.extend(neighbors.iter());
-
-        let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
-        for p in visited.iter() {
-            let dist = self.distance(id, *p).await?;
-            heap.push(VertexWithDistance {
-                id: *p,
-                distance: OrderedFloat(dist),
-            });
-        }
-
-        let mut new_neighbours: Vec<usize> = vec![];
-        while !visited.is_empty() {
-            let mut p = heap.pop().unwrap();
-            while !visited.contains(&p.id) {
-                // Because we are using a heap for `argmin(Visited)` in the original
-                // algorithm, we need to pop out the vertices that are not in `visited` anymore.
-                p = heap.pop().unwrap();
-            }
-
-            new_neighbours.push(p.id);
-            if new_neighbours.len() >= r {
-                break;
-            }
-
-            let mut to_remove: HashSet<usize> = HashSet::new();
-            for pv in visited.iter() {
-                let dist_prime = self.distance(p.id, *pv).await?;
-                let dist_query = self.distance(id, *pv).await?;
-
-                if alpha * dist_prime <= dist_query {
-                    to_remove.insert(*pv);
-                }
-            }
-            for pv in to_remove.iter() {
-                visited.remove(pv);
-            }
-        }
-        todo!()
-    }
 }
 
 pub struct VamanaBuilder {
@@ -182,14 +133,58 @@ impl VamanaBuilder {
         })
     }
 
+    async fn find_medoid() -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn index_pass(
+        &mut self,
+        medoid: usize,
+        alpha: f32,
+        r: usize,
+        l: usize,
+        mut rng: impl Rng,
+    ) -> Result<()> {
+        let mut ids = (0..self.vertices.len()).collect::<Vec<_>>();
+        ids.shuffle(&mut rng);
+
+        for id in ids {
+            let vector = self.get_vector(id).await?;
+            let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
+            self.robust_prune(id, visited, alpha, r).await?;
+            for neighbor_id in self.neighbors(id).await? {
+                let mut neighbor_set = HashSet::new();
+                neighbor_set.extend(self.neighbors(neighbor_id).await?);
+                neighbor_set.insert(id);
+                if neighbor_set.len() > r {
+                    self.robust_prune(neighbor_id, neighbor_set, alpha, r).await?;
+                } else {
+                    self.vertices[neighbor_id].neighbors.push(id as u32);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Build Vamana Graph from a dataset.
     pub async fn try_new(
         dataset: Arc<Dataset>,
         column: &str,
         r: usize,
         alpha: f32,
+        l: usize,
     ) -> Result<Self> {
         let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
+
+        let mut rng = rand::thread_rng();
+        let medoid = Self::find_medoid().await?;
+
+        // First pass.
+        graph.index_pass(medoid, 1.0, r, l, rng.clone()).await?;
+        // Second pass.
+        graph.index_pass(medoid, alpha, r, l, rng).await?;
+
         Ok(graph)
     }
 
@@ -229,7 +224,7 @@ impl VamanaBuilder {
         query: &Float32Array,
         k: usize,
         queue_size: usize, // L in the paper.
-    ) -> Result<Vec<usize>> {
+    ) -> Result<(Vec<usize>, HashSet<usize>)> {
         let mut visited: HashSet<usize> = HashSet::new();
 
         let mut candidates: BTreeMap<OrderedFloat<f32>, usize> = BTreeMap::new();
@@ -261,7 +256,7 @@ impl VamanaBuilder {
             }
         }
 
-        Ok(candidates.iter().take(k).map(|(_, id)| *id).collect())
+        Ok((candidates.iter().take(k).map(|(_, id)| *id).collect(), visited))
     }
 
     /// Algorithm 2 in the paper.
