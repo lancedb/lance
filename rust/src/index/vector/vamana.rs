@@ -40,7 +40,6 @@ struct VemanaData {
 
 type VemanaVertex = Vertex<VemanaData>;
 
-
 /// Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 ///
 #[async_trait]
@@ -73,7 +72,7 @@ pub(crate) trait Vamana: Graph {
                 // Because we are using a heap for `argmin(Visited)` in the original
                 // algorithm, we need to pop out the vertices that are not in `visited` anymore.
                 p = heap.pop().unwrap();
-            };
+            }
 
             new_neighbours.push(p.id);
             if new_neighbours.len() >= r {
@@ -264,6 +263,59 @@ impl VamanaBuilder {
 
         Ok(candidates.iter().take(k).map(|(_, id)| *id).collect())
     }
+
+    /// Algorithm 2 in the paper.
+    async fn robust_prune(
+        &mut self,
+        id: usize,
+        mut visited: HashSet<usize>,
+        alpha: f32,
+        r: usize,
+    ) -> Result<()> {
+        visited.remove(&id);
+        let neighbors = self.neighbors(id).await?;
+        visited.extend(neighbors.iter());
+
+        let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
+        for p in visited.iter() {
+            let dist = self.distance(id, *p).await?;
+            heap.push(VertexWithDistance {
+                id: *p,
+                distance: OrderedFloat(dist),
+            });
+        }
+
+        let mut new_neighbours: Vec<usize> = vec![];
+        while !visited.is_empty() {
+            let mut p = heap.pop().unwrap();
+            while !visited.contains(&p.id) {
+                // Because we are using a heap for `argmin(Visited)` in the original
+                // algorithm, we need to pop out the vertices that are not in `visited` anymore.
+                p = heap.pop().unwrap();
+            }
+
+            new_neighbours.push(p.id);
+            if new_neighbours.len() >= r {
+                break;
+            }
+
+            let mut to_remove: HashSet<usize> = HashSet::new();
+            for pv in visited.iter() {
+                let dist_prime = self.distance(p.id, *pv).await?;
+                let dist_query = self.distance(id, *pv).await?;
+
+                if alpha * dist_prime <= dist_query {
+                    to_remove.insert(*pv);
+                }
+            }
+            for pv in to_remove.iter() {
+                visited.remove(pv);
+            }
+        }
+
+        self.vertices[id].neighbors = new_neighbours.iter().map(|id| *id as u32).collect();
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -288,8 +340,7 @@ impl Graph for VamanaBuilder {
 }
 
 /// Vamana Graph implementation for Vamana.
-impl Vamana for VamanaBuilder {
-}
+impl Vamana for VamanaBuilder {}
 
 #[cfg(test)]
 mod tests {
@@ -340,7 +391,9 @@ mod tests {
         let dataset = create_dataset(uri, 200, 64).await;
 
         let rng = rand::thread_rng();
-        let inited_graph = VamanaBuilder::try_init(dataset, "vector", 10, rng).await.unwrap();
+        let inited_graph = VamanaBuilder::try_init(dataset, "vector", 10, rng)
+            .await
+            .unwrap();
 
         for (vertex, id) in inited_graph.vertices.iter().zip(0..) {
             // Statistically， each node should have 10 neighbors.
