@@ -9,5 +9,10 @@ fn main() -> Result<()> {
         &["./protos/format.proto", "./protos/index.proto"],
         &["./protos"],
     )?;
+
+    if cfg!(target_os = "windows") {
+        vcpkg::find_package("lapack").unwrap();
+    }
+
     Ok(())
 }

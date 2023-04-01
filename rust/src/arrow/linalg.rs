@@ -272,13 +272,6 @@ impl SingularValueDecomposition for MatrixView {
     type Matrix = Self;
     type Sigma = Float32Array;
 
-    // FIXME implement svd in windows
-    #[cfg(windows)]
-    fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
-        Err(Error::Arrow("SVD is not supported in windows".to_string()))
-    }
-
-    #[cfg(unix)]
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
