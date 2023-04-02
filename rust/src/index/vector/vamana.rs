@@ -20,15 +20,15 @@ use std::sync::Arc;
 
 use arrow::compute::divide_scalar;
 use arrow::datatypes::UInt64Type;
-use arrow_array::{Float32Array, cast::as_primitive_array, Array};
+use arrow_arith::arithmetic::{add, add_dyn, divide};
+use arrow_array::{cast::as_primitive_array, Array, Float32Array};
 use arrow_schema::DataType;
-use arrow_arith::arithmetic::{add_dyn, add, divide};
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 
 use super::graph::{Graph, Vertex, VertexWithDistance};
 use crate::arrow::*;
@@ -46,8 +46,7 @@ type VemanaVertex = Vertex<VemanaData>;
 /// Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 ///
 #[async_trait]
-pub(crate) trait Vamana: Graph {
-}
+pub(crate) trait Vamana: Graph {}
 
 pub struct VamanaBuilder {
     dataset: Arc<Dataset>,
@@ -137,22 +136,23 @@ impl VamanaBuilder {
 
     fn dimension(&self) -> Result<usize> {
         let schema = self.dataset.schema();
-        let field = schema.field(&self.column).ok_or_else(|| Error::Index(format!(
-            "column {} not found in schema",
-            self.column
-        )))?;
+        let field = schema
+            .field(&self.column)
+            .ok_or_else(|| Error::Index(format!("column {} not found in schema", self.column)))?;
         match field.data_type() {
             DataType::FixedSizeList(_, s) => Ok(s as usize),
             _ => Err(Error::Index(format!(
                 "column {} is not a vector column: {}",
-                self.column, field.data_type()
+                self.column,
+                field.data_type()
             ))),
         }
     }
 
     /// Find the closest vertex ID to the centroids.
     async fn find_medoid(&self) -> Result<usize> {
-        let mut stream = self.dataset
+        let mut stream = self
+            .dataset
             .scan()
             .project(&[&self.column])?
             .try_into_stream()
@@ -167,10 +167,9 @@ impl VamanaBuilder {
 
         while let Some(batch) = stream.try_next().await? {
             total += batch.num_rows();
-            let vector_col = batch.column_by_name(&self.column).ok_or_else(|| Error::Index(format!(
-                "column {} not found in schema",
-                self.column
-            )))?;
+            let vector_col = batch.column_by_name(&self.column).ok_or_else(|| {
+                Error::Index(format!("column {} not found in schema", self.column))
+            })?;
             let vectors = as_fixed_size_list_array(vector_col.as_ref());
             for i in 0..vectors.len() {
                 let vector = vectors.value(i);
@@ -181,18 +180,16 @@ impl VamanaBuilder {
 
         // Find the closest vertex to the centroid.
         {
-            let mut stream = self.dataset
+            let mut stream = self
+                .dataset
                 .scan()
                 .project(&[&self.column])?
                 .try_into_stream()
                 .await
                 .unwrap();
 
-            while let Some(batch) = stream.try_next().await? {
-                
-            }
+            while let Some(batch) = stream.try_next().await? {}
         }
-
 
         Ok(0)
     }
@@ -217,7 +214,8 @@ impl VamanaBuilder {
                 neighbor_set.extend(self.neighbors(neighbor_id).await?);
                 neighbor_set.insert(id);
                 if neighbor_set.len() > r {
-                    self.robust_prune(neighbor_id, neighbor_set, alpha, r).await?;
+                    self.robust_prune(neighbor_id, neighbor_set, alpha, r)
+                        .await?;
                 } else {
                     self.vertices[neighbor_id].neighbors.push(id as u32);
                 }
@@ -316,7 +314,10 @@ impl VamanaBuilder {
             }
         }
 
-        Ok((candidates.iter().take(k).map(|(_, id)| *id).collect(), visited))
+        Ok((
+            candidates.iter().take(k).map(|(_, id)| *id).collect(),
+            visited,
+        ))
     }
 
     /// Algorithm 2 in the paper.
