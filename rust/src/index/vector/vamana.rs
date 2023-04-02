@@ -18,9 +18,8 @@ use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::iter::repeat;
 use std::sync::Arc;
 
-use arrow::compute::divide_scalar;
-use arrow::datatypes::{UInt64Type, Float32Type};
-use arrow_arith::arithmetic::{add, add_dyn, divide};
+use arrow::datatypes::{Float32Type, UInt64Type};
+use arrow_arith::arithmetic::{add, divide_scalar};
 use arrow_array::{cast::as_primitive_array, Array, Float32Array};
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
@@ -201,7 +200,8 @@ impl VamanaBuilder {
                     Ok::<Arc<Float32Array>, Error>(dists)
                 })
                 .buffered(num_cpus::get())
-                .try_collect::<Vec<_>>().await?;
+                .try_collect::<Vec<_>>()
+                .await?;
             // For 1B vectors, the `distances` array is about `sizeof(f32) * 1B = 4GB`.
             let mut distance_refs: Vec<&dyn Array> = vec![];
             for d in distances.iter() {
@@ -229,7 +229,9 @@ impl VamanaBuilder {
         for id in ids {
             let vector = self.get_vector(id).await?;
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
+            let now = std::time::Instant::now();
             self.robust_prune(id, visited, alpha, r).await?;
+            println!("prune time: {:?}", now.elapsed());
             for neighbor_id in self.neighbors(id).await? {
                 let mut neighbor_set = HashSet::new();
                 neighbor_set.extend(self.neighbors(neighbor_id).await?);
@@ -254,15 +256,23 @@ impl VamanaBuilder {
         alpha: f32,
         l: usize,
     ) -> Result<Self> {
+        let now = std::time::Instant::now();
         let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
+        println!("Init graph: {}ms", now.elapsed().as_millis());
+
+        let now = std::time::Instant::now();
+        let medoid = graph.find_medoid().await?;
+        println!("Find medoid: {}ms", now.elapsed().as_millis());
 
         let rng = rand::thread_rng();
-        let medoid = graph.find_medoid().await?;
-
         // First pass.
+        let now = std::time::Instant::now();
         graph.index_pass(medoid, 1.0, r, l, rng.clone()).await?;
+        println!("First pass: {}ms", now.elapsed().as_millis());
         // Second pass.
+        let now = std::time::Instant::now();
         graph.index_pass(medoid, alpha, r, l, rng).await?;
+        println!("Second pass: {}ms", now.elapsed().as_millis());
 
         Ok(graph)
     }
@@ -353,9 +363,12 @@ impl VamanaBuilder {
         let neighbors = self.neighbors(id).await?;
         visited.extend(neighbors.iter());
 
+        let mut ios: usize = 0;
+
         let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
         for p in visited.iter() {
             let dist = self.distance(id, *p).await?;
+            ios += 2;
             heap.push(VertexWithDistance {
                 id: *p,
                 distance: OrderedFloat(dist),
@@ -380,7 +393,7 @@ impl VamanaBuilder {
             for pv in visited.iter() {
                 let dist_prime = self.distance(p.id, *pv).await?;
                 let dist_query = self.distance(id, *pv).await?;
-
+                ios += 4;
                 if alpha * dist_prime <= dist_query {
                     to_remove.insert(*pv);
                 }
@@ -389,7 +402,7 @@ impl VamanaBuilder {
                 visited.remove(pv);
             }
         }
-
+        println!("ios: {}", ios);
         self.vertices[id].neighbors = new_neighbours.iter().map(|id| *id as u32).collect();
         Ok(())
     }
@@ -427,7 +440,6 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile;
 
-    use crate::arrow::*;
     use crate::dataset::WriteParams;
     use crate::utils::testing::generate_random_array;
 
@@ -477,5 +489,16 @@ mod tests {
             assert!(vertex.neighbors.len() > 0);
             assert_eq!(vertex.id, id);
         }
+    }
+
+    #[tokio::test]
+    async fn test_build_index() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let dataset = create_dataset(uri, 200, 64).await;
+
+        let graph = VamanaBuilder::try_new(dataset, "vector", 50, 1.4, 100)
+            .await
+            .unwrap();
     }
 }
