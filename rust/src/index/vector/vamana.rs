@@ -15,12 +15,14 @@
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
-use std::hash::Hash;
+use std::iter::repeat;
 use std::sync::Arc;
 
-use arrow::array::as_primitive_array;
+use arrow::compute::divide_scalar;
 use arrow::datatypes::UInt64Type;
-use arrow_array::Float32Array;
+use arrow_array::{Float32Array, cast::as_primitive_array, Array};
+use arrow_schema::DataType;
+use arrow_arith::arithmetic::{add_dyn, add, divide};
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
@@ -133,9 +135,24 @@ impl VamanaBuilder {
         })
     }
 
+    fn dimension(&self) -> Result<usize> {
+        let schema = self.dataset.schema();
+        let field = schema.field(&self.column).ok_or_else(|| Error::Index(format!(
+            "column {} not found in schema",
+            self.column
+        )))?;
+        match field.data_type() {
+            DataType::FixedSizeList(_, s) => Ok(s as usize),
+            _ => Err(Error::Index(format!(
+                "column {} is not a vector column: {}",
+                self.column, field.data_type()
+            ))),
+        }
+    }
+
     /// Find the closest vertex ID to the centroids.
     async fn find_medoid(&self) -> Result<usize> {
-        let stream = self.dataset
+        let mut stream = self.dataset
             .scan()
             .project(&[&self.column])?
             .try_into_stream()
@@ -145,7 +162,36 @@ impl VamanaBuilder {
         // compute the centroids.
         // Can we use sample here instead?
         let mut total: usize = 0;
-        
+        let dim = self.dimension()?;
+        let mut centroids = Float32Array::from_iter(repeat(0.0).take(dim));
+
+        while let Some(batch) = stream.try_next().await? {
+            total += batch.num_rows();
+            let vector_col = batch.column_by_name(&self.column).ok_or_else(|| Error::Index(format!(
+                "column {} not found in schema",
+                self.column
+            )))?;
+            let vectors = as_fixed_size_list_array(vector_col.as_ref());
+            for i in 0..vectors.len() {
+                let vector = vectors.value(i);
+                centroids = add(&centroids, as_primitive_array(vector.as_ref()))?;
+            }
+        }
+        centroids = divide_scalar(&centroids, total as f32)?;
+
+        // Find the closest vertex to the centroid.
+        {
+            let mut stream = self.dataset
+                .scan()
+                .project(&[&self.column])?
+                .try_into_stream()
+                .await
+                .unwrap();
+
+            while let Some(batch) = stream.try_next().await? {
+                
+            }
+        }
 
 
         Ok(0)
