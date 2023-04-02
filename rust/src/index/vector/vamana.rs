@@ -200,9 +200,9 @@ impl VamanaBuilder {
                     let dists = l2_distance(&centroids, vectors, dim)?;
                     Ok::<Arc<Float32Array>, Error>(dists)
                 })
-                .buffered(10)
+                .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>().await?;
-            // For 1B vectors, distances is about 4GB.
+            // For 1B vectors, the `distances` array is about `sizeof(f32) * 1B = 4GB`.
             let mut distance_refs: Vec<&dyn Array> = vec![];
             for d in distances.iter() {
                 distance_refs.push(d.as_ref());
