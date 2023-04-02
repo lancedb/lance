@@ -92,6 +92,7 @@ enum IndexAction {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 enum IndexType {
     IvfPQ,
+    DiskANN,
 }
 
 #[tokio::main]

@@ -133,7 +133,21 @@ impl VamanaBuilder {
         })
     }
 
-    async fn find_medoid() -> Result<usize> {
+    /// Find the closest vertex ID to the centroids.
+    async fn find_medoid(&self) -> Result<usize> {
+        let stream = self.dataset
+            .scan()
+            .project(&[&self.column])?
+            .try_into_stream()
+            .await
+            .unwrap();
+
+        // compute the centroids.
+        // Can we use sample here instead?
+        let mut total: usize = 0;
+        
+
+
         Ok(0)
     }
 
@@ -177,8 +191,8 @@ impl VamanaBuilder {
     ) -> Result<Self> {
         let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
 
-        let mut rng = rand::thread_rng();
-        let medoid = Self::find_medoid().await?;
+        let rng = rand::thread_rng();
+        let medoid = graph.find_medoid().await?;
 
         // First pass.
         graph.index_pass(medoid, 1.0, r, l, rng.clone()).await?;
