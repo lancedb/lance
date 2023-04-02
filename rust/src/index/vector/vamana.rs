@@ -19,10 +19,11 @@ use std::iter::repeat;
 use std::sync::Arc;
 
 use arrow::compute::divide_scalar;
-use arrow::datatypes::UInt64Type;
+use arrow::datatypes::{UInt64Type, Float32Type};
 use arrow_arith::arithmetic::{add, add_dyn, divide};
 use arrow_array::{cast::as_primitive_array, Array, Float32Array};
 use arrow_schema::DataType;
+use arrow_select::concat::concat;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
@@ -179,7 +180,7 @@ impl VamanaBuilder {
         centroids = divide_scalar(&centroids, total as f32)?;
 
         // Find the closest vertex to the centroid.
-        {
+        let medoid_id = {
             let mut stream = self
                 .dataset
                 .scan()
@@ -188,10 +189,30 @@ impl VamanaBuilder {
                 .await
                 .unwrap();
 
-            while let Some(batch) = stream.try_next().await? {}
-        }
+            let distances = stream
+                .map(|b| async {
+                    let b = b?;
+                    let vector_col = b.column_by_name(&self.column).ok_or_else(|| {
+                        Error::Index(format!("column {} not found in schema", self.column))
+                    })?;
+                    let column = as_fixed_size_list_array(vector_col.as_ref());
+                    let vectors: &Float32Array = as_primitive_array(column.values().as_ref());
+                    let dists = l2_distance(&centroids, vectors, dim)?;
+                    Ok::<Arc<Float32Array>, Error>(dists)
+                })
+                .buffered(10)
+                .try_collect::<Vec<_>>().await?;
+            // For 1B vectors, distances is about 4GB.
+            let mut distance_refs: Vec<&dyn Array> = vec![];
+            for d in distances.iter() {
+                distance_refs.push(d.as_ref());
+            }
 
-        Ok(0)
+            let distances = concat(&distance_refs)?;
+            argmin(as_primitive_array::<Float32Type>(distances.as_ref())).unwrap()
+        };
+
+        Ok(medoid_id as usize)
     }
 
     async fn index_pass(
