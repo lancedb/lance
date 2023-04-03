@@ -15,7 +15,7 @@
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
-use std::iter::repeat;
+use std::iter::{repeat, repeat_with};
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
@@ -233,22 +233,46 @@ impl VamanaBuilder {
         ids.shuffle(&mut rng);
 
         let now = std::time::Instant::now();
+        let mut search_time = 0.0;
+        let mut prune_time = 0.0;
+        let mut prune_count = 0;
         for (i, &id) in ids.iter().enumerate() {
             if i % 100 == 0 {
-                println!("{} / {}: {}s", i, ids.len(), now.elapsed().as_secs_f32());
+                println!(
+                    "{} / {}: {}s, search={}s prune={}s / {}",
+                    i,
+                    ids.len(),
+                    now.elapsed().as_secs_f32(),
+                    search_time,
+                    prune_time,
+                    prune_count,
+                );
+                search_time = 0.0;
+                prune_time = 0.0;
+                prune_count = 0;
             }
             let vector = self.get_vector(id).await?;
+            let search_t = std::time::Instant::now();
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
+            search_time += search_t.elapsed().as_secs_f32();
+
+            let start = std::time::Instant::now();
             self.robust_prune(id, visited, alpha, r).await?;
-            for neighbor_id in self.neighbors(id).await? {
-                let mut neighbor_set = HashSet::new();
-                neighbor_set.extend(self.neighbors(neighbor_id).await?);
+            prune_count += 1;
+            prune_time += start.elapsed().as_secs_f32();
+
+            for j in self.neighbors(id).await? {
+                let mut neighbor_set: HashSet<usize> = HashSet::new();
+                neighbor_set.extend(self.neighbors(j).await?);
                 neighbor_set.insert(id);
                 if neighbor_set.len() > r {
-                    self.robust_prune(neighbor_id, neighbor_set, alpha, r)
+                    let start = std::time::Instant::now();
+                    self.robust_prune(j, neighbor_set, alpha, r)
                         .await?;
+                    prune_time += start.elapsed().as_secs_f32();
+                    prune_count += 1;
                 } else {
-                    self.vertices[neighbor_id].neighbors.push(id as u32);
+                    self.vertices[j].neighbors.push(id as u32);
                 }
             }
         }
@@ -307,12 +331,18 @@ impl VamanaBuilder {
     /// Greedy search.
     ///
     /// Algorithm 1 in the paper.
+    ///
+    /// Parameters:
+    /// - start: The starting vertex.
+    /// - query: The query vector.
+    /// - k: The number of nearest neighbors to return.
+    /// - search_size: Search list size, L in the paper.
     async fn greedy_search(
         &self,
         start: usize,
         query: &Float32Array,
         k: usize,
-        queue_size: usize, // L in the paper.
+        search_size: usize, // L in the paper.
     ) -> Result<(Vec<usize>, HashSet<usize>)> {
         let mut visited: HashSet<usize> = HashSet::new();
 
@@ -325,27 +355,25 @@ impl VamanaBuilder {
             distance: OrderedFloat(0.0),
         });
         while !heap.is_empty() {
-            println!("Greedy search: heap size: {}", heap.len());
             let p = heap.pop().unwrap();
+            visited.insert(p.id);
             for neighbor_id in self.neighbors(p.id).await?.iter() {
+                let neighbor_id = *neighbor_id as usize;
                 if visited.contains(&neighbor_id) {
                     // Already visited.
                     continue;
                 }
-                let dist = self.distance_to(query, *neighbor_id).await?;
-                heap.push(VertexWithDistance {
-                    id: *neighbor_id,
-                    distance: OrderedFloat(dist),
-                });
-                visited.insert(*neighbor_id);
-                candidates.insert(OrderedFloat(dist), *neighbor_id);
-                if candidates.len() > queue_size {
+                let dist = self.distance_to(query, neighbor_id).await?;
+                candidates.insert(OrderedFloat(dist), neighbor_id as usize);
+                if candidates.len() > search_size {
                     candidates.pop_last();
                 }
             }
-            heap = heap
-                .into_iter()
-                .filter(|v| !visited.contains(&v.id))
+            heap = candidates
+                .iter()
+                .filter(|(_, &id)| !visited.contains(&id))
+                .map(|(&v, &id)| VertexWithDistance { id, distance: v })
+                .take(1)
                 .collect();
         }
 
@@ -365,7 +393,7 @@ impl VamanaBuilder {
     ) -> Result<()> {
         visited.remove(&id);
         let neighbors = self.neighbors(id).await?;
-        visited.extend(neighbors.iter());
+        visited.extend(neighbors.iter().map(|id| *id as usize));
 
         let mut ios: usize = 0;
 
@@ -412,6 +440,20 @@ impl VamanaBuilder {
     }
 }
 
+fn distance(batch: &RecordBatch, column: &str, a: usize, b: usize) -> f32 {
+    let vector_column = batch
+        .column_by_name(column)
+        .expect(format!("column {} not found in batch", column).as_str());
+    let vectors = as_fixed_size_list_array(vector_column.as_ref());
+    let vector_a = vectors.value(a);
+    let vector_b = vectors.value(b);
+    let float_array_a: &Float32Array = as_primitive_array(vector_a.as_ref());
+    let float_array_b: &Float32Array = as_primitive_array(vector_b.as_ref());
+    l2_distance(float_array_a, float_array_b, float_array_a.len())
+        .unwrap()
+        .values()[0]
+}
+
 #[async_trait]
 impl Graph for VamanaBuilder {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
@@ -424,10 +466,7 @@ impl Graph for VamanaBuilder {
 
     async fn neighbors(&self, id: usize) -> Result<Vec<usize>> {
         Ok(self.vertices[id]
-            .neighbors
-            .iter()
-            .map(|id| *id as usize)
-            .collect())
+            .neighbors.iter().map(|id| *id as usize).collect())
     }
 }
 

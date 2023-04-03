@@ -85,9 +85,9 @@ dirs = "5.0.0"
 [features]
 cli = ["clap"]
 
-[[bin]]
-name = "lq"
-required-features = ["cli"]
+#[[bin]]
+#name = "lq"
+#required-features = ["cli"]
 
 [[bench]]
 name = "distance"
@@ -110,3 +110,6 @@ strip = true
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+[profile.bench]
+debug = true
