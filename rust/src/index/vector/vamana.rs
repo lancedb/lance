@@ -237,7 +237,7 @@ impl VamanaBuilder {
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
             let now = std::time::Instant::now();
             self.robust_prune(id, visited, alpha, r).await?;
-            println!("prune time: {:?}", now.elapsed());
+            // println!("prune time: {:?}", now.elapsed());
             for neighbor_id in self.neighbors(id).await? {
                 let mut neighbor_set = HashSet::new();
                 neighbor_set.extend(self.neighbors(neighbor_id).await?);
@@ -290,23 +290,14 @@ impl VamanaBuilder {
         Ok(graph)
     }
 
-    /// Get the vector at the given row id.
-    async fn get_vector(&self, row_id: usize) -> Result<Arc<Float32Array>> {
-        let projection = self.dataset.schema().project(&[&self.column])?;
-        let rows = self
-            .dataset
-            .take_rows(&[row_id as u64], &projection)
-            .await?;
-        if rows.num_rows() != 1 {
-            return Err(Error::Index(format!(
-                "expected 1 row, got {}",
-                rows.num_rows()
-            )));
-        }
-        let array = rows.column(0);
-        let fs_array = as_fixed_size_list_array(array);
-        let float_array = fs_array.value(0);
-        let float_array: &Float32Array = as_primitive_array(float_array.as_ref());
+    /// Get the vector at an index.
+    async fn get_vector(&self, idx: usize) -> Result<Arc<Float32Array>> {
+        let vector_column = self.batch.column_by_name(&self.column).ok_or_else(|| {
+            Error::Index(format!("column {} not found in batch", self.column))
+        })?;
+        let vectors = as_fixed_size_list_array(vector_column.as_ref());
+        let vector_value = vectors.value(idx);
+        let float_array: &Float32Array = as_primitive_array(vector_value.as_ref());
         Ok(Arc::new(float_array.clone()))
     }
 
@@ -415,7 +406,7 @@ impl VamanaBuilder {
                 visited.remove(pv);
             }
         }
-        println!("ios: {}", ios);
+        // println!("ios: {}", ios);
         self.vertices[id].neighbors = new_neighbours.iter().map(|id| *id as u32).collect();
         Ok(())
     }
@@ -424,10 +415,8 @@ impl VamanaBuilder {
 #[async_trait]
 impl Graph for VamanaBuilder {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
-        let row_id_a = self.vertices[a].aux_data.row_id;
-        let row_id_b = self.vertices[b].aux_data.row_id;
-        let vector_a = self.get_vector(row_id_a as usize).await.unwrap();
-        let vector_b = self.get_vector(row_id_b as usize).await.unwrap();
+        let vector_a = self.get_vector(a).await.unwrap();
+        let vector_b = self.get_vector(b).await.unwrap();
 
         let dist = l2_distance(&vector_a, &vector_b, vector_a.len())?;
         Ok(dist.values()[0])
