@@ -235,9 +235,7 @@ impl VamanaBuilder {
         for id in ids {
             let vector = self.get_vector(id).await?;
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
-            let now = std::time::Instant::now();
             self.robust_prune(id, visited, alpha, r).await?;
-            // println!("prune time: {:?}", now.elapsed());
             for neighbor_id in self.neighbors(id).await? {
                 let mut neighbor_set = HashSet::new();
                 neighbor_set.extend(self.neighbors(neighbor_id).await?);
@@ -262,13 +260,6 @@ impl VamanaBuilder {
         alpha: f32,
         l: usize,
     ) -> Result<Self> {
-        let stream = dataset
-            .scan()
-            .project(&[column])?
-            .with_row_id()
-            .try_into_stream()
-            .await?;
-
         let now = std::time::Instant::now();
         let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
         println!("Init graph: {}ms", now.elapsed().as_millis());
