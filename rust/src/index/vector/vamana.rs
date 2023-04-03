@@ -18,8 +18,10 @@ use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::iter::repeat;
 use std::sync::Arc;
 
+use arrow::compute::concat_batches;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_arith::arithmetic::{add, divide_scalar};
+use arrow_array::RecordBatch;
 use arrow_array::{cast::as_primitive_array, Array, Float32Array};
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
@@ -54,6 +56,9 @@ pub struct VamanaBuilder {
     column: String,
 
     vertices: Vec<Vertex<VemanaData>>,
+
+    /// For simplicity, we load all vectors into memory in the beginning.
+    batch: RecordBatch,
 }
 
 impl VamanaBuilder {
@@ -72,33 +77,33 @@ impl VamanaBuilder {
         mut rng: impl Rng,
     ) -> Result<Self> {
         let total = dataset.count_rows().await?;
-        let scanner = dataset
+        let stream = dataset
             .scan()
+            .project(&[column])?
             .with_row_id()
             .try_into_stream()
             .await
             .unwrap();
 
-        let batches = scanner.try_collect::<Vec<_>>().await?;
-        let mut vertices: Vec<VemanaVertex> = Vec::new();
-        let mut vertex_id = 0;
-        for batch in batches {
-            let row_id = as_primitive_array::<UInt64Type>(
-                batch
-                    .column_by_qualified_name(ROW_ID)
-                    .ok_or(Error::Index("row_id not found".to_string()))?,
-            );
-            for i in 0..row_id.len() {
-                vertices.push(Vertex {
-                    id: vertex_id,
-                    neighbors: vec![],
-                    aux_data: VemanaData {
-                        row_id: row_id.value(i),
-                    },
-                });
-                vertex_id += 1;
-            }
-        }
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+
+        let row_ids = as_primitive_array::<UInt64Type>(
+            batch
+                .column_by_qualified_name(ROW_ID)
+                .ok_or(Error::Index("row_id not found".to_string()))?,
+        );
+        let mut vertices: Vec<VemanaVertex> = row_ids
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(i, &row_id)| Vertex {
+                id: i as u32,
+                neighbors: vec![],
+                aux_data: VemanaData { row_id },
+            })
+            .collect();
+
         let distribution = Uniform::new(0, total);
         // Randomly connect to r neighbors.
         for i in 0..vertices.len() {
@@ -131,6 +136,7 @@ impl VamanaBuilder {
             dataset,
             column: column.to_string(),
             vertices,
+            batch,
         })
     }
 
@@ -256,6 +262,13 @@ impl VamanaBuilder {
         alpha: f32,
         l: usize,
     ) -> Result<Self> {
+        let stream = dataset
+            .scan()
+            .project(&[column])?
+            .with_row_id()
+            .try_into_stream()
+            .await?;
+
         let now = std::time::Instant::now();
         let mut graph = Self::try_init(dataset.clone(), column, r, rand::thread_rng()).await?;
         println!("Init graph: {}ms", now.elapsed().as_millis());
