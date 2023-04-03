@@ -94,7 +94,7 @@ jobs:
           git pull
           .\bootstrap-vcpkg.bat
           vcpkg install openblas --triplet x64-windows-static-md
-          vcpkg install lapack --triplet x64-windows
+          vcpkg install lapack --triplet x64-windows-static-md
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
