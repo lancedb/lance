@@ -14,7 +14,7 @@
 
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
-use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
 use std::iter::repeat;
 use std::sync::Arc;
 
@@ -232,7 +232,11 @@ impl VamanaBuilder {
         let mut ids = (0..self.vertices.len()).collect::<Vec<_>>();
         ids.shuffle(&mut rng);
 
-        for id in ids {
+        let now = std::time::Instant::now();
+        for (i, &id) in ids.iter().enumerate() {
+            if i % 100 == 0 {
+                println!("{} / {}: {}s", i, ids.len(), now.elapsed().as_secs_f32());
+            }
             let vector = self.get_vector(id).await?;
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
             self.robust_prune(id, visited, alpha, r).await?;
@@ -283,9 +287,10 @@ impl VamanaBuilder {
 
     /// Get the vector at an index.
     async fn get_vector(&self, idx: usize) -> Result<Arc<Float32Array>> {
-        let vector_column = self.batch.column_by_name(&self.column).ok_or_else(|| {
-            Error::Index(format!("column {} not found in batch", self.column))
-        })?;
+        let vector_column = self
+            .batch
+            .column_by_name(&self.column)
+            .ok_or_else(|| Error::Index(format!("column {} not found in batch", self.column)))?;
         let vectors = as_fixed_size_list_array(vector_column.as_ref());
         let vector_value = vectors.value(idx);
         let float_array: &Float32Array = as_primitive_array(vector_value.as_ref());
@@ -311,6 +316,8 @@ impl VamanaBuilder {
     ) -> Result<(Vec<usize>, HashSet<usize>)> {
         let mut visited: HashSet<usize> = HashSet::new();
 
+        // L in the paper.
+        // A map from distance to vertex id.
         let mut candidates: BTreeMap<OrderedFloat<f32>, usize> = BTreeMap::new();
         let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
         heap.push(VertexWithDistance {
@@ -318,11 +325,8 @@ impl VamanaBuilder {
             distance: OrderedFloat(0.0),
         });
         while !heap.is_empty() {
+            println!("Greedy search: heap size: {}", heap.len());
             let p = heap.pop().unwrap();
-            if visited.contains(&p.id) {
-                continue;
-            }
-            visited.insert(p.id);
             for neighbor_id in self.neighbors(p.id).await?.iter() {
                 if visited.contains(&neighbor_id) {
                     // Already visited.
@@ -333,11 +337,16 @@ impl VamanaBuilder {
                     id: *neighbor_id,
                     distance: OrderedFloat(dist),
                 });
+                visited.insert(*neighbor_id);
                 candidates.insert(OrderedFloat(dist), *neighbor_id);
                 if candidates.len() > queue_size {
                     candidates.pop_last();
                 }
             }
+            heap = heap
+                .into_iter()
+                .filter(|v| !visited.contains(&v.id))
+                .collect();
         }
 
         Ok((
@@ -489,6 +498,15 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let uri = tmp_dir.path().to_str().unwrap();
         let dataset = create_dataset(uri, 200, 64).await;
+
+        let graph = VamanaBuilder::try_new(dataset, "vector", 50, 1.4, 100)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_build_index_on_sift() {
+        let dataset = Arc::new(Dataset::open("sift_1m.lance").await.unwrap());
 
         let graph = VamanaBuilder::try_new(dataset, "vector", 50, 1.4, 100)
             .await
