@@ -106,10 +106,11 @@ name = "kmeans"
 harness = false
 
 [profile.release]
-strip = true
-opt-level = "s"
-lto = true
+#strip = true
+#opt-level = "s"
+#lto = true
 codegen-units = 1
+debug = true
 
 [profile.bench]
 debug = true

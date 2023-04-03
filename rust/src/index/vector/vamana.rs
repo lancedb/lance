@@ -186,7 +186,7 @@ impl VamanaBuilder {
 
         // Find the closest vertex to the centroid.
         let medoid_id = {
-            let mut stream = self
+            let stream = self
                 .dataset
                 .scan()
                 .project(&[&self.column])?
@@ -267,8 +267,7 @@ impl VamanaBuilder {
                 neighbor_set.insert(id);
                 if neighbor_set.len() > r {
                     let start = std::time::Instant::now();
-                    self.robust_prune(j, neighbor_set, alpha, r)
-                        .await?;
+                    self.robust_prune(j, neighbor_set, alpha, r).await?;
                     prune_time += start.elapsed().as_secs_f32();
                     prune_count += 1;
                 } else {
@@ -395,12 +394,9 @@ impl VamanaBuilder {
         let neighbors = self.neighbors(id).await?;
         visited.extend(neighbors.iter().map(|id| *id as usize));
 
-        let mut ios: usize = 0;
-
         let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
         for p in visited.iter() {
             let dist = self.distance(id, *p).await?;
-            ios += 2;
             heap.push(VertexWithDistance {
                 id: *p,
                 distance: OrderedFloat(dist),
@@ -425,7 +421,6 @@ impl VamanaBuilder {
             for pv in visited.iter() {
                 let dist_prime = self.distance(p.id, *pv).await?;
                 let dist_query = self.distance(id, *pv).await?;
-                ios += 4;
                 if alpha * dist_prime <= dist_query {
                     to_remove.insert(*pv);
                 }
@@ -440,20 +435,6 @@ impl VamanaBuilder {
     }
 }
 
-fn distance(batch: &RecordBatch, column: &str, a: usize, b: usize) -> f32 {
-    let vector_column = batch
-        .column_by_name(column)
-        .expect(format!("column {} not found in batch", column).as_str());
-    let vectors = as_fixed_size_list_array(vector_column.as_ref());
-    let vector_a = vectors.value(a);
-    let vector_b = vectors.value(b);
-    let float_array_a: &Float32Array = as_primitive_array(vector_a.as_ref());
-    let float_array_b: &Float32Array = as_primitive_array(vector_b.as_ref());
-    l2_distance(float_array_a, float_array_b, float_array_a.len())
-        .unwrap()
-        .values()[0]
-}
-
 #[async_trait]
 impl Graph for VamanaBuilder {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
@@ -466,7 +447,10 @@ impl Graph for VamanaBuilder {
 
     async fn neighbors(&self, id: usize) -> Result<Vec<usize>> {
         Ok(self.vertices[id]
-            .neighbors.iter().map(|id| *id as usize).collect())
+            .neighbors
+            .iter()
+            .map(|id| *id as usize)
+            .collect())
     }
 }
 
