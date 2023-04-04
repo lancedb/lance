@@ -33,7 +33,7 @@ use rand::Rng;
 use super::graph::{Graph, Vertex, VertexWithDistance};
 use crate::arrow::*;
 use crate::dataset::{Dataset, ROW_ID};
-use crate::utils::distance::l2::l2_distance;
+use crate::utils::distance::l2::{l2_distance, l2_distance_simd};
 use crate::{Error, Result};
 
 #[derive(Debug)]
@@ -322,9 +322,9 @@ impl VamanaBuilder {
     }
 
     /// Distance from the query vector to the vector at the given idx.
-    async fn distance_to(&self, query: &Float32Array, idx: usize) -> Result<f32> {
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
         let vector = self.get_vector(idx).await;
-        let dists = l2_distance_simd(query.values(), vector, query.len())?;
+        let dists = l2_distance_simd(query, vector, query.len())?;
         Ok(dists.values()[0])
     }
 
@@ -340,7 +340,7 @@ impl VamanaBuilder {
     async fn greedy_search(
         &self,
         start: usize,
-        query: &Float32Array,
+        query: &[f32],
         k: usize,
         search_size: usize, // L in the paper.
     ) -> Result<(Vec<usize>, HashSet<usize>)> {
@@ -443,7 +443,7 @@ impl Graph for VamanaBuilder {
         let vector_a = self.get_vector(a).await;
         let vector_b = self.get_vector(b).await;
 
-        let dist = l2_distance(&vector_a, &vector_b, vector_a.len())?;
+        let dist = l2_distance_simd(vector_a, vector_b, vector_a.len())?;
         Ok(dist.values()[0])
     }
 
