@@ -30,7 +30,7 @@ runs:
     - name: Add DLLs to wheel
       working-directory: python
       run: |
-          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+        $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
         $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
         $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
         $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
