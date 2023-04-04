@@ -256,9 +256,9 @@ mod tests {
     #[tokio::test]
     #[cfg(windows)]
     async fn test_windows_paths() {
+        use std::path::Component;
         use std::path::Prefix;
         use std::path::Prefix::*;
-        use std::path::Component;
 
         fn get_path_prefix(path: &StdPath) -> Prefix {
             match path.components().next().unwrap() {
