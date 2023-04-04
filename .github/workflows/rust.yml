@@ -75,19 +75,6 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**\Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: 'Setup vcpkg cache'
-        shell: 'bash'
-        run: |
-          `vcpkg fetch nuget | tail -n 1` \
-            sources add \
-            -source "https://nuget.pkg.github.com/eto-ai/index.json" \
-            -storepasswordincleartext \
-            -name "GitHub" \
-            -username "eto-ai" \
-            -password "${{ secrets.VCPKG_GITHUB_PACKAGES }}"
-          `vcpkg fetch nuget | tail -n 1` \
-            setapikey "${{ secrets.VCPKG_GITHUB_PACKAGES }}" \
-            -source "https://nuget.pkg.github.com/eto.ai/index.json"
       - uses: ./.github/workflows/install_windows_dependencies
         with:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
