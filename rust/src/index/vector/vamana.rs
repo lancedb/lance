@@ -55,7 +55,7 @@ pub struct VamanaBuilder {
 
     vertices: Vec<Vertex<VemanaData>>,
 
-    /// Vectors.
+    /// The vector data. Contiguous in memory for fast access.
     vectors: Float32Array,
 
     /// Vector dimension.
