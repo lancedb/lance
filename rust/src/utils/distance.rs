@@ -38,3 +38,7 @@ pub(crate) fn simd_alignment() -> i32 {
 
     1
 }
+
+fn is_simd_aligned(ptr: *const f32, alignment: usize) -> bool {
+    ptr as usize % alignment == 0
+}

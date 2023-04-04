@@ -15,6 +15,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
@@ -101,8 +102,8 @@ impl PQIndex {
                 Error::Index("PQIndex::l2_scores: PQ is not initialized".to_string())
             })?;
             let distances = l2_distance(
-                as_primitive_array(&from),
-                &subvec_centroids,
+                as_primitive_array::<Float32Type>(&from).values(),
+                subvec_centroids.values(),
                 sub_vector_length,
             )?;
             distance_table.extend(distances.values());
