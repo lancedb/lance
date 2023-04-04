@@ -311,6 +311,7 @@ mod tests {
     };
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_train_opq() {
         const DIM: usize = 32;
         let data = Arc::new(Float32Array::from_iter((0..12800).map(|v| v as f32)));
@@ -396,16 +397,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_build_index_with_opq() {
         test_build_index(true).await;
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn test_build_index_without_opq() {
         test_build_index(false).await;
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_init_rotation() {
         let dim: usize = 64;
         let r = init_rotation(dim).unwrap();

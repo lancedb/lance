@@ -16,7 +16,6 @@
 //!
 //!
 
-use std::cmp::min;
 use std::sync::Arc;
 
 use arrow::{
@@ -32,7 +31,7 @@ use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, Se
 use accelerate_src;
 
 #[allow(unused_imports)]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use openblas_src;
 
 use crate::{Error, Result};
@@ -273,10 +272,18 @@ impl SingularValueDecomposition for MatrixView {
     type Matrix = Self;
     type Sigma = Float32Array;
 
+    // FIXME implement svd in windows
+    #[cfg(windows)]
+    fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
+        Err(Error::Arrow("SVD is not supported in windows".to_string()))
+    }
+
+    #[cfg(unix)]
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)> {
         /// Sadly that the Accelerate Framework on macOS does not have LAPACKE(C)
         /// so we have to use the Fortran one which is column-major matrix.
         use lapack::sgesdd;
+        use std::cmp::min;
 
         let m = self.num_rows() as i32;
         let n = self.num_columns() as i32;
@@ -365,6 +372,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn test_svd() {
         // A 6 x 5 matrix, from
         // https://www.intel.com/content/www/us/en/develop/documentation/onemkl-lapack-examples/top/least-squares-and-eigenvalue-problems/singular-value-decomposition/gesvd-function/sgesvd-example/lapacke-sgesvd-example-c-row.html
