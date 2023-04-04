@@ -82,7 +82,8 @@ jobs:
       - name: Run tests
         run: |
           $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
-          echo $env:GITHUB_PATH
-          echo $env:PATH
+          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
+          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
+          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
           cargo build --all-features
           cargo test

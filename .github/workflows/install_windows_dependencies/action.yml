@@ -41,6 +41,3 @@ runs:
         vcpkg install openblas --triplet x64-windows-static-md
         vcpkg install lapack --triplet x64-windows-static-md
         vcpkg install protobuf
-        echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin' >> $env:GITHUB_PATH
-        echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin' >> $env:GITHUB_PATH
-        echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf' >> $env:GITHUB_PATH
