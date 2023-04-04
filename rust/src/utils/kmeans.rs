@@ -412,16 +412,14 @@ impl KMeans {
             .map(|(indices, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let dist = metric_type.func();
-                    let mut results = vec![];
-                    for idx in indices {
-                        let value_arr = data.slice(idx * dimension, dimension);
-                        let vector: &Float32Array = as_primitive_array(&value_arr);
-                        let distances = dist(vector, centroids.as_ref(), dimension).unwrap();
-                        let cluster_id = argmin(distances.as_ref()).unwrap();
-                        let distance = distances.value(cluster_id as usize);
-                        results.push((cluster_id, distance))
-                    }
-                    results
+                    data.values()
+                        .chunks_exact(dimension)
+                        .map(|v| {
+                            let distances = dist(v, centroids.values(), dimension).unwrap();
+                            let cluster_id = argmin(distances.as_ref()).unwrap();
+                            (cluster_id, distances.value(cluster_id as usize))
+                        })
+                        .collect()
                 })
                 .await?;
                 Ok::<Vec<_>, Error>(data)

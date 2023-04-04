@@ -92,8 +92,7 @@ pub enum MetricType {
 impl MetricType {
     pub fn func(
         &self,
-    ) -> Arc<dyn Fn(&Float32Array, &Float32Array, usize) -> Result<Arc<Float32Array>> + Send + Sync>
-    {
+    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Result<Arc<Float32Array>> + Send + Sync> {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),

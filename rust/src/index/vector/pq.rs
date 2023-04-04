@@ -377,7 +377,8 @@ impl ProductQuantizer {
                             let value = vec.value(i);
                             let vector: &Float32Array = as_primitive_array(value.as_ref());
                             let distances =
-                                dist_func(vector, centroid.as_ref(), vector.len()).unwrap();
+                                dist_func(vector.values(), centroid.values(), vector.len())
+                                    .unwrap();
                             min(distances.as_ref()).unwrap_or(0.0)
                         })
                         .sum::<f32>() as f64 // in case of overflow
@@ -408,21 +409,20 @@ impl ProductQuantizer {
         let dim = self.dimension;
         let num_rows = data.num_rows();
         let values = tokio::task::spawn_blocking(move || {
+            let flatten_values = flatten_data.values();
             let capacity = num_sub_vectors * num_rows;
             let mut builder: Vec<u8> = vec![0; capacity];
             // Dimension of each sub-vector.
             let sub_dim = dim / num_sub_vectors;
             for i in 0..num_rows {
                 let row_offset = i * dim;
+
                 for sub_idx in 0..num_sub_vectors {
                     let offset = row_offset + sub_idx * sub_dim;
-                    let sub_vector = flatten_data.slice(offset, sub_dim);
+                    let sub_vector = &flatten_values[offset..offset + sub_dim];
                     let centroids = all_centroids[sub_idx].as_ref();
-                    let code = argmin(
-                        dist_func(as_primitive_array(sub_vector.as_ref()), centroids, sub_dim)?
-                            .as_ref(),
-                    )
-                    .unwrap();
+                    let code = argmin(dist_func(sub_vector, centroids.values(), sub_dim)?.as_ref())
+                        .unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }

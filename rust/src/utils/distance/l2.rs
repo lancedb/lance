@@ -136,8 +136,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
         }
     }
 
-    // Fallback
-    let n = to.len() / dimension;
+    // Fallback to slow version
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
             to.chunks_exact(dimension)
@@ -168,8 +167,12 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores =
-            l2_distance(point.values(), as_primitive_array(mat.values().as_ref()), 8).unwrap();
+        let scores = l2_distance(
+            point.values(),
+            as_primitive_array::<Float32Type>(mat.values().as_ref()).values(),
+            8,
+        )
+        .unwrap();
 
         assert_eq!(
             scores.as_ref(),
@@ -178,10 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn test_not_aligned() {
+        let mat = (0..6)
+            .chain(0..8)
+            .chain(1..9)
+            .chain(2..10)
+            .chain(3..11)
+            .map(|v| v as f32)
+            .collect::<Vec<_>>();
+        let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
+        let scores = l2_distance(&point.values()[2..], &mat[6..], 8).unwrap();
+
+        assert_eq!(
+            scores.as_ref(),
+            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
+        );
+    }
+    #[test]
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance(&point, &mat, 5).unwrap();
+        let scores = l2_distance(point.values(), mat.values(), 5).unwrap();
 
         assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
@@ -233,7 +253,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance(&q, &values, 32).unwrap();
+        let d = l2_distance(q.values(), values.values(), 32).unwrap();
         assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }
