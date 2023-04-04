@@ -58,7 +58,6 @@ datafusion = { version = "19.0.0", default-features = false }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 lapack = "0.19.0"
 cblas = "0.4.0"
-ordered-float = "3.6.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = "0.3.2"
@@ -85,9 +84,9 @@ dirs = "5.0.0"
 [features]
 cli = ["clap"]
 
-#[[bin]]
-#name = "lq"
-#required-features = ["cli"]
+[[bin]]
+name = "lq"
+required-features = ["cli"]
 
 [[bench]]
 name = "distance"
@@ -106,11 +105,7 @@ name = "kmeans"
 harness = false
 
 [profile.release]
-#strip = true
-#opt-level = "s"
+strip = true
+opt-level = "s"
 lto = true
-#codegen-units = 1
-debug = true
-
-[profile.bench]
-debug = true
+codegen-units = 1
