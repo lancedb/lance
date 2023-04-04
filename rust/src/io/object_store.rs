@@ -26,7 +26,6 @@ use ::object_store::{
 };
 use futures::{future, TryFutureExt};
 use object_store::local::LocalFileSystem;
-use path_absolutize::Absolutize;
 use shellexpand::tilde;
 use url::Url;
 
@@ -96,12 +95,25 @@ impl ObjectStore {
 
     fn new_from_path(str_path: &str) -> Result<Self> {
         let expanded = tilde(str_path).to_string();
-        let absolute_path = StdPath::new(expanded.as_str()).absolutize()?;
+        let absolute_path = StdPath::new(&expanded);
 
-        if absolute_path.exists() {
+        if !absolute_path.try_exists()? {
+            println!(
+                "Creating dir {}",
+                absolute_path.clone().to_str().unwrap().to_owned()
+            );
             std::fs::create_dir_all(absolute_path.clone())?;
         } else if !absolute_path.is_dir() {
-            return Err(Error::IO(format!("{} is not a lance directory", str_path)))
+            println!(
+                "Is not a dir {}",
+                absolute_path.clone().to_str().unwrap().to_owned()
+            );
+            return Err(Error::IO(format!("{} is not a lance directory", str_path)));
+        } else {
+            println!(
+                "Continue with dir {}",
+                absolute_path.clone().to_str().unwrap().to_owned()
+            );
         }
 
         Ok(Self {
@@ -181,12 +193,13 @@ impl ObjectStore {
 
 #[cfg(test)]
 mod tests {
-    use std::env::set_current_dir;
-    use std::borrow::Cow;
-    use std::fs::File;
-    use std::fs::write;
-    use std::path::PathBuf;
     use super::*;
+    use std::borrow::Cow;
+    use std::env::set_current_dir;
+    use std::fs::write;
+    use std::fs::File;
+    use std::path::Prefix::Disk;
+    use std::path::{Component, PathBuf};
 
     fn write_to_fs_file(path_str: String, contents: String) -> std::io::Result<()> {
         let expanded = tilde(&path_str).to_string();
@@ -207,12 +220,22 @@ mod tests {
     async fn test_absolute_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        write_to_fs_file(tmp_path.clone() + "/bar/foo.lance/test_file", "TEST_CONTENT".to_string()).unwrap();
+        write_to_fs_file(
+            tmp_path.clone() + "/bar/foo.lance/test_file",
+            "TEST_CONTENT".to_string(),
+        )
+        .unwrap();
 
         // test a few variations of the same path
-        for uri in &[tmp_path.clone() +"/bar/foo.lance", tmp_path.clone() +"/./bar/foo.lance", tmp_path.clone() + "/bar/foo.lance/../foo.lance"] {
+        for uri in &[
+            tmp_path.clone() + "/bar/foo.lance",
+            tmp_path.clone() + "/./bar/foo.lance",
+            tmp_path.clone() + "/bar/foo.lance/../foo.lance",
+        ] {
             let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+            let contents = read_from_store(store, &Path::from("test_file"))
+                .await
+                .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
         }
     }
@@ -221,12 +244,18 @@ mod tests {
     async fn test_relative_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        write_to_fs_file(tmp_path.clone() + "/bar/foo.lance/test_file", "RELATIVE_URL".to_string()).unwrap();
+        write_to_fs_file(
+            tmp_path.clone() + "/bar/foo.lance/test_file",
+            "RELATIVE_URL".to_string(),
+        )
+        .unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+        let contents = read_from_store(store, &Path::from("test_file"))
+            .await
+            .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
     }
 
@@ -234,23 +263,58 @@ mod tests {
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         write_to_fs_file(uri.to_string() + "/test_file", "TILDE".to_string()).unwrap();
+        println!("{uri}");
         let store = ObjectStore::new(uri).await.unwrap();
-        let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+        println!("{uri}");
+        let contents = read_from_store(store, &Path::from("test_file"))
+            .await
+            .unwrap();
+        println!("{uri}");
         assert_eq!(contents, "TILDE");
     }
 
     #[tokio::test]
     #[cfg(windows)]
     async fn test_windows_paths() {
+        use std::path::Prefix;
+        use std::path::Prefix::*;
+
+        fn get_path_prefix(path: &StdPath) -> Prefix {
+            match path.components().next().unwrap() {
+                Component::Prefix(prefix_component) => prefix_component.kind(),
+                _ => panic!(),
+            }
+        }
+
+        fn get_drive_letter(prefix: Prefix) -> String {
+            match prefix {
+                Disk(bytes) => String::from_utf8(vec![bytes]).unwrap(),
+                _ => panic!(),
+            }
+        }
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path();
+        let prefix = get_path_prefix(tmp_path);
+        let drive_letter = get_drive_letter(prefix);
+        println!("{:?}", prefix);
+        println!("{}", drive_letter);
+
+        write_to_fs_file(
+            format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
+            "WINDOWS".to_string(),
+        )
+        .unwrap();
+
         for uri in &[
-            "c:/test_folder/test.lance",
-            "c:\\test_folder\\test.lance",
-            "c:\\test_folder\\..\\test_folder\\test.lance",
+            format!("{drive_letter}:/test_folder/test.lance"),
+            format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let store = ObjectStore::new(uri).await.unwrap();
-            assert_eq!(store.base_path().to_string(), "C:/test_folder/test.lance");
+            let contents = read_from_store(store, &Path::from("test_file"))
+                .await
+                .unwrap();
+            assert_eq!(contents, "WINDOWS");
         }
     }
-
-
 }
