@@ -95,16 +95,16 @@ impl ObjectStore {
 
     fn new_from_path(str_path: &str) -> Result<Self> {
         let expanded = tilde(str_path).to_string();
-        let absolute_path = StdPath::new(&expanded);
+        let expanded_path = StdPath::new(&expanded);
 
-        if !absolute_path.try_exists()? {
-            std::fs::create_dir_all(absolute_path.clone())?;
-        } else if !absolute_path.is_dir() {
+        if !expanded_path.try_exists()? {
+            std::fs::create_dir_all(expanded_path.clone())?;
+        } else if !expanded_path.is_dir() {
             return Err(Error::IO(format!("{} is not a lance directory", str_path)));
         }
 
         Ok(Self {
-            inner: Arc::new(LocalFileSystem::new_with_prefix(absolute_path.deref())?),
+            inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
             scheme: String::from("flle"),
             base_path: Path::from(object_store::path::DELIMITER),
             prefetch_size: 64 * 1024,

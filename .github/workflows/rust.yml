@@ -88,27 +88,12 @@ jobs:
           `vcpkg fetch nuget | tail -n 1` \
             setapikey "${{ secrets.VCPKG_GITHUB_PACKAGES }}" \
             -source "https://nuget.pkg.github.com/eto.ai/index.json"
-      - name: Setup Dependencies with vcpkg
-        run: |
-          cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
-          vcpkg install openblas --triplet x64-windows-static-md
-          vcpkg install lapack --triplet x64-windows-static-md
-      - name: Install Protoc v21.12
-        working-directory: C:\
-        run: |
-          New-Item -Path 'C:\protoc' -ItemType Directory
-          Set-Location C:\protoc
-          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
-          7z x protoc.zip
-        shell: powershell
+      - uses: ./.github/workflows/install_windows_dependencies
+        with:
+          vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
+          update_vcpkg: true
       - name: Run tests
         run: |
-          $env:PATH = 'C:\protoc\bin;' + $env:PATH
-          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
-          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
-          $env:GITHUB_PATH = 'C:\protoc\bin;' + $env:GITHUB_PATH
           $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
           cargo build --all-features
           cargo test
