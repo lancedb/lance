@@ -1,6 +1,9 @@
 # We create a composite action to be re-used both for testing and for releasing
 name: install_windows_dependencies
 description: "Build a lance wheel"
+env:
+  VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
+  VCPKG_ROOT: C:\vcpkg  
 inputs:
   vcpkg_token:
     description: "vcpkg packages repository token"
@@ -11,9 +14,6 @@ inputs:
     default: false
 runs:
   using: "composite"
-  env:
-    VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
-    VCPKG_ROOT: C:\vcpkg
   steps:
     - name: 'Setup vcpkg package cache'
       shell: 'bash'
