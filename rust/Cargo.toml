@@ -108,7 +108,7 @@ harness = false
 [profile.release]
 #strip = true
 #opt-level = "s"
-#lto = true
+lto = true
 #codegen-units = 1
 debug = true
 

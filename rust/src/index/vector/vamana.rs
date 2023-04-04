@@ -358,13 +358,18 @@ impl VamanaBuilder {
         // A map from distance to vertex id.
         let mut candidates: BTreeMap<OrderedFloat<f32>, usize> = BTreeMap::new();
         let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
+        let dist = self.distance_to(query, start)?;
         heap.push(VertexWithDistance {
             id: start,
-            distance: OrderedFloat(0.0),
+            distance: OrderedFloat(dist),
         });
         candidates.insert(OrderedFloat(self.distance_to(query, start)?), start);
-        while !heap.is_empty() {
-            let p = heap.pop().unwrap();
+        while let Some(p) = heap.pop() {
+            // In paper:
+            // p = argmin_{L \ V} d(p, q)
+            if visited.contains(&p.id) || !candidates.contains_key(&p.distance) {
+                continue;
+            }
             visited.insert(p.id);
             for neighbor_id in self.neighbors(p.id)?.iter() {
                 let neighbor_id = *neighbor_id as usize;
@@ -378,12 +383,6 @@ impl VamanaBuilder {
                     candidates.pop_last();
                 }
             }
-            heap = candidates
-                .iter()
-                .filter(|(_, &id)| !visited.contains(&id))
-                .map(|(&v, &id)| VertexWithDistance { id, distance: v })
-                .take(1)
-                .collect();
         }
 
         Ok((
@@ -451,7 +450,8 @@ async fn robust_prune(
             }
         }
         Ok::<_, Error>(new_neighbours)
-    }).await??;
+    })
+    .await??;
 
     Ok(new_neighbours.iter().map(|id| *id as u32).collect())
 }
