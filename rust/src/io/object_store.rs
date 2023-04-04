@@ -97,8 +97,13 @@ impl ObjectStore {
     fn new_from_path(str_path: &str) -> Result<Self> {
         let expanded = tilde(str_path).to_string();
         let absolute_path = StdPath::new(expanded.as_str()).absolutize()?;
-        // TODO better error handling
-        std::fs::create_dir_all(absolute_path.clone())?;
+
+        if absolute_path.exists() {
+            std::fs::create_dir_all(absolute_path.clone())?;
+        } else if !absolute_path.is_dir() {
+            return Err(Error::IO(format!("{} is not a lance directory", str_path)))
+        }
+
         Ok(Self {
             inner: Arc::new(LocalFileSystem::new_with_prefix(absolute_path.deref())?),
             scheme: String::from("flle"),
@@ -176,30 +181,66 @@ impl ObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use std::env::set_current_dir;
+    use std::borrow::Cow;
+    use std::fs::File;
+    use std::fs::write;
+    use std::path::PathBuf;
     use super::*;
 
-    #[tokio::test]
-    #[cfg(unix)]
-    #[ignore]
-    async fn test_uri_expansion() {
-        // test tilde and absolute path expansion
-        for uri in &["./bar/foo.lance", "../bar/foo.lance", "~/foo.lance"] {
-            let store = ObjectStore::new(uri).await.unwrap();
-            // NOTE: this is an optimistic check, since Path.as_ref() doesn't read back the leading slash
-            // for an absolute path, we are assuming it takes at least 1 char more than the original uri.
-            assert!(store.base_path().as_ref().len() > uri.len());
-        }
+    fn write_to_fs_file(path_str: String, contents: String) -> std::io::Result<()> {
+        let expanded = tilde(&path_str).to_string();
+        let path = StdPath::new(&expanded);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        write(path, contents)
+    }
 
-        // absolute file system uri doesn't need expansion
-        let uri = "/bar/foo.lance";
+    async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
+        let test_file_store = store.open(&path).await.unwrap();
+        let size = test_file_store.size().await.unwrap();
+        let bytes = test_file_store.get_range(0..size).await.unwrap();
+        let contents = String::from_utf8(bytes.to_vec()).unwrap();
+        Ok(contents)
+    }
+
+    #[tokio::test]
+    async fn test_absolute_paths() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        write_to_fs_file(tmp_path.clone() + "/bar/foo.lance/test_file", "TEST_CONTENT".to_string()).unwrap();
+
+        // test a few variations of the same path
+        for uri in &[tmp_path.clone() +"/bar/foo.lance", tmp_path.clone() +"/./bar/foo.lance", tmp_path.clone() + "/bar/foo.lance/../foo.lance"] {
+            let store = ObjectStore::new(uri).await.unwrap();
+            let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+            assert_eq!(contents, "TEST_CONTENT");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relative_paths() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        write_to_fs_file(tmp_path.clone() + "/bar/foo.lance/test_file", "RELATIVE_URL".to_string()).unwrap();
+
+        set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
+        let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
+
+        let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+        assert_eq!(contents, "RELATIVE_URL");
+    }
+
+    #[tokio::test]
+    async fn test_tilde_expansion() {
+        let uri = "~/foo.lance";
+        write_to_fs_file(uri.to_string() + "/test_file", "TILDE".to_string()).unwrap();
         let store = ObjectStore::new(uri).await.unwrap();
-        // +1 for the leading slash Path.as_ref() doesn't read back
-        assert!(store.base_path().as_ref().len() + 1 == uri.len());
+        let contents = read_from_store(store, &Path::from("test_file")).await.unwrap();
+        assert_eq!(contents, "TILDE");
     }
 
     #[tokio::test]
     #[cfg(windows)]
-    #[ignore]
     async fn test_windows_paths() {
         for uri in &[
             "c:/test_folder/test.lance",
@@ -211,26 +252,5 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[ignore]
-    async fn test_tilde_expansion() {
-        let uri = "~/foo.lance";
-        let store = ObjectStore::new(uri).await.unwrap();
 
-        // dir uses the platform-specific path separators
-        //    /home/eto/foo.lance
-        //    C:\Users\Administrator\foo.lance
-        let mut dir = dirs::home_dir().unwrap();
-        dir.push("foo.lance");
-        // dir_to_url always uses /
-        //    file:///Users/eto/foo.lance
-        //    file:///C:/Users/Administrator/foo.lance
-        let dir_to_url = Url::from_file_path(dir).unwrap();
-        // We are only interested in the path part of the URL, and we drop the first /
-        //    Users/eto/foo.lance
-        //    C:/Users/Administrator/foo.lance
-        let expected_path = &dir_to_url.path()[1..];
-
-        assert_eq!(store.base_path().to_string(), expected_path);
-    }
 }
