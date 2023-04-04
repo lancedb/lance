@@ -505,7 +505,7 @@ mod tests {
         };
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
-        let idx = KNNFlatExec::try_new(input, query).unwrap();
+        let idx = KNNFlatExec::try_new(vec![input], query).unwrap();
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

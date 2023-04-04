@@ -126,6 +126,17 @@ impl Dataset {
         Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
+    pub async fn checkout_version(&self, version: u64) -> Result<Self> {
+        let base_path = self.object_store.base_path().clone();
+        let manifest_file = manifest_path(&base_path, version);
+        Self::checkout_manifest(
+            self.object_store.clone(),
+            base_path,
+            &manifest_file,
+        )
+        .await
+    }
+
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,

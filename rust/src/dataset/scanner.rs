@@ -386,8 +386,7 @@ impl Scanner {
 
             let version = index.dataset_version;
             if version != self.dataset.version().version {
-                let uri = self.dataset.base.to_string();
-                let ds = Dataset::checkout(uri.as_str(), version).await?;
+                let ds = self.dataset.checkout_version(version).await?;
                 let max_fragment_id_idx = ds.manifest.fragments.iter()
                     .map(|f| f.id).max()
                     .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
@@ -397,6 +396,7 @@ impl Scanner {
                 if max_fragment_id_idx < max_fragment_id_ds {
                     // appended since index
                     // No index found. use flat search.
+                    println!("Flat search between {} and {}", max_fragment_id_idx + 1, max_fragment_id_ds + 1);
                     let vector_scan_projection =
                         Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                     let scan_node = self.scan_fragments(
@@ -485,7 +485,6 @@ impl Scanner {
 pub struct RecordBatchStream {
     #[pin]
     inputs: Vec<SendableRecordBatchStream>,
-    #[pin]
     curr: usize
 }
 
@@ -497,26 +496,30 @@ impl RecordBatchStream {
     pub fn from_vec(nodes: Vec<SendableRecordBatchStream>) -> Self {
         Self { inputs: nodes, curr: 0 }
     }
+
+    fn schema(&self) -> SchemaRef {
+        self.inputs[0].schema()
+    }
 }
 
 impl Stream for RecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let curr = self.curr;
+        let schema = self.schema();
         let mut this = self.project();
-        match this.inputs[curr].poll_next_unpin(cx) {
+        match this.inputs[*this.curr].poll_next_unpin(cx) {
             Poll::Ready(result) => {
                 match result {
                     Some(rs) => {
                         Poll::Ready(Some(rs.map_err(|e| Error::IO(e.to_string()))))
                     }
                     None => {
-                        if curr == this.inputs.len() - 1 {
+                        if *this.curr == this.inputs.len() - 1 {
                             Poll::Ready(None)
                         } else {
-                            self.curr += 1;
-                            self.poll_next(cx)
+                            *this.curr += 1;
+                            Poll::Ready(Some(Ok(RecordBatch::new_empty(schema))))
                         }
                     }
                 }

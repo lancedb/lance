@@ -25,6 +25,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use futures::future;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex, SCORE_COL};
@@ -65,6 +66,10 @@ pub async fn flat_search(
     query: &Query,
 ) -> Result<RecordBatch> {
     let batches = stream
+        .filter(|batch| {
+            let pred = batch.as_ref().map(|b| b.num_rows() > 0).unwrap_or(false);
+            future::ready(pred)
+        })
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
@@ -73,12 +78,15 @@ pub async fn flat_search(
                 // Ignore the score calculated from inner vector index.
                 batch = batch.drop_column(SCORE_COL)?;
             }
+            println!("Batch schema {:?}", batch.schema());
+            println!("Batch len {:?}", batch.num_rows());
             let vectors = batch
                 .column_by_name(&query.column)
                 .ok_or_else(|| {
                     Error::Schema(format!("column {} does not exist in dataset", query.column))
                 })?
                 .clone();
+            println!("Get vectors {}", vectors.len());
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
             let scores = tokio::task::spawn_blocking(move || {
                 mt.func()(
@@ -89,6 +97,7 @@ pub async fn flat_search(
                 .unwrap()
             })
             .await? as ArrayRef;
+            println!("Computed scores");
 
             // TODO: use heap
             let indices = sort_to_indices(&scores, None, Some(query.k))?;
@@ -96,17 +105,21 @@ pub async fn flat_search(
                 .try_with_column(ArrowField::new(SCORE_COL, DataType::Float32, false), scores)?;
             let struct_arr = StructArray::from(batch_with_score);
             let selected_arr = take(&struct_arr, &indices, None)?;
+            println!("Selected {:?}", selected_arr);
             Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
         })
         .buffer_unordered(16)
         .try_collect::<Vec<_>>()
         .await?;
+    println!("Got batches");
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let scores = batch.column_by_name(SCORE_COL).unwrap();
+    println!("query: {:?}", query);
     let indices = sort_to_indices(scores, None, Some(query.k))?;
 
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;
+    println!("Done take");
     Ok(as_struct_array(&selected_arr).into())
 }
 
