@@ -14,17 +14,15 @@
 
 //! Vamana Graph, described in DiskANN (NeurIPS' 19) and its following papers.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::iter::{repeat, repeat_with};
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_arith::arithmetic::{add, divide_scalar};
-use arrow_array::RecordBatch;
-use arrow_array::{cast::as_primitive_array, Array, Float32Array};
+use arrow_array::{cast::as_primitive_array, Array, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::DataType;
-use arrow_select::concat::concat;
+use arrow_select::concat::{concat, concat_batches};
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
@@ -57,8 +55,11 @@ pub struct VamanaBuilder {
 
     vertices: Vec<Vertex<VemanaData>>,
 
-    /// For simplicity, we load all vectors into memory in the beginning.
-    batch: RecordBatch,
+    /// Vectors.
+    vectors: Float32Array,
+
+    /// Vector dimension.
+    dimension: usize,
 }
 
 impl VamanaBuilder {
@@ -92,6 +93,11 @@ impl VamanaBuilder {
             batch
                 .column_by_qualified_name(ROW_ID)
                 .ok_or(Error::Index("row_id not found".to_string()))?,
+        );
+        let vectors = as_fixed_size_list_array(
+            batch
+                .column_by_qualified_name(column)
+                .ok_or(Error::Index(format!("column {} not found", column)))?,
         );
         let mut vertices: Vec<VemanaVertex> = row_ids
             .values()
@@ -136,7 +142,8 @@ impl VamanaBuilder {
             dataset,
             column: column.to_string(),
             vertices,
-            batch,
+            dimension: vectors.value_length() as usize,
+            vectors: as_primitive_array(vectors.values()).clone(),
         })
     }
 
@@ -251,7 +258,7 @@ impl VamanaBuilder {
                 prune_time = 0.0;
                 prune_count = 0;
             }
-            let vector = self.get_vector(id).await?;
+            let vector = self.get_vector(id).await;
             let search_t = std::time::Instant::now();
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
             search_time += search_t.elapsed().as_secs_f32();
@@ -309,21 +316,15 @@ impl VamanaBuilder {
     }
 
     /// Get the vector at an index.
-    async fn get_vector(&self, idx: usize) -> Result<Arc<Float32Array>> {
-        let vector_column = self
-            .batch
-            .column_by_name(&self.column)
-            .ok_or_else(|| Error::Index(format!("column {} not found in batch", self.column)))?;
-        let vectors = as_fixed_size_list_array(vector_column.as_ref());
-        let vector_value = vectors.value(idx);
-        let float_array: &Float32Array = as_primitive_array(vector_value.as_ref());
-        Ok(Arc::new(float_array.clone()))
+    async fn get_vector(&self, idx: usize) -> &[f32] {
+        let dim = self.dimension;
+        &self.vectors.values()[idx * dim..(idx + 1) * dim]
     }
 
     /// Distance from the query vector to the vector at the given idx.
     async fn distance_to(&self, query: &Float32Array, idx: usize) -> Result<f32> {
-        let vector = self.get_vector(idx).await?;
-        let dists = l2_distance(query, vector.as_ref(), query.len())?;
+        let vector = self.get_vector(idx).await;
+        let dists = l2_distance_simd(query.values(), vector, query.len())?;
         Ok(dists.values()[0])
     }
 
@@ -353,6 +354,7 @@ impl VamanaBuilder {
             id: start,
             distance: OrderedFloat(0.0),
         });
+        candidates.insert(OrderedFloat(self.distance_to(query, start).await?), start);
         while !heap.is_empty() {
             let p = heap.pop().unwrap();
             visited.insert(p.id);
@@ -438,8 +440,8 @@ impl VamanaBuilder {
 #[async_trait]
 impl Graph for VamanaBuilder {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
-        let vector_a = self.get_vector(a).await.unwrap();
-        let vector_b = self.get_vector(b).await.unwrap();
+        let vector_a = self.get_vector(a).await;
+        let vector_b = self.get_vector(b).await;
 
         let dist = l2_distance(&vector_a, &vector_b, vector_a.len())?;
         Ok(dist.values()[0])
@@ -531,7 +533,7 @@ mod tests {
     async fn test_build_index_on_sift() {
         let dataset = Arc::new(Dataset::open("sift_1m.lance").await.unwrap());
 
-        let graph = VamanaBuilder::try_new(dataset, "vector", 50, 1.4, 100)
+        let graph = VamanaBuilder::try_new(dataset, "vector", 50, 1.4, 60)
             .await
             .unwrap();
     }

@@ -109,7 +109,7 @@ harness = false
 #strip = true
 #opt-level = "s"
 #lto = true
-codegen-units = 1
+#codegen-units = 1
 debug = true
 
 [profile.bench]
