@@ -98,22 +98,9 @@ impl ObjectStore {
         let absolute_path = StdPath::new(&expanded);
 
         if !absolute_path.try_exists()? {
-            println!(
-                "Creating dir {}",
-                absolute_path.clone().to_str().unwrap().to_owned()
-            );
             std::fs::create_dir_all(absolute_path.clone())?;
         } else if !absolute_path.is_dir() {
-            println!(
-                "Is not a dir {}",
-                absolute_path.clone().to_str().unwrap().to_owned()
-            );
             return Err(Error::IO(format!("{} is not a lance directory", str_path)));
-        } else {
-            println!(
-                "Continue with dir {}",
-                absolute_path.clone().to_str().unwrap().to_owned()
-            );
         }
 
         Ok(Self {
@@ -194,12 +181,8 @@ impl ObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
     use std::env::set_current_dir;
     use std::fs::write;
-    use std::fs::File;
-    use std::path::Prefix::Disk;
-    use std::path::{Component, PathBuf};
 
     fn write_to_fs_file(path_str: String, contents: String) -> std::io::Result<()> {
         let expanded = tilde(&path_str).to_string();
@@ -263,13 +246,10 @@ mod tests {
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         write_to_fs_file(uri.to_string() + "/test_file", "TILDE".to_string()).unwrap();
-        println!("{uri}");
         let store = ObjectStore::new(uri).await.unwrap();
-        println!("{uri}");
         let contents = read_from_store(store, &Path::from("test_file"))
             .await
             .unwrap();
-        println!("{uri}");
         assert_eq!(contents, "TILDE");
     }
 
@@ -297,8 +277,6 @@ mod tests {
         let tmp_path = tmp_dir.path();
         let prefix = get_path_prefix(tmp_path);
         let drive_letter = get_drive_letter(prefix);
-        println!("{:?}", prefix);
-        println!("{}", drive_letter);
 
         write_to_fs_file(
             format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
