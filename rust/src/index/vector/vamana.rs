@@ -263,23 +263,24 @@ impl VamanaBuilder {
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
             search_time += search_t.elapsed().as_secs_f32();
 
-            let start = std::time::Instant::now();
-            self.robust_prune(id, visited, alpha, r).await?;
-            prune_count += 1;
-            prune_time += start.elapsed().as_secs_f32();
-
-            for j in self.neighbors(id).await? {
-                let mut neighbor_set: HashSet<usize> = HashSet::new();
-                neighbor_set.extend(self.neighbors(j).await?);
-                neighbor_set.insert(id);
-                if neighbor_set.len() > r {
-                    let start = std::time::Instant::now();
-                    self.robust_prune(j, neighbor_set, alpha, r).await?;
-                    prune_time += start.elapsed().as_secs_f32();
-                    prune_count += 1;
+            self.vertices[id].neighbors = robust_prune(self, id, visited, alpha, r).await?;
+            // Get a immutable reference to self.
+            let this: &VamanaBuilder = self;
+            let neighbours = stream::iter(self.neighbors(id).await?).map(|j| async move {
+                let mut neighbours = this.neighbors(j).await?;
+                if neighbours.len() + 1 > r {
+                    let mut neighbor_set: HashSet<usize> = HashSet::new();
+                    neighbor_set.extend(neighbours);
+                    neighbor_set.insert(id);
+                    let new_neighbours = robust_prune(this, j, neighbor_set, alpha, r).await?;
+                    Ok::<_, Error>((j, new_neighbours))
                 } else {
-                    self.vertices[j].neighbors.push(id as u32);
+                    neighbours.push(id);
+                    Ok::<_, Error>((j, vec![id as u32]))
                 }
+            }).buffered(num_cpus::get()).try_collect::<Vec<_>>().await?;
+            for (j, neighbours) in neighbours {
+                self.vertices[j].neighbors = neighbours;
             }
         }
 
@@ -383,58 +384,56 @@ impl VamanaBuilder {
             visited,
         ))
     }
+}
 
-    /// Algorithm 2 in the paper.
-    async fn robust_prune(
-        &mut self,
-        id: usize,
-        mut visited: HashSet<usize>,
-        alpha: f32,
-        r: usize,
-    ) -> Result<()> {
-        visited.remove(&id);
-        let neighbors = self.neighbors(id).await?;
-        visited.extend(neighbors.iter().map(|id| *id as usize));
+/// Algorithm 2 in the paper.
+async fn robust_prune(
+    graph: &VamanaBuilder,
+    id: usize,
+    mut visited: HashSet<usize>,
+    alpha: f32,
+    r: usize,
+) -> Result<Vec<u32>> {
+    visited.remove(&id);
+    let neighbors = graph.neighbors(id).await?;
+    visited.extend(neighbors.iter().map(|id| *id as usize));
 
-        let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
-        for p in visited.iter() {
-            let dist = self.distance(id, *p).await?;
-            heap.push(VertexWithDistance {
-                id: *p,
-                distance: OrderedFloat(dist),
-            });
-        }
-
-        let mut new_neighbours: Vec<usize> = vec![];
-        while !visited.is_empty() {
-            let mut p = heap.pop().unwrap();
-            while !visited.contains(&p.id) {
-                // Because we are using a heap for `argmin(Visited)` in the original
-                // algorithm, we need to pop out the vertices that are not in `visited` anymore.
-                p = heap.pop().unwrap();
-            }
-
-            new_neighbours.push(p.id);
-            if new_neighbours.len() >= r {
-                break;
-            }
-
-            let mut to_remove: HashSet<usize> = HashSet::new();
-            for pv in visited.iter() {
-                let dist_prime = self.distance(p.id, *pv).await?;
-                let dist_query = self.distance(id, *pv).await?;
-                if alpha * dist_prime <= dist_query {
-                    to_remove.insert(*pv);
-                }
-            }
-            for pv in to_remove.iter() {
-                visited.remove(pv);
-            }
-        }
-        // println!("ios: {}", ios);
-        self.vertices[id].neighbors = new_neighbours.iter().map(|id| *id as u32).collect();
-        Ok(())
+    let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
+    for p in visited.iter() {
+        let dist = graph.distance(id, *p).await?;
+        heap.push(VertexWithDistance {
+            id: *p,
+            distance: OrderedFloat(dist),
+        });
     }
+
+    let mut new_neighbours: Vec<usize> = vec![];
+    while !visited.is_empty() {
+        let mut p = heap.pop().unwrap();
+        while !visited.contains(&p.id) {
+            // Because we are using a heap for `argmin(Visited)` in the original
+            // algorithm, we need to pop out the vertices that are not in `visited` anymore.
+            p = heap.pop().unwrap();
+        }
+
+        new_neighbours.push(p.id);
+        if new_neighbours.len() >= r {
+            break;
+        }
+
+        let mut to_remove: HashSet<usize> = HashSet::new();
+        for pv in visited.iter() {
+            let dist_prime = graph.distance(p.id, *pv).await?;
+            let dist_query = graph.distance(id, *pv).await?;
+            if alpha * dist_prime <= dist_query {
+                to_remove.insert(*pv);
+            }
+        }
+        for pv in to_remove.iter() {
+            visited.remove(pv);
+        }
+    }
+    Ok(new_neighbours.iter().map(|id| *id as u32).collect())
 }
 
 #[async_trait]
