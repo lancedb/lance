@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_arith::arithmetic::{add, divide_scalar};
-use arrow_array::{cast::as_primitive_array, Array, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{cast::as_primitive_array, Array, Float32Array};
 use arrow_schema::DataType;
 use arrow_select::concat::{concat, concat_batches};
 use async_trait::async_trait;
@@ -55,8 +55,8 @@ pub struct VamanaBuilder {
 
     vertices: Vec<Vertex<VemanaData>>,
 
-    /// The vector data. Contiguous in memory for fast access.
-    vectors: Float32Array,
+    /// The vector data. contiguous in memory for fast access.
+    vectors: Arc<Float32Array>,
 
     /// Vector dimension.
     dimension: usize,
@@ -143,7 +143,7 @@ impl VamanaBuilder {
             column: column.to_string(),
             vertices,
             dimension: vectors.value_length() as usize,
-            vectors: as_primitive_array(vectors.values()).clone(),
+            vectors: Arc::new(as_primitive_array(vectors.values()).clone()),
         })
     }
 
@@ -258,27 +258,34 @@ impl VamanaBuilder {
                 prune_time = 0.0;
                 prune_count = 0;
             }
-            let vector = self.get_vector(id).await;
+            let vector = self.get_vector(id);
             let search_t = std::time::Instant::now();
             let (_, visited) = self.greedy_search(medoid, vector.as_ref(), 1, l).await?;
             search_time += search_t.elapsed().as_secs_f32();
 
-            self.vertices[id].neighbors = robust_prune(self, id, visited, alpha, r).await?;
+            let now = std::time::Instant::now();
+            self.vertices.get_mut(id).unwrap().neighbors =
+                robust_prune(self, id, visited, alpha, r).await?;
             // Get a immutable reference to self.
-            let this: &VamanaBuilder = self;
-            let neighbours = stream::iter(self.neighbors(id).await?).map(|j| async move {
-                let mut neighbours = this.neighbors(j).await?;
-                if neighbours.len() + 1 > r {
-                    let mut neighbor_set: HashSet<usize> = HashSet::new();
-                    neighbor_set.extend(neighbours);
-                    neighbor_set.insert(id);
-                    let new_neighbours = robust_prune(this, j, neighbor_set, alpha, r).await?;
-                    Ok::<_, Error>((j, new_neighbours))
-                } else {
-                    neighbours.push(id);
-                    Ok::<_, Error>((j, vec![id as u32]))
-                }
-            }).buffered(num_cpus::get()).try_collect::<Vec<_>>().await?;
+            let this: &Self = self;
+            let neighbours = stream::iter(self.neighbors(id)?)
+                .map(|j| async move {
+                    let mut neighbours = this.neighbors(j)?;
+                    if neighbours.len() + 1 > r {
+                        let mut neighbor_set: HashSet<usize> = HashSet::new();
+                        neighbor_set.extend(neighbours);
+                        neighbor_set.insert(id);
+                        let new_neighbours = robust_prune(&this, j, neighbor_set, alpha, r).await?;
+                        Ok::<_, Error>((j, new_neighbours))
+                    } else {
+                        neighbours.push(id);
+                        Ok::<_, Error>((j, vec![id as u32]))
+                    }
+                })
+                .buffered(num_cpus::get())
+                .try_collect::<Vec<_>>()
+                .await?;
+            prune_time += now.elapsed().as_secs_f32();
             for (j, neighbours) in neighbours {
                 self.vertices[j].neighbors = neighbours;
             }
@@ -317,14 +324,14 @@ impl VamanaBuilder {
     }
 
     /// Get the vector at an index.
-    async fn get_vector(&self, idx: usize) -> &[f32] {
+    fn get_vector(&self, idx: usize) -> &[f32] {
         let dim = self.dimension;
         &self.vectors.values()[idx * dim..(idx + 1) * dim]
     }
 
     /// Distance from the query vector to the vector at the given idx.
-    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
-        let vector = self.get_vector(idx).await;
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+        let vector = self.get_vector(idx);
         let dists = l2_distance_simd(query, vector, query.len())?;
         Ok(dists.values()[0])
     }
@@ -355,17 +362,17 @@ impl VamanaBuilder {
             id: start,
             distance: OrderedFloat(0.0),
         });
-        candidates.insert(OrderedFloat(self.distance_to(query, start).await?), start);
+        candidates.insert(OrderedFloat(self.distance_to(query, start)?), start);
         while !heap.is_empty() {
             let p = heap.pop().unwrap();
             visited.insert(p.id);
-            for neighbor_id in self.neighbors(p.id).await?.iter() {
+            for neighbor_id in self.neighbors(p.id)?.iter() {
                 let neighbor_id = *neighbor_id as usize;
                 if visited.contains(&neighbor_id) {
                     // Already visited.
                     continue;
                 }
-                let dist = self.distance_to(query, neighbor_id).await?;
+                let dist = self.distance_to(query, neighbor_id)?;
                 candidates.insert(OrderedFloat(dist), neighbor_id as usize);
                 if candidates.len() > search_size {
                     candidates.pop_last();
@@ -386,6 +393,13 @@ impl VamanaBuilder {
     }
 }
 
+fn distance(vectors: &Float32Array, dim: usize, i: usize, j: usize) -> Result<f32> {
+    let v1 = &vectors.values()[i * dim..(i + 1) * dim];
+    let v2 = &vectors.values()[j * dim..(j + 1) * dim];
+    let dists = l2_distance_simd(v1, v2, v1.len())?;
+    Ok(dists.values()[0])
+}
+
 /// Algorithm 2 in the paper.
 async fn robust_prune(
     graph: &VamanaBuilder,
@@ -395,58 +409,64 @@ async fn robust_prune(
     r: usize,
 ) -> Result<Vec<u32>> {
     visited.remove(&id);
-    let neighbors = graph.neighbors(id).await?;
+    let neighbors = graph.neighbors(id)?;
     visited.extend(neighbors.iter().map(|id| *id as usize));
 
     let mut heap: BinaryHeap<VertexWithDistance> = BinaryHeap::new();
     for p in visited.iter() {
-        let dist = graph.distance(id, *p).await?;
+        let dist = graph.distance(id, *p)?;
         heap.push(VertexWithDistance {
             id: *p,
             distance: OrderedFloat(dist),
         });
     }
 
-    let mut new_neighbours: Vec<usize> = vec![];
-    while !visited.is_empty() {
-        let mut p = heap.pop().unwrap();
-        while !visited.contains(&p.id) {
-            // Because we are using a heap for `argmin(Visited)` in the original
-            // algorithm, we need to pop out the vertices that are not in `visited` anymore.
-            p = heap.pop().unwrap();
-        }
+    let vectors = graph.vectors.clone();
+    let dim = graph.dimension;
+    let new_neighbours = tokio::task::spawn_blocking(move || {
+        let mut new_neighbours: Vec<usize> = vec![];
+        while !visited.is_empty() {
+            let mut p = heap.pop().unwrap();
+            while !visited.contains(&p.id) {
+                // Because we are using a heap for `argmin(Visited)` in the original
+                // algorithm, we need to pop out the vertices that are not in `visited` anymore.
+                p = heap.pop().unwrap();
+            }
 
-        new_neighbours.push(p.id);
-        if new_neighbours.len() >= r {
-            break;
-        }
+            new_neighbours.push(p.id);
+            if new_neighbours.len() >= r {
+                break;
+            }
 
-        let mut to_remove: HashSet<usize> = HashSet::new();
-        for pv in visited.iter() {
-            let dist_prime = graph.distance(p.id, *pv).await?;
-            let dist_query = graph.distance(id, *pv).await?;
-            if alpha * dist_prime <= dist_query {
-                to_remove.insert(*pv);
+            let mut to_remove: HashSet<usize> = HashSet::new();
+            for pv in visited.iter() {
+                let dist_prime = distance(vectors.as_ref(), dim, p.id, *pv)?;
+                let dist_query = distance(vectors.as_ref(), dim, id, *pv)?;
+                if alpha * dist_prime <= dist_query {
+                    to_remove.insert(*pv);
+                }
+            }
+            for pv in to_remove.iter() {
+                visited.remove(pv);
             }
         }
-        for pv in to_remove.iter() {
-            visited.remove(pv);
-        }
-    }
+        Ok::<_, Error>(new_neighbours)
+    }).await??;
+
     Ok(new_neighbours.iter().map(|id| *id as u32).collect())
 }
 
 #[async_trait]
 impl Graph for VamanaBuilder {
-    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
-        let vector_a = self.get_vector(a).await;
-        let vector_b = self.get_vector(b).await;
+    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        let vector_a = self.get_vector(a);
+        let vector_b = self.get_vector(b);
 
         let dist = l2_distance_simd(vector_a, vector_b, vector_a.len())?;
         Ok(dist.values()[0])
     }
 
-    async fn neighbors(&self, id: usize) -> Result<Vec<usize>> {
+    fn neighbors(&self, id: usize) -> Result<Vec<usize>> {
         Ok(self.vertices[id]
             .neighbors
             .iter()

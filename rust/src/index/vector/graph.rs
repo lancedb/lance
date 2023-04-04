@@ -34,10 +34,10 @@ pub struct Vertex<T> {
 #[async_trait]
 pub(crate) trait Graph {
     /// Distance between two vertices.
-    async fn distance(&self, a: usize, b: usize) -> Result<f32>;
+    fn distance(&self, a: usize, b: usize) -> Result<f32>;
 
     /// Get neighbors of a vertex, specified by its ID.
-    async fn neighbors(&self, id: usize) -> Result<Vec<usize>>;
+    fn neighbors(&self, id: usize) -> Result<Vec<usize>>;
 }
 
 pub(crate) struct VertexWithDistance {
