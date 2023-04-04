@@ -11,7 +11,9 @@ fn main() -> Result<()> {
     )?;
 
     if cfg!(target_os = "windows") {
-        vcpkg::find_package("lapack").unwrap();
+        #[cfg(target_env = "msvc")] {
+            vcpkg::find_package("lapack").unwrap();
+        }
     }
 
     Ok(())
