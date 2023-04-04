@@ -258,6 +258,7 @@ mod tests {
     async fn test_windows_paths() {
         use std::path::Prefix;
         use std::path::Prefix::*;
+        use std::path::Component;
 
         fn get_path_prefix(path: &StdPath) -> Prefix {
             match path.components().next().unwrap() {
