@@ -82,5 +82,7 @@ jobs:
       - name: Run tests
         run: |
           $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          echo $env:GITHUB_PATH
+          echo $env:PATH
           cargo build --all-features
           cargo test
