@@ -36,6 +36,7 @@ runs:
       shell: powershell
       run: |
         vcpkg install openblas --triplet x64-windows-static-md
+        vcpkg install lapack --triplet x64-windows-static-md
     - name: Install Protoc v21.12
       working-directory: C:\
       run: |
@@ -56,7 +57,8 @@ runs:
     - name: Add DLLs to wheel
       working-directory: python
       run: |
-        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\packages\openblas_x64-windows\bin;' + $env:PATH          
+        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
+        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
         pip install delvewheel
         delvewheel repair --wheel-dir target\wheels $(ls target/wheels/*.whl)
       shell: powershell
