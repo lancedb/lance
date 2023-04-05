@@ -481,12 +481,7 @@ class LanceScanner(pa.dataset.Scanner):
         return self._scanner.to_pyarrow()
 
     def to_batches(self) -> Iterator[RecordBatch]:
-        def _iterator(batch_iter):
-            for batch in batch_iter:
-                yield batch.record_batch
-
-        # Don't make ourselves a generator so errors are raised immediately
-        return _iterator(self.to_reader())
+        yield from self.to_reader()
 
     @property
     def projected_schema(self) -> Schema:
