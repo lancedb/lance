@@ -25,6 +25,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use futures::future;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex, SCORE_COL};
@@ -65,6 +66,10 @@ pub async fn flat_search(
     query: &Query,
 ) -> Result<RecordBatch> {
     let batches = stream
+        .filter(|batch| {
+            let pred = batch.as_ref().map(|b| b.num_rows() > 0).unwrap_or(false);
+            future::ready(pred)
+        })
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
