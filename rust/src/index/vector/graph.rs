@@ -15,13 +15,17 @@
 //! Graph-based vector index.
 //!
 
+use crate::Result;
 use std::any::Any;
 
+mod memory;
 mod persisted;
 
 /// Vertex (metadata). It does not include the actual data.
-pub trait Vertex {
-    fn bytes(&self) -> usize;
+pub trait Vertex: Sized {
+    fn byte_length(&self) -> usize;
+
+    fn from_bytes(data: &[u8]) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
 }

@@ -20,6 +20,7 @@ use lru_time_cache::LruCache;
 use object_store::path::Path;
 
 use super::Vertex;
+use crate::arrow::as_fixed_size_binary_array;
 use crate::datatypes::Schema;
 use crate::io::{FileReader, ObjectStore};
 use crate::{Error, Result};
@@ -42,6 +43,8 @@ pub struct PersistedGraph<'a, V: Vertex> {
 
     /// LRU cache for neighbors.
     neighbors_cache: Arc<Mutex<LruCache<u32, UInt32Array>>>,
+
+    prefetch_byte_size: usize,
 }
 
 impl<'a, V: Vertex> PersistedGraph<'a, V> {
@@ -76,6 +79,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
             vertex_projection,
             cache: Arc::new(Mutex::new(LruCache::with_capacity(1000000))),
             neighbors_cache: Arc::new(Mutex::new(LruCache::with_capacity(1000))),
+            prefetch_byte_size: 8196, // 8MB
         })
     }
 
@@ -92,8 +96,25 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
                 return Ok(vertex.clone());
             }
         }
-        let vertex = self.reader.take([indices], &self.vertex_projection).await?;
-        todo!()
+        let prefetch_size = self.prefetch_byte_size / self.vertex_size + 1;
+        let batch = self
+            .reader
+            .read_range(
+                id as usize..id as usize + prefetch_size,
+                &self.vertex_projection,
+            )
+            .await?;
+        assert_eq!(batch.num_rows(), prefetch_size);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            let array = as_fixed_size_binary_array(batch.column(0));
+            for i in 0..prefetch_size {
+                let vertex_bytes = array.value(i);
+                let vertex = V::from_bytes(vertex_bytes)?;
+                cache.insert(id + i as u32, Arc::new(vertex));
+            }
+            Ok(cache.get(&id).unwrap().clone())
+        }
     }
 
     /// Get the neighbors of a vertex, specified by its id.
@@ -112,12 +133,24 @@ mod tests {
     }
 
     impl Vertex for TestVertex {
-        fn bytes(&self) -> usize {
+        fn byte_length(&self) -> usize {
             return 20;
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+
+        fn from_bytes(data: &[u8]) -> Result<Self> {
+            if data.len() != 20 {
+                return Err(Error::Index(format!(
+                    "Invalid vertex size, expected: 20, got: {}",
+                    data.len()
+                )));
+            }
+            let row_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
+            let pq = data[4..].to_vec();
+            Ok(Self { row_id, pq })
         }
     }
 
