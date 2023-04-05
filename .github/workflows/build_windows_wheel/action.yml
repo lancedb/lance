@@ -21,9 +21,9 @@ runs:
         update_vcpkg: true
     - name: Update Environment Variables
       shell: powershell
-        - run: |
-          # echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo $env:PATH
+      run: |
+        # echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo $env:PATH
     - name: Build wheel
       env:
         VCPKG_ROOT: C:\vcpkg
