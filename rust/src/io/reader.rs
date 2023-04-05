@@ -204,6 +204,31 @@ impl<'a> FileReader<'a> {
         read_batch(self, &params.into(), projection, batch_id, self.with_row_id).await
     }
 
+    /// Read a range of records into one batch.
+    ///
+    /// Note that it might call concat if the range is crossing multiple batches, which
+    /// makes it less efficient than [`FileReader::read_batch()`].
+    pub(crate) async fn read_range(
+        &self,
+        range: Range<usize>,
+        projection: &Schema,
+    ) -> Result<RecordBatch> {
+        let range_in_batches = self.metadata.range_to_batches(range)?;
+        let batches =
+            stream::iter(range_in_batches)
+                .map(|(batch_id, range)| async move {
+                    self.read_batch(batch_id, range, projection).await
+                })
+                .buffered(num_cpus::get())
+                .try_collect::<Vec<_>>()
+                .await?;
+        let schema = Arc::new(
+            ArrowSchema::try_from(projection)
+                .map_err(|e| Error::Schema(format!("Failed to convert schema: {}", e)))?,
+        );
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
     /// Take by records by indices within the file.
     ///
     /// The indices must be sorted.
@@ -1181,5 +1206,29 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(batch, actual_batch);
+    }
+
+    #[tokio::test]
+    async fn test_read_ranges() {
+        // create a record batch with a null array column
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..100))];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+
+        // write to a lance file
+        let store = ObjectStore::memory();
+        let path = Path::from("/read_range");
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual_batch = reader.read_range(7..25, reader.schema()).await.unwrap();
+
+        assert_eq!(
+            actual_batch.column_by_name("i").unwrap().as_ref(),
+            &Int64Array::from_iter_values(7..25)
+        );
     }
 }
