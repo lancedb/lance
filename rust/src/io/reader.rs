@@ -204,6 +204,28 @@ impl<'a> FileReader<'a> {
         read_batch(self, &params.into(), projection, batch_id, self.with_row_id).await
     }
 
+    /// Read a range of records into one batch.
+    ///
+    /// Note that it might call concat if the range is crossing multiple batches.
+    pub(crate) async fn read_range(
+        &self,
+        range: Range<usize>,
+        projection: &Schema,
+    ) -> Result<RecordBatch> {
+        let range_in_batches = self.metadata.range_to_batches(range)?;
+        let batches = stream::iter(range_in_batches)
+            .map(|(batch_id, range)| async move {
+                self.read_batch(batch_id, range, projection).await
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        let schema = Arc::new(ArrowSchema::try_from(projection).map_err(|e| {
+            Error::Schema(format!("Failed to convert schema: {}", e))
+        })?);
+        Ok(concat_batches(&schema, &batches)?)
+    }
+
     /// Take by records by indices within the file.
     ///
     /// The indices must be sorted.
