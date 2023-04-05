@@ -384,36 +384,7 @@ impl Scanner {
                 knn_node_with_vector
             }; // vector, score, _rowid
 
-            // Check if we've created new versions since the index
-            let version = index.dataset_version;
-            if version != self.dataset.version().version {
-                // If we've added more rows, then we'll have new fragments
-                let ds = self.dataset.checkout_version(version).await?;
-                let max_fragment_id_idx = ds
-                    .manifest
-                    .max_fragment_id()
-                    .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
-                let max_fragment_id_ds = self
-                    .dataset
-                    .manifest
-                    .max_fragment_id()
-                    .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
-                // If we have new fragments, then we need to do a combined search
-                if max_fragment_id_idx < max_fragment_id_ds {
-                    let vector_scan_projection =
-                        Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-                    let scan_node = self.scan_fragments(
-                        true,
-                        vector_scan_projection,
-                        max_fragment_id_idx + 1,
-                        max_fragment_id_ds + 1,
-                    );
-                    // first we do flat search on just the new data
-                    let topk_appended = self.flat_knn(vec![scan_node], q)?;
-                    // then we do a flat search on KNN(new data) + ANN(indexed data)
-                    knn_node = self.flat_knn(vec![topk_appended, knn_node], q)?;
-                }
-            }
+            knn_node = self.knn_combined(&q, index, knn_node).await?;
 
             Ok(knn_node)
         } else {
@@ -425,30 +396,51 @@ impl Scanner {
         }
     }
 
+    /// Combine ANN results with KNN results for data appended after index creation
+    async fn knn_combined(
+        &self,
+        q: &&Query,
+        index: &Index,
+        knn_node: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Check if we've created new versions since the index
+        let version = index.dataset_version;
+        if version != self.dataset.version().version {
+            // If we've added more rows, then we'll have new fragments
+            let ds = self.dataset.checkout_version(version).await?;
+            let max_fragment_id_idx = ds
+                .manifest
+                .max_fragment_id()
+                .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
+            let max_fragment_id_ds = self
+                .dataset
+                .manifest
+                .max_fragment_id()
+                .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
+            // If we have new fragments, then we need to do a combined search
+            if max_fragment_id_idx < max_fragment_id_ds {
+                let vector_scan_projection =
+                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+                let scan_node = self.scan_fragments(
+                    true,
+                    vector_scan_projection,
+                    Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
+                );
+                // first we do flat search on just the new data
+                let topk_appended = self.flat_knn(vec![scan_node], q)?;
+                // then we do a flat search on KNN(new data) + ANN(indexed data)
+                return self.flat_knn(vec![topk_appended, knn_node], q);
+            }
+        }
+        Ok(knn_node)
+    }
+
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
-        self.scan_internal(with_row_id, projection, self.dataset.fragments().clone())
+        self.scan_fragments(with_row_id, projection, self.dataset.fragments().clone())
     }
 
     fn scan_fragments(
-        &self,
-        with_row_id: bool,
-        projection: Arc<Schema>,
-        start: u64,
-        end: u64,
-    ) -> Arc<dyn ExecutionPlan> {
-        let fragments = self
-            .dataset
-            .fragments()
-            .clone()
-            .iter()
-            .filter(|&f| f.id >= start && f.id < end)
-            .map(|f| f.clone())
-            .collect();
-        self.scan_internal(with_row_id, projection, Arc::new(fragments))
-    }
-
-    fn scan_internal(
         &self,
         with_row_id: bool,
         projection: Arc<Schema>,

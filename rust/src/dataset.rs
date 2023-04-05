@@ -126,6 +126,7 @@ impl Dataset {
         Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
+    /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
@@ -301,6 +302,7 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = dataset.as_ref().map_or(1, |d| d.manifest.version + 1);
+        // Inherit the index if we're just appending rows
         let indices = if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
                 Some(d.load_indices().await?)

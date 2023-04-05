@@ -92,7 +92,7 @@ message IndexMetadata {
   // Index name. Must be unique within one dataset version.
   string name = 3;
 
-  // The latest version of the dataset this index covers.
+  // The version of the dataset this index was built from.
   uint64 dataset_version = 4;
 }
 

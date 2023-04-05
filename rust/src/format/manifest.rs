@@ -23,6 +23,7 @@ use prost_types::Timestamp;
 
 use super::Fragment;
 use crate::datatypes::Schema;
+use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
 
 /// Manifest of a dataset
@@ -78,22 +79,28 @@ impl Manifest {
         )
     }
 
+    /// Return the max fragment id.
+    /// Note this does not support recycling of fragment ids.
     pub fn max_fragment_id(&self) -> Option<u64> {
         self.fragments.iter().map(|f| f.id).max()
     }
 
-    pub fn fragments_since(&self, since: Manifest) -> Vec<Fragment> {
-        let mut fragments = vec![];
-        let mut fragment_map = HashMap::new();
-        for fragment in self.fragments.iter() {
-            fragment_map.insert(fragment.id, fragment);
+    /// Return the fragments that are newer than the given manifest.
+    /// Note this does not support recycling of fragment ids.
+    pub fn fragments_since(&self, since: &Manifest) -> Result<Vec<Fragment>> {
+        if since.version >= self.version {
+            return Err(Error::IO(format!(
+                "fragments_since: given version {} is newer than manifest version {}",
+                since.version, self.version
+            )));
         }
-        for fragment in since.fragments.iter() {
-            if let Some(f) = fragment_map.remove(&fragment.id) {
-                fragments.push(f.clone());
-            }
-        }
-        fragments
+        let start = since.max_fragment_id();
+        Ok(self
+            .fragments
+            .iter()
+            .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
+            .map(|f| f.clone())
+            .collect())
     }
 }
 
