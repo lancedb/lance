@@ -16,6 +16,7 @@
 
 use std::{any::Any, sync::Arc};
 
+use arrow::datatypes::Float32Type;
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
     builder::{Float32Builder, UInt32Builder},
@@ -286,8 +287,8 @@ impl Ivf {
         let dist_func = metric_type.func();
         let centroid_values = self.centroids.values();
         let distances = dist_func(
-            query,
-            as_primitive_array(centroid_values.as_ref()),
+            query.values(),
+            as_primitive_array::<Float32Type>(centroid_values.as_ref()).values(),
             self.dimension(),
         )? as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
@@ -322,7 +323,7 @@ impl Ivf {
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id = argmin(
-                dist_func(&vector, centroids.data().as_ref(), dim)
+                dist_func(vector.values(), centroids.data().values(), dim)
                     .unwrap()
                     .as_ref(),
             )
@@ -493,7 +494,7 @@ fn compute_residual_matrix(
     for i in 0..data.num_rows() {
         let row = data.row(i).unwrap();
         let part_id = argmin(
-            dist_func(&row, centroids.data().as_ref(), dim)
+            dist_func(row.values(), centroids.data().values(), dim)
                 .unwrap()
                 .as_ref(),
         )

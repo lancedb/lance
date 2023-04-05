@@ -416,7 +416,8 @@ impl KMeans {
                     for idx in indices {
                         let value_arr = data.slice(idx * dimension, dimension);
                         let vector: &Float32Array = as_primitive_array(&value_arr);
-                        let distances = dist(vector, centroids.as_ref(), dimension).unwrap();
+                        let distances =
+                            dist(vector.values(), centroids.values(), dimension).unwrap();
                         let cluster_id = argmin(distances.as_ref()).unwrap();
                         let distance = distances.value(cluster_id as usize);
                         results.push((cluster_id, distance))
