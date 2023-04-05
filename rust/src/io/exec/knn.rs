@@ -25,8 +25,6 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
-use futures::stream::StreamExt;
-use futures::SinkExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 

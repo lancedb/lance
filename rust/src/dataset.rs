@@ -301,7 +301,14 @@ impl Dataset {
         };
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
-        manifest.version = dataset.as_ref().map_or(1, |d| d.manifest.version + 1);
+        manifest.version = match dataset.as_ref() {
+            Some(d) => d
+                .latest_manifest()
+                .await
+                .map(|m| m.version + 1)
+                .unwrap_or(1),
+            None => 1,
+        };
         // Inherit the index if we're just appending rows
         let indices = if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
