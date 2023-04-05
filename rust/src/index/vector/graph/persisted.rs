@@ -15,12 +15,14 @@
 use std::sync::{Arc, Mutex};
 
 use arrow_array::UInt32Array;
+use arrow_schema::DataType;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
 use super::Vertex;
+use crate::datatypes::Schema;
 use crate::io::{FileReader, ObjectStore};
-use crate::Result;
+use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
 const VERTEX_COL: &str = "vertex";
@@ -28,6 +30,12 @@ const VERTEX_COL: &str = "vertex";
 /// Persisted graph on disk, stored in the file.
 pub struct PersistedGraph<'a, V: Vertex> {
     reader: FileReader<'a>,
+
+    /// Vertex size in bytes.
+    vertex_size: usize,
+
+    /// Projection of the vertex column.
+    vertex_projection: Schema,
 
     /// LRU cache for vertices.
     cache: Arc<Mutex<LruCache<u32, Arc<V>>>>,
@@ -43,8 +51,29 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
         path: &Path,
     ) -> Result<PersistedGraph<'a, V>> {
         let file_reader = FileReader::try_new(object_store, path).await?;
+
+        let schema = file_reader.schema();
+        let vertex_projection = schema.project(&[VERTEX_COL])?;
+        let vertex_size = if let Some(field) = vertex_projection.fields.get(0) {
+            match field.data_type() {
+                DataType::FixedSizeBinary(size) => size as usize,
+                _ => {
+                    return Err(Error::Index(format!(
+                        "Vertex column must be of fixed size binary, got: {}",
+                        field.data_type()
+                    )))
+                }
+            }
+        } else {
+            return Err(Error::Index(
+                "Vertex column does not exist in the graph".to_string(),
+            ));
+        };
+
         Ok(Self {
             reader: file_reader,
+            vertex_size,
+            vertex_projection,
             cache: Arc::new(Mutex::new(LruCache::with_capacity(1000000))),
             neighbors_cache: Arc::new(Mutex::new(LruCache::with_capacity(1000))),
         })
@@ -63,6 +92,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
                 return Ok(vertex.clone());
             }
         }
+        let vertex = self.reader.take([indices], &self.vertex_projection).await?;
         todo!()
     }
 
