@@ -1,0 +1,46 @@
+# We create a composite action to be re-used both for testing and for releasing
+name: install_windows_dependencies
+description: "Build a lance wheel"
+env:
+  VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
+  VCPKG_ROOT: C:\vcpkg  
+inputs:
+  vcpkg_token:
+    description: "vcpkg packages repository token"
+    required: true
+  update_vcpkg:
+    description: "update vcpkg and its dependencies before installing packages"
+    required: true
+    default: false
+runs:
+  using: "composite"
+  steps:
+    - name: 'Setup vcpkg package cache'
+      shell: 'bash'
+      run: |
+        `vcpkg fetch nuget | tail -n 1` \
+          sources add \
+          -source "https://nuget.pkg.github.com/eto-ai/index.json" \
+          -storepasswordincleartext \
+          -name "GitHub" \
+          -username "eto-ai" \
+          -password "${{ inputs.vcpkg_token }}"
+        `vcpkg fetch nuget | tail -n 1` \
+          setapikey "${{ inputs.vcpkg_token }}" \
+          -source "https://nuget.pkg.github.com/eto.ai/index.json"
+    - name: Update vcpkg
+      if: ${{ inputs.update_vcpkg }}
+      shell: powershell
+      run: |
+        cd $env:VCPKG_INSTALLATION_ROOT
+        git pull
+        .\bootstrap-vcpkg.bat  -disableMetrics
+    - name: Setup Dependencies with vcpkg
+      shell: powershell
+      run: |
+        vcpkg install openblas --triplet x64-windows-static-md
+        vcpkg install lapack --triplet x64-windows-static-md
+        vcpkg install protobuf --triplet x64-windows
+        echo $env:VCPKG_INSTALLATION_ROOT
+        echo "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        ls "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf"
