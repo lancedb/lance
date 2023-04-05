@@ -15,17 +15,37 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - uses: ./.github/workflows/install_windows_dependencies
-      with:
-        vcpkg_token: ${{ inputs.vcpkg_token }}
-        update_vcpkg: true
-    - name: Update Environment Variables
+    - name: 'Setup vcpkg cache'
+      env:
+        VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
+      shell: 'bash'
+      run: |
+        `vcpkg fetch nuget | tail -n 1` \
+          sources add \
+          -source "https://nuget.pkg.github.com/eto-ai/index.json" \
+          -storepasswordincleartext \
+          -name "GitHub" \
+          -username "eto-ai" \
+          -password "${{ inputs.vcpkg_token }}"
+        `vcpkg fetch nuget | tail -n 1` \
+          setapikey "${{ inputs.vcpkg_token }}" \
+          -source "https://nuget.pkg.github.com/eto.ai/index.json"
+    - name: Setup Dependencies with vcpkg
+      env:
+        VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
       shell: powershell
       run: |
-        # echo $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-        echo $env:PATH
+        vcpkg install openblas --triplet x64-windows-static-md
+    - name: Install Protoc v21.12
+      working-directory: C:\
+      run: |
+        New-Item -Path 'C:\protoc' -ItemType Directory
+        Set-Location C:\protoc
+        Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+        7z x protoc.zip
+        Add-Content $env:GITHUB_PATH "C:\protoc\bin"
+      shell: powershell
     - name: Build wheel
-      if: false
       env:
         VCPKG_ROOT: C:\vcpkg
       uses: PyO3/maturin-action@v1
@@ -34,19 +54,13 @@ runs:
         args: ${{ inputs.args }}
         working-directory: python
     - name: Add DLLs to wheel
-      if: false
       working-directory: python
       run: |
-        # $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
-        # $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
-        # $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
-        # $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
-        echo $env:PATH
+        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\packages\openblas_x64-windows\bin;' + $env:PATH          
         pip install delvewheel
         delvewheel repair --wheel-dir target\wheels $(ls target/wheels/*.whl)
       shell: powershell
     - uses: actions/upload-artifact@v3
-      if: false
       with:
         name: windows-wheels
         path: python\target\wheels
