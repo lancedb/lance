@@ -110,8 +110,8 @@ def run(ds, q=None, assert_func=None):
                     assert len(rs) == 10
                     scores = rs["score"].to_numpy()
                     assert (scores.max() - scores.min()) > 1e-6
-                if assert_func is not None:
-                    assert_func(rs)
+                    if assert_func is not None:
+                        assert_func(rs)
     return times
 
 
