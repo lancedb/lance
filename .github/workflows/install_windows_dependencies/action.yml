@@ -40,6 +40,7 @@ runs:
       run: |
         # vcpkg install openblas --triplet x64-windows-static-md
         # vcpkg install lapack --triplet x64-windows-static-md
-        # vcpkg install protobuf --triplet x64-windows
+        vcpkg install protobuf --triplet x64-windows
         echo $env:VCPKG_INSTALLATION_ROOT
         echo "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        ls "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf"
