@@ -24,7 +24,8 @@ use datafusion::execution::{
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
 use datafusion::physical_plan::{
-    filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, SendableRecordBatchStream,
+    filter::FilterExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan,
+    SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
@@ -379,7 +380,7 @@ impl Scanner {
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let mut knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(vec![knn_node_with_vector], q)?
+                self.flat_knn(knn_node_with_vector, q)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
@@ -392,7 +393,7 @@ impl Scanner {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(vec![scan_node], q)?)
+            Ok(self.flat_knn(scan_node, q)?)
         }
     }
 
@@ -427,9 +428,11 @@ impl Scanner {
                     Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
                 );
                 // first we do flat search on just the new data
-                let topk_appended = self.flat_knn(vec![scan_node], q)?;
+                let topk_appended = self.flat_knn(scan_node, q)?;
+                // union
+                let unioned = UnionExec::new(vec![topk_appended, knn_node]);
                 // then we do a flat search on KNN(new data) + ANN(indexed data)
-                return self.flat_knn(vec![topk_appended, knn_node], q);
+                return self.flat_knn(Arc::new(unioned), q);
             }
         }
         Ok(knn_node)
@@ -457,12 +460,8 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(
-        &self,
-        inputs: Vec<Arc<dyn ExecutionPlan>>,
-        q: &Query,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(inputs, q.clone())?))
+    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
     }
 
     /// Create an Execution plan to do indexed ANN search
@@ -501,27 +500,16 @@ impl Scanner {
 #[pin_project::pin_project]
 pub struct RecordBatchStream {
     #[pin]
-    inputs: Vec<SendableRecordBatchStream>,
-    curr: usize,
+    exec_node: SendableRecordBatchStream,
 }
 
 impl RecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        Self {
-            inputs: vec![exec_node],
-            curr: 0,
-        }
-    }
-
-    pub fn from_vec(nodes: Vec<SendableRecordBatchStream>) -> Self {
-        Self {
-            inputs: nodes,
-            curr: 0,
-        }
+        Self { exec_node }
     }
 
     fn schema(&self) -> SchemaRef {
-        self.inputs[0].schema()
+        self.exec_node.schema()
     }
 }
 
@@ -529,20 +517,11 @@ impl Stream for RecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let schema = self.schema();
         let mut this = self.project();
-        match this.inputs[*this.curr].poll_next_unpin(cx) {
-            Poll::Ready(result) => match result {
-                Some(rs) => Poll::Ready(Some(rs.map_err(|e| Error::IO(e.to_string())))),
-                None => {
-                    if *this.curr == this.inputs.len() - 1 {
-                        Poll::Ready(None)
-                    } else {
-                        *this.curr += 1;
-                        Poll::Ready(Some(Ok(RecordBatch::new_empty(schema))))
-                    }
-                }
-            },
+        match this.exec_node.poll_next_unpin(cx) {
+            Poll::Ready(result) => {
+                Poll::Ready(result.map(|r| r.map_err(|e| Error::IO(e.to_string()))))
+            }
             Poll::Pending => Poll::Pending,
         }
     }

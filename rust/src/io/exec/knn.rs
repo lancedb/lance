@@ -48,11 +48,6 @@ impl KNNFlatStream {
         KNNFlatStream::from_stream(stream, query)
     }
 
-    pub(crate) fn from_vec(children: Vec<SendableRecordBatchStream>, query: &Query) -> Self {
-        let stream = RecordBatchStream::from_vec(children);
-        KNNFlatStream::from_stream(stream, query)
-    }
-
     fn from_stream(stream: RecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
@@ -110,7 +105,7 @@ impl DFRecordBatchStream for KNNFlatStream {
 /// - `input` schema does not have "score" column.
 pub struct KNNFlatExec {
     /// Input node.
-    inputs: Vec<Arc<dyn ExecutionPlan>>,
+    input: Arc<dyn ExecutionPlan>,
 
     /// The query to execute.
     query: Query,
@@ -130,8 +125,8 @@ impl KNNFlatExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
-    pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
-        let schema = inputs[0].schema(); // TODO validate schema
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
+        let schema = input.schema();
         let field = schema.field_with_name(&query.column).map_err(|_| {
             Error::IO(format!(
                 "KNNFlatExec node: query column {} not found in input schema",
@@ -149,7 +144,7 @@ impl KNNFlatExec {
             )));
         };
 
-        Ok(Self { inputs, query })
+        Ok(Self { input, query })
     }
 }
 
@@ -160,7 +155,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     /// Flat KNN inherits the schema from input node, and add one score column.
     fn schema(&self) -> arrow_schema::SchemaRef {
-        let input_schema = self.inputs[0].schema();
+        let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
         if !input_schema.field_with_name(SCORE_COL).is_ok() {
             fields.push(Field::new(SCORE_COL, DataType::Float32, false));
@@ -173,15 +168,15 @@ impl ExecutionPlan for KNNFlatExec {
     }
 
     fn output_partitioning(&self) -> Partitioning {
-        self.inputs[0].output_partitioning()
+        self.input.output_partitioning()
     }
 
     fn output_ordering(&self) -> Option<&[datafusion::physical_expr::PhysicalSortExpr]> {
-        self.inputs[0].output_ordering()
+        self.input.output_ordering()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        self.inputs.clone()
+        vec![self.input.clone()]
     }
 
     fn with_new_children(
@@ -196,14 +191,10 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let streams: DataFusionResult<Vec<SendableRecordBatchStream>> = self
-            .inputs
-            .iter()
-            .map(|node| node.execute(partition, context.clone()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect();
-        Ok(Box::pin(KNNFlatStream::from_vec(streams?, &self.query)))
+        Ok(Box::pin(KNNFlatStream::new(
+            self.input.execute(partition, context)?,
+            &self.query,
+        )))
     }
 
     fn statistics(&self) -> Statistics {
@@ -504,7 +495,7 @@ mod tests {
         };
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
-        let idx = KNNFlatExec::try_new(vec![input], query).unwrap();
+        let idx = KNNFlatExec::try_new(input, query).unwrap();
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![
