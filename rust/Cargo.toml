@@ -67,7 +67,6 @@ openblas-src = { version = "0.10.8", default-features= false, features = ["stati
 
 [target.'cfg(target_os = "windows")'.dependencies]
 openblas-src = { version = "0.10.8", default-features= false, features = ["system"]}
-lapack-src = { version = "0.8", features = ["openblas"] }
 
 [target.'cfg(target_os="windows")'.build-dependencies]
 vcpkg = "0.2"
