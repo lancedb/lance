@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_array::Float32Array;
 
 pub mod flat;
+mod graph;
 pub mod ivf;
 mod kmeans;
 mod opq;

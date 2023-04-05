@@ -58,6 +58,7 @@ datafusion = { version = "19.0.0", default-features = false }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 lapack = "0.19.0"
 cblas = "0.4.0"
+lru_time_cache = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = "0.3.2"
