@@ -24,9 +24,9 @@ use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream as DFRecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
-use futures::SinkExt;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
+use futures::SinkExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -66,8 +66,8 @@ impl KNNFlatStream {
                     tx.send(Err(DataFusionError::Execution(format!(
                         "Failed to compute scores: {e}"
                     ))))
-                        .await
-                        .expect("KNNFlat failed to send message");
+                    .await
+                    .expect("KNNFlat failed to send message");
                     return;
                 }
             };
@@ -198,8 +198,9 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-
-        let streams: DataFusionResult<Vec<SendableRecordBatchStream>> = self.inputs.iter()
+        let streams: DataFusionResult<Vec<SendableRecordBatchStream>> = self
+            .inputs
+            .iter()
             .map(|node| node.execute(partition, context.clone()))
             .collect::<Vec<_>>()
             .into_iter()

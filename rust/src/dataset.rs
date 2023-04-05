@@ -129,12 +129,7 @@ impl Dataset {
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Self::checkout_manifest(
-            self.object_store.clone(),
-            base_path,
-            &manifest_file,
-        )
-        .await
+        Self::checkout_manifest(self.object_store.clone(), base_path, &manifest_file).await
     }
 
     async fn checkout_manifest(
@@ -1159,7 +1154,6 @@ mod tests {
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        println!("Indices loaded: {:?}", indices);
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);

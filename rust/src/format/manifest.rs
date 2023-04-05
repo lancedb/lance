@@ -77,6 +77,24 @@ impl Manifest {
             Utc,
         )
     }
+
+    pub fn max_fragment_id(&self) -> Option<u64> {
+        self.fragments.iter().map(|f| f.id).max()
+    }
+
+    pub fn fragments_since(&self, since: Manifest) -> Vec<Fragment> {
+        let mut fragments = vec![];
+        let mut fragment_map = HashMap::new();
+        for fragment in self.fragments.iter() {
+            fragment_map.insert(fragment.id, fragment);
+        }
+        for fragment in since.fragments.iter() {
+            if let Some(f) = fragment_map.remove(&fragment.id) {
+                fragments.push(f.clone());
+            }
+        }
+        fragments
+    }
 }
 
 impl ProtoStruct for Manifest {

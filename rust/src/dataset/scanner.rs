@@ -384,26 +384,33 @@ impl Scanner {
                 knn_node_with_vector
             }; // vector, score, _rowid
 
+            // Check if we've created new versions since the index
             let version = index.dataset_version;
             if version != self.dataset.version().version {
+                // If we've added more rows, then we'll have new fragments
                 let ds = self.dataset.checkout_version(version).await?;
-                let max_fragment_id_idx = ds.manifest.fragments.iter()
-                    .map(|f| f.id).max()
+                let max_fragment_id_idx = ds
+                    .manifest
+                    .max_fragment_id()
                     .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
-                let max_fragment_id_ds = self.dataset.manifest.fragments.iter()
-                    .map(|f| f.id).max()
+                let max_fragment_id_ds = self
+                    .dataset
+                    .manifest
+                    .max_fragment_id()
                     .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
+                // If we have new fragments, then we need to do a combined search
                 if max_fragment_id_idx < max_fragment_id_ds {
-                    // appended since index
-                    // No index found. use flat search.
-                    println!("Flat search between {} and {}", max_fragment_id_idx + 1, max_fragment_id_ds + 1);
                     let vector_scan_projection =
                         Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
                     let scan_node = self.scan_fragments(
-                        true, vector_scan_projection,
-                        max_fragment_id_idx + 1, max_fragment_id_ds + 1
+                        true,
+                        vector_scan_projection,
+                        max_fragment_id_idx + 1,
+                        max_fragment_id_ds + 1,
                     );
+                    // first we do flat search on just the new data
                     let topk_appended = self.flat_knn(vec![scan_node], q)?;
+                    // then we do a flat search on KNN(new data) + ANN(indexed data)
                     knn_node = self.flat_knn(vec![topk_appended, knn_node], q)?;
                 }
             }
@@ -423,8 +430,17 @@ impl Scanner {
         self.scan_internal(with_row_id, projection, self.dataset.fragments().clone())
     }
 
-    fn scan_fragments(&self, with_row_id: bool, projection: Arc<Schema>, start: u64, end: u64) -> Arc<dyn ExecutionPlan> {
-        let fragments = self.dataset.fragments().clone()
+    fn scan_fragments(
+        &self,
+        with_row_id: bool,
+        projection: Arc<Schema>,
+        start: u64,
+        end: u64,
+    ) -> Arc<dyn ExecutionPlan> {
+        let fragments = self
+            .dataset
+            .fragments()
+            .clone()
             .iter()
             .filter(|&f| f.id >= start && f.id < end)
             .map(|f| f.clone())
@@ -432,7 +448,12 @@ impl Scanner {
         self.scan_internal(with_row_id, projection, Arc::new(fragments))
     }
 
-    fn scan_internal(&self, with_row_id: bool, projection: Arc<Schema>, fragments: Arc<Vec<Fragment>>) -> Arc<dyn ExecutionPlan> {
+    fn scan_internal(
+        &self,
+        with_row_id: bool,
+        projection: Arc<Schema>,
+        fragments: Arc<Vec<Fragment>>,
+    ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             fragments,
@@ -444,7 +465,11 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, inputs: Vec<Arc<dyn ExecutionPlan>>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+    fn flat_knn(
+        &self,
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(KNNFlatExec::try_new(inputs, q.clone())?))
     }
 
@@ -485,16 +510,22 @@ impl Scanner {
 pub struct RecordBatchStream {
     #[pin]
     inputs: Vec<SendableRecordBatchStream>,
-    curr: usize
+    curr: usize,
 }
 
 impl RecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        Self { inputs: vec![exec_node], curr: 0 }
+        Self {
+            inputs: vec![exec_node],
+            curr: 0,
+        }
     }
 
     pub fn from_vec(nodes: Vec<SendableRecordBatchStream>) -> Self {
-        Self { inputs: nodes, curr: 0 }
+        Self {
+            inputs: nodes,
+            curr: 0,
+        }
     }
 
     fn schema(&self) -> SchemaRef {
@@ -509,21 +540,17 @@ impl Stream for RecordBatchStream {
         let schema = self.schema();
         let mut this = self.project();
         match this.inputs[*this.curr].poll_next_unpin(cx) {
-            Poll::Ready(result) => {
-                match result {
-                    Some(rs) => {
-                        Poll::Ready(Some(rs.map_err(|e| Error::IO(e.to_string()))))
-                    }
-                    None => {
-                        if *this.curr == this.inputs.len() - 1 {
-                            Poll::Ready(None)
-                        } else {
-                            *this.curr += 1;
-                            Poll::Ready(Some(Ok(RecordBatch::new_empty(schema))))
-                        }
+            Poll::Ready(result) => match result {
+                Some(rs) => Poll::Ready(Some(rs.map_err(|e| Error::IO(e.to_string())))),
+                None => {
+                    if *this.curr == this.inputs.len() - 1 {
+                        Poll::Ready(None)
+                    } else {
+                        *this.curr += 1;
+                        Poll::Ready(Some(Ok(RecordBatch::new_empty(schema))))
                     }
                 }
-            }
+            },
             Poll::Pending => Poll::Pending,
         }
     }
