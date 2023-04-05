@@ -185,3 +185,15 @@ def test_tilde_paths(tmp_path: Path):
     # works with the resolved absolute path
     ds = lance.dataset(expected_abs_path)
     assert ds.to_table() == table
+
+
+def test_to_batches(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    batches = dataset.to_batches()
+    assert pa.Table.from_batches(batches) == table
+
+
