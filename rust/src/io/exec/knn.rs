@@ -44,11 +44,16 @@ pub struct KNNFlatStream {
 impl KNNFlatStream {
     /// Construct a [KNNFlat] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
+        let stream = RecordBatchStream::new(child);
+        KNNFlatStream::from_stream(stream, query)
+    }
+
+    fn from_stream(stream: RecordBatchStream, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batch = match flat_search(RecordBatchStream::new(child), &q).await {
+            let batch = match flat_search(stream, &q).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
@@ -186,8 +191,10 @@ impl ExecutionPlan for KNNFlatExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(KNNFlatStream::new(input_stream, &self.query)))
+        Ok(Box::pin(KNNFlatStream::new(
+            self.input.execute(partition, context)?,
+            &self.query,
+        )))
     }
 
     fn statistics(&self) -> Statistics {

@@ -38,3 +38,25 @@ pub(crate) fn simd_alignment() -> i32 {
 
     1
 }
+
+/// Is the pointer aligned to the given alignment?
+fn is_simd_aligned(ptr: *const f32, alignment: usize) -> bool {
+    ptr as usize % alignment == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::Float32Array;
+
+    #[test]
+    fn test_is_simd_aligned() {
+        let arr = Float32Array::from_iter([1.9, 2.3, 3.4, 4.5]);
+        assert!(is_simd_aligned(arr.values().as_ptr(), 32));
+
+        unsafe {
+            assert!(!is_simd_aligned(arr.values().as_ptr().add(3), 32));
+        }
+    }
+}

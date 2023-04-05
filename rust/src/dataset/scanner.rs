@@ -24,7 +24,8 @@ use datafusion::execution::{
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
 use datafusion::physical_plan::{
-    filter::FilterExec, limit::GlobalLimitExec, ExecutionPlan, SendableRecordBatchStream,
+    filter::FilterExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan,
+    SendableRecordBatchStream,
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
@@ -32,7 +33,7 @@ use futures::stream::{Stream, StreamExt};
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
 use crate::datatypes::Schema;
-use crate::format::Index;
+use crate::format::{Fragment, Index};
 use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
@@ -378,11 +379,14 @@ impl Scanner {
             let knn_node = self.ann(q, &index)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
-            let knn_node = if q.refine_factor.is_some() {
+            let mut knn_node = if q.refine_factor.is_some() {
                 self.flat_knn(knn_node_with_vector, q)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
+
+            knn_node = self.knn_combined(&q, index, knn_node).await?;
+
             Ok(knn_node)
         } else {
             // No index found. use flat search.
@@ -393,11 +397,61 @@ impl Scanner {
         }
     }
 
+    /// Combine ANN results with KNN results for data appended after index creation
+    async fn knn_combined(
+        &self,
+        q: &&Query,
+        index: &Index,
+        knn_node: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Check if we've created new versions since the index
+        let version = index.dataset_version;
+        if version != self.dataset.version().version {
+            // If we've added more rows, then we'll have new fragments
+            let ds = self.dataset.checkout_version(version).await?;
+            let max_fragment_id_idx = ds
+                .manifest
+                .max_fragment_id()
+                .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
+            let max_fragment_id_ds = self
+                .dataset
+                .manifest
+                .max_fragment_id()
+                .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
+            // If we have new fragments, then we need to do a combined search
+            if max_fragment_id_idx < max_fragment_id_ds {
+                let vector_scan_projection =
+                    Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
+                let scan_node = self.scan_fragments(
+                    true,
+                    vector_scan_projection,
+                    Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
+                );
+                // first we do flat search on just the new data
+                let topk_appended = self.flat_knn(scan_node, q)?;
+                // union
+                let unioned = UnionExec::new(vec![topk_appended, knn_node]);
+                // then we do a flat search on KNN(new data) + ANN(indexed data)
+                return self.flat_knn(Arc::new(unioned), q);
+            }
+        }
+        Ok(knn_node)
+    }
+
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+        self.scan_fragments(with_row_id, projection, self.dataset.fragments().clone())
+    }
+
+    fn scan_fragments(
+        &self,
+        with_row_id: bool,
+        projection: Arc<Schema>,
+        fragments: Arc<Vec<Fragment>>,
+    ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
-            self.dataset.fragments().clone(),
+            fragments,
             projection,
             self.batch_size,
             PREFETCH_SIZE,
@@ -452,6 +506,10 @@ pub struct RecordBatchStream {
 impl RecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.exec_node.schema()
     }
 }
 

@@ -19,11 +19,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
+use arrow::datatypes::Float32Type;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use futures::future;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
 use super::{Query, VectorIndex, SCORE_COL};
@@ -64,6 +66,10 @@ pub async fn flat_search(
     query: &Query,
 ) -> Result<RecordBatch> {
     let batches = stream
+        .filter(|batch| {
+            let pred = batch.as_ref().map(|b| b.num_rows() > 0).unwrap_or(false);
+            future::ready(pred)
+        })
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
@@ -80,7 +86,12 @@ pub async fn flat_search(
                 .clone();
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
             let scores = tokio::task::spawn_blocking(move || {
-                mt.func()(&k, as_primitive_array(flatten_vectors.as_ref()), k.len()).unwrap()
+                mt.func()(
+                    k.values(),
+                    as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
+                    k.len(),
+                )
+                .unwrap()
             })
             .await? as ArrayRef;
 

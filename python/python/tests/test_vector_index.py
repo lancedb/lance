@@ -68,8 +68,9 @@ def indexed_dataset(tmp_path):
     )
 
 
-def run(ds):
-    q = np.random.randn(768)
+def run(ds, q=None, assert_func=None):
+    if q is None:
+        q = np.random.randn(768)
     project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
@@ -109,6 +110,8 @@ def run(ds):
                     assert len(rs) == 10
                     scores = rs["score"].to_numpy()
                     assert (scores.max() - scores.min()) > 1e-6
+                    if assert_func is not None:
+                        assert_func(rs)
     return times
 
 
@@ -122,6 +125,26 @@ def test_flat(dataset):
 )
 def test_ann(indexed_dataset):
     print(run(indexed_dataset))
+
+
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
+def test_ann_append(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+    )
+    new_data = create_table(nvec=100)
+    dataset = lance.write_dataset(new_data, dataset.uri, mode="append")
+    q = new_data["vector"][0].as_py()
+
+    def func(rs: pa.Table):
+        assert rs["vector"][0].as_py() == q
+
+    print(run(dataset, q=np.array(q), assert_func=func))
 
 
 @pytest.mark.skipif(

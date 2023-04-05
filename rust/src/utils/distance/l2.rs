@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Float32Array};
+use arrow_array::Float32Array;
 
+use super::is_simd_aligned;
 use crate::Result;
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
@@ -53,20 +54,12 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     results[0]
 }
 
-/// Calculate L2 distance directly using Arrow compute kernels.
-///
 #[inline]
-pub fn l2_distance_arrow(from: &Float32Array, to: &Float32Array) -> f32 {
-    let a = from.values();
-    let b = to.values();
-    let mut d = 0.0;
-    // Better chance to auto-vectorization.
-    let l = a.len();
-    for i in 0..l {
-        let s = a[i] - b[i];
-        d += s * s;
-    }
-    d
+fn l2_distance_slow(from: &[f32], to: &[f32]) -> f32 {
+    from.iter()
+        .zip(to.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum()
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -86,14 +79,8 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     vaddvq_f32(sum)
 }
 
-fn l2_distance_simd(
-    from: &Float32Array,
-    to: &Float32Array,
-    dimension: usize,
-) -> Result<Arc<Float32Array>> {
+fn l2_distance_simd(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Float32Array>> {
     let n = to.len() / dimension;
-    let from_vector = from.values();
-    let to_buffer = to.values();
 
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
@@ -101,18 +88,12 @@ fn l2_distance_simd(
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
-                        euclidean_distance_fma(
-                            from_vector,
-                            &to_buffer[idx * dimension..(idx + 1) * dimension],
-                        )
+                        euclidean_distance_fma(from, &to[idx * dimension..(idx + 1) * dimension])
                     }
 
                     #[cfg(any(target_arch = "aarch64"))]
                     {
-                        l2_distance_neon(
-                            from_vector,
-                            &to_buffer[idx * dimension..(idx + 1) * dimension],
-                        )
+                        l2_distance_neon(from, &to[idx * dimension..(idx + 1) * dimension])
                     }
                 })
                 .map(Some),
@@ -121,17 +102,24 @@ fn l2_distance_simd(
     Ok(Arc::new(scores))
 }
 
-pub fn l2_distance(
-    from: &Float32Array,
-    to: &Float32Array,
-    dimension: usize,
-) -> Result<Arc<Float32Array>> {
+/// Compute L2 distance
+///
+/// Parameters
+///
+/// - `from`: the vector to compute distance from.
+/// - `to`: a list of vectors to compute distance to.
+/// - `dimension`: the dimension of the vectors.
+pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Float32Array>> {
     assert_eq!(from.len(), dimension);
     assert_eq!(to.len() % dimension, 0);
 
     #[cfg(any(target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
+        if is_x86_feature_detected!("fma")
+            && is_simd_aligned(from.as_ptr(), 32)
+            && is_simd_aligned(to.as_ptr(), 32)
+            && from.len() % 8 == 0
+        {
             return l2_distance_simd(from, to, dimension);
         }
     }
@@ -139,23 +127,20 @@ pub fn l2_distance(
     #[cfg(any(target_arch = "aarch64"))]
     {
         use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+        if is_aarch64_feature_detected!("neon")
+            && is_simd_aligned(from.as_ptr(), 16)
+            && is_simd_aligned(to.as_ptr(), 16)
+            && from.len() % 4 == 0
+        {
             return l2_distance_simd(from, to, dimension);
         }
     }
 
-    // Fallback
-    use arrow_array::cast::as_primitive_array;
-    let n = to.len() / dimension;
+    // Fallback to slow version
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
-            (0..n)
-                .map(|idx| {
-                    l2_distance_arrow(
-                        from,
-                        as_primitive_array(to.slice(idx * dimension, dimension).as_ref()),
-                    )
-                })
+            to.chunks_exact(dimension)
+                .map(|v| l2_distance_slow(from, v))
                 .map(Some),
         )
     };
@@ -182,7 +167,12 @@ mod tests {
             8,
         );
         let point = Float32Array::from((2..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance(&point, as_primitive_array(mat.values().as_ref()), 8).unwrap();
+        let scores = l2_distance(
+            point.values(),
+            as_primitive_array::<Float32Type>(mat.values().as_ref()).values(),
+            8,
+        )
+        .unwrap();
 
         assert_eq!(
             scores.as_ref(),
@@ -191,10 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn test_not_aligned() {
+        let mat = (0..6)
+            .chain(0..8)
+            .chain(1..9)
+            .chain(2..10)
+            .chain(3..11)
+            .map(|v| v as f32)
+            .collect::<Vec<_>>();
+        let point = Float32Array::from((0..10).map(|v| Some(v as f32)).collect::<Vec<_>>());
+        let scores = l2_distance(&point.values()[2..], &mat[6..], 8).unwrap();
+
+        assert_eq!(
+            scores.as_ref(),
+            &Float32Array::from(vec![32.0, 8.0, 0.0, 8.0])
+        );
+    }
+    #[test]
     fn test_odd_length_vector() {
         let mat = Float32Array::from_iter((0..5).map(|v| Some(v as f32)));
         let point = Float32Array::from((2..7).map(|v| Some(v as f32)).collect::<Vec<_>>());
-        let scores = l2_distance(&point, &mat, 5).unwrap();
+        let scores = l2_distance(point.values(), mat.values(), 5).unwrap();
 
         assert_eq!(scores.as_ref(), &Float32Array::from(vec![20.0]));
     }
@@ -246,7 +253,7 @@ mod tests {
         ]
         .into();
 
-        let d = l2_distance(&q, &values, 32).unwrap();
+        let d = l2_distance(q.values(), values.values(), 32).unwrap();
         assert_relative_eq!(0.31935785197341404, d.value(0));
     }
 }
