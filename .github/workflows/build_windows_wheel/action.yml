@@ -22,6 +22,7 @@ runs:
     - name: Build wheel
       env:
         VCPKG_ROOT: C:\vcpkg
+        PROTOC: C:\vcpkg\installed\x64-windows\tools\protobuf
       uses: PyO3/maturin-action@v1
       with:
         command: build

@@ -40,4 +40,4 @@ runs:
       run: |
         vcpkg install openblas --triplet x64-windows-static-md
         vcpkg install lapack --triplet x64-windows-static-md
-        vcpkg install protobuf
+        vcpkg install protobuf --triplet x64-windows
