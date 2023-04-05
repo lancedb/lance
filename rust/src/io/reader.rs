@@ -206,7 +206,8 @@ impl<'a> FileReader<'a> {
 
     /// Read a range of records into one batch.
     ///
-    /// Note that it might call concat if the range is crossing multiple batches.
+    /// Note that it might call concat if the range is crossing multiple batches, which
+    /// makes it less efficient than [`FileReader::read_batch()`].
     pub(crate) async fn read_range(
         &self,
         range: Range<usize>,
@@ -1210,13 +1211,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_ranges() {
         // create a record batch with a null array column
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int64, false),
-        ]);
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from_iter_values(0..100)),
-        ];
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..100))];
         let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
 
         // write to a lance file
