@@ -25,7 +25,6 @@ use crate::{utils::distance::is_simd_aligned, Result};
 /// Fallback Cosine Distance function.
 fn cosine_dist_slow(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
     assert_eq!(from.len(), dimension);
-    let n = to.len() / dimension;
 
     let distances: Float32Array = to
         .chunks_exact(dimension)
