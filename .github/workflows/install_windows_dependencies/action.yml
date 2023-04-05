@@ -34,7 +34,7 @@ runs:
       run: |
         cd $env:VCPKG_INSTALLATION_ROOT
         git pull
-        .\bootstrap-vcpkg.bat
+        .\bootstrap-vcpkg.bat --disable-metrics
     - name: Setup Dependencies with vcpkg
       shell: powershell
       run: |
