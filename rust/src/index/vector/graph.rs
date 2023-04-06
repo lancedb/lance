@@ -17,7 +17,10 @@
 
 use crate::Result;
 
+// TODO: remove dead_code after implementing the index.
+#[allow(dead_code)]
 mod builder;
+#[allow(dead_code)]
 mod persisted;
 
 /// Vertex (metadata). It does not include the actual data.

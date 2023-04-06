@@ -14,10 +14,7 @@
 
 //! Graph in memory.
 
-use std::any::Any;
-
 use super::Vertex;
-use crate::Result;
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
@@ -86,6 +83,7 @@ mod tests {
     use approx::assert_relative_eq;
 
     use super::*;
+    use crate::Result;
 
     struct FooVertex {
         id: u32,

@@ -17,8 +17,7 @@ use std::sync::{Arc, Mutex};
 use arrow::array::{as_list_array, as_primitive_array};
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
-    iterator::FixedSizeBinaryIter,
-    Array, ArrayAccessor, RecordBatch, UInt32Array,
+    Array, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lru_time_cache::LruCache;
