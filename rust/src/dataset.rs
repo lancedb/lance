@@ -35,7 +35,7 @@ mod write;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
-use crate::format::{pb, Fragment, Index, Manifest};
+use crate::format::{pb, Fragment, Index, Manifest, pb::IndexMetadata};
 use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams};
 use crate::index::vector::pq::PQBuildParams;
 use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
@@ -668,6 +668,19 @@ impl Dataset {
                 .iter()
                 .map(Index::try_from)
                 .collect::<Result<Vec<_>>>()?)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    pub async fn get_index_metadata(&self) -> Result<Vec<IndexMetadata>> {
+        if let Some(pos) = self.manifest.index_section.as_ref() {
+            let manifest_file = self.manifest_file(self.version().version);
+
+            let reader = self.object_store.open(&manifest_file).await?;
+            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
+
+            Ok(section.indices.iter().map(|idx| idx.clone()).collect::<Vec<_>>())
         } else {
             Ok(vec![])
         }

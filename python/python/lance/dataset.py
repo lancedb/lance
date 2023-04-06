@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from functools import cached_property, cache
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Iterator, Optional, Union, List, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -54,6 +55,14 @@ class LanceDataset(pa.dataset.Dataset):
         The location of the data
         """
         return self._uri
+
+    @cache
+    def list_indices(self) -> List[Dict[str, Any]]:
+        return self._ds.get_index_metadata()
+
+    @property
+    def has_index(self):
+        return len(self.list_indices()) > 0
 
     def scanner(
         self,

@@ -27,6 +27,7 @@ use pyo3::prelude::*;
 use pyo3::types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
+use uuid;
 
 use crate::Scanner;
 use lance::dataset::{
@@ -75,6 +76,22 @@ impl Dataset {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    fn get_index_metadata(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let index_metadata = self_.rt.block_on(async { self_.ds.get_index_metadata().await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let py = self_.py();
+        Ok(index_metadata.iter().map(|idx| {
+            let dict = PyDict::new(py);
+            
+            dict.set_item("name", idx.name.clone()).unwrap();
+            dict.set_item("uuid", uuid::Uuid.from_bytes_ref().unwrap();
+            dict.set_item("fields", idx.fields.clone())
+                .unwrap();
+            dict.set_item("version", idx.dataset_version.clone()).unwrap();
+            dict.to_object(py)
+        }).collect::<Vec<_>>())
     }
 
     fn scanner(
