@@ -258,10 +258,6 @@ mod tests {
             return 20;
         }
 
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         fn to_bytes(&self) -> Vec<u8> {
             let mut bytes = Vec::with_capacity(20);
             bytes.extend_from_slice(&self.row_id.to_le_bytes());

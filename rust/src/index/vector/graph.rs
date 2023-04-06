@@ -16,7 +16,6 @@
 //!
 
 use crate::Result;
-use std::any::Any;
 
 mod builder;
 mod persisted;
@@ -29,6 +28,4 @@ pub trait Vertex: Sized {
 
     // TODO: impl as Into trait?
     fn to_bytes(&self) -> Vec<u8>;
-
-    fn as_any(&self) -> &dyn Any;
 }

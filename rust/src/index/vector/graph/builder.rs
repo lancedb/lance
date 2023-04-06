@@ -110,10 +110,6 @@ mod tests {
             bytes.extend_from_slice(&self.val.to_le_bytes());
             bytes
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     #[test]
