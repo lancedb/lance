@@ -14,15 +14,19 @@
 
 use std::sync::{Arc, Mutex};
 
-use arrow_array::UInt32Array;
-use arrow_schema::DataType;
+use arrow_array::{
+    builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
+    RecordBatch, UInt32Array,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
+use super::builder::GraphBuilder;
 use super::Vertex;
 use crate::arrow::as_fixed_size_binary_array;
 use crate::datatypes::Schema;
-use crate::io::{FileReader, ObjectStore};
+use crate::io::{FileReader, FileWriter, ObjectStore};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
@@ -123,22 +127,95 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
     }
 }
 
+/// Parameters for writing the graph index.
+pub struct WriteGraphParams {
+    pub batch_size: usize,
+}
+
+impl Default for WriteGraphParams {
+    fn default() -> Self {
+        Self { batch_size: 10240 }
+    }
+}
+
+/// Write the graph to a file.
+pub async fn write_graph<V: Vertex>(
+    graph: &GraphBuilder<V>,
+    object_store: &ObjectStore,
+    path: &Path,
+    params: &WriteGraphParams,
+) -> Result<()> {
+    if graph.is_empty() {
+        return Err(Error::Index("Invalid graph".to_string()));
+    }
+    let binary_size = graph.vertex(0).byte_length();
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(
+            "vertex",
+            DataType::FixedSizeBinary(binary_size as i32),
+            false,
+        ),
+        Field::new(
+            "neighbors",
+            DataType::List(Box::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+    ]));
+    let schema = Schema::try_from(arrow_schema.as_ref())?;
+
+    let mut writer = FileWriter::try_new(object_store, path, &schema).await?;
+    for nodes in graph.nodes.as_slice().chunks(params.batch_size) {
+        let mut vertex_builder =
+            FixedSizeBinaryBuilder::with_capacity(nodes.len(), binary_size as i32);
+        let total_neighbors = nodes.iter().map(|node| node.neighbors.len()).sum();
+        let inner_builder = UInt32Builder::with_capacity(total_neighbors);
+        let mut neighbors_builder = ListBuilder::with_capacity(inner_builder, nodes.len());
+        for node in nodes {
+            vertex_builder.append_value(node.vertex.to_bytes())?;
+            neighbors_builder
+                .values()
+                .append_slice(node.neighbors.as_slice());
+            neighbors_builder.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(vertex_builder.finish()),
+                Arc::new(neighbors_builder.finish()),
+            ],
+        )
+        .unwrap();
+        writer.write(&[&batch]).await?;
+    }
+
+    writer.finish().await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct TestVertex {
+    struct FooVertex {
         row_id: u32,
         pq: Vec<u8>,
     }
 
-    impl Vertex for TestVertex {
+    impl Vertex for FooVertex {
         fn byte_length(&self) -> usize {
             return 20;
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+
+        fn to_bytes(&self) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(20);
+            bytes.extend_from_slice(&self.row_id.to_le_bytes());
+            bytes.extend_from_slice(&self.pq[..16]);
+            bytes
         }
 
         fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -159,7 +236,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/graph");
 
-        let graph = PersistedGraph::<TestVertex>::try_new(&store, &path)
+        let graph = PersistedGraph::<FooVertex>::try_new(&store, &path)
             .await
             .unwrap();
     }

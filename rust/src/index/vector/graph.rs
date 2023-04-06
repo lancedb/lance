@@ -18,7 +18,7 @@
 use crate::Result;
 use std::any::Any;
 
-mod memory;
+mod builder;
 mod persisted;
 
 /// Vertex (metadata). It does not include the actual data.
@@ -26,6 +26,9 @@ pub trait Vertex: Sized {
     fn byte_length(&self) -> usize;
 
     fn from_bytes(data: &[u8]) -> Result<Self>;
+
+    // TODO: impl as Into trait?
+    fn to_bytes(&self) -> Vec<u8>;
 
     fn as_any(&self) -> &dyn Any;
 }
