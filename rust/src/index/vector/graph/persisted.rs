@@ -34,6 +34,25 @@ use crate::{Error, Result};
 const NEIGHBORS_COL: &str = "neighbors";
 const VERTEX_COL: &str = "vertex";
 
+/// Parameters for reading a persisted graph.
+pub struct GraphReadParams {
+    pub prefetch_byte_size: usize,
+
+    pub vertex_cache_size: usize,
+
+    pub neighbors_cache_size: usize,
+}
+
+impl Default for GraphReadParams {
+    fn default() -> Self {
+        Self {
+            prefetch_byte_size: 8 * 1024,
+            vertex_cache_size: 100_000,
+            neighbors_cache_size: 1024,
+        }
+    }
+}
+
 /// Persisted graph on disk, stored in the file.
 pub struct PersistedGraph<'a, V: Vertex> {
     reader: FileReader<'a>,
@@ -53,7 +72,8 @@ pub struct PersistedGraph<'a, V: Vertex> {
     /// Projection of the neighbors column.
     neighbors_projection: Schema,
 
-    prefetch_byte_size: usize,
+    /// Read parameters.
+    params: GraphReadParams,
 }
 
 impl<'a, V: Vertex> PersistedGraph<'a, V> {
@@ -61,6 +81,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
     pub async fn try_new(
         object_store: &'a ObjectStore,
         path: &Path,
+        params: GraphReadParams,
     ) -> Result<PersistedGraph<'a, V>> {
         let file_reader = FileReader::try_new(object_store, path).await?;
 
@@ -87,10 +108,14 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
             reader: file_reader,
             vertex_size,
             vertex_projection,
-            cache: Arc::new(Mutex::new(LruCache::with_capacity(1000000))),
-            neighbors_cache: Arc::new(Mutex::new(LruCache::with_capacity(1000))),
+            cache: Arc::new(Mutex::new(LruCache::with_capacity(
+                params.vertex_cache_size,
+            ))),
+            neighbors_cache: Arc::new(Mutex::new(LruCache::with_capacity(
+                params.neighbors_cache_size,
+            ))),
             neighbors_projection,
-            prefetch_byte_size: 8196, // 8MB
+            params,
         })
     }
 
@@ -107,7 +132,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
                 return Ok(vertex.clone());
             }
         }
-        let prefetch_size = self.prefetch_byte_size / self.vertex_size + 1;
+        let prefetch_size = self.params.prefetch_byte_size / self.vertex_size + 1;
         let end = std::cmp::min(self.len(), id as usize + prefetch_size);
         let batch = self
             .reader
@@ -277,7 +302,7 @@ mod tests {
             .await
             .unwrap();
 
-        let graph = PersistedGraph::<FooVertex>::try_new(&store, &path)
+        let graph = PersistedGraph::<FooVertex>::try_new(&store, &path, GraphReadParams::default())
             .await
             .unwrap();
         let vertex = graph.vertex(77).await.unwrap();
