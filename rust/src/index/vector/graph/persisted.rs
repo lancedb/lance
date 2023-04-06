@@ -24,7 +24,7 @@ use lru_time_cache::LruCache;
 use object_store::path::Path;
 
 use super::builder::GraphBuilder;
-use super::Vertex;
+use super::{Vertex, VertexSerDe};
 use crate::arrow::as_fixed_size_binary_array;
 use crate::datatypes::Schema;
 use crate::io::{FileReader, FileWriter, ObjectStore};
@@ -53,7 +53,7 @@ impl Default for GraphReadParams {
 }
 
 /// Persisted graph on disk, stored in the file.
-pub struct PersistedGraph<V: Vertex> {
+pub(crate) struct PersistedGraph<V: Vertex> {
     reader: FileReader,
 
     /// Vertex size in bytes.
@@ -73,14 +73,18 @@ pub struct PersistedGraph<V: Vertex> {
 
     /// Read parameters.
     params: GraphReadParams,
+
+    /// SerDe for vertex.
+    serde: Box<dyn VertexSerDe<V>>,
 }
 
-impl<'a, V: Vertex> PersistedGraph<V> {
+impl<V: Vertex> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
-    pub async fn try_new(
-        object_store: &'a ObjectStore,
+    pub(crate) async fn try_new(
+        object_store: &ObjectStore,
         path: &Path,
         params: GraphReadParams,
+        serde: Box<dyn VertexSerDe<V>>,
     ) -> Result<PersistedGraph<V>> {
         let file_reader = FileReader::try_new(object_store, path).await?;
 
@@ -115,6 +119,7 @@ impl<'a, V: Vertex> PersistedGraph<V> {
             ))),
             neighbors_projection,
             params,
+            serde,
         })
     }
 
@@ -142,7 +147,7 @@ impl<'a, V: Vertex> PersistedGraph<V> {
             let mut cache = self.cache.lock().unwrap();
             let array = as_fixed_size_binary_array(batch.column(0));
             for (i, vertex_bytes) in array.iter().enumerate() {
-                let vertex = V::from_bytes(vertex_bytes.unwrap())?;
+                let vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
             Ok(cache.get(&id).unwrap().clone())
@@ -189,16 +194,17 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub async fn write_graph<V: Vertex>(
+pub(crate) async fn write_graph<V: Vertex>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,
     params: &WriteGraphParams,
+    serde: &impl VertexSerDe<V>,
 ) -> Result<()> {
     if graph.is_empty() {
         return Err(Error::Index("Invalid graph".to_string()));
     }
-    let binary_size = graph.vertex(0).byte_length();
+    let binary_size = serde.size();
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
         Field::new(
             "vertex",
@@ -222,7 +228,7 @@ pub async fn write_graph<V: Vertex>(
         let mut neighbors_builder = ListBuilder::with_capacity(inner_builder, nodes.len());
         for node in nodes {
             // Serialize the vertex metadata to fixed size binary bytes.
-            vertex_builder.append_value(node.vertex.to_bytes())?;
+            vertex_builder.append_value(serde.serialize(&node.vertex))?;
             neighbors_builder
                 .values()
                 .append_slice(node.neighbors.as_slice());
@@ -250,31 +256,30 @@ mod tests {
 
     struct FooVertex {
         row_id: u32,
+        // 16 bytes
         pq: Vec<u8>,
     }
 
-    impl Vertex for FooVertex {
-        fn byte_length(&self) -> usize {
-            return 20;
-        }
+    impl Vertex for FooVertex {}
 
-        fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes = Vec::with_capacity(20);
-            bytes.extend_from_slice(&self.row_id.to_le_bytes());
-            bytes.extend_from_slice(&self.pq[..16]);
+    struct FooVertexSerDe {}
+
+    impl VertexSerDe<FooVertex> for FooVertexSerDe {
+        fn serialize(&self, vertex: &FooVertex) -> Vec<u8> {
+            let mut bytes = vec![];
+            bytes.extend_from_slice(&vertex.row_id.to_le_bytes());
+            bytes.extend_from_slice(&vertex.pq);
             bytes
         }
 
-        fn from_bytes(data: &[u8]) -> Result<Self> {
-            if data.len() != 20 {
-                return Err(Error::Index(format!(
-                    "Invalid vertex size, expected: 20, got: {}",
-                    data.len()
-                )));
-            }
-            let row_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            let pq = data[4..].to_vec();
-            Ok(Self { row_id, pq })
+        fn deserialize(&self, bytes: &[u8]) -> Result<FooVertex> {
+            let row_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let pq = bytes[4..].to_vec();
+            Ok(FooVertex { row_id, pq })
+        }
+
+        fn size(&self) -> usize {
+            20
         }
     }
 
@@ -294,13 +299,21 @@ mod tests {
                 builder.add_edge(i, j);
             }
         }
-        write_graph(&builder, &store, &path, &WriteGraphParams::default())
-            .await
-            .unwrap();
+        let serde = Box::new(FooVertexSerDe {});
+        write_graph(
+            &builder,
+            &store,
+            &path,
+            &WriteGraphParams::default(),
+            serde.as_ref(),
+        )
+        .await
+        .unwrap();
 
-        let graph = PersistedGraph::<FooVertex>::try_new(&store, &path, GraphReadParams::default())
-            .await
-            .unwrap();
+        let graph =
+            PersistedGraph::<FooVertex>::try_new(&store, &path, GraphReadParams::default(), serde)
+                .await
+                .unwrap();
         let vertex = graph.vertex(77).await.unwrap();
         assert_eq!(vertex.row_id, 77);
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 
+mod diskann;
 pub mod flat;
 mod graph;
 pub mod ivf;
@@ -195,6 +196,11 @@ impl VectorIndexParams {
             max_iterations,
             max_opq_iterations: max_iterations,
         }
+    }
+
+    /// Create index parameters for `DiskANN` index.
+    pub fn diskann() -> Self {
+        todo!("DiskANN is not supported yet")
     }
 }
 

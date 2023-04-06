@@ -63,8 +63,14 @@ impl<V: Vertex> GraphBuilder<V> {
         &mut self.nodes[id].neighbors
     }
 
-    pub fn add_edge(&mut self, from: usize, to: usize) {
-        self.nodes[from].neighbors.push(to as u32);
+    /// Set neighbors of a node.
+    pub fn set_neighbors(&mut self, id: usize, neighbors: impl Into<Vec<u32>>) {
+        self.nodes[id].neighbors = neighbors.into();
+    }
+
+    /// Add a neighbor to a specific vertex.
+    pub fn add_neighbor(&mut self, vertex: usize, neighbor: usize) {
+        self.nodes[vertex].neighbors.push(neighbor as u32);
     }
 }
 
@@ -87,32 +93,13 @@ mod tests {
     use approx::assert_relative_eq;
 
     use super::*;
-    use crate::Result;
 
     struct FooVertex {
         id: u32,
         val: f32,
     }
 
-    impl Vertex for FooVertex {
-        fn byte_length(&self) -> usize {
-            8
-        }
-
-        fn from_bytes(data: &[u8]) -> Result<Self> {
-            Ok(Self {
-                id: u32::from_le_bytes(data[0..4].try_into().unwrap()),
-                val: f32::from_le_bytes(data[4..8].try_into().unwrap()),
-            })
-        }
-
-        fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes = vec![];
-            bytes.extend_from_slice(&self.id.to_le_bytes());
-            bytes.extend_from_slice(&self.val.to_le_bytes());
-            bytes
-        }
-    }
+    impl Vertex for FooVertex {}
 
     #[test]
     fn test_construct_builder() {
