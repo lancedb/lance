@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import os
+import pickle
 import platform
 import time
 from datetime import datetime
@@ -197,3 +198,12 @@ def test_to_batches(tmp_path: Path):
     assert pa.Table.from_batches(batches) == table
 
 
+def test_pickle(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    pickled = pickle.dumps(dataset)
+    unpickled = pickle.loads(pickled)
+    assert dataset.to_table() == unpickled.to_table()
