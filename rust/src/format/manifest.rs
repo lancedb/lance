@@ -23,6 +23,7 @@ use prost_types::Timestamp;
 
 use super::Fragment;
 use crate::datatypes::Schema;
+use crate::error::{Error, Result};
 use crate::format::{pb, ProtoStruct};
 
 /// Manifest of a dataset
@@ -76,6 +77,30 @@ impl Manifest {
             NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN),
             Utc,
         )
+    }
+
+    /// Return the max fragment id.
+    /// Note this does not support recycling of fragment ids.
+    pub fn max_fragment_id(&self) -> Option<u64> {
+        self.fragments.iter().map(|f| f.id).max()
+    }
+
+    /// Return the fragments that are newer than the given manifest.
+    /// Note this does not support recycling of fragment ids.
+    pub fn fragments_since(&self, since: &Manifest) -> Result<Vec<Fragment>> {
+        if since.version >= self.version {
+            return Err(Error::IO(format!(
+                "fragments_since: given version {} is newer than manifest version {}",
+                since.version, self.version
+            )));
+        }
+        let start = since.max_fragment_id();
+        Ok(self
+            .fragments
+            .iter()
+            .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
+            .map(|f| f.clone())
+            .collect())
     }
 }
 

@@ -56,7 +56,7 @@ const DATA_DIR: &str = "data";
 #[derive(Debug, Clone)]
 pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
-    base: Path,
+    pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
 }
 
@@ -126,6 +126,13 @@ impl Dataset {
         Self::checkout_manifest(object_store, base_path, &manifest_file).await
     }
 
+    /// Check out the specified version of this dataset
+    pub async fn checkout_version(&self, version: u64) -> Result<Self> {
+        let base_path = self.object_store.base_path().clone();
+        let manifest_file = manifest_path(&base_path, version);
+        Self::checkout_manifest(self.object_store.clone(), base_path, &manifest_file).await
+    }
+
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -193,14 +200,16 @@ impl Dataset {
         }
         let params = params; // discard mut
 
-        // append + input schema different from existing schema = error
-        let latest_manifest = if matches!(params.mode, WriteMode::Create) {
+        let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(read_manifest(&object_store, &latest_manifest_path).await?)
+            Some(Dataset::open(uri).await?)
         };
+
+        // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
-            if let Some(m) = latest_manifest.as_ref() {
+            if let Some(d) = dataset.as_ref() {
+                let m = d.manifest.as_ref();
                 if schema != m.schema {
                     return Err(Error::IO(format!(
                         "Append with different schema: original={} new={}",
@@ -211,8 +220,9 @@ impl Dataset {
         }
 
         let mut fragment_id = if matches!(params.mode, WriteMode::Append) {
-            latest_manifest.as_ref().map_or(0, |m| {
-                m.fragments
+            dataset.as_ref().map_or(0, |d| {
+                d.manifest
+                    .fragments
                     .iter()
                     .map(|f| f.id)
                     .max()
@@ -226,23 +236,13 @@ impl Dataset {
         };
 
         let mut fragments: Vec<Fragment> = if matches!(params.mode, WriteMode::Append) {
-            latest_manifest
+            dataset
                 .as_ref()
-                .map_or(vec![], |m| m.fragments.as_ref().clone())
+                .map_or(vec![], |d| d.manifest.fragments.as_ref().clone())
         } else {
             // Create or Overwrite create new fragments.
             vec![]
         };
-
-        macro_rules! new_writer {
-            () => {{
-                let file_path = format!("{}.lance", Uuid::new_v4());
-                let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                fragments.push(fragment);
-                fragment_id += 1;
-                Some(new_file_writer(&object_store, &file_path, &schema).await?)
-            }};
-        }
 
         let mut writer = None;
         let mut buffer = RecordBatchBuffer::empty();
@@ -252,7 +252,13 @@ impl Dataset {
             if buffer.num_rows() >= params.max_rows_per_group {
                 // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
-                    writer = new_writer!();
+                    writer = {
+                        let file_path = format!("{}.lance", Uuid::new_v4());
+                        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                        fragments.push(fragment);
+                        fragment_id += 1;
+                        Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                    }
                 };
 
                 let batches = buffer.finish()?;
@@ -273,7 +279,12 @@ impl Dataset {
         }
         if buffer.num_rows() > 0 {
             if writer.is_none() {
-                writer = new_writer!();
+                writer = {
+                    let file_path = format!("{}.lance", Uuid::new_v4());
+                    let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                    fragments.push(fragment);
+                    Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                }
             };
             let batches = buffer.finish()?;
             let batches_ref = batches.iter().map(|b| b).collect::<Vec<_>>();
@@ -290,17 +301,30 @@ impl Dataset {
         };
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
-        manifest.version = latest_manifest.map_or(1, |m| m.version + 1);
-        if matches!(params.mode, WriteMode::Overwrite) {
-            // If overwrite, invalidate index
-            manifest.index_section = None;
-        }
+        manifest.version = match dataset.as_ref() {
+            Some(d) => d
+                .latest_manifest()
+                .await
+                .map(|m| m.version + 1)
+                .unwrap_or(1),
+            None => 1,
+        };
+        // Inherit the index if we're just appending rows
+        let indices = if matches!(params.mode, WriteMode::Append) {
+            if let Some(d) = dataset.as_ref() {
+                Some(d.load_indices().await?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let duration_since_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
         let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
         manifest.timestamp_nanos = timestamp_nanos;
-        write_manifest_file(&object_store, &mut manifest, None).await?;
+        write_manifest_file(&object_store, &mut manifest, indices).await?;
 
         let base = object_store.base_path().clone();
         Ok(Self {
@@ -434,13 +458,13 @@ impl Dataset {
             }
         }
 
-        // Write index metadata down
-        let new_idx = Index::new(index_id, &index_name, &[field.id]);
-        indices.push(new_idx);
-
         let latest_manifest = self.latest_manifest().await?;
         let mut new_manifest = self.manifest.as_ref().clone();
         new_manifest.version = latest_manifest.version + 1;
+
+        // Write index metadata down
+        let new_idx = Index::new(index_id, &index_name, &[field.id], new_manifest.version);
+        indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
 
@@ -1102,14 +1126,22 @@ mod tests {
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
+        // Make sure valid arguments should create index successfully
         let mut params = VectorIndexParams::default();
         params.num_partitions = 10;
         params.num_sub_vectors = 2;
-        dataset
+        let dataset = dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
 
+        // Check the version is set correctly
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version;
+        assert_eq!(actual, expected);
+
+        // If running on a SIMD-enabled platform, check that SIMD alignment is enforced
         if simd_alignment() > 1 {
             params.num_sub_vectors = 10;
             let err = dataset
@@ -1118,6 +1150,24 @@ mod tests {
             assert!(err.is_err())
         }
 
+        // Append should inherit index
+        let mut write_params = WriteParams::default();
+        write_params.mode = WriteMode::Append;
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![vectors.clone()],
+        )
+        .unwrap()]);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let actual = indices.first().unwrap().dataset_version;
+        let expected = dataset.manifest.version - 1;
+        assert_eq!(actual, expected);
+
+        // Overwrite should invalidate index
         let mut write_params = WriteParams::default();
         write_params.mode = Overwrite;
         let batches =
@@ -1129,5 +1179,6 @@ mod tests {
             .await
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
+        assert!(dataset.load_indices().await.unwrap().is_empty());
     }
 }

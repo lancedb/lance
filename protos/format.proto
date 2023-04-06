@@ -91,6 +91,9 @@ message IndexMetadata {
 
   // Index name. Must be unique within one dataset version.
   string name = 3;
+
+  // The version of the dataset this index was built from.
+  uint64 dataset_version = 4;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.
