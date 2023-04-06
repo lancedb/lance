@@ -14,9 +14,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use arrow::array::{as_list_array, as_primitive_array};
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
-    RecordBatch, UInt32Array,
+    iterator::FixedSizeBinaryIter,
+    Array, ArrayAccessor, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lru_time_cache::LruCache;
@@ -46,7 +48,10 @@ pub struct PersistedGraph<'a, V: Vertex> {
     cache: Arc<Mutex<LruCache<u32, Arc<V>>>>,
 
     /// LRU cache for neighbors.
-    neighbors_cache: Arc<Mutex<LruCache<u32, UInt32Array>>>,
+    neighbors_cache: Arc<Mutex<LruCache<u32, Arc<UInt32Array>>>>,
+
+    /// Projection of the neighbors column.
+    neighbors_projection: Schema,
 
     prefetch_byte_size: usize,
 }
@@ -76,6 +81,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
                 "Vertex column does not exist in the graph".to_string(),
             ));
         };
+        let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
 
         Ok(Self {
             reader: file_reader,
@@ -83,6 +89,7 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
             vertex_projection,
             cache: Arc::new(Mutex::new(LruCache::with_capacity(1000000))),
             neighbors_cache: Arc::new(Mutex::new(LruCache::with_capacity(1000))),
+            neighbors_projection,
             prefetch_byte_size: 8196, // 8MB
         })
     }
@@ -101,20 +108,17 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
             }
         }
         let prefetch_size = self.prefetch_byte_size / self.vertex_size + 1;
+        let end = std::cmp::min(self.len(), id as usize + prefetch_size);
         let batch = self
             .reader
-            .read_range(
-                id as usize..id as usize + prefetch_size,
-                &self.vertex_projection,
-            )
+            .read_range(id as usize..end, &self.vertex_projection)
             .await?;
-        assert_eq!(batch.num_rows(), prefetch_size);
+        assert_eq!(batch.num_rows(), end - id as usize);
         {
             let mut cache = self.cache.lock().unwrap();
             let array = as_fixed_size_binary_array(batch.column(0));
-            for i in 0..prefetch_size {
-                let vertex_bytes = array.value(i);
-                let vertex = V::from_bytes(vertex_bytes)?;
+            for (i, vertex_bytes) in array.iter().enumerate() {
+                let vertex = V::from_bytes(vertex_bytes.unwrap())?;
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
             Ok(cache.get(&id).unwrap().clone())
@@ -122,8 +126,30 @@ impl<'a, V: Vertex> PersistedGraph<'a, V> {
     }
 
     /// Get the neighbors of a vertex, specified by its id.
-    pub async fn neighbors(&self, id: u32) -> Result<&[u32]> {
-        todo!()
+    pub async fn neighbors(&self, id: u32) -> Result<Arc<UInt32Array>> {
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+            if let Some(neighbors) = cache.get(&id) {
+                return Ok(neighbors.clone());
+            }
+        }
+        let batch = self
+            .reader
+            .read_range(id as usize..(id + 1) as usize, &self.neighbors_projection)
+            .await?;
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+
+            let array = as_list_array(batch.column(0));
+            if array.len() < 1 {
+                return Err(Error::Index("Invalid graph".to_string()));
+            }
+            let value = array.value(0);
+            let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
+            let neighbors = Arc::new(nb_array.clone());
+            cache.insert(id, neighbors.clone());
+            Ok(neighbors)
+        }
     }
 }
 
@@ -157,7 +183,7 @@ pub async fn write_graph<V: Vertex>(
         ),
         Field::new(
             "neighbors",
-            DataType::List(Box::new(Field::new("item", DataType::UInt32, false))),
+            DataType::List(Box::new(Field::new("item", DataType::UInt32, true))),
             false,
         ),
     ]));
@@ -183,8 +209,8 @@ pub async fn write_graph<V: Vertex>(
                 Arc::new(vertex_builder.finish()),
                 Arc::new(neighbors_builder.finish()),
             ],
-        )
-        .unwrap();
+        )?;
+
         writer.write(&[&batch]).await?;
     }
 
@@ -236,8 +262,33 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/graph");
 
+        let mut builder: GraphBuilder<FooVertex> = (0..100)
+            .map(|v| FooVertex {
+                row_id: v as u32,
+                pq: vec![0; 16],
+            })
+            .collect();
+        for i in 0..100 {
+            for j in i..i + 10 {
+                builder.add_edge(i, j);
+            }
+        }
+        write_graph(&builder, &store, &path, &WriteGraphParams::default())
+            .await
+            .unwrap();
+
         let graph = PersistedGraph::<FooVertex>::try_new(&store, &path)
             .await
             .unwrap();
+        let vertex = graph.vertex(77).await.unwrap();
+        assert_eq!(vertex.row_id, 77);
+
+        let vertex = graph.vertex(88).await.unwrap();
+        assert_eq!(vertex.row_id, 88);
+        let neighbors = graph.neighbors(88).await.unwrap();
+        assert_eq!(
+            neighbors.values(),
+            &[88, 89, 90, 91, 92, 93, 94, 95, 96, 97]
+        );
     }
 }

@@ -26,7 +26,9 @@ pub(crate) struct Node<V: Vertex> {
     pub(crate) neighbors: Vec<u32>,
 }
 
-/// Graph, used to build the persisted graph.
+/// A Graph that allows dynamically build graph to be persisted later.
+///
+/// It requires all vertices to be of the same size.
 pub struct GraphBuilder<V: Vertex> {
     pub(crate) nodes: Vec<Node<V>>,
 }
@@ -59,6 +61,10 @@ impl<V: Vertex> GraphBuilder<V> {
     pub fn neighbors_mut(&mut self, id: usize) -> &mut Vec<u32> {
         &mut self.nodes[id].neighbors
     }
+
+    pub fn add_edge(&mut self, from: usize, to: usize) {
+        self.nodes[from].neighbors.push(to as u32);
+    }
 }
 
 impl<V: Vertex> FromIterator<V> for GraphBuilder<V> {
@@ -77,6 +83,8 @@ impl<V: Vertex> FromIterator<V> for GraphBuilder<V> {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_relative_eq;
+
     use super::*;
 
     struct FooVertex {
@@ -110,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_construct_builder() {
-        let builder: GraphBuilder<FooVertex> = (0..100)
+        let mut builder: GraphBuilder<FooVertex> = (0..100)
             .map(|v| FooVertex {
                 id: v as u32,
                 val: v as f32 * 0.5,
@@ -119,6 +127,10 @@ mod tests {
 
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);
+        assert_relative_eq!(builder.vertex(77).val, 38.5);
         assert!(builder.neighbors(55).is_empty());
+
+        builder.vertex_mut(88).val = 22.0;
+        assert_relative_eq!(builder.vertex(88).val, 22.0);
     }
 }
