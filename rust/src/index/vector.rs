@@ -26,6 +26,7 @@ mod kmeans;
 mod opq;
 mod pq;
 mod traits;
+mod utils;
 
 use self::{ivf::IVFIndex, pq::PQIndex};
 

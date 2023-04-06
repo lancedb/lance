@@ -36,8 +36,8 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    opq::OptimizedProductQuantizer, pq::ProductQuantizer, MetricType, Query, VectorIndex,
-    INDEX_FILE_NAME,
+    opq::OptimizedProductQuantizer, pq::ProductQuantizer, utils::maybe_sample_training_data,
+    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
 use crate::{
@@ -447,34 +447,6 @@ pub struct PQBuildParams {
     pub max_opq_iters: usize,
 }
 
-async fn maybe_sample_training_data(
-    dataset: &Dataset,
-    column: &str,
-    sample_size_hint: usize,
-) -> Result<MatrixView> {
-    let num_rows = dataset.count_rows().await?;
-    let projection = dataset.schema().project(&[column])?;
-    let batch = if num_rows > sample_size_hint {
-        dataset.sample(sample_size_hint, &projection).await?
-    } else {
-        let mut scanner = dataset.scan();
-        scanner.project(&[column])?;
-        let batches = scanner
-            .try_into_stream()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
-    };
-
-    let array = batch.column_by_name(column).ok_or(Error::Index(format!(
-        "Sample training data: column {} does not exist in return",
-        column
-    )))?;
-    let fixed_size_array = as_fixed_size_list_array(array);
-    fixed_size_array.try_into()
-}
-
 /// Compute residual matrix.
 ///
 /// Parameters
@@ -553,8 +525,7 @@ pub async fn build_ivf_pq_index(
     let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
     let residual_data =
         compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
-    let pq_training_data =
-        FixedSizeListArray::try_new(residual_data.as_ref(), training_data.num_columns() as i32)?;
+    let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
 
     // The final train of PQ sub-vectors
     let pq = train_pq(&pq_training_data, pq_params).await?;
@@ -714,14 +685,13 @@ async fn write_index_file(
 }
 
 /// Train product quantization over (OPQ-rotated) residual vectors.
-async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<ProductQuantizer> {
+async fn train_pq(data: &MatrixView, params: &PQBuildParams) -> Result<ProductQuantizer> {
     let mut pq = ProductQuantizer::new(
         params.num_sub_vectors,
         params.num_bits as u32,
-        data.value_length() as usize,
+        data.num_columns(),
     );
-    let mat: MatrixView = data.try_into()?;
-    pq.train(&mat, params.metric_type, params.max_iters).await?;
+    pq.train(data, params.metric_type, params.max_iters).await?;
     Ok(pq)
 }
 
