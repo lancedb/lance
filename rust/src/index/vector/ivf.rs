@@ -36,7 +36,9 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    opq::OptimizedProductQuantizer, pq::ProductQuantizer, utils::maybe_sample_training_data,
+    opq::train_opq,
+    pq::{train_pq, PQBuildParams, ProductQuantizer},
+    utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
@@ -426,27 +428,6 @@ pub struct IvfBuildParams {
     pub max_iters: usize,
 }
 
-/// Parameters for building product quantization.
-pub struct PQBuildParams {
-    /// Number of subvectors to build PQ code
-    pub num_sub_vectors: usize,
-
-    /// The number of bits to present one PQ centroid.
-    pub num_bits: usize,
-
-    /// Metric type, L2 or Cosine.
-    pub metric_type: MetricType,
-
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
-    /// The max number of iterations for kmeans training.
-    pub max_iters: usize,
-
-    /// Max number of iterations to train OPQ, if `use_opq` is true.
-    pub max_opq_iters: usize,
-}
-
 /// Compute residual matrix.
 ///
 /// Parameters
@@ -682,31 +663,6 @@ async fn write_index_file(
     writer.shutdown().await?;
 
     Ok(())
-}
-
-/// Train product quantization over (OPQ-rotated) residual vectors.
-async fn train_pq(data: &MatrixView, params: &PQBuildParams) -> Result<ProductQuantizer> {
-    let mut pq = ProductQuantizer::new(
-        params.num_sub_vectors,
-        params.num_bits as u32,
-        data.num_columns(),
-    );
-    pq.train(data, params.metric_type, params.max_iters).await?;
-    Ok(pq)
-}
-
-/// Train Optimized Product Quantization.
-async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
-    let mut opq = OptimizedProductQuantizer::new(
-        params.num_sub_vectors as usize,
-        params.num_bits as u32,
-        params.metric_type,
-        params.max_opq_iters,
-    );
-
-    opq.train(data).await?;
-
-    Ok(opq)
 }
 
 /// Train IVF partitions using kmeans.

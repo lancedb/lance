@@ -23,8 +23,8 @@ use arrow_array::Float32Array;
 pub mod flat;
 pub mod ivf;
 mod kmeans;
-mod opq;
-mod pq;
+pub mod opq;
+pub mod pq;
 mod traits;
 mod utils;
 
