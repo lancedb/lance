@@ -38,6 +38,16 @@ class LanceDataset(pa.dataset.Dataset):
         self._uri = uri
         self._ds = _Dataset(uri, version)
 
+    def __reduce__(self):
+        return LanceDataset, (self.uri, self._ds.version())
+
+    def __getstate__(self):
+        return self.uri, self._ds.version()
+
+    def __setstate__(self, state):
+        self._uri, version = state
+        self._ds = _Dataset(self._uri, version)
+
     @property
     def uri(self) -> str:
         """
