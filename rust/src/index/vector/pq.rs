@@ -325,7 +325,9 @@ impl ProductQuantizer {
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
     pub fn centroids(&self, sub_vector_idx: usize) -> Option<Arc<Float32Array>> {
         assert!(sub_vector_idx < self.num_sub_vectors);
-        self.codebook.as_ref()?;
+        if self.codebook.is_none() {
+            return None;
+        };
 
         let num_centroids = Self::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
