@@ -19,7 +19,11 @@ use super::Vertex;
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
 pub(crate) struct Node<V: Vertex> {
+    /// The vertex metadata. will be serialized into fixed size binary in the persisted graph.
     pub(crate) vertex: V,
+
+    /// Neighbors are the ids of vertex in the graph.
+    /// This id is not the same as the row_id in the original lance dataset.
     pub(crate) neighbors: Vec<u32>,
 }
 

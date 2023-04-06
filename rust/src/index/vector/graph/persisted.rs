@@ -221,6 +221,7 @@ pub async fn write_graph<V: Vertex>(
         let inner_builder = UInt32Builder::with_capacity(total_neighbors);
         let mut neighbors_builder = ListBuilder::with_capacity(inner_builder, nodes.len());
         for node in nodes {
+            // Serialize the vertex metadata to fixed size binary bytes.
             vertex_builder.append_value(node.vertex.to_bytes())?;
             neighbors_builder
                 .values()
