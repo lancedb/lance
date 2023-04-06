@@ -518,8 +518,8 @@ impl ProductQuantizer {
         for (i, cnt) in counts.iter().enumerate() {
             if *cnt > 0 {
                 let s = sum[i * sub_vector_dim..(i + 1) * sub_vector_dim].as_mut();
-                for k in 0..s.len() {
-                    s[k] /= *cnt as f32;
+                for v in s.iter_mut() {
+                    *v /= *cnt as f32;
                 }
                 builder.append_slice(s);
             } else {
@@ -588,6 +588,54 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
         subarrays.push(sub_array);
     }
     subarrays
+}
+
+/// Parameters for building product quantization.
+pub struct PQBuildParams {
+    /// Number of subvectors to build PQ code
+    pub num_sub_vectors: usize,
+
+    /// The number of bits to present one PQ centroid.
+    pub num_bits: usize,
+
+    /// Metric type, L2 or Cosine.
+    pub metric_type: MetricType,
+
+    /// Train as optimized product quantization.
+    pub use_opq: bool,
+
+    /// The max number of iterations for kmeans training.
+    pub max_iters: usize,
+
+    /// Max number of iterations to train OPQ, if `use_opq` is true.
+    pub max_opq_iters: usize,
+}
+
+impl Default for PQBuildParams {
+    fn default() -> Self {
+        Self {
+            num_sub_vectors: 16,
+            num_bits: 8,
+            metric_type: MetricType::L2,
+            use_opq: false,
+            max_iters: 50,
+            max_opq_iters: 50,
+        }
+    }
+}
+
+/// Train product quantization over (OPQ-rotated) residual vectors.
+pub(crate) async fn train_pq(
+    data: &MatrixView,
+    params: &PQBuildParams,
+) -> Result<ProductQuantizer> {
+    let mut pq = ProductQuantizer::new(
+        params.num_sub_vectors,
+        params.num_bits as u32,
+        data.num_columns(),
+    );
+    pq.train(data, params.metric_type, params.max_iters).await?;
+    Ok(pq)
 }
 
 #[cfg(test)]

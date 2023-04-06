@@ -23,12 +23,16 @@ use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Arr
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
-use super::Query;
-use super::{pq::ProductQuantizer, MetricType, Transformer, VectorIndex};
+use super::{
+    pq::{PQBuildParams, ProductQuantizer},
+    MetricType, Query, Transformer, VectorIndex,
+};
 use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
-use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::io::object_writer::ObjectWriter;
+use crate::io::{
+    object_reader::{read_fixed_stride_array, ObjectReader},
+    object_writer::ObjectWriter,
+};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;
@@ -135,6 +139,23 @@ impl OptimizedProductQuantizer {
 
         Ok((rotation, pq_code))
     }
+}
+
+/// Train Optimized Product Quantization.
+pub(crate) async fn train_opq(
+    data: &MatrixView,
+    params: &PQBuildParams,
+) -> Result<OptimizedProductQuantizer> {
+    let mut opq = OptimizedProductQuantizer::new(
+        params.num_sub_vectors as usize,
+        params.num_bits as u32,
+        params.metric_type,
+        params.max_opq_iters,
+    );
+
+    opq.train(data).await?;
+
+    Ok(opq)
 }
 
 /// Initialize rotation matrix.

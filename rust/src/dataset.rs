@@ -36,7 +36,8 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams, PQBuildParams};
+use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams};
+use crate::index::vector::pq::PQBuildParams;
 use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
 use crate::io::{
     object_reader::{read_message, read_struct},

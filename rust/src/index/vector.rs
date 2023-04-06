@@ -24,9 +24,10 @@ pub mod flat;
 mod graph;
 pub mod ivf;
 mod kmeans;
-mod opq;
-mod pq;
+pub mod opq;
+pub mod pq;
 mod traits;
+mod utils;
 
 use self::{ivf::IVFIndex, pq::PQIndex};
 
