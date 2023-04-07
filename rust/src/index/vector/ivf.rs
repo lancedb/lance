@@ -332,6 +332,13 @@ impl Ivf {
             .unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
+            if vector.len() != cent.len() {
+                return Err(Error::IO(format!(
+                    "Ivf::compute_residual: dimension mismatch: {} != {}",
+                    vector.len(),
+                    cent.len()
+                )));
+            }
             unsafe {
                 residual_builder
                     .append_trusted_len_iter(vector.iter().zip(cent.iter()).map(|(v, c)| v - c))
@@ -454,6 +461,13 @@ fn compute_residual_matrix(
         )
         .unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
+        if row.len() != centroid.len() {
+            return Err(Error::IO(format!(
+                "Ivf::compute_residual: dimension mismatch: {} != {}",
+                row.len(),
+                centroid.len()
+            )));
+        };
         unsafe {
             builder.append_trusted_len_iter(row.iter().zip(centroid.iter()).map(|(v, c)| v - c))
         }
