@@ -152,9 +152,9 @@ impl MatrixView {
         }
         // Scale to f64 to reduce the chance of overflow.
         let dim = self.num_columns();
+        // Add all rows with only one memory allocation.
         let mut sum = vec![0_f64; dim];
-        // TODO: can SIMD work better here?
-        // This seems to be memory-throughput bound computation.
+        // TODO: can SIMD work better here? Is it memory-bandwidth bound?.
         self.data.values().chunks(dim).for_each(|row| {
             row.iter().enumerate().for_each(|(i, v)| {
                 sum[i] += *v as f64;
@@ -237,8 +237,8 @@ impl MatrixView {
 
     /// Sample `n` rows with a random generator.
     pub fn sample_with(&self, n: usize, mut rng: impl Rng) -> Self {
-        assert_eq!(
-            self.transpose, false,
+        assert!(
+            !self.transpose,
             "Does not support sampling on transposed matrix"
         );
         if n > self.num_rows() {
@@ -374,9 +374,9 @@ impl SingularValueDecomposition for MatrixView {
         }
 
         let u_values = Arc::new(Float32Array::from_iter_values(u));
-        let u = MatrixView::new(u_values, m as usize).transpose();
+        let u = Self::new(u_values, m as usize).transpose();
         let vt_values = Arc::new(Float32Array::from_iter_values(vt));
-        let vt = MatrixView::new(vt_values, n as usize).transpose();
+        let vt = Self::new(vt_values, n as usize).transpose();
         let sigma = Float32Array::from_iter_values(sigma);
         Ok((u, sigma, vt))
     }
