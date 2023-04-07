@@ -382,8 +382,6 @@ impl SingularValueDecomposition for MatrixView {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
