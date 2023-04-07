@@ -358,7 +358,7 @@ impl ProductQuantizer {
     /// Compute the quantization distortion (E).
     ///
     /// Quantization distortion is the difference between the centroids
-    /// from the PQ codeto the actual vector.
+    /// from the PQ code to the actual vector.
     pub async fn distortion(&self, data: &MatrixView, metric_type: MetricType) -> Result<f64> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
