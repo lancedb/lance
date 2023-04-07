@@ -574,13 +574,9 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
     for i in 0..m {
         let mut builder = Float32Builder::with_capacity(capacity);
         for j in 0..data.num_rows() {
-            let arr = data.row(j).unwrap();
-            let row: &Float32Array = as_primitive_array(&arr);
+            let row = data.row(j).unwrap();
             let start = i * sub_vector_length;
-
-            for k in start..start + sub_vector_length {
-                builder.append_value(row.value(k));
-            }
+            builder.append_slice(&row[start..start + sub_vector_length]);
         }
         let values = builder.finish();
         let sub_array =
