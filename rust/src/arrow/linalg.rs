@@ -51,7 +51,6 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
 
 /// A 2-D matrix view on top of Arrow Arrays.
 ///
-/// [MatrixView] does not own the data.
 #[derive(Debug, Clone)]
 pub struct MatrixView {
     /// Underneath data array.
@@ -130,7 +129,7 @@ impl MatrixView {
         }
     }
 
-    /// Returns a row at index `i`. Returns None if the index is out of bound.
+    /// Returns a row at index `i`. Returns `None` if the index is out of bound.
     ///
     /// # Panics if the matrix is transposed.
     pub fn row(&self, i: usize) -> Option<&[f32]> {
@@ -146,7 +145,7 @@ impl MatrixView {
         }
     }
 
-    /// Compute the centroid of all the rows. Returns None if the matrix is empty.
+    /// Compute the centroid from all the rows. Returns `None` if this matrix is empty.
     ///
     /// # Panics if the matrix is transposed.
     pub fn centroid(&self) -> Option<Float32Array> {
