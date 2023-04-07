@@ -258,6 +258,10 @@ impl Dataset {
             params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
         };
 
+        if let Some(n) = kwargs.get_item("num_bits") {
+            params.nbits = PyAny::downcast::<PyInt>(n)?.extract()?
+        };
+
         if let Some(o) = kwargs.get_item("use_opq") {
             params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
         };

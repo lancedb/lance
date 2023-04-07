@@ -150,7 +150,7 @@ pub struct VectorIndexParams {
     pub num_partitions: u32,
 
     /// the number of bits to present the centroids used in PQ.
-    pub nbits: u8,
+    pub nbits: usize,
 
     /// Use Optimized Product Quantizer.
     pub use_opq: bool,
@@ -179,7 +179,7 @@ impl VectorIndexParams {
     ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
     pub fn ivf_pq(
         num_partitions: u32,
-        nbits: u8,
+        nbits: usize,
         num_sub_vectors: u32,
         use_opq: bool,
         metric_type: MetricType,

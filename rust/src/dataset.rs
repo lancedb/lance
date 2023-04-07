@@ -440,7 +440,7 @@ impl Dataset {
                 };
                 let pq_params = PQBuildParams {
                     num_sub_vectors: vec_params.num_sub_vectors as usize,
-                    num_bits: 8,
+                    num_bits: vec_params.nbits,
                     metric_type: vec_params.metric_type,
                     max_iters: vec_params.max_iterations,
                     use_opq: vec_params.use_opq,

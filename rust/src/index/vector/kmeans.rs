@@ -30,7 +30,7 @@ pub async fn train_kmeans(
     array: &Float32Array,
     centroids: Option<Arc<Float32Array>>,
     dimension: usize,
-    k: usize,
+    k: usize, // how many centroids / points this cluster has
     max_iterations: u32,
     redos: usize,
     mut rng: impl Rng,

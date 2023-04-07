@@ -19,7 +19,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{as_primitive_array, Float32Builder};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt16Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 
@@ -117,7 +117,9 @@ impl OptimizedProductQuantizer {
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
         for i in 0..pq_code.len() {
             let code_arr = pq_code.value(i);
-            let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
+            // Here it is hardcoded to u8
+            let code: &UInt16Array = as_primitive_array(code_arr.as_ref());
+            // HERE OPQ uses PQ
             let reconstructed_vector = pq.reconstruct(code.values());
             builder.append_slice(reconstructed_vector.values());
         }
@@ -166,6 +168,7 @@ impl Transformer for OptimizedProductQuantizer {
         };
 
         // Run a few iterations to get the initialized centroids.
+        // Here creating pq
         let mut pq = ProductQuantizer::new(self.num_sub_vectors, self.num_bits, dim);
         pq.train(&train, self.metric_type, OPQ_PQ_INIT_ITERATIONS)
             .await?;
@@ -391,6 +394,7 @@ mod tests {
         let results = index.search(&query).await.unwrap();
         let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
         assert_eq!(row_ids.len(), 4);
+        println!("{:?}", row_ids.values());
         assert!(row_ids.values().contains(&10));
         assert_eq!(min(row_ids).unwrap() + 3, max(row_ids).unwrap());
     }

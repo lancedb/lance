@@ -312,6 +312,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         - **num_partitions**: the number of partitions of IVF (Inverted File Index).
         - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+        - **num_bits**: the number of bits used for the Product Quantization code.
 
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
@@ -334,6 +335,7 @@ class LanceDataset(pa.dataset.Dataset):
                 "IVF_PQ",
                 num_partitions=256,
                 num_sub_vectors=16
+                num_bits=12
             )
 
         References
@@ -379,9 +381,9 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(
                 f"Only IVF_PQ index_type supported. Got {index_type}"
             )
-        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs or "num_bits" not in kwargs:
             raise ValueError(
-                "num_partitions and num_sub_vectors are required for IVF_PQ"
+                "num_partitions, num_sub_vectors, and num_bits are required for IVF_PQ"
             )
 
         self._ds.create_index(column, index_type, name, metric, kwargs)

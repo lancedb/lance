@@ -13,19 +13,21 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::iter;
+use std::iter::Map;
+use std::slice::{ChunksExact, Iter};
 use std::sync::Arc;
+use arrow::compute::kernels::concat_elements::concat_elements_utf8_many;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
-    Float32Array, RecordBatch, UInt64Array, UInt8Array,
-};
+use arrow_array::{builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt16Array, UInt64Array, PrimitiveArray};
+use arrow_array::types::UInt16Type;
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
+use bytes::Buf;
 use rand::SeedableRng;
 
 use super::{MetricType, Query, VectorIndex};
@@ -56,7 +58,10 @@ pub struct PQIndex {
     pub pq: Arc<ProductQuantizer>,
 
     /// PQ code
-    pub code: Option<Arc<UInt8Array>>,
+    // here needs to be configurable
+    pub code: Option<Arc<UInt16Array>>,
+
+    pub codes_new: Option<Arc<PQCodes>>,
 
     /// ROW Id used to refer to the actual row in dataset.
     pub row_ids: Option<Arc<UInt64Array>>,
@@ -79,10 +84,11 @@ impl PQIndex {
     /// Load a PQ index (page) from the disk.
     pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
         Self {
-            nbits: pq.num_bits,
+            nbits: pq.num_bits as u32,
             num_sub_vectors: pq.num_sub_vectors,
             dimension: pq.dimension,
             code: None,
+            codes_new: Some(Arc::new(PQCodes::new(pq.num_bits))),
             row_ids: None,
             pq,
             metric_type,
@@ -110,15 +116,15 @@ impl PQIndex {
         }
 
         Ok(Arc::new(Float32Array::from_iter(
-            self.code
+            self.codes_new
                 .as_ref()
                 .unwrap()
-                .values()
-                .chunks_exact(self.num_sub_vectors)
+                .iter_chunked(self.num_sub_vectors)
                 .map(|c| {
                     c.iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
+                            // 256 == num_centroids, replace with function
                             distance_table[sub_vec_idx * 256 + *centroid as usize]
                         })
                         .sum::<f32>()
@@ -178,6 +184,7 @@ impl PQIndex {
                         .iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
+                            // 256 == num_centroids, replace with function
                             let idx = sub_vec_idx * 256 + *centroid as usize;
                             xy_table[idx]
                         })
@@ -186,6 +193,7 @@ impl PQIndex {
                         .iter()
                         .enumerate()
                         .map(|(sub_vec_idx, centroid)| {
+                            // 256 == num_centroids, replace with function
                             let idx = sub_vec_idx * 256 + *centroid as usize;
                             y_norm_table[idx]
                         })
@@ -201,15 +209,15 @@ impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        if self.code.is_none() || self.row_ids.is_none() {
+        if self.codes_new.is_none() || self.row_ids.is_none() {
             return Err(Error::Index(
                 "PQIndex::search: PQ is not initialized".to_string(),
             ));
         }
 
-        let code = self.code.as_ref().unwrap();
+        // let code = self.codes_new.as_ref().unwrap().as_ref().codes.unwrap();
         let row_ids = self.row_ids.as_ref().unwrap();
-        assert_eq!(code.len() % self.num_sub_vectors, 0);
+        // assert_eq!(code.len() % self.num_sub_vectors, 0);
 
         let scores = if self.metric_type == MetricType::L2 {
             self.fast_l2_scores(&query.key)?
@@ -245,10 +253,15 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
         let pq_code_length = self.pq.num_sub_vectors * length;
-        let pq_code =
-            read_fixed_stride_array(reader, &DataType::UInt8, offset, pq_code_length, ..).await?;
+        let codes = PQCodes::load(reader, offset, self.pq.num_bits, pq_code_length).await?;
+        // here code size is hardcoded to u8
+        // let pq_code =
+        //     read_fixed_stride_array(reader, &DataType::UInt16, offset, pq_code_length, ..).await?;
 
-        let row_id_offset = offset + pq_code_length /* *1 */;
+        println!("size: {}", DataType::UInt16.primitive_width().unwrap());
+        println!("size new: {}", codes.data_type.as_ref().unwrap().primitive_width().unwrap());
+
+        let row_id_offset = offset + pq_code_length * codes.data_type.as_ref().unwrap().primitive_width().unwrap();
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
@@ -256,7 +269,8 @@ impl VectorIndex for PQIndex {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
-            code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
+            code: None,
+            codes_new: Some(Arc::new(codes)),
             row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
@@ -302,7 +316,10 @@ pub struct ProductQuantizer {
 impl ProductQuantizer {
     /// Build a Product quantizer with `m` sub-vectors, and `nbits` to present centroids.
     pub fn new(m: usize, nbits: u32, dimension: usize) -> Self {
-        assert!(nbits == 8, "nbits can only be 8");
+        // println!()
+        // here - right now we only support 8, could support any value between 4 to 16
+        // we need to store nbits, and restore when we load it
+        assert!(nbits >= 4 && nbits <= 16, "nbits should be between 4 an 16");
         Self {
             num_bits: nbits,
             num_sub_vectors: m,
@@ -329,7 +346,7 @@ impl ProductQuantizer {
             return None;
         };
 
-        let num_centroids = Self::num_centroids(self.num_bits);
+        let num_centroids = Self::num_centroids(self.num_bits as u32);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
         let codebook = self.codebook.as_ref().unwrap();
         let arr = codebook.slice(
@@ -341,7 +358,9 @@ impl ProductQuantizer {
 
     /// Reconstruct a vector from its PQ code.
     /// It only supports U8 PQ code for now.
-    pub fn reconstruct(&self, code: &[u8]) -> Arc<Float32Array> {
+    // What should we return?
+    pub fn reconstruct(&self, code: &[u16]) -> Arc<Float32Array> {
+        // code is hardcoded to u8, this will break, maybe we should have a class that encapsulate it
         assert_eq!(code.len(), self.num_sub_vectors);
         let mut builder = Float32Builder::with_capacity(self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
@@ -360,6 +379,8 @@ impl ProductQuantizer {
     /// Quantization distortion is the difference between the centroids
     /// from the PQ code to the actual vector.
     pub async fn distortion(&self, data: &MatrixView, metric_type: MetricType) -> Result<f64> {
+        use futures::{stream, StreamExt, TryStreamExt};
+
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
 
@@ -411,7 +432,7 @@ impl ProductQuantizer {
         let values = tokio::task::spawn_blocking(move || {
             let flatten_values = flatten_data.values();
             let capacity = num_sub_vectors * num_rows;
-            let mut builder: Vec<u8> = vec![0; capacity];
+            let mut builder: Vec<u16> = vec![0; capacity];
             // Dimension of each sub-vector.
             let sub_dim = dim / num_sub_vectors;
             for i in 0..num_rows {
@@ -423,10 +444,10 @@ impl ProductQuantizer {
                     let centroids = all_centroids[sub_idx].as_ref();
                     let code = argmin(dist_func(sub_vector, centroids.values(), sub_dim)?.as_ref())
                         .unwrap();
-                    builder[i * num_sub_vectors + sub_idx] = code as u8;
+                    builder[i * num_sub_vectors + sub_idx] = code as u16;
                 }
             }
-            Ok::<UInt8Array, Error>(UInt8Array::from_iter_values(builder))
+            Ok::<UInt16Array, Error>(UInt16Array::from_iter_values(builder))
         })
         .await??;
 
@@ -444,7 +465,7 @@ impl ProductQuantizer {
         assert_eq!(data.data().null_count(), 0);
 
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
-        let num_centroids = 2_usize.pow(self.num_bits);
+        let num_centroids = ProductQuantizer::num_centroids(self.num_bits as u32);
         let dimension = data.num_columns();
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
@@ -488,7 +509,7 @@ impl ProductQuantizer {
     ) -> Result<()> {
         assert_eq!(data.num_rows(), pq_code.len());
 
-        let num_centroids = 2_usize.pow(self.num_bits);
+        let num_centroids = 2_usize.pow(self.num_bits as u32);
         let mut builder = Float32Builder::with_capacity(num_centroids * self.dimension);
         let sub_vector_dim = self.dimension / self.num_sub_vectors;
         let mut sum = vec![0.0_f32; self.dimension * num_centroids];
@@ -500,7 +521,7 @@ impl ProductQuantizer {
 
         for i in 0..data.num_rows() {
             let code_arr = pq_code.value(i);
-            let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
+            let code: &UInt16Array = as_primitive_array(code_arr.as_ref());
             for sub_vec_id in 0..code.len() {
                 let centroid = code.value(sub_vec_id) as usize;
                 let sub_vector = data.data().slice(
@@ -588,6 +609,116 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
         subarrays.push(sub_array);
     }
     subarrays
+}
+
+
+pub struct PQCodes {
+    num_bits: u32,
+
+    codes: Option<PrimitiveArray<UInt16Type>>,
+
+    data_type: Option<DataType>,
+
+// codes
+
+// load
+
+// save
+
+// reconstruct
+}
+
+impl PQCodes {
+    fn new(num_bits: u32) -> PQCodes {
+        PQCodes {
+            num_bits,
+            data_type: None,
+            codes: None,
+        }
+    }
+
+    fn num_bits_to_data_type(num_bits: u32) -> DataType {
+        if num_bits <= 8 {
+            DataType::UInt8
+        } else if num_bits <= 16 {
+            DataType::UInt16
+        } else {
+            panic!("{} is out of range", num_bits)
+        }
+    }
+
+    async fn load(reader: &dyn ObjectReader, offset: usize, num_bits: u32, length: usize) -> Result<PQCodes> {
+        let data_type = Self::num_bits_to_data_type(num_bits);
+        let pq_code = read_fixed_stride_array(reader, &data_type, offset, length, ..).await?;
+        let primitive_array = as_primitive_array::<UInt16Type>(pq_code.as_ref());
+        Ok(Self {
+            num_bits,
+            data_type: Some(data_type),
+            codes: Some(primitive_array.clone()),
+        })
+    }
+
+    // fn iter<'a>(&self) -> impl Iterator<Item = &[u16]>{
+    //     iter::Once(self.codes.unwrap().values())
+    // }
+
+    fn iter_chunked<'a>(&self, chunk_size: usize) -> impl Iterator<Item = &[u16]> {
+        self.codes.as_ref().unwrap().values().chunks_exact(chunk_size)
+    }
+
+    fn iter_chunked_usize_owned<'a>(&self, chunk_size: usize) -> impl Iterator<Item = Box<[usize]>> {
+        let chuncked_iter = self.codes.as_ref().unwrap().values().chunks_exact(chunk_size);
+        let vector_iter = chuncked_iter.map(|c| {
+            let mut v: Vec<usize> = Vec::new();
+            for u in c {
+                v.push(*u as usize);
+            }
+            v
+        });
+        let usize_iter = vector_iter.map(|v| Box::new(*v.as_slice()));
+        usize_iter
+        /**
+        error[E0277]: the size for values of type `[usize]` cannot be known at compilation time
+           --> src/index/vector/pq.rs:678:55
+            |
+        678 |         let usize_iter = vector_iter.map(|v| Box::new(*v.as_slice()));
+            |                                              -------- ^^^^^^^^^^^^^ doesn't have a size known at compile-time
+            |                                              |
+            |                                              required by a bound introduced by this call
+            |
+            = help: the trait `Sized` is not implemented for `[usize]`
+        note: required by a bound in `Box::<T>::new`
+           --> /Users/eto/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/boxed.rs:204:6
+       **/
+    }
+
+    fn iter_chunked_usize_ref<'a>(&self, chunk_size: usize) -> impl Iterator<Item = Box<&[usize]>> {
+        let chuncked_iter = self.codes.as_ref().unwrap().values().chunks_exact(chunk_size);
+        let vector_iter = chuncked_iter.map(|c| {
+            let mut v: Vec<usize> = Vec::new();
+            for u in c {
+                v.push(*u as usize);
+            }
+            v
+        });
+        let usize_iter = vector_iter.map(|v| Box::new(v.as_slice()));
+        usize_iter
+
+        /**
+        204 | impl<T> Box<T> {
+    |      ^ required by this bound in `Box::<T>::new`
+
+        error[E0515]: cannot return value referencing function parameter `v`
+           --> src/index/vector/pq.rs:704:46
+            |
+        704 |         let usize_iter = vector_iter.map(|v| Box::new(v.as_slice()));
+            |                                              ^^^^^^^^^------------^
+            |                                              |        |
+            |                                              |        `v` is borrowed here
+            |                                              returns a value referencing data owned by the current function
+        **/
+    }
+
 }
 
 #[cfg(test)]

@@ -517,10 +517,11 @@ pub async fn build_ivf_pq_index(
     pq_params: &PQBuildParams,
 ) -> Result<()> {
     println!(
-        "Building vector index: IVF{},{}PQ{}, metric={}",
+        "Building vector index: IVF{},{}PQ{},{}, metric={}",
         ivf_params.num_partitions,
         if pq_params.use_opq { "O" } else { "" },
         pq_params.num_sub_vectors,
+        pq_params.num_bits,
         ivf_params.metric_type,
     );
 
@@ -615,7 +616,7 @@ pub async fn build_ivf_pq_index(
                 ArrowField::new(
                     PQ_CODE_COLUMN,
                     DataType::FixedSizeList(
-                        Box::new(ArrowField::new("item", DataType::UInt8, true)),
+                        Box::new(ArrowField::new("item", DataType::UInt16, true)),
                         pq_params.num_sub_vectors as i32,
                     ),
                     false,
