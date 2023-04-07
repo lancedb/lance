@@ -139,6 +139,32 @@ impl MatrixView {
         }
     }
 
+    /// Compute the centroid of all the rows. Returns None if the matrix is empty.
+    ///
+    /// # Panics if the matrix is transposed.
+    pub fn centroid(&self) -> Option<Float32Array> {
+        assert!(
+            !self.transpose,
+            "Centroid is not defined for transposed matrix."
+        );
+        if self.num_rows() == 0 {
+            return None;
+        }
+        // Scale to f64 to reduce the chance of overflow.
+        let dim = self.num_columns();
+        let mut sum = vec![0_f64; dim];
+        // TODO: can SIMD work better here?
+        // This seems to be memory-throughput bound computation.
+        self.data.values().chunks(dim).for_each(|row| {
+            row.iter().enumerate().for_each(|(i, v)| {
+                sum[i] += *v as f64;
+            })
+        });
+        let total = self.num_rows() as f64;
+        let arr = Float32Array::from_iter(sum.iter().map(|v| (v / total) as f32));
+        Some(arr)
+    }
+
     /// (Lazy) transpose of the matrix.
     ///
     pub fn transpose(&self) -> Self {
@@ -356,6 +382,8 @@ impl SingularValueDecomposition for MatrixView {
     }
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -516,6 +544,17 @@ mod tests {
         assert_eq!(
             a_t.data().values(),
             &[1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn test_centroids() {
+        let data = Arc::new(Float32Array::from_iter((0..500).map(|v| v as f32)));
+        let mat = MatrixView::new(data, 10);
+        let centroids = mat.centroid().unwrap();
+        assert_eq!(
+            centroids.values(),
+            (245..255).map(|v| v as f32).collect::<Vec<_>>().as_slice(),
         );
     }
 }
