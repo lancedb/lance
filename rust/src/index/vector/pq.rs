@@ -358,7 +358,7 @@ impl ProductQuantizer {
     /// Compute the quantization distortion (E).
     ///
     /// Quantization distortion is the difference between the centroids
-    /// from the PQ code to the actual vector.
+    /// from the PQ codeto the actual vector.
     pub async fn distortion(&self, data: &MatrixView, metric_type: MetricType) -> Result<f64> {
         let sub_vectors = divide_to_subvectors(data, self.num_sub_vectors);
         debug_assert_eq!(sub_vectors.len(), self.num_sub_vectors);
@@ -574,13 +574,9 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
     for i in 0..m {
         let mut builder = Float32Builder::with_capacity(capacity);
         for j in 0..data.num_rows() {
-            let arr = data.row(j).unwrap();
-            let row: &Float32Array = as_primitive_array(&arr);
+            let row = data.row(j).unwrap();
             let start = i * sub_vector_length;
-
-            for k in start..start + sub_vector_length {
-                builder.append_value(row.value(k));
-            }
+            builder.append_slice(&row[start..start + sub_vector_length]);
         }
         let values = builder.finish();
         let sub_array =

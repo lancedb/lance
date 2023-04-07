@@ -130,12 +130,19 @@ impl MatrixView {
         }
     }
 
-    pub fn row(&self, i: usize) -> Option<Float32Array> {
+    /// Returns a row at index `i`. Returns None if the index is out of bound.
+    ///
+    /// # Panics if the matrix is transposed.
+    pub fn row(&self, i: usize) -> Option<&[f32]> {
+        assert!(
+            !self.transpose,
+            "Centroid is not defined for transposed matrix."
+        );
         if i >= self.num_rows() {
             None
         } else {
-            let slice_arr = self.data.slice(i * self.num_columns(), self.num_columns());
-            Some(as_primitive_array(slice_arr.as_ref()).clone())
+            let dim = self.num_columns();
+            Some(&self.data.values()[i * dim..(i + 1) * dim])
         }
     }
 

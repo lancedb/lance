@@ -325,16 +325,17 @@ impl Ivf {
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id = argmin(
-                dist_func(vector.values(), centroids.data().values(), dim)
+                dist_func(vector, centroids.data().values(), dim)
                     .unwrap()
                     .as_ref(),
             )
             .unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
-            let residual = subtract_dyn(&vector, &cent)?;
-            let resi_arr: &Float32Array = as_primitive_array(&residual);
-            residual_builder.append_slice(resi_arr.values());
+            unsafe {
+                residual_builder
+                    .append_trusted_len_iter(vector.iter().zip(cent.iter()).map(|(v, c)| v - c))
+            }
         }
 
         let part_ids = part_id_builder.finish();
@@ -447,15 +448,15 @@ fn compute_residual_matrix(
     for i in 0..data.num_rows() {
         let row = data.row(i).unwrap();
         let part_id = argmin(
-            dist_func(row.values(), centroids.data().values(), dim)
+            dist_func(row, centroids.data().values(), dim)
                 .unwrap()
                 .as_ref(),
         )
         .unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
-        let residual = subtract_dyn(&row, &centroid)?;
-        let f32_residual_array: &Float32Array = as_primitive_array(&residual);
-        builder.append_slice(f32_residual_array.values());
+        unsafe {
+            builder.append_trusted_len_iter(row.iter().zip(centroid.iter()).map(|(v, c)| v - c))
+        }
     }
     Ok(Arc::new(builder.finish()))
 }
