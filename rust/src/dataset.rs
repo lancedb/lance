@@ -33,6 +33,7 @@ mod fragment;
 pub mod scanner;
 mod write;
 
+use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
@@ -346,18 +347,8 @@ impl Dataset {
     /// It offers a fast path of counting rows by just computing via metadata.
     pub async fn count_rows(&self) -> Result<usize> {
         // Open file to read metadata.
-        let counts = stream::iter(self.manifest.fragments.as_ref())
-            .map(|f| async {
-                let path = self.data_dir().child(f.files[0].path.as_str());
-                let reader = FileReader::try_new_with_fragment(
-                    &self.object_store,
-                    &path,
-                    f.id,
-                    Some(self.manifest.as_ref()),
-                )
-                .await?;
-                Ok::<usize, Error>(reader.len())
-            })
+        let counts = stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_rows().await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
@@ -650,6 +641,17 @@ impl Dataset {
 
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    /// Get fragments.
+    ///
+    /// If `filter` is provided, only fragments with the given name will be returned.
+    pub fn get_fragments(&self) -> Vec<FileFragment> {
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| FileFragment::new(self, f.clone(), Some(self.manifest.as_ref())))
+            .collect()
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {

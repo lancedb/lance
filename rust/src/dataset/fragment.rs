@@ -17,7 +17,6 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use object_store::path::Path;
 
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
@@ -69,12 +68,8 @@ impl<'a> FileFragment<'a> {
         Ok(reader)
     }
 
-    /// Open the lance file(s) to read.
-    pub async fn open(&self, projection: Option<Arc<Schema>>) -> Result<FileReader> {
-        todo!()
-    }
-
     /// Count the rows in this fragment.
+    ///
     pub async fn count_rows(&self) -> Result<usize> {
         let reader = self
             .do_open(&[self.metadata.files[0].path.as_str()])
@@ -83,6 +78,13 @@ impl<'a> FileFragment<'a> {
     }
 
     pub async fn take(&self, indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
+        let reader = self
+            .do_open(&[self.metadata.files[0].path.as_str()])
+            .await?;
+        todo!()
+    }
+
+    pub async fn scan(&self, projection: &Schema) -> Result<RecordBatch> {
         todo!()
     }
 }
