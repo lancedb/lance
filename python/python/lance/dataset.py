@@ -29,6 +29,7 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .fragment import LanceFragment
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -192,7 +193,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(self, filter: Expression = None):
+    def get_fragments(self, filter: Expression = None) -> Iterator[pa.dataset.Fragment]:
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
         """

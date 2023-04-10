@@ -14,7 +14,6 @@
 
 //! Linear Algebra on Arrow Array
 //!
-//!
 
 use std::sync::Arc;
 
