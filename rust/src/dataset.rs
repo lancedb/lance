@@ -29,6 +29,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
+mod fragment;
 pub mod scanner;
 mod write;
 
