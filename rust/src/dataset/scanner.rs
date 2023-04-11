@@ -246,9 +246,7 @@ impl Scanner {
         Ok(Arc::new(schema))
     }
 
-    /// Create a stream of this Scanner.
-    ///
-    /// TODO: implement as IntoStream/IntoIterator.
+    /// Create a stream from the Scanner.
     pub async fn try_into_stream(&self) -> Result<impl RecordBatchStream> {
         let plan = self.create_plan().await?;
 
