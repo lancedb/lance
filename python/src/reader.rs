@@ -21,7 +21,8 @@ use arrow_schema::{ArrowError, SchemaRef};
 use futures::stream::StreamExt;
 use tokio::runtime::Runtime;
 
-use ::lance::dataset::scanner::{RecordBatchStream, Scanner as LanceScanner};
+use lance::dataset::scanner::{Scanner as LanceScanner, DatasetRecordBatchStream};
+use lance::io::RecordBatchStream;
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
@@ -29,7 +30,7 @@ use ::lance::dataset::scanner::{RecordBatchStream, Scanner as LanceScanner};
 /// an ArrowArrayStream in the Arrow C Data Interface
 pub struct LanceReader {
     schema: SchemaRef,
-    stream: RecordBatchStream,
+    stream: DatasetRecordBatchStream,
     rt: Arc<Runtime>,
 }
 
