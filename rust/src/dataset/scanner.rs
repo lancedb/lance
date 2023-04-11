@@ -256,7 +256,7 @@ impl Scanner {
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
-        Ok(ScannerRecordBatchStream::new(
+        Ok(DatasetRecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
     }
@@ -497,26 +497,28 @@ impl Scanner {
     }
 }
 
-/// ScannerStream is a container to wrap different types of ExecNode.
+/// [`DatasetRecordBatchScream`] wraps the Exec nodes into a [`RecordBatchStream`] for
+/// consumption by the user.
+///
 #[pin_project::pin_project]
-pub struct ScannerRecordBatchStream {
+pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
 }
 
-impl ScannerRecordBatchStream {
+impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
 }
 
-impl RecordBatchStream for ScannerRecordBatchStream {
+impl RecordBatchStream for DatasetRecordBatchStream {
     fn schema(&self) -> SchemaRef {
         self.exec_node.schema()
     }
 }
 
-impl Stream for ScannerRecordBatchStream {
+impl Stream for DatasetRecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
