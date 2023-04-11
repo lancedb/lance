@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::iter::Sum;
+
 use arrow_arith::aggregate::sum;
 use arrow_arith::arithmetic::{multiply_dyn, subtract_dyn};
 use arrow_array::cast::as_primitive_array;
@@ -19,9 +21,19 @@ use arrow_array::types::Float32Type;
 use arrow_array::{Array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 // use pprof::criterion::{Output, PProfProfiler};
+use num_traits::real::Real;
 
 use lance::linalg::l2::*;
 use lance::utils::testing::generate_random_array;
+
+#[inline]
+fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
+    from.iter()
+        .zip(to.iter())
+        .map(|(a, b)| (a.sub(*b).powi(2)))
+        .sum::<T>()
+        .sqrt()
+}
 
 fn bench_distance(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
@@ -34,12 +46,7 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("L2 distance(auto-vectorization)", |b| {
         b.iter(|| {
-            key.values()
-                .iter()
-                .zip(target.values().iter())
-                .map(|(a, b)| (a - b).powi(2))
-                .sum::<f32>()
-                .sqrt()
+            l2_scalar(key.values(), target.values())
         })
     });
 

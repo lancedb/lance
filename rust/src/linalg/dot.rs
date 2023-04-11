@@ -14,7 +14,10 @@
 
 //! dot product
 
+use arrow_array::Float32Array;
+
 pub trait Dot {
+    /// Dot product
     fn dot(&self, other: &Self) -> f32;
 }
 
@@ -23,6 +26,16 @@ impl Dot for [f32] {
         let mut sum = 0.0;
         for i in 0..self.len() {
             sum += self[i] * other[i];
+        }
+        sum
+    }
+}
+
+impl Dot for Float32Array {
+    fn dot(&self, other: &Self) -> f32 {
+        let mut sum = 0.0;
+        for i in 0..self.len() {
+            sum += self.value(i) * other.value(i);
         }
         sum
     }
