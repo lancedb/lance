@@ -14,6 +14,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+use std::cmp::min;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -28,7 +29,7 @@ use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
 use crate::io::{FileReader, RecordBatchStream};
-use crate::Result;
+use crate::{Error, Result};
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -93,13 +94,11 @@ impl<'a> FileFragment<'a> {
 
     /// Scan this [`FileFragment`].
     pub async fn scan(&self, projection: &Schema) -> Result<FragmentRecordBatchStream> {
-        let schema = Arc::new(ArrowSchema::from(projection));
         let reader = self
             .do_open(&[self.metadata.files[0].path.as_str()])
             .await?;
-
         let params = FragmentScanParams::default();
-        FragmentRecordBatchStream::try_new(schema, vec![reader], &params).await
+        FragmentRecordBatchStream::try_new(projection, vec![reader], params).await
     }
 }
 
@@ -125,7 +124,6 @@ impl Default for FragmentScanParams {
 /// in the fragment.
 pub struct FragmentRecordBatchStream {
     schema: SchemaRef,
-    readers: Vec<FileReader>,
 
     _io_thread: JoinHandle<()>,
 
@@ -134,17 +132,45 @@ pub struct FragmentRecordBatchStream {
 
 impl FragmentRecordBatchStream {
     pub async fn try_new(
-        schema: SchemaRef,
+        schema: &Schema,
         readers: Vec<FileReader>,
-        params: &FragmentScanParams,
+        params: FragmentScanParams,
     ) -> Result<Self> {
+        if readers.is_empty() {
+            return Err(Error::IO(
+                "No readers in FragmentRecordBatchStream".to_string(),
+            ));
+        }
         let (tx, rx) = mpsc::channel(params.prefetch_size);
 
-        let io_thread = tokio::spawn(async move {});
+        let projection = schema.clone();
+        let io_thread = tokio::spawn(async move {
+            // Only support one reader before schema evolution.
+            let reader = &readers[0];
+            'outer: for batch_id in 0..readers[0].num_batches() as i32 {
+                let rows_in_batch = readers[0].num_rows_in_batch(batch_id);
+                for start in (0..rows_in_batch).step_by(params.batch_size) {
+                    let result = reader
+                        .read_batch(
+                            batch_id,
+                            start..min(start + params.batch_size, rows_in_batch),
+                            &projection,
+                        )
+                        .await;
+                    if tx.is_closed() {
+                        // Early stop
+                        break 'outer;
+                    }
+                    if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
+                        eprintln!("Failed to scan data: {err}");
+                        break 'outer;
+                    }
+                }
+            }
+        });
 
         Ok(Self {
-            schema,
-            readers,
+            schema: Arc::new(ArrowSchema::from(schema)),
             _io_thread: io_thread,
             rx,
         })
