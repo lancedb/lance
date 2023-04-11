@@ -37,12 +37,11 @@ unsafe fn l2_neon(from: &[f32], to: &[f32]) -> f32 {
 
 /// Fall back to scalar implementation.
 fn l2_scalar(from: &[f32], to: &[f32]) -> f32 {
-    let mut sum = 0.0;
-    for i in 0..from.len() {
-        let diff = from[i] - to[i];
-        sum += diff * diff;
-    }
-    sum.sqrt()
+    from.iter()
+        .zip(to.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f32>()
+        .sqrt()
 }
 
 impl L2 for [f32] {
@@ -65,14 +64,6 @@ impl L2 for Float32Array {
     fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
     }
-
-    // fn l2_batch(&self, other: &Self) -> Float32Array {
-    //     let mut result = Vec::with_capacity(self.len());
-    //     for i in 0..self.len() {
-    //         result.push(self.l2(&other.slice(i, 1)));
-    //     }
-    //     Float32Array::from(result)
-    // }
 }
 
 #[cfg(test)]

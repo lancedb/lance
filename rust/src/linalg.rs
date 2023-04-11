@@ -12,5 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod l2;
 pub mod dot;
+pub mod l2;

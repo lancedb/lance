@@ -30,31 +30,29 @@ fn bench_distance(c: &mut Criterion) {
     // 1M of 1024 D vectors. 4GB in memory.
     let target = generate_random_array(1024 * 1024 * DIMENSION as usize);
 
-    c.bench_function("L2 distance", |b| {
+    c.bench_function("L2 distance", |b| b.iter(|| key.l2(&target)));
+
+    c.bench_function("L2 distance(auto-vectorization)", |b| {
         b.iter(|| {
-            key.l2(&target)
+            key.values()
+                .iter()
+                .zip(target.values().iter())
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt()
         })
     });
 
-    // c.bench_function("Cosine Distance", |b| {
-    //     let dist = CosineDistance::default();
-    //     b.iter(|| {
-    //         dist.distance(&key, &target, DIMENSION).unwrap();
-    //     })
-    // });
-
-    // c.bench_function("L2_distance_arrow", |b| {
-    //     b.iter(|| unsafe {
-    //         Float32Array::from_trusted_len_iter(
-    //             (0..target.len() / DIMENSION)
-    //                 .map(|idx| {
-    //                     let arr = target.slice(idx * DIMENSION, DIMENSION);
-    //                     l2_distance_arrow(&key, as_primitive_array(arr.as_ref()))
-    //                 })
-    //                 .map(|d| Some(d)),
-    //         )
-    //     });
-    // });
+    c.bench_function("L2 distance (loop)", |b| {
+        b.iter(|| {
+            let mut sum = 0.0;
+            for i in 0..key.len() {
+                let diff = key.value(i) - target.value(i);
+                sum += diff * diff;
+            }
+            sum.sqrt()
+        })
+    });
 
     c.bench_function("L2_distance_arrow_arith", |b| {
         b.iter(|| unsafe {
