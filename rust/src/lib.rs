@@ -30,6 +30,7 @@ pub mod error;
 pub mod format;
 pub mod index;
 pub mod io;
+pub mod linalg;
 pub mod utils;
 
 pub use error::{Error, Result};
