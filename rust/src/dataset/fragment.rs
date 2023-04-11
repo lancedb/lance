@@ -14,42 +14,31 @@
 
 //! Wraps a Fragment of the dataset.
 
-use std::cmp::min;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use futures::Stream;
-use tokio::sync::mpsc::{self, Receiver};
-use tokio::task::JoinHandle;
 
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
-use crate::format::{Fragment, Manifest};
-use crate::io::{FileReader, RecordBatchStream};
-use crate::{Error, Result};
+use crate::format::Fragment;
+use crate::io::FileReader;
+use crate::Result;
+
+use super::scanner::Scanner;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
 /// The interface is similar to `pyarrow.dataset.Fragment`.
-pub struct FileFragment<'a> {
-    dataset: &'a Dataset,
+pub struct FileFragment {
+    dataset: Arc<Dataset>,
 
     metadata: Fragment,
-
-    manifest: Option<&'a Manifest>,
 }
 
-impl<'a> FileFragment<'a> {
+impl FileFragment {
     /// Creates a new FileFragment.
-    pub fn new(dataset: &'a Dataset, metadata: Fragment, manifest: Option<&'a Manifest>) -> Self {
-        Self {
-            dataset,
-            metadata,
-            manifest,
-        }
+    pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
+        Self { dataset, metadata }
     }
 
     /// Returns the fragment's metadata.
@@ -93,101 +82,10 @@ impl<'a> FileFragment<'a> {
     }
 
     /// Scan this [`FileFragment`].
-    pub async fn scan(&self, projection: &Schema) -> Result<FragmentRecordBatchStream> {
-        let reader = self
-            .do_open(&[self.metadata.files[0].path.as_str()])
-            .await?;
-        let params = FragmentScanParams::default();
-        FragmentRecordBatchStream::try_new(projection, vec![reader], params).await
-    }
-}
-
-#[derive(Debug)]
-pub struct FragmentScanParams {
-    pub batch_size: usize,
-
-    pub prefetch_size: usize,
-}
-
-impl Default for FragmentScanParams {
-    fn default() -> Self {
-        Self {
-            batch_size: 8196,
-            prefetch_size: 4,
-        }
-    }
-}
-
-/// Scanning over a Fragment.
-///
-/// A Stream contains one or more [`FileReader`]s, each of which is responsible for separated columns
-/// in the fragment.
-pub struct FragmentRecordBatchStream {
-    schema: SchemaRef,
-
-    _io_thread: JoinHandle<()>,
-
-    rx: Receiver<Result<RecordBatch>>,
-}
-
-impl FragmentRecordBatchStream {
-    pub async fn try_new(
-        schema: &Schema,
-        readers: Vec<FileReader>,
-        params: FragmentScanParams,
-    ) -> Result<Self> {
-        if readers.is_empty() {
-            return Err(Error::IO(
-                "No readers in FragmentRecordBatchStream".to_string(),
-            ));
-        }
-        let (tx, rx) = mpsc::channel(params.prefetch_size);
-
-        let projection = schema.clone();
-        let io_thread = tokio::spawn(async move {
-            // Only support one reader before schema evolution.
-            let reader = &readers[0];
-            'outer: for batch_id in 0..readers[0].num_batches() as i32 {
-                let rows_in_batch = readers[0].num_rows_in_batch(batch_id);
-                for start in (0..rows_in_batch).step_by(params.batch_size) {
-                    let result = reader
-                        .read_batch(
-                            batch_id,
-                            start..min(start + params.batch_size, rows_in_batch),
-                            &projection,
-                        )
-                        .await;
-                    if tx.is_closed() {
-                        // Early stop
-                        break 'outer;
-                    }
-                    if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
-                        eprintln!("Failed to scan data: {err}");
-                        break 'outer;
-                    }
-                }
-            }
-        });
-
-        Ok(Self {
-            schema: Arc::new(ArrowSchema::from(schema)),
-            _io_thread: io_thread,
-            rx,
-        })
-    }
-}
-
-impl RecordBatchStream for FragmentRecordBatchStream {
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-}
-
-impl Stream for FragmentRecordBatchStream {
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+    ///
+    /// See [`Dataset::scan`].
+    pub fn scan(&self) -> Scanner {
+        Scanner::from_fragment(self.dataset.clone(), self.metadata.clone())
     }
 }
 
@@ -196,4 +94,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan() {}
+
+    #[tokio::test]
+    async fn test_fragment_take() {}
+
+    #[tokio::test]
+    async fn test_fragment_count() {}
 }
