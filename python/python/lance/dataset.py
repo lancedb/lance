@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from functools import cache, cached_property
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -56,7 +56,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._uri
 
-    @cache
+    @lru_cache(maxsize=None)
     def list_indices(self) -> List[Dict[str, Any]]:
         return self._ds.get_index_metadata()
 
