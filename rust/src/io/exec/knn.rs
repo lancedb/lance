@@ -43,7 +43,7 @@ pub struct KNNFlatStream {
 }
 
 impl KNNFlatStream {
-    /// Construct a [KNNFlat] node.
+    /// Construct a [`KNNFlatStream`] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
         KNNFlatStream::from_stream(stream, query)
