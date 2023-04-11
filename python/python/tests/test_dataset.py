@@ -219,4 +219,3 @@ def test_polar_scan(tmp_path: Path):
     polars_df = pl.scan_pyarrow_dataset(dataset)
     df = dataset.to_table().to_pandas()
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
-

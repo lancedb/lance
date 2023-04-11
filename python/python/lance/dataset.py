@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
-from functools import cached_property, cache
+from functools import cache, cached_property
 from pathlib import Path
-from typing import Iterator, Optional, Union, List, Dict, Any
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 import numpy as np
 import pandas as pd
