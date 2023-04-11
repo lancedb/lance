@@ -38,6 +38,7 @@ use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
 };
+use crate::io::RecordBatchStream;
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -248,14 +249,14 @@ impl Scanner {
     /// Create a stream of this Scanner.
     ///
     /// TODO: implement as IntoStream/IntoIterator.
-    pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
+    pub async fn try_into_stream(&self) -> Result<impl RecordBatchStream> {
         let plan = self.create_plan().await?;
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
-        Ok(RecordBatchStream::new(
+        Ok(ScannerRecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
     }
@@ -498,22 +499,24 @@ impl Scanner {
 
 /// ScannerStream is a container to wrap different types of ExecNode.
 #[pin_project::pin_project]
-pub struct RecordBatchStream {
+pub struct ScannerRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
 }
 
-impl RecordBatchStream {
+impl ScannerRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
+}
 
+impl RecordBatchStream for ScannerRecordBatchStream {
     fn schema(&self) -> SchemaRef {
         self.exec_node.schema()
     }
 }
 
-impl Stream for RecordBatchStream {
+impl Stream for ScannerRecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

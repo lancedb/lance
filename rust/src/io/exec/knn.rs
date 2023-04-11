@@ -28,10 +28,11 @@ use futures::stream::Stream;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
-use crate::dataset::scanner::RecordBatchStream;
+use crate::dataset::scanner::ScannerRecordBatchStream;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::flat::flat_search;
 use crate::index::vector::{open_index, Query, SCORE_COL};
+use crate::io::RecordBatchStream;
 use crate::{Error, Result};
 
 /// KNN node for post-filtering.
@@ -44,11 +45,11 @@ pub struct KNNFlatStream {
 impl KNNFlatStream {
     /// Construct a [KNNFlat] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
-        let stream = RecordBatchStream::new(child);
+        let stream = ScannerRecordBatchStream::new(child);
         KNNFlatStream::from_stream(stream, query)
     }
 
-    fn from_stream(stream: RecordBatchStream, query: &Query) -> Self {
+    fn from_stream(stream: impl RecordBatchStream + Send + 'static, query: &Query) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
