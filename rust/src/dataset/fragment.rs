@@ -21,6 +21,8 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use futures::Stream;
+use tokio::sync::mpsc::{self, Receiver};
+use tokio::task::JoinHandle;
 
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
@@ -89,9 +91,31 @@ impl<'a> FileFragment<'a> {
         reader.take(indices, projection).await
     }
 
+    /// Scan this [`FileFragment`].
     pub async fn scan(&self, projection: &Schema) -> Result<FragmentRecordBatchStream> {
         let schema = Arc::new(ArrowSchema::from(projection));
-        Ok(FragmentRecordBatchStream::new(schema))
+        let reader = self
+            .do_open(&[self.metadata.files[0].path.as_str()])
+            .await?;
+
+        let params = FragmentScanParams::default();
+        FragmentRecordBatchStream::try_new(schema, vec![reader], &params).await
+    }
+}
+
+#[derive(Debug)]
+pub struct FragmentScanParams {
+    pub batch_size: usize,
+
+    pub prefetch_size: usize,
+}
+
+impl Default for FragmentScanParams {
+    fn default() -> Self {
+        Self {
+            batch_size: 8196,
+            prefetch_size: 4,
+        }
     }
 }
 
@@ -102,14 +126,28 @@ impl<'a> FileFragment<'a> {
 pub struct FragmentRecordBatchStream {
     schema: SchemaRef,
     readers: Vec<FileReader>,
+
+    _io_thread: JoinHandle<()>,
+
+    rx: Receiver<Result<RecordBatch>>,
 }
 
 impl FragmentRecordBatchStream {
-    pub fn new(schema: SchemaRef) -> Self {
-        Self {
+    pub async fn try_new(
+        schema: SchemaRef,
+        readers: Vec<FileReader>,
+        params: &FragmentScanParams,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(params.prefetch_size);
+
+        let io_thread = tokio::spawn(async move {});
+
+        Ok(Self {
             schema,
-            readers: vec![],
-        }
+            readers,
+            _io_thread: io_thread,
+            rx,
+        })
     }
 }
 
@@ -123,7 +161,7 @@ impl Stream for FragmentRecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+        Pin::into_inner(self).rx.poll_recv(cx)
     }
 }
 
