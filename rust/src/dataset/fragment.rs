@@ -75,17 +75,19 @@ impl<'a> FileFragment<'a> {
         Ok(reader.len())
     }
 
-    pub async fn take(&self, indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
+    pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let reader = self
             .do_open(&[self.metadata.files[0].path.as_str()])
             .await?;
-        todo!()
+        reader.take(indices, projection).await
     }
 
-    pub async fn scan(&self, projection: &Schema) -> Result<RecordBatch> {
+    pub async fn scan(&self, projection: &Schema) -> Result<FragmentRecordBatchStream> {
         todo!()
     }
 }
+
+pub struct FragmentRecordBatchStream {}
 
 #[cfg(test)]
 mod tests {}
