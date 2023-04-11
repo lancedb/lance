@@ -14,8 +14,6 @@
 
 //! Wraps a Fragment of the dataset.
 
-use std::sync::Arc;
-
 use arrow_array::RecordBatch;
 
 use crate::dataset::Dataset;
@@ -26,7 +24,7 @@ use crate::Result;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
-/// The inteface is similar to `pyarrow.dataset.Fragment`.
+/// The interface is similar to `pyarrow.dataset.Fragment`.
 pub struct FileFragment<'a> {
     dataset: &'a Dataset,
 
