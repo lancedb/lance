@@ -497,7 +497,7 @@ impl Scanner {
     }
 }
 
-/// [`DatasetRecordBatchScream`] wraps the Exec nodes into a [`RecordBatchStream`] for
+/// [`DatasetRecordBatchScream`] wraps the dataset into a [`RecordBatchStream`] for
 /// consumption by the user.
 ///
 #[pin_project::pin_project]
