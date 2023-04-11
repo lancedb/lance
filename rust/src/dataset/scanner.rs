@@ -247,7 +247,7 @@ impl Scanner {
     }
 
     /// Create a stream from the Scanner.
-    pub async fn try_into_stream(&self) -> Result<impl RecordBatchStream> {
+    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
 
         let session_config = SessionConfig::new();
