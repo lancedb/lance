@@ -85,8 +85,8 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-pub struct FileReader<'a> {
-    object_reader: Box<dyn ObjectReader + 'a>,
+pub struct FileReader {
+    object_reader: Box<dyn ObjectReader>,
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
@@ -100,14 +100,14 @@ pub struct FileReader<'a> {
     with_row_id: bool,
 }
 
-impl<'a> FileReader<'a> {
+impl FileReader {
     /// Open file reader
     pub(crate) async fn try_new_with_fragment(
-        object_store: &'a ObjectStore,
+        object_store: &ObjectStore,
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-    ) -> Result<FileReader<'a>> {
+    ) -> Result<FileReader> {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -154,7 +154,7 @@ impl<'a> FileReader<'a> {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(object_store: &'a ObjectStore, path: &Path) -> Result<FileReader<'a>> {
+    pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -280,7 +280,7 @@ impl<'a> FileReader<'a> {
 
 /// Read a batch.
 async fn read_batch(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     params: &ReadBatchParams,
     schema: &Schema,
     batch_id: i32,
@@ -322,7 +322,7 @@ async fn read_batch(
 
 #[async_recursion]
 async fn read_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -365,7 +365,7 @@ fn get_page_info<'a>(
 
 /// Read primitive array for batch `batch_idx`.
 async fn _read_fixed_stride_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -383,7 +383,7 @@ async fn _read_fixed_stride_array(
 }
 
 fn read_null_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -427,7 +427,7 @@ fn read_null_array(
 }
 
 async fn read_binary_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -447,7 +447,7 @@ async fn read_binary_array(
 }
 
 async fn read_dictionary_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -472,7 +472,7 @@ async fn read_dictionary_array(
 }
 
 async fn read_struct_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -488,7 +488,7 @@ async fn read_struct_array(
 }
 
 async fn take_list_array<T: ArrowNumericType>(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     positions: &PrimitiveArray<T>,
@@ -537,7 +537,7 @@ where
 }
 
 async fn read_list_array<T: ArrowNumericType>(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -1038,7 +1038,7 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
 
         async fn read_array_w_params(
-            reader: &FileReader<'_>,
+            reader: &FileReader,
             field: &Field,
             params: ReadBatchParams,
         ) -> ArrayRef {

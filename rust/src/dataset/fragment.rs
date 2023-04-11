@@ -14,12 +14,18 @@
 
 //! Wraps a Fragment of the dataset.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
 use arrow_array::RecordBatch;
+use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use futures::Stream;
 
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::format::{Fragment, Manifest};
-use crate::io::FileReader;
+use crate::io::{FileReader, RecordBatchStream};
 use crate::Result;
 
 /// A Fragment of a Lance [`Dataset`].
@@ -75,6 +81,7 @@ impl<'a> FileFragment<'a> {
         Ok(reader.len())
     }
 
+    /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let reader = self
             .do_open(&[self.metadata.files[0].path.as_str()])
@@ -83,11 +90,46 @@ impl<'a> FileFragment<'a> {
     }
 
     pub async fn scan(&self, projection: &Schema) -> Result<FragmentRecordBatchStream> {
+        let schema = Arc::new(ArrowSchema::from(projection));
+        Ok(FragmentRecordBatchStream::new(schema))
+    }
+}
+
+/// Scanning over a Fragment.
+///
+/// A Stream contains one or more [`FileReader`]s, each of which is responsible for separated columns
+/// in the fragment.
+pub struct FragmentRecordBatchStream {
+    schema: SchemaRef,
+    readers: Vec<FileReader>,
+}
+
+impl FragmentRecordBatchStream {
+    pub fn new(schema: SchemaRef) -> Self {
+        Self {
+            schema,
+            readers: vec![],
+        }
+    }
+}
+
+impl RecordBatchStream for FragmentRecordBatchStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+impl Stream for FragmentRecordBatchStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         todo!()
     }
 }
 
-pub struct FragmentRecordBatchStream {}
-
 #[cfg(test)]
-mod tests {}
+mod tests {
+
+    #[tokio::test]
+    async fn test_scan() {}
+}
