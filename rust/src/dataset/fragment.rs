@@ -92,12 +92,102 @@ impl FileFragment {
 #[cfg(test)]
 mod tests {
 
-    #[tokio::test]
-    async fn test_scan() {}
+    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
+
+    use super::*;
+
+    use arrow_array::{Int32Array, RecordBatchReader, StringArray};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use tempfile::tempdir;
+
+    async fn create_dataset(test_uri: &str) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let batches = RecordBatchBuffer::new(
+            (0..10)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                            Arc::new(StringArray::from_iter_values(
+                                (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                            )),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 2;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+
+        dataset
+    }
 
     #[tokio::test]
-    async fn test_fragment_take() {}
+    async fn test_fragment_scan() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let fragment = &dataset.get_fragments()[2];
+        let mut scanner = fragment.scan();
+        let batches = scanner
+            .with_row_id()
+            .filter(" i  < 110")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 2);
+
+        assert_eq!(
+            batches[0].column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(80..100)
+        );
+        assert_eq!(
+            batches[1].column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(100..110)
+        );
+    }
 
     #[tokio::test]
-    async fn test_fragment_count() {}
+    async fn test_fragment_take() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let fragment = &dataset.get_fragments()[3];
+
+        let batch = fragment.take(&[1, 2, 4, 5, 8], dataset.schema()).await.unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from_iter_values(vec![121, 122, 124, 125, 128])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_count() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let fragment = &dataset.get_fragments()[3];
+
+        assert_eq!(fragment.count_rows().await.unwrap(), 40);
+    }
 }
