@@ -106,6 +106,7 @@ message VectorIndexStage {
   }
 }
 
+
 // Metric Type for Vector Index
 enum VectorMetricType {
   // L2 (Euclidean) Distance

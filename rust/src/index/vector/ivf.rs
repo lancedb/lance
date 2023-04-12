@@ -36,8 +36,10 @@ use rand::{rngs::SmallRng, SeedableRng};
 use uuid::Uuid;
 
 use super::{
-    opq::OptimizedProductQuantizer, pq::ProductQuantizer, MetricType, Query, VectorIndex,
-    INDEX_FILE_NAME,
+    opq::train_opq,
+    pq::{train_pq, PQBuildParams, ProductQuantizer},
+    utils::maybe_sample_training_data,
+    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
 use crate::{
@@ -323,16 +325,24 @@ impl Ivf {
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
             let part_id = argmin(
-                dist_func(vector.values(), centroids.data().values(), dim)
+                dist_func(vector, centroids.data().values(), dim)
                     .unwrap()
                     .as_ref(),
             )
             .unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
-            let residual = subtract_dyn(&vector, &cent)?;
-            let resi_arr: &Float32Array = as_primitive_array(&residual);
-            residual_builder.append_slice(resi_arr.values());
+            if vector.len() != cent.len() {
+                return Err(Error::IO(format!(
+                    "Ivf::compute_residual: dimension mismatch: {} != {}",
+                    vector.len(),
+                    cent.len()
+                )));
+            }
+            unsafe {
+                residual_builder
+                    .append_trusted_len_iter(vector.iter().zip(cent.iter()).map(|(v, c)| v - c))
+            }
         }
 
         let part_ids = part_id_builder.finish();
@@ -426,55 +436,6 @@ pub struct IvfBuildParams {
     pub max_iters: usize,
 }
 
-/// Parameters for building product quantization.
-pub struct PQBuildParams {
-    /// Number of subvectors to build PQ code
-    pub num_sub_vectors: usize,
-
-    /// The number of bits to present one PQ centroid.
-    pub num_bits: usize,
-
-    /// Metric type, L2 or Cosine.
-    pub metric_type: MetricType,
-
-    /// Train as optimized product quantization.
-    pub use_opq: bool,
-
-    /// The max number of iterations for kmeans training.
-    pub max_iters: usize,
-
-    /// Max number of iterations to train OPQ, if `use_opq` is true.
-    pub max_opq_iters: usize,
-}
-
-async fn maybe_sample_training_data(
-    dataset: &Dataset,
-    column: &str,
-    sample_size_hint: usize,
-) -> Result<MatrixView> {
-    let num_rows = dataset.count_rows().await?;
-    let projection = dataset.schema().project(&[column])?;
-    let batch = if num_rows > sample_size_hint {
-        dataset.sample(sample_size_hint, &projection).await?
-    } else {
-        let mut scanner = dataset.scan();
-        scanner.project(&[column])?;
-        let batches = scanner
-            .try_into_stream()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
-    };
-
-    let array = batch.column_by_name(column).ok_or(Error::Index(format!(
-        "Sample training data: column {} does not exist in return",
-        column
-    )))?;
-    let fixed_size_array = as_fixed_size_list_array(array);
-    fixed_size_array.try_into()
-}
-
 /// Compute residual matrix.
 ///
 /// Parameters
@@ -494,15 +455,22 @@ fn compute_residual_matrix(
     for i in 0..data.num_rows() {
         let row = data.row(i).unwrap();
         let part_id = argmin(
-            dist_func(row.values(), centroids.data().values(), dim)
+            dist_func(row, centroids.data().values(), dim)
                 .unwrap()
                 .as_ref(),
         )
         .unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
-        let residual = subtract_dyn(&row, &centroid)?;
-        let f32_residual_array: &Float32Array = as_primitive_array(&residual);
-        builder.append_slice(f32_residual_array.values());
+        if row.len() != centroid.len() {
+            return Err(Error::IO(format!(
+                "Ivf::compute_residual: dimension mismatch: {} != {}",
+                row.len(),
+                centroid.len()
+            )));
+        };
+        unsafe {
+            builder.append_trusted_len_iter(row.iter().zip(centroid.iter()).map(|(v, c)| v - c))
+        }
     }
     Ok(Arc::new(builder.finish()))
 }
@@ -553,8 +521,7 @@ pub async fn build_ivf_pq_index(
     let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
     let residual_data =
         compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
-    let pq_training_data =
-        FixedSizeListArray::try_new(residual_data.as_ref(), training_data.num_columns() as i32)?;
+    let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
 
     // The final train of PQ sub-vectors
     let pq = train_pq(&pq_training_data, pq_params).await?;
@@ -711,32 +678,6 @@ async fn write_index_file(
     writer.shutdown().await?;
 
     Ok(())
-}
-
-/// Train product quantization over (OPQ-rotated) residual vectors.
-async fn train_pq(data: &FixedSizeListArray, params: &PQBuildParams) -> Result<ProductQuantizer> {
-    let mut pq = ProductQuantizer::new(
-        params.num_sub_vectors,
-        params.num_bits as u32,
-        data.value_length() as usize,
-    );
-    let mat: MatrixView = data.try_into()?;
-    pq.train(&mat, params.metric_type, params.max_iters).await?;
-    Ok(pq)
-}
-
-/// Train Optimized Product Quantization.
-async fn train_opq(data: &MatrixView, params: &PQBuildParams) -> Result<OptimizedProductQuantizer> {
-    let mut opq = OptimizedProductQuantizer::new(
-        params.num_sub_vectors as usize,
-        params.num_bits as u32,
-        params.metric_type,
-        params.max_opq_iters,
-    );
-
-    opq.train(data).await?;
-
-    Ok(opq)
 }
 
 /// Train IVF partitions using kmeans.

@@ -13,6 +13,7 @@
 #  limitations under the License.
 
 import os
+import pickle
 import platform
 import time
 from datetime import datetime
@@ -20,7 +21,8 @@ from pathlib import Path
 from unittest import mock
 
 import lance
-import pandas as pd
+import pandas.testing as tm
+import polars as pl
 import pyarrow as pa
 import pytest
 
@@ -196,4 +198,25 @@ def test_to_batches(tmp_path: Path):
     batches = dataset.to_batches()
     assert pa.Table.from_batches(batches) == table
 
+
+def test_pickle(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    pickled = pickle.dumps(dataset)
+    unpickled = pickle.loads(pickled)
+    assert dataset.to_table() == unpickled.to_table()
+
+
+def test_polar_scan(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    polars_df = pl.scan_pyarrow_dataset(dataset)
+    df = dataset.to_table().to_pandas()
+    tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 

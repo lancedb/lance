@@ -267,6 +267,10 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
     }
 }
 
+pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
+    arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
+}
+
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.

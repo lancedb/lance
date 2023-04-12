@@ -51,7 +51,6 @@ fn transpose(input: &[f32], dimension: usize) -> Vec<f32> {
 
 /// A 2-D matrix view on top of Arrow Arrays.
 ///
-/// [MatrixView] does not own the data.
 #[derive(Debug, Clone)]
 pub struct MatrixView {
     /// Underneath data array.
@@ -130,13 +129,46 @@ impl MatrixView {
         }
     }
 
-    pub fn row(&self, i: usize) -> Option<Float32Array> {
+    /// Returns a row at index `i`. Returns `None` if the index is out of bound.
+    ///
+    /// # Panics if the matrix is transposed.
+    pub fn row(&self, i: usize) -> Option<&[f32]> {
+        assert!(
+            !self.transpose,
+            "Centroid is not defined for transposed matrix."
+        );
         if i >= self.num_rows() {
             None
         } else {
-            let slice_arr = self.data.slice(i * self.num_columns(), self.num_columns());
-            Some(as_primitive_array(slice_arr.as_ref()).clone())
+            let dim = self.num_columns();
+            Some(&self.data.values()[i * dim..(i + 1) * dim])
         }
+    }
+
+    /// Compute the centroid from all the rows. Returns `None` if this matrix is empty.
+    ///
+    /// # Panics if the matrix is transposed.
+    pub fn centroid(&self) -> Option<Float32Array> {
+        assert!(
+            !self.transpose,
+            "Centroid is not defined for transposed matrix."
+        );
+        if self.num_rows() == 0 {
+            return None;
+        }
+        // Scale to f64 to reduce the chance of overflow.
+        let dim = self.num_columns();
+        // Add all rows with only one memory allocation.
+        let mut sum = vec![0_f64; dim];
+        // TODO: can SIMD work better here? Is it memory-bandwidth bound?.
+        self.data.values().chunks(dim).for_each(|row| {
+            row.iter().enumerate().for_each(|(i, v)| {
+                sum[i] += *v as f64;
+            })
+        });
+        let total = self.num_rows() as f64;
+        let arr = Float32Array::from_iter(sum.iter().map(|v| (v / total) as f32));
+        Some(arr)
     }
 
     /// (Lazy) transpose of the matrix.
@@ -211,8 +243,8 @@ impl MatrixView {
 
     /// Sample `n` rows with a random generator.
     pub fn sample_with(&self, n: usize, mut rng: impl Rng) -> Self {
-        assert_eq!(
-            self.transpose, false,
+        assert!(
+            !self.transpose,
             "Does not support sampling on transposed matrix"
         );
         if n > self.num_rows() {
@@ -348,9 +380,9 @@ impl SingularValueDecomposition for MatrixView {
         }
 
         let u_values = Arc::new(Float32Array::from_iter_values(u));
-        let u = MatrixView::new(u_values, m as usize).transpose();
+        let u = Self::new(u_values, m as usize).transpose();
         let vt_values = Arc::new(Float32Array::from_iter_values(vt));
-        let vt = MatrixView::new(vt_values, n as usize).transpose();
+        let vt = Self::new(vt_values, n as usize).transpose();
         let sigma = Float32Array::from_iter_values(sigma);
         Ok((u, sigma, vt))
     }
@@ -516,6 +548,17 @@ mod tests {
         assert_eq!(
             a_t.data().values(),
             &[1.0, 4.0, 7.0, 10.0, 2.0, 5.0, 8.0, 11.0, 3.0, 6.0, 9.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn test_centroids() {
+        let data = Arc::new(Float32Array::from_iter((0..500).map(|v| v as f32)));
+        let mat = MatrixView::new(data, 10);
+        let centroids = mat.centroid().unwrap();
+        assert_eq!(
+            centroids.values(),
+            (245..255).map(|v| v as f32).collect::<Vec<_>>().as_slice(),
         );
     }
 }

@@ -38,6 +38,7 @@ use crate::index::vector::{MetricType, Query};
 use crate::io::exec::{
     KNNFlatExec, KNNIndexExec, LanceScanExec, Planner, ProjectionExec, TakeExec,
 };
+use crate::io::RecordBatchStream;
 use crate::utils::sql::parse_sql_filter;
 use crate::{Error, Result};
 
@@ -78,6 +79,9 @@ pub struct Scanner {
 
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
+
+    /// If set, this scanner serves one fragment only.
+    fragment: Option<Fragment>,
 }
 
 impl Scanner {
@@ -92,12 +96,42 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
+            fragment: None,
         }
+    }
+
+    pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
+        let projection = dataset.schema().clone();
+        Self {
+            dataset,
+            projections: projection,
+            filter: None,
+            batch_size: DEFAULT_BATCH_SIZE,
+            limit: None,
+            offset: None,
+            nearest: None,
+            with_row_id: false,
+            fragment: Some(fragment),
+        }
+    }
+
+    fn ensure_not_fragment_scan(&self) -> Result<()> {
+        if self.is_fragment_scan() {
+            Err(Error::IO(
+                "This operation is not supported for fragment scan".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_fragment_scan(&self) -> bool {
+        self.fragment.is_some()
     }
 
     /// Projection.
     ///
-    /// Only seelect the specific columns. If not specifid, all columns will be scanned.
+    /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
@@ -145,8 +179,10 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Find k-nearest neighbour within the vector column.
+    /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+        self.ensure_not_fragment_scan()?;
+
         if k == 0 {
             return Err(Error::IO("k must be positive".to_string()));
         }
@@ -245,17 +281,15 @@ impl Scanner {
         Ok(Arc::new(schema))
     }
 
-    /// Create a stream of this Scanner.
-    ///
-    /// TODO: implement as IntoStream/IntoIterator.
-    pub async fn try_into_stream(&self) -> Result<RecordBatchStream> {
+    /// Create a stream from the Scanner.
+    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
 
         let session_config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
-        Ok(RecordBatchStream::new(
+        Ok(DatasetRecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
     }
@@ -353,7 +387,7 @@ impl Scanner {
         Ok(plan)
     }
 
-    //
+    // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO("No nearest query".to_string()));
@@ -440,7 +474,12 @@ impl Scanner {
 
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
-        self.scan_fragments(with_row_id, projection, self.dataset.fragments().clone())
+        let fragments = if let Some(fragment) = self.fragment.as_ref() {
+            Arc::new(vec![fragment.clone()])
+        } else {
+            self.dataset.fragments().clone()
+        };
+        self.scan_fragments(with_row_id, projection, fragments)
     }
 
     fn scan_fragments(
@@ -496,24 +535,28 @@ impl Scanner {
     }
 }
 
-/// ScannerStream is a container to wrap different types of ExecNode.
+/// [`DatasetRecordBatchStream`] wraps the dataset into a [`RecordBatchStream`] for
+/// consumption by the user.
+///
 #[pin_project::pin_project]
-pub struct RecordBatchStream {
+pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
 }
 
-impl RecordBatchStream {
+impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
         Self { exec_node }
     }
+}
 
+impl RecordBatchStream for DatasetRecordBatchStream {
     fn schema(&self) -> SchemaRef {
         self.exec_node.schema()
     }
 }
 
-impl Stream for RecordBatchStream {
+impl Stream for DatasetRecordBatchStream {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

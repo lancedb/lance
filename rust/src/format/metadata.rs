@@ -1,23 +1,22 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use crate::format::{pb, ProtoStruct};
+use crate::{Error, Result};
 
 /// Data File Metadata
 #[derive(Debug, Default, PartialEq)]
@@ -139,6 +138,36 @@ impl Metadata {
             })
             .collect()
     }
+
+    /// Map the range of row indices to the corresponding batches.
+    ///
+    /// It returns a list of (batch_id, in_batch_range) tuples.
+    pub(crate) fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
+        if range.end > *(self.batch_offsets.last().unwrap()) as usize {
+            return Err(Error::IO(format!(
+                "Range {:?} is out of bounds {}",
+                range,
+                self.batch_offsets.last().unwrap()
+            )));
+        }
+        let offsets = self.batch_offsets.as_slice();
+        let mut batch_id = offsets
+            .binary_search(&(range.start as i32))
+            .unwrap_or_else(|x| x - 1);
+        let mut batches = vec![];
+
+        while batch_id < self.num_batches() {
+            let batch_start = offsets[batch_id] as usize;
+            if batch_start >= range.end {
+                break;
+            }
+            let start = std::cmp::max(range.start, batch_start) - batch_start;
+            let end = std::cmp::min(range.end, offsets[batch_id + 1] as usize) - batch_start;
+            batches.push((batch_id as i32, start..end));
+            batch_id += 1;
+        }
+        Ok(batches)
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +195,25 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn test_range_to_batches() {
+        let mut metadata = Metadata::default();
+        for l in [5, 10, 15, 20] {
+            metadata.push_batch_length(l);
+        }
+
+        let batches = metadata.range_to_batches(0..10).unwrap();
+        assert_eq!(batches, vec![(0, 0..5), (1, 0..5)]);
+
+        let batches = metadata.range_to_batches(2..10).unwrap();
+        assert_eq!(batches, vec![(0, 2..5), (1, 0..5)]);
+
+        let batches = metadata.range_to_batches(15..33).unwrap();
+        assert_eq!(batches, vec![(2, 0..15), (3, 0..3)]);
+
+        let batches = metadata.range_to_batches(14..33).unwrap();
+        assert_eq!(batches, vec![(1, 9..10), (2, 0..15), (3, 0..3)]);
     }
 }
