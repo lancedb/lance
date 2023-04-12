@@ -50,5 +50,5 @@ build-backend = "maturin"
 tests = [
     "pytest",
     "duckdb",
-    "polars[pyarrow,pandas]>=0.16.10",
+    "polars[pyarrow,pandas]",
 ]
