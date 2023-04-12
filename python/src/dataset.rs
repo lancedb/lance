@@ -78,10 +78,11 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
-    fn get_index_metadata(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+    /// Load index metadata
+    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let index_metadata = self_
             .rt
-            .block_on(async { self_.ds.get_index_metadata().await })
+            .block_on(async { self_.ds.load_indices().await })
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         let py = self_.py();
         Ok(index_metadata
@@ -96,11 +97,14 @@ impl Dataset {
                     .iter()
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
-                let idx_uuid = str::from_utf8(idx.uuid.as_ref().unwrap().uuid.as_slice())
-                    .unwrap_or("invalid uuid");
 
                 dict.set_item("name", idx.name.clone()).unwrap();
-                dict.set_item("uuid", idx_uuid).unwrap();
+                // TODO: once we add more than vector indices, we need to:
+                // 1. Change protos and write path to persist index type
+                // 2. Use the new field from idx instead of hard coding it to Vector
+                dict.set_item("type", IndexType::Vector.to_string())
+                    .unwrap();
+                dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version.clone())
                     .unwrap();

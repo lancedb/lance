@@ -672,23 +672,6 @@ impl Dataset {
             Ok(vec![])
         }
     }
-
-    pub async fn get_index_metadata(&self) -> Result<Vec<IndexMetadata>> {
-        if let Some(pos) = self.manifest.index_section.as_ref() {
-            let manifest_file = self.manifest_file(self.version().version);
-
-            let reader = self.object_store.open(&manifest_file).await?;
-            let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
-
-            Ok(section
-                .indices
-                .iter()
-                .map(|idx| idx.clone())
-                .collect::<Vec<_>>())
-        } else {
-            Ok(vec![])
-        }
-    }
 }
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
