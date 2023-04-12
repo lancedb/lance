@@ -33,10 +33,6 @@ impl Dot for [f32] {
 
 impl Dot for Float32Array {
     fn dot(&self, other: &Self) -> f32 {
-        let mut sum = 0.0;
-        for i in 0..self.len() {
-            sum += self.value(i) * other.value(i);
-        }
-        sum
+        self.values().dot(other.values())
     }
 }
