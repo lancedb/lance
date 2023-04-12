@@ -18,7 +18,9 @@ use arrow_array::Float32Array;
 use num_traits::{real::Real};
 
 pub trait L2 {
-    fn l2(&self, other: &Self) -> f32;
+    type Output;
+
+    fn l2(&self, other: &Self) -> Self::Output;
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -35,7 +37,7 @@ unsafe fn l2_neon(from: &[f32], to: &[f32]) -> f32 {
         let sub = vsubq_f32(left, right);
         sum = vfmaq_f32(sum, sub, sub);
     }
-    vaddvq_f32(sum)
+    vaddvq_f32(sum).sqrt()
 }
 
 /// Fall back to scalar implementation.
@@ -48,7 +50,9 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
 }
 
 impl L2 for [f32] {
-    fn l2(&self, other: &Self) -> f32 {
+    type Output = f32;
+
+    fn l2(&self, other: &Self) -> Self::Output {
         #[cfg(any(target_arch = "aarch64"))]
         {
             use std::arch::is_aarch64_feature_detected;
@@ -64,13 +68,17 @@ impl L2 for [f32] {
 }
 
 impl L2 for Vec<f32> {
-    fn l2(&self, other: &Self) -> f32 {
+    type Output = f32;
+
+    fn l2(&self, other: &Self) -> Self::Output {
         self.as_slice().l2(other.as_slice())
     }
 }
 
 impl L2 for Float32Array {
-    fn l2(&self, other: &Self) -> f32 {
+    type Output = f32;
+
+    fn l2(&self, other: &Self) -> Self::Output {
         self.values().l2(other.values())
     }
 }
