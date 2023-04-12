@@ -17,6 +17,8 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
+use super::add::add_fma_f32;
+
 /// Trait for calculating L2 distance.
 ///
 pub trait L2 {
@@ -29,6 +31,7 @@ pub trait L2 {
 #[target_feature(enable = "fma")]
 unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+
     debug_assert_eq!(from.len(), to.len());
 
     let len = from.len() / 8 * 8;
@@ -42,21 +45,12 @@ unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
         // sum = sub * sub + sum
         sums = _mm256_fmadd_ps(sub, sub, sums);
     }
-    // Shift and add vector, until only 1 value left.
-    // sums = [x0-x7], shift = [x4-x7]
-    let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
-    // [x0+x4, x1+x5, ..]
-    sums = _mm256_add_ps(sums, shift);
-    shift = _mm256_permute_ps(sums, 14);
-    sums = _mm256_add_ps(sums, shift);
-    sums = _mm256_hadd_ps(sums, sums);
-    let mut results: [f32; 8] = [0f32; 8];
-    _mm256_storeu_ps(results.as_mut_ptr(), sums);
+    let sum = add_fma_f32(sums);
 
     from[len..]
         .iter()
         .zip(to[len..].iter())
-        .fold(results[0], |acc, (a, b)| acc + (a - b).powi(2))
+        .fold(sum, |acc, (a, b)| acc + (a - b).powi(2))
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -92,6 +86,7 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
 impl L2 for [f32] {
     type Output = f32;
 
+    #[inline]
     fn l2(&self, other: &Self) -> Self::Output {
         #[cfg(any(target_arch = "aarch64"))]
         {
