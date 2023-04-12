@@ -17,6 +17,8 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
+/// Trait for calculating L2 distance.
+///
 pub trait L2 {
     type Output;
 
@@ -34,8 +36,8 @@ unsafe fn l2_fma(from: &[f32], to: &[f32]) -> f32 {
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
         // Cache line-aligned
-        let left = _mm256_load_ps(from.as_ptr().add(i));
-        let right = _mm256_load_ps(to.as_ptr().add(i));
+        let left = _mm256_loadu_ps(from.as_ptr().add(i));
+        let right = _mm256_loadu_ps(to.as_ptr().add(i));
         let sub = _mm256_sub_ps(left, right);
         // sum = sub * sub + sum
         sums = _mm256_fmadd_ps(sub, sub, sums);
@@ -67,7 +69,7 @@ unsafe fn l2_neon(from: &[f32], to: &[f32]) -> f32 {
         let sub = vsubq_f32(left, right);
         sum = vfmaq_f32(sum, sub, sub);
     }
-    vaddvq_f32(sum).sqrt()
+    vaddvq_f32(sum)
 }
 
 /// Fall back to scalar implementation.
@@ -81,7 +83,6 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
         .zip(to.iter())
         .map(|(a, b)| (a.sub(*b).powi(2)))
         .sum::<T>()
-        .sqrt()
 }
 
 impl L2 for [f32] {
@@ -132,8 +133,6 @@ mod tests {
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow::array::{as_primitive_array, FixedSizeListArray};
-    use arrow_array::types::Float32Type;
 
     #[test]
     fn test_l2_distance_cases() {
@@ -181,6 +180,26 @@ mod tests {
         ];
 
         let d = q.l2(&values);
-        assert_relative_eq!(0.31935785197341404, d);
+        // From numpy.linage.norm(a-b)
+        assert_relative_eq!( 0.3193578, d);
+
+        let fb_d = l2_scalar(q.as_slice(), values.as_slice());
+        assert_relative_eq!(d, fb_d);
+
+        let value_array: Float32Array = values.into();
+        let q_array: Float32Array = q.into();
+
+        assert_relative_eq!(d, q_array.l2(&value_array));
+    }
+
+    #[test]
+    fn test_not_aligned() {
+        let v1: Float32Array = (0..14).map(|v| v as f32).collect();
+        let v2: Float32Array = (0..10).map(|v| v as f32).collect();
+        let score = v1.values()[6..].l2(&v2.values()[2..]);
+
+        assert_eq!(
+            score, 128.0
+        );
     }
 }
