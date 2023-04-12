@@ -172,3 +172,18 @@ def test_use_index(dataset, tmp_path):
     )["id"].to_numpy()
 
     assert np.all(expected == actual)
+
+
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
+def test_has_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+    )
+    assert ann_ds.has_index
+
+    assert ann_ds.list_indices()[0]["fields"] == ["vector"]

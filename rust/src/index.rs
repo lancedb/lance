@@ -19,6 +19,7 @@
 //!
 
 use std::any::Any;
+use std::fmt;
 
 use async_trait::async_trait;
 
@@ -39,6 +40,14 @@ pub enum IndexType {
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100,
+}
+
+impl fmt::Display for IndexType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            IndexType::Vector => write!(f, "Vector"),
+        }
+    }
 }
 
 /// Builds index.

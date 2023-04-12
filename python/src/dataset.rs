@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::str;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -77,11 +78,46 @@ impl Dataset {
         arrow_schema.to_pyarrow(self_.py())
     }
 
+    /// Load index metadata
+    fn load_indices(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
+        let index_metadata = self_
+            .rt
+            .block_on(async { self_.ds.load_indices().await })
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let py = self_.py();
+        Ok(index_metadata
+            .iter()
+            .map(|idx| {
+                let dict = PyDict::new(py);
+                let schema = self_.ds.schema();
+                let field_names = schema
+                    .project_by_ids(idx.fields.as_slice())
+                    .unwrap()
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect::<Vec<_>>();
+
+                dict.set_item("name", idx.name.clone()).unwrap();
+                // TODO: once we add more than vector indices, we need to:
+                // 1. Change protos and write path to persist index type
+                // 2. Use the new field from idx instead of hard coding it to Vector
+                dict.set_item("type", IndexType::Vector.to_string())
+                    .unwrap();
+                dict.set_item("uuid", idx.uuid.to_string()).unwrap();
+                dict.set_item("fields", field_names).unwrap();
+                dict.set_item("version", idx.dataset_version.clone())
+                    .unwrap();
+                dict.to_object(py)
+            })
+            .collect::<Vec<_>>())
+    }
+
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
         filter: Option<String>,
-        limit: i64,
+        limit: Option<i64>,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
     ) -> PyResult<Scanner> {
@@ -97,9 +133,11 @@ impl Dataset {
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        scanner
-            .limit(limit, offset)
-            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        if let Some(limit) = limit {
+            scanner
+                .limit(limit, offset)
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
         if let Some(nearest) = nearest {
             let column = nearest
                 .get_item("column")
@@ -236,8 +274,8 @@ impl Dataset {
         columns: Vec<&str>,
         index_type: &str,
         name: Option<String>,
-        metric_type: &str,
-        kwargs: &PyDict,
+        metric_type: Option<&str>,
+        kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
             "IVF_PQ" => IndexType::Vector,
@@ -250,23 +288,28 @@ impl Dataset {
 
         // Only VectorParams are supported.
         let mut params = VectorIndexParams::default();
-        if let Some(n) = kwargs.get_item("num_partitions") {
-            params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
-        };
+        if let Some(kwargs) = kwargs {
+            if let Some(n) = kwargs.get_item("num_partitions") {
+                params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+            };
 
-        if let Some(n) = kwargs.get_item("num_sub_vectors") {
-            params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
-        };
+            if let Some(n) = kwargs.get_item("num_sub_vectors") {
+                params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+            };
 
-        if let Some(o) = kwargs.get_item("use_opq") {
-            params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
-        };
-        if let Some(o) = kwargs.get_item("max_opq_iterations") {
-            params.max_opq_iterations = PyAny::downcast::<PyInt>(o)?.extract()?
-        };
+            if let Some(o) = kwargs.get_item("use_opq") {
+                params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
+            };
+            if let Some(o) = kwargs.get_item("max_opq_iterations") {
+                params.max_opq_iterations = PyAny::downcast::<PyInt>(o)?.extract()?
+            };
+        }
 
-        params.metric_type =
-            MetricType::try_from(metric_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        params.metric_type = match metric_type {
+            Some(mt) => MetricType::try_from(mt.to_string().to_lowercase().as_str())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+            None => MetricType::L2,
+        };
 
         self_
             .rt
