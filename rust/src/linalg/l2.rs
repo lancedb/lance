@@ -71,6 +71,11 @@ unsafe fn l2_neon(from: &[f32], to: &[f32]) -> f32 {
 }
 
 /// Fall back to scalar implementation.
+///
+/// With `RUSTFLAGS="-C target-cpu=native"`, rustc will auto-vectorize to some extent.
+///
+/// `rustc 1.68` does SSE and loop-unfolding, inspect here
+/// https://rust.godbolt.org/
 fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter()
         .zip(to.iter())
@@ -98,16 +103,6 @@ impl L2 for [f32] {
             if is_x86_feature_detected!("fma") {
                 unsafe {
                     return l2_fma(self, other);
-                }
-            }
-        }
-
-        #[cfg(any(target_arch = "x86_64"))]
-        {
-            use std::arch::is_aarch64_feature_detected;
-            if is_aarch64_feature_detected!("neon") {
-                unsafe {
-                    return l2_neon(self, other);
                 }
             }
         }
