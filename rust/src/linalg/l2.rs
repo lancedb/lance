@@ -28,8 +28,7 @@ pub trait L2 {
 
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
-#[inline]
-unsafe fn l2_fma(from: &[f32], to: &[f32]) -> f32 {
+unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(from.len(), to.len());
 
@@ -59,7 +58,7 @@ unsafe fn l2_fma(from: &[f32], to: &[f32]) -> f32 {
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn l2_neon(from: &[f32], to: &[f32]) -> f32 {
+unsafe fn l2_neon_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     let len = from.len();
     let buf = [0.0_f32; 4];
@@ -104,7 +103,7 @@ impl L2 for [f32] {
         {
             if is_x86_feature_detected!("fma") {
                 unsafe {
-                    return l2_fma(self, other);
+                    return l2_fma_f32(self, other);
                 }
             }
         }
