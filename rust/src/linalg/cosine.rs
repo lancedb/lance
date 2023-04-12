@@ -59,13 +59,10 @@ unsafe fn cosine_dist_neon_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
     let mut xy = vaddvq_f32(xy);
     let mut y_sq = vaddvq_f32(y_sq);
     // Remaining
-    x[len..]
-        .iter()
-        .zip(y[len..].iter())
-        .for_each(|(x, y)| {
-            xy += x * y;
-            y_sq += y.powi(2)
-        });
+    x[len..].iter().zip(y[len..].iter()).for_each(|(x, y)| {
+        xy += x * y;
+        y_sq += y.powi(2)
+    });
     1.0 - xy / (x_norm * y_sq.sqrt())
 }
 
