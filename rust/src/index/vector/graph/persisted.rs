@@ -53,8 +53,8 @@ impl Default for GraphReadParams {
 }
 
 /// Persisted graph on disk, stored in the file.
-pub struct PersistedGraph<'a, V: Vertex> {
-    reader: FileReader<'a>,
+pub struct PersistedGraph<V: Vertex> {
+    reader: FileReader,
 
     /// Vertex size in bytes.
     vertex_size: usize,
@@ -75,13 +75,13 @@ pub struct PersistedGraph<'a, V: Vertex> {
     params: GraphReadParams,
 }
 
-impl<'a, V: Vertex> PersistedGraph<'a, V> {
+impl<'a, V: Vertex> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
     pub async fn try_new(
         object_store: &'a ObjectStore,
         path: &Path,
         params: GraphReadParams,
-    ) -> Result<PersistedGraph<'a, V>> {
+    ) -> Result<PersistedGraph<V>> {
         let file_reader = FileReader::try_new(object_store, path).await?;
 
         let schema = file_reader.schema();

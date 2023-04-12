@@ -31,7 +31,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::{concat, concat_batches};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
-use futures::stream::{self, Stream, TryStreamExt};
+use futures::stream::{self, TryStreamExt};
 use futures::StreamExt;
 use object_store::path::Path;
 use prost::Message;
@@ -85,8 +85,8 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// Lance File Reader.
 ///
 /// It reads arrow data from one data file.
-pub struct FileReader<'a> {
-    object_reader: Box<dyn ObjectReader + 'a>,
+pub struct FileReader {
+    object_reader: Box<dyn ObjectReader>,
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
@@ -100,14 +100,14 @@ pub struct FileReader<'a> {
     with_row_id: bool,
 }
 
-impl<'a> FileReader<'a> {
+impl FileReader {
     /// Open file reader
     pub(crate) async fn try_new_with_fragment(
-        object_store: &'a ObjectStore,
+        object_store: &ObjectStore,
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-    ) -> Result<FileReader<'a>> {
+    ) -> Result<FileReader> {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -154,7 +154,7 @@ impl<'a> FileReader<'a> {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(object_store: &'a ObjectStore, path: &Path) -> Result<FileReader<'a>> {
+    pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -245,42 +245,11 @@ impl<'a> FileReader<'a> {
         let schema = Arc::new(ArrowSchema::from(projection));
         Ok(concat_batches(&schema, &batches)?)
     }
-
-    /// Convert this [`FileReader`] into a [Stream] / [AsyncIterator](std::async_iter::AsyncIterator).
-    ///
-    /// Currently, it only does batch based scan.
-    /// Will add support for scanning with batch size later.
-    ///
-    // TODO: use IntoStream trait?
-    pub fn into_stream(&self) -> impl Stream<Item = Result<RecordBatch>> + '_ {
-        let num_batches = self.num_batches() as i32;
-
-        // Deref a bunch.
-        let schema = self.schema();
-        let with_row_id = self.with_row_id;
-
-        stream::unfold(0_i32, move |batch_id| async move {
-            let num_batches = num_batches;
-            if batch_id < num_batches {
-                let batch = read_batch(
-                    self,
-                    &ReadBatchParams::RangeFull,
-                    schema,
-                    batch_id,
-                    with_row_id,
-                )
-                .await;
-                Some((batch, batch_id + 1))
-            } else {
-                None
-            }
-        })
-    }
 }
 
 /// Read a batch.
 async fn read_batch(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     params: &ReadBatchParams,
     schema: &Schema,
     batch_id: i32,
@@ -322,7 +291,7 @@ async fn read_batch(
 
 #[async_recursion]
 async fn read_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -365,7 +334,7 @@ fn get_page_info<'a>(
 
 /// Read primitive array for batch `batch_idx`.
 async fn _read_fixed_stride_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -383,7 +352,7 @@ async fn _read_fixed_stride_array(
 }
 
 fn read_null_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -427,7 +396,7 @@ fn read_null_array(
 }
 
 async fn read_binary_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -447,7 +416,7 @@ async fn read_binary_array(
 }
 
 async fn read_dictionary_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -472,7 +441,7 @@ async fn read_dictionary_array(
 }
 
 async fn read_struct_array(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -488,7 +457,7 @@ async fn read_struct_array(
 }
 
 async fn take_list_array<T: ArrowNumericType>(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     positions: &PrimitiveArray<T>,
@@ -537,7 +506,7 @@ where
 }
 
 async fn read_list_array<T: ArrowNumericType>(
-    reader: &FileReader<'_>,
+    reader: &FileReader,
     field: &Field,
     batch_id: i32,
     params: &ReadBatchParams,
@@ -606,48 +575,9 @@ mod tests {
         RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-    use futures::StreamExt;
     use tempfile::tempdir;
 
     use crate::io::FileWriter;
-
-    #[tokio::test]
-    async fn file_reader_into_stream() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int64, true),
-            ArrowField::new("f", DataType::Float32, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
-        // Write 5 batches.
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(Int64Array::from_iter((0..100).collect::<Vec<_>>())),
-            Arc::new(Float32Array::from_iter(
-                (0..100).map(|n| n as f32).collect::<Vec<_>>(),
-            )),
-        ];
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-        for _ in 0..5 {
-            file_writer.write(&[&batch]).await.unwrap();
-        }
-        file_writer.finish().await.unwrap();
-
-        let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let stream = reader.into_stream();
-
-        assert_eq!(stream.count().await, 5);
-
-        let stream = reader.into_stream();
-        assert!(
-            stream
-                .map(|f| f.unwrap() == batch)
-                .all(|f| async move { f })
-                .await
-        );
-    }
 
     #[tokio::test]
     async fn read_with_row_id() {
@@ -1038,7 +968,7 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
 
         async fn read_array_w_params(
-            reader: &FileReader<'_>,
+            reader: &FileReader,
             field: &Field,
             params: ReadBatchParams,
         ) -> ArrayRef {
