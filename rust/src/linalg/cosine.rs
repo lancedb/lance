@@ -18,6 +18,7 @@
 use arrow_array::Float32Array;
 
 use crate::linalg::normalize::Normalize;
+use super::dot::Dot;
 
 pub trait Cosine {
     type Output;
@@ -28,7 +29,7 @@ pub trait Cosine {
 
 /// Fallback Cosine Distance function.
 #[inline]
-fn cosine_scalar(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
+fn cosine_fallback(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     assert_eq!(from.len(), dimension);
 
     let distances: Float32Array = to
@@ -48,10 +49,17 @@ fn cosine_scalar(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     distances
 }
 
+#[inline]
+fn cosine_scalar(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
+    let y_norm = y.norm();
+    let xy = x.dot(y);
+    1.0 - xy / (x_norm * y_norm)
+}
+
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn cosine_dist_neon(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
+unsafe fn cosine_dist_neon_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
     use std::arch::aarch64::*;
     let len = x.len();
     let buf = [0.0_f32; 4];
@@ -86,7 +94,7 @@ unsafe fn cosine_dist_fma_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -
 }
 
 #[inline]
-fn cosine_dist_simd(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
+fn cosine_dist_simd_f32(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     assert!(to.len() % dimension == 0);
     use arrow::array::Float32Builder;
 
@@ -97,11 +105,11 @@ fn cosine_dist_simd(from: &[f32], to: &[f32], dimension: usize) -> Float32Array 
     for y in to.chunks_exact(dimension) {
         #[cfg(any(target_arch = "aarch64"))]
         {
-            builder.append_value(unsafe { cosine_dist_neon(x, y, x_norm) });
+            builder.append_value(unsafe { cosine_dist_neon_f32(x, y, x_norm) });
         }
         #[cfg(any(target_arch = "x86_64"))]
         {
-            builder.append_value(unsafe { cosine_dist_fma(x, y, x_norm) });
+            builder.append_value(unsafe { cosine_dist_fma_f32(x, y, x_norm) });
         }
     }
     builder.finish()
@@ -121,7 +129,7 @@ impl Cosine for [f32] {
                 && is_simd_aligned(to.as_ptr(), 16)
                 && from.len() % 4 == 0
             {
-                return Ok(cosine_dist_simd(from, to, dimension));
+                return Ok(cosine_dist_simd_f32(from, to, dimension));
             }
         }
 
@@ -133,7 +141,7 @@ impl Cosine for [f32] {
         }
 
         // Fallback
-        cosine_scalar(from, to, dimension)
+        cosine_fallback(self, , dimension)
     }
 }
 

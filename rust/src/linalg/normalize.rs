@@ -16,8 +16,14 @@ use arrow_array::Float32Array;
 
 use super::add::add_fma_f32;
 
+/// Normalize a vector.
+///
+/// ```text
+/// || x || = sqrt(\sum_i x_i^2)
+/// ```
 pub trait Normalize {
     type Output;
+
     /// Normalize a vector.
     fn norm(&self) -> Self::Output;
 }

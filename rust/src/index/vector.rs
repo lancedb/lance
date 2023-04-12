@@ -46,8 +46,7 @@ use crate::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
-    linalg::l2::l2_distance,
-    utils::distance::cosine::cosine_distance,
+    linalg::{l2::l2_distance, cosine::cosine_distance},
     Error, Result,
 };
 pub use traits::*;

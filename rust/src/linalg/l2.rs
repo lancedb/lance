@@ -74,8 +74,8 @@ unsafe fn l2_neon_f32(from: &[f32], to: &[f32]) -> f32 {
 ///
 /// With `RUSTFLAGS="-C target-cpu=native"`, rustc will auto-vectorize to some extent.
 ///
-/// `rustc 1.68` does SSE and loop-unfolding, inspect here
-/// https://rust.godbolt.org/
+/// `rustc 1.68` uses SSE and does loop-unfolding, inspect here
+/// <https://rust.godbolt.org/>.
 fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter()
         .zip(to.iter())
