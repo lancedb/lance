@@ -119,10 +119,18 @@ def test_flat(dataset):
     print(run(dataset))
 
 
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
 def test_ann(indexed_dataset):
     print(run(indexed_dataset))
 
 
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
 def test_ann_append(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
@@ -139,6 +147,10 @@ def test_ann_append(tmp_path):
     print(run(dataset, q=np.array(q), assert_func=func))
 
 
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
@@ -162,6 +174,10 @@ def test_use_index(dataset, tmp_path):
     assert np.all(expected == actual)
 
 
+@pytest.mark.skipif(
+    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
+    reason="no neon on GHA",
+)
 def test_has_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
