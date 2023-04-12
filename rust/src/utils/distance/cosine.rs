@@ -17,8 +17,7 @@
 
 use arrow_array::Float32Array;
 
-use super::compute::normalize;
-use crate::utils::distance::is_simd_aligned;
+use crate::{linalg::normalize::Normalize, utils::distance::is_simd_aligned};
 
 /// Fallback Cosine Distance function.
 fn cosine_dist_slow(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
@@ -84,7 +83,7 @@ fn cosine_dist_simd(from: &[f32], to: &[f32], dimension: usize) -> Float32Array 
     use arrow::array::Float32Builder;
 
     let x = from;
-    let x_norm = normalize(x);
+    let x_norm = x.norm();
     let n = to.len() / dimension;
     let mut builder = Float32Builder::with_capacity(n);
     for y in to.chunks_exact(dimension) {

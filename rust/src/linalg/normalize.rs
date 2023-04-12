@@ -19,7 +19,7 @@ use super::add::add_fma_f32;
 pub trait Normalize {
     type Output;
     /// Normalize a vector.
-    fn normalize(&self) -> Self::Output;
+    fn norm(&self) -> Self::Output;
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -56,7 +56,7 @@ impl Normalize for [f32] {
     type Output = f32;
 
     #[inline]
-    fn normalize(&self) -> f32 {
+    fn norm(&self) -> f32 {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         unsafe {
             return normalize_neon(self);
@@ -76,7 +76,7 @@ impl Normalize for Float32Array {
     type Output = f32;
 
     #[inline]
-    fn normalize(&self) -> f32 {
-        self.values().normalize()
+    fn norm(&self) -> f32 {
+        self.values().norm()
     }
 }
