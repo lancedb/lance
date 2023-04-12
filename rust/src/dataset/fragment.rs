@@ -52,7 +52,7 @@ impl FileFragment {
     }
 
     async fn do_open(&self, paths: &[&str]) -> Result<FileReader> {
-        // TODO: support open multiple data failes.
+        // TODO: support open multiple data files.
         let path = self.dataset.data_dir().child(paths[0]);
         let reader = FileReader::try_new_with_fragment(
             &self.dataset.object_store,
