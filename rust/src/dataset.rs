@@ -29,9 +29,11 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
+mod fragment;
 pub mod scanner;
 mod write;
 
+use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
@@ -41,7 +43,7 @@ use crate::index::vector::pq::PQBuildParams;
 use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
 use crate::io::{
     object_reader::{read_message, read_struct},
-    read_manifest, read_metadata_offset, write_manifest, FileReader, FileWriter, ObjectStore,
+    read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
 };
 use crate::utils::distance::simd_alignment;
 use crate::{Error, Result};
@@ -345,18 +347,8 @@ impl Dataset {
     /// It offers a fast path of counting rows by just computing via metadata.
     pub async fn count_rows(&self) -> Result<usize> {
         // Open file to read metadata.
-        let counts = stream::iter(self.manifest.fragments.as_ref())
-            .map(|f| async {
-                let path = self.data_dir().child(f.files[0].path.as_str());
-                let reader = FileReader::try_new_with_fragment(
-                    &self.object_store,
-                    &path,
-                    f.id,
-                    Some(self.manifest.as_ref()),
-                )
-                .await?;
-                Ok::<usize, Error>(reader.len())
-            })
+        let counts = stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_rows().await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
@@ -484,23 +476,13 @@ impl Dataset {
         let mut row_count = 0;
         let mut start = 0;
         let schema = Arc::new(ArrowSchema::from(projection));
-        let object_store = &self.object_store;
         let mut batches = Vec::with_capacity(sorted_indices.len());
-        for fragment in self.fragments().iter() {
+        for fragment in self.get_fragments().iter() {
             if start >= sorted_indices.len() {
                 break;
             }
 
-            let path = self.data_dir().child(fragment.files[0].path.as_str());
-            let mut reader = FileReader::try_new_with_fragment(
-                object_store,
-                &path,
-                fragment.id,
-                Some(self.manifest.as_ref()),
-            )
-            .await?;
-
-            let max_row_indices = row_count + reader.len() as u32;
+            let max_row_indices = row_count + fragment.count_rows().await? as u32;
             if sorted_indices[start] < max_row_indices {
                 let mut end = start;
                 sorted_indices[end] -= row_count;
@@ -508,9 +490,8 @@ impl Dataset {
                     end += 1;
                     sorted_indices[end] -= row_count;
                 }
-                reader.set_projection(projection.clone());
                 batches.push(
-                    reader
+                    fragment
                         .take(&sorted_indices[start..end + 1], projection)
                         .await?,
                 );
@@ -555,23 +536,23 @@ impl Dataset {
                 .or_insert_with(|| vec![offset]);
         });
         let schema = Arc::new(ArrowSchema::from(projection));
-        let object_store = &self.object_store;
-        let batches = stream::iter(self.fragments().as_ref())
-            .filter(|f| async { row_ids_per_fragment.contains_key(&f.id) })
-            .then(|fragment| async {
-                let Some(indices) = row_ids_per_fragment.get(&fragment.id) else {
-                    return Ok(RecordBatch::new_empty(schema.clone()));
-                };
-                let path = self.data_dir().child(fragment.files[0].path.as_str());
-                let mut reader = FileReader::try_new_with_fragment(
-                    object_store,
-                    &path,
-                    fragment.id,
-                    Some(self.manifest.as_ref()),
+        let fragments = self.get_fragments();
+        let fragment_and_indices = fragments
+            .iter()
+            .map(|f| {
+                (
+                    f,
+                    row_ids_per_fragment.get(&(f.id() as u64)),
+                    schema.clone(),
                 )
-                .await?;
-                reader.set_projection(projection.clone());
-                reader.take(indices.as_slice(), projection).await
+            })
+            .collect::<Vec<_>>();
+        let batches = stream::iter(fragment_and_indices)
+            .then(|(fragment, indices_opt, schema)| async move {
+                let Some(indices) = indices_opt else {
+                    return Ok(RecordBatch::new_empty(schema));
+                };
+                fragment.take(indices.as_slice(), projection).await
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -649,6 +630,18 @@ impl Dataset {
 
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    /// Get fragments.
+    ///
+    /// If `filter` is provided, only fragments with the given name will be returned.
+    pub fn get_fragments(&self) -> Vec<FileFragment> {
+        let dataset = Arc::new(self.clone());
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| FileFragment::new(dataset.clone(), f.clone()))
+            .collect()
     }
 
     pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
