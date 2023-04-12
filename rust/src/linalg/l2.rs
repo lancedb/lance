@@ -26,8 +26,8 @@ pub trait L2<T: Real> {
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
     use super::add::add_fma_f32;
+    use std::arch::x86_64::*;
 
     debug_assert_eq!(from.len(), to.len());
 

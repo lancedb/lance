@@ -47,8 +47,8 @@ unsafe fn normalize_neon_f32(vector: &[f32]) -> f32 {
 #[target_feature(enable = "fma")]
 #[inline]
 unsafe fn normalize_fma(vector: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
     use super::add::add_fma_f32;
+    use std::arch::x86_64::*;
 
     let len = vector.len() / 8 * 8;
 
