@@ -42,9 +42,7 @@ fn cosine_fallback(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     let x_norm = from.norm();
     let distances: Float32Array = to
         .chunks_exact(dimension)
-        .map(|y| {
-            from.cosine_fast(x_norm, y)
-        })
+        .map(|y| from.cosine_fast(x_norm, y))
         .collect();
     distances
 }
@@ -93,10 +91,13 @@ unsafe fn cosine_dist_fma_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -
     let mut xy = add_fma_f32(xy);
     let mut y_sq = add_fma_f32(y_sq);
     // Remaining
-    x_vector[len..].iter().zip(y_vector[len..].iter()).for_each(|(x, y)| {
-        xy += x * y;
-        y_sq += y.powi(2)
-    });
+    x_vector[len..]
+        .iter()
+        .zip(y_vector[len..].iter())
+        .for_each(|(x, y)| {
+            xy += x * y;
+            y_sq += y.powi(2)
+        });
 
     1.0 - xy / (x_norm * y_sq.sqrt())
 }
