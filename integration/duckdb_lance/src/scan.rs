@@ -21,7 +21,7 @@ use duckdb_ext::ffi::{
 use duckdb_ext::table_function::{BindInfo, InitInfo, TableFunction};
 use duckdb_ext::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
 use futures::stream::StreamExt;
-use io::RecordBatchStream;
+use lance::io::RecordBatchStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
