@@ -51,13 +51,13 @@ unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
 
 #[repr(C)]
 struct ScanInitData {
-    stream: *mut RecordBatchStream,
+    stream: *mut dyn RecordBatchStream,
 
     done: bool,
 }
 
 impl ScanInitData {
-    fn new(stream: Box<RecordBatchStream>) -> Self {
+    fn new(stream: Box<dyn RecordBatchStream>) -> Self {
         Self {
             stream: Box::into_raw(stream),
             done: false,
