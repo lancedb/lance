@@ -81,7 +81,7 @@ unsafe fn cosine_dist_fma_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -
     use crate::linalg::add::add_fma_f32;
     use std::arch::x86_64::*;
 
-    let len = x_vector.len();
+    let len = x_vector.len() / 8 * 8;
     let mut xy = _mm256_setzero_ps();
     let mut y_sq = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
@@ -90,7 +90,15 @@ unsafe fn cosine_dist_fma_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -
         xy = _mm256_fmadd_ps(x, y, xy);
         y_sq = _mm256_fmadd_ps(y, y, y_sq);
     }
-    1.0 - add_fma_f32(xy) / (x_norm * add_fma_f32(y_sq).sqrt())
+    let mut xy = add_fma_f32(xy);
+    let mut y_sq = add_fma_f32(y_sq);
+    // Remaining
+    x_vector[len..].iter().zip(y_vector[len..].iter()).for_each(|(x, y)| {
+        xy += x * y;
+        y_sq += y.powi(2)
+    });
+
+    1.0 - xy / (x_norm * y_sq.sqrt())
 }
 
 #[inline]
@@ -187,5 +195,16 @@ mod tests {
         let d = cosine_distance(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d.value(0), 1.0 - 0.8735806510613104);
+    }
+
+    #[test]
+    fn test_not_aligned_cosine() {
+        let x: Float32Array = (1..50).map(|v| v as f32).collect();
+        let y: Float32Array = (100..150).map(|v| v as f32).collect();
+
+        // 15 elements, that is not aligned with 8 byte boundary.
+        let d = x.values()[2..17].cosine(&y.values()[3..18]);
+        // from scipy.spatial.distance.cosine
+        assert_relative_eq!(d, 0.067156250);
     }
 }

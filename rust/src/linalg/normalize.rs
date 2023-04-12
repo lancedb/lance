@@ -48,13 +48,18 @@ unsafe fn normalize_neon(vector: &[f32]) -> f32 {
 #[inline]
 unsafe fn normalize_fma(vector: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+
+    let len = vector.len() / 8 * 8;
+
     let mut sums = _mm256_setzero_ps();
-    for i in (0..vector.len()).step_by(8) {
+    for i in (0..len).step_by(8) {
         // Cache line-aligned
-        let x = _mm256_load_ps(vector.as_ptr().add(i));
+        let x = _mm256_loadu_ps(vector.as_ptr().add(i));
         sums = _mm256_fmadd_ps(x, x, sums);
     }
-    add_fma_f32(sums).sqrt()
+    let mut sums = add_fma_f32(sums);
+    sums += vector[len..].iter().map(|v| v * v).sum::<f32>();
+    sums.sqrt()
 }
 
 impl Normalize<f32> for [f32] {
