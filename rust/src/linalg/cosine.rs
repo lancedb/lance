@@ -17,10 +17,18 @@
 
 use arrow_array::Float32Array;
 
-use crate::{linalg::normalize::Normalize, utils::distance::is_simd_aligned};
+use crate::linalg::normalize::Normalize;
+
+pub trait Cosine {
+    type Output;
+
+    /// Cosine distance
+    fn cosine(&self, other: &Self) -> Self::Output;
+}
 
 /// Fallback Cosine Distance function.
-fn cosine_dist_slow(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
+#[inline]
+fn cosine_scalar(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     assert_eq!(from.len(), dimension);
 
     let distances: Float32Array = to
@@ -61,20 +69,20 @@ unsafe fn cosine_dist_neon(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 #[inline]
-unsafe fn cosine_dist_fma(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
-    use super::compute::add_fma;
+unsafe fn cosine_dist_fma_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
+    use crate::linalg::add::add_fma_f32;
     use std::arch::x86_64::*;
 
     let len = x_vector.len();
     let mut xy = _mm256_setzero_ps();
     let mut y_sq = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
-        let x = _mm256_load_ps(x_vector.as_ptr().add(i));
-        let y = _mm256_load_ps(y_vector.as_ptr().add(i));
+        let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
+        let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
         xy = _mm256_fmadd_ps(x, y, xy);
         y_sq = _mm256_fmadd_ps(y, y, y_sq);
     }
-    1.0 - add_fma(xy) / (x_norm * add_fma(y_sq).sqrt())
+    1.0 - add_fma_f32(xy) / (x_norm * add_fma_f32(y_sq).sqrt())
 }
 
 #[inline]
@@ -99,6 +107,36 @@ fn cosine_dist_simd(from: &[f32], to: &[f32], dimension: usize) -> Float32Array 
     builder.finish()
 }
 
+impl Cosine for [f32] {
+    type Output = f32;
+
+    fn cosine(&self, y: &Self) -> Self::Output {
+        let x_norm = self.norm();
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::is_aarch64_feature_detected;
+            if is_aarch64_feature_detected!("neon")
+                && is_simd_aligned(from.as_ptr(), 16)
+                && is_simd_aligned(to.as_ptr(), 16)
+                && from.len() % 4 == 0
+            {
+                return Ok(cosine_dist_simd(from, to, dimension));
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("fma") {
+                return unsafe { cosine_dist_fma_f32(self, y, x_norm) };
+            }
+        }
+
+        // Fallback
+        cosine_scalar(from, to, dimension)
+    }
+}
+
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
@@ -117,17 +155,13 @@ pub fn cosine_distance(from: &[f32], to: &[f32], dimension: usize) -> Float32Arr
 
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("fma")
-            && is_simd_aligned(from.as_ptr(), 32)
-            && is_simd_aligned(to.as_ptr(), 32)
-            && from.len() % 8 == 0
-        {
+        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
             return cosine_dist_simd(from, to, dimension);
         }
     }
 
     // Fallback
-    cosine_dist_slow(from, to, dimension)
+    cosine_scalar(from, to, dimension)
 }
 
 #[cfg(test)]
