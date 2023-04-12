@@ -17,6 +17,8 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
 use super::add::add_fma_f32;
 
 /// Trait for calculating L2 distance.
@@ -56,7 +58,7 @@ unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
 #[inline]
 unsafe fn l2_neon_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let len = from.len();
+    let len = from.len() / 4 * 4;
     let buf = [0.0_f32; 4];
     let mut sum = vld1q_f32(buf.as_ptr());
     for i in (0..len).step_by(4) {
@@ -65,7 +67,11 @@ unsafe fn l2_neon_f32(from: &[f32], to: &[f32]) -> f32 {
         let sub = vsubq_f32(left, right);
         sum = vfmaq_f32(sum, sub, sub);
     }
-    vaddvq_f32(sum)
+    let sum = vaddvq_f32(sum);
+    from[len..]
+        .iter()
+        .zip(to[len..].iter())
+        .fold(sum, |acc, (a, b)| acc + (a - b).powi(2))
 }
 
 /// Fall back to scalar implementation.
@@ -89,7 +95,7 @@ impl L2<f32> for [f32] {
             use std::arch::is_aarch64_feature_detected;
             if is_aarch64_feature_detected!("neon") {
                 unsafe {
-                    return l2_neon(self, other);
+                    return l2_neon_f32(self, other);
                 }
             }
         }

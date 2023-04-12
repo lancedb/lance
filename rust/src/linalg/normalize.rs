@@ -15,6 +15,8 @@
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "fma")]
 use super::add::add_fma_f32;
 
 /// Normalize a vector.
@@ -30,17 +32,19 @@ pub trait Normalize<O: Real> {
 #[cfg(any(target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn normalize_neon(vector: &[f32]) -> f32 {
+unsafe fn normalize_neon_f32(vector: &[f32]) -> f32 {
     use std::arch::aarch64::*;
 
     let buf = [0.0_f32; 4];
     let mut sum = vld1q_f32(buf.as_ptr());
-    let n = vector.len();
+    let n = vector.len() / 4 * 4;
     for i in (0..n).step_by(4) {
         let x = vld1q_f32(vector.as_ptr().add(i));
         sum = vfmaq_f32(sum, x, x);
     }
-    vaddvq_f32(sum).sqrt()
+    let mut sum = vaddvq_f32(sum);
+    sum += vector[n..].iter().map(|v| v * v).sum::<f32>();
+    sum.sqrt()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -67,12 +71,12 @@ impl Normalize<f32> for [f32] {
     fn norm(&self) -> f32 {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         unsafe {
-            return normalize_neon(self);
+            normalize_neon_f32(self)
         }
 
         #[cfg(target_arch = "x86_64")]
         {
-            unsafe { return normalize_fma(self) }
+            unsafe { normalize_fma(self) }
         }
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
