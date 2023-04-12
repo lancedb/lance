@@ -174,7 +174,10 @@ mod tests {
         let dataset = create_dataset(test_uri).await;
         let fragment = &dataset.get_fragments()[3];
 
-        let batch = fragment.take(&[1, 2, 4, 5, 8], dataset.schema()).await.unwrap();
+        let batch = fragment
+            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .await
+            .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from_iter_values(vec![121, 122, 124, 125, 128])
