@@ -25,6 +25,7 @@ use pyo3::prelude::*;
 
 pub(crate) mod dataset;
 pub(crate) mod errors;
+pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 

@@ -219,3 +219,12 @@ def test_polar_scan(tmp_path: Path):
     polars_df = pl.scan_pyarrow_dataset(dataset)
     df = dataset.to_table().to_pandas()
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+def test_get_fragments(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragment = dataset.get_fragments()[0]
+    assert fragment.count_rows() == 100

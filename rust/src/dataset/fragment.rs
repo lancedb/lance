@@ -29,6 +29,7 @@ use super::scanner::Scanner;
 /// A Fragment of a Lance [`Dataset`].
 ///
 /// The interface is similar to `pyarrow.dataset.Fragment`.
+#[derive(Debug, Clone)]
 pub struct FileFragment {
     dataset: Arc<Dataset>,
 

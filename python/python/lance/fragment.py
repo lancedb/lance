@@ -15,9 +15,34 @@
 
 """Dataset Fragment"""
 
+from typing import Union, Optional, Iterator
+
 import pyarrow as pa
 
+
 class LanceFragment(pa.dataset.Fragment):
-    def __init__(self):
+    def __init__(self, dataset: "LanceDataset", fragment_id: int):
+        self._ds = dataset
+        self._id = fragment_id
+        self._fragmnet = dataset.get
+
+    @property
+    def fragment_id(self):
+        return self.id
+
+    def count_rows(self, filter: Union[pa.compute.Expression, str]) -> int:
         pass
 
+    def head(self, num_rows: int) -> pa.Table:
+        pass
+
+    def take(self, indices) -> pa.Table:
+        pass
+
+    def to_batches(
+        self, schema: Optional[pa.Schema], **kwargs
+    ) -> Iterator[pa.RecordBatch]:
+        pass
+
+    def to_table(self, schema: Optional[pa.Schema] = None, **kwargs) -> pa.Table:
+        pass

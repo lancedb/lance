@@ -197,7 +197,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
-        raise NotImplementedError("Rust Fragments not yet exposed")
+        return self._ds.get_fragments()
 
     def to_batches(self, **kwargs):
         """
