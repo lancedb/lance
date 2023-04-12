@@ -20,8 +20,9 @@ use arrow_array::cast::as_primitive_array;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
-// use pprof::criterion::{Output, PProfProfiler};
 use num_traits::real::Real;
+#[cfg(target_os = "linux")]
+use pprof::criterion::{Output, PProfProfiler};
 
 use lance::linalg::l2::*;
 use lance::utils::testing::generate_random_array;
@@ -45,9 +46,7 @@ fn bench_distance(c: &mut Criterion) {
     c.bench_function("L2 distance", |b| b.iter(|| key.l2(&target)));
 
     c.bench_function("L2 distance(auto-vectorization)", |b| {
-        b.iter(|| {
-            l2_scalar(key.values(), target.values())
-        })
+        b.iter(|| l2_scalar(key.values(), target.values()))
     });
 
     c.bench_function("L2 distance (loop)", |b| {
