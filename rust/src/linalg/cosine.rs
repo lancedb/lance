@@ -42,10 +42,8 @@ fn cosine_fallback(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     let x_norm = from.norm();
     let distances: Float32Array = to
         .chunks_exact(dimension)
-        .map(|vector| {
-            let y_norm = vector.norm();
-            let xy = from.dot(vector);
-            1.0 - xy / (x_norm * y_norm)
+        .map(|y| {
+            from.cosine_fast(x_norm, y)
         })
         .collect();
     distances
