@@ -17,10 +17,6 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma")]
-use super::add::add_fma_f32;
-
 /// Trait for calculating L2 distance.
 ///
 pub trait L2<T: Real> {
@@ -31,6 +27,7 @@ pub trait L2<T: Real> {
 #[target_feature(enable = "fma")]
 unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+    use super::add::add_fma_f32;
 
     debug_assert_eq!(from.len(), to.len());
 

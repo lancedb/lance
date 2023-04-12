@@ -15,10 +15,6 @@
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma")]
-use super::add::add_fma_f32;
-
 /// Normalize a vector.
 ///
 /// ```text
@@ -52,6 +48,7 @@ unsafe fn normalize_neon_f32(vector: &[f32]) -> f32 {
 #[inline]
 unsafe fn normalize_fma(vector: &[f32]) -> f32 {
     use std::arch::x86_64::*;
+    use super::add::add_fma_f32;
 
     let len = vector.len() / 8 * 8;
 
