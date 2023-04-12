@@ -17,7 +17,6 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
-
 /// Trait for calculating L2 distance.
 ///
 pub trait L2 {
@@ -32,7 +31,7 @@ unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(from.len(), to.len());
 
-    let len = from.len();
+    let len = from.len() / 8 * 8;
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
         // Cache line-aligned
@@ -52,7 +51,11 @@ unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     sums = _mm256_hadd_ps(sums, sums);
     let mut results: [f32; 8] = [0f32; 8];
     _mm256_storeu_ps(results.as_mut_ptr(), sums);
-    results[0]
+
+    from[len..]
+        .iter()
+        .zip(to[len..].iter())
+        .fold(results[0], |acc, (a, b)| acc + (a - b).powi(2))
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -134,9 +137,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
 
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
-            to.chunks_exact(dimension)
-                .map(|v| from.l2(v))
-                .map(Some),
+            to.chunks_exact(dimension).map(|v| from.l2(v)).map(Some),
         )
     };
     scores
@@ -195,7 +196,7 @@ mod tests {
 
         let d = q.l2(&values);
         // From numpy.linage.norm(a-b)
-        assert_relative_eq!( 0.3193578, d);
+        assert_relative_eq!(0.3193578, d);
 
         let fb_d = l2_scalar(q.as_slice(), values.as_slice());
         assert_relative_eq!(d, fb_d);
@@ -212,16 +213,14 @@ mod tests {
         let v2: Float32Array = (0..10).map(|v| v as f32).collect();
         let score = v1.values()[6..].l2(&v2.values()[2..]);
 
-        assert_eq!(
-            score, 128.0
-        );
+        assert_eq!(score, 128.0);
     }
 
     #[test]
     fn test_odd_size_arrays() {
-        let v1 = (0..13).map(|v| v as f32).collect::<Vec<_>>();
-        let v2 = (2..15).map(|v| v as f32).collect::<Vec<_>>();
-        let score = v1.l2(&v2);
+        let v1 = (0..18).map(|v| v as f32).collect::<Vec<_>>();
+        let v2 = (2..20).map(|v| v as f32).collect::<Vec<_>>();
+        let score = v1[0..13].l2(&v2[0..13]);
 
         assert_relative_eq!(score, 4.0 * 13.0);
 

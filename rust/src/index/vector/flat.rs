@@ -86,12 +86,11 @@ pub async fn flat_search(
                 .clone();
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
             let scores = tokio::task::spawn_blocking(move || {
-                mt.func()(
+                Arc::new(mt.func()(
                     k.values(),
                     as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
                     k.len(),
-                )
-                .unwrap()
+                ))
             })
             .await? as ArrayRef;
 
