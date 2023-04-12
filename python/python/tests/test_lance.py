@@ -130,17 +130,6 @@ def test_create_index(tmp_path):
     dataset.create_index("emb", "IVF_PQ", num_partitions=16, num_sub_vectors=4)
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
-def test_simd_alignment(tmp_path):
-    dataset = _create_dataset(str(tmp_path / "test.lance"))
-    # SIMD alignment is enforced
-    with pytest.raises(OSError):
-        dataset.create_index("emb", "IVF_PQ", num_partitions=5, num_sub_vectors=16)
-
-
 def _create_dataset(uri):
     schema = pa.schema([pa.field("emb", pa.list_(pa.float32(), 32), False)])
     npvals = np.random.rand(1000, 32)

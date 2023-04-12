@@ -22,7 +22,6 @@ use futures::stream::StreamExt;
 use tokio::runtime::Runtime;
 
 use lance::dataset::scanner::{Scanner as LanceScanner, DatasetRecordBatchStream};
-use lance::io::RecordBatchStream;
 
 /// Lance's RecordBatchReader
 /// This implements Arrow's RecordBatchReader trait
