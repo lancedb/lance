@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use arrow_array::Float32Array;
+use num_traits::real::Real;
 
 use super::add::add_fma_f32;
 
@@ -21,11 +22,9 @@ use super::add::add_fma_f32;
 /// ```text
 /// || x || = sqrt(\sum_i x_i^2)
 /// ```
-pub trait Normalize {
-    type Output;
-
+pub trait Normalize<O: Real> {
     /// Normalize a vector.
-    fn norm(&self) -> Self::Output;
+    fn norm(&self) -> O;
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -58,9 +57,7 @@ unsafe fn normalize_fma(vector: &[f32]) -> f32 {
     add_fma_f32(sums).sqrt()
 }
 
-impl Normalize for [f32] {
-    type Output = f32;
-
+impl Normalize<f32> for [f32] {
     #[inline]
     fn norm(&self) -> f32 {
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -78,9 +75,7 @@ impl Normalize for [f32] {
     }
 }
 
-impl Normalize for Float32Array {
-    type Output = f32;
-
+impl Normalize<f32> for Float32Array {
     #[inline]
     fn norm(&self) -> f32 {
         self.values().norm()

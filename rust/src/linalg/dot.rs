@@ -16,18 +16,20 @@
 
 use arrow_array::Float32Array;
 
-pub trait Dot {
+use num_traits::real::Real;
+
+pub trait Dot<T: Real> {
     /// Dot product
-    fn dot(&self, other: &Self) -> f32;
+    fn dot(&self, other: &Self) -> T;
 }
 
-impl Dot for [f32] {
+impl Dot<f32> for [f32] {
     fn dot(&self, other: &Self) -> f32 {
         self.iter().zip(other.iter()).map(|(a, b)| a * b).sum()
     }
 }
 
-impl Dot for Float32Array {
+impl Dot<f32> for Float32Array {
     fn dot(&self, other: &Self) -> f32 {
         self.values().dot(other.values())
     }

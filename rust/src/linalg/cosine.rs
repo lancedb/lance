@@ -16,15 +16,22 @@
 //!
 
 use arrow_array::Float32Array;
+use num_traits::real::Real;
 
-use crate::linalg::normalize::Normalize;
 use super::dot::Dot;
+use crate::linalg::normalize::Normalize;
 
-pub trait Cosine {
-    type Output;
-
+pub trait Cosine<T: Real>: Normalize<T> {
     /// Cosine distance
-    fn cosine(&self, other: &Self) -> Self::Output;
+    fn cosine(&self, y: &Self) -> T {
+        let x_norm = self.norm();
+        self.cosine_fast(x_norm, y)
+    }
+
+    /// Cosine distance, fast version.
+    ///
+    /// This version assumes that the input vectors are already normalized.
+    fn cosine_fast(&self, x_norm: T, y: &Self) -> T;
 }
 
 /// Fallback Cosine Distance function.
@@ -32,28 +39,23 @@ pub trait Cosine {
 fn cosine_fallback(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
     assert_eq!(from.len(), dimension);
 
+    let x_norm = from.norm();
     let distances: Float32Array = to
         .chunks_exact(dimension)
         .map(|vector| {
-            let mut x_sq = 0_f32;
-            let mut y_sq = 0_f32;
-            let mut xy = 0_f32;
-            from.iter().zip(vector.iter()).for_each(|(x, y)| {
-                xy += x * y;
-                x_sq += x.powi(2);
-                y_sq += y.powi(2);
-            });
-            1.0 - xy / (x_sq.sqrt() * y_sq.sqrt())
+            let y_norm = vector.norm();
+            let xy = from.dot(vector);
+            1.0 - xy / (x_norm * y_norm)
         })
         .collect();
     distances
 }
 
 #[inline]
-fn cosine_scalar(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
+fn cosine_scalar<T: Normalize<V> + Dot<V> + ?Sized, V: Real>(x: &T, y: &T, x_norm: V) -> V {
     let y_norm = y.norm();
     let xy = x.dot(y);
-    1.0 - xy / (x_norm * y_norm)
+    V::one() - xy / (x_norm * y_norm)
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -115,12 +117,8 @@ fn cosine_dist_simd_f32(from: &[f32], to: &[f32], dimension: usize) -> Float32Ar
     builder.finish()
 }
 
-impl Cosine for [f32] {
-    type Output = f32;
-
-    fn cosine(&self, y: &Self) -> Self::Output {
-        let x_norm = self.norm();
-
+impl Cosine<f32> for [f32] {
+    fn cosine_fast(&self, x_norm: f32, y: &Self) -> f32 {
         #[cfg(target_arch = "aarch64")]
         {
             use std::arch::is_aarch64_feature_detected;
@@ -141,7 +139,7 @@ impl Cosine for [f32] {
         }
 
         // Fallback
-        cosine_fallback(self, , dimension)
+        cosine_scalar(self, y, x_norm)
     }
 }
 
@@ -164,12 +162,12 @@ pub fn cosine_distance(from: &[f32], to: &[f32], dimension: usize) -> Float32Arr
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
-            return cosine_dist_simd(from, to, dimension);
+            return cosine_dist_simd_f32(from, to, dimension);
         }
     }
 
     // Fallback
-    cosine_scalar(from, to, dimension)
+    cosine_fallback(from, to, dimension)
 }
 
 #[cfg(test)]

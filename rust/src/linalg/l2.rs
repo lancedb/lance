@@ -21,10 +21,8 @@ use super::add::add_fma_f32;
 
 /// Trait for calculating L2 distance.
 ///
-pub trait L2 {
-    type Output;
-
-    fn l2(&self, other: &Self) -> Self::Output;
+pub trait L2<T: Real> {
+    fn l2(&self, other: &Self) -> T;
 }
 
 #[cfg(any(target_arch = "x86_64"))]
@@ -83,11 +81,9 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
         .sum::<T>()
 }
 
-impl L2 for [f32] {
-    type Output = f32;
-
+impl L2<f32> for [f32] {
     #[inline]
-    fn l2(&self, other: &Self) -> Self::Output {
+    fn l2(&self, other: &Self) -> f32 {
         #[cfg(any(target_arch = "aarch64"))]
         {
             use std::arch::is_aarch64_feature_detected;
@@ -111,18 +107,14 @@ impl L2 for [f32] {
     }
 }
 
-impl L2 for Vec<f32> {
-    type Output = f32;
-
-    fn l2(&self, other: &Self) -> Self::Output {
+impl L2<f32> for Vec<f32> {
+    fn l2(&self, other: &Self) -> f32 {
         self.as_slice().l2(other.as_slice())
     }
 }
 
-impl L2 for Float32Array {
-    type Output = f32;
-
-    fn l2(&self, other: &Self) -> Self::Output {
+impl L2<f32> for Float32Array {
+    fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
     }
 }
