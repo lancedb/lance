@@ -174,10 +174,6 @@ def test_use_index(dataset, tmp_path):
     assert np.all(expected == actual)
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
 def test_has_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
