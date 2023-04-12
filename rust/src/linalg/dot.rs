@@ -23,11 +23,7 @@ pub trait Dot {
 
 impl Dot for [f32] {
     fn dot(&self, other: &Self) -> f32 {
-        let mut sum = 0.0;
-        for i in 0..self.len() {
-            sum += self[i] * other[i];
-        }
-        sum
+        self.iter().zip(other.iter()).map(|(a, b)| a * b).sum()
     }
 }
 

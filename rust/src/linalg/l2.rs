@@ -34,7 +34,8 @@ unsafe fn l2_fma_f32(from: &[f32], to: &[f32]) -> f32 {
     let len = from.len() / 8 * 8;
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
-        // Cache line-aligned
+        // We use `_mm256_loadu_ps` instead of `_mm256_load_ps` to make it work with unaligned data.
+        // Benchmark on an AMD Ryzen 5900X shows that it adds less than 2% overhead with aligned vectors.
         let left = _mm256_loadu_ps(from.as_ptr().add(i));
         let right = _mm256_loadu_ps(to.as_ptr().add(i));
         let sub = _mm256_sub_ps(left, right);

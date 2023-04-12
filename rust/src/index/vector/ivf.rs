@@ -324,10 +324,7 @@ impl Ivf {
         let centroids: MatrixView = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
-            let part_id = argmin(
-                &dist_func(vector, centroids.data().values(), dim)
-            )
-            .unwrap();
+            let part_id = argmin(&dist_func(vector, centroids.data().values(), dim)).unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
             if vector.len() != cent.len() {

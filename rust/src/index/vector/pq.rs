@@ -420,8 +420,7 @@ impl ProductQuantizer {
                     let offset = row_offset + sub_idx * sub_dim;
                     let sub_vector = &flatten_values[offset..offset + sub_dim];
                     let centroids = all_centroids[sub_idx].as_ref();
-                    let code = argmin(&dist_func(sub_vector, centroids.values(), sub_dim))
-                        .unwrap();
+                    let code = argmin(&dist_func(sub_vector, centroids.values(), sub_dim)).unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
