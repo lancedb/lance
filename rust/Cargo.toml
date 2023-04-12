@@ -94,7 +94,7 @@ name = "lq"
 required-features = ["cli"]
 
 [[bench]]
-name = "distance"
+name = "l2"
 harness = false
 
 [[bench]]

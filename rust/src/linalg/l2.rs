@@ -17,6 +17,7 @@ use std::iter::Sum;
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
+
 /// Trait for calculating L2 distance.
 ///
 pub trait L2 {
@@ -128,6 +129,20 @@ impl L2 for Float32Array {
     }
 }
 
+pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Float32Array {
+    assert_eq!(from.len(), dimension);
+    assert_eq!(to.len() % dimension, 0);
+
+    let scores: Float32Array = unsafe {
+        Float32Array::from_trusted_len_iter(
+            to.chunks_exact(dimension)
+                .map(|v| from.l2(v))
+                .map(Some),
+        )
+    };
+    scores
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +216,20 @@ mod tests {
         assert_eq!(
             score, 128.0
         );
+    }
+
+    #[test]
+    fn test_odd_size_arrays() {
+        let v1 = (0..13).map(|v| v as f32).collect::<Vec<_>>();
+        let v2 = (2..15).map(|v| v as f32).collect::<Vec<_>>();
+        let score = v1.l2(&v2);
+
+        assert_relative_eq!(score, 4.0 * 13.0);
+
+        let v1 = (0..3).map(|v| v as f32).collect::<Vec<_>>();
+        let v2 = (2..5).map(|v| v as f32).collect::<Vec<_>>();
+        let score = v1.l2(&v2);
+
+        assert_relative_eq!(score, 4.0 * 3.0);
     }
 }

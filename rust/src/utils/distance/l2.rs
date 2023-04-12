@@ -116,8 +116,6 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     #[cfg(any(target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("fma")
-            && is_simd_aligned(from.as_ptr(), 32)
-            && is_simd_aligned(to.as_ptr(), 32)
             && from.len() % 8 == 0
         {
             return l2_distance_simd(from, to, dimension);
