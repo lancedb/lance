@@ -58,7 +58,7 @@ class LanceDataset(pa.dataset.Dataset):
 
     @lru_cache(maxsize=None)
     def list_indices(self) -> List[Dict[str, Any]]:
-        return self._ds.get_index_metadata()
+        return self._ds.load_indices()
 
     @property
     def has_index(self):
