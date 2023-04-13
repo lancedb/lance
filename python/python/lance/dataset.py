@@ -193,10 +193,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(self, filter: Expression = None) -> Iterator[pa.dataset.Fragment]:
+    def get_fragments(self, filter: Optional[Expression] = None) -> Iterator[pa.dataset.Fragment]:
+        """Get all fragments from the dataset.
+
+        Note: filter is not supported yet.
         """
-        Not implemented (just override pyarrow dataset to prevent segfault)
-        """
+        if filter is not None:
+            raise ValueError("get_fragments() does not support filter yet")
         return [LanceFragment(self, f.id()) for f in self._ds.get_fragments()]
 
     def get_fragment(self, fragment_id: int) -> Optional[pa.dataset.Fragment]:
