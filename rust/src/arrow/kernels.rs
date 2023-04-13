@@ -107,12 +107,10 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
         DataType::Int64 => hash_numeric_type(as_primitive_array::<Int64Type>(array)),
         DataType::Utf8 => hash_string_type(as_string_array(array)),
         DataType::LargeUtf8 => hash_string_type(as_largestring_array(array)),
-        _ => {
-            return Err(Error::Arrow(format!(
-                "Hash only supports integer or string array, got: {}",
-                array.data_type()
-            )))
-        }
+        _ => Err(Error::Arrow(format!(
+            "Hash only supports integer or string array, got: {}",
+            array.data_type()
+        ))),
     }
 }
 
@@ -122,7 +120,9 @@ mod tests {
 
     use std::collections::HashSet;
 
-    use arrow_array::{Float32Array, Int16Array, Int8Array, StringArray, UInt32Array, UInt8Array};
+    use arrow_array::{
+        Float32Array, Int16Array, Int8Array, LargeStringArray, StringArray, UInt32Array, UInt8Array,
+    };
 
     #[test]
     fn test_argmax() {
@@ -179,6 +179,11 @@ mod tests {
         // Other than that, all values should be distinct
         let distinct_values: HashSet<u64> = h.values().iter().copied().collect();
         assert_eq!(distinct_values.len(), 5);
+
+        let a = LargeStringArray::from(vec!["a", "b", "ccc", "dec", "e", "a"]);
+        let h = hash(&a).unwrap();
+        // first and last value are the same.
+        assert_eq!(h.value(0), h.value(5));
     }
 
     #[test]
