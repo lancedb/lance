@@ -25,6 +25,7 @@ use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
 use futures::{future, TryFutureExt};
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use shellexpand::tilde;
 use url::Url;
@@ -74,6 +75,14 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
+async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    Ok(Arc::new(
+        GoogleCloudStorageBuilder::from_env()
+            .with_url(uri)
+            .build()?,
+    ))
+}
+
 impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
     pub async fn new(uri: &str) -> Result<Self> {
@@ -112,6 +121,12 @@ impl ObjectStore {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("s3"),
+                base_path: Path::from(url.path()),
+                prefetch_size: 64 * 1024,
+            }),
+            "gs" => Ok(Self {
+                inner: build_gcs_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 prefetch_size: 64 * 1024,
             }),

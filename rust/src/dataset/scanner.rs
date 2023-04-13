@@ -79,6 +79,9 @@ pub struct Scanner {
 
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
+
+    /// If set, this scanner serves one fragment only.
+    fragment: Option<Fragment>,
 }
 
 impl Scanner {
@@ -93,12 +96,42 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
+            fragment: None,
         }
+    }
+
+    pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
+        let projection = dataset.schema().clone();
+        Self {
+            dataset,
+            projections: projection,
+            filter: None,
+            batch_size: DEFAULT_BATCH_SIZE,
+            limit: None,
+            offset: None,
+            nearest: None,
+            with_row_id: false,
+            fragment: Some(fragment),
+        }
+    }
+
+    fn ensure_not_fragment_scan(&self) -> Result<()> {
+        if self.is_fragment_scan() {
+            Err(Error::IO(
+                "This operation is not supported for fragment scan".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_fragment_scan(&self) -> bool {
+        self.fragment.is_some()
     }
 
     /// Projection.
     ///
-    /// Only seelect the specific columns. If not specifid, all columns will be scanned.
+    /// Only select the specified columns. If not specified, all columns will be scanned.
     pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
@@ -146,8 +179,10 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Find k-nearest neighbour within the vector column.
+    /// Find k-nearest neighbor within the vector column.
     pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+        self.ensure_not_fragment_scan()?;
+
         if k == 0 {
             return Err(Error::IO("k must be positive".to_string()));
         }
@@ -352,7 +387,7 @@ impl Scanner {
         Ok(plan)
     }
 
-    //
+    // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO("No nearest query".to_string()));
@@ -439,7 +474,12 @@ impl Scanner {
 
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
-        self.scan_fragments(with_row_id, projection, self.dataset.fragments().clone())
+        let fragments = if let Some(fragment) = self.fragment.as_ref() {
+            Arc::new(vec![fragment.clone()])
+        } else {
+            self.dataset.fragments().clone()
+        };
+        self.scan_fragments(with_row_id, projection, fragments)
     }
 
     fn scan_fragments(
