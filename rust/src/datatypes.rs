@@ -692,8 +692,6 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                use std::backtrace::Backtrace;
-                println!("Custom backtrace: {}", Backtrace::force_capture());
                 return Err(Error::Schema(format!(
                     "Column {} does not exist",
                     col.as_ref()

@@ -331,6 +331,14 @@ impl Dataset {
             Ok(fragments)
         })
     }
+
+    fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {
+        if let Some(fragment) = self_.ds.get_fragment(fragment_id) {
+            Ok(Some(FileFragment::new(fragment.clone())))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl Dataset {

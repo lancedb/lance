@@ -239,3 +239,16 @@ def test_get_fragments(tmp_path: Path):
 
     taken = fragment.take([18, 20, 33, 53])
     assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
+
+
+def test_pickle_fragment(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragment = dataset.get_fragments()[0]
+    pickled = pickle.dumps(fragment)
+    unpickled = pickle.loads(pickled)
+
+    assert fragment.to_table() == unpickled.to_table()

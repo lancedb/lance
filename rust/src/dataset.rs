@@ -644,7 +644,17 @@ impl Dataset {
             .collect()
     }
 
-    pub fn fragments(&self) -> &Arc<Vec<Fragment>> {
+    pub fn get_fragment(&self, fragment_id: usize) -> Option<FileFragment> {
+        let dataset = Arc::new(self.clone());
+        let fragment = self
+            .manifest
+            .fragments
+            .iter()
+            .find(|f| f.id == fragment_id as u64)?;
+        Some(FileFragment::new(dataset, fragment.clone()))
+    }
+
+    pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
     }
 

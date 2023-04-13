@@ -22,20 +22,28 @@ import pyarrow as pa
 
 
 class LanceFragment(pa.dataset.Fragment):
-    def __init__(self, dataset: "LanceDataset", fragment: LanceFragment):
+    def __init__(self, dataset: "LanceDataset", fragment_id):
         self._ds = dataset
-        self._fragmnet = fragment
+        self._fragment = dataset.get_fragment(fragment_id)
+        if self._fragment is None:
+            raise ValueError(f"Fragment id does not exist: {fragment_id}")
+
+    def __reduce__(self):
+        from .dataset import LanceDataset
+
+        ds = LanceDataset(self._ds.uri, self._ds.version)
+        return LanceFragment, (ds, self.fragment_id)
 
     @property
     def fragment_id(self):
-        return self._fragmnet.idw
+        return self._fragment.id()
 
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
         if filter is not None:
             raise ValueError("Does not support filter at the moment")
-        return self._fragmnet.count_rows()
+        return self._fragment.count_rows()
 
     def head(self, num_rows: int) -> pa.Table:
         batches = self.scanner(limit=num_rows).to_batches()
@@ -50,7 +58,7 @@ class LanceFragment(pa.dataset.Fragment):
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
         filter_str = str(filter) if filter is not None else None
-        s = self._fragmnet.scanner(
+        s = self._fragment.scanner(
             columns=columns, filter=filter_str, limit=limit, offset=offset
         )
 
@@ -59,7 +67,7 @@ class LanceFragment(pa.dataset.Fragment):
         return LanceScanner(s, self._ds)
 
     def take(self, indices, columns: Optional[list[str]] = None) -> pa.Table:
-        return pa.Table.from_batches([self._fragmnet.take(indices, columns=columns)])
+        return pa.Table.from_batches([self._fragment.take(indices, columns=columns)])
 
     def to_batches(
         self,

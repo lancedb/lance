@@ -197,7 +197,11 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
-        return [LanceFragment(self, f) for f in self._ds.get_fragments()]
+        return [LanceFragment(self, f.id()) for f in self._ds.get_fragments()]
+
+    def get_fragment(self, fragment_id: int) -> Optional[pa.dataset.Fragment]:
+        """Get the fragment with fragment id"""
+        return self._ds.get_fragment(fragment_id)
 
     def to_batches(self, **kwargs):
         """
