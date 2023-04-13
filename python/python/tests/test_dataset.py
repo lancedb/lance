@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+import pandas as pd
+
 import lance
 import pandas.testing as tm
 import polars as pl
@@ -219,3 +221,34 @@ def test_polar_scan(tmp_path: Path):
     polars_df = pl.scan_pyarrow_dataset(dataset)
     df = dataset.to_table().to_pandas()
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+
+def test_get_fragments(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragment = dataset.get_fragments()[0]
+    assert fragment.count_rows() == 100
+
+    head = fragment.head(10)
+    tm.assert_frame_equal(head.to_pandas(), table.to_pandas()[0:10])
+
+    assert fragment.to_table() == table
+
+    taken = fragment.take([18, 20, 33, 53])
+    assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})
+
+
+def test_pickle_fragment(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragment = dataset.get_fragments()[0]
+    pickled = pickle.dumps(fragment)
+    unpickled = pickle.loads(pickled)
+
+    assert fragment.to_table() == unpickled.to_table()

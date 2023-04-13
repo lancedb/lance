@@ -132,7 +132,7 @@ impl Scanner {
     /// Projection.
     ///
     /// Only select the specified columns. If not specified, all columns will be scanned.
-    pub fn project(&mut self, columns: &[&str]) -> Result<&mut Self> {
+    pub fn project<T: AsRef<str>>(&mut self, columns: &[T]) -> Result<&mut Self> {
         self.projections = self.dataset.schema().project(columns)?;
         Ok(self)
     }
