@@ -31,4 +31,5 @@ pub mod linalg;
 pub mod session;
 pub mod utils;
 
+pub use dataset::Dataset;
 pub use error::{Error, Result};
