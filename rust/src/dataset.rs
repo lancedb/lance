@@ -30,7 +30,7 @@ use object_store::path::Path;
 use uuid::Uuid;
 
 pub mod fragment;
-mod hash_join;
+mod hash_joiner;
 pub mod scanner;
 pub mod updater;
 mod write;

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use arrow_array::{Array, RecordBatchReader};
 
-use crate::arrow::RecordBatchBuffer;
+use crate::arrow::{RecordBatchBuffer, hash};
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
@@ -31,10 +31,6 @@ pub(super) struct HashJoiner {
     on_column: String,
 }
 
-/// Hash the values of the array.
-fn hash_values(array: &dyn Array) -> Result<Vec<u64>> {
-    todo!()
-}
 
 impl HashJoiner {
     /// Create a new `HashJoiner`.
@@ -60,13 +56,15 @@ impl HashJoiner {
                 Error::IO(format!("HashJoiner: Column {} not found", self.on_column))
             })?;
 
-            let hashes = hash_values(key_column)?;
+            let hashes = hash(key_column.as_ref())?;
             for (i, hash_value) in hashes.iter().enumerate() {
                 let idx = start_idx + i;
-                self.index_map
-                    .entry(*hash_value)
-                    .or_insert_with(Vec::new)
-                    .push(idx);
+                if let Some(v) = hash_value {
+                    self.index_map
+                        .entry(v)
+                        .or_insert_with(Vec::new)
+                        .push(idx);
+                }
             }
             start_idx += batch.num_rows();
         }
