@@ -46,8 +46,7 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.count_rows()
 
     def head(self, num_rows: int) -> pa.Table:
-        batches = self.scanner(limit=num_rows).to_batches()
-        return pa.Table.from_batches(batches)
+        return self.scanner(limit=num_rows).to_table()
 
     def scanner(
         self,
