@@ -56,7 +56,6 @@ impl std::fmt::Display for ObjectStore {
 /// BUild S3 ObjectStore using default credential chain.
 async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
-    use aws_credential_types::provider::ProvideCredentials;
 
     const DEFAULT_REGION: &str = "us-west-2";
 

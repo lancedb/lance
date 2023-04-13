@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::c_char;
 
-use duckdb_ext::ffi::{duckdb_library_version, _duckdb_database};
+use duckdb_ext::ffi::{_duckdb_database, duckdb_library_version};
 use duckdb_ext::Database;
 use tokio::runtime::Runtime;
 
