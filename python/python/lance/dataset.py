@@ -197,7 +197,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
-        return self._ds.get_fragments()
+        return [LanceFragment(self, f) for f in self._ds.get_fragments()]
 
     def to_batches(self, **kwargs):
         """

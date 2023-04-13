@@ -121,9 +121,8 @@ impl Dataset {
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
-            let proj: Vec<&str> = c.iter().map(|s| s.as_str()).collect();
             scanner
-                .project(&proj)
+                .project(&c)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = filter {

@@ -42,6 +42,10 @@ impl FileFragment {
         Self { dataset, metadata }
     }
 
+    pub fn dataset(&self) -> &Dataset {
+        self.dataset.as_ref()
+    }
+
     /// Returns the fragment's metadata.
     pub fn metadata(&self) -> &Fragment {
         &self.metadata
