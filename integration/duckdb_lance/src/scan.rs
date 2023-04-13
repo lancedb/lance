@@ -20,8 +20,8 @@ use duckdb_ext::ffi::{
 };
 use duckdb_ext::table_function::{BindInfo, InitInfo, TableFunction};
 use duckdb_ext::{DataChunk, FunctionInfo, LogicalType, LogicalTypeId};
-use futures::stream::StreamExt;
-use lance::dataset::scanner::RecordBatchStream;
+use futures::StreamExt;
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance::dataset::Dataset;
 
 use crate::arrow::{record_batch_to_duckdb_data_chunk, to_duckdb_logical_type};
@@ -51,13 +51,13 @@ unsafe extern "C" fn drop_scan_bind_data_c(v: *mut c_void) {
 
 #[repr(C)]
 struct ScanInitData {
-    stream: *mut RecordBatchStream,
+    stream: *mut DatasetRecordBatchStream,
 
     done: bool,
 }
 
 impl ScanInitData {
-    fn new(stream: Box<RecordBatchStream>) -> Self {
+    fn new(stream: Box<DatasetRecordBatchStream>) -> Self {
         Self {
             stream: Box::into_raw(stream),
             done: false,
@@ -113,7 +113,8 @@ unsafe extern "C" fn read_lance_init(info: duckdb_init_info) {
     let stream = match crate::RUNTIME.block_on(async {
         dataset
             .scan()
-            .project(columns.as_slice()).unwrap()
+            .project(columns.as_slice())
+            .unwrap()
             .batch_size(duckdb_vector_size() as usize)
             .try_into_stream()
             .await
