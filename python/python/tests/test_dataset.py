@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+import pandas as pd
+
 import lance
 import pandas.testing as tm
 import polars as pl
@@ -220,6 +222,7 @@ def test_polar_scan(tmp_path: Path):
     df = dataset.to_table().to_pandas()
     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -233,3 +236,6 @@ def test_get_fragments(tmp_path: Path):
     tm.assert_frame_equal(head.to_pandas(), table.to_pandas()[0:10])
 
     assert fragment.to_table() == table
+
+    taken = fragment.take([18, 20, 33, 53])
+    assert taken == pa.Table.from_pydict({"a": [18, 20, 33, 53], "b": [18, 20, 33, 53]})

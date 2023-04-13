@@ -56,11 +56,11 @@ impl FileFragment {
     fn take(
         self_: PyRef<'_, Self>,
         row_indices: Vec<usize>,
-        projection: Option<Vec<String>>,
+        columns: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let dataset_schema = self_.fragment.dataset().schema();
-        let projection = if let Some(columns) = projection {
+        let projection = if let Some(columns) = columns {
             dataset_schema
                 .project(&columns)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?
@@ -84,10 +84,7 @@ impl FileFragment {
     ) -> PyResult<Scanner> {
         let rt = Arc::new(tokio::runtime::Runtime::new()?);
         let mut scanner = self_.fragment.scan();
-        println!("Column: {:?}", columns);
         if let Some(cols) = columns {
-            println!("Columns in none: {:?}", cols);
-            assert!(false, "{}", format!("Column num: {:?}", cols));
             scanner
                 .project(&cols)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

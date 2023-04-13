@@ -58,14 +58,15 @@ class LanceFragment(pa.dataset.Fragment):
 
         return LanceScanner(s, self._ds)
 
-    def take(self, indices) -> pa.Table:
-        pass
+    def take(self, indices, columns: Optional[list[str]] = None) -> pa.Table:
+        return pa.Table.from_batches([self._fragmnet.take(indices, columns=columns)])
 
     def to_batches(
-        self, columns: Optional[list[str]] = None,
+        self,
+        columns: Optional[list[str]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
         limit: int = 0,
-        offset: Optional[int] = None
+        offset: Optional[int] = None,
     ) -> Iterator[pa.RecordBatch]:
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset
