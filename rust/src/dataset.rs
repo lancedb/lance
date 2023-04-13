@@ -30,10 +30,10 @@ use object_store::path::Path;
 use uuid::Uuid;
 
 pub mod fragment;
+mod hash_join;
 pub mod scanner;
 pub mod updater;
 mod write;
-mod hash_join;
 
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
@@ -525,7 +525,6 @@ impl Dataset {
         }
 
         // Hash join
-
 
         todo!()
     }

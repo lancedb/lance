@@ -16,36 +16,60 @@
 
 use std::collections::HashMap;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatchReader};
+
+use crate::arrow::RecordBatchBuffer;
+use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub(super) struct HashJoiner {
     /// Hash value to row index map.
     index_map: HashMap<u64, Vec<usize>>,
+
+    data: RecordBatchBuffer,
+
+    on_column: String,
+}
+
+/// Hash the values of the array.
+fn hash_values(array: &dyn Array) -> Result<Vec<u64>> {
+    todo!()
 }
 
 impl HashJoiner {
     /// Create a new `HashJoiner`.
-    pub fn new() -> Self {
-        Self {
+    pub fn try_new(reader: &mut dyn RecordBatchReader, on: &str) -> Result<Self> {
+        // Check column exist
+        reader.schema().field_with_name(on)?;
+
+        Ok(Self {
             index_map: HashMap::new(),
-        }
+
+            // Hold all data in memory for simple implementation. Can do external sort later.
+            data: reader.collect::<std::result::Result<RecordBatchBuffer, _>>()?,
+
+            on_column: on.to_string(),
+        })
     }
 
-    /// Append a batch to the hash joiner.
-    pub fn append_batch(&mut self, batch: &RecordBatch, on: &str, start_idx: usize) {
-        let hash_column = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt64Array>()
-            .unwrap();
-        for i in 0..hash_column.len() {
-            let hash = hash_column.value(i);
-            let index = batch.index();
-            self.index_map
-                .entry(hash)
-                .and_modify(|v| v.push(index))
-                .or_insert(vec![index]);
+    pub fn build(&mut self) -> Result<()> {
+        let mut start_idx = 0;
+
+        for batch in &self.data.batches {
+            let key_column = batch.column_by_name(&self.on_column).ok_or_else(|| {
+                Error::IO(format!("HashJoiner: Column {} not found", self.on_column))
+            })?;
+
+            let hashes = hash_values(key_column)?;
+            for (i, hash_value) in hashes.iter().enumerate() {
+                let idx = start_idx + i;
+                self.index_map
+                    .entry(*hash_value)
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+            start_idx += batch.num_rows();
         }
+        Ok(())
     }
 }
