@@ -5,7 +5,7 @@ on:
       - main
   pull_request:
     paths:
-      - ./integration/duckdb_lance/*
+      - integration/duckdb_lance/*
       - .github/workflows/duckdb.yml
       - ./rust/*
 jobs:
