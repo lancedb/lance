@@ -60,13 +60,9 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     const DEFAULT_REGION: &str = "us-west-2";
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
-    let provider = aws_config::default_provider::credentials::default_provider().await;
-    let credentials = provider.provide_credentials().await.unwrap();
     Ok(Arc::new(
-        AmazonS3Builder::new()
+        AmazonS3Builder::from_env()
             .with_url(uri)
-            .with_access_key_id(credentials.access_key_id())
-            .with_secret_access_key(credentials.secret_access_key())
             .with_region(
                 region_provider
                     .region()
