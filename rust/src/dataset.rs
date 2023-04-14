@@ -501,27 +501,27 @@ impl Dataset {
     ) -> Result<Self> {
         // Sanity check.
         if self.schema().field(left_on).is_none() {
-            return Err(Error::IO(format!(
+            return Err(Error::IO { message: format!(
                 "Column {} does not exist in the left side dataset",
                 left_on
-            )));
+        )});
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::IO(format!(
+            return Err(Error::IO { message: format!(
                 "Column {} does not exist in the right side dataset",
                 right_on
-            )));
+            )});
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::IO(format!(
+                return Err(Error::IO { message: format!(
                     "Column {} exists in both sides of the dataset",
                     field.name()
-                )));
+                )});
             }
         }
 

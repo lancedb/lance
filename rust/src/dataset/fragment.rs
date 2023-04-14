@@ -27,6 +27,7 @@ use crate::format::Fragment;
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
+use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
 use super::WriteParams;
@@ -199,6 +200,11 @@ impl FileFragment {
 
         Ok(Updater::new(self.clone(), reader))
     }
+
+    /// Merge columns from joiner.
+    pub async fn merge(&self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        todo!()
+    }
 }
 
 impl From<FileFragment> for Fragment {
@@ -315,6 +321,7 @@ impl FragmentReader {
 
         merge_batches(&batches)
     }
+
 }
 
 #[cfg(test)]

@@ -44,7 +44,7 @@ impl HashJoiner {
         // Hold all data in memory for simple implementation. Can do external sort later.
         let batches = reader.collect::<std::result::Result<Vec<RecordBatch>, _>>()?;
         if batches.is_empty() {
-            return Err(Error::IO("HashJoiner: No data".to_string()));
+            return Err(Error::IO { message: "HashJoiner: No data".to_string()});
         };
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
@@ -60,7 +60,7 @@ impl HashJoiner {
         let key_column = self
             .batch
             .column_by_name(&self.on_column)
-            .ok_or_else(|| Error::IO(format!("HashJoiner: Column {} not found", self.on_column)))?;
+            .ok_or_else(|| Error::IO { message: format!("HashJoiner: Column {} not found", self.on_column) })?;
 
         let hashes = hash(key_column.as_ref())?;
         for (i, hash_value) in hashes.iter().enumerate() {
@@ -69,7 +69,7 @@ impl HashJoiner {
                 };
 
             if self.index_map.contains_key(&key) {
-                return Err(Error::IO(format!("HashJoiner: Duplicate key {}", key)));
+                return Err(Error::IO { message:format!("HashJoiner: Duplicate key {}", key) } );
             }
             // TODO: use [`HashMap::try_insert`] when it's stable.
             self.index_map.insert(key, i);
