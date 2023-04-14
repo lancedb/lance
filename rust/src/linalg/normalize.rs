@@ -53,7 +53,7 @@ unsafe fn normalize_fma(vector: &[f32]) -> f32 {
     let len = vector.len() / 8 * 8;
 
     let mut sums = _mm256_setzero_ps();
-    for i in (0..len).step_by(8) {  
+    for i in (0..len).step_by(8) {
         let x = _mm256_loadu_ps(vector.as_ptr().add(i));
         sums = _mm256_fmadd_ps(x, x, sums);
     }
