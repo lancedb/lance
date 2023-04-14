@@ -107,9 +107,10 @@ mod tests {
 
     use super::*;
 
+    use std::sync::Arc;
+
     use arrow_array::{Int32Array, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
 
     use crate::arrow::RecordBatchBuffer;
 
@@ -160,7 +161,7 @@ mod tests {
                 None,
                 None,
                 Some("str_22"),
-                None  // 11111 not found
+                None // 11111 not found
             ])
         );
     }

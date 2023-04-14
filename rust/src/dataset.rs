@@ -529,6 +529,10 @@ impl Dataset {
         let mut joiner = HashJoiner::try_new(stream, right_on)?;
         joiner.build()?;
 
+        // Write new data file to each fragment.
+        let mut new_fragments: Vec<Fragment> = vec![];
+        for fragment in self.get_fragments().iter() {}
+
         todo!()
     }
 
