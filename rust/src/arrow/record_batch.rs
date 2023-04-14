@@ -15,8 +15,7 @@
 //! Additional utility for [`RecordBatch`]
 //!
 
-use arrow::array::as_struct_array;
-use arrow_array::{Array, RecordBatch, RecordBatchReader, StructArray};
+use arrow_array::{cast::as_struct_array, Array, RecordBatch, RecordBatchReader, StructArray};
 use arrow_schema::{ArrowError, SchemaRef};
 use arrow_select::interleave::interleave;
 
@@ -51,6 +50,8 @@ impl RecordBatchBuffer {
         Ok(self.batches.clone())
     }
 
+    /// Make interleaving indices to be used with [`arrow_select::interleave::interleave`].
+    ///
     fn make_interleaving_indices(&self, indices: &[usize]) -> Vec<(usize, usize)> {
         let mut lengths = vec![0_usize];
         for batch in self.batches.iter() {
@@ -69,7 +70,7 @@ impl RecordBatchBuffer {
     }
 
     /// Take rows by indices.
-    pub fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
+    pub fn take_rows(&self, indices: &[usize]) -> Result<RecordBatch> {
         let arrays = self
             .batches
             .iter()
@@ -107,5 +108,47 @@ impl FromIterator<RecordBatch> for RecordBatchBuffer {
     fn from_iter<T: IntoIterator<Item = RecordBatch>>(iter: T) -> Self {
         let batches = iter.into_iter().collect::<Vec<_>>();
         Self::new(batches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arrow_array::{Float64Array, Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn test_take() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+
+        let batch_buffer: RecordBatchBuffer = (0..5)
+            .map(|v| {
+                let values = (v * 10..v * 10 + 10).collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter(values.iter().copied())),
+                        Arc::new(Float64Array::from_iter(values.iter().map(|v| *v as f64))),
+                        Arc::new(StringArray::from_iter_values(
+                            values.iter().map(|v| format!("str_{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let batch = batch_buffer.take_rows(&[10, 14, 30, 49, 0, 22]).unwrap();
+        assert_eq!(batch.num_rows(), 6);
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![10, 14, 30, 49, 0, 22])
+        );
     }
 }
