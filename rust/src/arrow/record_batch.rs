@@ -15,8 +15,10 @@
 //! Additional utility for [`RecordBatch`]
 //!
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow::array::as_struct_array;
+use arrow_array::{Array, RecordBatch, RecordBatchReader, StructArray};
 use arrow_schema::{ArrowError, SchemaRef};
+use arrow_select::interleave::interleave;
 
 use crate::Result;
 
@@ -47,6 +49,37 @@ impl RecordBatchBuffer {
 
     pub fn finish(&self) -> Result<Vec<RecordBatch>> {
         Ok(self.batches.clone())
+    }
+
+    fn make_interleaving_indices(&self, indices: &[usize]) -> Vec<(usize, usize)> {
+        let mut lengths = vec![0_usize];
+        for batch in self.batches.iter() {
+            lengths.push(lengths.last().unwrap() + batch.num_rows());
+        }
+
+        let mut idx = vec![];
+        for i in indices {
+            let batch_id = match lengths.binary_search(&i) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            idx.push((batch_id, i - lengths[batch_id]));
+        }
+        idx
+    }
+
+    /// Take rows by indices.
+    pub fn take(&self, indices: &[usize]) -> Result<RecordBatch> {
+        let arrays = self
+            .batches
+            .iter()
+            .map(|batch| StructArray::from(batch.clone()))
+            .collect::<Vec<_>>();
+        let refs = arrays.iter().map(|a| a as &dyn Array).collect::<Vec<_>>();
+
+        let interleaving_indices = self.make_interleaving_indices(indices);
+        let array = interleave(&refs, &interleaving_indices)?;
+        Ok(as_struct_array(&array).into())
     }
 }
 

@@ -16,21 +16,20 @@
 
 use std::collections::HashMap;
 
-use arrow_array::{Array, RecordBatchReader};
+use arrow_array::{Array, RecordBatch, RecordBatchReader};
 
-use crate::arrow::{RecordBatchBuffer, hash};
+use crate::arrow::{hash, RecordBatchBuffer};
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub(super) struct HashJoiner {
     /// Hash value to row index map.
-    index_map: HashMap<u64, Vec<usize>>,
+    index_map: HashMap<u64, usize>,
 
     data: RecordBatchBuffer,
 
     on_column: String,
 }
-
 
 impl HashJoiner {
     /// Create a new `HashJoiner`.
@@ -48,7 +47,8 @@ impl HashJoiner {
         })
     }
 
-    pub fn build(&mut self) -> Result<()> {
+    /// Build the hash index.
+    pub(super) fn build(&mut self) -> Result<()> {
         let mut start_idx = 0;
 
         for batch in &self.data.batches {
@@ -59,15 +59,35 @@ impl HashJoiner {
             let hashes = hash(key_column.as_ref())?;
             for (i, hash_value) in hashes.iter().enumerate() {
                 let idx = start_idx + i;
-                if let Some(v) = hash_value {
-                    self.index_map
-                        .entry(v)
-                        .or_insert_with(Vec::new)
-                        .push(idx);
+                let Some(key) = hash_value else {
+                    continue;
+                };
+
+                if self.index_map.contains_key(&key) {
+                    return Err(Error::IO(format!("HashJoiner: Duplicate key {}", key)));
                 }
+                // TODO: use [`HashMap::try_insert`] when it's stable.
+                self.index_map.insert(key, idx);
             }
             start_idx += batch.num_rows();
         }
         Ok(())
+    }
+
+    /// Collecting the data using the index column from left table.
+    pub(super) fn collect(&self, index_column: &dyn Array) -> Result<RecordBatch> {
+        let hashes = hash(index_column)?;
+        let mut indices: Vec<usize> = Vec::with_capacity(index_column.len());
+        for hash_value in hashes.iter() {
+            let Some(key) = hash_value else {
+                continue;
+            };
+
+            if let Some(idx) = self.index_map.get(&key) {
+                indices.push(*idx);
+            }
+        }
+
+        todo!()
     }
 }

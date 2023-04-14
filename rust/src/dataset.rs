@@ -46,6 +46,7 @@ use crate::io::{
 };
 use crate::session::Session;
 use crate::{Error, Result};
+use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
 pub use write::*;
 
@@ -494,7 +495,7 @@ impl Dataset {
     /// It performs a left-join on the two datasets.
     pub fn merge(
         &self,
-        stream: &dyn RecordBatchReader,
+        stream: &mut dyn RecordBatchReader,
         left_on: &str,
         right_on: &str,
     ) -> Result<Self> {
@@ -525,6 +526,8 @@ impl Dataset {
         }
 
         // Hash join
+        let mut joiner = HashJoiner::try_new(stream, right_on)?;
+        joiner.build()?;
 
         todo!()
     }
