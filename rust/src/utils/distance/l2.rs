@@ -28,14 +28,13 @@ use crate::Result;
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 #[inline]
-unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
+unsafe fn l2_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(from.len(), to.len());
 
     let len = from.len();
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
-        // Cache line-aligned
         let left = _mm256_loadu_ps(from.as_ptr().add(i));
         let right = _mm256_loadu_ps(to.as_ptr().add(i));
         let sub = _mm256_sub_ps(left, right);
@@ -89,7 +88,7 @@ fn l2_distance_simd(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Fl
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
-                        euclidean_distance_fma(from, &to[idx * dimension..(idx + 1) * dimension])
+                        l2_distance_fma(from, &to[idx * dimension..(idx + 1) * dimension])
                     }
 
                     #[cfg(any(target_arch = "aarch64"))]
