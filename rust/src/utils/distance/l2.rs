@@ -14,11 +14,11 @@
 
 //! L2 (Euclidean) distance.
 
-use std::sync::Arc;
+use std::{iter::Sum, sync::Arc};
 
 use arrow_array::Float32Array;
+use num_traits::real::Real;
 
-use super::is_simd_aligned;
 use crate::Result;
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
@@ -27,16 +27,16 @@ use crate::Result;
 #[cfg(any(target_arch = "x86_64"))]
 #[target_feature(enable = "fma")]
 #[inline]
-unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
+unsafe fn l2_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(from.len(), to.len());
 
-    let len = from.len();
+    // Get the potion of the vector that is aligned to 32 bytes.
+    let len = from.len() / 8 * 8;
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
-        // Cache line-aligned
-        let left = _mm256_load_ps(from.as_ptr().add(i));
-        let right = _mm256_load_ps(to.as_ptr().add(i));
+        let left = _mm256_loadu_ps(from.as_ptr().add(i));
+        let right = _mm256_loadu_ps(to.as_ptr().add(i));
         let sub = _mm256_sub_ps(left, right);
         // sum = sub * sub + sum
         sums = _mm256_fmadd_ps(sub, sub, sums);
@@ -51,15 +51,18 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     sums = _mm256_hadd_ps(sums, sums);
     let mut results: [f32; 8] = [0f32; 8];
     _mm256_storeu_ps(results.as_mut_ptr(), sums);
+
+    // Remaining
+    results[0] += l2_scalar(&from[len..], &to[len..]);
     results[0]
 }
 
 #[inline]
-fn l2_distance_slow(from: &[f32], to: &[f32]) -> f32 {
+fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter()
         .zip(to.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum()
+        .map(|(a, b)| (a.sub(*b).powi(2)))
+        .sum::<T>()
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -67,7 +70,7 @@ fn l2_distance_slow(from: &[f32], to: &[f32]) -> f32 {
 #[inline]
 unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let len = from.len();
+    let len = from.len() / 4 * 4;
     let buf = [0.0_f32; 4];
     let mut sum = vld1q_f32(buf.as_ptr());
     for i in (0..len).step_by(4) {
@@ -76,7 +79,9 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
         let sub = vsubq_f32(left, right);
         sum = vfmaq_f32(sum, sub, sub);
     }
-    vaddvq_f32(sum)
+    let mut sum = vaddvq_f32(sum);
+    sum += l2_scalar(&from[len..], &to[len..]);
+    sum
 }
 
 fn l2_distance_simd(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Float32Array>> {
@@ -88,7 +93,7 @@ fn l2_distance_simd(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Fl
                 .map(|idx| {
                     #[cfg(any(target_arch = "x86_64"))]
                     {
-                        euclidean_distance_fma(from, &to[idx * dimension..(idx + 1) * dimension])
+                        l2_distance_fma(from, &to[idx * dimension..(idx + 1) * dimension])
                     }
 
                     #[cfg(any(target_arch = "aarch64"))]
@@ -115,11 +120,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
 
     #[cfg(any(target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("fma")
-            && is_simd_aligned(from.as_ptr(), 32)
-            && is_simd_aligned(to.as_ptr(), 32)
-            && from.len() % 8 == 0
-        {
+        if is_x86_feature_detected!("fma") {
             return l2_distance_simd(from, to, dimension);
         }
     }
@@ -127,21 +128,15 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     #[cfg(any(target_arch = "aarch64"))]
     {
         use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon")
-            && is_simd_aligned(from.as_ptr(), 16)
-            && is_simd_aligned(to.as_ptr(), 16)
-            && from.len() % 4 == 0
-        {
+        if is_aarch64_feature_detected!("neon") {
             return l2_distance_simd(from, to, dimension);
         }
     }
 
-    // Fallback to slow version
+    // Fallback to non-SIMD version.
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
-            to.chunks_exact(dimension)
-                .map(|v| l2_distance_slow(from, v))
-                .map(Some),
+            to.chunks_exact(dimension).map(|v| Some(l2_scalar(from, v))),
         )
     };
     Ok(Arc::new(scores))
