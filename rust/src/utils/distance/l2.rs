@@ -19,7 +19,6 @@ use std::{iter::Sum, sync::Arc};
 use arrow_array::Float32Array;
 use num_traits::real::Real;
 
-use super::is_simd_aligned;
 use crate::Result;
 
 // TODO: wait [std::simd] to be stable to replace manually written AVX/FMA code.
@@ -134,12 +133,10 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
         }
     }
 
-    // Fallback to slow version
+    // Fallback to non-SIMD version.
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
-            to.chunks_exact(dimension)
-                .map(|v| l2_scalar(from, v))
-                .map(Some),
+            to.chunks_exact(dimension).map(|v| Some(l2_scalar(from, v))),
         )
     };
     Ok(Arc::new(scores))
