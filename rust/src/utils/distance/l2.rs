@@ -32,7 +32,8 @@ unsafe fn l2_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     debug_assert_eq!(from.len(), to.len());
 
-    let len = from.len();
+    // Get the potion of the vector that is aligned to 32 bytes.
+    let len = from.len() / 8 * 8;
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
         let left = _mm256_loadu_ps(from.as_ptr().add(i));
@@ -51,6 +52,9 @@ unsafe fn l2_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     sums = _mm256_hadd_ps(sums, sums);
     let mut results: [f32; 8] = [0f32; 8];
     _mm256_storeu_ps(results.as_mut_ptr(), sums);
+
+    // Remaining
+    results[0] += l2_scalar(&from[len..], &to[len..]);
     results[0]
 }
 
@@ -115,7 +119,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
 
     #[cfg(any(target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
+        if is_x86_feature_detected!("fma") {
             return l2_distance_simd(from, to, dimension);
         }
     }
