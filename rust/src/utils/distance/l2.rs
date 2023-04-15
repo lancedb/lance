@@ -14,7 +14,7 @@
 
 //! L2 (Euclidean) distance.
 
-use std::{sync::Arc, iter::Sum};
+use std::{iter::Sum, sync::Arc};
 
 use arrow_array::Float32Array;
 use num_traits::real::Real;
@@ -116,9 +116,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
 
     #[cfg(any(target_arch = "x86_64"))]
     {
-        if is_x86_feature_detected!("fma")
-            && from.len() % 8 == 0
-        {
+        if is_x86_feature_detected!("fma") && from.len() % 8 == 0 {
             return l2_distance_simd(from, to, dimension);
         }
     }
@@ -126,9 +124,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     #[cfg(any(target_arch = "aarch64"))]
     {
         use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon")
-            && from.len() % 4 == 0
-        {
+        if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
             return l2_distance_simd(from, to, dimension);
         }
     }
