@@ -71,7 +71,7 @@ fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
 #[inline]
 unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
     use std::arch::aarch64::*;
-    let len = from.len();
+    let len = from.len() / 4 * 4;
     let buf = [0.0_f32; 4];
     let mut sum = vld1q_f32(buf.as_ptr());
     for i in (0..len).step_by(4) {
@@ -80,7 +80,9 @@ unsafe fn l2_distance_neon(from: &[f32], to: &[f32]) -> f32 {
         let sub = vsubq_f32(left, right);
         sum = vfmaq_f32(sum, sub, sub);
     }
-    vaddvq_f32(sum)
+    let mut sum = vaddvq_f32(sum);
+    sum += l2_scalar(&from[len..], &to[len..]);
+    sum
 }
 
 fn l2_distance_simd(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Float32Array>> {
@@ -127,7 +129,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     #[cfg(any(target_arch = "aarch64"))]
     {
         use std::arch::is_aarch64_feature_detected;
-        if is_aarch64_feature_detected!("neon") && from.len() % 4 == 0 {
+        if is_aarch64_feature_detected!("neon") {
             return l2_distance_simd(from, to, dimension);
         }
     }
