@@ -34,7 +34,7 @@ use super::WriteParams;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
-/// The interface is similar to `pyarrow.dataset.Fragment`.
+/// The interface is modeled after `pyarrow.dataset.Fragment`.
 #[derive(Debug, Clone)]
 pub struct FileFragment {
     dataset: Arc<Dataset>,
@@ -202,7 +202,7 @@ impl FileFragment {
     }
 
     /// Merge columns from joiner.
-    pub async fn merge(&self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+    pub(crate) async fn merge(&self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
         todo!()
     }
 }

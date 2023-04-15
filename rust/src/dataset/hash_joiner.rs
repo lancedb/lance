@@ -26,7 +26,7 @@ use crate::arrow::hash;
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
-pub(super) struct HashJoiner {
+pub(crate) struct HashJoiner {
     /// Hash value to row index map.
     index_map: HashMap<u64, usize>,
 
