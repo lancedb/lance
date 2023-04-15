@@ -14,9 +14,10 @@
 
 //! L2 (Euclidean) distance.
 
-use std::sync::Arc;
+use std::{sync::Arc, iter::Sum};
 
 use arrow_array::Float32Array;
+use num_traits::real::Real;
 
 use super::is_simd_aligned;
 use crate::Result;
@@ -55,11 +56,11 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
 }
 
 #[inline]
-fn l2_distance_slow(from: &[f32], to: &[f32]) -> f32 {
+fn l2_scalar<T: Real + Sum>(from: &[T], to: &[T]) -> T {
     from.iter()
         .zip(to.iter())
-        .map(|(a, b)| (a - b).powi(2))
-        .sum()
+        .map(|(a, b)| (a.sub(*b).powi(2)))
+        .sum::<T>()
 }
 
 #[cfg(any(target_arch = "aarch64"))]
@@ -116,8 +117,6 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     #[cfg(any(target_arch = "x86_64"))]
     {
         if is_x86_feature_detected!("fma")
-            && is_simd_aligned(from.as_ptr(), 32)
-            && is_simd_aligned(to.as_ptr(), 32)
             && from.len() % 8 == 0
         {
             return l2_distance_simd(from, to, dimension);
@@ -128,8 +127,6 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     {
         use std::arch::is_aarch64_feature_detected;
         if is_aarch64_feature_detected!("neon")
-            && is_simd_aligned(from.as_ptr(), 16)
-            && is_simd_aligned(to.as_ptr(), 16)
             && from.len() % 4 == 0
         {
             return l2_distance_simd(from, to, dimension);
@@ -140,7 +137,7 @@ pub fn l2_distance(from: &[f32], to: &[f32], dimension: usize) -> Result<Arc<Flo
     let scores: Float32Array = unsafe {
         Float32Array::from_trusted_len_iter(
             to.chunks_exact(dimension)
-                .map(|v| l2_distance_slow(from, v))
+                .map(|v| l2_scalar(from, v))
                 .map(Some),
         )
     };
