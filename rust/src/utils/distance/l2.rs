@@ -36,8 +36,8 @@ unsafe fn euclidean_distance_fma(from: &[f32], to: &[f32]) -> f32 {
     let mut sums = _mm256_setzero_ps();
     for i in (0..len).step_by(8) {
         // Cache line-aligned
-        let left = _mm256_load_ps(from.as_ptr().add(i));
-        let right = _mm256_load_ps(to.as_ptr().add(i));
+        let left = _mm256_loadu_ps(from.as_ptr().add(i));
+        let right = _mm256_loadu_ps(to.as_ptr().add(i));
         let sub = _mm256_sub_ps(left, right);
         // sum = sub * sub + sum
         sums = _mm256_fmadd_ps(sub, sub, sums);
