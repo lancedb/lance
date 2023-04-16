@@ -207,12 +207,12 @@ pub(crate) async fn write_graph<V: Vertex>(
     let binary_size = serde.size();
     let arrow_schema = Arc::new(ArrowSchema::new(vec![
         Field::new(
-            "vertex",
+            VERTEX_COL,
             DataType::FixedSizeBinary(binary_size as i32),
             false,
         ),
         Field::new(
-            "neighbors",
+            NEIGHBORS_COL,
             DataType::List(Box::new(Field::new("item", DataType::UInt32, true))),
             false,
         ),
@@ -296,7 +296,7 @@ mod tests {
             .collect();
         for i in 0..100 {
             for j in i..i + 10 {
-                builder.add_edge(i, j);
+                builder.add_neighbor(i, j);
             }
         }
         let serde = Box::new(FooVertexSerDe {});
