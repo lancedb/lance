@@ -57,7 +57,7 @@ impl L2 for [f32] {
         {
             // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
             use aarch64::neon::l2_f32;
-            unsafe { l2_f32(self, other) }
+            l2_f32(self, other)
         }
 
         // Fallback to scalar implementation on other architectures.
@@ -141,20 +141,22 @@ mod aarch64 {
         use super::super::l2_scalar;
 
         #[inline]
-        pub(crate) unsafe fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
-            use std::arch::aarch64::*;
-            let len = from.len() / 4 * 4;
-            let buf = [0.0_f32; 4];
-            let mut sum = vld1q_f32(buf.as_ptr());
-            for i in (0..len).step_by(4) {
-                let left = vld1q_f32(from.as_ptr().add(i));
-                let right = vld1q_f32(to.as_ptr().add(i));
-                let sub = vsubq_f32(left, right);
-                sum = vfmaq_f32(sum, sub, sub);
+        pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+            unsafe {
+                use std::arch::aarch64::*;
+                let len = from.len() / 4 * 4;
+                let buf = [0.0_f32; 4];
+                let mut sum = vld1q_f32(buf.as_ptr());
+                for i in (0..len).step_by(4) {
+                    let left = vld1q_f32(from.as_ptr().add(i));
+                    let right = vld1q_f32(to.as_ptr().add(i));
+                    let sub = vsubq_f32(left, right);
+                    sum = vfmaq_f32(sum, sub, sub);
+                }
+                let mut sum = vaddvq_f32(sum);
+                sum += l2_scalar(&from[len..], &to[len..]);
+                sum
             }
-            let mut sum = vaddvq_f32(sum);
-            sum += l2_scalar(&from[len..], &to[len..]);
-            sum
         }
     }
 }
