@@ -19,12 +19,8 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::{
-    arrow::linalg::MatrixView,
-    index::vector::graph::{Graph, VertexWithDistance},
-    utils::distance::l2::l2_distance,
-};
-use crate::{Error, Result};
+use crate::index::vector::graph::{Graph, VertexWithDistance};
+use crate::Result;
 
 /// DiskANN search state.
 pub(crate) struct SearchState {
@@ -44,13 +40,13 @@ pub(crate) struct SearchState {
     /// Search size, `L` parameter in the paper. L must be greater or equal than k.
     l: usize,
 
-    /// The number of candidates to return.
+    /// Number of results to return.
     k: usize,
 }
 
 impl SearchState {
     /// Creates a new search state.
-    pub fn new(k: usize, l: usize) -> Self {
+    pub(crate) fn new(k: usize, l: usize) -> Self {
         Self {
             visited: HashSet::new(),
             candidates: BTreeMap::new(),
@@ -96,17 +92,6 @@ impl SearchState {
     fn is_visited(&self, vertex_id: usize) -> bool {
         self.visited.contains(&vertex_id)
     }
-}
-
-/// Distance from the query vector to the vector at the given idx.
-fn distance_to(vectors: &MatrixView, query: &[f32], idx: usize) -> Result<f32> {
-    let vector = vectors
-        .row(idx)
-        .ok_or(Error::Index("Invalid row index".to_string()))?;
-    let dim = vectors.num_columns();
-
-    let dists = l2_distance(query, vector, dim)?;
-    Ok(dists.value(0))
 }
 
 /// Greedy search.
