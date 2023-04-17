@@ -21,9 +21,15 @@ use crate::Result;
 /// Vertex with only Row ID.
 #[derive(Clone, Debug)]
 pub(crate) struct RowVertex {
-    row_id: u64,
+    pub(crate) row_id: u64,
 
-    vector: Option<Float32Array>,
+    pub(crate) vector: Option<Float32Array>,
+}
+
+impl RowVertex {
+    pub(crate) fn new(row_id: u64, vector: Option<Float32Array>) -> Self {
+        Self { row_id, vector }
+    }
 }
 
 impl Vertex for RowVertex {}

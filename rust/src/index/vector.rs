@@ -49,7 +49,7 @@ use crate::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
-    linalg::l2::{l2_distance_batch, l2_distance},
+    linalg::l2::{l2_distance, l2_distance_batch},
     utils::distance::cosine::cosine_distance_batch,
     Error, Result,
 };

@@ -25,17 +25,19 @@ use rand::Rng;
 
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
+use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
 use crate::index::vector::diskann::{DiskANNParams, PQVertexSerDe};
-use crate::index::vector::graph::Graph;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
+use crate::index::vector::graph::{Graph, Vertex};
 use crate::index::vector::pq::{train_pq, ProductQuantizer};
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::index::vector::MetricType;
 use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
+use super::row_vertex::RowVertex;
 use super::{search::greedy_search, PQVertex};
 
 /// Builder for DiskANN index.
@@ -66,16 +68,14 @@ impl Builder {
         let sample_size = 1000;
         let training_data =
             maybe_sample_training_data(self.dataset.as_ref(), &self.column, sample_size).await?;
-        let pq = train_pq(&training_data, &self.params.pq_params).await?;
 
         // Randomly initialize the graph with r random neighbors for each vertex.
         let mut graph = init_graph(
             self.dataset.clone(),
             &self.column,
             self.params.r,
-            rand::thread_rng(),
-            &pq,
             MetricType::L2,
+            rand::thread_rng(),
         )
         .await?;
 
@@ -113,10 +113,7 @@ impl Builder {
 
         let mut write_params = WriteGraphParams::default();
         write_params.batch_size = 2048 * 10;
-        let serde = PQVertexSerDe::new(
-            self.params.pq_params.num_sub_vectors,
-            self.params.pq_params.num_bits,
-        );
+        let serde = RowVertexSerDe {};
 
         write_graph(
             &graph,
@@ -146,10 +143,9 @@ async fn init_graph(
     dataset: Arc<Dataset>,
     column: &str,
     r: usize,
-    mut rng: impl Rng,
-    pq: &ProductQuantizer,
     metric_type: MetricType,
-) -> Result<GraphBuilder<PQVertex>> {
+    mut rng: impl Rng,
+) -> Result<GraphBuilder<RowVertex>> {
     let stream = dataset
         .scan()
         .project(&[column])?
@@ -172,15 +168,11 @@ async fn init_graph(
             .ok_or(Error::Index(format!("column {} not found", column)))?,
     );
     let matrix: MatrixView = vectors.try_into()?;
-    let pq_code = pq.transform(&matrix, metric_type).await?;
     let nodes = row_ids
         .values()
         .iter()
         .enumerate()
-        .map(|(i, &row_id)| PQVertex {
-            row_id,
-            pq: as_primitive_array(pq_code.value(i).as_ref()).clone(),
-        })
+        .map(|(i, &row_id)| RowVertex::new(row_id, None))
         .collect::<Vec<_>>();
     let mut graph = GraphBuilder::new(&nodes, matrix, metric_type);
 
@@ -226,8 +218,8 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
 }
 
 /// Algorithm 2 in the paper.
-async fn robust_prune(
-    graph: &GraphBuilder<PQVertex>,
+async fn robust_prune<V: Vertex + Clone>(
+    graph: &GraphBuilder<V>,
     id: usize,
     mut visited: HashSet<usize>,
     alpha: f32,
@@ -300,8 +292,8 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
 }
 
 /// One pass of index building.
-async fn index_once(
-    graph: &mut GraphBuilder<PQVertex>,
+async fn index_once<V: Vertex + Clone>(
+    graph: &mut GraphBuilder<V>,
     medoid: usize,
     alpha: f32,
     r: usize,
@@ -326,7 +318,7 @@ async fn index_once(
         let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
         graph.set_neighbors(id, neighbors.to_vec());
 
-        let fixed_graph: &GraphBuilder<PQVertex> = graph;
+        let fixed_graph: &GraphBuilder<V> = graph;
         let neighbours = stream::iter(neighbors)
             .map(|j| async move {
                 let mut neighbor_set: HashSet<usize> = fixed_graph
@@ -363,6 +355,7 @@ mod tests {
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use tempfile;
 
     use crate::dataset::WriteParams;
     use crate::utils::testing::generate_random_array;
@@ -397,21 +390,21 @@ mod tests {
         Arc::new(dataset)
     }
 
-    // #[tokio::test]
-    // async fn test_init() {
-    //     let tmp_dir = tempfile::tempdir().unwrap();
-    //     let uri = tmp_dir.path().to_str().unwrap();
-    //     let dataset = create_dataset(uri, 200, 64).await;
+    #[tokio::test]
+    async fn test_init() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let uri = tmp_dir.path().to_str().unwrap();
+        let dataset = create_dataset(uri, 200, 64).await;
 
-    //     let rng = rand::thread_rng();
-    //     let graph = init_graph(dataset, "vector", 10, rng, MetricType::L2)
-    //         .await
-    //         .unwrap();
+        let rng = rand::thread_rng();
+        let graph = init_graph(dataset, "vector", 10, MetricType::L2, rng)
+            .await
+            .unwrap();
 
-    //     for (id, node) in graph.nodes.iter().enumerate() {
-    //         // Statistically， each node should have 10 neighbors.
-    //         assert!(!node.neighbors.is_empty());
-    //         assert_eq!(node.vertex.row_id as usize, id);
-    //     }
-    // }
+        for (id, node) in graph.nodes.iter().enumerate() {
+            // Statistically， each node should have 10 neighbors.
+            assert!(!node.neighbors.is_empty());
+            assert_eq!(node.vertex.row_id as usize, id);
+        }
+    }
 }
