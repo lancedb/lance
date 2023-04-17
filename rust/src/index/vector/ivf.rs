@@ -292,7 +292,7 @@ impl Ivf {
             query.values(),
             as_primitive_array::<Float32Type>(centroid_values.as_ref()).values(),
             self.dimension(),
-        )? as ArrayRef;
+        ) as ArrayRef;
         let top_k_partitions = sort_to_indices(&distances, None, Some(nprobes))?;
         Ok(top_k_partitions)
     }
@@ -324,12 +324,8 @@ impl Ivf {
         let centroids: MatrixView = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
-            let part_id = argmin(
-                dist_func(vector, centroids.data().values(), dim)
-                    .unwrap()
-                    .as_ref(),
-            )
-            .unwrap();
+            let part_id =
+                argmin(dist_func(vector, centroids.data().values(), dim).as_ref()).unwrap();
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
             if vector.len() != cent.len() {
@@ -454,12 +450,7 @@ fn compute_residual_matrix(
     let mut builder = Float32Builder::with_capacity(data.data().len());
     for i in 0..data.num_rows() {
         let row = data.row(i).unwrap();
-        let part_id = argmin(
-            dist_func(row, centroids.data().values(), dim)
-                .unwrap()
-                .as_ref(),
-        )
-        .unwrap();
+        let part_id = argmin(dist_func(row, centroids.data().values(), dim).as_ref()).unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
         if row.len() != centroid.len() {
             return Err(Error::IO(format!(

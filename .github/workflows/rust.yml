@@ -35,6 +35,8 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v3
+      - name: CPU features
+        run: sysctl -a | grep cpu
       - name: Setup cache
         uses: actions/cache@v3
         continue-on-error: false

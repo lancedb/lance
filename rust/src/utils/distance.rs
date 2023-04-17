@@ -17,7 +17,6 @@
 
 pub mod compute;
 pub mod cosine;
-pub mod l2;
 
 #[inline]
 pub(crate) fn simd_alignment() -> i32 {

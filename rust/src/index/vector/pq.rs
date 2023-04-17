@@ -34,8 +34,8 @@ use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
+use crate::linalg::l2::l2_distance_batch;
 use crate::utils::distance::compute::normalize;
-use crate::utils::distance::l2::l2_distance;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -101,11 +101,11 @@ impl PQIndex {
             let subvec_centroids = self.pq.centroids(i).ok_or_else(|| {
                 Error::Index("PQIndex::l2_scores: PQ is not initialized".to_string())
             })?;
-            let distances = l2_distance(
+            let distances = l2_distance_batch(
                 as_primitive_array::<Float32Type>(&from).values(),
                 subvec_centroids.values(),
                 sub_vector_length,
-            )?;
+            );
             distance_table.extend(distances.values());
         }
 
@@ -377,8 +377,7 @@ impl ProductQuantizer {
                             let value = vec.value(i);
                             let vector: &Float32Array = as_primitive_array(value.as_ref());
                             let distances =
-                                dist_func(vector.values(), centroid.values(), vector.len())
-                                    .unwrap();
+                                dist_func(vector.values(), centroid.values(), vector.len());
                             min(distances.as_ref()).unwrap_or(0.0)
                         })
                         .sum::<f32>() as f64 // in case of overflow
@@ -421,7 +420,7 @@ impl ProductQuantizer {
                     let offset = row_offset + sub_idx * sub_dim;
                     let sub_vector = &flatten_values[offset..offset + sub_dim];
                     let centroids = all_centroids[sub_idx].as_ref();
-                    let code = argmin(dist_func(sub_vector, centroids.values(), sub_dim)?.as_ref())
+                    let code = argmin(dist_func(sub_vector, centroids.values(), sub_dim).as_ref())
                         .unwrap();
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }

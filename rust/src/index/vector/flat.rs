@@ -91,7 +91,6 @@ pub async fn flat_search(
                     as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
                     k.len(),
                 )
-                .unwrap()
             })
             .await? as ArrayRef;
 

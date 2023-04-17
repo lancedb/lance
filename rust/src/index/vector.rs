@@ -46,7 +46,8 @@ use crate::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
-    utils::distance::{cosine::cosine_distance, l2::l2_distance},
+    linalg::l2::l2_distance_batch,
+    utils::distance::cosine::cosine_distance,
     Error, Result,
 };
 pub use traits::*;
@@ -92,11 +93,9 @@ pub enum MetricType {
 }
 
 impl MetricType {
-    pub fn func(
-        &self,
-    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Result<Arc<Float32Array>> + Send + Sync> {
+    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
         match self {
-            Self::L2 => Arc::new(l2_distance),
+            Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance),
         }
     }
