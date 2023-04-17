@@ -34,8 +34,8 @@ use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::utils::distance::compute::normalize;
 use crate::linalg::l2::l2_distance_batch;
+use crate::utils::distance::compute::normalize;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
