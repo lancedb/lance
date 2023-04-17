@@ -194,7 +194,7 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub(crate) async fn write_graph<V: Vertex>(
+pub(crate) async fn write_graph<V: Vertex + Clone>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,
@@ -255,6 +255,7 @@ mod tests {
     use super::*;
     use crate::{arrow::linalg::MatrixView, index::vector::MetricType};
 
+    #[derive(Clone, Debug)]
     struct FooVertex {
         row_id: u32,
         // 16 bytes
@@ -294,8 +295,8 @@ mod tests {
                 row_id: v as u32,
                 pq: vec![0; 16],
             })
-            .collect();
-        let mut builder = GraphBuilder::new(nodes, MatrixView::random(100, 16), MetricType::L2);
+            .collect::<Vec<_>>();
+        let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);
         for i in 0..100 {
             for j in i..i + 10 {
                 builder.add_neighbor(i, j);

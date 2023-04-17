@@ -35,7 +35,7 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub(crate) struct GraphBuilder<V: Vertex> {
+pub(crate) struct GraphBuilder<V: Vertex + Clone> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
@@ -48,10 +48,16 @@ pub(crate) struct GraphBuilder<V: Vertex> {
     distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32>,
 }
 
-impl<V: Vertex> GraphBuilder<V> {
-    pub fn new(nodes: Vec<V>, data: MatrixView, metric_type: MetricType) -> Self {
+impl<'a, V: Vertex + Clone> GraphBuilder<V> {
+    pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
         Self {
-            nodes: vec![],
+            nodes: vertices
+                .iter()
+                .map(|v| Node {
+                    vertex: v.clone(),
+                    neighbors: Vec::new(),
+                })
+                .collect(),
             data,
             metric_type,
             distance_func: metric_type.func(),
@@ -89,7 +95,7 @@ impl<V: Vertex> GraphBuilder<V> {
     }
 }
 
-impl<V: Vertex> Graph for GraphBuilder<V> {
+impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
     fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(
@@ -131,6 +137,7 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Clone)]
     struct FooVertex {
         id: u32,
         val: f32,
@@ -146,7 +153,7 @@ mod tests {
                 val: v as f32 * 0.5,
             })
             .collect::<Vec<_>>();
-        let mut builder = GraphBuilder::new(nodes, MatrixView::random(100, 32), MetricType::L2);
+        let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 32), MetricType::L2);
 
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);

@@ -107,6 +107,7 @@ impl DiskANNParams {
 }
 
 /// DiskANN Vertex with PQ as persisted data.
+#[derive(Clone, Debug)]
 pub(crate) struct PQVertex {
     row_id: u64,
     /// PQ code for the vector.

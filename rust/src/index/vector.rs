@@ -20,8 +20,10 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 
+#[allow(dead_code)]
 mod diskann;
 pub mod flat;
+#[allow(dead_code)]
 mod graph;
 pub mod ivf;
 mod kmeans;

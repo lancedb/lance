@@ -182,7 +182,7 @@ async fn init_graph(
             pq: as_primitive_array(pq_code.value(i).as_ref()).clone(),
         })
         .collect::<Vec<_>>();
-    let mut graph = GraphBuilder::new(nodes, matrix, metric_type);
+    let mut graph = GraphBuilder::new(&nodes, matrix, metric_type);
 
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
