@@ -74,10 +74,6 @@ impl<V: Vertex> GraphBuilder<V> {
         &mut self.nodes[id].vertex
     }
 
-    pub fn neighbors(&self, id: usize) -> &[u32] {
-        self.nodes[id].neighbors.as_slice()
-    }
-
     pub fn neighbors_mut(&mut self, id: usize) -> &mut Vec<u32> {
         &mut self.nodes[id].neighbors
     }
@@ -104,13 +100,28 @@ impl<V: Vertex> Graph for GraphBuilder<V> {
         })?;
 
         let vector_b = self.data.row(b).ok_or_else(|| {
-            format!(
+            Error::Index(format!(
                 "Attempt to access row {} in a matrix with {} rows",
                 b,
                 self.data.num_rows()
-            )
+            ))
         })?;
-        Ok(self.data.row(a).dot(&self.data.row(b)))
+        Ok((self.distance_func)(vector_a, vector_b))
+    }
+
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+        let vector = self.data.row(idx).ok_or_else(|| {
+            Error::Index(format!(
+                "Attempt to access row {} in a matrix with {} rows",
+                idx,
+                self.data.num_rows()
+            ))
+        })?;
+        Ok((self.distance_func)(query, vector))
+    }
+
+    fn neighbors(&self, id: usize) -> Result<&[u32]> {
+        Ok(self.nodes[id].neighbors.as_slice())
     }
 }
 

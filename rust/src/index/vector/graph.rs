@@ -27,6 +27,10 @@ pub use persisted::*;
 pub trait Graph {
     /// Distance between two vertices, specified by their IDs.
     fn distance(&self, a: usize, b: usize) -> Result<f32>;
+
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
+
+    fn neighbors(&self, id: usize) -> Result<&[u32]>;
 }
 
 /// Vertex (metadata). It does not include the actual data.

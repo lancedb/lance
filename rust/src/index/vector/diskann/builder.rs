@@ -32,10 +32,11 @@ use crate::index::vector::graph::{
 use crate::index::vector::pq::{train_pq, ProductQuantizer};
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::index::vector::MetricType;
+use crate::index::vector::graph::Graph;
 use crate::utils::distance::l2::l2_distance;
 use crate::{Error, Result};
 
-use super::{search::greedy_search, PQVertex};
+use super::{search::greedy_search, PQVertex,};
 
 /// Builder for DiskANN index.
 pub struct Builder {
@@ -68,7 +69,7 @@ impl Builder {
         let pq = train_pq(&training_data, &self.params.pq_params).await?;
 
         // Randomly initialize the graph with r random neighbors for each vertex.
-        let graph = init_graph(
+        let mut graph = init_graph(
             self.dataset.clone(),
             &self.column,
             self.params.r,
@@ -186,7 +187,7 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i).iter().copied().collect();
+        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i)?.iter().copied().collect();
 
         while neighbor_ids.len() < r {
             let neighbor_id = rng.sample(distribution);
@@ -234,7 +235,7 @@ async fn robust_prune(
     r: usize,
 ) -> Result<Vec<u32>> {
     visited.remove(&id);
-    let neighbors = graph.neighbors(id);
+    let neighbors = graph.neighbors(id)?;
     visited.extend(neighbors.iter().map(|id| *id as usize));
 
     let mut heap: BinaryHeap<VertexWithDistance> = visited
@@ -263,7 +264,6 @@ async fn robust_prune(
             if new_neighbours.len() >= r {
                 break;
             }
-
             let mut to_remove: HashSet<usize> = HashSet::new();
             for pv in visited.iter() {
                 let dist_prime = distance(&matrix, p.id, *pv)?;
@@ -303,7 +303,6 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
 /// One pass of index building.
 async fn index_once(
     graph: &mut GraphBuilder<PQVertex>,
-    vectors: &MatrixView,
     medoid: usize,
     alpha: f32,
     r: usize,
@@ -314,11 +313,11 @@ async fn index_once(
     ids.shuffle(&mut rng);
 
     for (i, &id) in ids.iter().enumerate() {
-        let vector = vectors
+        let vector = graph.data
             .row(i)
             .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
 
-        let state = greedy_search(graph, vectors, medoid, vector, 1, l)?;
+        let state = greedy_search(graph, medoid, vector, 1, l)?;
 
         graph
             .neighbors_mut(id)
@@ -331,7 +330,7 @@ async fn index_once(
         let neighbours = stream::iter(neighbors)
             .map(|j| async move {
                 let mut neighbor_set: HashSet<usize> = fixed_graph
-                    .neighbors(j as usize)
+                    .neighbors(j as usize)?
                     .iter()
                     .map(|v| *v as usize)
                     .collect();
@@ -365,7 +364,7 @@ mod tests {
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use tempfile;
+
 
     use crate::dataset::WriteParams;
     use crate::utils::testing::generate_random_array;

@@ -19,10 +19,9 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use super::PQVertex;
 use crate::{
     arrow::linalg::MatrixView,
-    index::vector::graph::{builder::GraphBuilder, VertexWithDistance},
+    index::vector::graph::{VertexWithDistance, Graph},
     utils::distance::l2::l2_distance,
 };
 use crate::{Error, Result};
@@ -120,8 +119,7 @@ fn distance_to(vectors: &MatrixView, query: &[f32], idx: usize) -> Result<f32> {
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
 pub(crate) fn greedy_search(
-    graph: &GraphBuilder<PQVertex>,
-    vectors: &MatrixView,
+    graph: &dyn Graph,
     start: usize,
     query: &[f32],
     k: usize,
@@ -131,17 +129,17 @@ pub(crate) fn greedy_search(
     // A map from distance to vertex id.
     let mut state = SearchState::new(k, search_size);
 
-    let dist = distance_to(vectors, query, start)?;
+    let dist = graph.distance_to(query, start)?;
     state.push(start, dist);
     while let Some(id) = state.pop() {
         state.visit(id);
-        for neighbor_id in graph.neighbors(id).iter() {
+        for neighbor_id in graph.neighbors(id)?.iter() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
                 // Already visited.
                 continue;
             }
-            let dist = distance_to(vectors, query, neighbor_id)?;
+            let dist = graph.distance_to(query, neighbor_id)?;
             state.push(neighbor_id, dist);
         }
     }
