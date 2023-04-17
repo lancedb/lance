@@ -48,8 +48,6 @@ impl L2 for [f32] {
     fn l2(&self, other: &[f32]) -> f32 {
         #[cfg(all(target_arch = "x86_64"))]
         {
-            use std::arch::is_x86_feature_detected;
-
             // TODO: Only known platform that does not support FMA is Github Action Mac(Intel) Runner.
             // However, it introduces one more branch, which may affect performance.
             if is_x86_feature_detected!("fma") {
