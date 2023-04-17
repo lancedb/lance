@@ -94,11 +94,19 @@ pub enum MetricType {
 }
 
 impl MetricType {
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
+    /// Compute the distance from one vector to a batch of vectors.
+    pub fn batch_func(
+        &self,
+    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance),
         }
+    }
+
+    /// Returns the distance function between two vectors.
+    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32> {
+        todo!()
     }
 }
 

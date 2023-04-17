@@ -21,7 +21,7 @@ use ordered_float::OrderedFloat;
 
 use crate::{
     arrow::linalg::MatrixView,
-    index::vector::graph::{VertexWithDistance, Graph},
+    index::vector::graph::{Graph, VertexWithDistance},
     utils::distance::l2::l2_distance,
 };
 use crate::{Error, Result};

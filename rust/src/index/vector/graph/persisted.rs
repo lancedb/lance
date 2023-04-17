@@ -253,6 +253,7 @@ pub(crate) async fn write_graph<V: Vertex>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{arrow::linalg::MatrixView, index::vector::MetricType};
 
     struct FooVertex {
         row_id: u32,
@@ -288,12 +289,13 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/graph");
 
-        let mut builder: GraphBuilder<FooVertex> = (0..100)
+        let nodes = (0..100)
             .map(|v| FooVertex {
                 row_id: v as u32,
                 pq: vec![0; 16],
             })
             .collect();
+        let mut builder = GraphBuilder::new(nodes, MatrixView::random(100, 16), MetricType::L2);
         for i in 0..100 {
             for j in i..i + 10 {
                 builder.add_neighbor(i, j);

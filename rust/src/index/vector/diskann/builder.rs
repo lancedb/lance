@@ -26,17 +26,17 @@ use rand::Rng;
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::diskann::{DiskANNParams, PQVertexSerDe};
+use crate::index::vector::graph::Graph;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::pq::{train_pq, ProductQuantizer};
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::index::vector::MetricType;
-use crate::index::vector::graph::Graph;
 use crate::utils::distance::l2::l2_distance;
 use crate::{Error, Result};
 
-use super::{search::greedy_search, PQVertex,};
+use super::{search::greedy_search, PQVertex};
 
 /// Builder for DiskANN index.
 pub struct Builder {
@@ -289,7 +289,7 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
         .centroid()
         .ok_or_else(|| Error::Index("Cannot find the medoid of an empty matrix".to_string()))?;
 
-    let dist_func = metric_type.func();
+    let dist_func = metric_type.batch_func();
     // Find the closest vertex to the centroid.
     let dists = dist_func(
         centroid.values(),
@@ -313,7 +313,8 @@ async fn index_once(
     ids.shuffle(&mut rng);
 
     for (i, &id) in ids.iter().enumerate() {
-        let vector = graph.data
+        let vector = graph
+            .data
             .row(i)
             .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
 
@@ -337,8 +338,7 @@ async fn index_once(
                 neighbor_set.insert(id);
                 if neighbor_set.len() + 1 > r {
                     let new_neighbours =
-                        robust_prune(fixed_graph, j as usize, neighbor_set, alpha, r)
-                            .await?;
+                        robust_prune(fixed_graph, j as usize, neighbor_set, alpha, r).await?;
                     Ok::<_, Error>((j as usize, new_neighbours))
                 } else {
                     Ok::<_, Error>((
@@ -364,7 +364,6 @@ mod tests {
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-
 
     use crate::dataset::WriteParams;
     use crate::utils::testing::generate_random_array;

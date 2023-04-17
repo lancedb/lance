@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use super::{Graph, Vertex};
 use crate::arrow::linalg::MatrixView;
-use crate::{Result, Error};
 use crate::index::vector::MetricType;
+use crate::{Error, Result};
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
@@ -140,17 +140,18 @@ mod tests {
 
     #[test]
     fn test_construct_builder() {
-        let mut builder: GraphBuilder<FooVertex> = (0..100)
+        let nodes = (0..100)
             .map(|v| FooVertex {
                 id: v as u32,
                 val: v as f32 * 0.5,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut builder = GraphBuilder::new(nodes, MatrixView::random(100, 32), MetricType::L2);
 
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);
         assert_relative_eq!(builder.vertex(77).val, 38.5);
-        assert!(builder.neighbors(55).is_empty());
+        assert!(builder.neighbors(55).unwrap().is_empty());
 
         builder.vertex_mut(88).val = 22.0;
         assert_relative_eq!(builder.vertex(88).val, 22.0);
