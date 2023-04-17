@@ -50,8 +50,7 @@ impl L2 for [f32] {
         {
             use std::is_x86_feature_detected;
 
-            // TODO: Only known platform that does not support FMA is
-            // Github Action Mac(Intel) Runner.
+            // TODO: Only known platform that does not support FMA is Github Action Mac(Intel) Runner.
             // However, it introduces one more branch, which may affect performance.
             if is_x86_feature_detected("fma") {
                 // AVX2 / FMA is the lowest x86_64 CPU requirement (released from 2011) for Lance.
