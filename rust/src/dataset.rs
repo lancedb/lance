@@ -684,16 +684,37 @@ async fn write_manifest_file(
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
 ) -> Result<()> {
-    let path = manifest_path(object_store.base_path(), manifest.version);
-    let mut object_writer = object_store.create(&path).await?;
+    let mut m1 = manifest.clone();
+    let mut m2 = manifest.clone();
+
+    write_manifest_file_to_path(
+        object_store,
+        &mut m1,
+        indices.clone(),
+        &manifest_path(object_store.base_path(), manifest.version),
+    )
+    .await?;
+
+    write_manifest_file_to_path(
+        object_store,
+        &mut m2,
+        indices.clone(),
+        &latest_manifest_path(object_store.base_path()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn write_manifest_file_to_path(
+    object_store: &ObjectStore,
+    manifest: &mut Manifest,
+    indices: Option<Vec<Index>>,
+    path: &Path,
+) -> Result<()> {
+    let mut object_writer = object_store.create(path).await?;
     let pos = write_manifest(&mut object_writer, manifest, indices).await?;
     object_writer.write_magics(pos).await?;
     object_writer.shutdown().await?;
-
-    // Link it to latest manifest, and COMMIT.
-    let latest_manifest = latest_manifest_path(object_store.base_path());
-    object_store.inner.copy(&path, &latest_manifest).await?;
-
     Ok(())
 }
 
