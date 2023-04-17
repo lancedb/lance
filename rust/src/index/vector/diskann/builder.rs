@@ -33,7 +33,7 @@ use crate::index::vector::graph::{
 use crate::index::vector::pq::{train_pq, ProductQuantizer};
 use crate::index::vector::utils::maybe_sample_training_data;
 use crate::index::vector::MetricType;
-use crate::utils::distance::l2::l2_distance;
+use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
 use super::{search::greedy_search, PQVertex};
@@ -222,8 +222,7 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
         .row(j)
         .ok_or(Error::Index("Invalid row index".to_string()))?;
 
-    let dists = l2_distance(vector_i, vector_j, matrix.num_columns())?;
-    Ok(dists.value(0))
+    Ok(l2_distance(vector_i, vector_j))
 }
 
 /// Algorithm 2 in the paper.
@@ -295,7 +294,7 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
         centroid.values(),
         vectors.data().values(),
         vectors.num_columns(),
-    )?;
+    );
     let medoid_idx = argmin(dists.as_ref()).unwrap();
     Ok(medoid_idx as usize)
 }
