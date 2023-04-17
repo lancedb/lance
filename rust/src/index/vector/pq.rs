@@ -35,7 +35,7 @@ use crate::dataset::ROW_ID;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::utils::distance::compute::normalize;
-use crate::utils::distance::l2::l2_distance;
+use crate::linalg::l2::l2_distance_batch;
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -101,11 +101,11 @@ impl PQIndex {
             let subvec_centroids = self.pq.centroids(i).ok_or_else(|| {
                 Error::Index("PQIndex::l2_scores: PQ is not initialized".to_string())
             })?;
-            let distances = l2_distance(
+            let distances = l2_distance_batch(
                 as_primitive_array::<Float32Type>(&from).values(),
                 subvec_centroids.values(),
                 sub_vector_length,
-            )?;
+            );
             distance_table.extend(distances.values());
         }
 
