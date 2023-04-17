@@ -98,12 +98,12 @@ pub fn l2_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Floa
 }
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) mod x86_64 {
+mod x86_64 {
     pub(crate) mod avx {
         use super::super::l2_scalar;
 
         #[inline]
-        unsafe fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+        pub(crate) unsafe fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             use std::arch::x86_64::*;
             debug_assert_eq!(from.len(), to.len());
 
@@ -137,7 +137,7 @@ pub(crate) mod x86_64 {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    pub(crate) mod neon {
+    pub(super) mod neon {
         use super::super::l2_scalar;
 
         #[inline]
