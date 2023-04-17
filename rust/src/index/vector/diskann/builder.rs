@@ -181,7 +181,7 @@ async fn init_graph(
             pq: as_primitive_array(pq_code.value(i).as_ref()).clone(),
         })
         .collect::<Vec<_>>();
-    let mut graph = GraphBuilder::new(nodes, matrix);
+    let mut graph = GraphBuilder::new(nodes, matrix, metric_type);
 
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
@@ -324,7 +324,7 @@ async fn index_once(
             .neighbors_mut(id)
             .extend(state.visited.iter().map(|id| *id as u32));
 
-        let neighbors = robust_prune(graph, vectors, id, state.visited, alpha, r).await?;
+        let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
         graph.set_neighbors(id, neighbors.to_vec());
 
         let fixed_graph: &GraphBuilder<PQVertex> = graph;
@@ -338,7 +338,7 @@ async fn index_once(
                 neighbor_set.insert(id);
                 if neighbor_set.len() + 1 > r {
                     let new_neighbours =
-                        robust_prune(fixed_graph, vectors, j as usize, neighbor_set, alpha, r)
+                        robust_prune(fixed_graph, j as usize, neighbor_set, alpha, r)
                             .await?;
                     Ok::<_, Error>((j as usize, new_neighbours))
                 } else {
