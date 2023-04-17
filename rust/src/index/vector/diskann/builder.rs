@@ -27,7 +27,7 @@ use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::diskann::{DiskANNParams, PQVertexSerDe};
 use crate::index::vector::graph::{
-    write_graph, GraphBuilder, VertexWithDistance, WriteGraphParams,
+    builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::pq::{train_pq, ProductQuantizer};
 use crate::index::vector::utils::maybe_sample_training_data;
@@ -68,7 +68,7 @@ impl Builder {
         let pq = train_pq(&training_data, &self.params.pq_params).await?;
 
         // Randomly initialize the graph with r random neighbors for each vertex.
-        let (mut graph, vectors) = init_graph(
+        let graph = init_graph(
             self.dataset.clone(),
             &self.column,
             self.params.r,
@@ -79,14 +79,13 @@ impl Builder {
         .await?;
 
         // Find medoid
-        let medoid = find_medoid(&vectors, MetricType::L2).await?;
+        let medoid = find_medoid(&graph.data, self.params.metric_type).await?;
 
         let rng = rand::thread_rng();
         // First pass.
         let now = std::time::Instant::now();
         index_once(
             &mut graph,
-            &vectors,
             medoid,
             1.0,
             self.params.r,
@@ -99,7 +98,6 @@ impl Builder {
         let now = std::time::Instant::now();
         index_once(
             &mut graph,
-            &vectors,
             medoid,
             self.params.alpha,
             self.params.r,
@@ -150,7 +148,7 @@ async fn init_graph(
     mut rng: impl Rng,
     pq: &ProductQuantizer,
     metric_type: MetricType,
-) -> Result<(GraphBuilder<PQVertex>, MatrixView)> {
+) -> Result<GraphBuilder<PQVertex>> {
     let stream = dataset
         .scan()
         .project(&[column])?
@@ -174,7 +172,7 @@ async fn init_graph(
     );
     let matrix: MatrixView = vectors.try_into()?;
     let pq_code = pq.transform(&matrix, metric_type).await?;
-    let mut graph: GraphBuilder<PQVertex> = row_ids
+    let nodes = row_ids
         .values()
         .iter()
         .enumerate()
@@ -182,7 +180,8 @@ async fn init_graph(
             row_id,
             pq: as_primitive_array(pq_code.value(i).as_ref()).clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut graph = GraphBuilder::new(nodes, matrix);
 
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
@@ -210,7 +209,7 @@ async fn init_graph(
         }
     }
 
-    Ok((graph, matrix))
+    Ok(graph)
 }
 
 /// Distance between two vectors in the matrix.
@@ -229,7 +228,6 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
 /// Algorithm 2 in the paper.
 async fn robust_prune(
     graph: &GraphBuilder<PQVertex>,
-    matrix: &MatrixView,
     id: usize,
     mut visited: HashSet<usize>,
     alpha: f32,
@@ -242,7 +240,7 @@ async fn robust_prune(
     let mut heap: BinaryHeap<VertexWithDistance> = visited
         .iter()
         .map(|v| {
-            let dist = distance(matrix, id, *v).unwrap();
+            let dist = distance(&graph.data, id, *v).unwrap();
             VertexWithDistance {
                 id: *v,
                 distance: OrderedFloat(dist),
@@ -250,7 +248,7 @@ async fn robust_prune(
         })
         .collect();
 
-    let matrix = matrix.clone();
+    let matrix = graph.data.clone();
     let new_neighbours = tokio::task::spawn_blocking(move || {
         let mut new_neighbours: Vec<usize> = vec![];
         while !visited.is_empty() {

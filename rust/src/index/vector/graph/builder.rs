@@ -14,7 +14,12 @@
 
 //! Graph in memory.
 
-use super::Vertex;
+use std::sync::Arc;
+
+use super::{Graph, Vertex};
+use crate::arrow::linalg::MatrixView;
+use crate::{Result, Error};
+use crate::index::vector::MetricType;
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
@@ -30,13 +35,27 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub struct GraphBuilder<V: Vertex> {
+pub(crate) struct GraphBuilder<V: Vertex> {
     pub(crate) nodes: Vec<Node<V>>,
+
+    /// Hold all vectors in memory for fast access at the moment.
+    pub(crate) data: MatrixView,
+
+    /// Metric type.
+    metric_type: MetricType,
+
+    /// Distance function.
+    distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32>,
 }
 
 impl<V: Vertex> GraphBuilder<V> {
-    pub fn new() -> Self {
-        Self { nodes: vec![] }
+    pub fn new(nodes: Vec<V>, data: MatrixView, metric_type: MetricType) -> Self {
+        Self {
+            nodes: vec![],
+            data,
+            metric_type,
+            distance_func: metric_type.func(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -74,17 +93,24 @@ impl<V: Vertex> GraphBuilder<V> {
     }
 }
 
-impl<V: Vertex> FromIterator<V> for GraphBuilder<V> {
-    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
-        let nodes: Vec<Node<V>> = iter
-            .into_iter()
-            .map(|v| Node {
-                vertex: v,
-                neighbors: vec![],
-            })
-            .collect();
+impl<V: Vertex> Graph for GraphBuilder<V> {
+    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        let vector_a = self.data.row(a).ok_or_else(|| {
+            Error::Index(format!(
+                "Attempt to access row {} in a matrix with {} rows",
+                a,
+                self.data.num_rows()
+            ))
+        })?;
 
-        GraphBuilder { nodes: nodes }
+        let vector_b = self.data.row(b).ok_or_else(|| {
+            format!(
+                "Attempt to access row {} in a matrix with {} rows",
+                b,
+                self.data.num_rows()
+            )
+        })?;
+        Ok(self.data.row(a).dot(&self.data.row(b)))
     }
 }
 

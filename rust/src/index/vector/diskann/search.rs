@@ -22,7 +22,7 @@ use ordered_float::OrderedFloat;
 use super::PQVertex;
 use crate::{
     arrow::linalg::MatrixView,
-    index::vector::graph::{GraphBuilder, VertexWithDistance},
+    index::vector::graph::{builder::GraphBuilder, VertexWithDistance},
     utils::distance::l2::l2_distance,
 };
 use crate::{Error, Result};

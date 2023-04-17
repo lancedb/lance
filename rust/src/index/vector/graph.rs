@@ -17,12 +17,17 @@
 
 use ordered_float::OrderedFloat;
 
-mod builder;
-mod persisted;
+pub(crate) mod builder;
+pub(crate) mod persisted;
 
 use crate::Result;
-pub use builder::GraphBuilder;
 pub use persisted::*;
+
+/// Graph
+pub trait Graph {
+    /// Distance between two vertices, specified by their IDs.
+    fn distance(&self, a: usize, b: usize) -> Result<f32>;
+}
 
 /// Vertex (metadata). It does not include the actual data.
 pub trait Vertex {}

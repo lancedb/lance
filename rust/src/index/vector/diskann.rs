@@ -15,14 +15,16 @@
 ///! DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node
 ///
 /// Modified from diskann paper. The vector store is backed by the `lance` dataset.
-
 mod builder;
 mod search;
 
 use arrow_array::UInt8Array;
 use byteorder::{ByteOrder, LE};
 
-use super::graph::{Vertex, VertexSerDe};
+use super::{
+    graph::{Vertex, VertexSerDe},
+    MetricType,
+};
 use crate::index::vector::pq::PQBuildParams;
 use crate::Result;
 
@@ -38,6 +40,9 @@ pub struct DiskANNParams {
 
     /// Parameters to build PQ index.
     pub pq_params: PQBuildParams,
+
+    /// Metric type.
+    pub metric_type: MetricType,
 }
 
 // Default values from DiskANN paper.
@@ -48,6 +53,7 @@ impl Default for DiskANNParams {
             alpha: 1.2,
             l: 100,
             pq_params: PQBuildParams::default(),
+            metric_type: MetricType::L2,
         }
     }
 }
@@ -59,6 +65,7 @@ impl DiskANNParams {
             alpha,
             l,
             pq_params: PQBuildParams::default(),
+            metric_type: MetricType::L2,
         }
     }
 
@@ -90,6 +97,11 @@ impl DiskANNParams {
 
     pub fn use_opq(&mut self, use_opq: bool) -> &mut Self {
         self.pq_params.use_opq = use_opq;
+        self
+    }
+
+    pub fn metric_type(&mut self, metric_type: MetricType) -> &mut Self {
+        self.metric_type = metric_type;
         self
     }
 }
