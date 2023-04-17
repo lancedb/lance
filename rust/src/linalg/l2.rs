@@ -46,22 +46,29 @@ impl L2 for [f32] {
 
     #[inline]
     fn l2(&self, other: &[f32]) -> f32 {
-        #[cfg(any(target_arch = "x86_64"))]
+        #[cfg(all(target_arch = "x86_64"))]
         {
-            // AVX2 / FMA is the lowest x86_64 CPU requirement (released from 2011) for Lance.
-            use x86_64::avx::l2_f32;
-            unsafe { l2_f32(self, other) }
+            use std::is_x86_feature_detected;
+
+            // TODO: Only known platform that does not support FMA is
+            // Github Action Mac(Intel) Runner.
+            // However, it introduces one more branch, which may affect performance.
+            if is_x86_feature_detected("fma") {
+                // AVX2 / FMA is the lowest x86_64 CPU requirement (released from 2011) for Lance.
+                use x86_64::avx::l2_f32;
+                return l2_f32(self, other);
+            }
         }
 
         #[cfg(any(target_arch = "aarch64"))]
         {
             // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
             use aarch64::neon::l2_f32;
-            l2_f32(self, other)
+            return l2_f32(self, other);
         }
 
-        // Fallback to scalar implementation on other architectures.
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        // Fallback on x86_64 without AVX2 / FMA, or other platforms.
+        #[cfg(not(target_arch = "aarch64"))]
         l2_scalar(self, other)
     }
 }
@@ -103,34 +110,36 @@ mod x86_64 {
         use super::super::l2_scalar;
 
         #[inline]
-        pub(crate) unsafe fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
-            use std::arch::x86_64::*;
-            debug_assert_eq!(from.len(), to.len());
+        pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+            unsafe {
+                use std::arch::x86_64::*;
+                debug_assert_eq!(from.len(), to.len());
 
-            // Get the potion of the vector that is aligned to 32 bytes.
-            let len = from.len() / 8 * 8;
-            let mut sums = _mm256_setzero_ps();
-            for i in (0..len).step_by(8) {
-                let left = _mm256_loadu_ps(from.as_ptr().add(i));
-                let right = _mm256_loadu_ps(to.as_ptr().add(i));
-                let sub = _mm256_sub_ps(left, right);
-                // sum = sub * sub + sum
-                sums = _mm256_fmadd_ps(sub, sub, sums);
+                // Get the potion of the vector that is aligned to 32 bytes.
+                let len = from.len() / 8 * 8;
+                let mut sums = _mm256_setzero_ps();
+                for i in (0..len).step_by(8) {
+                    let left = _mm256_loadu_ps(from.as_ptr().add(i));
+                    let right = _mm256_loadu_ps(to.as_ptr().add(i));
+                    let sub = _mm256_sub_ps(left, right);
+                    // sum = sub * sub + sum
+                    sums = _mm256_fmadd_ps(sub, sub, sums);
+                }
+                // Shift and add vector, until only 1 value left.
+                // sums = [x0-x7], shift = [x4-x7]
+                let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
+                // [x0+x4, x1+x5, ..]
+                sums = _mm256_add_ps(sums, shift);
+                shift = _mm256_permute_ps(sums, 14);
+                sums = _mm256_add_ps(sums, shift);
+                sums = _mm256_hadd_ps(sums, sums);
+                let mut results: [f32; 8] = [0f32; 8];
+                _mm256_storeu_ps(results.as_mut_ptr(), sums);
+
+                // Remaining
+                results[0] += l2_scalar(&from[len..], &to[len..]);
+                results[0]
             }
-            // Shift and add vector, until only 1 value left.
-            // sums = [x0-x7], shift = [x4-x7]
-            let mut shift = _mm256_permute2f128_ps(sums, sums, 1);
-            // [x0+x4, x1+x5, ..]
-            sums = _mm256_add_ps(sums, shift);
-            shift = _mm256_permute_ps(sums, 14);
-            sums = _mm256_add_ps(sums, shift);
-            sums = _mm256_hadd_ps(sums, sums);
-            let mut results: [f32; 8] = [0f32; 8];
-            _mm256_storeu_ps(results.as_mut_ptr(), sums);
-
-            // Remaining
-            results[0] += l2_scalar(&from[len..], &to[len..]);
-            results[0]
         }
     }
 }
