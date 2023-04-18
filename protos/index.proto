@@ -92,6 +92,24 @@ message Transform {
 // Flat Index
 message Flat {}
 
+// DiskAnn Index
+message DiskAnn {
+  // Graph spec version
+  uint32 spec = 1;
+
+  // Graph file
+  string filename = 2;
+
+  // r parameter
+  uint32 r = 3;
+
+  // alpha parameter
+  float alpha = 4;
+
+  // L parameter
+  uint32 L = 5;
+}
+
 // One stage in the vector index pipeline.
 message VectorIndexStage {
   oneof stage {
@@ -103,6 +121,8 @@ message VectorIndexStage {
     PQ pq = 3;
     // Transformer
     Transform transform = 4;
+    // DiskANN
+    DiskAnn diskann = 5;
   }
 }
 

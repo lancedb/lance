@@ -411,7 +411,7 @@ impl KMeans {
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
-                    let dist = metric_type.func();
+                    let dist = metric_type.batch_func();
                     let mut results = vec![];
                     for idx in indices {
                         let value_arr = data.slice(idx * dimension, dimension);

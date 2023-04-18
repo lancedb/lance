@@ -371,7 +371,7 @@ impl ProductQuantizer {
             .zip(stream::iter(all_centroids))
             .map(|(vec, centroid)| async move {
                 tokio::task::spawn_blocking(move || {
-                    let dist_func = metric_type.func();
+                    let dist_func = metric_type.batch_func();
                     (0..vec.len())
                         .map(|i| {
                             let value = vec.value(i);
@@ -401,7 +401,7 @@ impl ProductQuantizer {
         let all_centroids = (0..self.num_sub_vectors)
             .map(|idx| self.centroids(idx).unwrap())
             .collect::<Vec<_>>();
-        let dist_func = metric_type.func();
+        let dist_func = metric_type.batch_func();
 
         let flatten_data = data.data();
         let num_sub_vectors = self.num_sub_vectors;

@@ -14,7 +14,12 @@
 
 //! Graph in memory.
 
-use super::Vertex;
+use std::sync::Arc;
+
+use super::{Graph, Vertex};
+use crate::arrow::linalg::MatrixView;
+use crate::index::vector::MetricType;
+use crate::{Error, Result};
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
@@ -30,13 +35,33 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub struct GraphBuilder<V: Vertex> {
+pub(crate) struct GraphBuilder<V: Vertex + Clone> {
     pub(crate) nodes: Vec<Node<V>>,
+
+    /// Hold all vectors in memory for fast access at the moment.
+    pub(crate) data: MatrixView,
+
+    /// Metric type.
+    metric_type: MetricType,
+
+    /// Distance function.
+    distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32>,
 }
 
-impl<V: Vertex> GraphBuilder<V> {
-    pub fn new() -> Self {
-        Self { nodes: vec![] }
+impl<'a, V: Vertex + Clone> GraphBuilder<V> {
+    pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
+        Self {
+            nodes: vertices
+                .iter()
+                .map(|v| Node {
+                    vertex: v.clone(),
+                    neighbors: Vec::new(),
+                })
+                .collect(),
+            data,
+            metric_type,
+            distance_func: metric_type.func(),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -55,30 +80,54 @@ impl<V: Vertex> GraphBuilder<V> {
         &mut self.nodes[id].vertex
     }
 
-    pub fn neighbors(&self, id: usize) -> &[u32] {
-        self.nodes[id].neighbors.as_slice()
-    }
-
     pub fn neighbors_mut(&mut self, id: usize) -> &mut Vec<u32> {
         &mut self.nodes[id].neighbors
     }
 
-    pub fn add_edge(&mut self, from: usize, to: usize) {
-        self.nodes[from].neighbors.push(to as u32);
+    /// Set neighbors of a node.
+    pub fn set_neighbors(&mut self, id: usize, neighbors: impl Into<Vec<u32>>) {
+        self.nodes[id].neighbors = neighbors.into();
+    }
+
+    /// Add a neighbor to a specific vertex.
+    pub fn add_neighbor(&mut self, vertex: usize, neighbor: usize) {
+        self.nodes[vertex].neighbors.push(neighbor as u32);
     }
 }
 
-impl<V: Vertex> FromIterator<V> for GraphBuilder<V> {
-    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
-        let nodes: Vec<Node<V>> = iter
-            .into_iter()
-            .map(|v| Node {
-                vertex: v,
-                neighbors: vec![],
-            })
-            .collect();
+impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
+    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        let vector_a = self.data.row(a).ok_or_else(|| {
+            Error::Index(format!(
+                "Vector index is out of range: {} >= {}",
+                a,
+                self.data.num_rows()
+            ))
+        })?;
 
-        GraphBuilder { nodes: nodes }
+        let vector_b = self.data.row(b).ok_or_else(|| {
+            Error::Index(format!(
+                "Vector index is out of range: {} >= {}",
+                b,
+                self.data.num_rows()
+            ))
+        })?;
+        Ok((self.distance_func)(vector_a, vector_b))
+    }
+
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+        let vector = self.data.row(idx).ok_or_else(|| {
+            Error::Index(format!(
+                "Attempt to access row {} in a matrix with {} rows",
+                idx,
+                self.data.num_rows()
+            ))
+        })?;
+        Ok((self.distance_func)(query, vector))
+    }
+
+    fn neighbors(&self, id: usize) -> Result<&[u32]> {
+        Ok(self.nodes[id].neighbors.as_slice())
     }
 }
 
@@ -87,46 +136,29 @@ mod tests {
     use approx::assert_relative_eq;
 
     use super::*;
-    use crate::Result;
 
+    #[derive(Debug, Clone)]
     struct FooVertex {
         id: u32,
         val: f32,
     }
 
-    impl Vertex for FooVertex {
-        fn byte_length(&self) -> usize {
-            8
-        }
-
-        fn from_bytes(data: &[u8]) -> Result<Self> {
-            Ok(Self {
-                id: u32::from_le_bytes(data[0..4].try_into().unwrap()),
-                val: f32::from_le_bytes(data[4..8].try_into().unwrap()),
-            })
-        }
-
-        fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes = vec![];
-            bytes.extend_from_slice(&self.id.to_le_bytes());
-            bytes.extend_from_slice(&self.val.to_le_bytes());
-            bytes
-        }
-    }
+    impl Vertex for FooVertex {}
 
     #[test]
     fn test_construct_builder() {
-        let mut builder: GraphBuilder<FooVertex> = (0..100)
+        let nodes = (0..100)
             .map(|v| FooVertex {
                 id: v as u32,
                 val: v as f32 * 0.5,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 32), MetricType::L2);
 
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);
         assert_relative_eq!(builder.vertex(77).val, 38.5);
-        assert!(builder.neighbors(55).is_empty());
+        assert!(builder.neighbors(55).unwrap().is_empty());
 
         builder.vertex_mut(88).val = 22.0;
         assert_relative_eq!(builder.vertex(88).val, 22.0);
