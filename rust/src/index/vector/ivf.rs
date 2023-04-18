@@ -286,7 +286,7 @@ impl Ivf {
                 self.dimension()
             )));
         }
-        let dist_func = metric_type.func();
+        let dist_func = metric_type.batch_func();
         let centroid_values = self.centroids.values();
         let distances = dist_func(
             query.values(),
@@ -320,7 +320,7 @@ impl Ivf {
             Float32Builder::with_capacity(data.num_columns() * data.num_rows());
 
         let dim = data.num_columns();
-        let dist_func = metric_type.func();
+        let dist_func = metric_type.batch_func();
         let centroids: MatrixView = self.centroids.as_ref().try_into()?;
         for i in 0..data.num_rows() {
             let vector = data.row(i).unwrap();
@@ -444,7 +444,7 @@ fn compute_residual_matrix(
     metric_type: MetricType,
 ) -> Result<Arc<Float32Array>> {
     assert_eq!(centroids.num_columns(), data.num_columns());
-    let dist_func = metric_type.func();
+    let dist_func = metric_type.batch_func();
 
     let dim = data.num_columns();
     let mut builder = Float32Builder::with_capacity(data.data().len());
