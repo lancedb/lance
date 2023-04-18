@@ -99,7 +99,7 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
     fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(
-                "Attempt to access row {} in a matrix with {} rows",
+                "Vector index is out of range: {} >= {}",
                 a,
                 self.data.num_rows()
             ))
@@ -107,7 +107,7 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
 
         let vector_b = self.data.row(b).ok_or_else(|| {
             Error::Index(format!(
-                "Attempt to access row {} in a matrix with {} rows",
+                "Vector index is out of range: {} >= {}",
                 b,
                 self.data.num_rows()
             ))
