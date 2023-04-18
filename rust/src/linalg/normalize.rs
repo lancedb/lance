@@ -43,15 +43,17 @@ mod x86_64 {
 
         #[inline]
         pub(crate) fn normalize_f32(vector: &[f32]) -> f32 {
-            unsafe {
+            let len = vector.len() / 8 * 8;
+            let mut sum = unsafe {
                 let mut sums = _mm256_setzero_ps();
-                for i in (0..vector.len()).step_by(8) {
-                    // Cache line-aligned
-                    let x = _mm256_load_ps(vector.as_ptr().add(i));
+                vector.chunks_exact(8).for_each(|chunk| {
+                    let x = _mm256_loadu_ps(chunk.as_ptr());
                     sums = _mm256_fmadd_ps(x, x, sums);
-                }
-                add_f32_register(sums).sqrt()
-            }
+                });
+                add_f32_register(sums)
+            };
+            sum += vector[len..].iter().map(|v| v * v).sum::<f32>();
+            sum.sqrt()
         }
     }
 }
@@ -74,5 +76,25 @@ mod aarch64 {
                 vaddvq_f32(sum).sqrt()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize() {
+        let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+
+        let result = normalize(&data);
+        assert_eq!(result, (1..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt());
+
+        let not_aligned = normalize(&data[2..]);
+        println!("Not aligned input: {:?}", &data[2..]);
+        assert_eq!(
+            not_aligned,
+            (3..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt()
+        );
     }
 }

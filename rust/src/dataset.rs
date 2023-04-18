@@ -1113,7 +1113,7 @@ mod tests {
         params.num_partitions = 10;
         params.num_sub_vectors = 2;
         let dataset = dataset
-            .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
+            .create_index(&["embeddings"], IndexType::Vector, None, &params)
             .await
             .unwrap();
 
