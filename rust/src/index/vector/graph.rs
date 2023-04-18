@@ -15,20 +15,73 @@
 //! Graph-based vector index.
 //!
 
-use crate::Result;
+use ordered_float::OrderedFloat;
 
-// TODO: remove dead_code after implementing the index.
-#[allow(dead_code)]
-mod builder;
-#[allow(dead_code)]
-mod persisted;
+pub(crate) mod builder;
+pub(crate) mod persisted;
+
+use crate::Result;
+pub use persisted::*;
+
+/// Graph
+pub trait Graph {
+    /// Distance between two vertices, specified by their IDs.
+    fn distance(&self, a: usize, b: usize) -> Result<f32>;
+
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
+
+    fn neighbors(&self, id: usize) -> Result<&[u32]>;
+}
 
 /// Vertex (metadata). It does not include the actual data.
-pub trait Vertex: Sized {
-    fn byte_length(&self) -> usize;
+pub trait Vertex {}
 
-    fn from_bytes(data: &[u8]) -> Result<Self>;
+/// Vertex SerDe. Used for serializing and deserializing the vertex.
+pub(crate) trait VertexSerDe<V: Vertex> {
+    /// The size of the serialized vertex, in bytes.
+    fn size(&self) -> usize;
 
-    // TODO: impl as Into trait?
-    fn to_bytes(&self) -> Vec<u8>;
+    /// Serialize the vertex into a buffer.
+    fn serialize(&self, vertex: &V) -> Vec<u8>;
+
+    /// Deserialize the vertex from the buffer.
+    fn deserialize(&self, data: &[u8]) -> Result<V>;
+}
+
+/// Vertex With Distance. Used for traversing the graph.
+pub(crate) struct VertexWithDistance {
+    /// Vertex ID.
+    pub id: usize,
+
+    /// Distance to the query.
+    pub distance: OrderedFloat<f32>,
+}
+
+impl VertexWithDistance {
+    pub fn new(id: usize, distance: f32) -> Self {
+        Self {
+            id,
+            distance: OrderedFloat(distance),
+        }
+    }
+}
+
+impl PartialEq for VertexWithDistance {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance.eq(&other.distance)
+    }
+}
+
+impl Eq for VertexWithDistance {}
+
+impl PartialOrd for VertexWithDistance {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.distance.partial_cmp(&other.distance)
+    }
+}
+
+impl Ord for VertexWithDistance {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.distance.cmp(&other.distance)
+    }
 }

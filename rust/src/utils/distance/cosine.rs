@@ -105,7 +105,7 @@ fn cosine_dist_simd(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Ar
 /// Cosine Distance
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
-pub fn cosine_distance(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
+pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::is_aarch64_feature_detected;
@@ -143,13 +143,13 @@ mod tests {
     fn test_cosine() {
         let x: Float32Array = (1..9).map(|v| v as f32).collect();
         let y: Float32Array = (100..108).map(|v| v as f32).collect();
-        let d = cosine_distance(x.values(), y.values(), 8);
+        let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from scipy.spatial.distance.cosine
         assert_relative_eq!(d.value(0), 1.0 - 0.90095701);
 
         let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
         let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
-        let d = cosine_distance(x.values(), y.values(), 8);
+        let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d.value(0), 1.0 - 0.8735806510613104);
     }

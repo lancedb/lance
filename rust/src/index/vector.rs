@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 
+#[allow(dead_code)]
+mod diskann;
 pub mod flat;
+#[allow(dead_code)]
 mod graph;
 pub mod ivf;
 mod kmeans;
@@ -46,8 +49,8 @@ use crate::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
-    linalg::l2::l2_distance_batch,
-    utils::distance::cosine::cosine_distance,
+    linalg::l2::{l2_distance, l2_distance_batch},
+    utils::distance::cosine::cosine_distance_batch,
     Error, Result,
 };
 pub use traits::*;
@@ -93,10 +96,21 @@ pub enum MetricType {
 }
 
 impl MetricType {
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
+    /// Compute the distance from one vector to a batch of vectors.
+    pub fn batch_func(
+        &self,
+    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
-            Self::Cosine => Arc::new(cosine_distance),
+            Self::Cosine => Arc::new(cosine_distance_batch),
+        }
+    }
+
+    /// Returns the distance function between two vectors.
+    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32> {
+        match self {
+            Self::L2 => Arc::new(l2_distance),
+            Self::Cosine => todo!("cosine distance"),
         }
     }
 }
@@ -195,6 +209,11 @@ impl VectorIndexParams {
             max_iterations,
             max_opq_iterations: max_iterations,
         }
+    }
+
+    /// Create index parameters for `DiskANN` index.
+    pub fn diskann() -> Self {
+        todo!("DiskANN is not supported yet")
     }
 }
 
