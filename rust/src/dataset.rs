@@ -365,14 +365,12 @@ impl Dataset {
     ///  - `name`: optional index name. Must be unique in the dataset.
     ///            if not provided, it will auto-generate one.
     ///  - `params`: index parameters.
-    ///  - `strict_simd_alignment`: whether to return error if it doesn't align to SIMD
     pub async fn create_index(
         &self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
-        strict_simd_alignment: bool,
     ) -> Result<Self> {
         if columns.len() != 1 {
             return Err(Error::Index(
