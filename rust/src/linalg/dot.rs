@@ -12,6 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod cosine;
-pub mod l2;
-pub mod dot;
+//! Dot product.
+
+pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
+    from.iter().zip(to.iter()).map(|(x, y)| x * y).sum()
+}
+pub trait Dot {
+    type Output;
+
+    /// Dot product.
+    fn dot(&self, other: &Self) -> Self::Output;
+}
+
+impl Dot for [f32] {
+    type Output = f32;
+
+    fn dot(&self, other: &[f32]) -> f32 {
+        self.iter().zip(other.iter()).map(|(x, y)| x * y).sum()
+    }
+}
