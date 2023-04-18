@@ -27,6 +27,8 @@ use ::object_store::{
 use futures::{future, TryFutureExt};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
+use object_store::ClientOptions;
+use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
 
@@ -75,9 +77,13 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
 }
 
 async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    // GCS enables cache for public buckets, we disable to improve consistency
+    let mut headers = HeaderMap::new();
+    headers.insert(CACHE_CONTROL, "no-cache".parse().unwrap());
     Ok(Arc::new(
         GoogleCloudStorageBuilder::from_env()
             .with_url(uri)
+            .with_client_options(ClientOptions::new().with_default_headers(headers))
             .build()?,
     ))
 }

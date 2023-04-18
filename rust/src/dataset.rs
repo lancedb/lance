@@ -684,24 +684,14 @@ async fn write_manifest_file(
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
 ) -> Result<()> {
-    let mut m1 = manifest.clone();
-    let mut m2 = manifest.clone();
+    let paths = vec![
+        manifest_path(object_store.base_path(), manifest.version),
+        latest_manifest_path(object_store.base_path()),
+    ];
 
-    write_manifest_file_to_path(
-        object_store,
-        &mut m1,
-        indices.clone(),
-        &manifest_path(object_store.base_path(), manifest.version),
-    )
-    .await?;
-
-    write_manifest_file_to_path(
-        object_store,
-        &mut m2,
-        indices.clone(),
-        &latest_manifest_path(object_store.base_path()),
-    )
-    .await?;
+    for p in paths {
+        write_manifest_file_to_path(object_store, manifest, indices.clone(), &p).await?
+    }
     Ok(())
 }
 
