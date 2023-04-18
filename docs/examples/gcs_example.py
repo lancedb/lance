@@ -14,3 +14,12 @@ ds = lance.dataset("gs://eto-public/datasets/oxford_pet/oxford_pet.lance")
 count = ds.count_rows()
 print(f"There are {count} pets")
 
+# You can also write to GCS
+import pandas as pd
+uri = "gs://eto-public/datasets/oxford_pet/example.lance"
+lance.write_dataset(pd.DataFrame({"a": pd.array([10], dtype="Int32")}), uri, mode='create')
+assert lance.dataset(uri).version == 1
+
+lance.write_dataset(pd.DataFrame({"a": pd.array([5], dtype="Int32")}), uri, mode='append')
+assert lance.dataset(uri).version == 2
+
