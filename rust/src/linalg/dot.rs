@@ -14,9 +14,14 @@
 
 //! Dot product.
 
+use num_traits::real::Real;
+use std::iter::Sum;
+
+#[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
-    from.iter().zip(to.iter()).map(|(x, y)| x * y).sum()
+    from.iter().zip(to.iter()).map(|(x, y)| x.mul(*y)).sum()
 }
+
 pub trait Dot {
     type Output;
 
@@ -28,6 +33,6 @@ impl Dot for [f32] {
     type Output = f32;
 
     fn dot(&self, other: &[f32]) -> f32 {
-        self.iter().zip(other.iter()).map(|(x, y)| x * y).sum()
+        dot(self, other)
     }
 }
