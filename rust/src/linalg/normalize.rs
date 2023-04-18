@@ -25,18 +25,20 @@ pub fn normalize(vector: &[f32]) -> f32 {
 
     #[cfg(target_arch = "x86_64")]
     {
-        x86_64::avx::normalize_f32(vector)
+        if is_x86_feature_detected!("fma") {
+            return x86_64::avx::normalize_f32(vector);
+        }
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     vector.iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
 
-    #[target_feature(enable = "fma")]
     pub(crate) mod avx {
+        use crate::linalg::x86_64::avx::*;
         use std::arch::x86_64::*;
 
         #[inline]
@@ -48,7 +50,7 @@ mod x86_64 {
                     let x = _mm256_load_ps(vector.as_ptr().add(i));
                     sums = _mm256_fmadd_ps(x, x, sums);
                 }
-                add_fma(sums).sqrt()
+                add_f32_register(sums).sqrt()
             }
         }
     }

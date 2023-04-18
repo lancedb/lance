@@ -94,13 +94,13 @@ pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<
 mod x86_64 {
     use std::arch::x86_64::*;
 
-    mod avx {
+    pub(crate) mod avx {
         use super::*;
 
         #[inline]
-        fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
+        pub(crate) fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
             unsafe {
-                use super::compute::add_fma;
+                use crate::linalg::x86_64::avx::add_f32_register;
 
                 let len = x_vector.len();
                 let mut xy = _mm256_setzero_ps();
@@ -111,7 +111,7 @@ mod x86_64 {
                     xy = _mm256_fmadd_ps(x, y, xy);
                     y_sq = _mm256_fmadd_ps(y, y, y_sq);
                 }
-                1.0 - add_fma(xy) / (x_norm * add_fma(y_sq).sqrt())
+                1.0 - add_f32_register(xy) / (x_norm * add_f32_register(y_sq).sqrt())
             }
         }
     }

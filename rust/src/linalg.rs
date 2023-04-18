@@ -16,3 +16,6 @@ pub mod cosine;
 pub mod dot;
 pub mod l2;
 pub mod normalize;
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
