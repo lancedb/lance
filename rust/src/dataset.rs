@@ -45,7 +45,6 @@ use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
 };
-use crate::utils::distance::simd_alignment;
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -406,25 +405,6 @@ impl Dataset {
                     .ok_or_else(|| {
                         Error::Index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
-
-                if let Some(field) = self.schema().field(column) {
-                    match field.data_type() {
-                        DataType::FixedSizeList(_, ndims) => {
-                            let sub = vec_params.num_sub_vectors as i32;
-                            let stride = simd_alignment();
-
-                            if (ndims / sub) % stride != 0 {
-                                let msg = format!("Vector dimensions / num_subvectors must be a multiple of {stride}. Got {ndims} / {sub} ");
-                                if strict_simd_alignment {
-                                    return Err(Error::Index(msg));
-                                } else {
-                                    println!("{}", msg);
-                                }
-                            }
-                        }
-                        _ => return Err(Error::Index("Must be FixedSizeList".to_string())),
-                    }
-                }
 
                 let ivf_params = IvfBuildParams {
                     num_partitions: vec_params.num_partitions as usize,
@@ -1144,15 +1124,6 @@ mod tests {
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version;
         assert_eq!(actual, expected);
-
-        // If running on a SIMD-enabled platform, check that SIMD alignment is enforced
-        if simd_alignment() > 1 {
-            params.num_sub_vectors = 10;
-            let err = dataset
-                .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
-                .await;
-            assert!(err.is_err())
-        }
 
         // Append should inherit index
         let mut write_params = WriteParams::default();
