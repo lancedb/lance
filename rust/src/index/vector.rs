@@ -299,7 +299,7 @@ pub(crate) async fn build_vector_index(
             .as_any()
             .downcast_ref::<DiskANNParams>()
             .unwrap();
-        build_diskann_index(dataset, column, uuid, params.clone()).await?;
+        build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
     } else {
         return Err(Error::Index(format!(
             "Build Vector Index: invalid stages: {:?}",
