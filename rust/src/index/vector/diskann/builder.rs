@@ -41,6 +41,7 @@ use super::search::greedy_search;
 pub(crate) async fn build_diskann_index(
     dataset: &Dataset,
     column: &str,
+    name: &str,
     uuid: &str,
     params: DiskANNParams,
 ) -> Result<()> {
@@ -88,7 +89,17 @@ pub(crate) async fn build_diskann_index(
     )
     .await?;
 
-    // Write metadata
+    write_index_file(
+        dataset,
+        column,
+        name,
+        uuid,
+        graph.data.num_columns(),
+        graph_file.to_string().as_str(),
+        params.metric_type,
+        &params,
+    )
+    .await?;
 
     Ok(())
 }
