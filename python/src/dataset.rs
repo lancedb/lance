@@ -35,7 +35,7 @@ use lance::dataset::{
 };
 use lance::index::{
     vector::{MetricType, VectorIndexParams},
-    IndexType, DatasetIndexExt,
+    IndexType, DatasetIndexExt, vector::diskann::DiskANNParams,
 };
 
 const DEFAULT_NPROBS: usize = 1;
@@ -320,7 +320,8 @@ impl Dataset {
                 VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)
             },
             "DISKANN" => {
-                todo!()
+                let params = DiskANNParams::default();
+                VectorIndexParams::with_diskann_params(m_type, params)
             },
             _ => {
                 return Err(PyValueError::new_err(format!(

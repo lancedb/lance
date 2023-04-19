@@ -20,8 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 
-#[allow(dead_code)]
-mod diskann;
+pub mod diskann;
 pub mod flat;
 #[allow(dead_code)]
 mod graph;
@@ -207,7 +206,11 @@ impl VectorIndexParams {
         }
     }
 
-    pub fn with_ivf_pq_params(metric_type: MetricType, ivf: IvfBuildParams, pq: PQBuildParams) -> Self {
+    pub fn with_ivf_pq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        pq: PQBuildParams,
+    ) -> Self {
         let stages: Vec<Box<dyn VertexIndexStageParams>> = vec![Box::new(ivf), Box::new(pq)];
         Self {
             stages,
@@ -215,11 +218,10 @@ impl VectorIndexParams {
         }
     }
 
-    /// Create index parameters for `DiskANN` index.
-    pub fn diskann(r: usize, alpha: f32, l: usize, metric_type: MetricType) -> Self {
-        let stage = Box::new(DiskANNParams::new(r, alpha, l));
+    pub fn with_diskann_params(metric_type: MetricType, diskann: DiskANNParams) -> Self {
+        let stages: Vec<Box<dyn VertexIndexStageParams>> = vec![Box::new(diskann)];
         Self {
-            stages: vec![stage],
+            stages,
             metric_type,
         }
     }

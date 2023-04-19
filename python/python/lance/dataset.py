@@ -402,14 +402,15 @@ class LanceDataset(pa.dataset.Dataset):
         ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
-        if index_type != "IVF_PQ":
+        if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
                 f"Only IVF_PQ index_type supported. Got {index_type}"
             )
-        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
-            raise ValueError(
-                "num_partitions and num_sub_vectors are required for IVF_PQ"
-            )
+        if index_type == "IVF_PQ":
+            if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+                raise ValueError(
+                    "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
 
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
