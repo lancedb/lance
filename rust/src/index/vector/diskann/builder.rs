@@ -24,13 +24,14 @@ use rand::{Rng, SeedableRng};
 
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
+use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
 use crate::index::vector::diskann::DiskANNParams;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::graph::{Graph, Vertex};
-use crate::index::vector::MetricType;
+use crate::index::vector::{MetricType, INDEX_FILE_NAME};
 use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
@@ -307,6 +308,52 @@ async fn index_once<V: Vertex + Clone>(
             graph.set_neighbors(j, nbs);
         }
     }
+
+    Ok(())
+}
+
+async fn write_index_file(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    dimension: usize,
+    graph_file: &str,
+    metric_type: MetricType,
+    params: &DiskANNParams,
+) -> Result<()> {
+    let object_store = dataset.object_store();
+    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let mut writer = object_store.create(&path).await?;
+
+    let stages: Vec<pb::VectorIndexStage> = vec![pb::VectorIndexStage {
+        stage: Some(pb::vector_index_stage::Stage::Diskann(pb::DiskAnn {
+            spec: 1,
+            filename: graph_file.to_string(),
+            r: params.r as u32,
+            alpha: params.alpha,
+            l: params.l as u32,
+        })),
+    }];
+    let metadata = pb::Index {
+        name: index_name.to_string(),
+        columns: vec![column.to_string()],
+        dataset_version: dataset.version().version,
+        index_type: pb::IndexType::Vector.into(),
+        implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
+            spec_version: 1,
+            dimension: dimension as u32,
+            stages,
+            metric_type: match metric_type {
+                MetricType::L2 => pb::VectorMetricType::L2.into(),
+                MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+            },
+        })),
+    };
+
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer.write_magics(pos).await?;
+    writer.shutdown().await?;
 
     Ok(())
 }

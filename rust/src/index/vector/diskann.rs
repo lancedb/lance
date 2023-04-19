@@ -26,6 +26,7 @@ use super::{
     graph::{Vertex, VertexSerDe},
     MetricType, VertexIndexStageParams,
 };
+use crate::index::pb;
 use crate::index::vector::pq::PQBuildParams;
 use crate::Result;
 pub(crate) use builder::build_diskann_index;
