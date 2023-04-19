@@ -26,19 +26,17 @@ use rand::Rng;
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
-use crate::index::vector::diskann::{DiskANNParams, PQVertexSerDe};
+use crate::index::vector::diskann::DiskANNParams;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::graph::{Graph, Vertex};
-use crate::index::vector::pq::{train_pq, ProductQuantizer};
-use crate::index::vector::utils::maybe_sample_training_data;
 use crate::index::vector::MetricType;
 use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
 use super::row_vertex::RowVertex;
-use super::{search::greedy_search, PQVertex};
+use super::search::greedy_search;
 
 /// Builder for DiskANN index.
 pub struct Builder {
@@ -64,11 +62,6 @@ impl Builder {
 
     /// Build the index.
     pub async fn build(&self) -> Result<()> {
-        // Step 1: train PQ codebook.
-        let sample_size = 1000;
-        let training_data =
-            maybe_sample_training_data(self.dataset.as_ref(), &self.column, sample_size).await?;
-
         // Randomly initialize the graph with r random neighbors for each vertex.
         let mut graph = init_graph(
             self.dataset.clone(),

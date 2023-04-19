@@ -1,4 +1,3 @@
-use arrow_array::Float32Array;
 // Copyright 2023 Lance Developers.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +12,7 @@ use arrow_array::Float32Array;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::Float32Array;
 use byteorder::{ByteOrder, LE};
 
 use super::{Vertex, VertexSerDe};

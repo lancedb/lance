@@ -39,7 +39,7 @@ use super::{
     opq::train_opq,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    MetricType, Query, VectorIndex, VertexIndexStageParams, INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
 use crate::{
@@ -420,16 +420,39 @@ fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
 }
 
 /// Parameters to build IVF partitions
+#[derive(Debug, Clone)]
 pub struct IvfBuildParams {
     /// Number of partitions to build.
     pub num_partitions: usize,
 
-    /// Metric type, L2 or Cosine.
-    pub metric_type: MetricType,
-
     // ---- kmeans parameters
     /// Max number of iterations to train kmeans.
     pub max_iters: usize,
+}
+
+impl Default for IvfBuildParams {
+    fn default() -> Self {
+        Self {
+            num_partitions: 32,
+            max_iters: 50,
+        }
+    }
+}
+
+impl VertexIndexStageParams for IvfBuildParams {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl IvfBuildParams {
+    /// Create a new instance of `IvfBuildParams`.
+    pub fn new(num_partitions: usize) -> Self {
+        Self {
+            num_partitions,
+            ..Default::default()
+        }
+    }
 }
 
 /// Compute residual matrix.
@@ -472,6 +495,7 @@ pub async fn build_ivf_pq_index(
     column: &str,
     index_name: &str,
     uuid: &Uuid,
+    metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
@@ -480,7 +504,7 @@ pub async fn build_ivf_pq_index(
         ivf_params.num_partitions,
         if pq_params.use_opq { "O" } else { "" },
         pq_params.num_sub_vectors,
-        ivf_params.metric_type,
+        metric_type,
     );
 
     sanity_check(dataset, column)?;
@@ -506,12 +530,11 @@ pub async fn build_ivf_pq_index(
     }
 
     // Train IVF partitions.
-    let ivf_model = train_ivf_model(&training_data, ivf_params).await?;
+    let ivf_model = train_ivf_model(&training_data, metric_type, ivf_params).await?;
 
     // Compute the residual vector for training PQ
     let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
-    let residual_data =
-        compute_residual_matrix(&training_data, &ivf_centroids, ivf_params.metric_type)?;
+    let residual_data = compute_residual_matrix(&training_data, &ivf_centroids, metric_type)?;
     let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
 
     // The final train of PQ sub-vectors
@@ -596,7 +619,7 @@ pub async fn build_ivf_pq_index(
         &transforms,
         ivf_model,
         pq,
-        ivf_params.metric_type,
+        metric_type,
         &batches,
     )
     .await
@@ -672,7 +695,11 @@ async fn write_index_file(
 }
 
 /// Train IVF partitions using kmeans.
-async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<Ivf> {
+async fn train_ivf_model(
+    data: &MatrixView,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+) -> Result<Ivf> {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let centroids = super::kmeans::train_kmeans(
@@ -683,7 +710,7 @@ async fn train_ivf_model(data: &MatrixView, params: &IvfBuildParams) -> Result<I
         params.max_iters as u32,
         REDOS,
         rng,
-        params.metric_type,
+        metric_type,
     )
     .await?;
     Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new(

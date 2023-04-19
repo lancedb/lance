@@ -32,7 +32,10 @@ pub mod pq;
 mod traits;
 mod utils;
 
-use self::{ivf::IVFIndex, pq::PQIndex};
+use self::{
+    ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
+    pq::{PQBuildParams, PQIndex},
+};
 
 use super::{pb, IndexParams};
 use crate::{
@@ -159,29 +162,19 @@ impl TryFrom<&str> for MetricType {
     }
 }
 
+pub trait VertexIndexStageParams: std::fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
-    // This is hard coded for IVF_PQ for now. Can refactor later to support more.
-    /// The number of IVF partitions
-    pub num_partitions: u32,
-
-    /// the number of bits to present the centroids used in PQ.
-    pub nbits: u8,
-
-    /// Use Optimized Product Quantizer.
-    pub use_opq: bool,
-
-    /// the number of sub vectors used in PQ.
-    pub num_sub_vectors: u32,
+    pub stages: Vec<Box<dyn VertexIndexStageParams>>,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
 
     /// Max number of iterations to train a KMean model
     pub max_iterations: usize,
-
-    /// Max number of iterations to train a OPQ model.
-    pub max_opq_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -190,25 +183,34 @@ impl VectorIndexParams {
     /// Parameters
     ///
     ///  - `num_partitions`: the number of IVF partitions.
-    ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
+    ///  - `num_bits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
     ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
     pub fn ivf_pq(
-        num_partitions: u32,
-        nbits: u8,
-        num_sub_vectors: u32,
+        num_partitions: usize,
+        num_bits: u8,
+        num_sub_vectors: usize,
         use_opq: bool,
         metric_type: MetricType,
         max_iterations: usize,
     ) -> Self {
+        let mut stages: Vec<Box<dyn VertexIndexStageParams>> = vec![];
+        if use_opq {};
+
+        stages.push(Box::new(IvfBuildParams::new(num_partitions)));
+        let mut pq_params = PQBuildParams::default();
+        pq_params.num_bits = num_bits as usize;
+        pq_params.num_sub_vectors = num_sub_vectors as usize;
+        pq_params.use_opq = use_opq;
+        pq_params.metric_type = metric_type;
+        pq_params.max_iters = max_iterations;
+        pq_params.max_opq_iters = max_iterations;
+
+        stages.push(Box::new(pq_params));
         Self {
-            num_partitions,
-            nbits,
-            num_sub_vectors,
-            use_opq,
+            stages,
             metric_type,
             max_iterations,
-            max_opq_iterations: max_iterations,
         }
     }
 
@@ -218,28 +220,82 @@ impl VectorIndexParams {
     }
 }
 
-impl Default for VectorIndexParams {
-    fn default() -> Self {
-        Self {
-            num_partitions: 32,
-            nbits: 8,
-            num_sub_vectors: 16,
-            use_opq: false,
-            metric_type: MetricType::L2,
-            max_iterations: MAX_ITERATIONS, // Faiss
-            max_opq_iterations: MAX_OPQ_ITERATIONS,
-        }
-    }
-}
-
 impl IndexParams for VectorIndexParams {
     fn as_any(&self) -> &dyn Any {
         self
     }
 }
 
+fn is_ivf_pq(stages: &[Box<dyn VertexIndexStageParams>]) -> bool {
+    if stages.len() < 2 {
+        return false;
+    }
+    let len = stages.len();
+
+    matches!(&stages[len - 1], PQBuildParams) && matches!(&stages[len - 2], IvfBuildParams)
+}
+
+fn is_diskann(stages: &[Box<dyn VertexIndexStageParams>]) -> bool {
+    if stages.is_empty() {
+        return false;
+    }
+    matches!(stages.last().unwrap().as_ref(), DiskANNBuildParams)
+}
+
+/// Build a Vector Index
+pub(crate) async fn build_vector_index(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: &uuid::Uuid,
+    params: &VectorIndexParams,
+) -> Result<()> {
+    let stages = &params.stages;
+
+    if stages.is_empty() {
+        return Err(Error::Index(
+            "Build Vector Index: must have at least 1 stage".to_string(),
+        ));
+    };
+
+    if is_ivf_pq(stages) {
+        // This is a IVF PQ index.
+        let len = stages.len();
+        let ivf_params = stages[len - 2]
+            .as_ref()
+            .as_any()
+            .downcast_ref::<IvfBuildParams>()
+            .unwrap();
+        let pq_params = stages[len - 1]
+            .as_any()
+            .downcast_ref::<PQBuildParams>()
+            .ok_or_else(|| {
+                Error::Index(format!("Build Vector Index: invalid stages: {:?}", stages))
+            })?;
+        build_ivf_pq_index(
+            dataset,
+            column,
+            &name,
+            &uuid,
+            params.metric_type,
+            &ivf_params,
+            &pq_params,
+        )
+        .await?
+    } else if is_diskann(stages) {
+        // This is DiskANN index.
+    } else {
+        return Err(Error::Index(format!(
+            "Build Vector Index: invalid stages: {:?}",
+            stages
+        )));
+    }
+
+    Ok(())
+}
+
 /// Open the Vector index on dataset, specified by the `uuid`.
-pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
     let index_dir = dataset.indices_dir().child(uuid);
     let index_file = index_dir.child(INDEX_FILE_NAME);
 

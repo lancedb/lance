@@ -590,7 +590,7 @@ mod test {
 
     use super::*;
     use crate::arrow::*;
-    use crate::index::{vector::VectorIndexParams, IndexType};
+    use crate::index::{DatasetIndexExt, {vector::VectorIndexParams, IndexType}};
     use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     #[tokio::test]

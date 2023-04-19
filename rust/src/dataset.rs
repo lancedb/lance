@@ -22,7 +22,7 @@ use std::time::SystemTime;
 use arrow_array::{
     cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
-use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -38,9 +38,6 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
-use crate::index::vector::ivf::{build_ivf_pq_index, IvfBuildParams};
-use crate::index::vector::pq::PQBuildParams;
-use crate::index::{vector::VectorIndexParams, IndexParams, IndexType};
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
@@ -105,7 +102,7 @@ fn manifest_path(base: &Path, version: u64) -> Path {
 }
 
 /// Get the latest manifest path
-fn latest_manifest_path(base: &Path) -> Path {
+pub(crate) fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
 }
 
@@ -357,98 +354,6 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
-    /// Create indices on columns.
-    ///
-    /// Upon finish, a new dataset version is generated.
-    ///
-    /// Parameters:
-    ///
-    ///  - `columns`: the columns to build the indices on.
-    ///  - `index_type`: specify [`IndexType`].
-    ///  - `name`: optional index name. Must be unique in the dataset.
-    ///            if not provided, it will auto-generate one.
-    ///  - `params`: index parameters.
-    pub async fn create_index(
-        &self,
-        columns: &[&str],
-        index_type: IndexType,
-        name: Option<String>,
-        params: &dyn IndexParams,
-    ) -> Result<Self> {
-        if columns.len() != 1 {
-            return Err(Error::Index(
-                "Only support building index on 1 column at the moment".to_string(),
-            ));
-        }
-        let column = columns[0];
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
-
-        // Load indices from the disk.
-        let mut indices = self.load_indices().await?;
-
-        let index_name = name.unwrap_or(format!("{column}_idx"));
-        if indices.iter().any(|i| i.name == index_name) {
-            return Err(Error::Index(format!(
-                "Index name '{index_name} already exists'"
-            )));
-        }
-
-        let index_id = Uuid::new_v4();
-        match index_type {
-            IndexType::Vector => {
-                let vec_params = params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| {
-                        Error::Index("Vector index type must take a VectorIndexParams".to_string())
-                    })?;
-
-                let ivf_params = IvfBuildParams {
-                    num_partitions: vec_params.num_partitions as usize,
-                    metric_type: vec_params.metric_type,
-                    max_iters: vec_params.max_iterations,
-                };
-                let pq_params = PQBuildParams {
-                    num_sub_vectors: vec_params.num_sub_vectors as usize,
-                    num_bits: 8,
-                    metric_type: vec_params.metric_type,
-                    max_iters: vec_params.max_iterations,
-                    use_opq: vec_params.use_opq,
-                    max_opq_iters: vec_params.max_opq_iterations,
-                };
-                build_ivf_pq_index(
-                    self,
-                    column,
-                    &index_name,
-                    &index_id,
-                    &ivf_params,
-                    &pq_params,
-                )
-                .await?
-            }
-        }
-
-        let latest_manifest = self.latest_manifest().await?;
-        let mut new_manifest = self.manifest.as_ref().clone();
-        new_manifest.version = latest_manifest.version + 1;
-
-        // Write index metadata down
-        let new_idx = Index::new(index_id, &index_name, &[field.id], new_manifest.version);
-        indices.push(new_idx);
-
-        write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
-
-        Ok(Self {
-            object_store: self.object_store.clone(),
-            base: self.base.clone(),
-            manifest: Arc::new(new_manifest),
-        })
-    }
-
     pub async fn take(&self, row_indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
         let mut sorted_indices: Vec<u32> =
             Vec::from_iter(row_indices.iter().map(|indice| *indice as u32));
@@ -572,7 +477,7 @@ impl Dataset {
         latest_manifest_path(&self.base)
     }
 
-    async fn latest_manifest(&self) -> Result<Manifest> {
+    pub(crate) async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(&self.object_store, &self.latest_manifest_path()).await
     }
 
@@ -660,7 +565,7 @@ impl Dataset {
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
 /// to this version.
-async fn write_manifest_file(
+pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
@@ -692,6 +597,9 @@ async fn write_manifest_file_to_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexType;
+    use crate::index::vector::MetricType;
+    use crate::index::{DatasetIndexExt, vector::VectorIndexParams};
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
@@ -1129,9 +1037,7 @@ mod tests {
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
         // Make sure valid arguments should create index successfully
-        let mut params = VectorIndexParams::default();
-        params.num_partitions = 10;
-        params.num_sub_vectors = 2;
+        let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
         let dataset = dataset
             .create_index(&["embeddings"], IndexType::Vector, None, &params)
             .await

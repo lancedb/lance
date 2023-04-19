@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
-use super::{MetricType, Query, VectorIndex};
+use super::{MetricType, Query, VectorIndex, VertexIndexStageParams};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
@@ -585,6 +585,7 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
 }
 
 /// Parameters for building product quantization.
+#[derive(Debug, Clone)]
 pub struct PQBuildParams {
     /// Number of subvectors to build PQ code
     pub num_sub_vectors: usize,
@@ -615,6 +616,12 @@ impl Default for PQBuildParams {
             max_iters: 50,
             max_opq_iters: 50,
         }
+    }
+}
+
+impl VertexIndexStageParams for PQBuildParams {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
