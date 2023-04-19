@@ -313,7 +313,7 @@ impl Dataset {
             .block_on(async {
                 self_
                     .ds
-                    .create_index(columns.as_slice(), idx_type, name, &params, true)
+                    .create_index(columns.as_slice(), idx_type, name, &params)
                     .await
             })
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
