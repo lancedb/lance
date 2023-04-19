@@ -191,6 +191,7 @@ impl VectorIndexParams {
     ) -> Self {
         let mut stages: Vec<Box<dyn VertexIndexStageParams>> = vec![];
         stages.push(Box::new(IvfBuildParams::new(num_partitions)));
+
         let mut pq_params = PQBuildParams::default();
         pq_params.num_bits = num_bits as usize;
         pq_params.num_sub_vectors = num_sub_vectors as usize;
@@ -198,8 +199,16 @@ impl VectorIndexParams {
         pq_params.metric_type = metric_type;
         pq_params.max_iters = max_iterations;
         pq_params.max_opq_iters = max_iterations;
-
         stages.push(Box::new(pq_params));
+
+        Self {
+            stages,
+            metric_type,
+        }
+    }
+
+    pub fn with_ivf_pq_params(metric_type: MetricType, ivf: IvfBuildParams, pq: PQBuildParams) -> Self {
+        let stages: Vec<Box<dyn VertexIndexStageParams>> = vec![Box::new(ivf), Box::new(pq)];
         Self {
             stages,
             metric_type,

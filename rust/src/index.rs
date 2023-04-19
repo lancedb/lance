@@ -70,7 +70,7 @@ pub trait IndexParams: Send + Sync {
 
 /// Extends Dataset with secondary index.
 #[async_trait]
-pub(crate) trait DatasetIndexExt {
+pub trait DatasetIndexExt {
     /// Create indices on columns.
     ///
     /// Upon finish, a new dataset version is generated.
