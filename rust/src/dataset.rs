@@ -597,9 +597,9 @@ async fn write_manifest_file_to_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::IndexType;
     use crate::index::vector::MetricType;
-    use crate::index::{DatasetIndexExt, vector::VectorIndexParams};
+    use crate::index::IndexType;
+    use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;

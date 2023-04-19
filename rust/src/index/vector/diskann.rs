@@ -24,11 +24,12 @@ use byteorder::{ByteOrder, LE};
 
 use super::{
     graph::{Vertex, VertexSerDe},
-    MetricType,
+    MetricType, VertexIndexStageParams,
 };
 use crate::index::vector::pq::PQBuildParams;
 use crate::Result;
 
+#[derive(Clone, Debug)]
 pub struct DiskANNParams {
     /// out-degree bound (R)
     pub r: usize,
@@ -103,6 +104,12 @@ impl DiskANNParams {
 
     pub fn metric_type(&mut self, metric_type: MetricType) -> &mut Self {
         self.metric_type = metric_type;
+        self
+    }
+}
+
+impl VertexIndexStageParams for DiskANNParams {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }

@@ -43,6 +43,7 @@ use crate::{
     index::{
         pb::vector_index_stage::Stage,
         vector::{
+            diskann::DiskANNParams,
             ivf::Ivf,
             opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
@@ -60,10 +61,6 @@ use crate::{
 };
 pub use traits::*;
 
-const MAX_ITERATIONS: usize = 50;
-/// Maximum number of iterations for OPQ.
-/// See OPQ paper for details.
-const MAX_OPQ_ITERATIONS: usize = 100;
 pub(crate) const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
 
@@ -172,9 +169,6 @@ pub struct VectorIndexParams {
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
-
-    /// Max number of iterations to train a KMean model
-    pub max_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -195,8 +189,6 @@ impl VectorIndexParams {
         max_iterations: usize,
     ) -> Self {
         let mut stages: Vec<Box<dyn VertexIndexStageParams>> = vec![];
-        if use_opq {};
-
         stages.push(Box::new(IvfBuildParams::new(num_partitions)));
         let mut pq_params = PQBuildParams::default();
         pq_params.num_bits = num_bits as usize;
@@ -210,13 +202,16 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            max_iterations,
         }
     }
 
     /// Create index parameters for `DiskANN` index.
-    pub fn diskann() -> Self {
-        todo!("DiskANN is not supported yet")
+    pub fn diskann(r: usize, alpha: f32, l: usize, metric_type: MetricType) -> Self {
+        let stage = Box::new(DiskANNParams::new(r, alpha, l));
+        Self {
+            stages: vec![stage],
+            metric_type,
+        }
     }
 }
 
