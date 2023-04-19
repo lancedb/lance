@@ -1,0 +1,6 @@
+The Lance project is a Rust-based library that aims to improve the performance and scalability of filtering operations in PyArrow. One of the key features of the Lance filter API is its ability to execute SQL-like WHERE clause expressions on Arrow tables, using the DataFusion engine under the hood.
+
+Using SQL WHERE clauses to filter data can be a powerful and familiar tool for data analysts and developers who are already familiar with SQL syntax. By leveraging the DataFusion engine, the Lance filter API is able to take advantage of the performance optimizations and query planning capabilities that come with a mature SQL engine.
+The Lance filter API is a specialized API in PyArrow that provides an interface for filtering data in Arrow tables based on specific conditions. This API was introduced as part of the Lance project, which aimed to improve the performance and scalability of filtering operations in PyArrow.
+
+The regular PyArrow API, on the other hand, provides a more general interface for working with Arrow data structures, including tables, arrays, and schemas. While it does provide some basic filtering capabilities (e.g., Boolean indexing), it does not provide the same level of performance optimizations as the Lance filter API.
