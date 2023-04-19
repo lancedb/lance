@@ -28,6 +28,7 @@ use super::{
 };
 use crate::index::vector::pq::PQBuildParams;
 use crate::Result;
+pub(crate) use builder::build_diskann_index;
 
 #[derive(Clone, Debug)]
 pub struct DiskANNParams {

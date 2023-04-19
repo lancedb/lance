@@ -133,7 +133,14 @@ impl DatasetIndexExt for Dataset {
                         Error::Index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
 
-                build_vector_index(self, column, &index_name, &index_id, &vec_params).await?;
+                build_vector_index(
+                    self,
+                    column,
+                    &index_name,
+                    &index_id.to_string(),
+                    &vec_params,
+                )
+                .await?;
             }
         }
 

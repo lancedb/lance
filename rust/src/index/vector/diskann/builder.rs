@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::Arc;
 
 use arrow_array::{cast::as_primitive_array, types::UInt64Type};
 use arrow_select::concat::concat_batches;
@@ -21,7 +20,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
@@ -38,89 +37,59 @@ use crate::{Error, Result};
 use super::row_vertex::RowVertex;
 use super::search::greedy_search;
 
-/// Builder for DiskANN index.
-pub struct Builder {
-    dataset: Arc<Dataset>,
-
-    column: String,
-
-    uuid: String,
-
+pub(crate) async fn build_diskann_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &str,
     params: DiskANNParams,
-}
+) -> Result<()> {
+    let rng = rand::rngs::SmallRng::from_entropy();
 
-impl Builder {
-    /// Create a [`Builder`] to build DiskANN index.
-    pub fn new(dataset: Arc<Dataset>, column: &str, uuid: &str, params: DiskANNParams) -> Self {
-        Self {
-            dataset,
-            column: column.to_string(),
-            uuid: uuid.to_string(),
-            params,
-        }
-    }
+    // Randomly initialize the graph with r random neighbors for each vertex.
+    let mut graph = init_graph(dataset, column, params.r, params.metric_type, rng.clone()).await?;
 
-    /// Build the index.
-    pub async fn build(&self) -> Result<()> {
-        // Randomly initialize the graph with r random neighbors for each vertex.
-        let mut graph = init_graph(
-            self.dataset.clone(),
-            &self.column,
-            self.params.r,
-            MetricType::L2,
-            rand::thread_rng(),
-        )
-        .await?;
+    // Find medoid
+    let medoid = {
+        let vectors = graph.data.clone();
+        find_medoid(&vectors, params.metric_type).await?
+    };
 
-        // Find medoid
-        let medoid = find_medoid(&graph.data, self.params.metric_type).await?;
+    // First pass.
+    let now = std::time::Instant::now();
+    index_once(&mut graph, medoid, 1.0, params.r, params.l, rng.clone()).await?;
+    println!("DiskANN: first pass: {}s", now.elapsed().as_secs_f32());
+    // Second pass.
+    let now = std::time::Instant::now();
+    index_once(
+        &mut graph,
+        medoid,
+        params.alpha,
+        params.r,
+        params.l,
+        rng.clone(),
+    )
+    .await?;
+    println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
 
-        let rng = rand::thread_rng();
-        // First pass.
-        let now = std::time::Instant::now();
-        index_once(
-            &mut graph,
-            medoid,
-            1.0,
-            self.params.r,
-            self.params.l,
-            rng.clone(),
-        )
-        .await?;
-        println!("DiskANN: first pass: {}s", now.elapsed().as_secs_f32());
-        // Second pass.
-        let now = std::time::Instant::now();
-        index_once(
-            &mut graph,
-            medoid,
-            self.params.alpha,
-            self.params.r,
-            self.params.l,
-            rng.clone(),
-        )
-        .await?;
-        println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
+    let index_dir = dataset.indices_dir().child(uuid);
+    let graph_file = index_dir.child("diskann_graph.lance");
 
-        let index_dir = self.dataset.indices_dir().child(self.uuid.as_str());
-        let graph_file = index_dir.child("diskann_graph.lance");
+    let mut write_params = WriteGraphParams::default();
+    write_params.batch_size = 2048 * 10;
+    let serde = RowVertexSerDe {};
 
-        let mut write_params = WriteGraphParams::default();
-        write_params.batch_size = 2048 * 10;
-        let serde = RowVertexSerDe {};
+    write_graph(
+        &graph,
+        dataset.object_store(),
+        &graph_file,
+        &write_params,
+        &serde,
+    )
+    .await?;
 
-        write_graph(
-            &graph,
-            self.dataset.object_store(),
-            &graph_file,
-            &write_params,
-            &serde,
-        )
-        .await?;
+    // Write metadata
 
-        // Write metadata
-
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Randomly initialize the graph with r random neighbors for each vertex.
@@ -133,7 +102,7 @@ impl Builder {
 ///  - rng: the random number generator.
 ///
 async fn init_graph(
-    dataset: Arc<Dataset>,
+    dataset: &Dataset,
     column: &str,
     r: usize,
     metric_type: MetricType,
@@ -346,6 +315,8 @@ async fn index_once<V: Vertex + Clone>(
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile;
@@ -390,7 +361,7 @@ mod tests {
         let dataset = create_dataset(uri, 200, 64).await;
 
         let rng = rand::thread_rng();
-        let graph = init_graph(dataset, "vector", 10, MetricType::L2, rng)
+        let graph = init_graph(dataset.as_ref(), "vector", 10, MetricType::L2, rng)
             .await
             .unwrap();
 

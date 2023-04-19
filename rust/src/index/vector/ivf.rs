@@ -33,7 +33,6 @@ use futures::{
     TryStreamExt,
 };
 use rand::{rngs::SmallRng, SeedableRng};
-use uuid::Uuid;
 
 use super::{
     opq::train_opq,
@@ -494,7 +493,7 @@ pub async fn build_ivf_pq_index(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
-    uuid: &Uuid,
+    uuid: &str,
     metric_type: MetricType,
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
@@ -631,7 +630,7 @@ async fn write_index_file(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
-    uuid: &Uuid,
+    uuid: &str,
     transformers: &[Box<dyn Transformer>],
     mut ivf: Ivf,
     pq: ProductQuantizer,
@@ -639,10 +638,7 @@ async fn write_index_file(
     batches: &[RecordBatch],
 ) -> Result<()> {
     let object_store = dataset.object_store();
-    let path = dataset
-        .indices_dir()
-        .child(uuid.to_string())
-        .child(INDEX_FILE_NAME);
+    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
 
     // Write each partition to disk.

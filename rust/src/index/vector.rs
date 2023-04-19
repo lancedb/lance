@@ -101,14 +101,15 @@ impl MetricType {
     /// Compute the distance from one vector to a batch of vectors.
     pub fn batch_func(
         &self,
-    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
+    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance_batch),
         }
     }
+
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32> {
+    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static> {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),
@@ -234,7 +235,7 @@ fn is_diskann(stages: &[Box<dyn VertexIndexStageParams>]) -> bool {
     if stages.is_empty() {
         return false;
     }
-    matches!(stages.last().unwrap().as_ref(), DiskANNBuildParams)
+    matches!(stages.last().unwrap().as_ref(), DiskANNParams)
 }
 
 /// Build a Vector Index
@@ -242,7 +243,7 @@ pub(crate) async fn build_vector_index(
     dataset: &Dataset,
     column: &str,
     name: &str,
-    uuid: &uuid::Uuid,
+    uuid: &str,
     params: &VectorIndexParams,
 ) -> Result<()> {
     let stages = &params.stages;
@@ -279,6 +280,15 @@ pub(crate) async fn build_vector_index(
         .await?
     } else if is_diskann(stages) {
         // This is DiskANN index.
+        use self::diskann::build_diskann_index;
+        let params = stages
+            .last()
+            .unwrap()
+            .as_ref()
+            .as_any()
+            .downcast_ref::<DiskANNParams>()
+            .unwrap();
+        build_diskann_index(dataset, column, uuid, params.clone()).await?;
     } else {
         return Err(Error::Index(format!(
             "Build Vector Index: invalid stages: {:?}",
