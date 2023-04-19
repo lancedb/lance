@@ -344,9 +344,11 @@ class LanceDataset(pa.dataset.Dataset):
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
 
-        For SIMD, the vector dimensions / num_sub_vectors must be a multiple of the stride
-        depending on the platform (4, 8, 16). An error is raised if this alignment
-        is not met.
+        If `index_type` is "DISKANN", then the following parameters are optional:
+
+        - **r**: out-degree bound
+        - **l**: number of levels in the graph.
+        - **alpha**: distance threadhold for the graph.
 
         Examples
         --------

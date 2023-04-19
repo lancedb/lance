@@ -24,7 +24,7 @@ use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -34,8 +34,9 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
 };
 use lance::index::{
+    vector::diskann::DiskANNParams,
     vector::{MetricType, VectorIndexParams},
-    IndexType, DatasetIndexExt, vector::diskann::DiskANNParams,
+    DatasetIndexExt, IndexType,
 };
 
 const DEFAULT_NPROBS: usize = 1;
@@ -318,11 +319,24 @@ impl Dataset {
                     };
                 }
                 VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)
-            },
+            }
             "DISKANN" => {
-                let params = DiskANNParams::default();
+                let mut params = DiskANNParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(n) = kwargs.get_item("r") {
+                        params.r = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("alpha") {
+                        params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("l") {
+                        params.l = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+                }
                 VectorIndexParams::with_diskann_params(m_type, params)
-            },
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
