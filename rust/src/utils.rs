@@ -17,7 +17,6 @@
 
 //! Various utilities
 
-pub mod distance;
 pub mod kmeans;
 pub mod sql;
 pub mod testing;

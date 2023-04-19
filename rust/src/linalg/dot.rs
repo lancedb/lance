@@ -12,10 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod cosine;
-pub mod dot;
-pub mod l2;
-pub mod normalize;
+//! Dot product.
 
-#[cfg(target_arch = "x86_64")]
-pub mod x86_64;
+use num_traits::real::Real;
+use std::iter::Sum;
+
+#[inline]
+pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
+    from.iter().zip(to.iter()).map(|(x, y)| x.mul(*y)).sum()
+}
+
+pub trait Dot {
+    type Output;
+
+    /// Dot product.
+    fn dot(&self, other: &Self) -> Self::Output;
+}
+
+impl Dot for [f32] {
+    type Output = f32;
+
+    fn dot(&self, other: &[f32]) -> f32 {
+        dot(self, other)
+    }
+}

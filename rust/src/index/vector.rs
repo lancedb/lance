@@ -49,8 +49,10 @@ use crate::{
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
-    linalg::l2::{l2_distance, l2_distance_batch},
-    utils::distance::cosine::cosine_distance_batch,
+    linalg::{
+        cosine::{cosine_distance, cosine_distance_batch},
+        l2::{l2_distance, l2_distance_batch},
+    },
     Error, Result,
 };
 pub use traits::*;
@@ -105,12 +107,11 @@ impl MetricType {
             Self::Cosine => Arc::new(cosine_distance_batch),
         }
     }
-
     /// Returns the distance function between two vectors.
     pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32> {
         match self {
             Self::L2 => Arc::new(l2_distance),
-            Self::Cosine => todo!("cosine distance"),
+            Self::Cosine => Arc::new(cosine_distance),
         }
     }
 }

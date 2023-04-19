@@ -376,7 +376,7 @@ mod tests {
 
         let params = VectorIndexParams::ivf_pq(4, 8, 4, with_opq, MetricType::L2, 3);
         let dataset = dataset
-            .create_index(&[column], IndexType::Vector, None, &params, true)
+            .create_index(&[column], IndexType::Vector, None, &params)
             .await
             .unwrap();
 
