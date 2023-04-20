@@ -13,10 +13,9 @@
 // limitations under the License.
 
 use arrow_arith::aggregate::sum;
-use arrow_arith::arithmetic::{multiply_dyn, subtract_dyn};
+use arrow_arith::arithmetic::{multiply, subtract};
 use arrow_arith::arity::binary;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::types::Float32Type;
 use arrow_array::{Array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 
@@ -28,12 +27,23 @@ use lance::utils::testing::generate_random_array;
 
 #[inline]
 fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
-    0.0
+    let s = subtract(x, y).unwrap();
+    let m = multiply(&s, &s).unwrap();
+    sum(&m).unwrap()
 }
 
 #[inline]
 fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
-    0.0
+    let m : Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
+    sum(&m).unwrap()
+}
+
+#[inline]
+fn l2_auto_vectorization(x: &Float32Array, y: &Float32Array) -> f32 {
+    x.values().iter()
+        .zip(y.values().iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f32>()
 }
 
 fn bench_distance(c: &mut Criterion) {
@@ -44,39 +54,48 @@ fn bench_distance(c: &mut Criterion) {
     // 1M of 1024 D vectors. 4GB in memory.
     let target = generate_random_array(TOTAL * DIMENSION);
 
-    c.bench_function("L2 distance", |b| {
+    c.bench_function("L2(simd)", |b| {
         b.iter(|| {
             l2_distance_batch(key.values(), target.values(), DIMENSION);
         })
     });
 
-    c.bench_function("L2_distance_arrow", |b| {
+    c.bench_function("L2(arrow)", |b| {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter(
                 (0..target.len() / DIMENSION)
                     .map(|idx| {
                         let arr = target.slice(idx * DIMENSION, DIMENSION);
-                        l2_arrow(&key, as_primitive_array(arr.as_ref()))
+                        Some(l2_arrow(&key, as_primitive_array(arr.as_ref())))
                     })
-                    .map(|d| Some(d)),
             )
         });
     });
 
-    c.bench_function("L2_distance_arrow_arith", |b| {
+    c.bench_function("L2(arrow_artiy)", |b| {
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter(
                 (0..target.len() / DIMENSION)
                     .map(|idx| {
                         let arr = target.slice(idx * DIMENSION, DIMENSION);
-                        let sub = subtract_dyn(arr.as_ref(), &key).unwrap();
-                        let mul = multiply_dyn(&sub, &sub).unwrap();
-                        sum(as_primitive_array::<Float32Type>(&mul)).unwrap_or(0.0)
+                        Some(l2_arrow_arity(&key, as_primitive_array(&arr)))
                     })
-                    .map(|d| Some(d)),
             )
         });
     });
+
+    c.bench_function("L2(auto-vectorization)", |b| {
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter(
+                (0..target.len() / DIMENSION)
+                    .map(|idx| {
+                        let arr = target.slice(idx * DIMENSION, DIMENSION);
+                        Some(l2_auto_vectorization(&key, as_primitive_array(&arr)))
+                    })
+            )
+        });
+    });
+
 }
 
 #[cfg(target_os = "linux")]
@@ -86,6 +105,7 @@ criterion_group!(
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_distance);
 
+// Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;

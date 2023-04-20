@@ -143,13 +143,14 @@ mod x86_64 {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
+
     pub(super) mod neon {
+        use std::arch::aarch64::*;
         use super::super::l2_scalar;
 
         #[inline]
         pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             unsafe {
-                use std::arch::aarch64::*;
                 let len = from.len() / 4 * 4;
                 let buf = [0.0_f32; 4];
                 let mut sum = vld1q_f32(buf.as_ptr());
