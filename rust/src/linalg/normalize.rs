@@ -65,16 +65,19 @@ mod aarch64 {
 
         #[inline]
         pub(crate) fn normalize_f32(vector: &[f32]) -> f32 {
-            unsafe {
+            let len = vector.len() / 4 * 4;
+            let mut sum = unsafe {
                 let buf = [0.0_f32; 4];
                 let mut sum = vld1q_f32(buf.as_ptr());
                 let n = vector.len();
-                for i in (0..n).step_by(4) {
+                for i in (0..len).step_by(4) {
                     let x = vld1q_f32(vector.as_ptr().add(i));
                     sum = vfmaq_f32(sum, x, x);
                 }
-                vaddvq_f32(sum).sqrt()
-            }
+                vaddvq_f32(sum)
+            };
+            sum += vector[len..].iter().map(|v| v.powi(2)).sum::<f32>();
+            sum.sqrt()
         }
     }
 }
@@ -91,7 +94,6 @@ mod tests {
         assert_eq!(result, (1..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt());
 
         let not_aligned = normalize(&data[2..]);
-        println!("Not aligned input: {:?}", &data[2..]);
         assert_eq!(
             not_aligned,
             (3..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt()
