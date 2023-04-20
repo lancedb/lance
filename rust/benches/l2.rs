@@ -34,13 +34,14 @@ fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
 
 #[inline]
 fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
-    let m : Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
+    let m: Float32Array = binary(x, y, |a, b| (a - b).powi(2)).unwrap();
     sum(&m).unwrap()
 }
 
 #[inline]
 fn l2_auto_vectorization(x: &Float32Array, y: &Float32Array) -> f32 {
-    x.values().iter()
+    x.values()
+        .iter()
         .zip(y.values().iter())
         .map(|(a, b)| (a - b).powi(2))
         .sum::<f32>()
@@ -62,40 +63,30 @@ fn bench_distance(c: &mut Criterion) {
 
     c.bench_function("L2(arrow)", |b| {
         b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter(
-                (0..target.len() / DIMENSION)
-                    .map(|idx| {
-                        let arr = target.slice(idx * DIMENSION, DIMENSION);
-                        Some(l2_arrow(&key, as_primitive_array(arr.as_ref())))
-                    })
-            )
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(l2_arrow(&key, as_primitive_array(arr.as_ref())))
+            }))
         });
     });
 
     c.bench_function("L2(arrow_artiy)", |b| {
         b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter(
-                (0..target.len() / DIMENSION)
-                    .map(|idx| {
-                        let arr = target.slice(idx * DIMENSION, DIMENSION);
-                        Some(l2_arrow_arity(&key, as_primitive_array(&arr)))
-                    })
-            )
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(l2_arrow_arity(&key, as_primitive_array(&arr)))
+            }))
         });
     });
 
     c.bench_function("L2(auto-vectorization)", |b| {
         b.iter(|| unsafe {
-            Float32Array::from_trusted_len_iter(
-                (0..target.len() / DIMENSION)
-                    .map(|idx| {
-                        let arr = target.slice(idx * DIMENSION, DIMENSION);
-                        Some(l2_auto_vectorization(&key, as_primitive_array(&arr)))
-                    })
-            )
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(l2_auto_vectorization(&key, as_primitive_array(&arr)))
+            }))
         });
     });
-
 }
 
 #[cfg(target_os = "linux")]

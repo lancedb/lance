@@ -145,8 +145,8 @@ mod x86_64 {
 mod aarch64 {
 
     pub(super) mod neon {
-        use std::arch::aarch64::*;
         use super::super::l2_scalar;
+        use std::arch::aarch64::*;
 
         #[inline]
         pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
