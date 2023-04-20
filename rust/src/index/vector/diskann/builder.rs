@@ -96,6 +96,7 @@ pub(crate) async fn build_diskann_index(
         uuid,
         graph.data.num_columns(),
         graph_file.to_string().as_str(),
+        &[medoid],
         params.metric_type,
         &params,
     )
@@ -330,6 +331,7 @@ async fn write_index_file(
     uuid: &str,
     dimension: usize,
     graph_file: &str,
+    entries: &[usize],
     metric_type: MetricType,
     params: &DiskANNParams,
 ) -> Result<()> {
@@ -344,6 +346,7 @@ async fn write_index_file(
             r: params.r as u32,
             alpha: params.alpha,
             l: params.l as u32,
+            entries: entries.iter().map(|v| *v as u64).collect(),
         })),
     }];
     let metadata = pb::Index {

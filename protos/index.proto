@@ -108,6 +108,9 @@ message DiskAnn {
 
   // L parameter
   uint32 L = 5;
+
+  /// Entry points to the graph
+  repeated uint64 entries = 6;
 }
 
 // One stage in the vector index pipeline.
