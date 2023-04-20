@@ -19,7 +19,10 @@ use futures::stream::StreamExt;
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::index::{vector::{MetricType, VectorIndexParams}, DatasetIndexExt};
+use lance::index::{
+    vector::{MetricType, VectorIndexParams},
+    DatasetIndexExt,
+};
 use lance::{Error, Result};
 
 #[derive(Parser)]
