@@ -36,14 +36,14 @@ import pytest
 from lance.vector import vec_to_table
 
 
-def create_table(nvec=10000, ndim=768):
+def create_table(nvec=1000, ndim=128):
     mat = np.random.randn(nvec, ndim)
     price = np.random.rand(nvec) * 100
 
     def gen_str(n):
         return "".join(random.choices(string.ascii_letters + string.digits, k=n))
 
-    meta = np.array([gen_str(1000) for _ in range(nvec)])
+    meta = np.array([gen_str(100) for _ in range(nvec)])
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
@@ -64,13 +64,13 @@ def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     yield dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
 
 
 def run(ds, q=None, assert_func=None):
     if q is None:
-        q = np.random.randn(768)
+        q = np.random.randn(128)
     project = [None, ["price"], ["vector", "price"], ["vector", "meta", "price"]]
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
@@ -119,23 +119,15 @@ def test_flat(dataset):
     print(run(dataset))
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
 def test_ann(indexed_dataset):
     print(run(indexed_dataset))
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
 def test_ann_append(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
     new_data = create_table(nvec=100)
     dataset = lance.write_dataset(new_data, dataset.uri, mode="append")
@@ -147,16 +139,12 @@ def test_ann_append(tmp_path):
     print(run(dataset, q=np.array(q), assert_func=func))
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    q = np.random.randn(768)
+    q = np.random.randn(128)
     expected = dataset.to_table(
         columns=["id"],
         nearest={
@@ -174,15 +162,11 @@ def test_use_index(dataset, tmp_path):
     assert np.all(expected == actual)
 
 
-@pytest.mark.skipif(
-    (platform.system() == "Darwin") and (platform.machine() != "arm64"),
-    reason="no neon on GHA",
-)
 def test_has_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=32, num_sub_vectors=16
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
     assert ann_ds.has_index
 
