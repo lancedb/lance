@@ -194,8 +194,9 @@ impl Dataset {
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
-        if !flag_dataset_exists && matches!(params.mode, WriteMode::Append)
-            || matches!(params.mode, WriteMode::Overwrite)
+        if !flag_dataset_exists
+            && (matches!(params.mode, WriteMode::Append)
+                || matches!(params.mode, WriteMode::Overwrite))
         {
             eprintln!("Warning: No existing dataset at {uri}, it will be created");
             params = WriteParams {
@@ -752,7 +753,6 @@ mod tests {
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
         write_params.mode = mode;
-        println!("{:?}", write_params);
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
@@ -821,7 +821,6 @@ mod tests {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        write_params.mode = WriteMode::Append;
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
