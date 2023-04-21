@@ -194,7 +194,9 @@ impl Dataset {
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
-        if !flag_dataset_exists && matches!(params.mode, WriteMode::Append) || matches!(params.mode, WriteMode::Overwrite) {
+        if !flag_dataset_exists && matches!(params.mode, WriteMode::Append)
+            || matches!(params.mode, WriteMode::Overwrite)
+        {
             eprintln!("Warning: No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
@@ -735,11 +737,11 @@ mod tests {
                                     &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
                                     &dict_values,
                                 )
-                                    .unwrap(),
+                                .unwrap(),
                             ),
                         ],
                     )
-                        .unwrap()
+                    .unwrap()
                 })
                 .collect(),
         );
