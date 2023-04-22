@@ -39,10 +39,9 @@ fn l2_arrow_arity(x: &Float32Array, y: &Float32Array) -> f32 {
 }
 
 #[inline]
-fn l2_auto_vectorization(x: &Float32Array, y: &Float32Array) -> f32 {
-    x.values()
-        .iter()
-        .zip(y.values().iter())
+fn l2_auto_vectorization(x: &[f32], y: &[f32]) -> f32 {
+    x.iter()
+        .zip(y.iter())
         .map(|(a, b)| (a - b).powi(2))
         .sum::<f32>()
 }
@@ -80,10 +79,11 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     c.bench_function("L2(auto-vectorization)", |b| {
+        let x = key.values();
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
-                let arr = target.slice(idx * DIMENSION, DIMENSION);
-                Some(l2_auto_vectorization(&key, as_primitive_array(&arr)))
+                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                Some(l2_auto_vectorization(x, y))
             }))
         });
     });

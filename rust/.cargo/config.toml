@@ -15,5 +15,8 @@ rustflags = [
     "-Wclippy::use_self",
 ]
 
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2"]
+
 [target.aarch64-apple-darwin]
 # rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon"]
