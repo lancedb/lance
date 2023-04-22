@@ -19,4 +19,4 @@ rustflags = [
 rustflags = ["-C", "target-cpu=haswell", "-C", "target-feature=+avx2"]
 
 [target.aarch64-apple-darwin]
-# rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+neon"]
+rustflags = ["-C", "target-cpu=apple-m1", "-C", "target-feature=+neon"]
