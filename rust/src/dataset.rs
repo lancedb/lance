@@ -193,7 +193,10 @@ impl Dataset {
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
-        if !flag_dataset_exists && matches!(params.mode, WriteMode::Append) {
+        if !flag_dataset_exists
+            && (matches!(params.mode, WriteMode::Append)
+                || matches!(params.mode, WriteMode::Overwrite))
+        {
             eprintln!("Warning: No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
@@ -702,10 +705,7 @@ mod tests {
     use futures::stream::TryStreamExt;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn create_dataset() {
-        let test_dir = tempdir().unwrap();
-
+    async fn create_file(path: &std::path::Path, mode: WriteMode) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new(
@@ -737,11 +737,11 @@ mod tests {
         );
         let expected_batches = batches.batches.clone();
 
-        let test_uri = test_dir.path().to_str().unwrap();
-
+        let test_uri = path.to_str().unwrap();
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
+        write_params.mode = mode;
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
@@ -780,6 +780,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..10).collect::<Vec<_>>()
         )
+    }
+
+    #[tokio::test]
+    async fn test_create_dataset() {
+        // Appending / Overwriting a dataset that does not exist is treated as Create
+        for mode in [WriteMode::Create, WriteMode::Append, Overwrite] {
+            let test_dir = tempdir().unwrap();
+            create_file(test_dir.path(), mode).await
+        }
     }
 
     #[tokio::test]
