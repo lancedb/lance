@@ -302,7 +302,7 @@ mod tests {
                 builder.add_neighbor(i, j);
             }
         }
-        let serde = Box::new(FooVertexSerDe {});
+        let serde = Arc::new(FooVertexSerDe {});
         write_graph(
             &builder,
             &store,
