@@ -37,6 +37,12 @@ impl Vertex for RowVertex {}
 
 pub(crate) struct RowVertexSerDe {}
 
+impl RowVertexSerDe {
+    pub(crate) fn new() -> Self {
+        Self {}
+    }
+}
+
 impl VertexSerDe<RowVertex> for RowVertexSerDe {
     fn size(&self) -> usize {
         8

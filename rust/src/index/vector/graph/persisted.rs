@@ -75,7 +75,7 @@ pub(crate) struct PersistedGraph<V: Vertex> {
     params: GraphReadParams,
 
     /// SerDe for vertex.
-    serde: Box<dyn VertexSerDe<V>>,
+    serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
 }
 
 impl<V: Vertex> PersistedGraph<V> {
@@ -84,7 +84,7 @@ impl<V: Vertex> PersistedGraph<V> {
         object_store: &ObjectStore,
         path: &Path,
         params: GraphReadParams,
-        serde: Box<dyn VertexSerDe<V>>,
+        serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
     ) -> Result<PersistedGraph<V>> {
         let file_reader = FileReader::try_new(object_store, path).await?;
 

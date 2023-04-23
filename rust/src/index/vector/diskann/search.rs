@@ -20,9 +20,15 @@ use std::{
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use object_store::path::Path;
 use ordered_float::OrderedFloat;
 
-use crate::Result;
+use super::row_vertex::{RowVertex, RowVertexSerDe};
+use crate::{
+    index::vector::graph::{GraphReadParams, PersistedGraph},
+    io::ObjectStore,
+    Result,
+};
 use crate::{
     index::{
         vector::VectorIndex,
@@ -147,8 +153,24 @@ pub(crate) fn greedy_search(
     Ok(state)
 }
 
-#[derive(Debug)]
-pub struct DiskANNIndex {}
+pub struct DiskANNIndex {
+    graph: PersistedGraph<RowVertex>,
+}
+
+impl std::fmt::Debug for DiskANNIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DiskANNIndex")
+    }
+}
+
+impl DiskANNIndex {
+    pub async fn try_new(object_store: &ObjectStore, graph_path: &Path) -> Result<Self> {
+        let params = GraphReadParams::default();
+        let serde = Arc::new(RowVertexSerDe::new());
+        let graph = PersistedGraph::try_new(object_store, graph_path, params, serde).await?;
+        Ok(Self { graph })
+    }
+}
 
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
