@@ -15,12 +15,25 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashSet},
+    sync::Arc,
 };
 
+use arrow_array::RecordBatch;
+use async_trait::async_trait;
 use ordered_float::OrderedFloat;
 
-use crate::index::vector::graph::{Graph, VertexWithDistance};
 use crate::Result;
+use crate::{
+    index::{
+        vector::VectorIndex,
+        vector::{
+            graph::{Graph, VertexWithDistance},
+            Query,
+        },
+    },
+    io::object_reader::ObjectReader,
+    Error,
+};
 
 /// DiskANN search state.
 pub(crate) struct SearchState {
@@ -132,6 +145,33 @@ pub(crate) fn greedy_search(
     }
 
     Ok(state)
+}
+
+#[derive(Debug)]
+pub struct DiskANNIndex {}
+
+#[async_trait]
+impl VectorIndex for DiskANNIndex {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        todo!()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("DiskANNIndex is not loadable".to_string()))
+    }
 }
 
 #[cfg(test)]
