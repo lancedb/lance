@@ -21,7 +21,7 @@ mod search;
 
 use super::{
     graph::{Vertex, VertexSerDe},
-    MetricType, VertexIndexStageParams,
+    MetricType,
 };
 use crate::index::vector::pq::PQBuildParams;
 pub(crate) use builder::build_diskann_index;
@@ -101,12 +101,6 @@ impl DiskANNParams {
 
     pub fn metric_type(&mut self, metric_type: MetricType) -> &mut Self {
         self.metric_type = metric_type;
-        self
-    }
-}
-
-impl VertexIndexStageParams for DiskANNParams {
-    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }

@@ -38,7 +38,7 @@ use super::{
     opq::train_opq,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, VertexIndexStageParams, INDEX_FILE_NAME,
+    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::io::object_reader::ObjectReader;
 use crate::{
@@ -435,12 +435,6 @@ impl Default for IvfBuildParams {
             num_partitions: 32,
             max_iters: 50,
         }
-    }
-}
-
-impl VertexIndexStageParams for IvfBuildParams {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

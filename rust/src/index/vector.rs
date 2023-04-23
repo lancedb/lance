@@ -159,16 +159,14 @@ impl TryFrom<&str> for MetricType {
     }
 }
 
-/// Parameters of each stage.
+/// Parameters of each index stage.
 #[derive(Debug)]
 pub enum StageParams {
     Ivf(IvfBuildParams),
-    PQ(PQBuildParams),
-    DiskANN(DiskANNParams),
-}
 
-pub trait VertexIndexStageParams: std::fmt::Debug + Send + Sync {
-    fn as_any(&self) -> &dyn Any;
+    PQ(PQBuildParams),
+
+    DiskANN(DiskANNParams),
 }
 
 /// The parameters to build vector index.
