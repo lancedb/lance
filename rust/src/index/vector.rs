@@ -159,13 +159,21 @@ impl TryFrom<&str> for MetricType {
     }
 }
 
+/// Parameters of each stage.
+#[derive(Debug)]
+pub enum StageParams {
+    Ivf(IvfBuildParams),
+    PQ(PQBuildParams),
+    DiskANN(DiskANNParams),
+}
+
 pub trait VertexIndexStageParams: std::fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
-    pub stages: Vec<Box<dyn VertexIndexStageParams>>,
+    pub stages: Vec<StageParams>,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
@@ -188,8 +196,8 @@ impl VectorIndexParams {
         metric_type: MetricType,
         max_iterations: usize,
     ) -> Self {
-        let mut stages: Vec<Box<dyn VertexIndexStageParams>> = vec![];
-        stages.push(Box::new(IvfBuildParams::new(num_partitions)));
+        let mut stages: Vec<StageParams> = vec![];
+        stages.push(StageParams::Ivf(IvfBuildParams::new(num_partitions)));
 
         let mut pq_params = PQBuildParams::default();
         pq_params.num_bits = num_bits as usize;
@@ -198,7 +206,7 @@ impl VectorIndexParams {
         pq_params.metric_type = metric_type;
         pq_params.max_iters = max_iterations;
         pq_params.max_opq_iters = max_iterations;
-        stages.push(Box::new(pq_params));
+        stages.push(StageParams::PQ(pq_params));
 
         Self {
             stages,
@@ -211,7 +219,7 @@ impl VectorIndexParams {
         ivf: IvfBuildParams,
         pq: PQBuildParams,
     ) -> Self {
-        let stages: Vec<Box<dyn VertexIndexStageParams>> = vec![Box::new(ivf), Box::new(pq)];
+        let stages = vec![StageParams::Ivf(ivf), StageParams::PQ(pq)];
         Self {
             stages,
             metric_type,
@@ -219,7 +227,7 @@ impl VectorIndexParams {
     }
 
     pub fn with_diskann_params(metric_type: MetricType, diskann: DiskANNParams) -> Self {
-        let stages: Vec<Box<dyn VertexIndexStageParams>> = vec![Box::new(diskann)];
+        let stages = vec![StageParams::DiskANN(diskann)];
         Self {
             stages,
             metric_type,
@@ -233,20 +241,22 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
-fn is_ivf_pq(stages: &[Box<dyn VertexIndexStageParams>]) -> bool {
+fn is_ivf_pq(stages: &[StageParams]) -> bool {
     if stages.len() < 2 {
         return false;
     }
     let len = stages.len();
 
-    matches!(&stages[len - 1], PQBuildParams) && matches!(&stages[len - 2], IvfBuildParams)
+    matches!(&stages[len - 1], StageParams::PQ(_))
+        && matches!(&stages[len - 2], StageParams::Ivf(_))
 }
 
-fn is_diskann(stages: &[Box<dyn VertexIndexStageParams>]) -> bool {
+fn is_diskann(stages: &[StageParams]) -> bool {
     if stages.is_empty() {
         return false;
     }
-    matches!(stages.last().unwrap().as_ref(), DiskANNParams)
+    let last = stages.last().unwrap();
+    matches!(last, StageParams::DiskANN(_))
 }
 
 /// Build a Vector Index
@@ -268,37 +278,34 @@ pub(crate) async fn build_vector_index(
     if is_ivf_pq(stages) {
         // This is a IVF PQ index.
         let len = stages.len();
-        let ivf_params = stages[len - 2]
-            .as_ref()
-            .as_any()
-            .downcast_ref::<IvfBuildParams>()
-            .unwrap();
-        let pq_params = stages[len - 1]
-            .as_any()
-            .downcast_ref::<PQBuildParams>()
-            .ok_or_else(|| {
-                Error::Index(format!("Build Vector Index: invalid stages: {:?}", stages))
-            })?;
+        let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
+        let StageParams::PQ(pq_params) = &stages[len - 1] else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
         build_ivf_pq_index(
             dataset,
             column,
             &name,
             &uuid,
             params.metric_type,
-            &ivf_params,
-            &pq_params,
+            ivf_params,
+            pq_params,
         )
         .await?
     } else if is_diskann(stages) {
         // This is DiskANN index.
         use self::diskann::build_diskann_index;
-        let params = stages
-            .last()
-            .unwrap()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<DiskANNParams>()
-            .unwrap();
+        let StageParams::DiskANN(params) = stages.last().unwrap() else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
         build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
     } else {
         return Err(Error::Index(format!(

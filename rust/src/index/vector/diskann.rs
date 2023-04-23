@@ -19,15 +19,11 @@ mod builder;
 mod row_vertex;
 mod search;
 
-use arrow_array::UInt8Array;
-use byteorder::{ByteOrder, LE};
-
 use super::{
     graph::{Vertex, VertexSerDe},
     MetricType, VertexIndexStageParams,
 };
 use crate::index::vector::pq::PQBuildParams;
-use crate::Result;
 pub(crate) use builder::build_diskann_index;
 
 #[derive(Clone, Debug)]
@@ -112,54 +108,6 @@ impl DiskANNParams {
 impl VertexIndexStageParams for DiskANNParams {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-}
-
-/// DiskANN Vertex with PQ as persisted data.
-#[derive(Clone, Debug)]
-pub(crate) struct PQVertex {
-    row_id: u64,
-    /// PQ code for the vector.
-    pq: UInt8Array,
-}
-
-impl Vertex for PQVertex {}
-
-struct PQVertexSerDe {
-    num_sub_vectors: usize,
-
-    /// Number of bits for each PQ code.
-    num_bits: usize,
-}
-
-impl PQVertexSerDe {
-    pub(crate) fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
-        Self {
-            num_sub_vectors,
-            num_bits,
-        }
-    }
-}
-
-impl VertexSerDe<PQVertex> for PQVertexSerDe {
-    #[inline]
-    fn size(&self) -> usize {
-        8 /* row_id*/ + 8 /* Length of pq */ + self.num_sub_vectors * 1 /* only 8 bits now */
-    }
-
-    fn deserialize(&self, data: &[u8]) -> Result<PQVertex> {
-        let row_id = LE::read_u64(&data[0..8]);
-        let pq_size = LE::read_u64(&data[8..16]) as usize;
-        let pq = UInt8Array::from_iter_values(data[16..16 + pq_size].iter().copied());
-        Ok(PQVertex { row_id, pq })
-    }
-
-    fn serialize(&self, vertex: &PQVertex) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.size());
-        bytes.extend_from_slice(&vertex.row_id.to_le_bytes());
-        bytes.extend_from_slice(&vertex.pq.len().to_le_bytes());
-        bytes.extend_from_slice(&vertex.pq.values());
-        bytes
     }
 }
 

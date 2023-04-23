@@ -146,8 +146,7 @@ async fn init_graph(
     let nodes = row_ids
         .values()
         .iter()
-        .enumerate()
-        .map(|(i, &row_id)| RowVertex::new(row_id, None))
+        .map(|&row_id| RowVertex::new(row_id, None))
         .collect::<Vec<_>>();
     let mut graph = GraphBuilder::new(&nodes, matrix, metric_type);
 

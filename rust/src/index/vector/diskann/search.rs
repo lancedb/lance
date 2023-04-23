@@ -41,6 +41,8 @@ pub(crate) struct SearchState {
     l: usize,
 
     /// Number of results to return.
+    //TODO: used during search.
+    #[allow(dead_code)]
     k: usize,
 }
 

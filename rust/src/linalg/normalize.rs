@@ -69,7 +69,6 @@ mod aarch64 {
             let mut sum = unsafe {
                 let buf = [0.0_f32; 4];
                 let mut sum = vld1q_f32(buf.as_ptr());
-                let n = vector.len();
                 for i in (0..len).step_by(4) {
                     let x = vld1q_f32(vector.as_ptr().add(i));
                     sum = vfmaq_f32(sum, x, x);
