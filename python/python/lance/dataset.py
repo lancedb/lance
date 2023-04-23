@@ -406,7 +406,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type = index_type.upper()
         if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
-                f"Only IVF_PQ index_type supported. Got {index_type}"
+                f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
             )
         if index_type == "IVF_PQ":
             if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
