@@ -19,7 +19,10 @@ use futures::stream::StreamExt;
 use futures::TryStreamExt;
 
 use lance::dataset::Dataset;
-use lance::index::vector::{MetricType, VectorIndexParams};
+use lance::index::{
+    vector::{MetricType, VectorIndexParams},
+    DatasetIndexExt,
+};
 use lance::{Error, Result};
 
 #[derive(Parser)]
@@ -69,11 +72,11 @@ enum Commands {
 
         /// Nunber of IVF partitions. Only useful when the index type is 'ivf-pq'.
         #[arg(short = 'p', long, default_value_t = 64, value_name = "NUM")]
-        num_partitions: u32,
+        num_partitions: usize,
 
         /// Number of sub-vectors in Product Quantizer
         #[arg(short = 's', long, default_value_t = 8, value_name = "NUM")]
-        num_sub_vectors: u32,
+        num_sub_vectors: usize,
 
         /// Distance metric type. Only support 'l2' and 'cosine'.
         #[arg(short = 'm', long, value_name = "DISTANCE")]
@@ -160,8 +163,8 @@ async fn create_index(
     name: &Option<String>,
     column: &Option<String>,
     index_type: &Option<IndexType>,
-    num_partitions: &u32,
-    num_sub_vectors: &u32,
+    num_partitions: &usize,
+    num_sub_vectors: &usize,
     metric_type: &Option<String>,
     use_opq: bool,
 ) -> Result<()> {

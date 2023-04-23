@@ -41,6 +41,8 @@ pub(crate) struct SearchState {
     l: usize,
 
     /// Number of results to return.
+    //TODO: used during search.
+    #[allow(dead_code)]
     k: usize,
 }
 
@@ -59,9 +61,9 @@ impl SearchState {
     /// Return the next unvisited vertex.
     fn pop(&mut self) -> Option<usize> {
         while let Some(vertex) = self.heap.pop() {
-            debug_assert!(!self.visited.contains(&vertex.0.id));
+            // println!("Pop {} visited {:?}", vertex.0.id, self.visited);
 
-            if !self.candidates.contains_key(&vertex.0.distance) {
+            if self.is_visited(vertex.0.id) || !self.candidates.contains_key(&vertex.0.distance) {
                 // The vertex has been removed from the candidate lists,
                 // from [`push()`].
                 continue;

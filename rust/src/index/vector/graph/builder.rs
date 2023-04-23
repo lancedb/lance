@@ -45,7 +45,7 @@ pub(crate) struct GraphBuilder<V: Vertex + Clone> {
     metric_type: MetricType,
 
     /// Distance function.
-    distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32>,
+    distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync>,
 }
 
 impl<'a, V: Vertex + Clone> GraphBuilder<V> {

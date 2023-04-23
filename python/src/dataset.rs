@@ -20,9 +20,11 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::index::vector::ivf::IvfBuildParams;
+use lance::index::vector::pq::PQBuildParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{IntoPyDict, PyBool, PyDict, PyInt, PyLong};
+use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
@@ -32,8 +34,9 @@ use lance::dataset::{
     scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
 };
 use lance::index::{
+    vector::diskann::DiskANNParams,
     vector::{MetricType, VectorIndexParams},
-    IndexType,
+    DatasetIndexExt, IndexType,
 };
 
 const DEFAULT_NPROBS: usize = 1;
@@ -275,7 +278,7 @@ impl Dataset {
         kwargs: Option<&PyDict>,
     ) -> PyResult<()> {
         let idx_type = match index_type.to_uppercase().as_str() {
-            "IVF_PQ" => IndexType::Vector,
+            "IVF_PQ" | "DISKANN" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -283,29 +286,62 @@ impl Dataset {
             }
         };
 
-        // Only VectorParams are supported.
-        let mut params = VectorIndexParams::default();
-        if let Some(kwargs) = kwargs {
-            if let Some(n) = kwargs.get_item("num_partitions") {
-                params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
-            };
-
-            if let Some(n) = kwargs.get_item("num_sub_vectors") {
-                params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
-            };
-
-            if let Some(o) = kwargs.get_item("use_opq") {
-                params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
-            };
-            if let Some(o) = kwargs.get_item("max_opq_iterations") {
-                params.max_opq_iterations = PyAny::downcast::<PyInt>(o)?.extract()?
-            };
-        }
-
-        params.metric_type = match metric_type {
+        let m_type = match metric_type {
             Some(mt) => MetricType::try_from(mt.to_string().to_lowercase().as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?,
             None => MetricType::L2,
+        };
+
+        // Only VectorParams are supported.
+        let params = match index_type.to_uppercase().as_str() {
+            "IVF_PQ" => {
+                let mut ivf_params = IvfBuildParams::default();
+                let mut pq_params = PQBuildParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(n) = kwargs.get_item("num_partitions") {
+                        ivf_params.num_partitions = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("num_bits") {
+                        pq_params.num_bits = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("num_sub_vectors") {
+                        pq_params.num_sub_vectors = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+
+                    if let Some(o) = kwargs.get_item("use_opq") {
+                        pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
+                    };
+
+                    if let Some(o) = kwargs.get_item("max_opq_iterations") {
+                        pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
+                    };
+                }
+                VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)
+            }
+            "DISKANN" => {
+                let mut params = DiskANNParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(n) = kwargs.get_item("r") {
+                        params.r = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("alpha") {
+                        params.alpha = PyAny::downcast::<PyFloat>(n)?.extract()?
+                    };
+
+                    if let Some(n) = kwargs.get_item("l") {
+                        params.l = PyAny::downcast::<PyInt>(n)?.extract()?
+                    };
+                }
+                VectorIndexParams::with_diskann_params(m_type, params)
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Index type '{index_type}' is not supported."
+                )))
+            }
         };
 
         self_

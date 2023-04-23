@@ -20,8 +20,7 @@ use std::sync::Arc;
 
 use arrow_array::Float32Array;
 
-#[allow(dead_code)]
-mod diskann;
+pub mod diskann;
 pub mod flat;
 #[allow(dead_code)]
 mod graph;
@@ -32,7 +31,10 @@ pub mod pq;
 mod traits;
 mod utils;
 
-use self::{ivf::IVFIndex, pq::PQIndex};
+use self::{
+    ivf::{build_ivf_pq_index, IVFIndex, IvfBuildParams},
+    pq::{PQBuildParams, PQIndex},
+};
 
 use super::{pb, IndexParams};
 use crate::{
@@ -40,6 +42,7 @@ use crate::{
     index::{
         pb::vector_index_stage::Stage,
         vector::{
+            diskann::DiskANNParams,
             ivf::Ivf,
             opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
@@ -57,10 +60,6 @@ use crate::{
 };
 pub use traits::*;
 
-const MAX_ITERATIONS: usize = 50;
-/// Maximum number of iterations for OPQ.
-/// See OPQ paper for details.
-const MAX_OPQ_ITERATIONS: usize = 100;
 pub(crate) const SCORE_COL: &str = "score";
 const INDEX_FILE_NAME: &str = "index.idx";
 
@@ -101,14 +100,15 @@ impl MetricType {
     /// Compute the distance from one vector to a batch of vectors.
     pub fn batch_func(
         &self,
-    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync> {
+    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance_batch),
         }
     }
+
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32> {
+    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static> {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),
@@ -159,29 +159,22 @@ impl TryFrom<&str> for MetricType {
     }
 }
 
+/// Parameters of each index stage.
+#[derive(Debug)]
+pub enum StageParams {
+    Ivf(IvfBuildParams),
+
+    PQ(PQBuildParams),
+
+    DiskANN(DiskANNParams),
+}
+
 /// The parameters to build vector index.
 pub struct VectorIndexParams {
-    // This is hard coded for IVF_PQ for now. Can refactor later to support more.
-    /// The number of IVF partitions
-    pub num_partitions: u32,
-
-    /// the number of bits to present the centroids used in PQ.
-    pub nbits: u8,
-
-    /// Use Optimized Product Quantizer.
-    pub use_opq: bool,
-
-    /// the number of sub vectors used in PQ.
-    pub num_sub_vectors: u32,
+    pub stages: Vec<StageParams>,
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
-
-    /// Max number of iterations to train a KMean model
-    pub max_iterations: usize,
-
-    /// Max number of iterations to train a OPQ model.
-    pub max_opq_iterations: usize,
 }
 
 impl VectorIndexParams {
@@ -190,44 +183,52 @@ impl VectorIndexParams {
     /// Parameters
     ///
     ///  - `num_partitions`: the number of IVF partitions.
-    ///  - `nbits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
+    ///  - `num_bits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
     ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
     pub fn ivf_pq(
-        num_partitions: u32,
-        nbits: u8,
-        num_sub_vectors: u32,
+        num_partitions: usize,
+        num_bits: u8,
+        num_sub_vectors: usize,
         use_opq: bool,
         metric_type: MetricType,
         max_iterations: usize,
     ) -> Self {
+        let mut stages: Vec<StageParams> = vec![];
+        stages.push(StageParams::Ivf(IvfBuildParams::new(num_partitions)));
+
+        let mut pq_params = PQBuildParams::default();
+        pq_params.num_bits = num_bits as usize;
+        pq_params.num_sub_vectors = num_sub_vectors as usize;
+        pq_params.use_opq = use_opq;
+        pq_params.metric_type = metric_type;
+        pq_params.max_iters = max_iterations;
+        pq_params.max_opq_iters = max_iterations;
+        stages.push(StageParams::PQ(pq_params));
+
         Self {
-            num_partitions,
-            nbits,
-            num_sub_vectors,
-            use_opq,
+            stages,
             metric_type,
-            max_iterations,
-            max_opq_iterations: max_iterations,
         }
     }
 
-    /// Create index parameters for `DiskANN` index.
-    pub fn diskann() -> Self {
-        todo!("DiskANN is not supported yet")
-    }
-}
-
-impl Default for VectorIndexParams {
-    fn default() -> Self {
+    pub fn with_ivf_pq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        pq: PQBuildParams,
+    ) -> Self {
+        let stages = vec![StageParams::Ivf(ivf), StageParams::PQ(pq)];
         Self {
-            num_partitions: 32,
-            nbits: 8,
-            num_sub_vectors: 16,
-            use_opq: false,
-            metric_type: MetricType::L2,
-            max_iterations: MAX_ITERATIONS, // Faiss
-            max_opq_iterations: MAX_OPQ_ITERATIONS,
+            stages,
+            metric_type,
+        }
+    }
+
+    pub fn with_diskann_params(metric_type: MetricType, diskann: DiskANNParams) -> Self {
+        let stages = vec![StageParams::DiskANN(diskann)];
+        Self {
+            stages,
+            metric_type,
         }
     }
 }
@@ -238,8 +239,84 @@ impl IndexParams for VectorIndexParams {
     }
 }
 
+fn is_ivf_pq(stages: &[StageParams]) -> bool {
+    if stages.len() < 2 {
+        return false;
+    }
+    let len = stages.len();
+
+    matches!(&stages[len - 1], StageParams::PQ(_))
+        && matches!(&stages[len - 2], StageParams::Ivf(_))
+}
+
+fn is_diskann(stages: &[StageParams]) -> bool {
+    if stages.is_empty() {
+        return false;
+    }
+    let last = stages.last().unwrap();
+    matches!(last, StageParams::DiskANN(_))
+}
+
+/// Build a Vector Index
+pub(crate) async fn build_vector_index(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: &str,
+    params: &VectorIndexParams,
+) -> Result<()> {
+    let stages = &params.stages;
+
+    if stages.is_empty() {
+        return Err(Error::Index(
+            "Build Vector Index: must have at least 1 stage".to_string(),
+        ));
+    };
+
+    if is_ivf_pq(stages) {
+        // This is a IVF PQ index.
+        let len = stages.len();
+        let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
+        let StageParams::PQ(pq_params) = &stages[len - 1] else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
+        build_ivf_pq_index(
+            dataset,
+            column,
+            &name,
+            &uuid,
+            params.metric_type,
+            ivf_params,
+            pq_params,
+        )
+        .await?
+    } else if is_diskann(stages) {
+        // This is DiskANN index.
+        use self::diskann::build_diskann_index;
+        let StageParams::DiskANN(params) = stages.last().unwrap() else {
+            return Err(Error::Index(
+                format!("Build Vector Index: invalid stages: {:?}", stages),
+            ));
+        };
+        build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
+    } else {
+        return Err(Error::Index(format!(
+            "Build Vector Index: invalid stages: {:?}",
+            stages
+        )));
+    }
+
+    Ok(())
+}
+
 /// Open the Vector index on dataset, specified by the `uuid`.
-pub async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
     let index_dir = dataset.indices_dir().child(uuid);
     let index_file = index_dir.child(INDEX_FILE_NAME);
 

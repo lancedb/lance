@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::Arc;
 
 use arrow_array::{cast::as_primitive_array, types::UInt64Type};
 use arrow_select::concat::concat_batches;
@@ -21,113 +20,89 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use ordered_float::OrderedFloat;
 use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 
 use crate::arrow::{linalg::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
+use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
-use crate::index::vector::diskann::{DiskANNParams, PQVertexSerDe};
+use crate::index::vector::diskann::DiskANNParams;
 use crate::index::vector::graph::{
     builder::GraphBuilder, write_graph, VertexWithDistance, WriteGraphParams,
 };
 use crate::index::vector::graph::{Graph, Vertex};
-use crate::index::vector::pq::{train_pq, ProductQuantizer};
-use crate::index::vector::utils::maybe_sample_training_data;
-use crate::index::vector::MetricType;
+use crate::index::vector::{MetricType, INDEX_FILE_NAME};
 use crate::linalg::l2::l2_distance;
 use crate::{Error, Result};
 
 use super::row_vertex::RowVertex;
-use super::{search::greedy_search, PQVertex};
+use super::search::greedy_search;
 
-/// Builder for DiskANN index.
-pub struct Builder {
-    dataset: Arc<Dataset>,
-
-    column: String,
-
-    uuid: String,
-
+pub(crate) async fn build_diskann_index(
+    dataset: &Dataset,
+    column: &str,
+    name: &str,
+    uuid: &str,
     params: DiskANNParams,
-}
+) -> Result<()> {
+    let rng = rand::rngs::SmallRng::from_entropy();
 
-impl Builder {
-    /// Create a [`Builder`] to build DiskANN index.
-    pub fn new(dataset: Arc<Dataset>, column: &str, uuid: &str, params: DiskANNParams) -> Self {
-        Self {
-            dataset,
-            column: column.to_string(),
-            uuid: uuid.to_string(),
-            params,
-        }
-    }
+    // Randomly initialize the graph with r random neighbors for each vertex.
+    let mut graph = init_graph(dataset, column, params.r, params.metric_type, rng.clone()).await?;
 
-    /// Build the index.
-    pub async fn build(&self) -> Result<()> {
-        // Step 1: train PQ codebook.
-        let sample_size = 1000;
-        let training_data =
-            maybe_sample_training_data(self.dataset.as_ref(), &self.column, sample_size).await?;
+    // Find medoid
+    let medoid = {
+        let vectors = graph.data.clone();
+        find_medoid(&vectors, params.metric_type).await?
+    };
 
-        // Randomly initialize the graph with r random neighbors for each vertex.
-        let mut graph = init_graph(
-            self.dataset.clone(),
-            &self.column,
-            self.params.r,
-            MetricType::L2,
-            rand::thread_rng(),
-        )
-        .await?;
+    // First pass.
+    let now = std::time::Instant::now();
+    index_once(&mut graph, medoid, 1.0, params.r, params.l, rng.clone()).await?;
+    println!("DiskANN: first pass: {}s", now.elapsed().as_secs_f32());
+    // Second pass.
+    let now = std::time::Instant::now();
+    index_once(
+        &mut graph,
+        medoid,
+        params.alpha,
+        params.r,
+        params.l,
+        rng.clone(),
+    )
+    .await?;
+    println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
 
-        // Find medoid
-        let medoid = find_medoid(&graph.data, self.params.metric_type).await?;
+    let index_dir = dataset.indices_dir().child(uuid);
+    let graph_file = index_dir.child("diskann_graph.lance");
 
-        let rng = rand::thread_rng();
-        // First pass.
-        let now = std::time::Instant::now();
-        index_once(
-            &mut graph,
-            medoid,
-            1.0,
-            self.params.r,
-            self.params.l,
-            rng.clone(),
-        )
-        .await?;
-        println!("DiskANN: first pass: {}s", now.elapsed().as_secs_f32());
-        // Second pass.
-        let now = std::time::Instant::now();
-        index_once(
-            &mut graph,
-            medoid,
-            self.params.alpha,
-            self.params.r,
-            self.params.l,
-            rng.clone(),
-        )
-        .await?;
-        println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
+    let mut write_params = WriteGraphParams::default();
+    write_params.batch_size = 2048 * 10;
+    let serde = RowVertexSerDe {};
 
-        let index_dir = self.dataset.indices_dir().child(self.uuid.as_str());
-        let graph_file = index_dir.child("diskann_graph.lance");
+    write_graph(
+        &graph,
+        dataset.object_store(),
+        &graph_file,
+        &write_params,
+        &serde,
+    )
+    .await?;
 
-        let mut write_params = WriteGraphParams::default();
-        write_params.batch_size = 2048 * 10;
-        let serde = RowVertexSerDe {};
+    write_index_file(
+        dataset,
+        column,
+        name,
+        uuid,
+        graph.data.num_columns(),
+        graph_file.to_string().as_str(),
+        &[medoid],
+        params.metric_type,
+        &params,
+    )
+    .await?;
 
-        write_graph(
-            &graph,
-            self.dataset.object_store(),
-            &graph_file,
-            &write_params,
-            &serde,
-        )
-        .await?;
-
-        // Write metadata
-
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Randomly initialize the graph with r random neighbors for each vertex.
@@ -140,7 +115,7 @@ impl Builder {
 ///  - rng: the random number generator.
 ///
 async fn init_graph(
-    dataset: Arc<Dataset>,
+    dataset: &Dataset,
     column: &str,
     r: usize,
     metric_type: MetricType,
@@ -171,8 +146,7 @@ async fn init_graph(
     let nodes = row_ids
         .values()
         .iter()
-        .enumerate()
-        .map(|(i, &row_id)| RowVertex::new(row_id, None))
+        .map(|&row_id| RowVertex::new(row_id, None))
         .collect::<Vec<_>>();
     let mut graph = GraphBuilder::new(&nodes, matrix, metric_type);
 
@@ -349,9 +323,59 @@ async fn index_once<V: Vertex + Clone>(
     Ok(())
 }
 
+async fn write_index_file(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    uuid: &str,
+    dimension: usize,
+    graph_file: &str,
+    entries: &[usize],
+    metric_type: MetricType,
+    params: &DiskANNParams,
+) -> Result<()> {
+    let object_store = dataset.object_store();
+    let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);
+    let mut writer = object_store.create(&path).await?;
+
+    let stages: Vec<pb::VectorIndexStage> = vec![pb::VectorIndexStage {
+        stage: Some(pb::vector_index_stage::Stage::Diskann(pb::DiskAnn {
+            spec: 1,
+            filename: graph_file.to_string(),
+            r: params.r as u32,
+            alpha: params.alpha,
+            l: params.l as u32,
+            entries: entries.iter().map(|v| *v as u64).collect(),
+        })),
+    }];
+    let metadata = pb::Index {
+        name: index_name.to_string(),
+        columns: vec![column.to_string()],
+        dataset_version: dataset.version().version,
+        index_type: pb::IndexType::Vector.into(),
+        implementation: Some(pb::index::Implementation::VectorIndex(pb::VectorIndex {
+            spec_version: 1,
+            dimension: dimension as u32,
+            stages,
+            metric_type: match metric_type {
+                MetricType::L2 => pb::VectorMetricType::L2.into(),
+                MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+            },
+        })),
+    };
+
+    let pos = writer.write_protobuf(&metadata).await?;
+    writer.write_magics(pos).await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
 
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
@@ -397,7 +421,7 @@ mod tests {
         let dataset = create_dataset(uri, 200, 64).await;
 
         let rng = rand::thread_rng();
-        let graph = init_graph(dataset, "vector", 10, MetricType::L2, rng)
+        let graph = init_graph(dataset.as_ref(), "vector", 10, MetricType::L2, rng)
             .await
             .unwrap();
 

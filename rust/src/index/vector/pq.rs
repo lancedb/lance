@@ -585,6 +585,7 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
 }
 
 /// Parameters for building product quantization.
+#[derive(Debug, Clone)]
 pub struct PQBuildParams {
     /// Number of subvectors to build PQ code
     pub num_sub_vectors: usize,

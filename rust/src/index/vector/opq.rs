@@ -326,6 +326,7 @@ mod tests {
 
     use crate::arrow::{linalg::MatrixView, *};
     use crate::dataset::{Dataset, ROW_ID};
+    use crate::index::DatasetIndexExt;
     use crate::index::{
         vector::{ivf::IVFIndex, open_index, opq::OPQIndex, VectorIndexParams},
         IndexType,

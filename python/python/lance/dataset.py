@@ -344,9 +344,11 @@ class LanceDataset(pa.dataset.Dataset):
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
 
-        For SIMD, the vector dimensions / num_sub_vectors must be a multiple of the stride
-        depending on the platform (4, 8, 16). An error is raised if this alignment
-        is not met.
+        If `index_type` is "DISKANN", then the following parameters are optional:
+
+        - **r**: out-degree bound
+        - **l**: number of levels in the graph.
+        - **alpha**: distance threadhold for the graph.
 
         Examples
         --------
@@ -402,14 +404,15 @@ class LanceDataset(pa.dataset.Dataset):
         ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
-        if index_type != "IVF_PQ":
+        if index_type not in ["IVF_PQ", "DISKANN"]:
             raise NotImplementedError(
-                f"Only IVF_PQ index_type supported. Got {index_type}"
+                f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
             )
-        if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
-            raise ValueError(
-                "num_partitions and num_sub_vectors are required for IVF_PQ"
-            )
+        if index_type == "IVF_PQ":
+            if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+                raise ValueError(
+                    "num_partitions and num_sub_vectors are required for IVF_PQ"
+                )
 
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
