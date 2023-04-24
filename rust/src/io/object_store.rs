@@ -30,7 +30,7 @@ use object_store::local::LocalFileSystem;
 use object_store::ClientOptions;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
-use url::Url;
+use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
@@ -96,11 +96,15 @@ impl ObjectStore {
         };
 
         // Try to parse the provided string as a Url, if that fails treat it as local FS
-        future::ready(Url::parse(uri))
-            .map_err(Error::from)
-            .and_then(|url| Self::new_from_url(url))
-            .or_else(|_| future::ready(Self::new_from_path(uri)))
-            .await
+        match Url::parse(uri) {
+            Ok(url) => Self::new_from_url(url).map_err(Error::from).await,
+            Err(ParseError::RelativeUrlWithoutBase) => {
+                future::ready(Self::new_from_path(uri))
+                    .map_err(Error::from)
+                    .await
+            }
+            Err(e) => future::err(Error::from(e)).await,
+        }
     }
 
     fn new_from_path(str_path: &str) -> Result<Self> {
@@ -313,3 +317,4 @@ mod tests {
         }
     }
 }
+
