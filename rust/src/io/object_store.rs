@@ -24,13 +24,13 @@ use std::sync::Arc;
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
-use futures::{future, TryFutureExt};
+use futures::{future, FutureExt, TryFutureExt};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ClientOptions;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
-use url::Url;
+use url::{ParseError, Url};
 
 use crate::error::{Error, Result};
 use crate::io::object_reader::CloudObjectReader;
@@ -97,9 +97,19 @@ impl ObjectStore {
 
         // Try to parse the provided string as a Url, if that fails treat it as local FS
         future::ready(Url::parse(uri))
-            .map_err(Error::from)
-            .and_then(|url| Self::new_from_url(url))
-            .or_else(|_| future::ready(Self::new_from_path(uri)))
+            .map(
+                |result| {
+                    match result {
+                        Ok(url) => {
+                            Self::new_from_url(url)
+                        }
+                        Err(ParseError::RelativeUrlWithoutBase) => {
+                            Self::new_from_path(url)
+                        }
+                        others => Error::from(others)
+                    }
+                }
+            )
             .await
     }
 
@@ -223,7 +233,7 @@ mod tests {
             tmp_path.clone() + "/bar/foo.lance/test_file",
             "TEST_CONTENT".to_string(),
         )
-        .unwrap();
+            .unwrap();
 
         // test a few variations of the same path
         for uri in &[
@@ -247,7 +257,7 @@ mod tests {
             tmp_path.clone() + "/bar/foo.lance/test_file",
             "RELATIVE_URL".to_string(),
         )
-        .unwrap();
+            .unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
@@ -299,7 +309,7 @@ mod tests {
             format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
             "WINDOWS".to_string(),
         )
-        .unwrap();
+            .unwrap();
 
         for uri in &[
             format!("{drive_letter}:/test_folder/test.lance"),
