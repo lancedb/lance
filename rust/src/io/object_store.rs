@@ -24,7 +24,6 @@ use std::sync::Arc;
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
-use futures::{future, TryFutureExt};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ClientOptions;
@@ -47,6 +46,20 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     prefetch_size: usize,
+}
+
+/// URI schemes supported by lance
+mod schemes {
+    static S3: &str = "s3";
+    static GOOGLE_CLOUD: &str = "gs";
+    static LOCAL_FILESYSTEM: &str = "file";
+
+    static ALL_SCHEMES: &[&str] = &[S3, GOOGLE_CLOUD, LOCAL_FILESYSTEM];
+
+    pub(crate) fn is_supported(uri: &str) -> bool {
+        let uri_lower = uri.to_lowercase();
+        ALL_SCHEMES.iter().any(|s| uri_lower.starts_with(s))
+    }
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -95,12 +108,13 @@ impl ObjectStore {
             return Ok(Self::memory());
         };
 
-        // Try to parse the provided string as a Url, if that fails treat it as local FS
-        future::ready(Url::parse(uri))
-            .map_err(Error::from)
-            .and_then(|url| Self::new_from_url(url))
-            .or_else(|_| future::ready(Self::new_from_path(uri)))
-            .await
+        // If uri includes a scheme, parse it as URL, fallback to local filesystem otherwise
+        if schemes::is_supported(uri) {
+            let url = Url::parse(uri)?;
+            Self::new_from_url(url).await
+        } else {
+            Self::new_from_path(uri)
+        }
     }
 
     fn new_from_path(str_path: &str) -> Result<Self> {
