@@ -24,7 +24,7 @@ use std::sync::Arc;
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
 };
-use futures::{future, FutureExt, TryFutureExt};
+use futures::{future, TryFutureExt};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ClientOptions;
