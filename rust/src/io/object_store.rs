@@ -96,21 +96,15 @@ impl ObjectStore {
         };
 
         // Try to parse the provided string as a Url, if that fails treat it as local FS
-        future::ready(Url::parse(uri))
-            .map(
-                |result| {
-                    match result {
-                        Ok(url) => {
-                            Self::new_from_url(url)
-                        }
-                        Err(ParseError::RelativeUrlWithoutBase) => {
-                            Self::new_from_path(url)
-                        }
-                        others => Error::from(others)
-                    }
-                }
-            )
-            .await
+        match Url::parse(uri) {
+            Ok(url) => Self::new_from_url(url).map_err(Error::from).await,
+            Err(ParseError::RelativeUrlWithoutBase) => {
+                future::ready(Self::new_from_path(uri))
+                    .map_err(Error::from)
+                    .await
+            }
+            Err(e) => future::err(Error::from(e)).await,
+        }
     }
 
     fn new_from_path(str_path: &str) -> Result<Self> {
@@ -233,7 +227,7 @@ mod tests {
             tmp_path.clone() + "/bar/foo.lance/test_file",
             "TEST_CONTENT".to_string(),
         )
-            .unwrap();
+        .unwrap();
 
         // test a few variations of the same path
         for uri in &[
@@ -257,7 +251,7 @@ mod tests {
             tmp_path.clone() + "/bar/foo.lance/test_file",
             "RELATIVE_URL".to_string(),
         )
-            .unwrap();
+        .unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
@@ -309,7 +303,7 @@ mod tests {
             format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
             "WINDOWS".to_string(),
         )
-            .unwrap();
+        .unwrap();
 
         for uri in &[
             format!("{drive_letter}:/test_folder/test.lance"),
