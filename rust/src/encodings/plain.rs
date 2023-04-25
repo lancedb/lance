@@ -325,14 +325,14 @@ impl<'a> Decoder for PlainDecoder<'a> {
             return self.take_boolean(indices).await;
         }
 
-        let block_size = self.reader.prefetch_size() as u32;
-        let byte_width = self.data_type.byte_width() as u32;
+        let block_size = self.reader.prefetch_size();
+        let byte_width = self.data_type.byte_width();
 
         let mut chunk_ranges = vec![];
         let mut start: u32 = 0;
         for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1) * byte_width
-                > indices.value(start as usize) * byte_width + block_size
+            if indices.value(j as usize + 1) as usize * byte_width
+                > indices.value(start as usize) as usize * byte_width + block_size
             {
                 chunk_ranges.push(start..j + 1);
                 start = j + 1;
