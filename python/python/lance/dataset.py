@@ -28,8 +28,8 @@ import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
-from .lance import __version__, _Dataset, _Scanner, _write_dataset
 from .fragment import LanceFragment
+from .lance import __version__, _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -193,7 +193,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("not changing schemas yet")
 
-    def get_fragments(self, filter: Optional[Expression] = None) -> Iterator[pa.dataset.Fragment]:
+    def get_fragments(
+        self, filter: Optional[Expression] = None
+    ) -> Iterator[pa.dataset.Fragment]:
         """Get all fragments from the dataset.
 
         Note: filter is not supported yet.

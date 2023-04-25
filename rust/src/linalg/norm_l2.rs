@@ -17,16 +17,16 @@
 /// The parameters must be cache line aligned. For example, from
 /// Arrow Arrays, i.e., Float32Array
 #[inline]
-pub fn normalize(vector: &[f32]) -> f32 {
+pub fn norm_l2(vector: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     {
-        aarch64::neon::normalize_f32(vector)
+        aarch64::neon::norm_l2(vector)
     }
 
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("fma") {
-            return x86_64::avx::normalize_f32(vector);
+            return x86_64::avx::norm_l2_f32(vector);
         }
     }
 
@@ -42,7 +42,7 @@ mod x86_64 {
         use std::arch::x86_64::*;
 
         #[inline]
-        pub(crate) fn normalize_f32(vector: &[f32]) -> f32 {
+        pub(crate) fn norm_l2_f32(vector: &[f32]) -> f32 {
             let len = vector.len() / 8 * 8;
             let mut sum = unsafe {
                 let mut sums = _mm256_setzero_ps();
@@ -64,7 +64,7 @@ mod aarch64 {
         use std::arch::aarch64::*;
 
         #[inline]
-        pub(crate) fn normalize_f32(vector: &[f32]) -> f32 {
+        pub(crate) fn norm_l2(vector: &[f32]) -> f32 {
             let len = vector.len() / 4 * 4;
             let mut sum = unsafe {
                 let buf = [0.0_f32; 4];
@@ -86,13 +86,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize() {
+    fn test_norm_l2() {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
-        let result = normalize(&data);
+        let result = norm_l2(&data);
         assert_eq!(result, (1..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt());
 
-        let not_aligned = normalize(&data[2..]);
+        let not_aligned = norm_l2(&data[2..]);
         assert_eq!(
             not_aligned,
             (3..=8).map(|v| (v * v) as f32).sum::<f32>().sqrt()
