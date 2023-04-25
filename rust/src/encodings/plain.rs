@@ -858,7 +858,7 @@ mod tests {
             20,
             100,
             120,
-            (u32_overflow / byte_width) as u32,  // Two overflow offsets
+            (u32_overflow / byte_width) as u32, // Two overflow offsets
             (u32_overflow / byte_width) as u32 + 100,
         ];
         let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
