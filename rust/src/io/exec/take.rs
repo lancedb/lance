@@ -67,11 +67,10 @@ impl Take {
                     let rows = if extra.fields.is_empty() {
                         batch
                     } else {
-                        let batch = dataset
+                        dataset
                             .take_rows(row_ids.values(), &extra)
                             .await?
-                            .merge(&batch)?;
-                        batch
+                            .merge(&batch)?
                     };
                     Ok::<RecordBatch, Error>(rows)
                 })
