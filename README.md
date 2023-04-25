@@ -232,6 +232,14 @@ A comparison of different data formats in each stage of ML development cycle.
 | Exploration         | Fast  | Slow          | Fast       | Slow     | Fast     | Decent    |
 | Infra Support       | Rich  | Rich          | Decent     | Limited  | Rich     | Rich      |
 
+## Community Highlights
+
+Lance is currently used in production by:
+* [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
+* Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
+* E-commerce company for billion-scale+ vector personalized search.
+* and more.
+
 ## Presentations and Talks
 
 * [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.
