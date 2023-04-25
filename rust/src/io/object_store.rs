@@ -50,11 +50,11 @@ pub struct ObjectStore {
 
 /// URI schemes supported by lance
 mod schemes {
-    static S3: &str = "s3";
-    static GOOGLE_CLOUD: &str = "gs";
-    static LOCAL_FILESYSTEM: &str = "file";
+    pub(crate) const AWS_S3: &str = "s3";
+    pub(crate) const GOOGLE_CLOUD_STORAGE: &str = "gs";
+    pub(crate) const LOCAL_FILESYSTEM: &str = "file";
 
-    static ALL_SCHEMES: &[&str] = &[S3, GOOGLE_CLOUD, LOCAL_FILESYSTEM];
+    static ALL_SCHEMES: &[&str] = &[AWS_S3, GOOGLE_CLOUD_STORAGE, LOCAL_FILESYSTEM];
 
     pub(crate) fn is_supported(uri: &str) -> bool {
         let uri_lower = uri.to_lowercase();
@@ -137,19 +137,19 @@ impl ObjectStore {
 
     async fn new_from_url(url: Url) -> Result<Self> {
         match url.scheme() {
-            "s3" => Ok(Self {
+            schemes::AWS_S3 => Ok(Self {
                 inner: build_s3_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
                 prefetch_size: 64 * 1024,
             }),
-            "gs" => Ok(Self {
+            schemes::GOOGLE_CLOUD_STORAGE => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 prefetch_size: 64 * 1024,
             }),
-            "file" => Self::new_from_path(url.path()),
+            schemes::LOCAL_FILESYSTEM => Self::new_from_path(url.path()),
             s => Err(Error::IO(format!("Unknown scheme {}", s))),
         }
     }
