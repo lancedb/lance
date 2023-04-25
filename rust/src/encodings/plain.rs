@@ -310,6 +310,23 @@ impl<'a> PlainDecoder<'a> {
     }
 }
 
+fn make_chunked_requests(
+    indices: &[u32],
+    byte_width: usize,
+    block_size: usize,
+) -> Vec<Range<usize>> {
+    let mut chunked_ranges = vec![];
+    let mut start: usize = 0;
+    for (i, w) in indices.windows(2).enumerate() {
+        if w[0] as usize * byte_width + block_size < w[1] as usize * byte_width {
+            chunked_ranges.push(start..i);
+            start = i;
+        }
+    }
+    chunked_ranges.push(start..indices.len());
+    chunked_ranges
+}
+
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
@@ -328,20 +345,9 @@ impl<'a> Decoder for PlainDecoder<'a> {
         let block_size = self.reader.prefetch_size();
         let byte_width = self.data_type.byte_width();
 
-        let mut chunk_ranges = vec![];
-        let mut start: u32 = 0;
-        for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1) as usize * byte_width
-                > indices.value(start as usize) as usize * byte_width + block_size
-            {
-                chunk_ranges.push(start..j + 1);
-                start = j + 1;
-            }
-        }
-        // Remaining
-        chunk_ranges.push(start..indices.len() as u32);
+        let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
 
-        let arrays = stream::iter(chunk_ranges)
+        let arrays = stream::iter(chunked_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
