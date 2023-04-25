@@ -95,8 +95,9 @@ impl<'a, V: Vertex + Clone> GraphBuilder<V> {
     }
 }
 
+#[async_trait]
 impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
-    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(
                 "Vector index is out of range: {} >= {}",
@@ -115,7 +116,7 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
         Ok((self.distance_func)(vector_a, vector_b))
     }
 
-    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
         let vector = self.data.row(idx).ok_or_else(|| {
             Error::Index(format!(
                 "Attempt to access row {} in a matrix with {} rows",
@@ -126,7 +127,7 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
         Ok((self.distance_func)(query, vector))
     }
 
-    fn neighbors(&self, id: usize) -> Result<&[u32]> {
+    async fn neighbors(&self, id: usize) -> Result<&[u32]> {
         Ok(self.nodes[id].neighbors.as_slice())
     }
 }

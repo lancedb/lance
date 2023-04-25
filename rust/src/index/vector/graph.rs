@@ -16,6 +16,7 @@
 //!
 
 use ordered_float::OrderedFloat;
+use async_trait::async_trait;
 
 pub(crate) mod builder;
 pub(crate) mod persisted;
@@ -24,13 +25,15 @@ use crate::Result;
 pub use persisted::*;
 
 /// Graph
+#[async_trait]
 pub trait Graph {
     /// Distance between two vertices, specified by their IDs.
-    fn distance(&self, a: usize, b: usize) -> Result<f32>;
+    async fn distance(&self, a: usize, b: usize) -> Result<f32>;
 
-    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
+    /// Distance from query vector to a vertex identified by the idx.
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
 
-    fn neighbors(&self, id: usize) -> Result<&[u32]>;
+    async fn neighbors(&self, id: usize) -> Result<&[u32]>;
 }
 
 /// Vertex (metadata). It does not include the actual data.

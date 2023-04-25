@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
-use super::builder::GraphBuilder;
+use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
 use crate::arrow::as_fixed_size_binary_array;
 use crate::datatypes::Schema;
@@ -179,6 +179,20 @@ impl<V: Vertex> PersistedGraph<V> {
             cache.insert(id, neighbors.clone());
             Ok(neighbors)
         }
+    }
+}
+
+impl<V: Vertex> Graph for PersistedGraph<V> {
+    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        todo!()
+    }
+
+    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+        todo!()
+    }
+
+    fn neighbors(&self, id: usize) -> Result<&[u32]> {
+        todo!()
     }
 }
 

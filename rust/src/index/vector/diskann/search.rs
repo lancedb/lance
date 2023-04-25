@@ -124,7 +124,7 @@ impl SearchState {
 /// - query: The query vector.
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
-pub(crate) fn greedy_search(
+pub(crate) async fn greedy_search(
     graph: &dyn Graph,
     start: usize,
     query: &[f32],
@@ -135,17 +135,17 @@ pub(crate) fn greedy_search(
     // A map from distance to vertex id.
     let mut state = SearchState::new(k, search_size);
 
-    let dist = graph.distance_to(query, start)?;
+    let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
     while let Some(id) = state.pop() {
         state.visit(id);
-        for neighbor_id in graph.neighbors(id)?.iter() {
+        for neighbor_id in graph.neighbors(id).await?.iter() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
                 // Already visited.
                 continue;
             }
-            let dist = graph.distance_to(query, neighbor_id)?;
+            let dist = graph.distance_to(query, neighbor_id).await?;
             state.push(neighbor_id, dist);
         }
     }
@@ -164,6 +164,8 @@ impl std::fmt::Debug for DiskANNIndex {
 }
 
 impl DiskANNIndex {
+    /// Creates a new DiskANN index.
+
     pub async fn try_new(object_store: &ObjectStore, graph_path: &Path) -> Result<Self> {
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
@@ -175,7 +177,8 @@ impl DiskANNIndex {
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        todo!()
+        let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
+        Ok(())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
