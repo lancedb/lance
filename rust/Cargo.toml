@@ -37,7 +37,7 @@ async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
-object_store = { version = "0.5.6", features = ["aws", "gcp"] }
+object_store = { version = "0.5.6", features = ["aws_profile", "gcp"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
