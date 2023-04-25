@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Plain encoding
 //!
@@ -847,5 +844,25 @@ mod tests {
             actual.column_by_name("b").unwrap().as_ref(),
             &BooleanArray::from(vec![false, false, true, false, true])
         );
+    }
+
+    #[test]
+    fn test_make_chunked_request() {
+        let byte_width: usize = 4096; // 4K
+        let prefetch_size: usize = 64 * 1024; // 64KB.
+        let u32_overflow: usize = u32::MAX as usize + 10;
+
+        let indices: Vec<u32> = vec![
+            1,
+            10,
+            20,
+            100,
+            120,
+            (u32_overflow / byte_width) as u32,
+            (u32_overflow / byte_width) as u32 + 20,
+        ];
+        let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
+        assert_eq!(chunks.len(), 5, "got chunks: {:?}", chunks);
+        assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6)])
     }
 }
