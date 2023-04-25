@@ -316,8 +316,8 @@ fn make_chunked_requests(
     let mut start: usize = 0;
     for (i, w) in indices.windows(2).enumerate() {
         if w[0] as usize * byte_width + block_size < w[1] as usize * byte_width {
-            chunked_ranges.push(start..i);
-            start = i;
+            chunked_ranges.push(start..i + 1);
+            start = i + 1;
         }
     }
     chunked_ranges.push(start..indices.len());
@@ -858,11 +858,11 @@ mod tests {
             20,
             100,
             120,
-            (u32_overflow / byte_width) as u32,
-            (u32_overflow / byte_width) as u32 + 20,
+            (u32_overflow / byte_width) as u32,  // Two overflow offsets
+            (u32_overflow / byte_width) as u32 + 100,
         ];
         let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
         assert_eq!(chunks.len(), 5, "got chunks: {:?}", chunks);
-        assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6)])
+        assert_eq!(chunks, vec![(0..3), (3..4), (4..5), (5..6), (6..7)])
     }
 }
