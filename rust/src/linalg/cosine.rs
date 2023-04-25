@@ -92,9 +92,10 @@ pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
-    use super::dotprod_scalar;
-    use super::sq_scalar;
     use std::arch::x86_64::*;
+
+    use super::dot;
+    use super::norm_l2;
 
     pub(crate) mod avx {
         use super::*;
@@ -115,9 +116,9 @@ mod x86_64 {
                 }
                 // handle remaining elements
                 let mut dotprod = add_f32_register(xy);
-                dotprod += dotprod_scalar(&x_vector[len..], &y_vector[len..]);
+                dotprod += dot(&x_vector[len..], &y_vector[len..]);
                 let mut y_sq_sum = add_f32_register(y_sq);
-                y_sq_sum += sq_scalar(&y_vector[len..]);
+                y_sq_sum += norm_l2(&y_vector[len..]).powi(2);
                 1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
             }
         }
