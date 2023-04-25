@@ -314,8 +314,9 @@ fn make_chunked_requests(
 ) -> Vec<Range<usize>> {
     let mut chunked_ranges = vec![];
     let mut start: usize = 0;
-    for (i, w) in indices.windows(2).enumerate() {
-        if w[0] as usize * byte_width + block_size < w[1] as usize * byte_width {
+    for i in 0..indices.len() - 1 {
+        if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size
+        {
             chunked_ranges.push(start..i + 1);
             start = i + 1;
         }
