@@ -314,6 +314,12 @@ fn make_chunked_requests(
 ) -> Vec<Range<usize>> {
     let mut chunked_ranges = vec![];
     let mut start: usize = 0;
+    // Note: limit the I/O size to the block size.
+    //
+    // Another option could be checking whether `indices[i]` and `indices[i+1]` are not
+    // farther way than the block size:
+    //    indices[i] * byte_width + block_size < indices[i+1] * byte_width
+    // It might allow slightly larger sequential reads.
     for i in 0..indices.len() - 1 {
         if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size
         {
