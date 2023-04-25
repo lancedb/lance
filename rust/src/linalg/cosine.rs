@@ -19,7 +19,7 @@ use arrow_array::Float32Array;
 use num_traits::real::Real;
 
 use super::dot::dot;
-use super::normalize::normalize;
+use super::norm_l2::norm_l2;
 
 /// Cosine Distance
 pub trait Cosine {
@@ -37,7 +37,7 @@ impl Cosine for [f32] {
 
     #[inline]
     fn cosine(&self, other: &[f32]) -> f32 {
-        let x_norm = normalize(self);
+        let x_norm = norm_l2(self);
         self.cosine_fast(x_norm, other)
     }
 
@@ -79,7 +79,7 @@ pub fn cosine_distance(from: &[f32], to: &[f32]) -> f32 {
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
 pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
-    let x_norm = normalize(from);
+    let x_norm = norm_l2(from);
 
     let dists = unsafe {
         Float32Array::from_trusted_len_iter(
@@ -124,21 +124,12 @@ mod x86_64 {
     }
 }
 
-#[inline]
-fn dotprod_scalar<T: Real + Sum>(x: &[T], y: &[T]) -> T {
-    x.iter().zip(y.iter()).map(|(a, b)| (a.mul(*b))).sum::<T>()
-}
-
-#[inline]
-fn sq_scalar<T: Real + Sum>(y: &[T]) -> T {
-    y.iter().map(|a| a.powi(2)).sum::<T>()
-}
-
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    use super::dotprod_scalar;
-    use super::sq_scalar;
     use std::arch::aarch64::*;
+
+    use super::dot;
+    use super::norm_l2;
 
     pub(crate) mod neon {
         use super::*;
@@ -158,9 +149,9 @@ mod aarch64 {
                 }
                 // handle remaining elements
                 let mut dotprod = vaddvq_f32(xy);
-                dotprod += dotprod_scalar(&x[len..], &y[len..]);
+                dotprod += dot(&x[len..], &y[len..]);
                 let mut y_sq_sum = vaddvq_f32(y_sq);
-                y_sq_sum += sq_scalar(&y[len..]);
+                y_sq_sum += norm_l2(&y[len..]).powi(2);
                 1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
             }
         }
