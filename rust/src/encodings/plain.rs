@@ -869,7 +869,7 @@ mod tests {
             (u32_overflow / byte_width) as u32 + 100,
         ];
         let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
-        assert_eq!(chunks.len(), 5, "got chunks: {:?}", chunks);
-        assert_eq!(chunks, vec![(0..3), (3..4), (4..5), (5..6), (6..7)])
+        assert_eq!(chunks.len(), 6, "got chunks: {:?}", chunks);
+        assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6), (6..7)])
     }
 }
