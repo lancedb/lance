@@ -19,7 +19,7 @@ use arrow_array::Float32Array;
 use num_traits::real::Real;
 
 use super::dot::dot;
-use super::normalize::normalize;
+use super::norm_l2::norm_l2;
 
 /// Cosine Distance
 pub trait Cosine {
@@ -37,7 +37,7 @@ impl Cosine for [f32] {
 
     #[inline]
     fn cosine(&self, other: &[f32]) -> f32 {
-        let x_norm = normalize(self);
+        let x_norm = norm_l2(self);
         self.cosine_fast(x_norm, other)
     }
 
@@ -79,7 +79,7 @@ pub fn cosine_distance(from: &[f32], to: &[f32]) -> f32 {
 ///
 /// <https://en.wikipedia.org/wiki/Cosine_similarity>
 pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
-    let x_norm = normalize(from);
+    let x_norm = norm_l2(from);
 
     let dists = unsafe {
         Float32Array::from_trusted_len_iter(
@@ -94,6 +94,9 @@ pub fn cosine_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<
 mod x86_64 {
     use std::arch::x86_64::*;
 
+    use super::dot;
+    use super::norm_l2;
+
     pub(crate) mod avx {
         use super::*;
 
@@ -102,7 +105,7 @@ mod x86_64 {
             unsafe {
                 use crate::linalg::x86_64::avx::add_f32_register;
 
-                let len = x_vector.len();
+                let len = x_vector.len() / 8 * 8;
                 let mut xy = _mm256_setzero_ps();
                 let mut y_sq = _mm256_setzero_ps();
                 for i in (0..len).step_by(8) {
@@ -111,7 +114,12 @@ mod x86_64 {
                     xy = _mm256_fmadd_ps(x, y, xy);
                     y_sq = _mm256_fmadd_ps(y, y, y_sq);
                 }
-                1.0 - add_f32_register(xy) / (x_norm * add_f32_register(y_sq).sqrt())
+                // handle remaining elements
+                let mut dotprod = add_f32_register(xy);
+                dotprod += dot(&x_vector[len..], &y_vector[len..]);
+                let mut y_sq_sum = add_f32_register(y_sq);
+                y_sq_sum += norm_l2(&y_vector[len..]).powi(2);
+                1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
             }
         }
     }
@@ -121,13 +129,16 @@ mod x86_64 {
 mod aarch64 {
     use std::arch::aarch64::*;
 
+    use super::dot;
+    use super::norm_l2;
+
     pub(crate) mod neon {
         use super::*;
 
         #[inline]
         pub(crate) fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
             unsafe {
-                let len = x.len();
+                let len = x.len() / 4 * 4;
                 let buf = [0.0_f32; 4];
                 let mut xy = vld1q_f32(buf.as_ptr());
                 let mut y_sq = xy;
@@ -137,7 +148,12 @@ mod aarch64 {
                     xy = vfmaq_f32(xy, left, right);
                     y_sq = vfmaq_f32(y_sq, right, right);
                 }
-                1.0 - vaddvq_f32(xy) / (x_norm * vaddvq_f32(y_sq).sqrt())
+                // handle remaining elements
+                let mut dotprod = vaddvq_f32(xy);
+                dotprod += dot(&x[len..], &y[len..]);
+                let mut y_sq_sum = vaddvq_f32(y_sq);
+                y_sq_sum += norm_l2(&y[len..]).powi(2);
+                1.0 - dotprod / (x_norm * y_sq_sum.sqrt())
             }
         }
     }
@@ -162,5 +178,14 @@ mod tests {
         let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
         assert_relative_eq!(d.value(0), 1.0 - 0.8735806510613104);
+    }
+
+    #[test]
+    fn test_cosine_not_aligned() {
+        let x: Float32Array = vec![16 as f32, 32 as f32].into();
+        let y: Float32Array = vec![1 as f32, 2 as f32, 4 as f32, 8 as f32].into();
+        let d = cosine_distance_batch(x.values(), y.values(), 2);
+        assert_relative_eq!(d.value(0), 0.0);
+        assert_relative_eq!(d.value(1), 0.0);
     }
 }

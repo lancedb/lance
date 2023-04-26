@@ -20,9 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-import pandas as pd
-
 import lance
+import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa

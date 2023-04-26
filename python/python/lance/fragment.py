@@ -16,7 +16,8 @@
 """Dataset Fragment"""
 
 from __future__ import annotations
-from typing import Union, Optional, Iterator
+
+from typing import Iterator, Optional, Union
 
 import pyarrow as pa
 

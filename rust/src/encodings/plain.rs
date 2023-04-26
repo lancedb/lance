@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Plain encoding
 //!
@@ -310,6 +307,30 @@ impl<'a> PlainDecoder<'a> {
     }
 }
 
+fn make_chunked_requests(
+    indices: &[u32],
+    byte_width: usize,
+    block_size: usize,
+) -> Vec<Range<usize>> {
+    let mut chunked_ranges = vec![];
+    let mut start: usize = 0;
+    // Note: limit the I/O size to the block size.
+    //
+    // Another option could be checking whether `indices[i]` and `indices[i+1]` are not
+    // farther way than the block size:
+    //    indices[i] * byte_width + block_size < indices[i+1] * byte_width
+    // It might allow slightly larger sequential reads.
+    for i in 0..indices.len() - 1 {
+        if indices[i + 1] as usize * byte_width > indices[start] as usize * byte_width + block_size
+        {
+            chunked_ranges.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    chunked_ranges.push(start..indices.len());
+    chunked_ranges
+}
+
 #[async_trait]
 impl<'a> Decoder for PlainDecoder<'a> {
     async fn decode(&self) -> Result<ArrayRef> {
@@ -325,23 +346,12 @@ impl<'a> Decoder for PlainDecoder<'a> {
             return self.take_boolean(indices).await;
         }
 
-        let block_size = self.reader.prefetch_size() as u32;
-        let byte_width = self.data_type.byte_width() as u32;
+        let block_size = self.reader.prefetch_size();
+        let byte_width = self.data_type.byte_width();
 
-        let mut chunk_ranges = vec![];
-        let mut start: u32 = 0;
-        for j in 0..(indices.len() - 1) as u32 {
-            if indices.value(j as usize + 1) * byte_width
-                > indices.value(start as usize) * byte_width + block_size
-            {
-                chunk_ranges.push(start..j + 1);
-                start = j + 1;
-            }
-        }
-        // Remaining
-        chunk_ranges.push(start..indices.len() as u32);
+        let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
 
-        let arrays = stream::iter(chunk_ranges)
+        let arrays = stream::iter(chunked_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
@@ -841,5 +851,25 @@ mod tests {
             actual.column_by_name("b").unwrap().as_ref(),
             &BooleanArray::from(vec![false, false, true, false, true])
         );
+    }
+
+    #[test]
+    fn test_make_chunked_request() {
+        let byte_width: usize = 4096; // 4K
+        let prefetch_size: usize = 64 * 1024; // 64KB.
+        let u32_overflow: usize = u32::MAX as usize + 10;
+
+        let indices: Vec<u32> = vec![
+            1,
+            10,
+            20,
+            100,
+            120,
+            (u32_overflow / byte_width) as u32, // Two overflow offsets
+            (u32_overflow / byte_width) as u32 + 100,
+        ];
+        let chunks = make_chunked_requests(&indices, byte_width, prefetch_size);
+        assert_eq!(chunks.len(), 6, "got chunks: {:?}", chunks);
+        assert_eq!(chunks, vec![(0..2), (2..3), (3..4), (4..5), (5..6), (6..7)])
     }
 }

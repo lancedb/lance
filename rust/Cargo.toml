@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
@@ -37,7 +37,7 @@ async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
-object_store = { version = "0.5.6", features = ["aws", "gcp"] }
+object_store = { version = "0.5.6", features = ["aws_profile", "gcp"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
@@ -69,14 +69,14 @@ accelerate-src = "0.3.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 openblas-src = { version = "0.10.8", default-features= false, features = ["static", "cblas"]}
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 openblas-src = { version = "0.10.8", default-features= false, features = ["system"]}
 
 [target.'cfg(target_os="windows")'.build-dependencies]
 vcpkg = "0.2"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 
 [build-dependencies]
 prost-build = "0.11"
