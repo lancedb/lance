@@ -16,6 +16,8 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use super::{Graph, Vertex};
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
@@ -35,7 +37,7 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub(crate) struct GraphBuilder<V: Vertex + Clone> {
+pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
@@ -48,7 +50,7 @@ pub(crate) struct GraphBuilder<V: Vertex + Clone> {
     distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync>,
 }
 
-impl<'a, V: Vertex + Clone> GraphBuilder<V> {
+impl<'a, V: Vertex + Clone + Sync> GraphBuilder<V> {
     pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
         Self {
             nodes: vertices
@@ -96,7 +98,7 @@ impl<'a, V: Vertex + Clone> GraphBuilder<V> {
 }
 
 #[async_trait]
-impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
+impl<V: Vertex + Clone + Sync> Graph for GraphBuilder<V> {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(

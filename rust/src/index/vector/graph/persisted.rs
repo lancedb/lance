@@ -208,7 +208,7 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub(crate) async fn write_graph<V: Vertex + Clone>(
+pub(crate) async fn write_graph<V: Vertex + Clone + Sync>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,

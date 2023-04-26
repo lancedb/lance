@@ -15,8 +15,8 @@
 //! Graph-based vector index.
 //!
 
-use ordered_float::OrderedFloat;
 use async_trait::async_trait;
+use ordered_float::OrderedFloat;
 
 pub(crate) mod builder;
 pub(crate) mod persisted;

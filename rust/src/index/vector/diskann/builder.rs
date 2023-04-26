@@ -153,7 +153,7 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i)?.iter().copied().collect();
+        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i).await?.iter().copied().collect();
 
         while neighbor_ids.len() < r {
             let neighbor_id = rng.sample(distribution);
@@ -192,7 +192,7 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
 }
 
 /// Algorithm 2 in the paper.
-async fn robust_prune<V: Vertex + Clone>(
+async fn robust_prune<V: Vertex + Clone + Sync>(
     graph: &GraphBuilder<V>,
     id: usize,
     mut visited: HashSet<usize>,
@@ -200,7 +200,7 @@ async fn robust_prune<V: Vertex + Clone>(
     r: usize,
 ) -> Result<Vec<u32>> {
     visited.remove(&id);
-    let neighbors = graph.neighbors(id)?;
+    let neighbors = graph.neighbors(id).await?;
     visited.extend(neighbors.iter().map(|id| *id as usize));
 
     let mut heap: BinaryHeap<VertexWithDistance> = visited
@@ -266,7 +266,7 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
 }
 
 /// One pass of index building.
-async fn index_once<V: Vertex + Clone>(
+async fn index_once<V: Vertex + Clone + Sync>(
     graph: &mut GraphBuilder<V>,
     medoid: usize,
     alpha: f32,
@@ -283,7 +283,7 @@ async fn index_once<V: Vertex + Clone>(
             .row(i)
             .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
 
-        let state = greedy_search(graph, medoid, vector, 1, l)?;
+        let state = greedy_search(graph, medoid, vector, 1, l).await?;
 
         graph
             .neighbors_mut(id)
@@ -296,7 +296,8 @@ async fn index_once<V: Vertex + Clone>(
         let neighbours = stream::iter(neighbors)
             .map(|j| async move {
                 let mut neighbor_set: HashSet<usize> = fixed_graph
-                    .neighbors(j as usize)?
+                    .neighbors(j as usize)
+                    .await?
                     .iter()
                     .map(|v| *v as usize)
                     .collect();
