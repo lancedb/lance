@@ -34,7 +34,7 @@ use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
-use crate::linalg::{l2::l2_distance_batch, normalize::normalize};
+use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
 use crate::{Error, Result};
 
 /// Product Quantization Index.
@@ -133,7 +133,7 @@ impl PQIndex {
         let mut xy_table: Vec<f32> = vec![];
         let mut y_norm_table: Vec<f32> = vec![];
 
-        let x_norm = normalize(key.values()).powi(2);
+        let x_norm = norm_l2(key.values()).powi(2);
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {

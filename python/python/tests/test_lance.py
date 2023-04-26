@@ -20,6 +20,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset
 import pytest
+from lance.vector import vec_to_table
 
 
 def test_table_roundtrip(tmp_path):
@@ -102,6 +103,24 @@ def test_nearest(tmp_path):
 
 def l2sq(vec, mat):
     return np.sum((mat - vec) ** 2, axis=1)
+
+
+def test_nearest_cosine(tmp_path):
+    tbl = vec_to_table([[2.5, 6], [7.4, 3.3]])
+    lance.write_dataset(tbl, tmp_path)
+
+    q = [483.5, 1384.5]
+    dataset = lance.dataset(tmp_path)
+    rs = dataset.to_table(
+        nearest={"column": "vector", "q": q, "k": 10, "metric": "cosine"}
+    ).to_pandas()
+    for i in range(len(rs)):
+        assert rs.score[i] == pytest.approx(cosine_distance(rs.vector[i], q), abs=1e-6)
+        assert 0 <= rs.score[i] <= 1
+
+
+def cosine_distance(vec1, vec2):
+    return 1 - np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 
 def test_count_rows(tmp_path):
