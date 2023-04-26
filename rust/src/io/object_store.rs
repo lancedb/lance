@@ -326,4 +326,12 @@ mod tests {
             assert_eq!(contents, "WINDOWS");
         }
     }
+
+    #[tokio::test]
+    async fn test_supported_schemes() {
+        assert!(schemes::is_supported("s3://bucket/path"));
+        assert!(schemes::is_supported("gs://bucket/path"));
+        assert!(schemes::is_supported("file://folder"));
+        assert!(!schemes::is_supported("azure://bucket/path"));
+    }
 }
