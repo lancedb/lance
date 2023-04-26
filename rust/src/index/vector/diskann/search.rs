@@ -19,6 +19,7 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
+use arrow_schema::{Schema, Field, DataType};
 use async_trait::async_trait;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
@@ -125,7 +126,7 @@ impl SearchState {
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
 pub(crate) async fn greedy_search(
-    graph: &dyn Graph,
+    graph: &(dyn Graph + Send + Sync),
     start: usize,
     query: &[f32],
     k: usize,
@@ -178,7 +179,8 @@ impl DiskANNIndex {
 impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
-        Ok(())
+        let schema = Arc::new(Schema::new(vec![Field::new("row_id", DataType::UInt64, false)]));
+        Ok(RecordBatch::new_empty(schema))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

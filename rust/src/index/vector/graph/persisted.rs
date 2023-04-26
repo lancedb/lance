@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use arrow::array::{as_list_array, as_primitive_array};
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
@@ -182,16 +183,17 @@ impl<V: Vertex> PersistedGraph<V> {
     }
 }
 
-impl<V: Vertex> Graph for PersistedGraph<V> {
-    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+#[async_trait]
+impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
+    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         todo!()
     }
 
-    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
         todo!()
     }
 
-    fn neighbors(&self, id: usize) -> Result<&[u32]> {
+    async fn neighbors(&self, id: usize) -> Result<&[u32]> {
         todo!()
     }
 }
@@ -208,7 +210,7 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub(crate) async fn write_graph<V: Vertex + Clone + Sync>(
+pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,

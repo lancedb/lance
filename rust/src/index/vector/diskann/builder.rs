@@ -192,7 +192,7 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
 }
 
 /// Algorithm 2 in the paper.
-async fn robust_prune<V: Vertex + Clone + Sync>(
+async fn robust_prune<V: Vertex + Clone + Sync + Send>(
     graph: &GraphBuilder<V>,
     id: usize,
     mut visited: HashSet<usize>,
@@ -266,7 +266,7 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
 }
 
 /// One pass of index building.
-async fn index_once<V: Vertex + Clone + Sync>(
+async fn index_once<V: Vertex + Clone + Sync + Send>(
     graph: &mut GraphBuilder<V>,
     medoid: usize,
     alpha: f32,

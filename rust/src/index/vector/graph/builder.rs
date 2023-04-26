@@ -37,7 +37,7 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync> {
+pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
@@ -50,7 +50,7 @@ pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync> {
     distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync>,
 }
 
-impl<'a, V: Vertex + Clone + Sync> GraphBuilder<V> {
+impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
     pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
         Self {
             nodes: vertices
@@ -98,7 +98,7 @@ impl<'a, V: Vertex + Clone + Sync> GraphBuilder<V> {
 }
 
 #[async_trait]
-impl<V: Vertex + Clone + Sync> Graph for GraphBuilder<V> {
+impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(
