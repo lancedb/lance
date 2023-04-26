@@ -18,15 +18,19 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatch;
-use arrow_schema::{Schema, Field, DataType};
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
-    index::vector::graph::{GraphReadParams, PersistedGraph},
+    dataset::ROW_ID,
+    index::vector::{
+        graph::{GraphReadParams, PersistedGraph},
+        SCORE_COL,
+    },
     io::ObjectStore,
     Result,
 };
@@ -179,8 +183,29 @@ impl DiskANNIndex {
 impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
-        let schema = Arc::new(Schema::new(vec![Field::new("row_id", DataType::UInt64, false)]));
-        Ok(RecordBatch::new_empty(schema))
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(SCORE_COL, DataType::Float32, false),
+        ]));
+
+        let row_ids: UInt64Array = state
+            .candidates
+            .iter()
+            .take(query.k)
+            .map(|(_, id)| *id as u64)
+            .collect();
+        let scores: Float32Array = state
+            .candidates
+            .iter()
+            .take(query.k)
+            .map(|(d, _)| **d)
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+        )?;
+        Ok(batch)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
