@@ -372,7 +372,7 @@ mod tests {
         TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit, Fields as ArrowFields};
     use object_store::path::Path;
 
     use crate::io::{FileReader, ObjectStore};
@@ -411,7 +411,7 @@ mod tests {
             ArrowField::new(
                 "fixed_size_list",
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     16,
                 ),
                 true,
@@ -419,17 +419,17 @@ mod tests {
             ArrowField::new("fixed_size_binary", DataType::FixedSizeBinary(8), true),
             ArrowField::new(
                 "l",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
                 true,
             ),
             ArrowField::new(
                 "large_l",
-                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
                 true,
             ),
             ArrowField::new(
                 "l_dict",
-                DataType::List(Box::new(ArrowField::new(
+                DataType::List(Arc::new(ArrowField::new(
                     "item",
                     DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
                     true,
@@ -438,7 +438,7 @@ mod tests {
             ),
             ArrowField::new(
                 "large_l_dict",
-                DataType::LargeList(Box::new(ArrowField::new(
+                DataType::LargeList(Arc::new(ArrowField::new(
                     "item",
                     DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
                     true,
@@ -447,10 +447,10 @@ mod tests {
             ),
             ArrowField::new(
                 "s",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("si", DataType::Int64, true),
                     ArrowField::new("sb", DataType::Utf8, true),
-                ]),
+                ])),
                 true,
             ),
         ]);
@@ -611,7 +611,7 @@ mod tests {
                 "ts_tz",
                 DataType::Timestamp(
                     TimeUnit::Microsecond,
-                    Some("America/Los_Angeles".to_string()),
+                    Some("America/Los_Angeles".into()),
                 ),
                 false,
             ),

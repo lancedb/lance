@@ -388,7 +388,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "vector",
             DataType::FixedSizeList(
-                Box::new(Field::new("item", DataType::Float32, true)),
+                Arc::new(Field::new("item", DataType::Float32, true)),
                 dim as i32,
             ),
             true,

@@ -132,7 +132,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "embeddings",
             DataType::FixedSizeList(
-                Box::new(Field::new("item", DataType::Float32, true)),
+                Arc::new(Field::new("item", DataType::Float32, true)),
                 dimension,
             ),
             false,

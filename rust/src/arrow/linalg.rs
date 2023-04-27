@@ -447,13 +447,14 @@ mod tests {
             -0.6525516,
             0.10910681,
         ];
-        assert_relative_eq!(u.data().values(), expected_u.as_slice(), epsilon = 0.0001,);
+        u.data().values().iter().zip(expected_u.iter()).for_each(|(a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
 
-        assert_relative_eq!(
-            sigma.values(),
-            vec![27.46873242, 22.64318501, 8.55838823, 5.9857232, 2.01489966].as_slice(),
-            epsilon = 0.0001,
-        );
+        let expected = vec![27.46873242, 22.64318501, 8.55838823, 5.9857232, 2.01489966];
+        sigma.values().iter().zip(expected).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
 
         // Obtained from `numpy.linagl.svd()`.
         let expected_vt = vec![
@@ -483,7 +484,9 @@ mod tests {
             -0.62652825,
             -0.43955169,
         ];
-        assert_relative_eq!(vt.data().values(), expected_vt.as_slice(), epsilon = 0.0001,)
+        vt.data().values().iter().zip(expected_vt).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
     }
 
     #[test]
@@ -499,7 +502,10 @@ mod tests {
         let b = MatrixView::new(b_data, 2);
 
         let c = a.dot(&b).unwrap();
-        assert_relative_eq!(c.data.values(), vec![44.0, 50.0, 98.0, 113.0].as_slice(),);
+        let expected = vec![44.0, 50.0, 98.0, 113.0];
+        c.data.values().iter().zip(expected).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
     }
 
     #[test]
@@ -515,7 +521,10 @@ mod tests {
         let b = MatrixView::new(b_data, 2);
 
         let c_t = b.transpose().dot(&a.transpose()).unwrap();
-        assert_relative_eq!(c_t.data.values(), vec![44.0, 98.0, 50.0, 113.0].as_slice(),);
+        let expected = vec![44.0, 98.0, 50.0, 113.0];
+        c_t.data.values().iter().zip(expected).for_each(|(&a, b)| {
+            assert_relative_eq!(a, b, epsilon = 0.0001);
+        });
     }
 
     #[test]

@@ -552,7 +552,7 @@ mod tests {
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let list_type =
-                DataType::FixedSizeList(Box::new(Field::new("item", t.clone(), true)), 3);
+                DataType::FixedSizeList(Arc::new(Field::new("item", t.clone(), true)), 3);
             let mut arrs: Vec<ArrayRef> = Vec::new();
 
             for _ in 0..10 {
@@ -580,8 +580,8 @@ mod tests {
     #[tokio::test]
     async fn test_encode_decode_nested_fixed_size_list() {
         // FixedSizeList of FixedSizeList
-        let inner = DataType::FixedSizeList(Box::new(Field::new("item", DataType::Int64, true)), 2);
-        let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
+        let inner = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, true)), 2);
+        let t = DataType::FixedSizeList(Arc::new(Field::new("item", inner, true)), 2);
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
@@ -595,7 +595,7 @@ mod tests {
 
         // FixedSizeList of FixedSizeBinary
         let inner = DataType::FixedSizeBinary(2);
-        let t = DataType::FixedSizeList(Box::new(Field::new("item", inner, true)), 2);
+        let t = DataType::FixedSizeList(Arc::new(Field::new("item", inner, true)), 2);
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
@@ -722,7 +722,7 @@ mod tests {
         for i in (0..1000).step_by(4) {
             let data = array.slice(i, 4);
             file_writer
-                .write(&[&RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
+                .write(&[&RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
                 .await
                 .unwrap();
         }
@@ -776,12 +776,11 @@ mod tests {
         let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
 
         for i in (0..100).step_by(4) {
-            let data = fixed_size_list.slice(i, 4);
-            let slice: &FixedSizeListArray = as_fixed_size_list_array(data.as_ref());
+            let slice: FixedSizeListArray = fixed_size_list.slice(i, 4);
             file_writer
                 .write(&[&RecordBatch::try_new(
                     arrow_schema.clone(),
-                    vec![Arc::new(slice.clone())],
+                    vec![Arc::new(slice)],
                 )
                 .unwrap()])
                 .await

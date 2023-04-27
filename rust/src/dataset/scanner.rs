@@ -761,7 +761,7 @@ mod test {
             ArrowField::new(
                 "vec",
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     32,
                 ),
                 true,
@@ -843,7 +843,7 @@ mod test {
                     ArrowField::new(
                         "vec",
                         DataType::FixedSizeList(
-                            Box::new(ArrowField::new("item", DataType::Float32, true)),
+                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
                             32,
                         ),
                         true,
@@ -894,7 +894,7 @@ mod test {
                 ArrowField::new(
                     "vec",
                     DataType::FixedSizeList(
-                        Box::new(ArrowField::new("item", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
                         32,
                     ),
                     true,
@@ -944,7 +944,7 @@ mod test {
                 ArrowField::new(
                     "vec",
                     DataType::FixedSizeList(
-                        Box::new(ArrowField::new("item", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
                         32,
                     ),
                     true,

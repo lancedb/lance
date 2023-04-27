@@ -469,9 +469,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_binary_data_with_offset() {
-        let slice = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
-        let array = as_string_array(slice.as_ref());
-        test_round_trips(&[array]).await;
+        let array: StringArray = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
+        test_round_trips(&[&array]).await;
     }
 
     #[tokio::test]
@@ -584,7 +583,7 @@ mod tests {
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         for i in 0..10 {
             let pos = encoder
-                .encode(&[data.slice(i * 10, 10).as_ref()])
+                .encode(&[&data.slice(i * 10, 10)])
                 .await
                 .unwrap();
             assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));

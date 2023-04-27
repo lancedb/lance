@@ -574,7 +574,7 @@ mod tests {
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
         RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
     };
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, Fields as ArrowFields};
     use tempfile::tempdir;
 
     use crate::io::FileWriter;
@@ -702,7 +702,7 @@ mod tests {
     async fn test_write_null_string_in_struct(field_nullable: bool) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "parent",
-            DataType::Struct(vec![ArrowField::new("str", DataType::Utf8, field_nullable)]),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new("str", DataType::Utf8, field_nullable)])),
             true,
         )]));
 
@@ -795,14 +795,14 @@ mod tests {
             DataType::Struct(subfields) => subfields
                 .iter()
                 .zip(expected_columns)
-                .map(|(f, d)| (f.clone(), d))
+                .map(|(f, d)| (f.as_ref().clone(), d))
                 .collect::<Vec<_>>(),
             _ => panic!("unexpected field"),
         };
 
         let expected_struct_array = StructArray::from(expected_struct);
         let expected_batch = RecordBatch::from(&StructArray::from(vec![(
-            arrow_schema.fields[0].clone(),
+            arrow_schema.fields[0].as_ref().clone(),
             Arc::new(expected_struct_array) as ArrayRef,
         )]));
 
@@ -815,23 +815,23 @@ mod tests {
     fn make_schema_of_list_array() -> Arc<arrow_schema::Schema> {
         Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
-            DataType::Struct(vec![
+            DataType::Struct(ArrowFields::from(vec![
                 ArrowField::new(
                     "li",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     true,
                 ),
                 ArrowField::new(
                     "ls",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
                     true,
                 ),
                 ArrowField::new(
                     "ll",
-                    DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     false,
                 ),
-            ]),
+            ])),
             true,
         )]))
     }
@@ -857,7 +857,7 @@ mod tests {
             (
                 ArrowField::new(
                     "li",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     true,
                 ),
                 Arc::new(li_builder.finish()) as ArrayRef,
@@ -865,7 +865,7 @@ mod tests {
             (
                 ArrowField::new(
                     "ls",
-                    DataType::List(Box::new(ArrowField::new("item", DataType::Utf8, true))),
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
                     true,
                 ),
                 Arc::new(ls_builder.finish()) as ArrayRef,
@@ -873,7 +873,7 @@ mod tests {
             (
                 ArrowField::new(
                     "ll",
-                    DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     false,
                 ),
                 Arc::new(large_list_builder.finish()) as ArrayRef,
@@ -887,11 +887,11 @@ mod tests {
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
-            DataType::Struct(vec![ArrowField::new(
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
                 "d",
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 true,
-            )]),
+            )])),
             true,
         )]));
 
@@ -1022,12 +1022,12 @@ mod tests {
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "l",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                 false,
             ),
             ArrowField::new(
                 "ll",
-                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                 false,
             ),
         ]);
@@ -1092,12 +1092,12 @@ mod tests {
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "l",
-                DataType::List(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                 false,
             ),
             ArrowField::new(
                 "ll",
-                DataType::LargeList(Box::new(ArrowField::new("item", DataType::Int32, true))),
+                DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                 false,
             ),
         ]);

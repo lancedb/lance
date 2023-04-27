@@ -696,8 +696,10 @@ mod tests {
             actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
         }
 
-        let result = pq.codebook.unwrap().values();
-        let expected = actual_pq.codebook.unwrap().values();
-        assert_relative_eq!(result, expected);
+        let result = pq.codebook.unwrap();
+        let expected = actual_pq.codebook.unwrap();
+        result.values().iter().zip(expected.values()).for_each(|(&r, &e)| {
+            assert!(relative_eq!(r, e));
+        });
     }
 }
