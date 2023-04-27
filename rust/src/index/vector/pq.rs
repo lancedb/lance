@@ -13,14 +13,13 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
-    Float32Array, RecordBatch, UInt64Array, UInt8Array,
-};
+use arrow_array::{builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array, PrimitiveArray};
+use arrow_array::types::Int32Type;
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
@@ -137,8 +136,7 @@ impl PQIndex {
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
-            let slice = key.slice(i * sub_vector_length, sub_vector_length);
-            let key_sub_vector: &Float32Array = as_primitive_array(slice.as_ref());
+            let key_sub_vector: Float32Array = key.slice(i * sub_vector_length, sub_vector_length);
             let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| {
                 Error::Index("PQIndex::cosine_scores: PQ is not initialized".to_string())
             })?;
@@ -501,12 +499,11 @@ impl ProductQuantizer {
             let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
             for sub_vec_id in 0..code.len() {
                 let centroid = code.value(sub_vec_id) as usize;
-                let sub_vector = data.data().slice(
+                let sub_vector: Float32Array = data.data().slice(
                     i * self.dimension + sub_vec_id * sub_vector_dim,
                     sub_vector_dim,
                 );
                 counts[sub_vec_id * num_centroids + centroid] += 1;
-                let sub_vector: &Float32Array = as_primitive_array(sub_vector.as_ref());
                 for k in 0..sub_vector.len() {
                     sum[sub_vec_id * sum_stride + centroid * sub_vector_dim + k] +=
                         sub_vector.value(k);
@@ -637,7 +634,7 @@ pub(crate) async fn train_pq(
 mod tests {
 
     use super::*;
-    use approx::assert_relative_eq;
+    use approx::{assert_relative_eq, relative_eq};
     use arrow_array::types::Float32Type;
 
     #[test]
@@ -696,10 +693,8 @@ mod tests {
             actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
         }
 
-        assert_relative_eq!(
-            pq.codebook.unwrap().values(),
-            actual_pq.codebook.unwrap().values(),
-            epsilon = 0.01
-        );
+        let result = pq.codebook.unwrap().values();
+        let expected = actual_pq.codebook.unwrap().values();
+        assert_relative_eq!(result, expected);
     }
 }

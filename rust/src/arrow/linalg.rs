@@ -254,7 +254,7 @@ impl MatrixView {
         let mut builder = Float32Builder::with_capacity(n * dim);
         for idx in chosen.iter() {
             let s = self.data.slice(idx * dim, dim);
-            builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
+            builder.append_slice(s.values());
         }
         let data = Arc::new(builder.finish());
         Self {

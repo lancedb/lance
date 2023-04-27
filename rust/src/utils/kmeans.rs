@@ -102,8 +102,8 @@ async fn kmean_plusplus(
     assert!(data.len() > k * dimension);
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
     let first_idx = rng.gen_range(0..data.len() / dimension);
-    let first_vector = data.slice(first_idx * dimension, dimension);
-    kmeans.centroids = Arc::new(as_primitive_array(first_vector.as_ref()).clone());
+    let first_vector: Float32Array = data.slice(first_idx * dimension, dimension);
+    kmeans.centroids = Arc::new(first_vector);
 
     let mut seen = HashSet::new();
     seen.insert(first_idx);
@@ -120,8 +120,7 @@ async fn kmean_plusplus(
             }
         }
 
-        let slice = data.slice(chosen * dimension, dimension);
-        let new_vector: &Float32Array = as_primitive_array(slice.as_ref());
+        let new_vector: Float32Array = data.slice(chosen * dimension, dimension);
 
         let new_centroid_values = Float32Array::from_iter_values(
             kmeans
@@ -208,7 +207,7 @@ impl KMeanMembership {
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
                                 sum =
-                                    add(&sum, as_primitive_array(data.slice(i * dimension, dimension).as_ref())).unwrap();
+                                    add(&sum, &data.slice(i * dimension, dimension)).unwrap();
                                 total += 1.0;
                             };
                         }
@@ -216,8 +215,7 @@ impl KMeanMembership {
                             divide_scalar(&sum, total).unwrap()
                         } else {
                             eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
-                            let prev_centroids = prev_centroids.slice(cluster * dimension, dimension);
-                            as_primitive_array(prev_centroids.as_ref()).clone()
+                            prev_centroids.slice(cluster * dimension, dimension)
                         }
                     })
                     .await

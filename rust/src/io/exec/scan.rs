@@ -203,8 +203,8 @@ impl ExecutionPlan for LanceScanExec {
     fn schema(&self) -> SchemaRef {
         let schema: ArrowSchema = self.projection.as_ref().into();
         if self.with_row_id {
-            let mut fields = schema.fields;
-            fields.push(Field::new(ROW_ID, DataType::UInt64, false));
+            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
+            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
             Arc::new(ArrowSchema::new(fields))
         } else {
             Arc::new(schema)

@@ -15,6 +15,7 @@
 //! Var-length binary encoding.
 //!
 
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
@@ -193,7 +194,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let end = positions.value(range.end);
 
         let slice = positions.slice(range.start, range.len() + 1);
-        let position_slice: &Int64Array = as_primitive_array(slice.as_ref());
+        let position_slice: &Int64Array = as_primitive_array(slice.borrow());
         let offset_data = if T::Offset::IS_LARGE {
             subtract_scalar(position_slice, start)?.into_data()
         } else {
