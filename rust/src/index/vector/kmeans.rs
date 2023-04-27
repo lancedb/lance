@@ -16,7 +16,7 @@ use std::borrow::Borrow;
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Float32Array,
 };
 use rand::{seq::IteratorRandom, Rng};
 

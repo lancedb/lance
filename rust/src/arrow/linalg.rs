@@ -17,10 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::{
-    array::{as_primitive_array, Float32Builder},
-    datatypes::Float32Type,
-};
+use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};

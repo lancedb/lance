@@ -366,7 +366,7 @@ impl Field {
                     panic!("Unsupported dictionary key type: {}", key_type);
                 }
             },
-            DataType::Struct(mut subfields) => {
+            DataType::Struct(subfields) => {
                 for (i, f) in subfields.iter().enumerate() {
                     let lance_field = self
                         .children

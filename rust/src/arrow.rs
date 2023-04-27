@@ -221,7 +221,7 @@ impl FixedSizeListArrayExt for FixedSizeListArray {
         );
         let data = ArrayDataBuilder::new(list_type)
             .len(values.len() / list_size as usize)
-            .add_child_data(values.data().clone())
+            .add_child_data(values.into_data())
             .build()?;
 
         Ok(Self::from(data))
@@ -261,7 +261,7 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
         let data_type = DataType::FixedSizeBinary(stride);
         let data = ArrayDataBuilder::new(data_type)
             .len(values.len() / stride as usize)
-            .add_buffer(values.data().buffers()[0].clone())
+            .add_buffer(values.into_data().buffers()[0].clone())
             .build()?;
         Ok(Self::from(data))
     }

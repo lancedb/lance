@@ -74,7 +74,7 @@ impl<'a> BinaryEncoder<'a> {
             let end = offsets[offsets.len() - 1].as_usize();
             let b = unsafe {
                 std::slice::from_raw_parts(
-                    arr.data().buffers()[1].as_ptr().offset(start as isize),
+                    arr.to_data().buffers()[1].as_ptr().offset(start as isize),
                     end - start,
                 )
             };
@@ -92,7 +92,7 @@ impl<'a> BinaryEncoder<'a> {
         let positions_offset = self.writer.tell();
         let pos_array = pos_builder.finish();
         self.writer
-            .write_all(pos_array.data().buffers()[0].as_slice())
+            .write_all(pos_array.to_data().buffers()[0].as_slice())
             .await?;
         Ok(positions_offset)
     }
@@ -392,7 +392,6 @@ mod tests {
     use super::*;
     use arrow_select::concat::concat;
 
-    use arrow_array::cast::as_string_array;
     use arrow_array::{
         new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
         OffsetSizeTrait, StringArray,

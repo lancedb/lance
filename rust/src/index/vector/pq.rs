@@ -13,15 +13,13 @@
 // limitations under the License.
 
 use std::any::Any;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::types::Int32Type;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
-    Float32Array, PrimitiveArray, RecordBatch, UInt64Array, UInt8Array,
+    Float32Array, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -637,7 +635,7 @@ pub(crate) async fn train_pq(
 mod tests {
 
     use super::*;
-    use approx::{assert_relative_eq, relative_eq};
+    use approx::relative_eq;
     use arrow_array::types::Float32Type;
 
     #[test]

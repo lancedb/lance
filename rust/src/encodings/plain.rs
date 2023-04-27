@@ -91,7 +91,7 @@ impl<'a> PlainEncoder<'a> {
 
         let boolean_array = builder.finish();
         self.writer
-            .write_all(boolean_array.data().buffers()[0].as_slice())
+            .write_all(boolean_array.into_data().buffers()[0].as_slice())
             .await?;
         Ok(())
     }
@@ -111,7 +111,7 @@ impl<'a> PlainEncoder<'a> {
         } else {
             let byte_width = data_type.byte_width();
             for a in arrays.iter() {
-                let data = a.data();
+                let data = a.to_data();
                 let slice = unsafe {
                     from_raw_parts(
                         data.buffers()[0].as_ptr().add(a.offset() * byte_width),
