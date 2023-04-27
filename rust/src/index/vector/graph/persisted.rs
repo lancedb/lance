@@ -193,8 +193,31 @@ impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
         todo!()
     }
 
-    async fn neighbors(&self, id: usize) -> Result<&[u32]> {
-        todo!()
+    /// Get the neighbors of a vertex, specified by its id.
+    async fn neighbors<'a>(&'a self, id: usize) -> Result<&'a [u32]> {
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+            if let Some(neighbors) = cache.get(&(id as u32)) {
+                return Ok(neighbors.values());
+            }
+        }
+        let batch = self
+            .reader
+            .read_range(id as usize..(id + 1) as usize, &self.neighbors_projection)
+            .await?;
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+
+            let array = as_list_array(batch.column(0));
+            if array.len() < 1 {
+                return Err(Error::Index("Invalid graph".to_string()));
+            }
+            let value = array.value(0);
+            let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
+            let neighbors = Arc::new(nb_array.clone());
+            cache.insert(id as u32, neighbors.clone());
+            Ok(neighbors.values())
+        }
     }
 }
 
