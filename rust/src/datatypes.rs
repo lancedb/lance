@@ -578,12 +578,10 @@ impl TryFrom<&ArrowField> for Field {
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let children = match field.data_type() {
-            DataType::Struct(children) => {
-                children
-                    .iter()
-                    .map(|f| Self::try_from(f.as_ref()))
-                    .collect::<Result<_>>()?
-            }
+            DataType::Struct(children) => children
+                .iter()
+                .map(|f| Self::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
@@ -907,7 +905,7 @@ impl From<&Schema> for Vec<pb::Field> {
 mod tests {
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, TimeUnit, Fields as ArrowFields};
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, TimeUnit};
 
     #[test]
     fn arrow_field_to_field() {
@@ -1006,7 +1004,11 @@ mod tests {
     fn struct_field() {
         let arrow_field = ArrowField::new(
             "struct",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new("a", DataType::Int32, true)])),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                true,
+            )])),
             false,
         );
         let field = Field::try_from(&arrow_field).unwrap();
@@ -1143,9 +1145,11 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(
-                    ArrowFields::from(vec![ArrowField::new("f1", DataType::Utf8, true)])
-                ),
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    true,
+                )])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),

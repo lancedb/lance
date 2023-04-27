@@ -24,7 +24,7 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field, Schema, Fields, FieldRef};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
 mod kernels;
 pub mod linalg;

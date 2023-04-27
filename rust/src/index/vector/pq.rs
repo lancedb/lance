@@ -18,8 +18,11 @@ use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
-use arrow_array::{builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, UInt8Array, PrimitiveArray};
 use arrow_array::types::Int32Type;
+use arrow_array::{
+    builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
+    Float32Array, PrimitiveArray, RecordBatch, UInt64Array, UInt8Array,
+};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;

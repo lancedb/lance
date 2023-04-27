@@ -14,7 +14,7 @@
 
 //! Extension to arrow schema
 
-use arrow_schema::{ArrowError, Field, Schema, FieldRef};
+use arrow_schema::{ArrowError, Field, FieldRef, Schema};
 
 /// Extends the functionality of [arrow_schema::Schema].
 pub trait SchemaExt {
