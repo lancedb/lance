@@ -722,7 +722,9 @@ mod tests {
         for i in (0..1000).step_by(4) {
             let data = array.slice(i, 4);
             file_writer
-                .write(&[&RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
+                .write(&[
+                    &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap(),
+                ])
                 .await
                 .unwrap();
         }
@@ -778,11 +780,9 @@ mod tests {
         for i in (0..100).step_by(4) {
             let slice: FixedSizeListArray = fixed_size_list.slice(i, 4);
             file_writer
-                .write(&[&RecordBatch::try_new(
-                    arrow_schema.clone(),
-                    vec![Arc::new(slice)],
-                )
-                .unwrap()])
+                .write(&[
+                    &RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(slice)]).unwrap(),
+                ])
                 .await
                 .unwrap();
         }

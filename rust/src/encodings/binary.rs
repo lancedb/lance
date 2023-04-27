@@ -582,10 +582,7 @@ mod tests {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         for i in 0..10 {
-            let pos = encoder
-                .encode(&[&data.slice(i * 10, 10)])
-                .await
-                .unwrap();
+            let pos = encoder.encode(&[&data.slice(i * 10, 10)]).await.unwrap();
             assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));
         }
     }

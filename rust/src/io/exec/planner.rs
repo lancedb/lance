@@ -254,7 +254,7 @@ mod tests {
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
     };
-    use arrow_schema::{DataType, Field, Schema, Fields};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::logical_expr::{col, lit};
 
     #[test]

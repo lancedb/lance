@@ -98,7 +98,6 @@ impl PhysicalExpr for Column {
     }
 }
 
-
 struct ColumnVisitor {
     columns: Vec<String>,
 }

@@ -372,7 +372,9 @@ mod tests {
         TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit, Fields as ArrowFields};
+    use arrow_schema::{
+        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema, TimeUnit,
+    };
     use object_store::path::Path;
 
     use crate::io::{FileReader, ObjectStore};
@@ -609,10 +611,7 @@ mod tests {
             ),
             ArrowField::new(
                 "ts_tz",
-                DataType::Timestamp(
-                    TimeUnit::Microsecond,
-                    Some("America/Los_Angeles".into()),
-                ),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("America/Los_Angeles".into())),
                 false,
             ),
         ]));

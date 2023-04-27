@@ -574,7 +574,7 @@ mod tests {
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
         RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
     };
-    use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, Fields as ArrowFields};
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use tempfile::tempdir;
 
     use crate::io::FileWriter;
@@ -702,7 +702,11 @@ mod tests {
     async fn test_write_null_string_in_struct(field_nullable: bool) {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "parent",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new("str", DataType::Utf8, field_nullable)])),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "str",
+                DataType::Utf8,
+                field_nullable,
+            )])),
             true,
         )]));
 

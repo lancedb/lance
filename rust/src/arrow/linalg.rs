@@ -447,9 +447,13 @@ mod tests {
             -0.6525516,
             0.10910681,
         ];
-        u.data().values().iter().zip(expected_u.iter()).for_each(|(a, b)| {
-            assert_relative_eq!(a, b, epsilon = 0.0001);
-        });
+        u.data()
+            .values()
+            .iter()
+            .zip(expected_u.iter())
+            .for_each(|(a, b)| {
+                assert_relative_eq!(a, b, epsilon = 0.0001);
+            });
 
         let expected = vec![27.46873242, 22.64318501, 8.55838823, 5.9857232, 2.01489966];
         sigma.values().iter().zip(expected).for_each(|(&a, b)| {
@@ -484,9 +488,13 @@ mod tests {
             -0.62652825,
             -0.43955169,
         ];
-        vt.data().values().iter().zip(expected_vt).for_each(|(&a, b)| {
-            assert_relative_eq!(a, b, epsilon = 0.0001);
-        });
+        vt.data()
+            .values()
+            .iter()
+            .zip(expected_vt)
+            .for_each(|(&a, b)| {
+                assert_relative_eq!(a, b, epsilon = 0.0001);
+            });
     }
 
     #[test]

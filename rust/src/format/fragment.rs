@@ -113,7 +113,9 @@ impl From<&Fragment> for pb::DataFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, Fields as ArrowFields};
+    use arrow_schema::{
+        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+    };
 
     #[test]
     fn test_new_fragment() {

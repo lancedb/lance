@@ -698,8 +698,12 @@ mod tests {
 
         let result = pq.codebook.unwrap();
         let expected = actual_pq.codebook.unwrap();
-        result.values().iter().zip(expected.values()).for_each(|(&r, &e)| {
-            assert!(relative_eq!(r, e));
-        });
+        result
+            .values()
+            .iter()
+            .zip(expected.values())
+            .for_each(|(&r, &e)| {
+                assert!(relative_eq!(r, e));
+            });
     }
 }
