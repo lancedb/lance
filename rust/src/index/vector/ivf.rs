@@ -347,7 +347,7 @@ impl Ivf {
             ArrowField::new(
                 RESIDUAL_COLUMN,
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dim as i32,
                 ),
                 false,
@@ -589,7 +589,7 @@ pub async fn build_ivf_pq_index(
                 ArrowField::new(
                     PQ_CODE_COLUMN,
                     DataType::FixedSizeList(
-                        Box::new(ArrowField::new("item", DataType::UInt8, true)),
+                        Arc::new(ArrowField::new("item", DataType::UInt8, true)),
                         pq_params.num_sub_vectors as i32,
                     ),
                     false,

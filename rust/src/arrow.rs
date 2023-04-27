@@ -24,7 +24,7 @@ use arrow_array::{
     OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt8Array,
 };
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 
 mod kernels;
 pub mod linalg;
@@ -169,13 +169,13 @@ where
 {
     fn try_new<T: Array>(values: T, offsets: &PrimitiveArray<Offset>) -> Result<Self> {
         let data_type = if Offset::Native::IS_LARGE {
-            DataType::LargeList(Box::new(Field::new(
+            DataType::LargeList(Arc::new(Field::new(
                 "item",
                 values.data_type().clone(),
                 true,
             )))
         } else {
-            DataType::List(Box::new(Field::new(
+            DataType::List(Arc::new(Field::new(
                 "item",
                 values.data_type().clone(),
                 true,
@@ -216,12 +216,12 @@ pub trait FixedSizeListArrayExt {
 impl FixedSizeListArrayExt for FixedSizeListArray {
     fn try_new<T: Array>(values: T, list_size: i32) -> Result<Self> {
         let list_type = DataType::FixedSizeList(
-            Box::new(Field::new("item", values.data_type().clone(), true)),
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
             list_size,
         );
         let data = ArrayDataBuilder::new(list_type)
             .len(values.len() / list_size as usize)
-            .add_child_data(values.data().clone())
+            .add_child_data(values.into_data())
             .build()?;
 
         Ok(Self::from(data))
@@ -261,7 +261,7 @@ impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
         let data_type = DataType::FixedSizeBinary(stride);
         let data = ArrayDataBuilder::new(data_type)
             .len(values.len() / stride as usize)
-            .add_buffer(values.data().buffers()[0].clone())
+            .add_buffer(values.into_data().buffers()[0].clone())
             .build()?;
         Ok(Self::from(data))
     }
@@ -353,10 +353,10 @@ pub trait RecordBatchExt {
 
 impl RecordBatchExt for RecordBatch {
     fn try_with_column(&self, field: Field, arr: ArrayRef) -> Result<Self> {
-        let mut new_fields = self.schema().fields.clone();
-        new_fields.push(field);
+        let mut new_fields: Vec<FieldRef> = self.schema().fields.iter().cloned().collect();
+        new_fields.push(FieldRef::new(field));
         let new_schema = Arc::new(Schema::new_with_metadata(
-            new_fields,
+            Fields::from(new_fields.as_slice()),
             self.schema().metadata.clone(),
         ));
         let mut new_columns = self.columns().to_vec();
@@ -373,9 +373,9 @@ impl RecordBatchExt for RecordBatch {
             )));
         }
 
-        let mut fields = self.schema().fields.clone();
+        let mut fields: Vec<FieldRef> = self.schema().fields.iter().cloned().collect();
         let mut columns = Vec::from(self.columns());
-        for field in other.schema().fields.as_slice() {
+        for field in other.schema().fields.iter() {
             if !fields.iter().any(|f| f.name() == field.name()) {
                 fields.push(field.clone());
                 columns.push(

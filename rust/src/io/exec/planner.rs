@@ -254,7 +254,7 @@ mod tests {
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
     };
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::logical_expr::{col, lit};
 
     #[test]
@@ -264,10 +264,10 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new(
                 "st",
-                DataType::Struct(vec![
+                DataType::Struct(Fields::from(vec![
                     Field::new("x", DataType::Float32, false),
                     Field::new("y", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
         ]));

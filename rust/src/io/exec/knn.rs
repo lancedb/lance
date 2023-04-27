@@ -159,7 +159,7 @@ impl ExecutionPlan for KNNFlatExec {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
         if !input_schema.field_with_name(SCORE_COL).is_ok() {
-            fields.push(Field::new(SCORE_COL, DataType::Float32, false));
+            fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
         }
 
         Arc::new(Schema::new_with_metadata(
@@ -392,7 +392,7 @@ mod tests {
             ArrowField::new(
                 "vector",
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     128,
                 ),
                 true,
@@ -476,7 +476,7 @@ mod tests {
             ArrowField::new(
                 "vector",
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Float32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
                     dim as i32,
                 ),
                 true,
@@ -504,7 +504,7 @@ mod tests {
                 ArrowField::new(
                     "vector",
                     DataType::FixedSizeList(
-                        Box::new(ArrowField::new("item", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
                         dim as i32,
                     ),
                     true,

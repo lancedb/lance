@@ -15,6 +15,7 @@
 //! Var-length binary encoding.
 //!
 
+use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
@@ -73,7 +74,7 @@ impl<'a> BinaryEncoder<'a> {
             let end = offsets[offsets.len() - 1].as_usize();
             let b = unsafe {
                 std::slice::from_raw_parts(
-                    arr.data().buffers()[1].as_ptr().offset(start as isize),
+                    arr.to_data().buffers()[1].as_ptr().offset(start as isize),
                     end - start,
                 )
             };
@@ -91,7 +92,7 @@ impl<'a> BinaryEncoder<'a> {
         let positions_offset = self.writer.tell();
         let pos_array = pos_builder.finish();
         self.writer
-            .write_all(pos_array.data().buffers()[0].as_slice())
+            .write_all(pos_array.to_data().buffers()[0].as_slice())
             .await?;
         Ok(positions_offset)
     }
@@ -193,7 +194,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let end = positions.value(range.end);
 
         let slice = positions.slice(range.start, range.len() + 1);
-        let position_slice: &Int64Array = as_primitive_array(slice.as_ref());
+        let position_slice: &Int64Array = as_primitive_array(slice.borrow());
         let offset_data = if T::Offset::IS_LARGE {
             subtract_scalar(position_slice, start)?.into_data()
         } else {
@@ -391,7 +392,6 @@ mod tests {
     use super::*;
     use arrow_select::concat::concat;
 
-    use arrow_array::cast::as_string_array;
     use arrow_array::{
         new_empty_array, types::GenericStringType, GenericStringArray, LargeStringArray,
         OffsetSizeTrait, StringArray,
@@ -468,9 +468,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_binary_data_with_offset() {
-        let slice = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
-        let array = as_string_array(slice.as_ref());
-        test_round_trips(&[array]).await;
+        let array: StringArray = StringArray::from(vec![Some("d"), Some("e")]).slice(1, 1);
+        test_round_trips(&[&array]).await;
     }
 
     #[tokio::test]
@@ -582,10 +581,7 @@ mod tests {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         for i in 0..10 {
-            let pos = encoder
-                .encode(&[data.slice(i * 10, 10).as_ref()])
-                .await
-                .unwrap();
+            let pos = encoder.encode(&[&data.slice(i * 10, 10)]).await.unwrap();
             assert_eq!(pos, (i * (8 * 11) /* offset array */ + (i + 1) * (10 * 10)));
         }
     }

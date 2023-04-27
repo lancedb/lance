@@ -51,6 +51,15 @@ impl Column {
     }
 }
 
+impl PartialEq<dyn Any> for Column {
+    fn eq(&self, other: &dyn Any) -> bool {
+        other
+            .downcast_ref::<Self>()
+            .map(|x| self == x)
+            .unwrap_or(false)
+    }
+}
+
 impl PhysicalExpr for Column {
     fn as_any(&self) -> &dyn Any {
         self
@@ -89,15 +98,6 @@ impl PhysicalExpr for Column {
     }
 }
 
-impl PartialEq<dyn Any> for Column {
-    fn eq(&self, other: &dyn Any) -> bool {
-        other
-            .downcast_ref::<Self>()
-            .map(|x| self == x)
-            .unwrap_or(false)
-    }
-}
-
 struct ColumnVisitor {
     columns: Vec<String>,
 }
@@ -129,7 +129,7 @@ mod tests {
     use super::*;
 
     use arrow_array::{ArrayRef, Float32Array, Int32Array, StringArray, StructArray};
-    use arrow_schema::Field;
+    use arrow_schema::{Field, Fields};
 
     #[test]
     fn test_simple_column() {
@@ -138,10 +138,10 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new(
                 "st",
-                DataType::Struct(vec![
+                DataType::Struct(Fields::from(vec![
                     Field::new("x", DataType::Float32, false),
                     Field::new("y", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
         ]));
@@ -169,10 +169,10 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new(
                 "st",
-                DataType::Struct(vec![
+                DataType::Struct(Fields::from(vec![
                     Field::new("x", DataType::Float32, false),
                     Field::new("y", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
         ]));

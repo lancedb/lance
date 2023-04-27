@@ -113,7 +113,9 @@ impl From<&Fragment> for pb::DataFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{
+        DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
+    };
 
     #[test]
     fn test_new_fragment() {
@@ -122,10 +124,10 @@ mod tests {
         let arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "s",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("si", DataType::Int32, false),
                     ArrowField::new("sb", DataType::Binary, true),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("bool", DataType::Boolean, true),

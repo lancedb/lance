@@ -213,7 +213,7 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
         ),
         Field::new(
             NEIGHBORS_COL,
-            DataType::List(Box::new(Field::new("item", DataType::UInt32, true))),
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
             false,
         ),
     ]));

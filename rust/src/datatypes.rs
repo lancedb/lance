@@ -4,6 +4,7 @@ use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::{self};
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 use arrow_array::cast::{as_large_list_array, as_list_array};
 use arrow_array::types::{
@@ -184,7 +185,7 @@ impl TryFrom<&LogicalType> for DataType {
                             .parse::<i32>()
                             .map_err(|e: _| Error::Schema(e.to_string()))?;
                         Ok(FixedSizeList(
-                            Box::new(ArrowField::new("item", elem_type, true)),
+                            Arc::new(ArrowField::new("item", elem_type, true)),
                             size,
                         ))
                     }
@@ -238,10 +239,10 @@ impl TryFrom<&LogicalType> for DataType {
                         Err(Error::Schema(format!("Unsupported timestamp type: {}", lt)))
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
-                        let tz = if splits[2] == "-" {
+                        let tz: Option<Arc<str>> = if splits[2] == "-" {
                             None
                         } else {
-                            Some(splits[2].to_string())
+                            Some(splits[2].into())
                         };
                         Ok(Timestamp(timeunit, tz))
                     }
@@ -302,9 +303,9 @@ impl Field {
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {
-            lt if lt.is_list() => DataType::List(Box::new(ArrowField::from(&self.children[0]))),
+            lt if lt.is_list() => DataType::List(Arc::new(ArrowField::from(&self.children[0]))),
             lt if lt.is_large_list() => {
-                DataType::LargeList(Box::new(ArrowField::from(&self.children[0])))
+                DataType::LargeList(Arc::new(ArrowField::from(&self.children[0])))
             }
             lt if lt.is_struct() => {
                 DataType::Struct(self.children.iter().map(ArrowField::from).collect())
@@ -365,8 +366,8 @@ impl Field {
                     panic!("Unsupported dictionary key type: {}", key_type);
                 }
             },
-            DataType::Struct(mut subfields) => {
-                for (i, f) in subfields.iter_mut().enumerate() {
+            DataType::Struct(subfields) => {
+                for (i, f) in subfields.iter().enumerate() {
                     let lance_field = self
                         .children
                         .iter_mut()
@@ -577,9 +578,10 @@ impl TryFrom<&ArrowField> for Field {
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let children = match field.data_type() {
-            DataType::Struct(children) => {
-                children.iter().map(Self::try_from).collect::<Result<_>>()?
-            }
+            DataType::Struct(children) => children
+                .iter()
+                .map(|f| Self::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
             DataType::List(item) => vec![Self::try_from(item.as_ref())?],
             DataType::LargeList(item) => vec![Self::try_from(item.as_ref())?],
             _ => vec![],
@@ -840,7 +842,7 @@ impl TryFrom<&ArrowSchema> for Schema {
             fields: schema
                 .fields
                 .iter()
-                .map(Field::try_from)
+                .map(|f| Field::try_from(f.as_ref()))
                 .collect::<Result<_>>()?,
             metadata: schema.metadata.clone(),
         };
@@ -903,7 +905,7 @@ impl From<&Schema> for Vec<pb::Field> {
 mod tests {
     use super::*;
 
-    use arrow_schema::{Field as ArrowField, TimeUnit};
+    use arrow_schema::{Field as ArrowField, Fields as ArrowFields, TimeUnit};
 
     #[test]
     fn arrow_field_to_field() {
@@ -937,7 +939,7 @@ mod tests {
             ),
             (
                 "timestamp:s:America/New_York",
-                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".to_string())),
+                DataType::Timestamp(TimeUnit::Second, Some("America/New_York".into())),
             ),
             ("time32:s", DataType::Time32(TimeUnit::Second)),
             ("time32:ms", DataType::Time32(TimeUnit::Millisecond)),
@@ -951,7 +953,7 @@ mod tests {
             (
                 "fixed_size_list:int32:10",
                 DataType::FixedSizeList(
-                    Box::new(ArrowField::new("item", DataType::Int32, true)),
+                    Arc::new(ArrowField::new("item", DataType::Int32, true)),
                     10,
                 ),
             ),
@@ -967,7 +969,7 @@ mod tests {
     #[test]
     fn test_nested_types() {
         assert_eq!(
-            LogicalType::try_from(&DataType::List(Box::new(ArrowField::new(
+            LogicalType::try_from(&DataType::List(Arc::new(ArrowField::new(
                 "item",
                 DataType::Binary,
                 false
@@ -977,9 +979,9 @@ mod tests {
             "list"
         );
         assert_eq!(
-            LogicalType::try_from(&DataType::List(Box::new(ArrowField::new(
+            LogicalType::try_from(&DataType::List(Arc::new(ArrowField::new(
                 "item",
-                DataType::Struct(vec![]),
+                DataType::Struct(ArrowFields::empty()),
                 false
             ))))
             .unwrap()
@@ -987,11 +989,11 @@ mod tests {
             "list.struct"
         );
         assert_eq!(
-            LogicalType::try_from(&DataType::Struct(vec![ArrowField::new(
+            LogicalType::try_from(&DataType::Struct(ArrowFields::from(vec![ArrowField::new(
                 "item",
                 DataType::Binary,
                 false
-            )]))
+            )])))
             .unwrap()
             .0,
             "struct"
@@ -1002,7 +1004,11 @@ mod tests {
     fn struct_field() {
         let arrow_field = ArrowField::new(
             "struct",
-            DataType::Struct(vec![ArrowField::new("a", DataType::Int32, true)]),
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                true,
+            )])),
             false,
         );
         let field = Field::try_from(&arrow_field).unwrap();
@@ -1017,11 +1023,11 @@ mod tests {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f2", DataType::Boolean, false),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1032,10 +1038,10 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1049,11 +1055,11 @@ mod tests {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f2", DataType::Boolean, false),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1064,10 +1070,10 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1081,11 +1087,11 @@ mod tests {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f2", DataType::Boolean, false),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1103,11 +1109,11 @@ mod tests {
     fn test_get_nested_field() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
-            DataType::Struct(vec![
+            DataType::Struct(ArrowFields::from(vec![
                 ArrowField::new("f1", DataType::Utf8, true),
                 ArrowField::new("f2", DataType::Boolean, false),
                 ArrowField::new("f3", DataType::Float32, false),
-            ]),
+            ])),
             true,
         )]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
@@ -1122,11 +1128,11 @@ mod tests {
             ArrowField::new("a", DataType::Int32, false),
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![
+                DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f2", DataType::Boolean, false),
                     ArrowField::new("f3", DataType::Float32, false),
-                ]),
+                ])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
@@ -1139,7 +1145,11 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
                 "b",
-                DataType::Struct(vec![ArrowField::new("f1", DataType::Utf8, true)]),
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    true,
+                )])),
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),

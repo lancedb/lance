@@ -351,7 +351,7 @@ mod tests {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "vector",
             DataType::FixedSizeList(
-                Box::new(ArrowField::new("item", DataType::Float32, true)),
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
                 64,
             ),
             true,
@@ -434,10 +434,10 @@ mod tests {
         // R^T * R = I
         let i = r.transpose().dot(&r).unwrap();
 
-        assert_relative_eq!(
-            i.data().values(),
-            MatrixView::identity(dim).data().values(),
-            epsilon = 0.001
-        );
+        let expected = i.data().values().to_vec();
+        let result = MatrixView::identity(dim).data().values().to_vec();
+        expected.iter().zip(result).for_each(|(&e, r)| {
+            assert_relative_eq!(e, r, epsilon = 0.001);
+        });
     }
 }

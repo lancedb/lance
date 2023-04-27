@@ -137,8 +137,7 @@ impl PQIndex {
 
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
-            let slice = key.slice(i * sub_vector_length, sub_vector_length);
-            let key_sub_vector: &Float32Array = as_primitive_array(slice.as_ref());
+            let key_sub_vector: Float32Array = key.slice(i * sub_vector_length, sub_vector_length);
             let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| {
                 Error::Index("PQIndex::cosine_scores: PQ is not initialized".to_string())
             })?;
@@ -501,12 +500,11 @@ impl ProductQuantizer {
             let code: &UInt8Array = as_primitive_array(code_arr.as_ref());
             for sub_vec_id in 0..code.len() {
                 let centroid = code.value(sub_vec_id) as usize;
-                let sub_vector = data.data().slice(
+                let sub_vector: Float32Array = data.data().slice(
                     i * self.dimension + sub_vec_id * sub_vector_dim,
                     sub_vector_dim,
                 );
                 counts[sub_vec_id * num_centroids + centroid] += 1;
-                let sub_vector: &Float32Array = as_primitive_array(sub_vector.as_ref());
                 for k in 0..sub_vector.len() {
                     sum[sub_vec_id * sum_stride + centroid * sub_vector_dim + k] +=
                         sub_vector.value(k);
@@ -637,7 +635,7 @@ pub(crate) async fn train_pq(
 mod tests {
 
     use super::*;
-    use approx::assert_relative_eq;
+    use approx::relative_eq;
     use arrow_array::types::Float32Type;
 
     #[test]
@@ -696,10 +694,14 @@ mod tests {
             actual_pq.train(&mat, MetricType::L2, 1).await.unwrap();
         }
 
-        assert_relative_eq!(
-            pq.codebook.unwrap().values(),
-            actual_pq.codebook.unwrap().values(),
-            epsilon = 0.01
-        );
+        let result = pq.codebook.unwrap();
+        let expected = actual_pq.codebook.unwrap();
+        result
+            .values()
+            .iter()
+            .zip(expected.values())
+            .for_each(|(&r, &e)| {
+                assert!(relative_eq!(r, e));
+            });
     }
 }

@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Array, Float32Array,
+    builder::Float32Builder, cast::as_primitive_array, types::Float32Type, Float32Array,
 };
 use rand::{seq::IteratorRandom, Rng};
 
@@ -56,7 +57,7 @@ pub async fn train_kmeans(
         let mut builder = Float32Builder::with_capacity(sample_size * dimension);
         for idx in chosen.iter() {
             let s = array.slice(idx * dimension, dimension);
-            builder.append_slice(as_primitive_array::<Float32Type>(s.as_ref()).values());
+            builder.append_slice(as_primitive_array::<Float32Type>(s.borrow()).values());
         }
         builder.finish()
     } else {

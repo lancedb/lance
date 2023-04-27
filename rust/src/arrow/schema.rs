@@ -14,7 +14,7 @@
 
 //! Extension to arrow schema
 
-use arrow_schema::{ArrowError, Field, Schema};
+use arrow_schema::{ArrowError, Field, FieldRef, Schema};
 
 /// Extends the functionality of [arrow_schema::Schema].
 pub trait SchemaExt {
@@ -33,8 +33,8 @@ impl SchemaExt for Schema {
                 self
             )));
         };
-        let mut fields = self.fields.clone();
-        fields.push(field);
+        let mut fields: Vec<FieldRef> = self.fields().iter().cloned().collect();
+        fields.push(FieldRef::new(field));
         Ok(Schema::new_with_metadata(fields, self.metadata.clone()))
     }
 
