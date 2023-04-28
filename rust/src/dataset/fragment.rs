@@ -85,7 +85,7 @@ impl FileFragment {
     /// containing the columns, even the data has not written yet.
     ///
     /// Internal use only.
-    pub async fn new_writer(&mut self, schema: &Schema) -> Result<FileWriter> {
+    pub async fn new_writer<'a>(&mut self, schema: &'a Schema) -> Result<FileWriter<'a>> {
         // Sanity check.
         //
         // To keep it simple, new schema must have no intersection with the existing schema.
