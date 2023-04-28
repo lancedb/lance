@@ -591,7 +591,8 @@ mod tests {
         let path = Path::from("/foo");
 
         // Write 10 batches.
-        let params = FileWriterParams::default();
+        let mut params = FileWriterParams::default();
+        params.max_batch_size = 10;
         let mut file_writer = FileWriter::try_new(&store, &path, &schema, params)
             .await
             .unwrap();

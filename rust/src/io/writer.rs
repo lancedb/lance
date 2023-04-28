@@ -103,6 +103,12 @@ impl Default for FileWriterParams {
     }
 }
 
+impl FileWriterParams {
+    pub fn new(max_batch_size: usize) -> Self {
+        Self { max_batch_size }
+    }
+}
+
 /// [FileWriter] writes Arrow [RecordBatch] to one Lance file.
 ///
 /// ```ignored
@@ -149,28 +155,68 @@ impl<'a> FileWriter<'a> {
         })
     }
 
+    /// Write one group of RecordBatch to the file.
+    async fn write_once(&mut self) -> Result<()> {
+        for field in self.schema.fields.iter() {
+            let arrs = self
+                .buf
+                .batches
+                .iter()
+                .map(|b| {
+                    let column_id = b.schema().index_of(&field.name)?;
+                    Ok(b.column(column_id).clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.write_array(field, &arrs).await?;
+        }
+        let batch_length = self.buf.num_rows() as i32;
+        self.metadata.push_batch_length(batch_length);
+        self.batch_id += 1;
+        self.buf = RecordBatchBuffer::empty();
+        Ok(())
+    }
+
     /// Write a [RecordBatch] to the open file.
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    pub async fn write(&mut self, batch: &[RecordBatch]) -> Result<()> {
-        for field in self.schema.fields.iter() {
-            let arrs: Result<Vec<_>> = batch
-                .iter()
-                .map(|b| {
-                    let column_id = b.schema().index_of(&field.name)?;
-                    Ok(b.column(column_id))
-                })
-                .collect();
-            self.write_array(field, arrs?.as_slice()).await?;
+    pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        let max_group_size = self.params.max_batch_size;
+        let mut i = 0;
+        let mut offset = 0;
+        while i < batches.len() {
+            let batch = &batches[i];
+            let remaining = max_group_size - self.buf.num_rows();
+            println!(
+                "Batch num rows {}, offset={offset} remaining={remaining}",
+                batch.num_rows()
+            );
+            let len = std::cmp::min(batch.num_rows() - offset, remaining);
+            if len == 0 {
+                i += 1;
+                continue;
+            };
+            let slice = batch.slice(offset, len);
+            self.buf.push(slice);
+            offset += len;
+            if offset >= batch.num_rows() {
+                offset = 0;
+                i += 1;
+            }
+
+            if self.buf.num_rows() >= max_group_size {
+                self.write_once().await?;
+            }
         }
-        let batch_length = batch.iter().map(|b| b.num_rows() as i32).sum();
-        self.metadata.push_batch_length(batch_length);
-        self.batch_id += 1;
+
         Ok(())
     }
 
     pub async fn finish(&mut self) -> Result<()> {
+        if self.buf.num_rows() > 0 {
+            self.write_once().await?;
+        };
+
         self.write_footer().await?;
         self.object_writer.shutdown().await
     }
@@ -185,7 +231,7 @@ impl<'a> FileWriter<'a> {
     }
 
     #[async_recursion]
-    async fn write_array(&mut self, field: &Field, arrs: &[&ArrayRef]) -> Result<()> {
+    async fn write_array(&mut self, field: &Field, arrs: &[ArrayRef]) -> Result<()> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
         let arrs_ref = arrs.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -279,7 +325,7 @@ impl<'a> FileWriter<'a> {
             .for_each(|a| assert_eq!(a.num_columns(), field.children.len()));
 
         for child in &field.children {
-            let mut arrs: Vec<&ArrayRef> = Vec::new();
+            let mut arrs: Vec<ArrayRef> = Vec::new();
             for struct_array in arrays {
                 let arr = struct_array
                     .column_by_name(&child.name)
@@ -288,9 +334,9 @@ impl<'a> FileWriter<'a> {
                         child.name,
                         struct_array.data_type()
                     )))?;
-                arrs.push(arr);
+                arrs.push(arr.clone());
             }
-            self.write_array(child, arrs.as_slice()).await?;
+            self.write_array(child, &arrs).await?;
         }
         Ok(())
     }
@@ -326,7 +372,7 @@ impl<'a> FileWriter<'a> {
         let positions: &dyn Array = &pos_builder.finish();
         self.write_fixed_stride_array(field, &[positions]).await?;
         let arrs = list_arrs.iter().collect::<Vec<_>>();
-        self.write_array(&field.children[0], arrs.as_slice()).await
+        self.write_array(&field.children[0], &list_arrs).await
     }
 
     async fn write_large_list_array(&mut self, field: &Field, arrs: &[&dyn Array]) -> Result<()> {
@@ -360,8 +406,7 @@ impl<'a> FileWriter<'a> {
 
         let positions: &dyn Array = &pos_builder.finish();
         self.write_fixed_stride_array(field, &[positions]).await?;
-        let arrs = list_arrs.iter().collect::<Vec<_>>();
-        self.write_array(&field.children[0], arrs.as_slice()).await
+        self.write_array(&field.children[0], &list_arrs).await
     }
 
     async fn write_footer(&mut self) -> Result<()> {
@@ -391,8 +436,8 @@ mod tests {
     use arrow_array::{
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        LargeListArray, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array,
+        Int64Array, LargeListArray, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
         TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
@@ -667,5 +712,33 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(actual, batches[0]);
+    }
+
+    #[tokio::test]
+    async fn test_write_large_record_batch() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = vec![RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10000))],
+        )
+        .unwrap()];
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/foo");
+        let params = FileWriterParams::new(128);
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema, params)
+            .await
+            .unwrap();
+        file_writer.write(&batches).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path).await.unwrap();
+        let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
+        assert_eq!(128, actual.num_rows());
     }
 }

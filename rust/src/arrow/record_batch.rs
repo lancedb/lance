@@ -45,6 +45,10 @@ impl RecordBatchBuffer {
         self.batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    pub fn push(&mut self, batch: RecordBatch) {
+        self.batches.push(batch);
+    }
+
     pub fn finish(&self) -> Result<Vec<RecordBatch>> {
         Ok(self.batches.clone())
     }

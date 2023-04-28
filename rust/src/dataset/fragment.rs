@@ -131,7 +131,7 @@ mod tests {
 
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 2;
+        write_params.max_rows_per_group = 20;
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
 
         Dataset::write(&mut batches, test_uri, Some(write_params))

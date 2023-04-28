@@ -747,7 +747,10 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema, FileWriterParams::default()).await.unwrap();
+        let mut file_writer =
+            FileWriter::try_new(&store, &path, &schema, FileWriterParams::default())
+                .await
+                .unwrap();
 
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         for i in 0..10 {
