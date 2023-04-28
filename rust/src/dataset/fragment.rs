@@ -57,8 +57,11 @@ impl FileFragment {
         self.metadata.id as usize
     }
 
-    async fn do_open(&self, paths: &[&str]) -> Result<FileReader> {
+    async fn do_open(&self, schema: &Schema) -> Result<FileReader> {
         // TODO: support open multiple data files.
+        for data_file in self.metadata.files.iter() {
+            let data_file_schema = data_file.schema(schema);
+        }
         let path = self.dataset.data_dir().child(paths[0]);
         let reader = FileReader::try_new_with_fragment(
             &self.dataset.object_store,
@@ -73,6 +76,10 @@ impl FileFragment {
     /// Count the rows in this fragment.
     ///
     pub async fn count_rows(&self) -> Result<usize> {
+        if self.metadata.files.is_empty() {
+            return Err(Error::IO(format!("Fragment {} does not contain any data", self.id())));
+        };
+
         let reader = self
             .do_open(&[self.metadata.files[0].path.as_str()])
             .await?;
@@ -83,6 +90,8 @@ impl FileFragment {
     ///
     /// After it is called, this Fragment contains the metadata of the new DataFile,
     /// containing the columns, even the data has not written yet.
+    ///
+    /// It is the caller's responsibility to close the [`FileWriter`].
     ///
     /// Internal use only.
     pub async fn new_writer<'a>(&mut self, schema: &'a Schema) -> Result<FileWriter<'a>> {
@@ -270,5 +279,18 @@ mod tests {
         writer.finish().await.unwrap();
 
         assert_eq!(fragment.metadata.files.len(), 2);
+
+        // Scan again
+        let scanner = fragment
+            .scan()
+            .batch_size(50)
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        let batches = scanner.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        println!("Batches: {:?}", batches);
     }
 }

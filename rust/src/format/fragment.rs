@@ -38,6 +38,10 @@ impl DataFile {
             fields: schema.field_ids(),
         }
     }
+
+    pub(crate) fn schema(&self, full_schema: &Schema) -> Schema {
+        full_schema.project_by_ids(&self.fields)
+    }
 }
 
 impl From<&DataFile> for pb::DataFile {
