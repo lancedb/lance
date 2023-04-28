@@ -17,12 +17,13 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use uuid::Uuid;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
-use crate::format::Fragment;
-use crate::io::FileReader;
-use crate::Result;
+use crate::format::{DataFile, Fragment};
+use crate::io::{FileReader, FileWriter};
+use crate::{Error, Result};
 
 use super::scanner::Scanner;
 
@@ -76,6 +77,38 @@ impl FileFragment {
             .do_open(&[self.metadata.files[0].path.as_str()])
             .await?;
         Ok(reader.len())
+    }
+
+    /// Create a new Writer for new columns.
+    ///
+    /// After it is called, this Fragment contains the metadata of the new DataFile,
+    /// containing the columns, even the data has not written yet.
+    ///
+    /// Internal use only.
+    pub async fn new_writer(&mut self, schema: &Schema) -> Result<FileWriter> {
+        // Sanity check.
+        //
+        // To keep it simple, new schema must have no intersection with the existing schema.
+        let existing_schema = self.dataset.schema();
+        for field in schema.fields.iter() {
+            // Just check the first level names.
+            if existing_schema.field(&field.name).is_some() {
+                return Err(Error::IO(format!(
+                    "Append column: duplicated column {} already exists",
+                    field.name
+                )));
+            }
+        }
+
+        let object_store = self.dataset.object_store.as_ref();
+        let file_path = format!("{}.lance", Uuid::new_v4());
+        self.metadata.add_file(&file_path, schema);
+
+        let full_path = object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(file_path.as_str());
+        FileWriter::try_new(object_store, &full_path, schema).await
     }
 
     /// Take rows from this fragment.
@@ -198,4 +231,7 @@ mod tests {
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
     }
+
+    #[tokio::test]
+    async fn test_append_columns() {}
 }
