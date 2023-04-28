@@ -254,7 +254,7 @@ impl Dataset {
         let mut buffer = RecordBatchBuffer::empty();
         for batch_result in peekable {
             let batch = batch_result?;
-            buffer.batches.push(batch);
+            buffer.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
                 // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
