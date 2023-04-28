@@ -38,6 +38,7 @@ use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::FileWriterParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
@@ -87,12 +88,15 @@ async fn new_file_writer<'a>(
     object_store: &'a ObjectStore,
     data_file_path: &str,
     schema: &'a Schema,
+    max_group_size: usize,
 ) -> Result<FileWriter<'a>> {
     let full_path = object_store
         .base_path()
         .child(DATA_DIR)
         .child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema).await
+    let mut params = FileWriterParams::default();
+    params.max_batch_size = max_group_size;
+    FileWriter::try_new(object_store, &full_path, schema, params).await
 }
 
 /// Get the manifest file path for a version.
@@ -259,17 +263,20 @@ impl Dataset {
                         let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                         fragments.push(fragment);
                         fragment_id += 1;
-                        Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                        Some(
+                            new_file_writer(
+                                &object_store,
+                                &file_path,
+                                &schema,
+                                params.max_rows_per_group,
+                            )
+                            .await?,
+                        )
                     }
                 };
 
                 let batches = buffer.finish()?;
-                let batches_ref = batches.iter().collect::<Vec<_>>();
-                writer
-                    .as_mut()
-                    .unwrap()
-                    .write(batches_ref.as_slice())
-                    .await?;
+                writer.as_mut().unwrap().write(&batches).await?;
                 buffer = RecordBatchBuffer::empty();
             }
             if let Some(w) = writer.as_mut() {
@@ -285,16 +292,19 @@ impl Dataset {
                     let file_path = format!("{}.lance", Uuid::new_v4());
                     let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                     fragments.push(fragment);
-                    Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                    Some(
+                        new_file_writer(
+                            &object_store,
+                            &file_path,
+                            &schema,
+                            params.max_rows_per_group,
+                        )
+                        .await?,
+                    )
                 }
             };
             let batches = buffer.finish()?;
-            let batches_ref = batches.iter().map(|b| b).collect::<Vec<_>>();
-            writer
-                .as_mut()
-                .unwrap()
-                .write(batches_ref.as_slice())
-                .await?;
+            writer.as_mut().unwrap().write(&batches).await?;
         }
         if let Some(w) = writer.as_mut() {
             // Drop the last writer.

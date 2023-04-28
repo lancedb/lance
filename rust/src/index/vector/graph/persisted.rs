@@ -25,9 +25,9 @@ use object_store::path::Path;
 
 use super::builder::GraphBuilder;
 use super::{Vertex, VertexSerDe};
-use crate::arrow::as_fixed_size_binary_array;
 use crate::datatypes::Schema;
 use crate::io::{FileReader, FileWriter, ObjectStore};
+use crate::{arrow::as_fixed_size_binary_array, io::FileWriterParams};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
@@ -219,7 +219,8 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
     ]));
     let schema = Schema::try_from(arrow_schema.as_ref())?;
 
-    let mut writer = FileWriter::try_new(object_store, path, &schema).await?;
+    let mut writer =
+        FileWriter::try_new(object_store, path, &schema, FileWriterParams::default()).await?;
     for nodes in graph.nodes.as_slice().chunks(params.batch_size) {
         let mut vertex_builder =
             FixedSizeBinaryBuilder::with_capacity(nodes.len(), binary_size as i32);
@@ -242,7 +243,7 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
             ],
         )?;
 
-        writer.write(&[&batch]).await?;
+        writer.write(&[batch]).await?;
     }
 
     writer.finish().await?;

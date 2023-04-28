@@ -14,10 +14,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{ArrayBuilder, PrimitiveBuilder};
-use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
-use arrow_array::types::{Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_array::{
+    builder::{ArrayBuilder, PrimitiveBuilder},
+    cast::{as_large_list_array, as_list_array, as_struct_array},
+    types::{Int32Type, Int64Type},
+    Array, ArrayRef, RecordBatch, StructArray,
+};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
@@ -88,6 +90,19 @@ pub async fn write_manifest(
     writer.write_struct(manifest).await
 }
 
+/// Parameters to write a DataFile.
+pub struct FileWriterParams {
+    pub max_batch_size: usize,
+}
+
+impl Default for FileWriterParams {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 8194,
+        }
+    }
+}
+
 /// [FileWriter] writes Arrow [RecordBatch] to one Lance file.
 ///
 /// ```ignored
@@ -107,6 +122,12 @@ pub struct FileWriter<'a> {
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
+
+    // Write parameters.
+    params: FileWriterParams,
+
+    /// Buffer to hold the hold RecordBatch to reach to enough size to write to disk.
+    buf: RecordBatchBuffer,
 }
 
 impl<'a> FileWriter<'a> {
@@ -114,6 +135,7 @@ impl<'a> FileWriter<'a> {
         object_store: &ObjectStore,
         path: &Path,
         schema: &'a Schema,
+        params: FileWriterParams,
     ) -> Result<FileWriter<'a>> {
         let object_writer = object_store.create(path).await?;
         Ok(Self {
@@ -122,6 +144,8 @@ impl<'a> FileWriter<'a> {
             batch_id: 0,
             page_table: PageTable::default(),
             metadata: Metadata::default(),
+            params,
+            buf: RecordBatchBuffer::empty(),
         })
     }
 
@@ -129,7 +153,7 @@ impl<'a> FileWriter<'a> {
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    pub async fn write(&mut self, batch: &[&RecordBatch]) -> Result<()> {
+    pub async fn write(&mut self, batch: &[RecordBatch]) -> Result<()> {
         for field in self.schema.fields.iter() {
             let arrs: Result<Vec<_>> = batch
                 .iter()
@@ -557,18 +581,21 @@ mod tests {
                 ),
             ])),
         ];
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
-        schema.set_dictionary(&batch).unwrap();
+        let batches = vec![RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap()];
+        schema.set_dictionary(&batches[0]).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        let params = FileWriterParams::default();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema, params)
+            .await
+            .unwrap();
+        file_writer.write(&batches).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
-        assert_eq!(actual, batch);
+        assert_eq!(actual, batches[0]);
     }
 
     #[tokio::test]
@@ -587,18 +614,21 @@ mod tests {
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
         let columns: Vec<ArrayRef> = vec![Arc::new(dict_arr)];
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
-        schema.set_dictionary(&batch).unwrap();
+        let batches = vec![RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap()];
+        schema.set_dictionary(&batches[0]).unwrap();
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        let params = FileWriterParams::default();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema, params)
+            .await
+            .unwrap();
+        file_writer.write(&batches).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
-        assert_eq!(actual, batch);
+        assert_eq!(actual, batches[0]);
     }
 
     #[tokio::test]
@@ -622,17 +652,20 @@ mod tests {
                     .with_timezone("America/Los_Angeles"),
             ),
         ];
-        let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
+        let batches = vec![RecordBatch::try_new(arrow_schema.clone(), columns).unwrap()];
 
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        let params = FileWriterParams::default();
+        let mut file_writer = FileWriter::try_new(&store, &path, &schema, params)
+            .await
+            .unwrap();
+        file_writer.write(&batches).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual = reader.read_batch(0, .., reader.schema()).await.unwrap();
-        assert_eq!(actual, batch);
+        assert_eq!(actual, batches[0]);
     }
 }
