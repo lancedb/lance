@@ -134,8 +134,10 @@ mod tests {
 
     use super::*;
 
-    use arrow_array::{Int32Array, RecordBatchReader, StringArray};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow::array::AsArray;
+    use arrow_arith::arithmetic::multiply_scalar;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatchReader, StringArray};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -233,5 +235,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_columns() {}
+    async fn test_append_new_columns() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = create_dataset(test_uri).await;
+
+        let fragment = &mut dataset.get_fragments()[0];
+        let new_arrow_schema = Arc::new(ArrowSchema::new(Fields::from(vec![ArrowField::new(
+            "double_i",
+            DataType::Int32,
+            true,
+        )])));
+        let schema: Schema = new_arrow_schema.as_ref().try_into().unwrap();
+        let mut writer = fragment.new_writer(&schema).await.unwrap();
+        let mut scanner = fragment
+            .scan()
+            .batch_size(50)
+            .project(&["i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        while let Some(batch) = scanner.try_next().await.unwrap() {
+            let input_col = batch.column_by_name("i").unwrap();
+            let result_col: Int32Array = multiply_scalar(&input_col.as_primitive(), 2).unwrap();
+            let batch = RecordBatch::try_new(
+                new_arrow_schema.clone(),
+                vec![Arc::new(result_col) as ArrayRef],
+            )
+            .unwrap();
+            writer.write(&[&batch]).await.unwrap();
+        }
+
+        writer.finish().await.unwrap();
+
+        assert_eq!(fragment.metadata.files.len(), 2);
+    }
 }
