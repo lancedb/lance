@@ -186,6 +186,54 @@ impl Field {
         Ok(f)
     }
 
+    /// Intersection of two [`Field`]s.
+    ///
+    pub(super) fn intersection(&self, other: &Self) -> Result<Self> {
+        if self.name != other.name {
+            return Err(Error::Arrow(format!(
+                "Attempt to intersect different fields: {} and {}",
+                self.name, other.name,
+            )));
+        }
+        let self_type = self.data_type();
+        let other_type = other.data_type();
+        if self_type.is_struct() && other_type.is_struct() {
+            let children = self
+                .children
+                .iter()
+                .filter_map(|c| {
+                    if let Some(other_child) = other.child(&c.name) {
+                        let intersection = c.intersection(other_child).ok()?;
+                        Some(intersection)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let f = Self {
+                name: self.name.clone(),
+                id: self.id,
+                parent_id: self.parent_id,
+                logical_type: self.logical_type.clone(),
+                extension_name: self.extension_name.clone(),
+                encoding: self.encoding.clone(),
+                nullable: self.nullable,
+                children,
+                dictionary: self.dictionary.clone(),
+            };
+            return Ok(f);
+        }
+
+        if self_type != other_type || self.name != other.name {
+            return Err(Error::Arrow(format!(
+                "Attempt to intersect different fields: ({}, {}) and ({}, {})",
+                self.name, self_type, other.name, other_type
+            )));
+        }
+
+        Ok(self.clone())
+    }
+
     pub(super) fn exclude(&self, other: &Self) -> Option<Self> {
         if !self.data_type().is_nested() {
             return None;

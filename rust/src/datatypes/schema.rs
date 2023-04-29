@@ -68,6 +68,18 @@ impl Schema {
         })
     }
 
+    /// Intersection between two [`Schema`].
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
+        let mut candidates: Vec<Field> = vec![];
+        for field in other.fields.iter() {
+            if let Some(candidate_field) = self.field(&field.name) {
+                candidates.push(candidate_field.intersection(&field)?);
+            }
+        }
+
+        todo!()
+    }
+
     pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
         let protos: Vec<pb::Field> = self.into();
 
