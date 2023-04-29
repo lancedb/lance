@@ -608,4 +608,40 @@ mod tests {
             .unwrap();
         assert!(f1.intersection(&f3).is_err());
     }
+
+    #[test]
+    fn test_struct_field_intersection() {
+        let f1: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("b", DataType::Int32, true),
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let f2: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("c", DataType::Int32, true),
+                ArrowField::new("a", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let actual = f1.intersection(&f2).unwrap();
+
+        let expected: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("c", DataType::Int32, true),
+            ])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
 }
