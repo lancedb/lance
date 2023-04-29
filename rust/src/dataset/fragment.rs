@@ -14,15 +14,17 @@
 
 //! Wraps a Fragment of the dataset.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
-use crate::format::{DataFile, Fragment};
-use crate::io::{FileReader, FileWriter};
+use crate::format::Fragment;
+use crate::io::{FileReader, FileWriter, RecordBatchStream};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
@@ -61,6 +63,7 @@ impl FileFragment {
         // TODO: support open multiple data files.
         for data_file in self.metadata.files.iter() {
             let data_file_schema = data_file.schema(schema);
+            let schema_per_file = data_file_schema.project(columns);
         }
         let path = self.dataset.data_dir().child(paths[0]);
         let reader = FileReader::try_new_with_fragment(
@@ -77,7 +80,10 @@ impl FileFragment {
     ///
     pub async fn count_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            return Err(Error::IO(format!("Fragment {} does not contain any data", self.id())));
+            return Err(Error::IO(format!(
+                "Fragment {} does not contain any data",
+                self.id()
+            )));
         };
 
         let reader = self
@@ -123,7 +129,7 @@ impl FileFragment {
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let reader = self
-            .do_open(&[self.metadata.files[0].path.as_str()])
+            .do_open(projection)
             .await?;
         reader.take(indices, projection).await
     }
@@ -133,6 +139,32 @@ impl FileFragment {
     /// See [`Dataset::scan`].
     pub fn scan(&self) -> Scanner {
         Scanner::from_fragment(self.dataset.clone(), self.metadata.clone())
+    }
+}
+
+/// FragmentScanner
+struct FragmentReader {
+    readers: Vec<(FileReader, Schema)>,
+
+    /// Projection Schema
+    schema: Schema,
+}
+
+impl FragmentReader {
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub async fn read_range(&mut self, range: Range<usize>) -> Result<RecordBatch> {
+        let batches = stream::iter(&self.readers)
+            .map(|(reader, schema)| async move {
+                let batch = reader.read_range(range.start..range.end, &schema).await?;
+                Ok::<RecordBatch, Error>(batch)
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        todo!()
     }
 }
 
