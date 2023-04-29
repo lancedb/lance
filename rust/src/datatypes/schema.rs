@@ -77,7 +77,10 @@ impl Schema {
             }
         }
 
-        todo!()
+        Ok(Self {
+            fields: candidates,
+            metadata: self.metadata.clone(),
+        })
     }
 
     pub fn project_by_ids(&self, column_ids: &[i32]) -> Result<Self> {
@@ -420,5 +423,53 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&excluded), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_intersection() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+            ArrowField::new("d", DataType::Utf8, false),
+        ]);
+        let other = Schema::try_from(&arrow_schema).unwrap();
+
+        let actual: ArrowSchema = (&schema.intersection(&other).unwrap()).into();
+
+        let expected = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    true,
+                ), ArrowField::new("f2", DataType::Boolean, false)])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        assert_eq!(actual, expected);
     }
 }

@@ -635,9 +635,11 @@ mod tests {
 
         let expected: Field = ArrowField::new(
             "a",
-            DataType::Struct(Fields::from(vec![
-                ArrowField::new("c", DataType::Int32, true),
-            ])),
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
             true,
         )
         .try_into()
