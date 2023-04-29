@@ -125,7 +125,7 @@ impl Field {
                     let lance_field = self
                         .children
                         .iter_mut()
-                        .find(|c| c.name == f.name().to_string())
+                        .find(|c| c.name == *f.name())
                         .unwrap();
                     let struct_arr = arr.as_struct();
                     lance_field.set_dictionary(struct_arr.column(i));
@@ -153,8 +153,7 @@ impl Field {
             self.children
                 .iter()
                 .find(|c| c.name == first)
-                .map(|c| c.sub_field(&path_components[1..]))
-                .flatten()
+                .and_then(|c| c.sub_field(&path_components[1..]))
         }
     }
 
@@ -249,7 +248,7 @@ impl Field {
                 }
             })
             .filter(Option::is_some)
-            .map(Option::unwrap)
+            .flatten()
             .collect::<Vec<_>>();
         if children.is_empty() {
             None

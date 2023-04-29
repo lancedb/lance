@@ -73,7 +73,7 @@ impl Schema {
         let mut candidates: Vec<Field> = vec![];
         for field in other.fields.iter() {
             if let Some(candidate_field) = self.field(&field.name) {
-                candidates.push(candidate_field.intersection(&field)?);
+                candidates.push(candidate_field.intersection(field)?);
             }
         }
 
@@ -123,8 +123,7 @@ impl Schema {
         self.fields
             .iter()
             .find(|f| f.name == split[0])
-            .map(|c| c.sub_field(&split[1..]))
-            .flatten()
+            .and_then(|c| c.sub_field(&split[1..]))
     }
 
     pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
@@ -239,8 +238,8 @@ impl From<&Schema> for ArrowSchema {
 }
 
 /// Convert Lance Schema to Arrow Schema
-impl From<&Schema> for Schema {
-    fn from(schema: &Schema) -> Self {
+impl From<&Self> for Schema {
+    fn from(schema: &Self) -> Self {
         schema.clone()
     }
 }
