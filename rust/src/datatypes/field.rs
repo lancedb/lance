@@ -409,6 +409,14 @@ impl TryFrom<&ArrowField> for Field {
     }
 }
 
+impl TryFrom<ArrowField> for Field {
+    type Error = Error;
+
+    fn try_from(field: ArrowField) -> Result<Self> {
+        Self::try_from(&field)
+    }
+}
+
 impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
         Self::new(&field.name, field.data_type(), field.nullable)
@@ -581,5 +589,23 @@ mod tests {
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+    }
+
+    #[test]
+    fn test_field_intersection() {
+        let f1: Field = ArrowField::new("a", DataType::Int32, true)
+            .try_into()
+            .unwrap();
+        let f2: Field = ArrowField::new("a", DataType::Int32, true)
+            .try_into()
+            .unwrap();
+        let i1 = f1.intersection(&f2).unwrap();
+
+        assert_eq!(i1, f1);
+
+        let f3: Field = ArrowField::new("b", DataType::Int32, true)
+            .try_into()
+            .unwrap();
+        assert!(f1.intersection(&f3).is_err());
     }
 }
