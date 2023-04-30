@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::{FileReader, FileWriter, RecordBatchStream};
+use crate::io::{FileReader, FileWriter};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
@@ -59,21 +59,36 @@ impl FileFragment {
         self.metadata.id as usize
     }
 
-    async fn do_open(&self, schema: &Schema) -> Result<FileReader> {
-        // TODO: support open multiple data files.
+    /// Open all the data files as part of the projection schema.
+    async fn do_open(&self, projection: &Schema) -> Result<FragmentReader> {
+        let full_schema = self.dataset.schema();
+
+        let mut opened_files = vec![];
         for data_file in self.metadata.files.iter() {
-            let data_file_schema = data_file.schema(schema);
-            let schema_per_file = data_file_schema.project(columns);
+            let data_file_schema = data_file.schema(&full_schema);
+            let schema_per_file = data_file_schema.intersection(projection)?;
+            if !schema_per_file.fields.is_empty() {
+                let path = self.dataset.data_dir().child(data_file.path.as_str());
+                let reader = FileReader::try_new_with_fragment(
+                    &self.dataset.object_store,
+                    &path,
+                    self.id() as u64,
+                    None,
+                )
+                .await?;
+                opened_files.push((reader, schema_per_file));
+            }
         }
-        let path = self.dataset.data_dir().child(paths[0]);
-        let reader = FileReader::try_new_with_fragment(
-            &self.dataset.object_store,
-            &path,
-            self.id() as u64,
-            None,
-        )
-        .await?;
-        Ok(reader)
+
+        if opened_files.is_empty() {
+            return Err(Error::IO(format!(
+                "Does not find any data file for schema: {}\nfragment_id={}",
+                projection,
+                self.id()
+            )));
+        }
+
+        Ok(FragmentReader::new(opened_files, projection.clone()))
     }
 
     /// Count the rows in this fragment.
@@ -86,9 +101,19 @@ impl FileFragment {
             )));
         };
 
-        let reader = self
-            .do_open(&[self.metadata.files[0].path.as_str()])
-            .await?;
+        // Just open any file. All of them should have same size.
+        let path = self
+            .dataset
+            .data_dir()
+            .child(self.metadata.files[0].path.as_str());
+        let reader = FileReader::try_new_with_fragment(
+            &self.dataset.object_store,
+            &path,
+            self.id() as u64,
+            None,
+        )
+        .await?;
+
         Ok(reader.len())
     }
 
@@ -128,10 +153,8 @@ impl FileFragment {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
-        let reader = self
-            .do_open(projection)
-            .await?;
-        reader.take(indices, projection).await
+        let reader = self.do_open(projection).await?;
+        reader.take(indices).await
     }
 
     /// Scan this [`FileFragment`].
@@ -142,8 +165,12 @@ impl FileFragment {
     }
 }
 
-/// FragmentScanner
+/// [`FragmentReader`] is an abstract reader for a [`FileFragment`].
+///
+/// It opens the data files that contains the columns of the projection schema, and
+/// reconstruct the RecordBatch from columns read from each data file.
 struct FragmentReader {
+    /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
 
     /// Projection Schema
@@ -151,14 +178,34 @@ struct FragmentReader {
 }
 
 impl FragmentReader {
+    fn new(readers: Vec<(FileReader, Schema)>, projection: Schema) -> Self {
+        Self {
+            readers,
+            schema: projection,
+        }
+    }
+
     pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub async fn read_range(&mut self, range: Range<usize>) -> Result<RecordBatch> {
+    pub async fn read_range(&self, range: Range<usize>) -> Result<RecordBatch> {
         let batches = stream::iter(&self.readers)
             .map(|(reader, schema)| async move {
                 let batch = reader.read_range(range.start..range.end, &schema).await?;
+                Ok::<RecordBatch, Error>(batch)
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+        todo!()
+    }
+
+    /// Take rows from this fragment.
+    pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let batches = stream::iter(&self.readers)
+            .map(|(reader, schema)| async move {
+                let batch = reader.take(indices, &schema).await?;
                 Ok::<RecordBatch, Error>(batch)
             })
             .buffered(num_cpus::get())
@@ -279,7 +326,7 @@ mod tests {
     async fn test_append_new_columns() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = create_dataset(test_uri).await;
+        let dataset = create_dataset(test_uri).await;
 
         let fragment = &mut dataset.get_fragments()[0];
         let new_arrow_schema = Arc::new(ArrowSchema::new(Fields::from(vec![ArrowField::new(
