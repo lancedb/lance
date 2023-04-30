@@ -39,6 +39,9 @@ pub struct LocalObjectReader {
     /// File handler.
     file: Arc<File>,
 
+    /// Fie path.
+    path: Path,
+
     /// Preferred I/O size, in bytes.
     ///
     /// It could be the block size for local SSD.
@@ -60,12 +63,17 @@ impl LocalObjectReader {
         Ok(Box::new(Self {
             file: File::open(local_path)?.into(),
             prefetch_size: prefetch,
+            path: path.clone(),
         }))
     }
 }
 
 #[async_trait]
 impl ObjectReader for LocalObjectReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn prefetch_size(&self) -> usize {
         self.prefetch_size
     }

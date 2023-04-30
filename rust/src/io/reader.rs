@@ -86,7 +86,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 ///
 /// It reads arrow data from one data file.
 pub struct FileReader {
-    object_reader: Box<dyn ObjectReader>,
+    object_reader: Arc<dyn ObjectReader>,
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
@@ -98,6 +98,12 @@ pub struct FileReader {
     /// If set true, returns the row ID from the dataset alongside with the
     /// actual data.
     with_row_id: bool,
+}
+
+impl std::fmt::Debug for FileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FileReader(fragment={}, path={})", self.fragment_id, self.object_reader.path())
+    }
 }
 
 impl FileReader {
@@ -144,7 +150,7 @@ impl FileReader {
         .await?;
 
         Ok(Self {
-            object_reader,
+            object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
             page_table,

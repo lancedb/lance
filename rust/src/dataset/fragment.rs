@@ -158,7 +158,7 @@ impl FileFragment {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
-        let reader = self.do_open(projection).await?;
+        let reader = self.do_open(&projection.clone()).await?;
         reader.take(indices).await
     }
 
@@ -207,27 +207,28 @@ impl FragmentReader {
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
-        todo!()
+        let mut merged = batches[0].clone();
+        for i in 1..batches.len() {
+            merged = merged.merge(&batches[i])?;
+        }
+        Ok(merged)
     }
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        let batches = stream::iter(&self.readers)
-            .map(|(reader, schema)| async move {
-                let batch = reader.take(indices, &schema).await?;
-                Ok::<RecordBatch, Error>(batch)
-            })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
-        if batches.is_empty() {
-            return Err(Error::IO(format!(
-                "Fragment {} does not contain any data",
-                self.fragment_id,
-            )));
-        }
+        let mut batches = vec![];
 
-        todo!()
+        // TODO: Putting this loop in async blocks cause lifetime issues.
+        // We need to fix
+        for (reader, schema) in self.readers.iter() {
+            let batch = reader.take(indices, &schema).await?;
+            batches.push(batch);
+        }
+        let mut merged = batches[0].clone();
+        for i in 1..batches.len() {
+            merged = merged.merge(&batches[i])?;
+        }
+        Ok(merged)
     }
 }
 
