@@ -21,6 +21,7 @@ use arrow_array::RecordBatch;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use uuid::Uuid;
 
+use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
@@ -88,7 +89,11 @@ impl FileFragment {
             )));
         }
 
-        Ok(FragmentReader::new(opened_files, projection.clone()))
+        Ok(FragmentReader::new(
+            self.id(),
+            opened_files,
+            projection.clone(),
+        ))
     }
 
     /// Count the rows in this fragment.
@@ -175,13 +180,17 @@ struct FragmentReader {
 
     /// Projection Schema
     schema: Schema,
+
+    /// ID of the fragment
+    fragment_id: usize,
 }
 
 impl FragmentReader {
-    fn new(readers: Vec<(FileReader, Schema)>, projection: Schema) -> Self {
+    fn new(fragment_id: usize, readers: Vec<(FileReader, Schema)>, projection: Schema) -> Self {
         Self {
             readers,
             schema: projection,
+            fragment_id,
         }
     }
 
@@ -211,6 +220,13 @@ impl FragmentReader {
             .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
+        if batches.is_empty() {
+            return Err(Error::IO(format!(
+                "Fragment {} does not contain any data",
+                self.fragment_id,
+            )));
+        }
+
         todo!()
     }
 }
