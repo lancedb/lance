@@ -18,7 +18,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use crate::arrow::*;
@@ -156,6 +155,7 @@ impl FileFragment {
             .base_path()
             .child(DATA_DIR)
             .child(file_path.as_str());
+        println!("Full path: {}", full_path);
         FileWriter::try_new(object_store, &full_path, schema).await
     }
 
@@ -365,6 +365,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
+        println!("Test URI: {:?}", test_uri);
 
         let fragment = &mut dataset.get_fragments()[0];
         let new_arrow_schema = Arc::new(ArrowSchema::new(Fields::from(vec![ArrowField::new(

@@ -95,7 +95,6 @@ impl LanceStream {
                     let result = reader
                         .read_range(offset..min(offset + read_size, total_rows))
                         .await;
-                    println!("Read rows: {:?}", result);
 
                     if tx.is_closed() {
                         // Early stop
@@ -130,7 +129,6 @@ impl RecordBatchStream for LanceStream {
         } else {
             Arc::new(schema)
         }
-        // Arc::new(self.projection.as_ref().into())
     }
 }
 

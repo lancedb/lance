@@ -233,6 +233,9 @@ impl FileReader {
                 .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
+        if batches.len() == 1 {
+            return Ok(batches[0].clone());
+        }
         let schema = batches[0].schema();
         Ok(concat_batches(&schema, &batches)?)
     }
