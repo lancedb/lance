@@ -174,6 +174,7 @@ impl Dataset {
             if let Ok(b) = batch {
                 schema = Schema::try_from(b.schema().as_ref())?;
                 schema.set_dictionary(b)?;
+                schema.validate()?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }

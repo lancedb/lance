@@ -54,6 +54,7 @@ pub struct Field {
 }
 
 impl Field {
+
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {
