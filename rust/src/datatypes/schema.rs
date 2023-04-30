@@ -71,7 +71,10 @@ impl Schema {
     pub(crate) fn validate(&self) -> Result<bool> {
         for field in self.fields.iter() {
             if field.name.contains('.') {
-                return Err(Error::Schema(format!("Field {} cannot contain `.`", field.name.clone())));
+                return Err(Error::Schema(format!(
+                    "Field {} cannot contain `.`",
+                    field.name.clone()
+                )));
             }
         }
         Ok(true)
