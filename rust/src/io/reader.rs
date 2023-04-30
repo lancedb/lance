@@ -102,7 +102,12 @@ pub struct FileReader {
 
 impl std::fmt::Debug for FileReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FileReader(fragment={}, path={})", self.fragment_id, self.object_reader.path())
+        write!(
+            f,
+            "FileReader(fragment={}, path={})",
+            self.fragment_id,
+            self.object_reader.path()
+        )
     }
 }
 
@@ -228,10 +233,7 @@ impl FileReader {
                 .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
-        let schema = Arc::new(
-            ArrowSchema::try_from(projection)
-                .map_err(|e| Error::Schema(format!("Failed to convert schema: {}", e)))?,
-        );
+        let schema = batches[0].schema();
         Ok(concat_batches(&schema, &batches)?)
     }
 

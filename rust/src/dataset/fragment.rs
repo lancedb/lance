@@ -61,7 +61,10 @@ impl FileFragment {
     }
 
     /// Open all the data files as part of the projection schema.
-    async fn do_open(&self, projection: &Schema) -> Result<FragmentReader> {
+    ///
+    /// Parameters
+    /// - projection: The projection schema.
+    pub async fn open(&self, projection: &Schema) -> Result<FragmentReader> {
         let full_schema = self.dataset.schema();
 
         let mut opened_files = vec![];
@@ -158,7 +161,7 @@ impl FileFragment {
 
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
-        let reader = self.do_open(&projection.clone()).await?;
+        let reader = self.open(projection).await?;
         reader.take(indices).await
     }
 
@@ -174,7 +177,7 @@ impl FileFragment {
 ///
 /// It opens the data files that contains the columns of the projection schema, and
 /// reconstruct the RecordBatch from columns read from each data file.
-struct FragmentReader {
+pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
 
@@ -183,6 +186,24 @@ struct FragmentReader {
 
     /// ID of the fragment
     fragment_id: usize,
+}
+
+impl std::fmt::Display for FragmentReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FragmentReader(id={})", self.fragment_id)
+    }
+}
+
+fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Err(Error::IO("Cannot merge empty batches".to_string()));
+    }
+
+    let mut merged = batches[0].clone();
+    for i in 1..batches.len() {
+        merged = merged.merge(&batches[i])?;
+    }
+    Ok(merged)
 }
 
 impl FragmentReader {
@@ -198,20 +219,25 @@ impl FragmentReader {
         &self.schema
     }
 
+    pub(crate) fn with_row_id(&mut self) -> &mut Self {
+        self.readers[0].0.with_row_id(true);
+        self
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.readers[0].0.len()
+    }
+
     pub async fn read_range(&self, range: Range<usize>) -> Result<RecordBatch> {
-        let batches = stream::iter(&self.readers)
-            .map(|(reader, schema)| async move {
-                let batch = reader.read_range(range.start..range.end, &schema).await?;
-                Ok::<RecordBatch, Error>(batch)
-            })
-            .buffered(num_cpus::get())
-            .try_collect::<Vec<_>>()
-            .await?;
-        let mut merged = batches[0].clone();
-        for i in 1..batches.len() {
-            merged = merged.merge(&batches[i])?;
+        // TODO: Putting this loop in async blocks cause lifetime issues.
+        // We need to fix
+        let mut batches = vec![];
+        for (reader, schema) in self.readers.iter() {
+            let batch = reader.read_range(range.start..range.end, schema).await?;
+            batches.push(batch);
         }
-        Ok(merged)
+
+        merge_batches(&batches)
     }
 
     /// Take rows from this fragment.
@@ -224,27 +250,22 @@ impl FragmentReader {
             let batch = reader.take(indices, &schema).await?;
             batches.push(batch);
         }
-        let mut merged = batches[0].clone();
-        for i in 1..batches.len() {
-            merged = merged.merge(&batches[i])?;
-        }
-        Ok(merged)
+
+        merge_batches(&batches)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
-
-    use super::*;
-
-    use arrow::array::AsArray;
     use arrow_arith::arithmetic::multiply_scalar;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatchReader, StringArray};
+    use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchReader, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
+
+    use super::*;
+    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -377,16 +398,12 @@ mod tests {
         assert_eq!(fragment.metadata.files.len(), 2);
 
         // Scan again
-        let scanner = fragment
-            .scan()
-            .batch_size(50)
-            .project(&["i", "double_i"])
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap();
-        let batches = scanner.try_collect::<Vec<_>>().await.unwrap();
-        assert_eq!(batches.len(), 1);
-        println!("Batches: {:?}", batches);
+        let full_schema = dataset.schema().merge(&schema);
+        let new_project = full_schema.project(&["i", "double_i"]).unwrap();
+        let reader = fragment.open(&new_project).await.unwrap();
+        let batch = reader.read_range(12..28).await.unwrap();
+
+        assert_eq!(batch.schema().as_ref(), &(&new_project).into());
+        println!("Batches: {:?}", batch);
     }
 }
