@@ -72,7 +72,7 @@ impl Schema {
         for field in self.fields.iter() {
             if field.name.contains('.') {
                 return Err(Error::Schema(format!(
-                    "Field {} cannot contain `.`",
+                    "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
                 )));
             }
