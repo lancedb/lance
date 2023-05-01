@@ -34,7 +34,8 @@ impl Updater {
         }
     }
 
-    async fn next(&mut self) -> Result<Option<RecordBatch>> {
+    /// Returns the next [`RecordBatch`] as input for updater.
+    pub async fn next(&mut self) -> Result<Option<RecordBatch>> {
         todo!()
     }
 }

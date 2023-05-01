@@ -110,5 +110,12 @@ class LanceFragment(pa.dataset.Fragment):
         -------
             A new fragment with the added column(s).
         """
-        
-        return self._ds.add_column(self, value_func)
+        updater = self._fragment.updater(columns)
+
+        while True:
+            batch = updater.next()
+            if batch is None:
+                break
+
+            updater.update(value_func(batch))
+
