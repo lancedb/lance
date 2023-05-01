@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 pub mod fragment;
 pub mod scanner;
+mod updater;
 mod write;
 
 use self::fragment::FileFragment;

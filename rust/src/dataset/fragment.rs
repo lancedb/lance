@@ -132,7 +132,7 @@ impl FileFragment {
     /// It is the caller's responsibility to close the [`FileWriter`].
     ///
     /// Internal use only.
-    pub async fn new_writer<'a>(&mut self, schema: &'a Schema) -> Result<FileWriter<'a>> {
+    pub(super) async fn new_writer<'a>(&mut self, schema: &'a Schema) -> Result<FileWriter<'a>> {
         // Sanity check.
         //
         // To keep it simple, new schema must have no intersection with the existing schema.
@@ -155,7 +155,6 @@ impl FileFragment {
             .base_path()
             .child(DATA_DIR)
             .child(file_path.as_str());
-        println!("Full path: {}", full_path);
         FileWriter::try_new(object_store, &full_path, schema).await
     }
 

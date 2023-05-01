@@ -102,4 +102,10 @@ impl FileFragment {
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn, rt))
     }
+
+    fn updater(self_: PyRef<'_, Self>) -> PyResult<()> {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async { self_.fragment.updater().await })
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
 }

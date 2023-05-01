@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import Iterator, Optional, Union
+from typing import Callable, Iterator, Optional, Union
 
 import pyarrow as pa
 
@@ -90,3 +90,25 @@ class LanceFragment(pa.dataset.Fragment):
         return self.scanner(
             columns=columns, filter=filter, limit=limit, offset=offset
         ).to_table()
+
+    def add_columns(
+        self,
+        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        columns: Optional[list[str]] = None,
+    ) -> LanceFragment:
+        """Add columns to this Fragment.
+
+        Parameters
+        ----------
+        value_func: Callable.
+            A function that takes a RecordBatch as input and returns a RecordBatch.
+        columns: Optional[list[str]].
+            If specified, only the columns in this list will be passed to the value_func.
+            Otherwise, all columns will be passed to the value_func.
+
+        Returns
+        -------
+            A new fragment with the added column(s).
+        """
+        
+        return self._ds.add_column(self, value_func)
