@@ -15,27 +15,46 @@
 use arrow_array::RecordBatch;
 
 use super::fragment::FragmentReader;
-use crate::Result;
+use crate::{io::FileWriter, Error, Result};
 
 /// Update or insert a new column.
-pub struct Updater {
+pub struct Updater<'a> {
     /// The reader over the [`Fragment`]
     reader: FragmentReader,
 
     last_input: Option<RecordBatch>,
-}
 
-impl Updater {
+    writer: FileWriter<'a>,
+}
+impl<'a> Updater<'a> {
     /// Create a new updater.
-    fn new(reader: FragmentReader) -> Self {
+    fn new(reader: FragmentReader, writer: FileWriter<'a>) -> Self {
         Self {
             reader,
             last_input: None,
+            writer,
         }
     }
 
     /// Returns the next [`RecordBatch`] as input for updater.
     pub async fn next(&mut self) -> Result<Option<RecordBatch>> {
+        todo!()
+    }
+
+    /// Update one batch.
+    pub async fn update(&mut self, batch: &RecordBatch) -> Result<()> {
+        let Some(last) = self.last_input.as_ref() else {
+            return Err(Error::IO("Fragment Updater: no input data is available before update".to_string()));
+        };
+
+        if last.num_rows() != batch.num_rows() {
+            return Err(Error::IO(format!(
+                "Fragment Updater: new batch has different size with the source batch: {} != {}",
+                last.num_rows(),
+                batch.num_rows()
+            )));
+        }
+
         todo!()
     }
 }
