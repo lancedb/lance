@@ -174,6 +174,7 @@ impl Dataset {
             if let Ok(b) = batch {
                 schema = Schema::try_from(b.schema().as_ref())?;
                 schema.set_dictionary(b)?;
+                schema.validate()?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
@@ -1079,5 +1080,36 @@ mod tests {
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
         assert!(dataset.load_indices().await.unwrap().is_empty());
+    }
+
+    async fn create_bad_file() -> Result<Dataset> {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "a.b.c",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batches = RecordBatchBuffer::new(
+            (0..20)
+                .map(|i| {
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                    )
+                    .unwrap()
+                })
+                .collect(),
+        );
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut reader, test_uri, None).await
+    }
+
+    #[tokio::test]
+    async fn test_bad_field_name() {
+        // don't allow `.` in the field name
+        assert!(create_bad_file().await.is_err());
     }
 }

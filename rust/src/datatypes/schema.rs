@@ -68,6 +68,20 @@ impl Schema {
         })
     }
 
+    /// Check that the top level fields don't contain `.` in their names
+    /// to distinguish from nested fields.
+    pub(crate) fn validate(&self) -> Result<bool> {
+        for field in self.fields.iter() {
+            if field.name.contains('.') {
+                return Err(Error::Schema(format!(
+                    "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
+                    field.name.clone()
+                )));
+            }
+        }
+        Ok(true)
+    }
+
     /// Intersection between two [`Schema`].
     pub fn intersection(&self, other: &Self) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
