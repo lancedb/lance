@@ -68,6 +68,8 @@ impl Schema {
         })
     }
 
+    /// Check that the top level fields don't contain `.` in their names
+    /// to distinguish from nested fields.
     pub(crate) fn validate(&self) -> Result<bool> {
         for field in self.fields.iter() {
             if field.name.contains('.') {
