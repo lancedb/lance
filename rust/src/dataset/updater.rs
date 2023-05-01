@@ -25,20 +25,27 @@ pub struct Updater<'a> {
     last_input: Option<RecordBatch>,
 
     writer: FileWriter<'a>,
+
+    batch_id: usize,
 }
 impl<'a> Updater<'a> {
-    /// Create a new updater.
+    /// Create a new updater with source reader, and destination writer.
     fn new(reader: FragmentReader, writer: FileWriter<'a>) -> Self {
         Self {
             reader,
             last_input: None,
             writer,
+            batch_id: 0,
         }
     }
 
     /// Returns the next [`RecordBatch`] as input for updater.
-    pub async fn next(&mut self) -> Result<Option<RecordBatch>> {
-        todo!()
+    pub async fn next(&mut self) -> Result<Option<&RecordBatch>> {
+        let batch = self.reader.read_batch(self.batch_id).await?;
+        self.batch_id += 1;
+
+        self.last_input = Some(batch);
+        Ok(self.last_input.as_ref())
     }
 
     /// Update one batch.
@@ -55,6 +62,8 @@ impl<'a> Updater<'a> {
             )));
         }
 
-        todo!()
+        self.writer.write(&[batch]).await?;
+
+        Ok(())
     }
 }

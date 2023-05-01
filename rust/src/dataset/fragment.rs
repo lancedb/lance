@@ -91,11 +91,11 @@ impl FileFragment {
             )));
         }
 
-        Ok(FragmentReader::new(
+        FragmentReader::try_new(
             self.id(),
             opened_files,
             projection.clone(),
-        ))
+        )
     }
 
     /// Count the rows in this fragment.
@@ -206,12 +206,29 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
-    fn new(fragment_id: usize, readers: Vec<(FileReader, Schema)>, projection: Schema) -> Self {
-        Self {
+    fn try_new(
+        fragment_id: usize,
+        readers: Vec<(FileReader, Schema)>,
+        projection: Schema,
+    ) -> Result<Self> {
+        if readers.is_empty() {
+            return Err(Error::IO(
+                "Cannot create FragmentReader with zero readers".to_string(),
+            ));
+        }
+
+        let num_batches = readers[0].0.num_batches();
+        if !readers.iter().all(|r| r.0.num_batches() == num_batches) {
+            return Err(Error::IO(
+                "Cannot create FragmentReader from data files with different number of batches".to_string(),
+            ));
+        }
+
+        Ok(Self {
             readers,
             schema: projection,
             fragment_id,
-        }
+        })
     }
 
     pub(crate) fn schema(&self) -> &Schema {
@@ -225,6 +242,16 @@ impl FragmentReader {
 
     pub(crate) fn len(&self) -> usize {
         self.readers[0].0.len()
+    }
+
+    pub async fn read_batch(&self, batch_id: usize) -> Result<RecordBatch> {
+        // TODO: use tokio::async buffer to make parallel reads.
+        let mut batches = vec![];
+        for (reader, schema) in self.readers.iter() {
+            let batch = reader.read_batch(batch_id as i32, .., schema).await?;
+            batches.push(batch);
+        }
+        merge_batches(&batches)
     }
 
     pub async fn read_range(&self, range: Range<usize>) -> Result<RecordBatch> {
