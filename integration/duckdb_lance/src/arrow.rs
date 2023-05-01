@@ -57,7 +57,7 @@ pub fn to_duckdb_type_id(data_type: &DataType) -> Result<LogicalTypeId> {
         DataType::Utf8 | DataType::LargeUtf8 => Varchar,
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => List,
         DataType::Struct(_) => Struct,
-        DataType::Union(_, _, _) => Union,
+        DataType::Union(_, _) => Union,
         DataType::Dictionary(_, _) => todo!(),
         DataType::Decimal128(_, _) => Decimal,
         DataType::Decimal256(_, _) => Decimal,
