@@ -8,8 +8,8 @@ lance = { path = "../../rust" }
 duckdb-ext = { path = "./duckdb-ext" }
 lazy_static = "1.4.0"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
-arrow-schema = "33.0.0"
-arrow-array = "33.0.0"
+arrow-schema = "37.0.0"
+arrow-array = "37.0.0"
 futures = "0.3"
 num-traits = "0.2"
 
