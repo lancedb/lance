@@ -101,20 +101,20 @@ pub async fn write_manifest(
 /// // Need to close file writer to flush buffer and footer.
 /// file_writer.shutdown();
 /// ```
-pub struct FileWriter<'a> {
+pub struct FileWriter {
     object_writer: ObjectWriter,
-    schema: &'a Schema,
+    schema: Schema,
     batch_id: i32,
     page_table: PageTable,
     metadata: Metadata,
 }
 
-impl<'a> FileWriter<'a> {
+impl FileWriter {
     pub async fn try_new(
         object_store: &ObjectStore,
         path: &Path,
-        schema: &'a Schema,
-    ) -> Result<FileWriter<'a>> {
+        schema: Schema,
+    ) -> Result<FileWriter> {
         let object_writer = object_store.create(path).await?;
         Ok(Self {
             object_writer,
@@ -129,18 +129,27 @@ impl<'a> FileWriter<'a> {
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    pub async fn write(&mut self, batch: &[&RecordBatch]) -> Result<()> {
-        for field in self.schema.fields.iter() {
-            let arrs: Result<Vec<_>> = batch
+    pub async fn write(&mut self, batches: &[&RecordBatch]) -> Result<()> {
+        // Copy a list of fields to avoid borrow checker error.
+        let fields = self
+            .schema
+            .fields
+            .iter()
+            .map(|f| f.clone())
+            .collect::<Vec<_>>();
+        for field in fields.iter() {
+            let arrs = batches
                 .iter()
-                .map(|b| {
-                    let column_id = b.schema().index_of(&field.name)?;
-                    Ok(b.column(column_id))
+                .map(|batch| {
+                    batch.column_by_name(&field.name).ok_or_else(|| {
+                        Error::IO(format!("FileWriter::write: Field {} not found", field.name))
+                    })
                 })
-                .collect();
-            self.write_array(field, arrs?.as_slice()).await?;
+                .collect::<Result<Vec<_>>>()?;
+
+            self.write_array(field, &arrs).await?;
         }
-        let batch_length = batch.iter().map(|b| b.num_rows() as i32).sum();
+        let batch_length = batches.iter().map(|b| b.num_rows() as i32).sum();
         self.metadata.push_batch_length(batch_length);
         self.batch_id += 1;
         Ok(())
@@ -346,7 +355,7 @@ impl<'a> FileWriter<'a> {
         self.metadata.page_table_position = pos;
 
         // Step 2. Write manifest and dictionary values.
-        let mut manifest = Manifest::new(self.schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(&self.schema, Arc::new(vec![]));
         let pos = write_manifest(&mut self.object_writer, &mut manifest, None).await?;
 
         // Step 3. Write metadata.
@@ -562,7 +571,7 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
         file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -592,7 +601,7 @@ mod tests {
 
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
         file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -627,7 +636,7 @@ mod tests {
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
         file_writer.write(&[&batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 

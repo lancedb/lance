@@ -715,7 +715,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
 
         let array = Int32Array::from_iter_values(0..1000);
 
@@ -746,7 +746,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
 
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         for i in 0..10 {
@@ -775,7 +775,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
 
         for i in (0..100).step_by(4) {
             let slice: FixedSizeListArray = fixed_size_list.slice(i, 4);
@@ -806,7 +806,9 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
 
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
@@ -835,7 +837,9 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, &schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
 
         let array = BooleanArray::from((0..5000).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
