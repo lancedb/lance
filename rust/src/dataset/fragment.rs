@@ -173,11 +173,13 @@ impl FileFragment {
     }
 
     /// Create an [`Updater`] to append new columns.
-    pub fn updater(&self, columns: Option<Vec<String>>) -> Result<Updater> {
+    pub async fn updater(&self, columns: Option<Vec<String>>) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
         if let Some(columns) = columns {
             schema = schema.project(&columns)?;
         }
+        let reader = self.open(&schema).await?;
+        let writer = self.new_writer(schema)
 
         todo!()
     }

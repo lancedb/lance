@@ -24,18 +24,18 @@ pub struct Updater {
 
     last_input: Option<RecordBatch>,
 
-    writer: FileWriter,
+    writer: Option<FileWriter>,
 
     batch_id: usize,
 }
 
 impl Updater {
     /// Create a new updater with source reader, and destination writer.
-    fn new(reader: FragmentReader, writer: FileWriter) -> Self {
+    fn new(reader: FragmentReader) -> Self {
         Self {
             reader,
             last_input: None,
-            writer,
+            writer: None,
             batch_id: 0,
         }
     }
@@ -61,6 +61,11 @@ impl Updater {
                 last.num_rows(),
                 batch.num_rows()
             )));
+        };
+
+        if self.writer.is_none() {
+            let output_schema = batch.schema();
+            // Need to assign field id correctly here.
         }
 
         self.writer.write(&[batch]).await?;

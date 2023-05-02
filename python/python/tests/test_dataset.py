@@ -251,3 +251,23 @@ def test_pickle_fragment(tmp_path: Path):
     unpickled = pickle.loads(pickled)
 
     assert fragment.to_table() == unpickled.to_table()
+
+
+def test_add_columns(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+    print(fragments)
+
+    fragment = fragments[0]
+
+    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
+        print(adder)
+        pass
+    updater = fragment.add_columns(adder, columns=["a"])
+    
+
+    pass
