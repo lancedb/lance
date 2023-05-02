@@ -12,13 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 
 use super::fragment::FragmentReader;
+use crate::dataset::Dataset;
 use crate::{io::FileWriter, Error, Result};
 
 /// Update or insert a new column.
 pub struct Updater {
+    dataset: Arc<Dataset>,
+
     /// The reader over the [`Fragment`]
     reader: FragmentReader,
 
@@ -31,8 +36,9 @@ pub struct Updater {
 
 impl Updater {
     /// Create a new updater with source reader, and destination writer.
-    fn new(reader: FragmentReader) -> Self {
+    pub(super) fn new(dataset: Arc<Dataset>, reader: FragmentReader) -> Self {
         Self {
+            dataset,
             reader,
             last_input: None,
             writer: None,
@@ -66,6 +72,8 @@ impl Updater {
         if self.writer.is_none() {
             let output_schema = batch.schema();
             // Need to assign field id correctly here.
+            let merged = self.dataset.schema().merge(output_schema.as_ref())?;
+            let schema = merged.project_
         }
 
         self.writer.write(&[batch]).await?;

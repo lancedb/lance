@@ -179,9 +179,8 @@ impl FileFragment {
             schema = schema.project(&columns)?;
         }
         let reader = self.open(&schema).await?;
-        let writer = self.new_writer(schema)
 
-        todo!()
+        Ok(Updater::new(self.dataset.clone(), reader))
     }
 }
 
