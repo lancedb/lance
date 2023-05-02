@@ -499,4 +499,40 @@ mod tests {
         ]);
         assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn test_merge_schemas_and_assign_field_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        assert_eq!(schema.max_field_id(), Some(5));
+
+        let to_merged_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("d", DataType::Int32, false),
+            ArrowField::new("e", DataType::Binary, false),
+        ]);
+        let to_merged = Schema::try_from(&to_merged_arrow_schema).unwrap();
+        // It is already assigned with field ids.
+        assert_eq!(to_merged.max_field_id(), Some(1));
+
+        let merged = schema.merge(&to_merged);
+        assert_eq!(merged.max_field_id(), Some(7));
+
+        let field = merged.field("d").unwrap();
+        assert_eq!(field.id, 6);
+        let field = merged.field("e").unwrap();
+        assert_eq!(field.id, 7);
+    }
 }
