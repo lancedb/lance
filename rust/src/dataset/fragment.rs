@@ -28,6 +28,7 @@ use crate::io::{FileReader, FileWriter};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
+use super::updater::Updater;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -169,6 +170,16 @@ impl FileFragment {
     /// See [`Dataset::scan`].
     pub fn scan(&self) -> Scanner {
         Scanner::from_fragment(self.dataset.clone(), self.metadata.clone())
+    }
+
+    /// Create an [`Updater`] to append new columns.
+    pub fn updater(&self, columns: Option<Vec<String>>) -> Result<Updater> {
+        let mut schema = self.dataset.schema().clone();
+        if let Some(columns) = columns {
+            schema = schema.project(&columns)?;
+        }
+        
+        todo!()
     }
 }
 
