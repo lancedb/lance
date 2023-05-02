@@ -299,6 +299,12 @@ impl Field {
             .for_each(|f| f.set_id(self.id, id_seed));
     }
 
+    /// Recursively reset field ID for this field and all its children.
+    pub(super) fn reset_id(&mut self) {
+        self.id = -1;
+        self.children.iter_mut().for_each(Self::reset_id);
+    }
+
     // Find any nested child with a specific field id
     pub(super) fn mut_field_by_id(&mut self, id: i32) -> Option<&mut Self> {
         for child in self.children.as_mut_slice() {

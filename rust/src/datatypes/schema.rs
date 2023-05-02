@@ -198,18 +198,33 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
-    pub fn merge(&self, other: &Self) -> Self {
+    fn reset_id(&mut self) {
+        self.fields.iter_mut().for_each(|f| f.reset_id());
+    }
+
+    /// Merge this schema from the other schema.
+    ///
+    /// After merging, the field IDs from `other` schema will be reassigned,
+    /// following the fields in `self`.
+    pub fn merge<S: TryInto<Self, Error = Error>>(&self, other: S) -> Result<Self> {
+        let mut other: Self = other.try_into()?;
+        other.reset_id();
+
         let mut fields = self.fields.clone();
         for field in other.fields.as_slice() {
             if !fields.iter().any(|f| f.name == field.name) {
                 fields.push(field.clone());
             }
         }
-        let mut metadata = other.metadata.clone();
-        self.metadata.iter().for_each(|(k, v)| {
-            metadata.insert(k.to_string(), v.to_string());
-        });
-        Self { fields, metadata }
+        let metadata = self
+            .metadata
+            .iter()
+            .chain(other.metadata.iter())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut schema = Self { fields, metadata };
+        schema.set_field_id();
+        Ok(schema)
     }
 }
 
@@ -251,10 +266,12 @@ impl From<&Schema> for ArrowSchema {
     }
 }
 
-/// Convert Lance Schema to Arrow Schema
-impl From<&Self> for Schema {
-    fn from(schema: &Self) -> Self {
-        schema.clone()
+/// Make API cleaner to accept both [`Schema`] and Arrow Schema.
+impl TryFrom<&Self> for Schema {
+    type Error = Error;
+
+    fn try_from(schema: &Self) -> Result<Self> {
+        Ok(schema.clone())
     }
 }
 
@@ -483,5 +500,73 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_merge_schemas_and_assign_field_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        assert_eq!(schema.max_field_id(), Some(5));
+
+        let to_merged_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("d", DataType::Int32, false),
+            ArrowField::new("e", DataType::Binary, false),
+        ]);
+        let to_merged = Schema::try_from(&to_merged_arrow_schema).unwrap();
+        // It is already assigned with field ids.
+        assert_eq!(to_merged.max_field_id(), Some(1));
+
+        let merged = schema.merge(&to_merged).unwrap();
+        assert_eq!(merged.max_field_id(), Some(7));
+
+        let field = merged.field("d").unwrap();
+        assert_eq!(field.id, 6);
+        let field = merged.field("e").unwrap();
+        assert_eq!(field.id, 7);
+    }
+
+    #[test]
+    fn test_merge_arrow_schema() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        assert_eq!(schema.max_field_id(), Some(5));
+
+        let to_merged_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("d", DataType::Int32, false),
+            ArrowField::new("e", DataType::Binary, false),
+        ]);
+        let merged = schema.merge(&to_merged_arrow_schema).unwrap();
+        assert_eq!(merged.max_field_id(), Some(7));
+
+        let field = merged.field("d").unwrap();
+        assert_eq!(field.id, 6);
+        let field = merged.field("e").unwrap();
+        assert_eq!(field.id, 7);
     }
 }
