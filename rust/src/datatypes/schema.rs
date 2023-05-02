@@ -198,17 +198,24 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
-    pub fn merge(&self, other: &Self) -> Self {
+    /// Merge this schema from the other schema.
+    ///
+    /// After merging, the field IDs from `other` schema will be reassigned,
+    /// following the fields in `self`.
+    pub fn merge<S: Into<Self>>(&self, other: S) -> Self {
+        let other: Self = other.into();
         let mut fields = self.fields.clone();
         for field in other.fields.as_slice() {
             if !fields.iter().any(|f| f.name == field.name) {
                 fields.push(field.clone());
             }
         }
-        let mut metadata = other.metadata.clone();
-        self.metadata.iter().for_each(|(k, v)| {
-            metadata.insert(k.to_string(), v.to_string());
-        });
+        let metadata = self
+            .metadata
+            .iter()
+            .chain(other.metadata.iter())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         Self { fields, metadata }
     }
 }

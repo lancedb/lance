@@ -169,7 +169,7 @@ impl TakeExec {
         }
 
         let input_schema = Schema::try_from(input.schema().as_ref())?;
-        let output_schema = input_schema.merge(&extra_schema);
+        let output_schema = input_schema.merge(extra_schema.as_ref());
 
         let remaining_schema = extra_schema.exclude(&input_schema)?;
 
