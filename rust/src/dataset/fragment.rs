@@ -133,7 +133,7 @@ impl FileFragment {
     /// It is the caller's responsibility to close the [`FileWriter`].
     ///
     /// Internal use only.
-    pub(super) async fn new_writer<'a>(&mut self, schema: &'a Schema) -> Result<FileWriter<'a>> {
+    pub(super) async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter> {
         // Sanity check.
         //
         // To keep it simple, new schema must have no intersection with the existing schema.
@@ -150,7 +150,7 @@ impl FileFragment {
 
         let object_store = self.dataset.object_store.as_ref();
         let file_path = format!("{}.lance", Uuid::new_v4());
-        self.metadata.add_file(&file_path, schema);
+        self.metadata.add_file(&file_path, &schema);
 
         let full_path = object_store
             .base_path()
@@ -178,7 +178,7 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(&columns)?;
         }
-        
+
         todo!()
     }
 }
@@ -411,7 +411,7 @@ mod tests {
             true,
         )])));
         let schema: Schema = new_arrow_schema.as_ref().try_into().unwrap();
-        let mut writer = fragment.new_writer(&schema).await.unwrap();
+        let mut writer = fragment.new_writer(schema.clone()).await.unwrap();
         let mut scanner = fragment
             .scan()
             .batch_size(50)

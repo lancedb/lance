@@ -19,8 +19,8 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 
-use crate::Scanner;
 use crate::updater::Updater;
+use crate::Scanner;
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -106,8 +106,9 @@ impl FileFragment {
 
     fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let rt = tokio::runtime::Runtime::new()?;
-        let inner = rt.block_on(async { self_.fragment.updater(columns) })
+        let inner = rt
+            .block_on(async { self_.fragment.updater(columns) })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(Updater::new(inner, rt))
+        Ok(Updater::new(inner))
     }
 }

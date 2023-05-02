@@ -18,19 +18,20 @@ use super::fragment::FragmentReader;
 use crate::{io::FileWriter, Error, Result};
 
 /// Update or insert a new column.
-pub struct Updater<'a> {
+pub struct Updater {
     /// The reader over the [`Fragment`]
     reader: FragmentReader,
 
     last_input: Option<RecordBatch>,
 
-    writer: FileWriter<'a>,
+    writer: FileWriter,
 
     batch_id: usize,
 }
-impl<'a> Updater<'a> {
+
+impl Updater {
     /// Create a new updater with source reader, and destination writer.
-    fn new(reader: FragmentReader, writer: FileWriter<'a>) -> Self {
+    fn new(reader: FragmentReader, writer: FileWriter) -> Self {
         Self {
             reader,
             last_input: None,
