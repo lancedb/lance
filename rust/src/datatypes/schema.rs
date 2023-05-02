@@ -198,12 +198,18 @@ impl Schema {
             .for_each(|f| f.set_id(-1, &mut current_id));
     }
 
+    fn reset_id(&mut self) {
+        self.fields.iter_mut().for_each(|f| f.reset_id());
+    }
+
     /// Merge this schema from the other schema.
     ///
     /// After merging, the field IDs from `other` schema will be reassigned,
     /// following the fields in `self`.
     pub fn merge<S: Into<Self>>(&self, other: S) -> Self {
-        let other: Self = other.into();
+        let mut other: Self = other.into();
+        other.reset_id();
+
         let mut fields = self.fields.clone();
         for field in other.fields.as_slice() {
             if !fields.iter().any(|f| f.name == field.name) {
@@ -216,7 +222,9 @@ impl Schema {
             .chain(other.metadata.iter())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        Self { fields, metadata }
+        let mut schema = Self { fields, metadata };
+        schema.set_field_id();
+        schema
     }
 }
 
