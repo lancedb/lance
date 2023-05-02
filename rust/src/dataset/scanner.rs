@@ -273,8 +273,7 @@ impl Scanner {
         }
 
         let schema = if !extra_columns.is_empty() {
-            let extra_schema = Schema::try_from(&ArrowSchema::new(extra_columns))?;
-            self.projections.merge(&extra_schema)
+            self.projections.merge(&ArrowSchema::new(extra_columns))?
         } else {
             self.projections.clone()
         };
