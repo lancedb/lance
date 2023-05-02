@@ -83,16 +83,16 @@ impl From<&Manifest> for Version {
 }
 
 /// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
-async fn new_file_writer<'a>(
-    object_store: &'a ObjectStore,
+async fn new_file_writer(
+    object_store: &ObjectStore,
     data_file_path: &str,
-    schema: &'a Schema,
-) -> Result<FileWriter<'a>> {
+    schema: &Schema,
+) -> Result<FileWriter> {
     let full_path = object_store
         .base_path()
         .child(DATA_DIR)
         .child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema).await
+    FileWriter::try_new(object_store, &full_path, schema.clone()).await
 }
 
 /// Get the manifest file path for a version.
