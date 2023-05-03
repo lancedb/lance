@@ -196,7 +196,10 @@ impl Field {
         };
 
         match (self.data_type(), other.data_type()) {
-            (dt, other_dt) if dt.is_primitive() && other_dt.is_primitive() => {
+            (dt, other_dt)
+                if (dt.is_primitive() && other_dt.is_primitive())
+                    || (dt.is_binary_like() || other_dt.is_binary_like()) =>
+            {
                 if dt != other_dt {
                     return Err(Error::Schema(format!(
                         "Attempt to project field by different types: {} and {}",
@@ -205,14 +208,25 @@ impl Field {
                 }
                 Ok(self.clone())
             }
-            (dt, other_dt) if dt.is_struct() && other_dt.is_struct() => {
-                todo!()
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                let mut fields = vec![];
+                for other_field in other.children.iter() {
+                    let Some(child) = self.child(&other_field.name) else {
+                        return Err(Error::Schema(format!(
+                            "Attempt to project non-existed field: {} on {}", other_field.name, self,
+                        )));
+                    };
+                    fields.push(child.project_by_field(other_field)?);
+                }
+                let mut cloned = self.clone();
+                cloned.children = fields;
+                Ok(cloned)
             }
             (DataType::List(_), DataType::List(_)) => {
                 let projected = self.children[0].project_by_field(&other.children[0])?;
                 let mut cloned = self.clone();
                 cloned.children = vec![projected];
-               Ok(cloned)
+                Ok(cloned)
             }
             _ => Err(Error::Schema(format!(
                 "Attempt to project incompatible fields: {} and {}",
