@@ -71,7 +71,6 @@ impl FileFragment {
         let full_schema = self.dataset.schema();
 
         let mut opened_files = vec![];
-        println!("meteadata.files: {:?}", self.metadata.files);
         for data_file in self.metadata.files.iter() {
             let data_file_schema = data_file.schema(&full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
@@ -227,7 +226,6 @@ impl FragmentReader {
         // TODO: use tokio::async buffer to make parallel reads.
         let mut batches = vec![];
         for (reader, schema) in self.readers.iter() {
-            println!("Reading {:?} schema={:?} batch={}", reader, schema, batch_id);
             let batch = reader
                 .read_batch(batch_id as i32, params.clone(), schema)
                 .await?;
@@ -395,12 +393,32 @@ mod tests {
 
         // Scan again
         let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+        let dataset = dataset
+            .create_version_from_fragments(&full_schema, &[new_fragment])
+            .await
+            .unwrap();
+        assert_eq!(dataset.version().version, 2);
         let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
-        let reader = fragment.open(&new_projection).await.unwrap();
-        // println!("Reader schema: {:?}", reader);
-        let batch = reader.read_range(12..28).await.unwrap();
 
-        assert_eq!(batch.schema().as_ref(), &(&new_projection).into());
-        println!("Batches: {:?}", batch);
+        let stream = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
+        let expected_batch = RecordBatch::try_new(Arc::new(
+            ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new("double_i", DataType::Int32, true),
+            ]),
+        ), vec![
+            Arc::new(Int32Array::from_iter_values(0..20)),
+            Arc::new(Int32Array::from_iter_values((0..40).step_by(2))),
+        ]).unwrap();
+        assert_eq!(batches[0], expected_batch);
     }
 }

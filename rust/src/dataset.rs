@@ -338,6 +338,31 @@ impl Dataset {
         })
     }
 
+    /// Create a new version of [`Dataset`] from a collection of fragments.
+    pub async fn create_version_from_fragments(
+        &self,
+        schema: &Schema,
+        fragments: &[Fragment],
+    ) -> Result<Self> {
+        let mut manifest = Manifest::new(schema, Arc::new(fragments.to_vec()));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        let duration_since_epoch = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
+        manifest.timestamp_nanos = timestamp_nanos;
+        let base = self.object_store.base_path().clone();
+        Ok(Self {
+            object_store: self.object_store.clone(),
+            base: base.into(),
+            manifest: Arc::new(manifest.clone()),
+        })
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))

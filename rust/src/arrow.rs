@@ -392,7 +392,6 @@ impl RecordBatchExt for RecordBatch {
                 );
             }
         }
-        println!("Try new: {:#?}", fields);
         Ok(Self::try_new(Arc::new(Schema::new(fields)), columns)?)
     }
 
