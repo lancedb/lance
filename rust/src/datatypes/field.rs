@@ -196,6 +196,7 @@ impl Field {
         };
 
         match (self.data_type(), other.data_type()) {
+            (DataType::Boolean, DataType::Boolean) => Ok(self.clone()),
             (dt, other_dt)
                 if (dt.is_primitive() && other_dt.is_primitive())
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
