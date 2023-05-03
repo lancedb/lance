@@ -206,10 +206,6 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.readers[0].0.len()
-    }
-
     pub(crate) fn num_batches(&self) -> usize {
         self.readers[0].0.num_batches()
     }
