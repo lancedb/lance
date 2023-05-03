@@ -185,6 +185,42 @@ impl Field {
         Ok(f)
     }
 
+    /// Project by a field.
+    ///
+    pub(super) fn project_by_field(&self, other: &Self) -> Result<Self> {
+        if self.name != other.name {
+            return Err(Error::Schema(format!(
+                "Attempt to project field by different names: {} and {}",
+                self.name, other.name,
+            )));
+        };
+
+        match (self.data_type(), other.data_type()) {
+            (dt, other_dt) if dt.is_primitive() && other_dt.is_primitive() => {
+                if dt != other_dt {
+                    return Err(Error::Schema(format!(
+                        "Attempt to project field by different types: {} and {}",
+                        dt, other_dt,
+                    )));
+                }
+                Ok(self.clone())
+            }
+            (dt, other_dt) if dt.is_struct() && other_dt.is_struct() => {
+                todo!()
+            }
+            (DataType::List(_), DataType::List(_)) => {
+                let projected = self.children[0].project_by_field(&other.children[0])?;
+                let mut cloned = self.clone();
+                cloned.children = vec![projected];
+               Ok(cloned)
+            }
+            _ => Err(Error::Schema(format!(
+                "Attempt to project incompatible fields: {} and {}",
+                self, other
+            ))),
+        }
+    }
+
     /// Intersection of two [`Field`]s.
     ///
     pub(super) fn intersection(&self, other: &Self) -> Result<Self> {
