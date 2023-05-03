@@ -418,6 +418,7 @@ mod tests {
                 true,
             ),
             ArrowField::new("c", DataType::Float64, false),
+            ArrowField::new("s", DataType::Utf8, false),
             ArrowField::new(
                 "l",
                 DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
@@ -446,6 +447,7 @@ mod tests {
                 )])),
                 true,
             ),
+            ArrowField::new("s", DataType::Utf8, false),
             ArrowField::new(
                 "l",
                 DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
