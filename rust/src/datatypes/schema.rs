@@ -423,6 +423,11 @@ mod tests {
                 DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
                 false,
             ),
+            ArrowField::new(
+                "fixed_l",
+                DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
+                false,
+            ),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
@@ -439,6 +444,11 @@ mod tests {
             ArrowField::new(
                 "l",
                 DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "fixed_l",
+                DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
                 false,
             ),
         ]);

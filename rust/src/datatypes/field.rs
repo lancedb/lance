@@ -222,11 +222,15 @@ impl Field {
                 cloned.children = fields;
                 Ok(cloned)
             }
-            (DataType::List(_), DataType::List(_)) => {
+            (DataType::List(_), DataType::List(_))
+            | (DataType::LargeList(_), DataType::LargeList(_)) => {
                 let projected = self.children[0].project_by_field(&other.children[0])?;
                 let mut cloned = self.clone();
                 cloned.children = vec![projected];
                 Ok(cloned)
+            }
+            (DataType::FixedSizeList(_, n), DataType::FixedSizeList(_, m)) if n == m => {
+                todo!()
             }
             _ => Err(Error::Schema(format!(
                 "Attempt to project incompatible fields: {} and {}",
