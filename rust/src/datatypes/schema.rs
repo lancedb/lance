@@ -428,6 +428,11 @@ mod tests {
                 DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
                 false,
             ),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
@@ -449,6 +454,11 @@ mod tests {
             ArrowField::new(
                 "fixed_l",
                 DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
                 false,
             ),
         ]);
