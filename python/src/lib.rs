@@ -28,6 +28,7 @@ pub(crate) mod errors;
 pub(crate) mod fragment;
 pub(crate) mod reader;
 pub(crate) mod scanner;
+pub(crate) mod updater;
 
 pub use dataset::write_dataset;
 pub use dataset::Dataset;

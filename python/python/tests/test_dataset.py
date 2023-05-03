@@ -251,3 +251,22 @@ def test_pickle_fragment(tmp_path: Path):
     unpickled = pickle.loads(pickled)
 
     assert fragment.to_table() == unpickled.to_table()
+
+
+def test_add_columns(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+
+    fragment = fragments[0]
+
+    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
+        c_array = pa.compute.multiply(batch.column(0), 2)
+        return pa.RecordBatch.from_arrays([c_array], names=["c"])
+
+    fragment = fragment.add_columns(adder, columns=["a"])
+    print(fragment)
+    # TODO: add python API in followup

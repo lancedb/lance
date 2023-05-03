@@ -196,6 +196,7 @@ impl Field {
         };
 
         match (self.data_type(), other.data_type()) {
+            (DataType::Boolean, DataType::Boolean) => Ok(self.clone()),
             (dt, other_dt)
                 if (dt.is_primitive() && other_dt.is_primitive())
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
@@ -229,11 +230,10 @@ impl Field {
                 cloned.children = vec![projected];
                 Ok(cloned)
             }
-            (DataType::FixedSizeList(_, n), DataType::FixedSizeList(_, m)) if n == m => {
-                let projected = self.children[0].project_by_field(&other.children[0])?;
-                let mut cloned = self.clone();
-                cloned.children = vec![projected];
-                Ok(cloned)
+            (DataType::FixedSizeList(dt, n), DataType::FixedSizeList(other_dt, m))
+                if dt == other_dt && n == m =>
+            {
+                Ok(self.clone())
             }
             (
                 DataType::Dictionary(self_key, self_value),

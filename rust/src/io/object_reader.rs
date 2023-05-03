@@ -39,6 +39,9 @@ use crate::io::ObjectStore;
 
 #[async_trait]
 pub trait ObjectReader: Send + Sync {
+    /// The file path of the object to read.
+    fn path(&self) -> &Path;
+
     /// Suggest optimal I/O size per storage device.
     fn prefetch_size(&self) -> usize;
 
@@ -75,6 +78,10 @@ impl<'a> CloudObjectReader {
 
 #[async_trait]
 impl ObjectReader for CloudObjectReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn prefetch_size(&self) -> usize {
         self.prefetch_size
     }

@@ -10,7 +10,7 @@ mod manifest;
 mod metadata;
 mod page_table;
 use crate::{Error, Result};
-pub use fragment::Fragment;
+pub use fragment::*;
 pub use index::Index;
 pub use manifest::Manifest;
 pub use metadata::Metadata;

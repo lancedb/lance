@@ -86,7 +86,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 ///
 /// It reads arrow data from one data file.
 pub struct FileReader {
-    object_reader: Box<dyn ObjectReader>,
+    object_reader: Arc<dyn ObjectReader>,
     metadata: Metadata,
     page_table: PageTable,
     projection: Option<Schema>,
@@ -98,6 +98,17 @@ pub struct FileReader {
     /// If set true, returns the row ID from the dataset alongside with the
     /// actual data.
     with_row_id: bool,
+}
+
+impl std::fmt::Debug for FileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FileReader(fragment={}, path={})",
+            self.fragment_id,
+            self.object_reader.path()
+        )
+    }
 }
 
 impl FileReader {
@@ -133,6 +144,7 @@ impl FileReader {
             let mut m: Manifest =
                 read_struct(object_reader.as_ref(), metadata.manifest_position.unwrap()).await?;
             m.schema.load_dictionary(object_reader.as_ref()).await?;
+
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         };
         let page_table = PageTable::load(
@@ -144,7 +156,7 @@ impl FileReader {
         .await?;
 
         Ok(Self {
-            object_reader,
+            object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
             page_table,
@@ -156,11 +168,6 @@ impl FileReader {
     /// Open one Lance data file for read.
     pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
-    }
-
-    /// Set the projection [Schema].
-    pub fn set_projection(&mut self, schema: Schema) {
-        self.projection = Some(schema)
     }
 
     /// Instruct the FileReader to return meta row id column.
@@ -222,10 +229,10 @@ impl FileReader {
                 .buffered(num_cpus::get())
                 .try_collect::<Vec<_>>()
                 .await?;
-        let schema = Arc::new(
-            ArrowSchema::try_from(projection)
-                .map_err(|e| Error::Schema(format!("Failed to convert schema: {}", e)))?,
-        );
+        if batches.len() == 1 {
+            return Ok(batches[0].clone());
+        }
+        let schema = batches[0].schema();
         Ok(concat_batches(&schema, &batches)?)
     }
 

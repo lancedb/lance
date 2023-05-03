@@ -28,10 +28,10 @@ use futures::stream::Stream;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
+use crate::dataset::fragment::FileFragment;
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::FileReader;
 
 /// Dataset Scan Node.
 #[derive(Debug)]
@@ -42,6 +42,8 @@ pub struct LanceStream {
 
     /// Manifest of the dataset
     projection: Arc<Schema>,
+
+    with_row_id: bool,
 }
 
 impl LanceStream {
@@ -67,48 +69,32 @@ impl LanceStream {
         let (tx, rx) = mpsc::channel(prefetch_size);
 
         let project_schema = projection.clone();
-        let data_dir = dataset.data_dir();
         let io_thread = tokio::spawn(async move {
             'outer: for frag in fragments.as_ref() {
                 if tx.is_closed() {
                     return;
                 }
-                let data_file = &frag.files[0];
-                let path = data_dir.child(data_file.path.clone());
-                let reader = match FileReader::try_new_with_fragment(
-                    dataset.object_store.as_ref(),
-                    &path,
-                    frag.id,
-                    Some(dataset.manifest.as_ref()),
-                )
-                .await
-                {
+                let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
+                let reader = match file_fragment.open(project_schema.as_ref()).await {
                     Ok(mut r) => {
-                        r.set_projection(project_schema.as_ref().clone());
-                        r.with_row_id(with_row_id);
+                        if with_row_id {
+                            r.with_row_id();
+                        };
                         r
                     }
                     Err(e) => {
-                        tx.send(Err(DataFusionError::Execution(format!(
-                            "Failed to open file: {path}: {e}"
-                        ))))
-                        .await
-                        .expect("Scanner sending error message");
+                        tx.send(Err(DataFusionError::from(e)))
+                            .await
+                            .expect("Scanner sending error message");
                         // Stop reading.
                         break;
                     }
                 };
-
-                let r = &reader;
-                for batch_id in 0..reader.num_batches() as i32 {
+                for batch_id in 0..reader.num_batches() {
                     let rows_in_batch = reader.num_rows_in_batch(batch_id);
                     for start in (0..rows_in_batch).step_by(read_size) {
-                        let result = r
-                            .read_batch(
-                                batch_id,
-                                start..min(start + read_size, rows_in_batch),
-                                project_schema.as_ref(),
-                            )
+                        let result = reader
+                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
                             .await;
                         if tx.is_closed() {
                             // Early stop
@@ -129,13 +115,21 @@ impl LanceStream {
             rx,
             _io_thread: io_thread, // Drop the background I/O thread with the stream.
             projection,
+            with_row_id,
         })
     }
 }
 
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
-        Arc::new(self.projection.as_ref().into())
+        let schema: ArrowSchema = self.projection.as_ref().into();
+        if self.with_row_id {
+            let mut fields: Vec<Arc<Field>> = schema.fields.to_vec();
+            fields.push(Arc::new(Field::new(ROW_ID, DataType::UInt64, false)));
+            Arc::new(ArrowSchema::new(fields))
+        } else {
+            Arc::new(schema)
+        }
     }
 }
 

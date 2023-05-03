@@ -24,7 +24,7 @@ use crate::format::pb;
 ///
 /// A data file is one piece of file storing data.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DataFile {
+pub(crate) struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
     /// The Ids of fields in this file.
@@ -32,11 +32,15 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    pub fn new(path: &str, schema: &Schema) -> Self {
+    pub(crate) fn new(path: &str, schema: &Schema) -> Self {
         Self {
             path: path.to_string(),
             fields: schema.field_ids(),
         }
+    }
+
+    pub(crate) fn schema(&self, full_schema: &Schema) -> Schema {
+        full_schema.project_by_ids(&self.fields).unwrap()
     }
 }
 
@@ -68,7 +72,7 @@ pub struct Fragment {
     pub id: u64,
 
     /// Files within the fragment.
-    pub files: Vec<DataFile>,
+    pub(crate) files: Vec<DataFile>,
 }
 
 impl Fragment {
@@ -82,6 +86,11 @@ impl Fragment {
             id,
             files: vec![DataFile::new(path, schema)],
         }
+    }
+
+    /// Add a new [`DataFile`] to this fragment.
+    pub fn add_file(&mut self, path: &str, schema: &Schema) {
+        self.files.push(DataFile::new(path, schema));
     }
 
     /// Get all field IDs from this fragment, sorted.
