@@ -21,7 +21,6 @@ from typing import Callable, Iterator, Optional, Union
 
 import pyarrow as pa
 
-
 class LanceFragment(pa.dataset.Fragment):
     def __init__(self, dataset: "LanceDataset", fragment_id):
         self._ds = dataset
@@ -116,6 +115,13 @@ class LanceFragment(pa.dataset.Fragment):
             batch = updater.next()
             if batch is None:
                 break
+            new_value = value_func(batch)
+            if not isinstance(new_value, pa.RecordBatch):
+                raise ValueError(
+                    f"value_func must return a Pyarrow RecordBatch, got {type(new_value)}"
+                )
 
-            updater.update(value_func(batch))
+            updater.update(new_value)
+        return updater.finish()
+
 

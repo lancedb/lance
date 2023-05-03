@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use uuid::Uuid;
 
 use super::fragment::FragmentReader;
-use super::DATA_DIR;
+use super::{DATA_DIR, Dataset};
 use crate::dataset::FileFragment;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
@@ -46,6 +48,14 @@ impl Updater {
             writer: None,
             batch_id: 0,
         }
+    }
+
+    pub fn fragment(&self) -> &FileFragment {
+        &self.fragment
+    }
+
+    pub fn dataset(&self) -> &Dataset {
+        self.fragment.dataset()
     }
 
     /// Returns the next [`RecordBatch`] as input for updater.

@@ -12,11 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow::pyarrow::PyArrowConvert;
 use arrow_array::RecordBatch;
 use pyo3::{exceptions::*, prelude::*};
 
+use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::updater::Updater as LanceUpdater;
+
+use crate::fragment::FragmentMetadata;
+
+use super::fragment::FileFragment;
 
 #[pyclass(name = "_Updater", module = "_lib")]
 pub struct Updater {
@@ -59,5 +66,16 @@ impl Updater {
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })
+    }
+
+    fn finish(&mut self) -> PyResult<FragmentMetadata> {
+        let fragment = self.rt.block_on(async {
+            self.inner
+                .finish()
+                .await
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?;
+
+        Ok(FragmentMetadata::new(fragment))
     }
 }

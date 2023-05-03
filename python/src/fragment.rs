@@ -16,6 +16,7 @@ use arrow::pyarrow::PyArrowConvert;
 use std::sync::Arc;
 
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::format::Fragment as LanceFragmentMetadata;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 
@@ -106,9 +107,28 @@ impl FileFragment {
 
     fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let rt = tokio::runtime::Runtime::new()?;
+        let cols = columns.as_ref().map(|col| col.as_slice());
         let inner = rt
-            .block_on(async { self_.fragment.updater(columns).await })
+            .block_on(async { self_.fragment.updater(cols).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
+    }
+}
+
+#[pyclass(name = "_FragmentMetadata", module = "_lib")]
+pub struct FragmentMetadata {
+    inner: LanceFragmentMetadata,
+}
+
+impl FragmentMetadata {
+    pub(crate) fn new(inner: LanceFragmentMetadata) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl FragmentMetadata {
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.inner)
     }
 }

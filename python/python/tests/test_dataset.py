@@ -260,14 +260,12 @@ def test_add_columns(tmp_path: Path):
 
     dataset = lance.dataset(base_dir)
     fragments = dataset.get_fragments()
-    print(fragments)
 
     fragment = fragments[0]
 
     def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
-        print(adder)
-        pass
-    updater = fragment.add_columns(adder, columns=["a"])
-    
+        c_array = pa.compute.multiply(batch.column(0), 2)
+        return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
-    pass
+    fragment = fragment.add_columns(adder, columns=["a"])
+    print(fragment)
