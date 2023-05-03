@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use uuid::Uuid;
 
 use super::fragment::FragmentReader;
-use super::{DATA_DIR, Dataset};
+use super::{Dataset, DATA_DIR};
 use crate::dataset::FileFragment;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
