@@ -94,10 +94,7 @@ impl LanceStream {
                     let rows_in_batch = reader.num_rows_in_batch(batch_id);
                     for start in (0..rows_in_batch).step_by(read_size) {
                         let result = reader
-                            .read_batch(
-                                batch_id,
-                                start..min(start + read_size, rows_in_batch),
-                            )
+                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
                             .await;
                         if tx.is_closed() {
                             // Early stop

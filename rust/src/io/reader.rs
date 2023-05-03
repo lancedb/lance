@@ -144,6 +144,7 @@ impl FileReader {
             let mut m: Manifest =
                 read_struct(object_reader.as_ref(), metadata.manifest_position.unwrap()).await?;
             m.schema.load_dictionary(object_reader.as_ref()).await?;
+
             (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
         };
         let page_table = PageTable::load(
@@ -167,11 +168,6 @@ impl FileReader {
     /// Open one Lance data file for read.
     pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
-    }
-
-    /// Set the projection [Schema].
-    pub fn set_projection(&mut self, schema: Schema) {
-        self.projection = Some(schema)
     }
 
     /// Instruct the FileReader to return meta row id column.

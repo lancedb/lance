@@ -18,13 +18,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use uuid::Uuid;
 
 use crate::arrow::*;
-use crate::dataset::{Dataset, DATA_DIR};
+use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::{FileReader, FileWriter, ReadBatchParams};
+use crate::io::{FileReader, ReadBatchParams};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
@@ -37,7 +36,7 @@ use super::updater::Updater;
 pub struct FileFragment {
     dataset: Arc<Dataset>,
 
-    metadata: Fragment,
+    pub(super) metadata: Fragment,
 }
 
 impl FileFragment {
@@ -72,6 +71,7 @@ impl FileFragment {
         let full_schema = self.dataset.schema();
 
         let mut opened_files = vec![];
+        println!("meteadata.files: {:?}", self.metadata.files);
         for data_file in self.metadata.files.iter() {
             let data_file_schema = data_file.schema(&full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
@@ -81,10 +81,11 @@ impl FileFragment {
                     &self.dataset.object_store,
                     &path,
                     self.id() as u64,
-                    None,
+                    Some(self.dataset.manifest.as_ref()),
                 )
                 .await?;
-                opened_files.push((reader, schema_per_file));
+                let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
+                opened_files.push((reader, initialized_schema));
             }
         }
 
@@ -96,7 +97,7 @@ impl FileFragment {
             )));
         }
 
-        FragmentReader::try_new(self.id(), opened_files, projection.clone())
+        FragmentReader::try_new(self.id(), opened_files)
     }
 
     /// Count the rows in this fragment.
@@ -125,40 +126,6 @@ impl FileFragment {
         Ok(reader.len())
     }
 
-    /// Create a new Writer for new columns.
-    ///
-    /// After it is called, this Fragment contains the metadata of the new DataFile,
-    /// containing the columns, even the data has not written yet.
-    ///
-    /// It is the caller's responsibility to close the [`FileWriter`].
-    ///
-    /// Internal use only.
-    pub(super) async fn new_writer(&mut self, schema: Schema) -> Result<FileWriter> {
-        // Sanity check.
-        //
-        // To keep it simple, new schema must have no intersection with the existing schema.
-        let existing_schema = self.dataset.schema();
-        for field in schema.fields.iter() {
-            // Just check the first level names.
-            if existing_schema.field(&field.name).is_some() {
-                return Err(Error::IO(format!(
-                    "Append column: duplicated column {} already exists",
-                    field.name
-                )));
-            }
-        }
-
-        let object_store = self.dataset.object_store.as_ref();
-        let file_path = format!("{}.lance", Uuid::new_v4());
-        self.metadata.add_file(&file_path, &schema);
-
-        let full_path = object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(file_path.as_str());
-        FileWriter::try_new(object_store, &full_path, schema).await
-    }
-
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let reader = self.open(projection).await?;
@@ -173,7 +140,7 @@ impl FileFragment {
     }
 
     /// Create an [`Updater`] to append new columns.
-    pub async fn updater(&self, columns: Option<Vec<String>>) -> Result<Updater> {
+    pub async fn updater<T: AsRef<str>>(&self, columns: Option<&[T]>) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
         if let Some(columns) = columns {
             schema = schema.project(&columns)?;
@@ -191,9 +158,6 @@ impl FileFragment {
 pub struct FragmentReader {
     /// Readers and schema of each opened data file.
     readers: Vec<(FileReader, Schema)>,
-
-    /// Projection Schema
-    schema: Schema,
 
     /// ID of the fragment
     fragment_id: usize,
@@ -218,11 +182,7 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
-    fn try_new(
-        fragment_id: usize,
-        readers: Vec<(FileReader, Schema)>,
-        projection: Schema,
-    ) -> Result<Self> {
+    fn try_new(fragment_id: usize, readers: Vec<(FileReader, Schema)>) -> Result<Self> {
         if readers.is_empty() {
             return Err(Error::IO(
                 "Cannot create FragmentReader with zero readers".to_string(),
@@ -236,16 +196,10 @@ impl FragmentReader {
                     .to_string(),
             ));
         }
-
         Ok(Self {
             readers,
-            schema: projection,
             fragment_id,
         })
-    }
-
-    pub(crate) fn schema(&self) -> &Schema {
-        &self.schema
     }
 
     pub(crate) fn with_row_id(&mut self) -> &mut Self {
@@ -273,7 +227,10 @@ impl FragmentReader {
         // TODO: use tokio::async buffer to make parallel reads.
         let mut batches = vec![];
         for (reader, schema) in self.readers.iter() {
-            let batch = reader.read_batch(batch_id as i32, params.clone(), schema).await?;
+            println!("Reading {:?} schema={:?} batch={}", reader, schema, batch_id);
+            let batch = reader
+                .read_batch(batch_id as i32, params.clone(), schema)
+                .await?;
             batches.push(batch);
         }
         merge_batches(&batches)
@@ -311,7 +268,7 @@ mod tests {
 
     use arrow_arith::arithmetic::multiply_scalar;
     use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchReader, StringArray};
-    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -416,46 +373,34 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
-        println!("Test URI: {:?}", test_uri);
 
         let fragment = &mut dataset.get_fragments()[0];
-        let new_arrow_schema = Arc::new(ArrowSchema::new(Fields::from(vec![ArrowField::new(
+        let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
+        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "double_i",
             DataType::Int32,
             true,
-        )])));
-        let schema: Schema = new_arrow_schema.as_ref().try_into().unwrap();
-        let mut writer = fragment.new_writer(schema.clone()).await.unwrap();
-        let mut scanner = fragment
-            .scan()
-            .batch_size(50)
-            .project(&["i"])
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap();
-        while let Some(batch) = scanner.try_next().await.unwrap() {
+        )]));
+        while let Some(batch) = updater.next().await.unwrap() {
             let input_col = batch.column_by_name("i").unwrap();
             let result_col: Int32Array = multiply_scalar(&input_col.as_primitive(), 2).unwrap();
-            let batch = RecordBatch::try_new(
-                new_arrow_schema.clone(),
-                vec![Arc::new(result_col) as ArrayRef],
-            )
-            .unwrap();
-            writer.write(&[&batch]).await.unwrap();
+            let batch =
+                RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
+                    .unwrap();
+            updater.update(&batch).await.unwrap();
         }
+        let new_fragment = updater.finish().await.unwrap();
 
-        writer.finish().await.unwrap();
-
-        assert_eq!(fragment.metadata.files.len(), 2);
+        assert_eq!(new_fragment.files.len(), 2);
 
         // Scan again
-        let full_schema = dataset.schema().merge(&schema).unwrap();
-        let new_project = full_schema.project(&["i", "double_i"]).unwrap();
-        let reader = fragment.open(&new_project).await.unwrap();
+        let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+        let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
+        let reader = fragment.open(&new_projection).await.unwrap();
+        // println!("Reader schema: {:?}", reader);
         let batch = reader.read_range(12..28).await.unwrap();
 
-        assert_eq!(batch.schema().as_ref(), &(&new_project).into());
+        assert_eq!(batch.schema().as_ref(), &(&new_projection).into());
         println!("Batches: {:?}", batch);
     }
 }
