@@ -108,6 +108,29 @@ impl Schema {
         Ok(Self::from(&filtered_protos))
     }
 
+    /// Project the schema by another schema, and preserves field metadata, i.e., Field IDs.
+    ///
+    /// Parameters
+    /// - `projection`: The schema to project by. Can be [`arrow_schema::Schema`] or [`Schema`].
+    pub fn project_by_schema<S: TryInto<Self, Error = Error>>(
+        &self,
+        projection: S,
+    ) -> Result<Self> {
+        let projection = projection.try_into()?;
+        let mut new_fields = vec![];
+        for field in projection.fields.iter() {
+            if let Some(self_field) = self.field(&field.name) {
+                new_fields.push(self_field.project_by_field(field)?);
+            } else {
+                return Err(Error::Schema(format!("Field {} not found", field.name)));
+            }
+        }
+        Ok(Self {
+            fields: new_fields,
+            metadata: self.metadata.clone(),
+        })
+    }
+
     /// Exclude the fields from `other` Schema, and returns a new Schema.
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
         let other = schema.try_into().map_err(|_| {
@@ -309,6 +332,8 @@ impl From<&Schema> for Vec<pb::Field> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     use arrow_schema::{
@@ -377,6 +402,71 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+    }
+
+    #[test]
+    fn test_schema_project_by_schema() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f3", DataType::Float32, false),
+                ])),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, false),
+            ArrowField::new("s", DataType::Utf8, false),
+            ArrowField::new(
+                "l",
+                DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "fixed_l",
+                DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let projection = ArrowSchema::new(vec![
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "f1",
+                    DataType::Utf8,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("s", DataType::Utf8, false),
+            ArrowField::new(
+                "l",
+                DataType::List(Arc::new(ArrowField::new("le", DataType::Int32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "fixed_l",
+                DataType::List(Arc::new(ArrowField::new("elem", DataType::Float32, false))),
+                false,
+            ),
+            ArrowField::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]);
+        let projected = schema.project_by_schema(&projection).unwrap();
+
+        assert_eq!(ArrowSchema::from(&projected), projection);
     }
 
     #[test]

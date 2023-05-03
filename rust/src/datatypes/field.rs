@@ -185,6 +185,67 @@ impl Field {
         Ok(f)
     }
 
+    /// Project by a field.
+    ///
+    pub(super) fn project_by_field(&self, other: &Self) -> Result<Self> {
+        if self.name != other.name {
+            return Err(Error::Schema(format!(
+                "Attempt to project field by different names: {} and {}",
+                self.name, other.name,
+            )));
+        };
+
+        match (self.data_type(), other.data_type()) {
+            (dt, other_dt)
+                if (dt.is_primitive() && other_dt.is_primitive())
+                    || (dt.is_binary_like() && other_dt.is_binary_like()) =>
+            {
+                if dt != other_dt {
+                    return Err(Error::Schema(format!(
+                        "Attempt to project field by different types: {} and {}",
+                        dt, other_dt,
+                    )));
+                }
+                Ok(self.clone())
+            }
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                let mut fields = vec![];
+                for other_field in other.children.iter() {
+                    let Some(child) = self.child(&other_field.name) else {
+                        return Err(Error::Schema(format!(
+                            "Attempt to project non-existed field: {} on {}", other_field.name, self,
+                        )));
+                    };
+                    fields.push(child.project_by_field(other_field)?);
+                }
+                let mut cloned = self.clone();
+                cloned.children = fields;
+                Ok(cloned)
+            }
+            (DataType::List(_), DataType::List(_))
+            | (DataType::LargeList(_), DataType::LargeList(_)) => {
+                let projected = self.children[0].project_by_field(&other.children[0])?;
+                let mut cloned = self.clone();
+                cloned.children = vec![projected];
+                Ok(cloned)
+            }
+            (DataType::FixedSizeList(_, n), DataType::FixedSizeList(_, m)) if n == m => {
+                let projected = self.children[0].project_by_field(&other.children[0])?;
+                let mut cloned = self.clone();
+                cloned.children = vec![projected];
+                Ok(cloned)
+            }
+            (
+                DataType::Dictionary(self_key, self_value),
+                DataType::Dictionary(other_key, other_value),
+            ) if self_key == other_key && self_value == other_value => Ok(self.clone()),
+            _ => Err(Error::Schema(format!(
+                "Attempt to project incompatible fields: {} and {}",
+                self, other
+            ))),
+        }
+    }
+
     /// Intersection of two [`Field`]s.
     ///
     pub(super) fn intersection(&self, other: &Self) -> Result<Self> {
