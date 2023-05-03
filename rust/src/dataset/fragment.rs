@@ -410,15 +410,17 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
-        let expected_batch = RecordBatch::try_new(Arc::new(
-            ArrowSchema::new(vec![
+        let expected_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("i", DataType::Int32, true),
                 ArrowField::new("double_i", DataType::Int32, true),
-            ]),
-        ), vec![
-            Arc::new(Int32Array::from_iter_values(0..20)),
-            Arc::new(Int32Array::from_iter_values((0..40).step_by(2))),
-        ]).unwrap();
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..20)),
+                Arc::new(Int32Array::from_iter_values((0..40).step_by(2))),
+            ],
+        )
+        .unwrap();
         assert_eq!(batches[0], expected_batch);
     }
 }
