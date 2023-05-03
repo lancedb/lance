@@ -107,7 +107,7 @@ impl FileFragment {
     fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let rt = tokio::runtime::Runtime::new()?;
         let inner = rt
-            .block_on(async { self_.fragment.updater(columns) })
+            .block_on(async { self_.fragment.updater(columns).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
     }

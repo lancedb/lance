@@ -90,19 +90,23 @@ impl LanceStream {
                         break;
                     }
                 };
-                let total_rows = reader.len();
-                for offset in (0..total_rows).step_by(read_size) {
-                    let result = reader
-                        .read_range(offset..min(offset + read_size, total_rows))
-                        .await;
-
-                    if tx.is_closed() {
-                        // Early stop
-                        break 'outer;
-                    }
-                    if let Err(err) = tx.send(result.map_err(|e| DataFusionError::from(e))).await {
-                        eprintln!("Failed to scan data: {err}");
-                        break 'outer;
+                for batch_id in 0..reader.num_batches() {
+                    let rows_in_batch = reader.num_rows_in_batch(batch_id);
+                    for start in (0..rows_in_batch).step_by(read_size) {
+                        let result = reader
+                            .read_batch(
+                                batch_id,
+                                start..min(start + read_size, rows_in_batch),
+                            )
+                            .await;
+                        if tx.is_closed() {
+                            // Early stop
+                            break 'outer;
+                        }
+                        if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
+                            eprintln!("Failed to scan data: {err}");
+                            break 'outer;
+                        }
                     }
                 }
             }

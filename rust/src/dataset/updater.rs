@@ -12,17 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
-
 use arrow_array::RecordBatch;
 
 use super::fragment::FragmentReader;
-use crate::dataset::Dataset;
+use crate::dataset::FileFragment;
 use crate::{io::FileWriter, Error, Result};
 
 /// Update or insert a new column.
 pub struct Updater {
-    dataset: Arc<Dataset>,
+    fragment: FileFragment,
 
     /// The reader over the [`Fragment`]
     reader: FragmentReader,
@@ -36,9 +34,9 @@ pub struct Updater {
 
 impl Updater {
     /// Create a new updater with source reader, and destination writer.
-    pub(super) fn new(dataset: Arc<Dataset>, reader: FragmentReader) -> Self {
+    pub(super) fn new(fragment: FileFragment, reader: FragmentReader) -> Self {
         Self {
-            dataset,
+            fragment,
             reader,
             last_input: None,
             writer: None,
@@ -48,7 +46,7 @@ impl Updater {
 
     /// Returns the next [`RecordBatch`] as input for updater.
     pub async fn next(&mut self) -> Result<Option<&RecordBatch>> {
-        let batch = self.reader.read_batch(self.batch_id).await?;
+        let batch = self.reader.read_batch(self.batch_id, ..).await?;
         self.batch_id += 1;
 
         self.last_input = Some(batch);
@@ -72,11 +70,15 @@ impl Updater {
         if self.writer.is_none() {
             let output_schema = batch.schema();
             // Need to assign field id correctly here.
-            let merged = self.dataset.schema().merge(output_schema.as_ref())?;
-            let schema = merged.project_
+            let merged = self.fragment.schema().merge(output_schema.as_ref())?;
+            // Get the schema with correct field id.
+            let schema = merged.project_by_schema(output_schema.as_ref())?;
+
+            self.writer = Some(self.fragment.new_writer(schema).await?);
         }
 
-        self.writer.write(&[batch]).await?;
+        let writer = self.writer.as_mut().unwrap();
+        writer.write(&[batch]).await?;
 
         Ok(())
     }

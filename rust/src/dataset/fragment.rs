@@ -24,7 +24,7 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::{FileReader, FileWriter};
+use crate::io::{FileReader, FileWriter, ReadBatchParams};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
@@ -48,6 +48,10 @@ impl FileFragment {
 
     pub fn dataset(&self) -> &Dataset {
         self.dataset.as_ref()
+    }
+
+    pub fn schema(&self) -> &Schema {
+        self.dataset.schema()
     }
 
     /// Returns the fragment's metadata.
@@ -92,11 +96,7 @@ impl FileFragment {
             )));
         }
 
-        FragmentReader::try_new(
-            self.id(),
-            opened_files,
-            projection.clone(),
-        )
+        FragmentReader::try_new(self.id(), opened_files, projection.clone())
     }
 
     /// Count the rows in this fragment.
@@ -180,7 +180,7 @@ impl FileFragment {
         }
         let reader = self.open(&schema).await?;
 
-        Ok(Updater::new(self.dataset.clone(), reader))
+        Ok(Updater::new(self.clone(), reader))
     }
 }
 
@@ -232,7 +232,8 @@ impl FragmentReader {
         let num_batches = readers[0].0.num_batches();
         if !readers.iter().all(|r| r.0.num_batches() == num_batches) {
             return Err(Error::IO(
-                "Cannot create FragmentReader from data files with different number of batches".to_string(),
+                "Cannot create FragmentReader from data files with different number of batches"
+                    .to_string(),
             ));
         }
 
@@ -256,11 +257,23 @@ impl FragmentReader {
         self.readers[0].0.len()
     }
 
-    pub async fn read_batch(&self, batch_id: usize) -> Result<RecordBatch> {
+    pub(crate) fn num_batches(&self) -> usize {
+        self.readers[0].0.num_batches()
+    }
+
+    pub(crate) fn num_rows_in_batch(&self, batch_id: usize) -> usize {
+        self.readers[0].0.num_rows_in_batch(batch_id as i32)
+    }
+
+    pub(crate) async fn read_batch(
+        &self,
+        batch_id: usize,
+        params: impl Into<ReadBatchParams> + Clone,
+    ) -> Result<RecordBatch> {
         // TODO: use tokio::async buffer to make parallel reads.
         let mut batches = vec![];
         for (reader, schema) in self.readers.iter() {
-            let batch = reader.read_batch(batch_id as i32, .., schema).await?;
+            let batch = reader.read_batch(batch_id as i32, params.clone(), schema).await?;
             batches.push(batch);
         }
         merge_batches(&batches)
@@ -437,7 +450,7 @@ mod tests {
         assert_eq!(fragment.metadata.files.len(), 2);
 
         // Scan again
-        let full_schema = dataset.schema().merge(&schema);
+        let full_schema = dataset.schema().merge(&schema).unwrap();
         let new_project = full_schema.project(&["i", "double_i"]).unwrap();
         let reader = fragment.open(&new_project).await.unwrap();
         let batch = reader.read_range(12..28).await.unwrap();
