@@ -269,3 +269,4 @@ def test_add_columns(tmp_path: Path):
 
     fragment = fragment.add_columns(adder, columns=["a"])
     print(fragment)
+    # TODO: add python API in followup
