@@ -445,7 +445,7 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
     })
 }
 
-fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
+pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {

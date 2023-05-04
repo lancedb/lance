@@ -57,7 +57,7 @@ impl Updater {
         let batch = RecordBatch::from_pyarrow(batch)?;
         self.rt.block_on(async {
             self.inner
-                .update(&batch)
+                .update(batch)
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })

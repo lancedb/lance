@@ -21,6 +21,8 @@ from typing import Callable, Iterator, Optional, Union
 import pyarrow as pa
 import pandas as pd
 
+from .lance import _LanceFragment
+
 
 class LanceFragment(pa.dataset.Fragment):
     def __init__(self, dataset: "LanceDataset", fragment_id: int):
@@ -41,6 +43,7 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: int,
         data: pa.Table,
         schema: Optional[pa.Schema] = None,
+        max_rows_per_group: Optional[int] = None,
     ) -> LanceFragment:
         """Create a new fragment from the given data.
 
@@ -69,7 +72,10 @@ class LanceFragment(pa.dataset.Fragment):
             reader = data
         else:
             raise TypeError(f"Unknown data_obj type {type(data)}")
-        # return LanceFragment(self._ds, fragment_id)
+
+        return _LanceFragment.create(
+            dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
+        )
 
     @property
     def fragment_id(self):

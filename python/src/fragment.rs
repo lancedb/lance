@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
+use arrow_array::RecordBatchReader;
+use pyo3::types::PyDict;
 use std::sync::Arc;
 
 use lance::dataset::fragment::FileFragment as LanceFragment;
@@ -20,6 +23,7 @@ use lance::format::Fragment as LanceFragmentMetadata;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 
+use crate::dataset::get_write_params;
 use crate::updater::Updater;
 use crate::Scanner;
 
@@ -39,6 +43,35 @@ impl FileFragment {
 impl FileFragment {
     fn __repr__(&self) -> String {
         format!("LanceFileFragment(id={})", self.fragment.id())
+    }
+
+    #[staticmethod]
+    fn create(
+        dataset_uri: &str,
+        fragment_id: usize,
+        reader: &PyAny,
+        options: &PyDict,
+    ) -> PyResult<FragmentMetadata> {
+        let rt = tokio::runtime::Runtime::new()?;
+        let metadata = rt.block_on(async {
+            let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+                let scanner: Scanner = reader.extract()?;
+                Box::new(
+                    scanner
+                        .to_reader()
+                        .await
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                )
+            } else {
+                Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
+            };
+
+            let params = get_write_params(options)?;
+            LanceFragment::create(dataset_uri, fragment_id, batches.as_mut(), params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))
+        })?;
+        Ok(FragmentMetadata::new(metadata))
     }
 
     fn id(&self) -> usize {

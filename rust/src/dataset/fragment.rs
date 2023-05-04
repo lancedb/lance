@@ -58,8 +58,10 @@ impl FileFragment {
         dataset_uri: &str,
         id: usize,
         reader: &mut dyn RecordBatchReader,
-        params: &WriteParams,
+        params: Option<WriteParams>,
     ) -> Result<Fragment> {
+        let params = params.unwrap_or_default();
+
         let base_path = Path::from(dataset_uri);
         let filename = format!("{}.lance", Uuid::new_v4());
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
