@@ -30,6 +30,7 @@ use crate::{Error, Result};
 
 use super::scanner::Scanner;
 use super::updater::Updater;
+use super::WriteParams;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -52,10 +53,12 @@ impl FileFragment {
     /// This method can be used before a `Dataset` is created. For example,
     /// Fragments can be created distributed first, before a central machine to
     /// commit the dataset with these fragments.
+    ///
     pub async fn create(
         dataset_uri: &str,
         id: usize,
-        reader: &dyn RecordBatchReader,
+        reader: &mut dyn RecordBatchReader,
+        params: &WriteParams,
     ) -> Result<Fragment> {
         let base_path = Path::from(dataset_uri);
         let filename = format!("{}.lance", Uuid::new_v4());
@@ -65,6 +68,25 @@ impl FileFragment {
 
         let object_store = ObjectStore::new(dataset_uri).await?;
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema).await?;
+        let mut buffer = RecordBatchBuffer::empty();
+
+        while let Some(rst) = reader.next() {
+            let batch = rst?; // TODO: close writer on Error?
+            buffer.batches.push(batch);
+            if buffer.num_rows() >= params.max_rows_per_group {
+                let batches = buffer.finish()?;
+                writer.write(&batches).await?;
+                buffer = RecordBatchBuffer::empty();
+            }
+        }
+
+        if buffer.num_rows() > 0 {
+            let batches = buffer.finish()?;
+            writer.write(&batches).await?;
+        };
+
+        // Params.max_rows_per_file is ignored in this case.
+        writer.finish().await?;
         todo!()
     }
 
@@ -404,7 +426,7 @@ mod tests {
             let batch =
                 RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
                     .unwrap();
-            updater.update(&batch).await.unwrap();
+            updater.update(batch).await.unwrap();
         }
         let new_fragment = updater.finish().await.unwrap();
 

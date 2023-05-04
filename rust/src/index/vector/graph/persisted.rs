@@ -242,7 +242,7 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
             ],
         )?;
 
-        writer.write(&[&batch]).await?;
+        writer.write(&[batch]).await?;
     }
 
     writer.finish().await?;
