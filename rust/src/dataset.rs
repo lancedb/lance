@@ -481,7 +481,7 @@ impl Dataset {
             session: Arc::new(Session::default()),
         })
     }
-    
+
     /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
     ///
     /// Parameters:

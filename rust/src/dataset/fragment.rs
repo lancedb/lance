@@ -20,6 +20,9 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use uuid::Uuid;
 
+use super::hash_joiner::HashJoiner;
+use super::scanner::Scanner;
+use super::updater::Updater;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
@@ -27,9 +30,6 @@ use crate::format::Fragment;
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
-use super::hash_joiner::HashJoiner;
-use super::scanner::Scanner;
-use super::updater::Updater;
 use super::WriteParams;
 
 /// A Fragment of a Lance [`Dataset`].
@@ -321,7 +321,6 @@ impl FragmentReader {
 
         merge_batches(&batches)
     }
-
 }
 
 #[cfg(test)]
