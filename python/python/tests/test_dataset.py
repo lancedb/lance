@@ -269,4 +269,8 @@ def test_add_columns(tmp_path: Path):
 
     fragment = fragment.add_columns(adder, columns=["a"])
     print(fragment)
+
+    schema = dataset.schema.append(pa.field("c", pa.int32()))
+    dataset = dataset._create_version_from_fragments(schema, [fragment])
+    print(dataset)
     # TODO: add python API in followup

@@ -419,6 +419,35 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
+    def _create_version_from_fragments(
+        self,
+        new_schema: pa.Schema,
+        fragments,
+    ) -> LanceDataset:
+        """Create a new version of dataset with collected fragments.
+
+        Parameters
+        ----------
+        new_schema : pa.Schema
+            The schema for the new version of dataset.
+        fragments : list[Fragment]
+            The fragments to create new version of dataset.
+
+        Returns
+        -------
+        LanceDataset
+            A new version of Lance Dataset.
+
+        Note:
+        -----
+        This method is for internal use only.
+        """
+        ds = self._ds.create_version_from_fragments(new_schema, fragments)
+
+        lds = LanceDataset(self.uri)
+        lds._ds = ds
+        return lds
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
