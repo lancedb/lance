@@ -20,6 +20,8 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::datatypes::Schema;
+use lance::format::Fragment;
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
 use pyo3::exceptions::{PyIOError, PyKeyError, PyValueError};
@@ -28,7 +30,7 @@ use pyo3::types::{IntoPyDict, PyBool, PyDict, PyFloat, PyInt, PyLong};
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
-use crate::fragment::FileFragment;
+use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::Scanner;
 use lance::dataset::{
     scanner::Scanner as LanceScanner, Dataset as LanceDataset, Version, WriteMode, WriteParams,
@@ -374,6 +376,42 @@ impl Dataset {
         } else {
             Ok(None)
         }
+    }
+
+    fn create_version_from_fragments(
+        self_: PyRef<Self>,
+        schema: &PyAny,
+        fragments: Vec<&PyAny>,
+    ) -> PyResult<Self> {
+        let schema = ArrowSchema::from_pyarrow(schema)?;
+        let fragment_metadata = fragments
+            .iter()
+            .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
+            .collect::<PyResult<Vec<Fragment>>>()?;
+
+        let dataset_schema = self_.ds.schema();
+        let new_schema = Schema::try_from(&schema)
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
+        let added_on_schema = new_schema
+            .exclude(dataset_schema)
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
+        let new_schema_with_id = dataset_schema
+            .merge(&added_on_schema)
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
+        let ds = self_
+            .rt
+            .block_on(async {
+                self_
+                    .ds
+                    .create_version_from_fragments(&new_schema_with_id, &fragment_metadata)
+                    .await
+            })
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(Self {
+            ds: Arc::new(ds),
+            rt: self_.rt.clone(),
+            uri: self_.uri.clone(),
+        })
     }
 }
 

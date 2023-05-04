@@ -355,6 +355,10 @@ impl Dataset {
             .unwrap();
         let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
         manifest.timestamp_nanos = timestamp_nanos;
+
+        // Preserve indices.
+        let indices = self.load_indices().await?;
+        write_manifest_file(&self.object_store, &mut manifest, Some(indices)).await?;
         let base = self.object_store.base_path().clone();
         Ok(Self {
             object_store: self.object_store.clone(),

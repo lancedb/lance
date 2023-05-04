@@ -268,5 +268,9 @@ def test_add_columns(tmp_path: Path):
         return pa.RecordBatch.from_arrays([c_array], names=["c"])
 
     fragment = fragment.add_columns(adder, columns=["a"])
-    print(fragment)
-    # TODO: add python API in followup
+    schema = dataset.schema.append(pa.field("c", pa.int64()))
+    dataset = dataset._create_version_from_fragments(schema, [fragment])
+    tbl = dataset.to_table()
+    assert tbl == pa.Table.from_pydict(
+        {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
+    )

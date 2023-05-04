@@ -116,8 +116,9 @@ impl FileFragment {
 }
 
 #[pyclass(name = "_FragmentMetadata", module = "_lib")]
+#[derive(Clone, Debug)]
 pub struct FragmentMetadata {
-    inner: LanceFragmentMetadata,
+    pub(crate) inner: LanceFragmentMetadata,
 }
 
 impl FragmentMetadata {
