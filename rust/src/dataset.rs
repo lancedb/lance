@@ -329,17 +329,25 @@ impl Dataset {
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
-    pub async fn create_version_from_fragments(
-        &self,
-        schema: &Schema,
-        fragments: &[Fragment],
-    ) -> Result<Self> {
-        let mut manifest = Manifest::new(schema, Arc::new(fragments.to_vec()));
-        manifest.version = self
-            .latest_manifest()
-            .await
-            .map(|m| m.version + 1)
-            .unwrap_or(1);
+    pub async fn commit(base_uri: &str, schema: &Schema, fragments: &[Fragment]) -> Result<Self> {
+        let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
+        let latest_manifest = latest_manifest_path(object_store.base_path());
+        let mut indices = vec![];
+        let mut version = 1;
+        let schema = if object_store.exists(&latest_manifest).await? {
+            let dataset = Self::open(base_uri).await?;
+            version = dataset.version().version + 1;
+            indices = dataset.load_indices().await?;
+
+            let dataset_schema = dataset.schema();
+            let added_on_schema = schema.exclude(dataset_schema)?;
+            dataset_schema.merge(&added_on_schema)?
+        } else {
+            schema.clone()
+        };
+
+        let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
+        manifest.version = version;
         let duration_since_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap();
@@ -347,11 +355,11 @@ impl Dataset {
         manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        let indices = self.load_indices().await?;
-        write_manifest_file(&self.object_store, &mut manifest, Some(indices)).await?;
-        let base = self.object_store.base_path().clone();
+        write_manifest_file(&object_store, &mut manifest, Some(indices)).await?;
+        let base = object_store.base_path().clone();
+
         Ok(Self {
-            object_store: self.object_store.clone(),
+            object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
         })

@@ -62,14 +62,16 @@ impl FileFragment {
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
 
-        let base_path = Path::from(dataset_uri);
-        let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = base_path.child(DATA_DIR).child(filename.clone());
-
         let schema = Schema::try_from(reader.schema().as_ref())?;
+        let object_store = ObjectStore::new(dataset_uri).await?;
+        let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
 
-        let object_store = ObjectStore::new(dataset_uri).await?;
+        let full_path = object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(filename.clone());
+
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
 
@@ -438,8 +440,7 @@ mod tests {
 
         // Scan again
         let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = dataset
-            .create_version_from_fragments(&full_schema, &[new_fragment])
+        let dataset = Dataset::commit(test_uri, &full_schema, &[new_fragment])
             .await
             .unwrap();
         assert_eq!(dataset.version().version, 2);

@@ -32,6 +32,7 @@ pub(crate) mod updater;
 
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
+use fragment::FileFragment;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
@@ -39,6 +40,7 @@ pub use scanner::Scanner;
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
+    m.add_class::<FileFragment>()?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

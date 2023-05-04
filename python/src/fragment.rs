@@ -46,11 +46,12 @@ impl FileFragment {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dataset_uri, fragment_id, reader, **kwargs))]
     fn create(
         dataset_uri: &str,
         fragment_id: usize,
         reader: &PyAny,
-        options: &PyDict,
+        kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
         let rt = tokio::runtime::Runtime::new()?;
         let metadata = rt.block_on(async {
@@ -66,7 +67,12 @@ impl FileFragment {
                 Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
             };
 
-            let params = get_write_params(options)?;
+            let params = if let Some(kw_params) = kwargs {
+                get_write_params(kw_params)?
+            } else {
+                None
+            };
+
             LanceFragment::create(dataset_uri, fragment_id, batches.as_mut(), params)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))

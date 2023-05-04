@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 from typing import Callable, Iterator, Optional, Union
+from pathlib import Path
 
 import pyarrow as pa
 import pandas as pd
 
-from .lance import _LanceFragment
+from .lance import _Fragment
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -39,11 +40,11 @@ class LanceFragment(pa.dataset.Fragment):
 
     @staticmethod
     def create(
-        dataset_uri: str,
+        dataset_uri: Union[str, Path],
         fragment_id: int,
         data: pa.Table,
         schema: Optional[pa.Schema] = None,
-        max_rows_per_group: Optional[int] = None,
+        max_rows_per_group: int = 1024,
     ) -> LanceFragment:
         """Create a new fragment from the given data.
 
@@ -73,7 +74,9 @@ class LanceFragment(pa.dataset.Fragment):
         else:
             raise TypeError(f"Unknown data_obj type {type(data)}")
 
-        return _LanceFragment.create(
+        if isinstance(dataset_uri, Path):
+            dataset_uri = str(dataset_uri)
+        return _Fragment.create(
             dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
         )
 
