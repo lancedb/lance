@@ -62,12 +62,13 @@ impl FileFragment {
     ) -> Result<Fragment> {
         let base_path = Path::from(dataset_uri);
         let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = base_path.child(DATA_DIR).child(filename);
+        let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let schema = Schema::try_from(reader.schema().as_ref())?;
+        let fragment = Fragment::with_file(id as u64, &filename, &schema);
 
         let object_store = ObjectStore::new(dataset_uri).await?;
-        let mut writer = FileWriter::try_new(&object_store, &full_path, schema).await?;
+        let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
 
         while let Some(rst) = reader.next() {
@@ -87,7 +88,8 @@ impl FileFragment {
 
         // Params.max_rows_per_file is ignored in this case.
         writer.finish().await?;
-        todo!()
+
+        Ok(fragment)
     }
 
     pub fn dataset(&self) -> &Dataset {
