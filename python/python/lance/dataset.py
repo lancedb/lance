@@ -464,10 +464,7 @@ class LanceDataset(pa.dataset.Dataset):
         This method is for internal use only.
         """
         ds = self._ds.create_version_from_fragments(new_schema, fragments)
-
-        lds = LanceDataset(self.uri)
-        lds._ds = ds
-        return lds
+        return LanceDataset(self.uri)
 
 
 class ScannerBuilder:

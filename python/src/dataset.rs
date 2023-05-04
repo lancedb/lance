@@ -391,13 +391,13 @@ impl Dataset {
 
         let dataset_schema = self_.ds.schema();
         let new_schema = Schema::try_from(&schema)
-            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance")))?;
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
         let added_on_schema = new_schema
             .exclude(dataset_schema)
-            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance")))?;
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
         let new_schema_with_id = dataset_schema
             .merge(&added_on_schema)
-            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance")))?;
+            .map_err(|e| PyValueError::new_err(format!("Can not convert schema to lance: {}", e)))?;
         let ds = self_
             .rt
             .block_on(async {
