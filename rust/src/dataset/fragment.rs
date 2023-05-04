@@ -17,13 +17,15 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::arrow::*;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::{FileReader, ReadBatchParams};
+use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
@@ -43,6 +45,27 @@ impl FileFragment {
     /// Creates a new FileFragment.
     pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
         Self { dataset, metadata }
+    }
+
+    /// Create a new [`FileFragment`] from a [`RecordBatchReader`].
+    ///
+    /// This method can be used before a `Dataset` is created. For example,
+    /// Fragments can be created distributed first, before a central machine to
+    /// commit the dataset with these fragments.
+    pub async fn create(
+        dataset_uri: &str,
+        id: usize,
+        reader: &dyn RecordBatchReader,
+    ) -> Result<Fragment> {
+        let base_path = Path::from(dataset_uri);
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let full_path = base_path.child(DATA_DIR).child(filename);
+
+        let schema = Schema::try_from(reader.schema().as_ref())?;
+
+        let object_store = ObjectStore::new(dataset_uri).await?;
+        let mut writer = FileWriter::try_new(&object_store, &full_path, schema).await?;
+        todo!()
     }
 
     pub fn dataset(&self) -> &Dataset {
