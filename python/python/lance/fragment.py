@@ -65,8 +65,6 @@ class LanceFragment(pa.dataset.Fragment):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
         elif isinstance(data, pa.Table):
             reader = data.to_reader()
-        elif isinstance(data, pa.dataset.Dataset):
-            reader = pa.dataset.Scanner.from_dataset(data).to_reader()
         elif isinstance(data, pa.dataset.Scanner):
             reader = data.to_reader()
         elif isinstance(data, pa.RecordBatchReader):
