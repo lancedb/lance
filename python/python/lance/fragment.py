@@ -11,18 +11,22 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-#
 
 """Dataset Fragment"""
 
 from __future__ import annotations
 
 from typing import Callable, Iterator, Optional, Union
+from pathlib import Path
 
 import pyarrow as pa
+import pandas as pd
+
+from .lance import _Fragment
+
 
 class LanceFragment(pa.dataset.Fragment):
-    def __init__(self, dataset: "LanceDataset", fragment_id):
+    def __init__(self, dataset: "LanceDataset", fragment_id: int):
         self._ds = dataset
         self._fragment = dataset.get_fragment(fragment_id)
         if self._fragment is None:
@@ -33,6 +37,46 @@ class LanceFragment(pa.dataset.Fragment):
 
         ds = LanceDataset(self._ds.uri, self._ds.version)
         return LanceFragment, (ds, self.fragment_id)
+
+    @staticmethod
+    def create(
+        dataset_uri: Union[str, Path],
+        fragment_id: int,
+        data: pa.Table,
+        schema: Optional[pa.Schema] = None,
+        max_rows_per_group: int = 1024,
+    ) -> LanceFragment:
+        """Create a new fragment from the given data.
+
+        This can be used if the dataset is not yet created.
+
+        Parameters
+        ----------
+        dataset_uri: str
+            The URI of the dataset.
+        fragment_id: int
+            The ID of the fragment.
+        data: pa.Table
+            The data to write to this fragment.
+        schema: pa.Schema, optional
+            The schema of the data. If not specified, the schema will be inferred from the data.
+        """
+        if isinstance(data, pd.DataFrame):
+            reader = pa.Table.from_pandas(data, schema=schema).to_reader()
+        elif isinstance(data, pa.Table):
+            reader = data.to_reader()
+        elif isinstance(data, pa.dataset.Scanner):
+            reader = data.to_reader()
+        elif isinstance(data, pa.RecordBatchReader):
+            reader = data
+        else:
+            raise TypeError(f"Unknown data_obj type {type(data)}")
+
+        if isinstance(dataset_uri, Path):
+            dataset_uri = str(dataset_uri)
+        return _Fragment.create(
+            dataset_uri, fragment_id, reader, max_rows_per_group=max_rows_per_group
+        )
 
     @property
     def fragment_id(self):
@@ -123,5 +167,3 @@ class LanceFragment(pa.dataset.Fragment):
 
             updater.update(new_value)
         return updater.finish()
-
-

@@ -419,10 +419,12 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
-    def _create_version_from_fragments(
-        self,
+    @staticmethod
+    def _commit(
+        base_uri: Union[str, Path],
         new_schema: pa.Schema,
         fragments,
+        mode: str = "append",
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 
@@ -463,8 +465,10 @@ class LanceDataset(pa.dataset.Dataset):
         -----
         This method is for internal use only.
         """
-        ds = self._ds.create_version_from_fragments(new_schema, fragments)
-        return LanceDataset(self.uri)
+        if isinstance(base_uri, Path):
+            base_uri = str(base_uri)
+        _Dataset.commit(base_uri, new_schema, fragments)
+        return LanceDataset(base_uri)
 
 
 class ScannerBuilder:

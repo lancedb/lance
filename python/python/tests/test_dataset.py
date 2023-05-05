@@ -21,10 +21,12 @@ from pathlib import Path
 from unittest import mock
 
 import lance
+import lance.fragment
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 
@@ -269,8 +271,32 @@ def test_add_columns(tmp_path: Path):
 
     fragment = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
-    dataset = dataset._create_version_from_fragments(schema, [fragment])
+    dataset = lance.LanceDataset._commit(base_dir, schema, [fragment])
     tbl = dataset.to_table()
     assert tbl == pa.Table.from_pydict(
         {"a": range(100), "b": range(100), "c": pa.array(range(0, 200, 2), pa.int64())}
     )
+
+
+def test_create_from_fragments(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+
+    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    tbl = dataset.to_table()
+    assert tbl == table
+
+
+def test_commit_fragments_via_scanner(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    parquet_dir = tmp_path / "parquet.parquet"
+    pq.write_to_dataset(table, parquet_dir)
+
+    base_dir = tmp_path / "test"
+    scanner = pa.dataset.dataset(parquet_dir).scanner()
+    fragment = lance.fragment.LanceFragment.create(base_dir, 1, scanner)
+
+    dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
+    tbl = dataset.to_table()
+    assert tbl == table

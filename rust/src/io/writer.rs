@@ -129,7 +129,7 @@ impl FileWriter {
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
     /// Returns [Err] if the schema does not match with the batch.
-    pub async fn write(&mut self, batches: &[&RecordBatch]) -> Result<()> {
+    pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         // Copy a list of fields to avoid borrow checker error.
         let fields = self
             .schema
@@ -572,7 +572,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -602,7 +602,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -637,7 +637,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();

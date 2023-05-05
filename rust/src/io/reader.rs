@@ -610,7 +610,7 @@ mod tests {
                 )),
             ];
             let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
-            file_writer.write(&[&batch]).await.unwrap();
+            file_writer.write(&[batch]).await.unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -677,7 +677,7 @@ mod tests {
 
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
         for batch in batches.iter() {
-            file_writer.write(&[&batch]).await.unwrap();
+            file_writer.write(&[batch.clone()]).await.unwrap();
         }
         file_writer.finish().await.unwrap();
 
@@ -730,7 +730,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -774,7 +774,7 @@ mod tests {
         let batches_ref = batches.iter().collect::<Vec<_>>();
 
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(batches_ref.as_slice()).await.unwrap();
+        file_writer.write(&batches).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
@@ -794,7 +794,7 @@ mod tests {
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let mut expected_columns: Vec<ArrayRef> = Vec::new();
@@ -974,7 +974,7 @@ mod tests {
         let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
             .await
             .unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         // read the file back
@@ -1073,7 +1073,7 @@ mod tests {
         let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
             .await
             .unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         // read the file back
@@ -1141,7 +1141,7 @@ mod tests {
 
         let schema: Schema = (&arrow_schema).try_into().unwrap();
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch.clone()]).await.unwrap();
+        file_writer.write(&[batch.clone()]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         // Make sure the big array was not written to the file
@@ -1165,7 +1165,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/read_range");
         let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
-        file_writer.write(&[&batch]).await.unwrap();
+        file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();

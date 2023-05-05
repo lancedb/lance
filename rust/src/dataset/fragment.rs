@@ -17,17 +17,19 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
+use uuid::Uuid;
 
 use crate::arrow::*;
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::{FileReader, ReadBatchParams};
+use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
 use super::scanner::Scanner;
 use super::updater::Updater;
+use super::WriteParams;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -43,6 +45,54 @@ impl FileFragment {
     /// Creates a new FileFragment.
     pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
         Self { dataset, metadata }
+    }
+
+    /// Create a new [`FileFragment`] from a [`RecordBatchReader`].
+    ///
+    /// This method can be used before a `Dataset` is created. For example,
+    /// Fragments can be created distributed first, before a central machine to
+    /// commit the dataset with these fragments.
+    ///
+    pub async fn create(
+        dataset_uri: &str,
+        id: usize,
+        reader: &mut dyn RecordBatchReader,
+        params: Option<WriteParams>,
+    ) -> Result<Fragment> {
+        let params = params.unwrap_or_default();
+
+        let schema = Schema::try_from(reader.schema().as_ref())?;
+        let object_store = ObjectStore::new(dataset_uri).await?;
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let fragment = Fragment::with_file(id as u64, &filename, &schema);
+
+        let full_path = object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(filename.clone());
+
+        let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
+        let mut buffer = RecordBatchBuffer::empty();
+
+        while let Some(rst) = reader.next() {
+            let batch = rst?; // TODO: close writer on Error?
+            buffer.batches.push(batch);
+            if buffer.num_rows() >= params.max_rows_per_group {
+                let batches = buffer.finish()?;
+                writer.write(&batches).await?;
+                buffer = RecordBatchBuffer::empty();
+            }
+        }
+
+        if buffer.num_rows() > 0 {
+            let batches = buffer.finish()?;
+            writer.write(&batches).await?;
+        };
+
+        // Params.max_rows_per_file is ignored in this case.
+        writer.finish().await?;
+
+        Ok(fragment)
     }
 
     pub fn dataset(&self) -> &Dataset {
@@ -381,7 +431,7 @@ mod tests {
             let batch =
                 RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
                     .unwrap();
-            updater.update(&batch).await.unwrap();
+            updater.update(batch).await.unwrap();
         }
         let new_fragment = updater.finish().await.unwrap();
 
@@ -389,10 +439,14 @@ mod tests {
 
         // Scan again
         let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = dataset
-            .create_version_from_fragments(&full_schema, &[new_fragment])
-            .await
-            .unwrap();
+        let dataset = Dataset::commit(
+            test_uri,
+            &full_schema,
+            &[new_fragment],
+            crate::dataset::WriteMode::Create,
+        )
+        .await
+        .unwrap();
         assert_eq!(dataset.version().version, 2);
         let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
 
