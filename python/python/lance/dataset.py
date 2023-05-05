@@ -424,6 +424,7 @@ class LanceDataset(pa.dataset.Dataset):
         base_uri: Union[str, Path],
         new_schema: pa.Schema,
         fragments,
+        mode: str = "append",
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 

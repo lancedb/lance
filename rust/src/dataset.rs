@@ -329,7 +329,12 @@ impl Dataset {
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
-    pub async fn commit(base_uri: &str, schema: &Schema, fragments: &[Fragment]) -> Result<Self> {
+    pub async fn commit(
+        base_uri: &str,
+        schema: &Schema,
+        fragments: &[Fragment],
+        mode: WriteMode,
+    ) -> Result<Self> {
         let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
         let latest_manifest = latest_manifest_path(object_store.base_path());
         let mut indices = vec![];
@@ -337,7 +342,11 @@ impl Dataset {
         let schema = if object_store.exists(&latest_manifest).await? {
             let dataset = Self::open(base_uri).await?;
             version = dataset.version().version + 1;
-            indices = dataset.load_indices().await?;
+
+            if matches!(mode, WriteMode::Append) {
+                // Append mode: inherit indices from previous version.
+                indices = dataset.load_indices().await?;
+            }
 
             let dataset_schema = dataset.schema();
             let added_on_schema = schema.exclude(dataset_schema)?;

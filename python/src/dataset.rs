@@ -383,19 +383,24 @@ impl Dataset {
         dataset_uri: &str,
         schema: &PyAny,
         fragments: Vec<&PyAny>,
+        mode: Option<&str>,
     ) -> PyResult<Self> {
         let rt = Arc::new(Runtime::new()?);
         let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
         let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!("Failed to convert Arrow schema to Lance schema: {}", e))
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
         })?;
         let fragment_metadata = fragments
             .iter()
             .map(|f| f.extract::<FragmentMetadata>().map(|fm| fm.inner))
             .collect::<PyResult<Vec<Fragment>>>()?;
+        let mode = parse_write_mode(mode.unwrap_or("create"))?;
         let ds = rt
             .block_on(async {
-                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata).await
+                LanceDataset::commit(dataset_uri, &schema, &fragment_metadata, mode).await
             })
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -435,18 +440,22 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
     })
 }
 
+fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
+    match mode.to_string().to_lowercase().as_str() {
+        "create" => Ok(WriteMode::Create),
+        "append" => Ok(WriteMode::Append),
+        "overwrite" => Ok(WriteMode::Overwrite),
+        _ => Err(PyValueError::new_err(format!("Invalid mode {mode}"))),
+    }
+}
+
 pub(crate) fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
         let mut p = WriteParams::default();
         if let Some(mode) = options.get_item("mode") {
-            p.mode = match mode.to_string().to_lowercase().as_str() {
-                "create" => Ok(WriteMode::Create),
-                "append" => Ok(WriteMode::Append),
-                "overwrite" => Ok(WriteMode::Overwrite),
-                _ => Err(PyValueError::new_err(format!("Invalid mode {mode}"))),
-            }?;
+            p.mode = parse_write_mode(mode.extract::<String>()?.as_str())?;
         };
         if let Some(maybe_nrows) = options.get_item("max_rows_per_file") {
             p.max_rows_per_file = usize::extract(maybe_nrows)?;
