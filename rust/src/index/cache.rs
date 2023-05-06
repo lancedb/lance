@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 
 use lru_time_cache::LruCache;
 
-use super::Index;
+use super::{vector::VectorIndex, Index};
 
 #[derive(Clone)]
 pub(crate) struct IndexCache {
-    cache: Arc<Mutex<LruCache<String, Arc<dyn Index>>>>,
+    cache: Arc<Mutex<LruCache<String, Arc<dyn VectorIndex>>>>,
 }
 
 impl IndexCache {
@@ -31,14 +31,14 @@ impl IndexCache {
     }
 
     /// Get an Index if present. Otherwise returns [None].
-    pub(crate) fn get(&self, key: &str) -> Option<Arc<dyn Index>> {
+    pub(crate) fn get(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
         let mut cache = self.cache.lock().unwrap();
         let idx = cache.get(key);
         idx.map(|idx| idx.clone())
     }
 
     ///
-    pub(crate) fn insert(&mut self, key: &str, index: Arc<dyn Index>) {
+    pub(crate) fn insert(&self, key: &str, index: Arc<dyn VectorIndex>) {
         let mut cache = self.cache.lock().unwrap();
         cache.insert(key.to_string(), index);
     }
