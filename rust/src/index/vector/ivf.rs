@@ -43,11 +43,8 @@ use super::{
 use crate::io::object_reader::ObjectReader;
 use crate::{
     arrow::{linalg::MatrixView, *},
-    index::vector::Transformer,
-};
-use crate::{
     dataset::{Dataset, ROW_ID},
-    index::pb,
+    index::{pb, vector::Transformer, Index},
 };
 use crate::{Error, Result};
 
@@ -114,6 +111,12 @@ impl std::fmt::Debug for IVFIndex {
     }
 }
 
+impl Index for IVFIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[async_trait]
 impl VectorIndex for IVFIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
@@ -142,10 +145,6 @@ impl VectorIndex for IVFIndex {
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_scores).into())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn is_loadable(&self) -> bool {

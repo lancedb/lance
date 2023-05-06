@@ -30,15 +30,15 @@ impl IndexCache {
     }
 
     /// Get an Index if present. Otherwise returns [None].
-    pub(crate) fn get(&self, uuid: &str) -> Option<Arc<dyn Index>> {
+    pub(crate) fn get(&self, key: &str) -> Option<Arc<dyn Index>> {
         let mut cache = self.cache.lock().unwrap();
-        let idx = cache.get(uuid);
+        let idx = cache.get(key);
         idx.map(|idx| idx.clone())
     }
 
     ///
-    pub(crate) fn insert(&mut self, index: Arc<dyn Index>) {
+    pub(crate) fn insert(&mut self, key: &str, index: Arc<dyn Index>) {
         let mut cache = self.cache.lock().unwrap();
-        cache.insert(index.uuid().to_string(), index);
+        cache.insert(key.to_string(), index);
     }
 }

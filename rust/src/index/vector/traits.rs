@@ -23,14 +23,14 @@ use async_trait::async_trait;
 use super::Query;
 use crate::{
     arrow::linalg::MatrixView,
-    index::pb::Transform,
+    index::{pb::Transform, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,
 };
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
-pub trait VectorIndex: Send + Sync + std::fmt::Debug {
+pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
@@ -47,9 +47,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
-
-    /// As any.
-    fn as_any(&self) -> &dyn Any;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

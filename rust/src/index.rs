@@ -37,8 +37,10 @@ use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
 
-pub trait Index {
-    fn uuid(&self) -> &str;
+/// Trait of a secondary index.
+pub(crate) trait Index {
+    /// Cast to [Any].
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Index Type

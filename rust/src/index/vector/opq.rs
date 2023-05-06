@@ -27,12 +27,12 @@ use super::{
     pq::{PQBuildParams, ProductQuantizer},
     MetricType, Query, Transformer, VectorIndex,
 };
-use crate::arrow::linalg::*;
 use crate::index::pb::{Transform, TransformType};
 use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
 };
+use crate::{arrow::linalg::*, index::Index};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;
@@ -248,7 +248,7 @@ pub struct OPQIndex {
 }
 
 impl OPQIndex {
-    pub fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
+    pub(crate) fn new(sub_index: Arc<dyn VectorIndex>, opq: OptimizedProductQuantizer) -> Self {
         Self { sub_index, opq }
     }
 }
@@ -268,6 +268,12 @@ impl std::fmt::Debug for OPQIndex {
     }
 }
 
+impl Index for OPQIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[async_trait]
 impl VectorIndex for OPQIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
@@ -276,10 +282,6 @@ impl VectorIndex for OPQIndex {
         let mut transformed_query = query.clone();
         transformed_query.key = transformed.data();
         self.sub_index.search(&transformed_query).await
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn is_loadable(&self) -> bool {

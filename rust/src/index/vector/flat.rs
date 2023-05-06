@@ -15,51 +15,18 @@
 //! Flat Vector Index.
 //!
 
-use std::any::Any;
-use std::sync::Arc;
-
 use arrow::array::as_primitive_array;
 use arrow::datatypes::Float32Type;
 use arrow_array::{cast::as_struct_array, ArrayRef, RecordBatch, StructArray};
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField};
 use arrow_select::{concat::concat_batches, take::take};
-use async_trait::async_trait;
 use futures::future;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
-use super::{Query, VectorIndex, SCORE_COL};
+use super::{Query, SCORE_COL};
 use crate::arrow::*;
-use crate::dataset::Dataset;
-use crate::io::object_reader::ObjectReader;
 use crate::{Error, Result};
-
-/// Flat Vector Index.
-///
-/// Flat index is a meta index. It does not build extra index structure,
-/// and does exhaustive search.
-///
-/// Flat index always provides 100% recall because exhaustive search over the
-/// uncompressed original vectors.
-///
-/// Reference:
-///   - <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>
-#[derive(Debug)]
-pub struct FlatIndex<'a> {
-    dataset: &'a Dataset,
-
-    /// Vector column to search for.
-    column: String,
-}
-
-impl<'a> FlatIndex<'a> {
-    pub fn try_new(dataset: &'a Dataset, name: &str) -> Result<Self> {
-        Ok(Self {
-            dataset,
-            column: name.to_string(),
-        })
-    }
-}
 
 pub async fn flat_search(
     stream: impl Stream<Item = Result<RecordBatch>>,
@@ -112,37 +79,4 @@ pub async fn flat_search(
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;
     Ok(as_struct_array(&selected_arr).into())
-}
-
-#[async_trait]
-impl VectorIndex for FlatIndex<'_> {
-    /// Search the flat index.
-    async fn search(&self, params: &Query) -> Result<RecordBatch> {
-        let stream = self
-            .dataset
-            .scan()
-            .project(&[&self.column])?
-            .with_row_id()
-            .try_into_stream()
-            .await?;
-        flat_search(stream, params).await
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        // Can not use `self` because of the lifetime.
-        todo!()
-    }
-
-    fn is_loadable(&self) -> bool {
-        false
-    }
-
-    async fn load(
-        &self,
-        _reader: &dyn ObjectReader,
-        _offset: usize,
-        _length: usize,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index("Flat index does not support load".to_string()))
-    }
 }

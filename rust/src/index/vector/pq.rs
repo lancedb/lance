@@ -32,6 +32,7 @@ use super::{MetricType, Query, VectorIndex};
 use crate::arrow::linalg::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
+use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
@@ -198,6 +199,12 @@ impl PQIndex {
     }
 }
 
+impl Index for PQIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[async_trait]
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
@@ -229,10 +236,6 @@ impl VectorIndex for PQIndex {
             ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn is_loadable(&self) -> bool {
