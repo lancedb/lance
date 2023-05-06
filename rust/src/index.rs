@@ -28,13 +28,18 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
+mod cache;
 pub mod vector;
 
 use crate::dataset::write_manifest_file;
-use crate::format::Index;
+use crate::format::Index as IndexMetadata;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
+
+pub trait Index {
+    fn uuid(&self) -> &str;
+}
 
 /// Index Type
 pub enum IndexType {
@@ -146,7 +151,7 @@ impl DatasetIndexExt for Dataset {
         new_manifest.version = latest_manifest.version + 1;
 
         // Write index metadata down
-        let new_idx = Index::new(index_id, &index_name, &[field.id], new_manifest.version);
+        let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], new_manifest.version);
         indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
