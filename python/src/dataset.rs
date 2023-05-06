@@ -128,6 +128,7 @@ impl Dataset {
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
+            println!("project {:?}", c);
             scanner
                 .project(&c)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
