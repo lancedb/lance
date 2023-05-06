@@ -12,23 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lance Columnar Data Format
-//!
-//! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
-//! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
-//! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
+use crate::index::cache::IndexCache;
 
-pub mod arrow;
-pub mod datafusion;
-pub mod dataset;
-pub mod datatypes;
-pub mod encodings;
-pub mod error;
-pub mod format;
-pub mod index;
-pub mod io;
-pub mod linalg;
-pub mod session;
-pub mod utils;
+#[derive(Clone)]
+pub struct Session {
+    pub(crate) index_cache: IndexCache,
+}
 
-pub use error::{Error, Result};
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Session()")
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            index_cache: IndexCache::new(100),
+        }
+    }
+}

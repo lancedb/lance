@@ -43,6 +43,7 @@ use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
 };
+use crate::session::Session;
 use crate::{Error, Result};
 pub use scanner::ROW_ID;
 pub use write::*;
@@ -58,6 +59,8 @@ pub struct Dataset {
     pub(crate) object_store: Arc<ObjectStore>,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
+
+    pub(crate) session: Session,
 }
 
 /// Dataset Version
@@ -186,6 +189,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
+            session: Session::default(),
         })
     }
 
@@ -361,6 +365,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
+            session: Session::default(),
         })
     }
 
@@ -407,6 +412,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
+            session: Session::default(),
         })
     }
 

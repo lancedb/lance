@@ -18,14 +18,15 @@ use lru_time_cache::LruCache;
 
 use super::Index;
 
+#[derive(Clone)]
 pub(crate) struct IndexCache {
-    cache: Mutex<LruCache<String, Arc<dyn Index>>>,
+    cache: Arc<Mutex<LruCache<String, Arc<dyn Index>>>>,
 }
 
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            cache: Mutex::new(LruCache::with_capacity(capacity)),
+            cache: Arc::new(Mutex::new(LruCache::with_capacity(capacity))),
         }
     }
 
