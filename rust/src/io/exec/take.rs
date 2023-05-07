@@ -169,9 +169,13 @@ impl TakeExec {
         }
 
         let input_schema = Schema::try_from(input.schema().as_ref())?;
+        println!("Input schema: {:?}", input_schema);
+        println!("Extra schema: {:?}", extra_schema);
         let output_schema = input_schema.merge(extra_schema.as_ref())?;
+        println!("Output schema: {:?}", output_schema);
 
         let remaining_schema = extra_schema.exclude(&input_schema)?;
+        println!("remaining schema: {:?}", remaining_schema);
 
         Ok(Self {
             dataset,

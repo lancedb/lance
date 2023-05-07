@@ -351,25 +351,33 @@ impl Scanner {
         let mut plan: Arc<dyn ExecutionPlan> = if self.nearest.is_some() {
             self.knn().await?
         } else if let Some(expr) = filter_expr.as_ref() {
+            println!("1:expr {:?}", expr);
             let columns_in_filter = column_names_in_expr(expr.as_ref());
+            println!("1:columns_in_filter {:?}", columns_in_filter);
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+            println!("1:filter_schema {:?}", filter_schema);
             self.scan(true, filter_schema)
         } else {
             // Scan without filter or limits
             self.scan(self.with_row_id, self.projections.clone().into())
         };
+        println!("1:plan_schema: {:?}", plan.schema());
 
         // Stage 2: filter
         if let Some(predicates) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(predicates.as_ref());
+            println!("2:columns_in_filter {:?}", columns_in_filter);
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
+            println!("2:filter_schema {:?}", filter_schema);
             let remaining_schema = filter_schema.exclude(plan.schema().as_ref())?;
+            println!("2:remaining_schema {:?}", remaining_schema);
             if !remaining_schema.fields.is_empty() {
                 // Not all columns for filter are ready, so we need to take them first
                 plan = self.take(plan, &remaining_schema)?;
             }
             plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
+        println!("2:plan_schema: {:?}", plan.schema());
 
         // Stage 3: limit / offset
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
@@ -378,11 +386,15 @@ impl Scanner {
 
         // Stage 4: take remaining columns / projection
         let output_schema = self.output_schema()?;
+        println!("4:output_schema {:?}", output_schema);
         let remaining_schema = output_schema.exclude(plan.schema().as_ref())?;
+        println!("4:remaining_schema {:?}", remaining_schema);
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema)?;
+            println!("4:plan_schema: {:?}", plan.schema());
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
+        println!("4:plan_schema: {:?}", plan.schema());
 
         Ok(plan)
     }
