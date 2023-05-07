@@ -15,7 +15,7 @@
 //! Traits for vector index.
 //!
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;

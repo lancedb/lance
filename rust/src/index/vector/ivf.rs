@@ -40,7 +40,7 @@ use super::{
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
-use crate::io::object_reader::ObjectReader;
+use crate::{io::object_reader::ObjectReader, session::Session};
 use crate::{
     arrow::{linalg::MatrixView, *},
     dataset::{Dataset, ROW_ID},
@@ -54,6 +54,8 @@ const PQ_CODE_COLUMN: &str = "__pq_code";
 
 /// IVF Index.
 pub struct IVFIndex {
+    uuid: String,
+
     /// Ivf model
     ivf: Ivf,
 
@@ -63,11 +65,15 @@ pub struct IVFIndex {
     sub_index: Arc<dyn VectorIndex>,
 
     metric_type: MetricType,
+
+    session: Arc<Session>,
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
+        session: Arc<Session>,
+        uuid: &str,
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
         sub_index: Arc<dyn VectorIndex>,
@@ -80,6 +86,8 @@ impl IVFIndex {
             )));
         }
         Ok(Self {
+            uuid: uuid.to_owned(),
+            session,
             ivf,
             reader,
             sub_index,
@@ -88,15 +96,22 @@ impl IVFIndex {
     }
 
     async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
-        let offset = self.ivf.offsets[partition_id];
-        let length = self.ivf.lengths[partition_id] as usize;
+        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
+        let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
+            part_idx
+        } else {
+            let offset = self.ivf.offsets[partition_id];
+            let length = self.ivf.lengths[partition_id] as usize;
+            let idx = self
+                .sub_index
+                .load(self.reader.as_ref(), offset, length)
+                .await?;
+            self.session.index_cache.insert(&cache_key, idx.clone());
+            idx
+        };
+
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
-
-        let part_index = self
-            .sub_index
-            .load(self.reader.as_ref(), offset, length)
-            .await?;
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();

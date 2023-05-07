@@ -163,7 +163,7 @@ impl DatasetIndexExt for Dataset {
             object_store: self.object_store.clone(),
             base: self.base.clone(),
             manifest: Arc::new(new_manifest),
-            session: Session::default(),
+            session: Arc::new(Session::default()),
         })
     }
 }

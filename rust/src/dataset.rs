@@ -60,7 +60,7 @@ pub struct Dataset {
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
 
-    pub(crate) session: Session,
+    pub(crate) session: Arc<Session>,
 }
 
 /// Dataset Version
@@ -189,7 +189,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
-            session: Session::default(),
+            session: Arc::new(Session::default()),
         })
     }
 
@@ -365,7 +365,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
-            session: Session::default(),
+            session: Arc::new(Session::default()),
         })
     }
 
@@ -412,7 +412,7 @@ impl Dataset {
             object_store,
             base: base.into(),
             manifest: Arc::new(manifest.clone()),
-            session: Session::default(),
+            session: Arc::new(Session::default()),
         })
     }
 

@@ -317,7 +317,7 @@ pub(crate) async fn build_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+pub(crate) async fn open_index<'a>(dataset: &'a Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex + 'a>> {
     if let Some(index) = dataset.session.index_cache.get(uuid) {
         return Ok(index);
     }
@@ -410,6 +410,8 @@ pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn 
                 }
                 let ivf = Ivf::try_from(ivf_pb)?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
+                    dataset.session.clone(),
+                    uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
