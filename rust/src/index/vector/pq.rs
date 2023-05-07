@@ -108,21 +108,25 @@ impl PQIndex {
             distance_table.extend(distances.values());
         }
 
-        Ok(Arc::new(Float32Array::from_iter(
-            self.code
-                .as_ref()
-                .unwrap()
-                .values()
-                .chunks_exact(self.num_sub_vectors)
-                .map(|c| {
-                    c.iter()
-                        .enumerate()
-                        .map(|(sub_vec_idx, centroid)| {
-                            distance_table[sub_vec_idx * 256 + *centroid as usize]
-                        })
-                        .sum::<f32>()
-                }),
-        )))
+        Ok(Arc::new(unsafe {
+            Float32Array::from_trusted_len_iter(
+                self.code
+                    .as_ref()
+                    .unwrap()
+                    .values()
+                    .chunks_exact(self.num_sub_vectors)
+                    .map(|c| {
+                        Some(
+                            c.iter()
+                                .enumerate()
+                                .map(|(sub_vec_idx, centroid)| {
+                                    distance_table[sub_vec_idx * 256 + *centroid as usize]
+                                })
+                                .sum::<f32>(),
+                        )
+                    }),
+            )
+        }))
     }
 
     fn cosine_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
