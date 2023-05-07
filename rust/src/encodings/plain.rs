@@ -48,6 +48,11 @@ use crate::Error;
 
 use super::Decoder;
 
+/// Parallelism factor decides how many run parallel I/O issued per CPU core.
+/// This is a heuristic value, with the assumption NVME and S3/GCS can
+/// handles large mount of parallel I/O & large disk-queue.
+const PARALLELISM_FACTOR: usize = 4;
+
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
@@ -362,7 +367,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = subtract_scalar(request, start)?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-            .buffered(8)
+            .buffered(num_cpus::get() * PARALLELISM_FACTOR)
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
