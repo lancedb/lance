@@ -246,7 +246,7 @@ impl FileReader {
                 self.read_batch(batch.batch_id, batch.offsets.as_slice(), projection)
                     .await
             })
-            .buffered(num_cpus::get())
+            .buffered(num_cpus::get() * 4)
             .try_collect::<Vec<_>>()
             .await?;
         let schema = Arc::new(ArrowSchema::from(projection));

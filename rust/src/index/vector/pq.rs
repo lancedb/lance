@@ -89,10 +89,11 @@ impl PQIndex {
         }
     }
 
+    #[inline(never)]
     fn compute_code(code: &[u8], table: &[f32]) -> f32 {
         let mut s = 0_f32;
         for i in 0..code.len() {
-            s += table[(code[i] as usize) * code.len() + i];
+            s += table[i * 256 + code[i] as usize];
         }
         s
     }
