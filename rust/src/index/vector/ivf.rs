@@ -40,12 +40,12 @@ use super::{
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
-use crate::{io::object_reader::ObjectReader, session::Session};
 use crate::{
     arrow::{linalg::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     index::{pb, vector::Transformer, Index},
 };
+use crate::{io::object_reader::ObjectReader, session::Session};
 use crate::{Error, Result};
 
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";

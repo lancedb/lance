@@ -317,7 +317,10 @@ pub(crate) async fn build_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-pub(crate) async fn open_index<'a>(dataset: &'a Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex + 'a>> {
+pub(crate) async fn open_index<'a>(
+    dataset: &'a Dataset,
+    uuid: &str,
+) -> Result<Arc<dyn VectorIndex + 'a>> {
     if let Some(index) = dataset.session.index_cache.get(uuid) {
         return Ok(index);
     }
