@@ -162,7 +162,7 @@ impl ObjectStore {
     /// Open a file for path
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path),
+            "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
                 self,
                 path.clone(),
