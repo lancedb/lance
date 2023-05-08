@@ -372,12 +372,10 @@ impl RecordBatchExt for RecordBatch {
                 other.num_rows()
             )));
         }
-        let left_fields = self.schema().fields.iter().cloned().collect::<Vec<_>>();
-        let right_fields = other.schema().fields.iter().cloned().collect::<Vec<_>>();
-        let left_columns = self.columns().iter().cloned().collect::<Vec<_>>();
-        let right_columns = other.columns().iter().cloned().collect::<Vec<_>>();
-        let (fields, columns) = merge(left_fields, left_columns, right_fields, right_columns);
-        Ok(Self::try_new(Arc::new(Schema::new(fields)), columns)?)
+        let left_struct_array: StructArray = self.clone().into();
+        let right_struct_array: StructArray = other.clone().into();
+        merge(&left_struct_array, &right_struct_array)
+            .map(|arr| arr.into())
     }
 
     fn drop_column(&self, name: &str) -> Result<RecordBatch> {
@@ -426,81 +424,63 @@ impl RecordBatchExt for RecordBatch {
 
 /// Merge the fields and columns of two RecordBatch's recursively
 fn merge(
-    left_fields: Vec<FieldRef>,
-    left_columns: Vec<ArrayRef>,
-    right_fields: Vec<FieldRef>,
-    right_columns: Vec<ArrayRef>,
-) -> (Vec<FieldRef>, Vec<ArrayRef>) {
-    let mut fields: Vec<FieldRef> = vec![];
+    left_struct_array: &StructArray,
+    right_struct_array: &StructArray
+) -> Result<StructArray> {
+    let mut fields: Vec<Field> = vec![];
     let mut columns: Vec<ArrayRef> = vec![];
+    let right_fields = right_struct_array.fields();
+    let right_columns = right_struct_array.columns();
+
     // iterate through the fields on the left hand side
-    left_fields
+    for (left_field, left_column) in left_struct_array.fields()
         .iter()
-        .zip(left_columns.iter())
-        .for_each(|(field, column)| {
-            match right_fields.iter().position(|f| f.name() == field.name()) {
+        .zip(left_struct_array.columns().iter()) {
+            match right_fields.iter().position(|f| f.name() == left_field.name()) {
                 // if the field exists on the right hand side, merge them recursively if appropriate
                 Some(right_index) => {
                     let right_field = right_fields.get(right_index).unwrap();
                     let right_column = right_columns.get(right_index).unwrap();
                     // if both fields are struct, merge them recursively
-                    match (field.data_type(), right_field.data_type()) {
-                        (DataType::Struct(left_sub_fields), DataType::Struct(right_sub_fields)) => {
-                            let left_struct_array = as_struct_array(column);
-                            let right_struct_array = as_struct_array(right_column.as_ref());
-                            let (merged_fields, merged_columns) = merge(
-                                left_sub_fields.iter().cloned().collect::<Vec<_>>(),
-                                left_struct_array
-                                    .columns()
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                                right_sub_fields.iter().cloned().collect::<Vec<_>>(),
-                                right_struct_array
-                                    .columns()
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>(),
-                            );
-                            fields.push(FieldRef::new(Field::new(
-                                field.name(),
-                                DataType::Struct(Fields::from(merged_fields.clone())),
-                                field.is_nullable(),
-                            )));
-
-                            columns.push(Arc::new(StructArray::from(
-                                merged_fields
-                                    .iter()
-                                    .zip(merged_columns.iter())
-                                    .map(|(f, c)| (f.as_ref().clone(), c.clone()))
-                                    .collect::<Vec<_>>(),
-                            )));
+                    match (left_field.data_type(), right_field.data_type()) {
+                        (DataType::Struct(_), DataType::Struct(_)) => {
+                            let left_sub_array = as_struct_array(left_column);
+                            let right_sub_array = as_struct_array(right_column);
+                            let merged_sub_array = merge(left_sub_array, right_sub_array)?;
+                            fields.push(Field::new(
+                                left_field.name(),
+                                merged_sub_array.data_type().clone(),
+                                left_field.is_nullable(),
+                            ));
+                            columns.push(Arc::new(merged_sub_array) as ArrayRef);
                         }
                         // otherwise, just use the field on the left hand side
                         _ => {
-                            fields.push(field.clone());
-                            columns.push(column.clone());
+                            return Err(Error::Arrow(format!("RecordBatch merge got conflicting types")));
                         }
                     }
                 }
                 None => {
-                    fields.push(field.clone());
-                    columns.push(column.clone());
+                    fields.push(left_field.as_ref().clone());
+                    columns.push(left_column.clone());
                 }
             }
-        });
+        };
+
     // now iterate through the fields on the right hand side
     right_fields
         .iter()
         .zip(right_columns.iter())
         .for_each(|(field, column)| {
             // add new columns on the right
-            if !left_fields.iter().any(|f| f.name() == field.name()) {
-                fields.push(field.clone());
+            if !left_struct_array.fields().iter().any(|f| f.name() == field.name()) {
+                fields.push(field.as_ref().clone());
                 columns.push(column.clone() as ArrayRef);
             }
         });
-    (fields, columns)
+
+    let zipped: Vec<(Field, ArrayRef)> = fields.iter().cloned().zip(columns.iter().cloned()).collect::<Vec<_>>();
+    StructArray::try_from(zipped).map_err(|e| Error::Arrow(format!("Failed to merge RecordBatch: {}", e)))
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {
