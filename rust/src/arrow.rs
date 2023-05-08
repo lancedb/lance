@@ -451,3 +451,88 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
         .column_by_name(components[0])
         .and_then(|arr| get_sub_array(arr, &components[1..]))
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int32Array, StringArray, StructArray};
+    use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn test_merge_recursive() {
+        let a_array = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let e_array = Int32Array::from(vec![Some(4), Some(5), Some(6)]);
+        let c_array = Int32Array::from(vec![Some(7), Some(8), Some(9)]);
+        let d_array = StringArray::from(vec![Some("a"), Some("b"), Some("c")]);
+
+        let left_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new(
+                "b",
+                DataType::Struct(vec![
+                    Field::new("c", DataType::Int32, true),
+                ].into()),
+                true,
+            ),
+        ]);
+        let left_batch = RecordBatch::try_new(
+            Arc::new(left_schema.clone()),
+            vec![
+                Arc::new(a_array.clone()),
+                Arc::new(StructArray::from(vec![(
+                    Field::new("c", DataType::Int32, true),
+                    Arc::new(c_array.clone()) as ArrayRef
+            )]))]).unwrap();
+
+        let right_schema = Schema::new(vec![
+            Field::new("e", DataType::Int32, true),
+            Field::new(
+                "b",
+                DataType::Struct(vec![
+                    Field::new("d", DataType::Utf8, true),
+                ].into()),
+                true,
+            ),
+        ]);
+        let right_batch = RecordBatch::try_new(
+            Arc::new(right_schema.clone()),
+            vec![
+                Arc::new(e_array.clone()),
+                Arc::new(StructArray::from(vec![(
+                    Field::new("d", DataType::Utf8, true),
+                    Arc::new(d_array.clone()) as ArrayRef,
+                )])) as ArrayRef
+            ]).unwrap();
+
+        let merged_schema = Schema::new(
+            vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new(
+                    "b",
+                    DataType::Struct(vec![
+                        Field::new("c", DataType::Int32, true),
+                        Field::new("d", DataType::Utf8, true),
+                    ].into()),
+                    true,
+                ),
+                Field::new("e", DataType::Int32, true),
+            ]
+        );
+        let merged_batch = RecordBatch::try_new(
+            Arc::new(merged_schema.clone()),
+            vec![
+                Arc::new(a_array) as ArrayRef,
+                Arc::new(StructArray::from(vec![
+                    (Field::new("c", DataType::Int32, true), Arc::new(c_array) as ArrayRef),
+                    (Field::new("d", DataType::Utf8, true), Arc::new(d_array) as ArrayRef)
+                ])) as ArrayRef,
+                Arc::new(e_array) as ArrayRef
+            ],
+        ).unwrap();
+
+        let result = left_batch.merge(&right_batch).unwrap();
+        assert_eq!(result, merged_batch);
+    }
+}
