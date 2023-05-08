@@ -122,10 +122,10 @@ impl FileReader {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
-        let begin = if file_size < object_store.prefetch_size() {
+        let begin = if file_size < object_store.block_size() {
             0
         } else {
-            file_size - object_store.prefetch_size()
+            file_size - object_store.block_size()
         };
         let tail_bytes = object_reader.get_range(begin..file_size).await?;
         let metadata_pos = read_metadata_offset(&tail_bytes)?;

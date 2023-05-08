@@ -74,7 +74,7 @@ impl ObjectReader for LocalObjectReader {
         &self.path
     }
 
-    fn prefetch_size(&self) -> usize {
+    fn block_size(&self) -> usize {
         self.prefetch_size
     }
 

@@ -43,7 +43,7 @@ pub trait ObjectReader: Send + Sync {
     fn path(&self) -> &Path;
 
     /// Suggest optimal I/O size per storage device.
-    fn prefetch_size(&self) -> usize;
+    fn block_size(&self) -> usize;
 
     /// Object/File Size.
     async fn size(&self) -> Result<usize>;
@@ -62,16 +62,16 @@ pub struct CloudObjectReader {
     // File path
     pub path: Path,
 
-    prefetch_size: usize,
+    block_size: usize,
 }
 
 impl<'a> CloudObjectReader {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: &'a ObjectStore, path: Path, prefetch_size: usize) -> Result<Self> {
+    pub fn new(object_store: &'a ObjectStore, path: Path, block_size: usize) -> Result<Self> {
         Ok(Self {
             object_store: object_store.clone(),
             path,
-            prefetch_size,
+            block_size,
         })
     }
 }
@@ -82,8 +82,8 @@ impl ObjectReader for CloudObjectReader {
         &self.path
     }
 
-    fn prefetch_size(&self) -> usize {
-        self.prefetch_size
+    fn block_size(&self) -> usize {
+        self.block_size
     }
 
     /// Object/File Size.
