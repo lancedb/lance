@@ -147,7 +147,11 @@ impl Dataset {
     }
 
     /// Check out a version of the dataset with read params.
-    pub async fn checkout_with_params(uri: &str, version: u64, params: &ReadParams) -> Result<Self> {
+    pub async fn checkout_with_params(
+        uri: &str,
+        version: u64,
+        params: &ReadParams,
+    ) -> Result<Self> {
         let mut object_store = ObjectStore::new(uri).await?;
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
