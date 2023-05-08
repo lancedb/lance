@@ -35,10 +35,15 @@ from .lance import __version__, _Dataset, _Scanner, _write_dataset
 class LanceDataset(pa.dataset.Dataset):
     """A dataset in Lance format where the data is stored at the given uri"""
 
-    def __init__(self, uri: Union[str, Path], version: Optional[int] = None):
+    def __init__(
+        self,
+        uri: Union[str, Path],
+        version: Optional[int] = None,
+        block_size: Optional[int] = None,
+    ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
-        self._ds = _Dataset(uri, version)
+        self._ds = _Dataset(uri, version, block_size)
 
     def __reduce__(self):
         return LanceDataset, (self.uri, self._ds.version())

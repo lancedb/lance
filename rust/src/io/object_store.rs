@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
@@ -46,7 +43,7 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     base_path: Path,
-    prefetch_size: usize,
+    block_size: usize,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -117,7 +114,7 @@ impl ObjectStore {
             inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
             scheme: String::from("flle"),
             base_path: Path::from(object_store::path::DELIMITER),
-            prefetch_size: 64 * 1024,
+            block_size: 4 * 1024, // 4KB block size
         })
     }
 
@@ -127,16 +124,16 @@ impl ObjectStore {
                 inner: build_s3_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
-                prefetch_size: 64 * 1024,
+                block_size: 64 * 1024,
             }),
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
-                prefetch_size: 64 * 1024,
+                block_size: 64 * 1024,
             }),
             "file" => Self::new_from_path(url.path()),
-            s => Err(Error::IO(format!("Unknown scheme {}", s))),
+            s => Err(Error::IO(format!("Unsupported scheme {}", s))),
         }
     }
 
@@ -146,16 +143,16 @@ impl ObjectStore {
             inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
             base_path: Path::from("/"),
-            prefetch_size: 64 * 1024,
+            block_size: 64 * 1024,
         }
     }
 
-    pub fn prefetch_size(&self) -> usize {
-        self.prefetch_size
+    pub fn block_size(&self) -> usize {
+        self.block_size
     }
 
-    pub fn set_prefetch_size(&mut self, new_size: usize) {
-        self.prefetch_size = new_size;
+    pub fn set_block_size(&mut self, new_size: usize) {
+        self.block_size = new_size;
     }
 
     pub fn base_path(&self) -> &Path {
@@ -165,11 +162,11 @@ impl ObjectStore {
     /// Open a file for path
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path),
+            "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
                 self,
                 path.clone(),
-                self.prefetch_size,
+                self.block_size,
             )?)),
         }
     }

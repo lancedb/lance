@@ -33,6 +33,7 @@ def dataset(
     uri: Union[str, Path],
     version: Optional[int] = None,
     asof: Optional[Union[datetime, pd.Timestamp, str]] = None,
+    block_size: Optional[int] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -46,8 +47,10 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given argument value.
         If a version is already specified, this arg is ignored.
+    block_size : optional, int
+        Block size in bytes. Provide a hint for the size of the minimal I/O request.
     """
-    ds = LanceDataset(uri, version)
+    ds = LanceDataset(uri, version, block_size)
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)
         ver_cutoff = max(
@@ -59,6 +62,6 @@ def dataset(
                 f"{ts_cutoff} is earlier than the first version of this dataset"
             )
         else:
-            return LanceDataset(uri, ver_cutoff)
+            return LanceDataset(uri, ver_cutoff, block_size)
     else:
         return ds

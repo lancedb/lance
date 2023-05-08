@@ -275,7 +275,7 @@ impl<'a> PlainDecoder<'a> {
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
-        let block_size = self.reader.prefetch_size() as u32;
+        let block_size = self.reader.block_size() as u32;
         let boolean_block_size = block_size * 8;
 
         let mut chunk_ranges = vec![];
@@ -351,7 +351,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
             return self.take_boolean(indices).await;
         }
 
-        let block_size = self.reader.prefetch_size();
+        let block_size = self.reader.block_size();
         let byte_width = self.data_type.byte_width();
 
         let chunked_ranges = make_chunked_requests(indices.values(), byte_width, block_size);
@@ -831,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn test_take_boolean_beyond_chunk() {
         let mut store = ObjectStore::memory();
-        store.set_prefetch_size(256);
+        store.set_block_size(256);
         let path = Path::from("/take_bools");
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(

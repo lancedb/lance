@@ -107,23 +107,59 @@ pub(crate) fn latest_manifest_path(base: &Path) -> Path {
     base.child(LATEST_MANIFEST_NAME)
 }
 
+/// Customize read behavior of a dataset.
+pub struct ReadParams {
+    /// The block size passed to the underlying Object Store reader.
+    ///
+    /// This is used to control the minimal request size.
+    pub block_size: Option<usize>,
+}
+
+impl Default for ReadParams {
+    fn default() -> Self {
+        Self { block_size: None }
+    }
+}
+
 impl Dataset {
     /// Open an existing dataset.
     pub async fn open(uri: &str) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri).await?);
+        let params = ReadParams::default();
+        Self::open_with_params(uri, &params).await
+    }
+
+    /// Open a dataset with read params.
+    pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
+        let mut object_store = ObjectStore::new(uri).await?;
+        if let Some(block_size) = params.block_size {
+            object_store.set_block_size(block_size);
+        }
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
-        Self::checkout_manifest(object_store, base_path, &latest_manifest_path).await
+        Self::checkout_manifest(Arc::new(object_store), base_path, &latest_manifest_path).await
     }
 
     /// Check out a version of the dataset.
     pub async fn checkout(uri: &str, version: u64) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri).await?);
+        let params = ReadParams::default();
+        Self::checkout_with_params(uri, version, &params).await
+    }
+
+    /// Check out a version of the dataset with read params.
+    pub async fn checkout_with_params(
+        uri: &str,
+        version: u64,
+        params: &ReadParams,
+    ) -> Result<Self> {
+        let mut object_store = ObjectStore::new(uri).await?;
+        if let Some(block_size) = params.block_size {
+            object_store.set_block_size(block_size);
+        };
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Self::checkout_manifest(object_store, base_path, &manifest_file).await
+        Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file).await
     }
 
     /// Check out the specified version of this dataset

@@ -20,6 +20,7 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::dataset::ReadParams;
 use lance::datatypes::Schema;
 use lance::format::Fragment;
 use lance::index::vector::ivf::IvfBuildParams;
@@ -56,13 +57,14 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[new]
-    fn new(uri: String, version: Option<u64>) -> PyResult<Self> {
+    fn new(uri: String, version: Option<u64>, block_size: Option<usize>) -> PyResult<Self> {
         let rt = Runtime::new()?;
+        let params = ReadParams { block_size };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
-                LanceDataset::checkout(uri.as_str(), ver).await
+                LanceDataset::checkout_with_params(uri.as_str(), ver, &params).await
             } else {
-                LanceDataset::open(uri.as_str()).await
+                LanceDataset::open_with_params(uri.as_str(), &params).await
             }
         });
         match dataset {

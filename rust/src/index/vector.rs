@@ -324,11 +324,11 @@ pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn 
     let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
 
     let file_size = reader.size().await?;
-    let prefetch_size = object_store.prefetch_size();
-    let begin = if file_size < prefetch_size {
+    let block_size = object_store.block_size();
+    let begin = if file_size < block_size {
         0
     } else {
-        file_size - prefetch_size
+        file_size - block_size
     };
     let tail_bytes = reader.get_range(begin..file_size).await?;
     let metadata_pos = read_metadata_offset(&tail_bytes)?;

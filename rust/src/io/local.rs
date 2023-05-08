@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Optimized local I/Os
 
@@ -42,27 +39,17 @@ pub struct LocalObjectReader {
     /// Fie path.
     path: Path,
 
-    /// Preferred I/O size, in bytes.
-    ///
-    /// It could be the block size for local SSD.
-    prefetch_size: usize,
+    /// Block size, in bytes.
+    block_size: usize,
 }
-
-/// Default prefetch size for local SSD.
-const PREFETCH_SIZE: usize = 4096;
 
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
-    pub fn open(path: &Path) -> Result<Box<dyn ObjectReader>> {
-        Self::open_with_prefetch(path, PREFETCH_SIZE)
-    }
-
-    /// Open a local object reader, with specified `prefetch` size.
-    pub fn open_with_prefetch(path: &Path, prefetch: usize) -> Result<Box<dyn ObjectReader>> {
+    pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
         Ok(Box::new(Self {
             file: File::open(local_path)?.into(),
-            prefetch_size: prefetch,
+            block_size,
             path: path.clone(),
         }))
     }
@@ -74,8 +61,8 @@ impl ObjectReader for LocalObjectReader {
         &self.path
     }
 
-    fn prefetch_size(&self) -> usize {
-        self.prefetch_size
+    fn block_size(&self) -> usize {
+        self.block_size
     }
 
     /// Returns the file size.
