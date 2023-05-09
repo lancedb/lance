@@ -233,10 +233,28 @@ impl Schema {
         let mut other: Self = other.try_into()?;
         other.reset_id();
 
-        let mut fields = self.fields.clone();
+        let mut merged_fields: Vec<Field> = vec![];
+        for mut field in self.fields.iter().cloned() {
+            if let Some(other_field) = other.field(&field.name) {
+                // if both are struct types, then merge the fields
+                if field.data_type().is_struct() && other_field.data_type().is_struct() {
+                    field.merge(other_field)?;
+                    merged_fields.push(field);
+                } else {
+                    // if they're incompatible types, return an error
+                    return Err(Error::Schema("Cannot merge non-struct fields".to_string()));
+                }
+            } else {
+                // simply add to list if it only exists in one schema
+                merged_fields.push(field);
+            }
+        }
+
+        // we already checked for overlap so just need to add new top-level fields
+        // in the incoming schema
         for field in other.fields.as_slice() {
-            if !fields.iter().any(|f| f.name == field.name) {
-                fields.push(field.clone());
+            if !merged_fields.iter().any(|f| f.name == field.name) {
+                merged_fields.push(field.clone());
             }
         }
         let metadata = self
@@ -245,7 +263,10 @@ impl Schema {
             .chain(other.metadata.iter())
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut schema = Self { fields, metadata };
+        let mut schema = Self {
+            fields: merged_fields,
+            metadata,
+        };
         schema.set_field_id();
         Ok(schema)
     }
@@ -658,5 +679,43 @@ mod tests {
         assert_eq!(field.id, 6);
         let field = merged.field("e").unwrap();
         assert_eq!(field.id, 7);
+    }
+
+    #[test]
+    fn test_merge_nested_field() {
+        let arrow_schema1 = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f1",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]);
+        let schema1 = Schema::try_from(&arrow_schema1).unwrap();
+
+        let arrow_schema2 = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f2",
+                DataType::Utf8,
+                true,
+            )])),
+            true,
+        )]);
+        let schema2 = Schema::try_from(&arrow_schema2).unwrap();
+
+        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("f1", DataType::Utf8, true),
+                ArrowField::new("f2", DataType::Utf8, true),
+            ])),
+            true,
+        )]);
+        let expected_schema = Schema::try_from(&expected_arrow_schema).unwrap();
+
+        let result = schema1.merge(&schema2).unwrap();
+        assert_eq!(result, expected_schema);
     }
 }
