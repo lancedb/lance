@@ -351,7 +351,8 @@ impl Field {
                 // do nothing
             }
             (DataType::FixedSizeBinary(self_size), DataType::FixedSizeBinary(other_size))
-            if self_size == other_size => {
+                if self_size == other_size =>
+            {
                 // do nothing
             }
             _ => {
