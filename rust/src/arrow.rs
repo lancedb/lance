@@ -457,9 +457,9 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
                     }
                     // otherwise, just use the field on the left hand side
                     _ => {
-                        return Err(Error::Arrow(format!(
-                            "RecordBatch merge got conflicting types"
-                        )));
+                        // TODO handle list-of-struct and other types
+                        fields.push(left_field.as_ref().clone());
+                        columns.push(left_column.clone());
                     }
                 }
             }
