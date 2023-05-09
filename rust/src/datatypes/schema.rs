@@ -237,21 +237,9 @@ impl Schema {
         for mut field in self.fields.iter().cloned() {
             if let Some(other_field) = other.field(&field.name) {
                 // if both are struct types, then merge the fields
-                if field.data_type().is_struct() && other_field.data_type().is_struct() {
-                    field.merge(other_field)?;
-                    merged_fields.push(field);
-                } else {
-                    // TODO
-                    // ideally if they're incompatible types, return an error
-                    // return Err(Error::Schema("Cannot merge non-struct fields".to_string()));
-                    // but because of _rowid we have some field id conflicts for now
-                    // so we'll just use the left field and once we fix _rowid issue we revert
-                    merged_fields.push(field);
-                }
-            } else {
-                // simply add to list if it only exists in one schema
-                merged_fields.push(field);
+                field.merge(other_field)?;
             }
+            merged_fields.push(field);
         }
 
         // we already checked for overlap so just need to add new top-level fields
@@ -689,22 +677,36 @@ mod tests {
     fn test_merge_nested_field() {
         let arrow_schema1 = ArrowSchema::new(vec![ArrowField::new(
             "b",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "f1",
-                DataType::Utf8,
-                true,
-            )])),
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new(
+                    "f1",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "f11",
+                        DataType::Utf8,
+                        true,
+                    )])),
+                    true,
+                ),
+                ArrowField::new("f2", DataType::Float32, false),
+            ])),
             true,
         )]);
         let schema1 = Schema::try_from(&arrow_schema1).unwrap();
 
         let arrow_schema2 = ArrowSchema::new(vec![ArrowField::new(
             "b",
-            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                "f2",
-                DataType::Utf8,
-                true,
-            )])),
+            DataType::Struct(ArrowFields::from(vec![
+                ArrowField::new(
+                    "f1",
+                    DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                        "f22",
+                        DataType::Utf8,
+                        true,
+                    )])),
+                    true,
+                ),
+                ArrowField::new("f3", DataType::Float32, false),
+            ])),
             true,
         )]);
         let schema2 = Schema::try_from(&arrow_schema2).unwrap();
@@ -712,12 +714,27 @@ mod tests {
         let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
             DataType::Struct(ArrowFields::from(vec![
-                ArrowField::new("f1", DataType::Utf8, true),
-                ArrowField::new("f2", DataType::Utf8, true),
+                ArrowField::new(
+                    "f1",
+                    DataType::Struct(ArrowFields::from(vec![
+                        ArrowField::new("f11", DataType::Utf8, true),
+                        ArrowField::new("f22", DataType::Utf8, true),
+                    ])),
+                    true,
+                ),
+                ArrowField::new("f2", DataType::Float32, false),
+                ArrowField::new("f3", DataType::Float32, false),
             ])),
             true,
         )]);
-        let expected_schema = Schema::try_from(&expected_arrow_schema).unwrap();
+        let mut expected_schema = Schema::try_from(&expected_arrow_schema).unwrap();
+        expected_schema.fields[0]
+            .child_mut("f1")
+            .unwrap()
+            .child_mut("f22")
+            .unwrap()
+            .id = 4;
+        expected_schema.fields[0].child_mut("f2").unwrap().id = 3;
 
         let result = schema1.merge(&schema2).unwrap();
         assert_eq!(result, expected_schema);
