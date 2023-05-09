@@ -1320,13 +1320,22 @@ mod test {
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        for x in &batches {
-            println!("Schema: {:?}", x.schema());
-            println!("Batch: {:?}", x);
-        }
         let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
 
         let expected_batch = concat_batches(&schema, &input_batches.as_slice()[1..]).unwrap();
         assert_eq!(batch, expected_batch);
+
+        // other reported bug with nested top level column access
+        let batches = dataset
+            .scan()
+            .project(vec!["struct"].as_slice())
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        concat_batches(&batches[0].schema(), &batches).unwrap();
     }
 }
