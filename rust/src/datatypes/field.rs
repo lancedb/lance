@@ -330,11 +330,38 @@ impl Field {
 
     /// Merge the children of other field into this one.
     pub(super) fn merge(&mut self, other: &Self) -> Result<()> {
-        for other_child in other.children.as_slice() {
-            if let Some(field) = self.child_mut(&other_child.name) {
-                field.merge(other_child)?;
-            } else {
-                self.children.push(other_child.clone());
+        match (self.data_type(), other.data_type()) {
+            (DataType::Struct(_), DataType::Struct(_)) => {
+                for other_child in other.children.as_slice() {
+                    if let Some(field) = self.child_mut(&other_child.name) {
+                        field.merge(other_child)?;
+                    } else {
+                        self.children.push(other_child.clone());
+                    }
+                }
+            }
+            (DataType::List(_), DataType::List(_))
+            | (DataType::LargeList(_), DataType::LargeList(_)) => {
+                self.children[0].merge(&other.children[0])?;
+            }
+            (
+                DataType::FixedSizeList(_, self_list_size),
+                DataType::FixedSizeList(_, other_list_size),
+            ) if self_list_size == other_list_size => {
+                // do nothing
+            }
+            (DataType::FixedSizeBinary(self_size), DataType::FixedSizeBinary(other_size))
+                if self_size == other_size =>
+            {
+                // do nothing
+            }
+            _ => {
+                if self.data_type() != other.data_type() {
+                    return Err(Error::Schema(format!(
+                        "Attempt to merge incompatible fields: {} and {}",
+                        self, other
+                    )));
+                }
             }
         }
         Ok(())
