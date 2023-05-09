@@ -367,11 +367,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = subtract_scalar(request, start)?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-<<<<<<< HEAD
             .buffered(num_cpus::get() * PARALLELISM_FACTOR)
-=======
-            .buffered(num_cpus::get() * 4)
->>>>>>> 9ac99a4 (more)
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
