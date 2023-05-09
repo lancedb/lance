@@ -241,8 +241,12 @@ impl Schema {
                     field.merge(other_field)?;
                     merged_fields.push(field);
                 } else {
-                    // if they're incompatible types, return an error
-                    return Err(Error::Schema("Cannot merge non-struct fields".to_string()));
+                    // TODO
+                    // ideally if they're incompatible types, return an error
+                    // return Err(Error::Schema("Cannot merge non-struct fields".to_string()));
+                    // but because of _rowid we have some field id conflicts for now
+                    // so we'll just use the left field and once we fix _rowid issue we revert
+                    merged_fields.push(field);
                 }
             } else {
                 // simply add to list if it only exists in one schema
