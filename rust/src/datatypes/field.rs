@@ -347,21 +347,12 @@ impl Field {
             (
                 DataType::FixedSizeList(_, self_list_size),
                 DataType::FixedSizeList(_, other_list_size),
-            ) => {
-                if self_list_size != other_list_size {
-                    return Err(Error::Schema(format!(
-                        "Attempt to merge incompatible list fields: {} and {}",
-                        self, other
-                    )));
-                }
+            ) if self_list_size == other_list_size => {
+                // do nothing
             }
-            (DataType::FixedSizeBinary(self_size), DataType::FixedSizeBinary(other_size)) => {
-                if self_size != other_size {
-                    return Err(Error::Schema(format!(
-                        "Attempt to merge incompatible fixed size binary fields: {} and {}",
-                        self, other
-                    )));
-                }
+            (DataType::FixedSizeBinary(self_size), DataType::FixedSizeBinary(other_size))
+            if self_size == other_size => {
+                // do nothing
             }
             _ => {
                 if self.data_type() != other.data_type() {
