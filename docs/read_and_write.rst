@@ -4,6 +4,38 @@ Read and Write Lance Dataset
 Lance dataset APIs follows the `PyArrow API <https://arrow.apache.org/docs/python/parquet.html>`_
 conventions.
 
+Writing Lance Dataset
+---------------------
+
+Similar to Apache Pyarrow, the simplest approach to create a Lance dataset is
+writing a :py:class:`pyarrow.Table` via :py:meth:`lance.write_dataset`.
+
+  .. code-block:: python
+
+    import lance
+    import pyarrow as pa
+
+    table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                                  {"name": "Bob", "age": 30}])
+    lance.write_dataset(table, "./alice_and_bob.lance")
+
+If the memory footprint of the dataset is too large to fit in memory, :py:meth:`lance.write_dataset`
+also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` es.
+
+  .. code-block:: python
+
+    import lance
+    import pyarrow as pa
+
+    def producer():
+        yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
+        yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
+
+    lance.write_dataset(producer, "./alice_and_bob.lance")
+
+:py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
+`pyarrow.Dataset`, and `Iterator[pyarrow.RecordBatch]`. Check the function doc for more details.
+
 Reading Lance Dataset
 ---------------------
 
@@ -14,12 +46,12 @@ To open a Lance dataset, use the :py:meth:`lance.dataset` function:
     import lance
     ds = lance.dataset("s3://bucket/path/imagenet.lance")
     # Or local path
-    ds = local.dataset("./imagenet.lance")
+    ds = lance.dataset("./imagenet.lance")
 
   .. note::
 
     Lance supports local file system, AWS ``s3`` and Google Cloud Storage(``gs``) as storage backends
-    at the moment.
+    at the moment. See :ref:`storages` for more details.
 
 The most straightforward approach for reading a Lance dataset is to utilize the :py:meth:`lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
