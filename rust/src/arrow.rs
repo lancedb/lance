@@ -406,19 +406,39 @@ impl RecordBatchExt for RecordBatch {
     }
 
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
-        let mut columns = vec![];
-        for field in schema.fields.iter() {
-            if let Some(col) = self.column_by_name(field.name()) {
-                columns.push(col.clone());
-            } else {
-                return Err(Error::Arrow(format!(
-                    "field {} does not exist in the RecordBatch",
-                    field.name()
-                )));
-            }
-        }
-        Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
+        let struct_array: StructArray = self.clone().into();
+        project(&struct_array, schema.fields()).map(|arr| RecordBatch::from(arr))
     }
+}
+
+fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
+    let mut columns: Vec<ArrayRef> = vec![];
+    for field in fields.iter() {
+        if let Some(col) = struct_array.column_by_name(field.name()) {
+            match field.data_type() {
+                // TODO handle list-of-struct
+                DataType::Struct(subfields) => {
+                    let projected = project(as_struct_array(col), subfields)?;
+                    columns.push(Arc::new(projected));
+                }
+                _ => {
+                    columns.push(col.clone());
+                }
+            }
+        } else {
+            return Err(Error::Arrow(format!(
+                "field {} does not exist in the RecordBatch",
+                field.name()
+            )));
+        }
+    }
+    Ok(StructArray::from(
+        fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .zip(columns)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Merge the fields and columns of two RecordBatch's recursively
