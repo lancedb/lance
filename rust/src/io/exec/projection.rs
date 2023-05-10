@@ -51,8 +51,7 @@ impl ProjectionStream {
                 .zip(stream::repeat_with(|| schema_clone.clone()))
                 .then(|(batch, schema)| async move {
                     let batch = batch?;
-                    let output_batch = batch.project_by_schema(schema.as_ref());
-                    output_batch
+                    batch.project_by_schema(schema.as_ref())
                 })
                 .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                 .try_for_each(|b| async {
