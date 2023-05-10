@@ -1312,7 +1312,7 @@ mod test {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let batches = dataset
             .scan()
-            .filter("struct.i >= 20")
+            .filter("struct.o = 'o-20'")
             .unwrap()
             .try_into_stream()
             .await
