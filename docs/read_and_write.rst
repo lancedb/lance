@@ -34,7 +34,7 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
     lance.write_dataset(producer, "./alice_and_bob.lance")
 
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
-`pyarrow.Dataset`, and `Iterator[pyarrow.RecordBatch]`. Check the function doc for more details.
+:py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
 
 Reading Lance Dataset
 ---------------------
@@ -111,6 +111,12 @@ For example, the following filter string is acceptable:
     ((label IN [10, 20]) AND (note.email IS NOT NULL))
         OR NOT note.created
 
+ .. warning::
+
+    Currently limitation: it does not support filter on columns that are
+    `SQL Keywords <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>_`.
+    We are working on a resolution. For now please rename the column for filter predicates to work
+
 Random read
 ~~~~~~~~~~~
 
@@ -121,3 +127,7 @@ One district feature of Lance, as columnar format, is that it allows you to read
         # Access the 2nd, 101th and 501th rows
         data = ds.take([1, 100, 500], columns=["image", "label"])
 
+The ability to achieve fast random access to individual rows plays a crucial role in facilitating various workflows
+such as random sampling and shuffling in ML training.
+Additionally, it empowers users to construct secondary indices,
+enabling swift execution of queries for enhanced performance.
