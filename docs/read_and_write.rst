@@ -84,5 +84,8 @@ Random read
 
 One district feature of Lance, as columnar format, is that it allows you to read random samples quickly.
 
+    .. code-block:: python
 
+        # Access the 2nd, 101th and 501th rows
+        data = ds.take([1, 100, 500], columns=["image", "label"])
 
