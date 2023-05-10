@@ -12,13 +12,15 @@ Lance is a columnar data format that is easy and fast to version, query and trai
 
 * **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
 
+blabla
+
 .. toctree::
    :maxdepth: 1
 
    Quickstart <./notebooks/quickstart>
+   ./read_and_write
    File Format <./format>
    API References <./api/api>
-
 
 
 Indices and tables

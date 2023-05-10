@@ -33,7 +33,9 @@ from .lance import __version__, _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
-    """A dataset in Lance format where the data is stored at the given uri"""
+    """A dataset in Lance format where the data is stored at the given uri.
+
+    """
 
     def __init__(
         self,
@@ -96,16 +98,18 @@ class LanceDataset(pa.dataset.Dataset):
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
             Get the rows corresponding to the K most similar vectors.
-                Example: {
-                  "column": <embedding col name>,
-                  "q": <query vector as pa.Float32Array>,
-                  "k": 10,
-                  "nprobes": 1,
-                  "refine_factor": 1
-                }
+
+            Example: `{
+                "column": <embedding col name>,
+                "q": <query vector as pa.Float32Array>,
+                "k": 10,
+                "nprobes": 1,
+                "refine_factor": 1
+            }`
 
         Notes
         -----
+
         For now, if BOTH filter and nearest is specified, then:
         1. nearest is executed first.
         2. The results are filtered afterwards.
@@ -122,6 +126,7 @@ class LanceDataset(pa.dataset.Dataset):
             "use_index": False
         }
         ```
+
         """
         return (
             ScannerBuilder(self)
@@ -270,11 +275,13 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         **kwargs : dict, optional
-            See scanner() method for full parameter description.
+            See py:method:`scanner` method for full parameter description.
 
         Returns
         -------
         count : int
+            The total number of rows in the dataset.
+
         """
         return self._ds.count_rows()
 
@@ -323,7 +330,7 @@ class LanceDataset(pa.dataset.Dataset):
         metric: str = "L2",
         **kwargs,
     ) -> LanceDataset:
-        """Create index on column
+        """Create index on column.
 
         ***Experimental API***
 
@@ -341,6 +348,7 @@ class LanceDataset(pa.dataset.Dataset):
             Default is "L2".
         kwargs :
             Parameters passed to the index building process.
+
 
         If `index_type` is "IVF_PQ", then the following parameters are required:
 
@@ -371,6 +379,7 @@ class LanceDataset(pa.dataset.Dataset):
                 num_partitions=256,
                 num_sub_vectors=16
             )
+
 
         References
         ----------
