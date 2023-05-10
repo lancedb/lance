@@ -27,7 +27,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use sqlparser::ast::{
-    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, Value,
+    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, UnaryOperator,
+    Value,
 };
 
 use crate::{
@@ -78,6 +79,20 @@ impl Planner {
             self.binary_op(op)?,
             Box::new(self.parse_sql_expr(right)?),
         )))
+    }
+
+    fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
+        Ok(match op {
+            UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
+                Expr::Not(Box::new(self.parse_sql_expr(expr)?))
+            }
+            _ => {
+                return Err(Error::IO(format!(
+                    "Unary operator '{:?}' is not supported",
+                    op
+                )))
+            }
+        })
     }
 
     // See datafusion `sqlToRel::parse_sql_number()`
@@ -151,13 +166,14 @@ impl Planner {
             }
             SQLExpr::CompoundIdentifier(ids) => self.column(ids.as_slice()),
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
+            SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
-            SQLExpr::IsNotNull(_) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::InList {
                 expr,
                 list,
@@ -185,7 +201,7 @@ impl Planner {
             ))),
             _ => {
                 return Err(Error::IO(format!(
-                    "Expression '{expr}' is not supported as filter in lance"
+                    "Expression FUCK '{expr:#?}' is not supported as filter in lance"
                 )))
             }
         }
@@ -236,6 +252,7 @@ impl Planner {
                 self.create_physical_expr(expr.expr.as_ref())?,
                 self.create_physical_expr(expr.pattern.as_ref())?,
             )),
+            Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"
@@ -409,6 +426,72 @@ mod tests {
             predicates.into_array(0).as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, false, true, true, false, false, false, false
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sql_is_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("s").is_null();
+        let expr = planner.parse_filter("s IS NULL").unwrap();
+        assert_eq!(expr, expected);
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter((0..10).map(|v| {
+                if v % 3 == 0 {
+                    Some(format!("str-{}", v))
+                } else {
+                    None
+                }
+            })))],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, true, true, false, true, true, false, true, true, false
+            ])
+        );
+
+        let expr = planner.parse_filter("s IS NOT NULL").unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                true, false, false, true, false, false, true, false, false, true,
+            ])
+        );
+    }
+
+    #[test]
+    fn test_sql_invert() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Boolean, true)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expr = planner.parse_filter("NOT s").unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(BooleanArray::from_iter(
+                (0..10).map(|v| Some(v % 3 == 0)),
+            ))],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, true, true, false, true, true, false, true, true, false
             ])
         );
     }
