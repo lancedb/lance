@@ -33,6 +33,8 @@ pub struct Updater {
 
     writer: Option<FileWriter>,
 
+    output_schema: Option<Schema>,
+
     batch_id: usize,
 }
 
@@ -44,6 +46,7 @@ impl Updater {
             reader,
             last_input: None,
             writer: None,
+            output_schema: None,
             batch_id: 0,
         }
     }
@@ -130,6 +133,7 @@ impl Updater {
             let merged = self.fragment.schema().merge(output_schema.as_ref())?;
             // Get the schema with correct field id.
             let schema = merged.project_by_schema(output_schema.as_ref())?;
+            self.output_schema = Some(merged);
 
             self.writer = Some(self.new_writer(schema).await?);
         }
@@ -147,5 +151,9 @@ impl Updater {
         }
 
         Ok(self.fragment.metadata().clone())
+    }
+
+    pub fn schema(&self) -> Option<&Schema> {
+        self.output_schema.as_ref()
     }
 }

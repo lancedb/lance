@@ -71,6 +71,9 @@ impl Updater {
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })?;
 
-        Ok(FragmentMetadata::new(fragment))
+        Ok(FragmentMetadata::new(
+            fragment,
+            self.inner.schema().unwrap().clone(),
+        ))
     }
 }

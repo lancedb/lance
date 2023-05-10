@@ -271,6 +271,8 @@ def test_add_columns(tmp_path: Path):
 
     fragment = fragment.add_columns(adder, columns=["a"])
     schema = dataset.schema.append(pa.field("c", pa.int64()))
+    assert fragment.schema() == schema
+
     dataset = lance.LanceDataset._commit(base_dir, schema, [fragment])
     tbl = dataset.to_table()
     assert tbl == pa.Table.from_pydict(
@@ -296,6 +298,7 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     base_dir = tmp_path / "test"
     scanner = pa.dataset.dataset(parquet_dir).scanner()
     fragment = lance.fragment.LanceFragment.create(base_dir, 1, scanner)
+    assert fragment.schema() == table.schema
 
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
