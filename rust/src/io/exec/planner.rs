@@ -201,7 +201,7 @@ impl Planner {
             ))),
             _ => {
                 return Err(Error::IO(format!(
-                    "Expression FUCK '{expr:#?}' is not supported as filter in lance"
+                    "Expression '{expr}' is not supported as filter in lance"
                 )))
             }
         }
