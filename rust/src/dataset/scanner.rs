@@ -581,7 +581,7 @@ mod test {
     use arrow::datatypes::Int32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, RecordBatchReader,
-        StringArray,
+        StringArray, StructArray,
     };
     use arrow_schema::DataType;
     use futures::TryStreamExt;
@@ -1260,5 +1260,82 @@ mod test {
         .unwrap();
 
         assert_eq!(batch, &expected);
+    }
+
+    #[tokio::test]
+    async fn test_filter_proj_bug() {
+        let struct_i_field = ArrowField::new("i", DataType::Int32, true);
+        let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "struct",
+                DataType::Struct(vec![struct_i_field.clone(), struct_o_field.clone()].into()),
+                true,
+            ),
+            ArrowField::new("s", DataType::Utf8, true),
+        ]));
+
+        let input_batches: Vec<RecordBatch> = (0..5)
+            .map(|i| {
+                let struct_i_arr: Arc<Int32Array> =
+                    Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
+                let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{}", v)),
+                ));
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(StructArray::from(vec![
+                            (struct_i_field.clone(), struct_i_arr.clone() as ArrayRef),
+                            (struct_o_field.clone(), struct_o_arr.clone() as ArrayRef),
+                        ])),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let reader = RecordBatchBuffer::new(input_batches.clone());
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(reader);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let batches = dataset
+            .scan()
+            .filter("struct.i >= 20")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+
+        let expected_batch = concat_batches(&schema, &input_batches.as_slice()[1..]).unwrap();
+        assert_eq!(batch, expected_batch);
+
+        // other reported bug with nested top level column access
+        let batches = dataset
+            .scan()
+            .project(vec!["struct"].as_slice())
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        concat_batches(&batches[0].schema(), &batches).unwrap();
     }
 }
