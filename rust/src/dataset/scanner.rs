@@ -1280,7 +1280,7 @@ mod test {
                 let struct_i_arr: Arc<Int32Array> =
                     Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20));
                 let struct_o_arr: Arc<StringArray> = Arc::new(StringArray::from_iter_values(
-                    (i * 20..(i + 1) * 20).map(|v| format!("o-{}", v)),
+                    (i * 20..(i + 1) * 20).map(|v| format!("o-{:02}", v)),
                 ));
                 RecordBatch::try_new(
                     schema.clone(),
@@ -1312,7 +1312,7 @@ mod test {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let batches = dataset
             .scan()
-            .filter("struct.o = 'o-20'")
+            .filter("struct.i >= 20")
             .unwrap()
             .try_into_stream()
             .await
@@ -1323,6 +1323,20 @@ mod test {
         let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
 
         let expected_batch = concat_batches(&schema, &input_batches.as_slice()[1..]).unwrap();
+        assert_eq!(batch, expected_batch);
+
+        // different order
+        let batches = dataset
+            .scan()
+            .filter("struct.o >= 'o-20'")
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
         assert_eq!(batch, expected_batch);
 
         // other reported bug with nested top level column access
