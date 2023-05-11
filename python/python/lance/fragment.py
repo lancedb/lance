@@ -22,7 +22,7 @@ from pathlib import Path
 import pyarrow as pa
 import pandas as pd
 
-from .lance import _Fragment
+from .lance import _Fragment, _FragmentMetadata
 
 
 class LanceFragment(pa.dataset.Fragment):

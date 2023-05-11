@@ -19,6 +19,7 @@ from typing import Optional, Union
 import pandas as pd
 
 from .dataset import LanceDataset, __version__, write_dataset
+from .fragment import _FragmentMetadata
 from .util import sanitize_ts
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "__version__",
     "write_dataset",
     "dataset",
+    "_FragmentMetadata",
 ]
 
 
