@@ -25,6 +25,7 @@ use lance::format::Fragment as LanceFragmentMetadata;
 use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyBytes, PyDict};
 
 use crate::dataset::get_write_params;
@@ -185,6 +186,25 @@ impl FragmentMetadata {
 
 #[pymethods]
 impl FragmentMetadata {
+    #[new]
+    fn init() -> Self {
+        Self {
+            inner: LanceFragmentMetadata::new(0),
+            schema: Schema::from(&Vec::<pb::Field>::new()),
+        }
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Lt => Ok(self.inner.id < other.inner.id),
+            CompareOp::Le => Ok(self.inner.id <= other.inner.id),
+            CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
+            CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
+            CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
+            CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v)
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
     }
