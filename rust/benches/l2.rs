@@ -16,7 +16,7 @@ use arrow_arith::aggregate::sum;
 use arrow_arith::arithmetic::{multiply, subtract};
 use arrow_arith::arity::binary;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{Float32Array};
+use arrow_array::Float32Array;
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(target_os = "linux")]
