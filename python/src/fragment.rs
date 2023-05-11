@@ -15,6 +15,8 @@
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
 use arrow_array::RecordBatchReader;
+use arrow_schema::Schema as ArrowSchema;
+use lance::datatypes::Schema;
 use pyo3::types::PyDict;
 use std::sync::Arc;
 
@@ -54,7 +56,7 @@ impl FileFragment {
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
         let rt = tokio::runtime::Runtime::new()?;
-        let metadata = rt.block_on(async {
+        rt.block_on(async {
             let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
                 let scanner: Scanner = reader.extract()?;
                 Box::new(
@@ -66,6 +68,8 @@ impl FileFragment {
             } else {
                 Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
             };
+            let schema = Schema::try_from(batches.schema().as_ref())
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
             let params = if let Some(kw_params) = kwargs {
                 get_write_params(kw_params)?
@@ -73,11 +77,12 @@ impl FileFragment {
                 None
             };
 
-            LanceFragment::create(dataset_uri, fragment_id, batches.as_mut(), params)
-                .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))
-        })?;
-        Ok(FragmentMetadata::new(metadata))
+            let metadata =
+                LanceFragment::create(dataset_uri, fragment_id, batches.as_mut(), params)
+                    .await
+                    .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(FragmentMetadata::new(metadata, schema))
+        })
     }
 
     fn id(&self) -> usize {
@@ -152,17 +157,27 @@ impl FileFragment {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
     }
+
+    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let schema = self_.fragment.dataset().schema();
+        let arrow_schema: ArrowSchema = schema.into();
+        arrow_schema.to_pyarrow(self_.py())
+    }
 }
 
 #[pyclass(name = "_FragmentMetadata", module = "_lib")]
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
+    schema: Schema,
 }
 
 impl FragmentMetadata {
-    pub(crate) fn new(inner: LanceFragmentMetadata) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: LanceFragmentMetadata, full_schema: Schema) -> Self {
+        Self {
+            inner,
+            schema: full_schema,
+        }
     }
 }
 
@@ -170,5 +185,10 @@ impl FragmentMetadata {
 impl FragmentMetadata {
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
+    }
+
+    fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let arrow_schema: ArrowSchema = (&self_.schema).into();
+        arrow_schema.to_pyarrow(self_.py())
     }
 }
