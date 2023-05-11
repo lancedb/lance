@@ -300,6 +300,12 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, 1, scanner)
     assert fragment.schema() == table.schema
 
+    # Pickle-able
+    print(type(fragment))
+    pickled = pickle.dumps(fragment)
+    # unpickled = pickle.loads(pickled)
+    # assert fragment == unpickled
+
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
     assert tbl == table
