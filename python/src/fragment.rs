@@ -12,18 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
-use lance::datatypes::Schema;
-use pyo3::types::PyDict;
-use std::sync::Arc;
-
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::datatypes::Schema;
+use lance::format::pb;
 use lance::format::Fragment as LanceFragmentMetadata;
+use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
+use pyo3::types::{PyBytes, PyDict};
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -165,7 +168,7 @@ impl FileFragment {
     }
 }
 
-#[pyclass(name = "_FragmentMetadata", module = "_lib")]
+#[pyclass(name = "_FragmentMetadata", module= "lance")]
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
@@ -183,8 +186,54 @@ impl FragmentMetadata {
 
 #[pymethods]
 impl FragmentMetadata {
+    #[new]
+    fn init() -> Self {
+        Self {
+            inner: LanceFragmentMetadata::new(0),
+            schema: Schema::from(&Vec::<pb::Field>::new()),
+        }
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Lt => Ok(self.inner.id < other.inner.id),
+            CompareOp::Le => Ok(self.inner.id <= other.inner.id),
+            CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
+            CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
+            CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
+            CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v)
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!("{:?}", self.inner)
+    }
+
+    pub fn __setstate__(&mut self, py: Python, state: PyObject) -> PyResult<()> {
+        match state.extract::<&PyBytes>(py) {
+            Ok(bytes) => {
+                let bytes = bytes.as_bytes();
+                let manifest = pb::Manifest::decode(bytes).map_err(|e| {
+                    PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
+                })?;
+                self.schema = Schema::try_from(&manifest.fields).map_err(|e| {
+                    PyValueError::new_err(format!("Unable to unpickle FragmentMetadata: {}", e))
+                })?;
+                self.inner = LanceFragmentMetadata::from(&manifest.fragments[0]);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn __getstate__(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
+        let container = pb::Manifest {
+            fields: (&self_.schema).into(),
+            fragments: vec![pb::DataFragment::from(&self_.inner)],
+            ..Default::default()
+        };
+
+        Ok(PyBytes::new(self_.py(), container.encode_to_vec().as_slice()).to_object(self_.py()))
     }
 
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {

@@ -16,13 +16,13 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterator, Optional, Union
+from typing import Any, Callable, Iterator, Optional, Union
 from pathlib import Path
 
 import pyarrow as pa
 import pandas as pd
 
-from .lance import _Fragment
+from .lance import _Fragment, _FragmentMetadata
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -173,3 +173,4 @@ class LanceFragment(pa.dataset.Fragment):
         """Return the schema of this fragment."""
 
         return self._fragment.schema()
+
