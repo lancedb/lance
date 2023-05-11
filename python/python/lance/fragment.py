@@ -22,7 +22,7 @@ from pathlib import Path
 import pyarrow as pa
 import pandas as pd
 
-from lance.lance import _Fragment
+from .lance import _Fragment
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -174,10 +174,3 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
-
-class FragmentMetadata:
-    def __init__(self, metadata: "_FragmentMetadata"):
-        self._inner = metadata
-
-    def __setattr__(self, __name: str, __value: Any) -> None:
-        pass
