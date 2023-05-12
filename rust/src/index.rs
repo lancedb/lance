@@ -28,13 +28,21 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
 }
 
+pub(crate) mod cache;
 pub mod vector;
 
 use crate::dataset::write_manifest_file;
-use crate::format::Index;
+use crate::format::Index as IndexMetadata;
+use crate::session::Session;
 use crate::{dataset::Dataset, Error, Result};
 
 use self::vector::{build_vector_index, VectorIndexParams};
+
+/// Trait of a secondary index.
+pub(crate) trait Index: Send + Sync {
+    /// Cast to [Any].
+    fn as_any(&self) -> &dyn Any;
+}
 
 /// Index Type
 pub enum IndexType {
@@ -146,7 +154,7 @@ impl DatasetIndexExt for Dataset {
         new_manifest.version = latest_manifest.version + 1;
 
         // Write index metadata down
-        let new_idx = Index::new(index_id, &index_name, &[field.id], new_manifest.version);
+        let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], new_manifest.version);
         indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
@@ -155,6 +163,7 @@ impl DatasetIndexExt for Dataset {
             object_store: self.object_store.clone(),
             base: self.base.clone(),
             manifest: Arc::new(new_manifest),
+            session: Arc::new(Session::default()),
         })
     }
 }

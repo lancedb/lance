@@ -316,7 +316,14 @@ pub(crate) async fn build_vector_index(
 }
 
 /// Open the Vector index on dataset, specified by the `uuid`.
-pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn VectorIndex>> {
+pub(crate) async fn open_index<'a>(
+    dataset: &'a Dataset,
+    uuid: &str,
+) -> Result<Arc<dyn VectorIndex + 'a>> {
+    if let Some(index) = dataset.session.index_cache.get(uuid) {
+        return Ok(index);
+    }
+
     let index_dir = dataset.indices_dir().child(uuid);
     let index_file = index_dir.child(INDEX_FILE_NAME);
 
@@ -405,6 +412,8 @@ pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn 
                 }
                 let ivf = Ivf::try_from(ivf_pb)?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
+                    dataset.session.clone(),
+                    uuid,
                     ivf,
                     reader.clone(),
                     last_stage.unwrap(),
@@ -431,5 +440,7 @@ pub(crate) async fn open_index(dataset: &Dataset, uuid: &str) -> Result<Arc<dyn 
             vec_idx.stages
         )));
     }
-    Ok(last_stage.unwrap())
+    let idx = last_stage.unwrap();
+    dataset.session.index_cache.insert(uuid, idx.clone());
+    Ok(idx)
 }

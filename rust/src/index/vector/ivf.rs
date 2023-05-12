@@ -40,15 +40,12 @@ use super::{
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
-use crate::io::object_reader::ObjectReader;
 use crate::{
     arrow::{linalg::MatrixView, *},
-    index::vector::Transformer,
-};
-use crate::{
     dataset::{Dataset, ROW_ID},
-    index::pb,
+    index::{pb, vector::Transformer, Index},
 };
+use crate::{io::object_reader::ObjectReader, session::Session};
 use crate::{Error, Result};
 
 const PARTITION_ID_COLUMN: &str = "__ivf_part_id";
@@ -57,6 +54,8 @@ const PQ_CODE_COLUMN: &str = "__pq_code";
 
 /// IVF Index.
 pub struct IVFIndex {
+    uuid: String,
+
     /// Ivf model
     ivf: Ivf,
 
@@ -66,11 +65,15 @@ pub struct IVFIndex {
     sub_index: Arc<dyn VectorIndex>,
 
     metric_type: MetricType,
+
+    session: Arc<Session>,
 }
 
 impl IVFIndex {
     /// Create a new IVF index.
     pub(crate) fn try_new(
+        session: Arc<Session>,
+        uuid: &str,
         ivf: Ivf,
         reader: Arc<dyn ObjectReader>,
         sub_index: Arc<dyn VectorIndex>,
@@ -83,6 +86,8 @@ impl IVFIndex {
             )));
         }
         Ok(Self {
+            uuid: uuid.to_owned(),
+            session,
             ivf,
             reader,
             sub_index,
@@ -91,15 +96,22 @@ impl IVFIndex {
     }
 
     async fn search_in_partition(&self, partition_id: usize, query: &Query) -> Result<RecordBatch> {
-        let offset = self.ivf.offsets[partition_id];
-        let length = self.ivf.lengths[partition_id] as usize;
+        let cache_key = format!("{}-ivf-{}", self.uuid, partition_id);
+        let part_index = if let Some(part_idx) = self.session.index_cache.get(&cache_key) {
+            part_idx
+        } else {
+            let offset = self.ivf.offsets[partition_id];
+            let length = self.ivf.lengths[partition_id] as usize;
+            let idx = self
+                .sub_index
+                .load(self.reader.as_ref(), offset, length)
+                .await?;
+            self.session.index_cache.insert(&cache_key, idx.clone());
+            idx
+        };
+
         let partition_centroids = self.ivf.centroids.value(partition_id);
         let residual_key = subtract_dyn(query.key.as_ref(), &partition_centroids)?;
-
-        let part_index = self
-            .sub_index
-            .load(self.reader.as_ref(), offset, length)
-            .await?;
         // Query in partition.
         let mut part_query = query.clone();
         part_query.key = as_primitive_array(&residual_key).clone().into();
@@ -111,6 +123,12 @@ impl IVFIndex {
 impl std::fmt::Debug for IVFIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Ivf({}) -> {:?}", self.metric_type, self.sub_index)
+    }
+}
+
+impl Index for IVFIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -142,10 +160,6 @@ impl VectorIndex for IVFIndex {
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_scores).into())
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn is_loadable(&self) -> bool {

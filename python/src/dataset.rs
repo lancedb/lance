@@ -43,6 +43,7 @@ use lance::index::{
 };
 
 const DEFAULT_NPROBS: usize = 1;
+const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -57,9 +58,18 @@ pub struct Dataset {
 #[pymethods]
 impl Dataset {
     #[new]
-    fn new(uri: String, version: Option<u64>, block_size: Option<usize>) -> PyResult<Self> {
+    fn new(
+        uri: String,
+        version: Option<u64>,
+        block_size: Option<usize>,
+        index_cache_size: Option<usize>,
+    ) -> PyResult<Self> {
         let rt = Runtime::new()?;
-        let params = ReadParams { block_size };
+        let params = ReadParams {
+            block_size,
+            index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+            session: None,
+        };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
                 LanceDataset::checkout_with_params(uri.as_str(), ver, &params).await
