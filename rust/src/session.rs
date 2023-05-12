@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::dataset::DEFAULT_INDEX_CACHE_SIZE;
 use crate::index::cache::IndexCache;
 
+/// A user session tracks the runtime state.
 #[derive(Clone)]
 pub struct Session {
+    /// Cache for opened indices.
     pub(crate) index_cache: IndexCache,
 }
 
@@ -25,10 +28,23 @@ impl std::fmt::Debug for Session {
     }
 }
 
+impl Session {
+    /// Create a new session.
+    ///
+    /// Parameters:
+    ///
+    /// - ***index_cache_size***: the size of the index cache.
+    pub fn new(index_cache_size: usize) -> Self {
+        Self {
+            index_cache: IndexCache::new(index_cache_size),
+        }
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self {
-            index_cache: IndexCache::new(100),
+            index_cache: IndexCache::new(DEFAULT_INDEX_CACHE_SIZE),
         }
     }
 }

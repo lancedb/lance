@@ -89,15 +89,6 @@ impl PQIndex {
         }
     }
 
-    #[inline(never)]
-    fn compute_code(code: &[u8], table: &[f32]) -> f32 {
-        let mut s = 0_f32;
-        for i in 0..code.len() {
-            s += table[i * 256 + code[i] as usize];
-        }
-        s
-    }
-
     fn fast_l2_scores(&self, key: &Float32Array) -> Result<ArrayRef> {
         // Build distance table for each sub-centroid to the query key.
         //

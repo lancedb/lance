@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use lru_time_cache::LruCache;
 
-use super::{vector::VectorIndex, Index};
+use super::vector::VectorIndex;
 
 #[derive(Clone)]
 pub(crate) struct IndexCache {

@@ -52,6 +52,7 @@ const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
 const DATA_DIR: &str = "data";
+pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset
 #[derive(Debug, Clone)]
@@ -116,11 +117,38 @@ pub struct ReadParams {
     ///
     /// This is used to control the minimal request size.
     pub block_size: Option<usize>,
+
+    /// Cache size for index cache. If it is zero, index cache is disabled.
+    ///
+    pub index_cache_size: usize,
+
+    /// If present, dataset will use this shared [`Session`] instead creating a new one.
+    ///
+    /// This is useful for sharing the same session across multiple datasets.
+    pub session: Option<Arc<Session>>,
+}
+
+impl ReadParams {
+    /// Set the cache size for indices. Set to zero, to disable the cache.
+    pub fn index_cache_size(&mut self, cache_size: usize) -> &mut Self {
+        self.index_cache_size = cache_size;
+        self
+    }
+
+    /// Set a shared session for the datasets.
+    pub fn session(&mut self, session: Arc<Session>) -> &mut Self {
+        self.session = Some(session);
+        self
+    }
 }
 
 impl Default for ReadParams {
     fn default() -> Self {
-        Self { block_size: None }
+        Self {
+            block_size: None,
+            index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            session: None,
+        }
     }
 }
 
@@ -140,7 +168,19 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
-        Self::checkout_manifest(Arc::new(object_store), base_path, &latest_manifest_path).await
+
+        let session = if let Some(session) = params.session.as_ref() {
+            session.clone()
+        } else {
+            Arc::new(Session::new(params.index_cache_size))
+        };
+        Self::checkout_manifest(
+            Arc::new(object_store),
+            base_path,
+            &latest_manifest_path,
+            session,
+        )
+        .await
     }
 
     /// Check out a version of the dataset.
@@ -162,20 +202,33 @@ impl Dataset {
 
         let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file).await
+
+        let session = if let Some(session) = params.session.as_ref() {
+            session.clone()
+        } else {
+            Arc::new(Session::new(params.index_cache_size))
+        };
+        Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file, session).await
     }
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
         let base_path = self.object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-        Self::checkout_manifest(self.object_store.clone(), base_path, &manifest_file).await
+        Self::checkout_manifest(
+            self.object_store.clone(),
+            base_path,
+            &manifest_file,
+            self.session.clone(),
+        )
+        .await
     }
 
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         manifest_path: &Path,
+        session: Arc<Session>,
     ) -> Result<Self> {
         let object_reader = object_store.open(manifest_path).await?;
         let bytes = object_store.inner.get(manifest_path).await?.bytes().await?;
@@ -189,7 +242,7 @@ impl Dataset {
             object_store,
             base: base_path,
             manifest: Arc::new(manifest),
-            session: Arc::new(Session::default()),
+            session,
         })
     }
 

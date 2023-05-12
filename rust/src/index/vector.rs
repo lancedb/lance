@@ -47,7 +47,6 @@ use crate::{
             opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
         },
-        Index,
     },
     io::{
         object_reader::{read_message, ObjectReader},
