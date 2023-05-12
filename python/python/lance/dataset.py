@@ -33,9 +33,7 @@ from .lance import __version__, _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
-    """A dataset in Lance format where the data is stored at the given uri.
-
-    """
+    """A dataset in Lance format where the data is stored at the given uri."""
 
     def __init__(
         self,
@@ -80,6 +78,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
+        batch_readahead: Optional[int] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -107,6 +106,8 @@ class LanceDataset(pa.dataset.Dataset):
                 "nprobes": 1,
                 "refine_factor": 1
             }`
+        batch_readahead: int, optional
+            The number of batches to read ahead.
 
         Notes
         -----
@@ -136,6 +137,7 @@ class LanceDataset(pa.dataset.Dataset):
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
+            .batch_readahead(batch_readahead)
             .to_scanner()
         )
 
@@ -153,6 +155,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
+        batch_readahead: Optional[int] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -188,7 +191,12 @@ class LanceDataset(pa.dataset.Dataset):
         2. The results are filtered afterwards.
         """
         return self.scanner(
-            columns=columns, filter=filter, limit=limit, offset=offset, nearest=nearest
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            nearest=nearest,
+            batch_readahead=batch_readahead,
         ).to_table()
 
     @property
@@ -219,9 +227,17 @@ class LanceDataset(pa.dataset.Dataset):
         """Get the fragment with fragment id"""
         return self._ds.get_fragment(fragment_id)
 
-    def to_batches(self, **kwargs):
-        """
-        Read the dataset as materialized record batches.
+    def to_batches(
+        self,
+        columns: Optional[list[str]] = None,
+        filter: Optional[Union[str, pa.compute.Expression]] = None,
+        limit: int = 0,
+        offset: Optional[int] = None,
+        nearest: Optional[dict] = None,
+        batch_readahead: Optional[int] = None,
+        **kwargs,
+    ) -> Iterator[pa.RecordBatch]:
+        """Read the dataset as materialized record batches.
 
         Parameters
         ----------
@@ -230,9 +246,16 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        record_batches : iterator of RecordBatch
+        record_batches : Iterator of RecordBatch
         """
-        return self.scanner(**kwargs).to_batches()
+        return self.scanner(
+            columns=columns,
+            filter=filter,
+            limit=limit,
+            offset=offset,
+            nearest=nearest,
+            batch_readahead=batch_readahead,
+        ).to_batches()
 
     def take(self, indices, **kwargs):
         """
@@ -488,6 +511,13 @@ class ScannerBuilder:
         self._offset = None
         self._columns = None
         self._nearest = None
+        self._batch_readahead = None
+
+    def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
+        if nbatches is not None and int(nbatches) < 0:
+            raise ValueError("batch_readahead must be non-negative")
+        self._batch_readahead = nbatches
+        return self
 
     def limit(self, n: int = 0) -> ScannerBuilder:
         if int(n) < 0:
@@ -553,7 +583,12 @@ class ScannerBuilder:
 
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
-            self._columns, self._filter, self._limit, self._offset, self._nearest
+            self._columns,
+            self._filter,
+            self._limit,
+            self._offset,
+            self._nearest,
+            self._batch_readahead,
         )
         return LanceScanner(scanner, self.ds)
 

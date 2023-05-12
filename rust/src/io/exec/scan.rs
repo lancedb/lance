@@ -55,7 +55,7 @@ impl LanceStream {
     ///  - ***projection***: the projection [Schema].
     ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
-    ///  - ***prefetch_size***: the number of batches to read ahead.
+    ///  - ***batch_readahead***: the number of batches to read ahead.
     ///  - ***with_row_id***: load row ID from the datasets.
     ///
     pub fn try_new(
@@ -63,10 +63,10 @@ impl LanceStream {
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
-        prefetch_size: usize,
+        batch_readahead: usize,
         with_row_id: bool,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(prefetch_size);
+        let (tx, rx) = mpsc::channel(batch_readahead);
 
         let project_schema = projection.clone();
         let io_thread = tokio::spawn(async move {
@@ -147,7 +147,7 @@ pub struct LanceScanExec {
     fragments: Arc<Vec<Fragment>>,
     projection: Arc<Schema>,
     read_size: usize,
-    prefetch_size: usize,
+    batch_readahead: usize,
     with_row_id: bool,
 }
 
@@ -175,7 +175,7 @@ impl LanceScanExec {
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
-        prefetch_size: usize,
+        batch_readahead: usize,
         with_row_id: bool,
     ) -> Self {
         Self {
@@ -183,7 +183,7 @@ impl LanceScanExec {
             fragments,
             projection,
             read_size,
-            prefetch_size,
+            batch_readahead,
             with_row_id,
         }
     }
@@ -235,7 +235,7 @@ impl ExecutionPlan for LanceScanExec {
             self.fragments.clone(),
             self.projection.clone(),
             self.read_size,
-            self.prefetch_size,
+            self.batch_readahead,
             self.with_row_id,
         )?))
     }

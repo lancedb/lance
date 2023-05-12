@@ -46,7 +46,8 @@ use crate::{Error, Result};
 pub const ROW_ID: &str = "_rowid";
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
-const PREFETCH_SIZE: usize = 8;
+// Same as pyarrow Dataset::scanner()
+const DEFAULT_BATCH_READAHEAD: usize = 16;
 
 /// Dataset Scanner
 ///
@@ -72,6 +73,9 @@ pub struct Scanner {
     /// The batch size controls the maximum size of rows to return for each read.
     batch_size: usize,
 
+    /// Number of batches to prefetch
+    batch_readahead: usize,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -92,6 +96,7 @@ impl Scanner {
             projections: projection,
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            batch_readahead: DEFAULT_BATCH_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
@@ -107,6 +112,7 @@ impl Scanner {
             projections: projection,
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            batch_readahead: DEFAULT_BATCH_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
@@ -161,6 +167,12 @@ impl Scanner {
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    /// Set the prefetch size.
+    pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
+        self.batch_readahead = nbatches;
         self
     }
 
@@ -492,7 +504,7 @@ impl Scanner {
             fragments,
             projection,
             self.batch_size,
-            PREFETCH_SIZE,
+            self.batch_readahead,
             with_row_id,
         ))
     }
