@@ -125,6 +125,7 @@ impl Dataset {
         limit: Option<i64>,
         offset: Option<i64>,
         nearest: Option<&PyDict>,
+        prefetch_size: Option<usize>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -141,6 +142,9 @@ impl Dataset {
             scanner
                 .limit(limit, offset)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(prefetch_size) = prefetch_size {
+            scanner.prefetch_size(prefetch_size);
         }
         if let Some(nearest) = nearest {
             let column = nearest
