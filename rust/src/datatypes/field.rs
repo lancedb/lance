@@ -239,6 +239,7 @@ impl Field {
                 DataType::Dictionary(self_key, self_value),
                 DataType::Dictionary(other_key, other_value),
             ) if self_key == other_key && self_value == other_value => Ok(self.clone()),
+            (DataType::Null, DataType::Null) => Ok(self.clone()),
             _ => Err(Error::Schema(format!(
                 "Attempt to project incompatible fields: {} and {}",
                 self, other
@@ -682,6 +683,29 @@ mod tests {
         assert_eq!(field.name, "struct");
         assert_eq!(&field.data_type(), arrow_field.data_type());
         assert_eq!(ArrowField::try_from(&field).unwrap(), arrow_field);
+    }
+
+    #[test]
+    fn test_project_by_field_null_type() {
+        let f1: Field = ArrowField::new("a", DataType::Null, true)
+            .try_into()
+            .unwrap();
+        let f2: Field = ArrowField::new("a", DataType::Null, true)
+            .try_into()
+            .unwrap();
+        let p1 = f1.project_by_field(&f2).unwrap();
+
+        assert_eq!(p1, f1);
+
+        let f3: Field = ArrowField::new("b", DataType::Null, true)
+            .try_into()
+            .unwrap();
+        assert!(f1.project_by_field(&f3).is_err());
+
+        let f4: Field = ArrowField::new("a", DataType::Int32, true)
+            .try_into()
+            .unwrap();
+        assert!(f1.project_by_field(&f4).is_err());
     }
 
     #[test]
