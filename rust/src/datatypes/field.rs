@@ -239,11 +239,7 @@ impl Field {
                 DataType::Dictionary(self_key, self_value),
                 DataType::Dictionary(other_key, other_value),
             ) if self_key == other_key && self_value == other_value => Ok(self.clone()),
-            (
-                DataType::Null, DataType::Null
-            ) => {
-                Ok(self.clone())
-            },
+            (DataType::Null, DataType::Null) => Ok(self.clone()),
             _ => Err(Error::Schema(format!(
                 "Attempt to project incompatible fields: {} and {}",
                 self, other
