@@ -168,7 +168,7 @@ impl FileFragment {
     }
 }
 
-#[pyclass(name = "_FragmentMetadata", module= "lance")]
+#[pyclass(name = "_FragmentMetadata", module = "lance")]
 #[derive(Clone, Debug)]
 pub struct FragmentMetadata {
     pub(crate) inner: LanceFragmentMetadata,
@@ -201,7 +201,7 @@ impl FragmentMetadata {
             CompareOp::Eq => Ok(self.inner.id == other.inner.id && self.schema == other.schema),
             CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
             CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
-            CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v)
+            CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v),
         }
     }
 

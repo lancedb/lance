@@ -42,10 +42,11 @@ class LanceDataset(pa.dataset.Dataset):
         uri: Union[str, Path],
         version: Optional[int] = None,
         block_size: Optional[int] = None,
+        index_cache_size: Optional[int] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
-        self._ds = _Dataset(uri, version, block_size)
+        self._ds = _Dataset(uri, version, block_size, index_cache_size)
 
     def __reduce__(self):
         return LanceDataset, (self.uri, self._ds.version())
