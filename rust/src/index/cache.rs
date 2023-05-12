@@ -20,14 +20,24 @@ use super::vector::VectorIndex;
 
 #[derive(Clone)]
 pub(crate) struct IndexCache {
+    /// The maximum number of indices to cache.
+    capacity: usize,
+
     cache: Arc<Mutex<LruCache<String, Arc<dyn VectorIndex>>>>,
 }
 
 impl IndexCache {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
+            capacity,
             cache: Arc::new(Mutex::new(LruCache::with_capacity(capacity))),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        let cache = self.cache.lock().unwrap();
+        cache.len()
     }
 
     /// Get an Index if present. Otherwise returns [None].
@@ -37,8 +47,12 @@ impl IndexCache {
         idx.map(|idx| idx.clone())
     }
 
-    ///
+    /// Insert a new entry into the cache.
     pub(crate) fn insert(&self, key: &str, index: Arc<dyn VectorIndex>) {
+        if self.capacity == 0 {
+            // Work-around. lru_time_cache panics if capacity is 0.
+            return;
+        }
         let mut cache = self.cache.lock().unwrap();
         cache.insert(key.to_string(), index);
     }

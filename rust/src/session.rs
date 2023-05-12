@@ -48,3 +48,27 @@ impl Default for Session {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::index::vector::{
+        pq::{PQIndex, ProductQuantizer},
+        MetricType,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn test_disable_index_cache() {
+        let no_cache = Session::new(0);
+        assert!(no_cache.index_cache.get("abc").is_none());
+
+        let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
+        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+        no_cache.index_cache.insert("abc", idx);
+
+        assert!(no_cache.index_cache.get("abc").is_none());
+        assert_eq!(no_cache.index_cache.len(), 0);
+    }
+}
