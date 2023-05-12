@@ -198,7 +198,7 @@ def test_to_batches(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     dataset = lance.dataset(base_dir)
-    batches = dataset.to_batches()
+    batches = dataset.to_batches(batch_readahead=20)
     assert pa.Table.from_batches(batches) == table
 
 
