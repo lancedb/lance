@@ -77,7 +77,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
-        prefetch_size: Optional[int] = None,
+        batch_readahead: Optional[int] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -105,8 +105,8 @@ class LanceDataset(pa.dataset.Dataset):
                 "nprobes": 1,
                 "refine_factor": 1
             }`
-        prefetch_size: int, optional
-            The number of batches to prefetch.
+        batch_readahead: int, optional
+            The number of batches to read ahead.
 
         Notes
         -----
@@ -136,7 +136,7 @@ class LanceDataset(pa.dataset.Dataset):
             .limit(limit)
             .offset(offset)
             .nearest(**(nearest or {}))
-            .prefetch_size(prefetch_size)
+            .batch_readahead(batch_readahead)
             .to_scanner()
         )
 
@@ -154,7 +154,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
-        prefetch_size: Optional[int] = None,
+        batch_readahead: Optional[int] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -195,7 +195,7 @@ class LanceDataset(pa.dataset.Dataset):
             limit=limit,
             offset=offset,
             nearest=nearest,
-            prefetch_size=prefetch_size,
+            batch_readahead=batch_readahead,
         ).to_table()
 
     @property
@@ -233,7 +233,7 @@ class LanceDataset(pa.dataset.Dataset):
         limit: int = 0,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
-        prefetch_size: Optional[int] = None,
+        batch_readahead: Optional[int] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -253,7 +253,7 @@ class LanceDataset(pa.dataset.Dataset):
             limit=limit,
             offset=offset,
             nearest=nearest,
-            prefetch_size=prefetch_size,
+            batch_readahead=batch_readahead,
         ).to_batches()
 
     def take(self, indices, **kwargs):
@@ -510,12 +510,12 @@ class ScannerBuilder:
         self._offset = None
         self._columns = None
         self._nearest = None
-        self._prefetch_size = None
+        self._batch_readahead = None
 
-    def prefetch_size(self, size: Optional[int] = None) -> ScannerBuilder:
-        if size is not None and int(size) < 0:
-            raise ValueError("Prefetch size must be non-negative")
-        self._prefetch = size
+    def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
+        if nbatches is not None and int(nbatches) < 0:
+            raise ValueError("batch_readahead must be non-negative")
+        self._batch_readahead = nbatches
         return self
 
     def limit(self, n: int = 0) -> ScannerBuilder:
@@ -587,7 +587,7 @@ class ScannerBuilder:
             self._limit,
             self._offset,
             self._nearest,
-            self._prefetch_size,
+            self._batch_readahead,
         )
         return LanceScanner(scanner, self.ds)
 
