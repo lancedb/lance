@@ -38,7 +38,7 @@ pub trait Graph {
 }
 
 #[async_trait]
-pub trait GraphMapNeighbors<T: Send> : Graph {
+pub trait GraphMapNeighbors<T: Send>: Graph {
     /// Map the neighbors of the vertex.
     async fn map_neighbors(&self, f: impl FnMut(u32) -> T) -> Result<Vec<T>>;
 }

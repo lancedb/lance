@@ -38,7 +38,7 @@ use crate::{
     index::{
         vector::VectorIndex,
         vector::{
-            graph::{Graph, VertexWithDistance, GraphMapNeighbors},
+            graph::{Graph, GraphMapNeighbors, VertexWithDistance},
             Query,
         },
     },
