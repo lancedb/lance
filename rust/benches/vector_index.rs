@@ -18,6 +18,7 @@
 use arrow_array::{cast::as_primitive_array, Float32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
+#[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
 
@@ -88,9 +89,16 @@ fn bench_flat_index(c: &mut Criterion) {
     );
 }
 
+#[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = bench_flat_index);
+// Non-linux version does not support pprof.
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_flat_index);
 criterion_main!(benches);

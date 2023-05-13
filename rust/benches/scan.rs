@@ -28,6 +28,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
+#[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance::dataset::Dataset;
@@ -53,9 +54,15 @@ fn bench_scan(c: &mut Criterion) {
     });
 }
 
+#[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    targets = bench_scan);
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_scan);
 criterion_main!(benches);
