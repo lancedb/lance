@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    any::Any,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashSet},
     sync::Arc,
@@ -27,9 +28,12 @@ use ordered_float::OrderedFloat;
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
     dataset::ROW_ID,
-    index::vector::{
-        graph::{GraphReadParams, PersistedGraph},
-        SCORE_COL,
+    index::{
+        vector::{
+            graph::{GraphReadParams, PersistedGraph},
+            SCORE_COL,
+        },
+        Index,
     },
     io::ObjectStore,
     Result,
@@ -179,6 +183,12 @@ impl DiskANNIndex {
     }
 }
 
+impl Index for DiskANNIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
@@ -206,10 +216,6 @@ impl VectorIndex for DiskANNIndex {
             vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
         )?;
         Ok(batch)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn is_loadable(&self) -> bool {
