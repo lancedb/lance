@@ -24,11 +24,11 @@ use crate::format::pb;
 ///
 /// A data file is one piece of file storing data.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DataFile {
+pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
     /// The Ids of fields in this file.
-    fields: Vec<i32>,
+    pub fields: Vec<i32>,
 }
 
 impl DataFile {
@@ -72,7 +72,7 @@ pub struct Fragment {
     pub id: u64,
 
     /// Files within the fragment.
-    pub(crate) files: Vec<DataFile>,
+    pub files: Vec<DataFile>,
 }
 
 impl Fragment {

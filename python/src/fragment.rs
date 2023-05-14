@@ -21,7 +21,7 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
 use lance::format::pb;
-use lance::format::Fragment as LanceFragmentMetadata;
+use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
@@ -165,6 +165,41 @@ impl FileFragment {
         let schema = self_.fragment.dataset().schema();
         let arrow_schema: ArrowSchema = schema.into();
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+    /// Returns the data file objects associated with this fragment.
+    fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
+        let data_files: Vec<DataFile> = self_
+            .fragment
+            .metadata()
+            .files
+            .iter()
+            .map(|f| DataFile::new(f.clone()))
+            .collect();
+        Ok(data_files)
+    }
+}
+
+/// Metadata of a DataFile.
+#[pyclass(name = "_DataFile", module = "_lib")]
+pub struct DataFile {
+    pub(crate) inner: LanceDataFile,
+}
+
+impl DataFile {
+    fn new(inner: LanceDataFile) -> Self {
+        Self { inner }
+    }
+}
+
+#[pymethods]
+impl DataFile {
+    fn path(&self) -> String {
+        self.inner.path.to_string()
+    }
+
+    fn field_ids(&self) -> Vec<i32> {
+        self.inner.fields.clone()
     }
 }
 

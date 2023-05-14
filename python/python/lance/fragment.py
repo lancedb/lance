@@ -174,3 +174,8 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.schema()
 
+    def data_files(self):
+        """Return the data files of this fragment."""
+
+        return self._fragment.data_files()
+
