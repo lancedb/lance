@@ -15,18 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::{cast::as_primitive_array, Float32Array};
+use arrow_array::{
+    cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader,
+};
+use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
+#[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
+use std::sync::Arc;
 
+use lance::arrow::{FixedSizeListArrayExt, RecordBatchBuffer};
+use lance::dataset::{WriteMode, WriteParams};
+use lance::index::vector::ivf::IvfBuildParams;
+use lance::index::vector::pq::PQBuildParams;
+use lance::index::vector::{MetricType, VectorIndexParams};
+use lance::index::{DatasetIndexExt, IndexType};
 use lance::{arrow::as_fixed_size_list_array, dataset::Dataset};
 
-fn bench_flat_index(c: &mut Criterion) {
+fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
-
+    rt.block_on(async {
+        create_file(std::path::Path::new("./vec_data.lance"), WriteMode::Create).await
+    });
     let dataset = rt.block_on(async { Dataset::open("./vec_data.lance").await.unwrap() });
     let first_batch = rt.block_on(async {
         dataset
@@ -47,7 +60,7 @@ fn bench_flat_index(c: &mut Criterion) {
     let q: &Float32Array = as_primitive_array(&value);
 
     c.bench_function(
-        format!("Flat_Index(d={},top_k=10,nprops=10)", q.len()).as_str(),
+        format!("Flat_Index(d={},top_k=10,nprobes=10)", q.len()).as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let results = dataset
@@ -67,7 +80,7 @@ fn bench_flat_index(c: &mut Criterion) {
     );
 
     c.bench_function(
-        format!("Ivf_PQ_Refine(d={},top_k=10,nprops=10, refine=2)", q.len()).as_str(),
+        format!("Ivf_PQ_Refine(d={},top_k=10,nprobes=10, refine=2)", q.len()).as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let results = dataset
@@ -88,9 +101,82 @@ fn bench_flat_index(c: &mut Criterion) {
     );
 }
 
+async fn create_file(path: &std::path::Path, mode: WriteMode) {
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "vector",
+        DataType::FixedSizeList(
+            FieldRef::new(Field::new("item", DataType::Float32, true)),
+            128,
+        ),
+        false,
+    )]));
+
+    let num_rows = 100_000;
+    let batch_size = 10000;
+    let batches = RecordBatchBuffer::new(
+        (0..(num_rows / batch_size) as i32)
+            .map(|_| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(
+                        FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128)
+                            .unwrap(),
+                    )],
+                )
+                .unwrap()
+            })
+            .collect(),
+    );
+
+    let test_uri = path.to_str().unwrap();
+    std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
+    let mut write_params = WriteParams::default();
+    write_params.max_rows_per_file = num_rows as usize;
+    write_params.max_rows_per_group = batch_size as usize;
+    write_params.mode = mode;
+    let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+    let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let mut ivf_params = IvfBuildParams::default();
+    ivf_params.num_partitions = 32;
+    let mut pq_params = PQBuildParams::default();
+    pq_params.num_bits = 8;
+    pq_params.num_sub_vectors = 16;
+    pq_params.use_opq = false;
+    let m_type = MetricType::L2;
+    let params = VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params);
+    dataset
+        .create_index(
+            vec!["vector"].as_slice(),
+            IndexType::Vector,
+            Some("ivf_pq_index".to_string()),
+            &params,
+        )
+        .await
+        .unwrap();
+}
+
+fn create_float32_array(num_elements: i32) -> Float32Array {
+    // generate an Arrow Float32Array with 10000*128 elements randomly
+    let mut rng = rand::thread_rng();
+    let mut values = Vec::with_capacity(num_elements as usize);
+    for _ in 0..num_elements {
+        values.push(rng.gen_range(0.0..1.0));
+    }
+    Float32Array::from(values)
+}
+
+#[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_flat_index);
+    targets = bench_ivf_pq_index);
+// Non-linux version does not support pprof.
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default().significance_level(0.1).sample_size(10);
+    targets = bench_ivf_pq_index);
 criterion_main!(benches);
