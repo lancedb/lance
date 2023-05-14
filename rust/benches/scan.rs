@@ -26,17 +26,27 @@
 //!
 //! TODO: Take parameterized input to specify dataset URI from command line.
 
+use arrow_array::{
+    BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchReader,
+    StringArray,
+};
+use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::TryStreamExt;
+use lance::arrow::FixedSizeListArrayExt;
+use lance::arrow::RecordBatchBuffer;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
+use std::sync::Arc;
 
-use lance::dataset::Dataset;
+use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 fn bench_scan(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
-
+    rt.block_on(async {
+        create_file(std::path::Path::new("./test.lance"), WriteMode::Create).await
+    });
     let dataset = rt.block_on(async { Dataset::open("./test.lance").await.unwrap() });
 
     c.bench_function("Scan full dataset", |b| {
@@ -52,6 +62,78 @@ fn bench_scan(c: &mut Criterion) {
             assert!(count.len() >= 1);
         })
     });
+
+    std::fs::remove_dir_all("./test.lance").unwrap();
+}
+
+async fn create_file(path: &std::path::Path, mode: WriteMode) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("i", DataType::Int32, false),
+        Field::new("f", DataType::Float32, false),
+        Field::new("s", DataType::Utf8, false),
+        Field::new(
+            "fsl",
+            DataType::FixedSizeList(
+                FieldRef::new(Field::new("item", DataType::Float32, true)),
+                2,
+            ),
+            false,
+        ),
+        Field::new("blob", DataType::Binary, false),
+    ]));
+    let num_rows = 100_000;
+    let batch_size = 10;
+    let batches = RecordBatchBuffer::new(
+        (0..(num_rows / batch_size) as i32)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(
+                            i * batch_size..(i + 1) * batch_size,
+                        )),
+                        Arc::new(Float32Array::from_iter_values(
+                            (i * batch_size..(i + 1) * batch_size)
+                                .map(|x| x as f32)
+                                .collect::<Vec<_>>(),
+                        )),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * batch_size..(i + 1) * batch_size)
+                                .map(|x| format!("s-{}", x).to_string())
+                                .collect::<Vec<_>>(),
+                        )),
+                        Arc::new(
+                            FixedSizeListArray::try_new(
+                                Float32Array::from_iter_values(
+                                    (i * batch_size..(i + 2) * batch_size)
+                                        .map(|x| (batch_size + (x - batch_size) / 2) as f32)
+                                        .collect::<Vec<_>>(),
+                                ),
+                                2,
+                            )
+                            .unwrap(),
+                        ),
+                        Arc::new(BinaryArray::from_iter_values(
+                            (i * batch_size..(i + 1) * batch_size)
+                                .map(|x| format!("blob-{}", x).to_string().into_bytes())
+                                .collect::<Vec<_>>(),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect(),
+    );
+
+    let test_uri = path.to_str().unwrap();
+    let mut write_params = WriteParams::default();
+    write_params.max_rows_per_file = 40;
+    write_params.max_rows_per_group = 10;
+    write_params.mode = mode;
+    let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+    Dataset::write(&mut reader, test_uri, Some(write_params))
+        .await
+        .unwrap();
 }
 
 #[cfg(target_os = "linux")]
