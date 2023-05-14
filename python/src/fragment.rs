@@ -194,6 +194,10 @@ impl DataFile {
 
 #[pymethods]
 impl DataFile {
+    fn __repr__(&self) -> String {
+        format!("DataFile({})", self.path())
+    }
+
     fn path(&self) -> String {
         self.inner.path.to_string()
     }
@@ -274,5 +278,16 @@ impl FragmentMetadata {
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema: ArrowSchema = (&self_.schema).into();
         arrow_schema.to_pyarrow(self_.py())
+    }
+
+     /// Returns the data file objects associated with this fragment.
+     fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
+        let data_files: Vec<DataFile> = self_
+            .inner
+            .files
+            .iter()
+            .map(|f| DataFile::new(f.clone()))
+            .collect();
+        Ok(data_files)
     }
 }

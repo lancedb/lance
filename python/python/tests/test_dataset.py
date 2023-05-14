@@ -16,6 +16,7 @@ import os
 import pickle
 import platform
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -288,6 +289,17 @@ def test_create_from_fragments(tmp_path: Path):
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
     assert tbl == table
+
+
+def test_data_files(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    fragment = lance.fragment.LanceFragment.create(base_dir, 1, table)
+
+    data_files = fragment.data_files()
+    assert len(data_files) == 1
+    # it is a valid uuid
+    uuid.UUID(os.path.splitext(data_files[0].path())[0])
 
 
 def test_commit_fragments_via_scanner(tmp_path: Path):
