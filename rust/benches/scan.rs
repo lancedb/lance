@@ -62,8 +62,6 @@ fn bench_scan(c: &mut Criterion) {
             assert!(count.len() >= 1);
         })
     });
-
-    std::fs::remove_dir_all("./test.lance").unwrap();
 }
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
@@ -82,7 +80,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
         Field::new("blob", DataType::Binary, false),
     ]));
     let num_rows = 100_000;
-    let batch_size = 10;
+    let batch_size = 10000;
     let batches = RecordBatchBuffer::new(
         (0..(num_rows / batch_size) as i32)
             .map(|i| {
@@ -126,9 +124,10 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     );
 
     let test_uri = path.to_str().unwrap();
+    std::fs::remove_dir_all(test_uri).map_or_else(|| println!("{} not exists", test_uri), |_| {});
     let mut write_params = WriteParams::default();
-    write_params.max_rows_per_file = 40;
-    write_params.max_rows_per_group = 10;
+    write_params.max_rows_per_file = num_rows as usize;
+    write_params.max_rows_per_group = batch_size as usize;
     write_params.mode = mode;
     let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
     Dataset::write(&mut reader, test_uri, Some(write_params))
