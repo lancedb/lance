@@ -124,7 +124,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     );
 
     let test_uri = path.to_str().unwrap();
-    std::fs::remove_dir_all(test_uri).map_or_else(|| println!("{} not exists", test_uri), |_| {});
+    std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
     let mut write_params = WriteParams::default();
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;

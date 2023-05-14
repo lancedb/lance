@@ -103,7 +103,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "fsl",
+        "vector",
         DataType::FixedSizeList(
             FieldRef::new(Field::new("item", DataType::Float32, true)),
             128,
@@ -129,7 +129,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     );
 
     let test_uri = path.to_str().unwrap();
-    std::fs::remove_dir_all(test_uri).map_or_else(|| println!("{} not exists", test_uri), |_| {});
+    std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
     let mut write_params = WriteParams::default();
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;
@@ -148,7 +148,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let params = VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params);
     dataset
         .create_index(
-            vec!["fsl"].as_slice(),
+            vec!["vector"].as_slice(),
             IndexType::Vector,
             Some("ivf_pq_index".to_string()),
             &params,
