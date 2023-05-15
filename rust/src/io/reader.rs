@@ -71,7 +71,13 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    assert!(file_size - manifest_pos <= buf.len());
+    assert!(
+        file_size - manifest_pos <= buf.len(),
+        "Assert file_size - manifest_pos <= buf.len(), but got file_size = {}, manifest_pos = {}, buf.len() = {}",
+        file_size,
+        manifest_pos,
+        buf.len()
+    );
     let proto =
         pb::Manifest::decode(&buf[buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16])?;
     Ok(Manifest::from(proto))
