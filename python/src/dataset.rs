@@ -433,7 +433,7 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
-        let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+        let mut batches: Box<dyn RecordBatchReader + Send> = if reader.is_instance_of::<Scanner>()? {
             let scanner: Scanner = reader.extract()?;
             Box::new(
                 scanner

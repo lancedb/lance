@@ -430,7 +430,7 @@ mod tests {
         let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();

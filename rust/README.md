@@ -29,7 +29,7 @@ use ::lance::dataset::WriteParams;
 use ::lance::dataset::Dataset;
 
 let mut write_params = WriteParams::default();
-let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batches);
 Dataset::write(&mut reader, test_uri, Some(write_params)).await?;
 ```
 

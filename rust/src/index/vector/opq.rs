@@ -367,7 +367,7 @@ mod tests {
         )
         .unwrap()
         .into()]);
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
+        let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batch);
         Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
             .await
             .unwrap();

@@ -270,7 +270,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let mut params = WriteParams::default();
         params.max_rows_per_group = 10;
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(params))
             .await
             .unwrap();

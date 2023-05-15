@@ -624,7 +624,7 @@ mod test {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -662,7 +662,7 @@ mod test {
         )
         .unwrap()]);
 
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         Dataset::write(&mut batches, test_uri, None).await.unwrap();
@@ -746,7 +746,7 @@ mod test {
         let batches = RecordBatchBuffer::new(expected_batches.clone());
         let mut params = WriteParams::default();
         params.max_rows_per_group = 10;
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         Dataset::write(&mut reader, path, Some(params))
             .await
             .unwrap();
@@ -789,7 +789,7 @@ mod test {
 
         let mut params = WriteParams::default();
         params.max_rows_per_group = 10;
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader + Send> = Box::new(batches);
 
         let dataset = Dataset::write(&mut reader, path, Some(params))
             .await
@@ -1233,7 +1233,7 @@ mod test {
         .unwrap()]);
 
         let write_params = WriteParams::default();
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader + Send> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1304,7 +1304,7 @@ mod test {
         let mut write_params = WriteParams::default();
         write_params.max_rows_per_file = 40;
         write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(reader);
+        let mut batches: Box<dyn RecordBatchReader + Send> = Box::new(reader);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
