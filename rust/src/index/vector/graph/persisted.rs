@@ -194,11 +194,11 @@ impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
     }
 
     /// Get the neighbors of a vertex, specified by its id.
-    async fn neighbors<'a>(&'a self, id: usize) -> Result<&'a [u32]> {
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>> {
         {
             let mut cache = self.neighbors_cache.lock().unwrap();
             if let Some(neighbors) = cache.get(&(id as u32)) {
-                return Ok(neighbors.values());
+                return Ok(neighbors.clone());
             }
         }
         let batch = self
@@ -216,7 +216,7 @@ impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
             let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
             let neighbors = Arc::new(nb_array.clone());
             cache.insert(id as u32, neighbors.clone());
-            Ok(neighbors.values())
+            Ok(neighbors.clone())
         }
     }
 }

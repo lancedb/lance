@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::UInt32Array;
 use async_trait::async_trait;
 
 use super::{Graph, Vertex};
@@ -31,7 +32,7 @@ pub(crate) struct Node<V: Vertex> {
 
     /// Neighbors are the ids of vertex in the graph.
     /// This id is not the same as the row_id in the original lance dataset.
-    pub(crate) neighbors: Vec<u32>,
+    pub(crate) neighbors: Arc<UInt32Array>,
 }
 
 /// A Graph that allows dynamically build graph to be persisted later.
@@ -82,10 +83,6 @@ impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
         &mut self.nodes[id].vertex
     }
 
-    pub fn neighbors_mut(&mut self, id: usize) -> &mut Vec<u32> {
-        &mut self.nodes[id].neighbors
-    }
-
     /// Set neighbors of a node.
     pub fn set_neighbors(&mut self, id: usize, neighbors: impl Into<Vec<u32>>) {
         self.nodes[id].neighbors = neighbors.into();
@@ -129,8 +126,8 @@ impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
         Ok((self.distance_func)(query, vector))
     }
 
-    async fn neighbors(&self, id: usize) -> Result<&[u32]> {
-        Ok(self.nodes[id].neighbors.as_slice())
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>> {
+        Ok(self.nodes[id].neighbors)
     }
 }
 

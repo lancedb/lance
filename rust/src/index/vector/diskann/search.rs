@@ -42,7 +42,7 @@ use crate::{
     index::{
         vector::VectorIndex,
         vector::{
-            graph::{Graph, GraphMapNeighbors, VertexWithDistance},
+            graph::{Graph, VertexWithDistance},
             Query,
         },
     },
@@ -148,7 +148,7 @@ pub(crate) async fn greedy_search(
     state.push(start, dist);
     while let Some(id) = state.pop() {
         state.visit(id);
-        for neighbor_id in graph.neighbors(id).await?.iter() {
+        for neighbor_id in graph.neighbors(id).await?.values() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
                 // Already visited.

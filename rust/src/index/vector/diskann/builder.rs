@@ -153,7 +153,8 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i).await?.iter().copied().collect();
+        let mut neighbor_ids: HashSet<u32> =
+            graph.neighbors(i).await?.values().iter().copied().collect();
 
         while neighbor_ids.len() < r {
             let neighbor_id = rng.sample(distribution);
@@ -201,7 +202,7 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
 ) -> Result<Vec<u32>> {
     visited.remove(&id);
     let neighbors = graph.neighbors(id).await?;
-    visited.extend(neighbors.iter().map(|id| *id as usize));
+    visited.extend(neighbors.values().iter().map(|id| *id as usize));
 
     let mut heap: BinaryHeap<VertexWithDistance> = visited
         .iter()
@@ -298,6 +299,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
                 let mut neighbor_set: HashSet<usize> = fixed_graph
                     .neighbors(j as usize)
                     .await?
+                    .values()
                     .iter()
                     .map(|v| *v as usize)
                     .collect();

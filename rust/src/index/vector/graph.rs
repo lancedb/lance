@@ -15,6 +15,9 @@
 //! Graph-based vector index.
 //!
 
+use std::sync::Arc;
+
+use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use ordered_float::OrderedFloat;
 
@@ -34,13 +37,7 @@ pub trait Graph {
     async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
 
     /// Return the neighbor IDs.
-    async fn neighbors(&self, id: usize) -> Result<&[u32]>;
-}
-
-#[async_trait]
-pub trait GraphMapNeighbors<T: Send>: Graph {
-    /// Map the neighbors of the vertex.
-    async fn map_neighbors(&self, f: impl FnMut(u32) -> T) -> Result<Vec<T>>;
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>>;
 }
 
 /// Vertex (metadata). It does not include the actual data.
