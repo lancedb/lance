@@ -19,7 +19,7 @@ import os
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -627,6 +627,31 @@ class LanceScanner(pa.dataset.Scanner):
         Not implemented
         """
         raise NotImplementedError("from fragment")
+
+    @staticmethod
+    def from_fragments(fragments: Iterable[LanceFragment], **kwargs):
+        """
+        Create a scanner from an iterable of fragments.
+
+        Parameters
+        ----------
+        fragments : Iterable[LanceFragment]
+
+        Returns
+        -------
+        LanceScanner
+        """
+        # TODO: peek instead of list
+        if not isinstance(fragments, list):
+            fragments = list(iter(fragments))
+
+        if len(fragments) == 0:
+            raise ValueError("Must pass at least one fragment")
+        
+        dataset = fragments[0]._ds
+        # TODO: pass down an iterator
+        scanner = _Scanner.from_fragments([fragment._fragment for fragment in fragments])
+        return LanceScanner(scanner, dataset)
 
     @staticmethod
     def from_batches(*args, **kwargs):

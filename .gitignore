@@ -88,3 +88,5 @@ data
 
 # c++ lsp
 .ccls-cache/
+
+python/venv

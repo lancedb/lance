@@ -320,3 +320,26 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     dataset = lance.LanceDataset._commit(base_dir, table.schema, [fragment])
     tbl = dataset.to_table()
     assert tbl == table
+
+
+def test_load_scanner_from_fragments(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    for _ in range(3):
+        lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+    
+    dataset = lance.dataset(tmp_path / "dataset")
+    fragments = list(dataset.get_fragments())
+    assert len(fragments) == 3
+
+    # Create a scanner from first two fragments
+    scanner = lance.LanceScanner.from_fragments(fragments[0:2])
+    assert scanner.to_table().num_rows == 2 * 100
+
+    # Accepts an iterator
+    scanner = lance.LanceScanner.from_fragments(iter(fragments[0:2]))
+    assert scanner.to_table().num_rows == 2 * 100
+
+    # Fails if no fragments passed
+    with pytest.raises(ValueError, match="Must pass at least one fragment"):
+        lance.LanceScanner.from_fragments([])
+
