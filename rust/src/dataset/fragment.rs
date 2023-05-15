@@ -200,6 +200,12 @@ impl FileFragment {
     }
 }
 
+impl From<FileFragment> for Fragment {
+    fn from(fragment: FileFragment) -> Self {
+        fragment.metadata
+    }
+}
+
 /// [`FragmentReader`] is an abstract reader for a [`FileFragment`].
 ///
 /// It opens the data files that contains the columns of the projection schema, and

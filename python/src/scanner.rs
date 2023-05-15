@@ -19,13 +19,17 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::*;
 use arrow::pyarrow::*;
+use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
 use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
-use ::lance::dataset::scanner::Scanner as LanceScanner;
+use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::scanner::Scanner as LanceScanner;
+use lance::format::Fragment as FormatFragment;
 use pyo3::exceptions::PyValueError;
 
+use crate::dataset::Dataset;
 use crate::errors::ioerror;
 use crate::fragment::FileFragment;
 use crate::reader::LanceReader;
@@ -80,25 +84,29 @@ impl Scanner {
     }
 
     #[staticmethod]
-    fn from_fragments(fragments: Vec<FileFragment>) -> PyResult<Self> {
-        let fragments = fragments
-            .into_iter()
-            .map(|f| f.fragment().clone())
-            .collect::<Vec<_>>();
+    fn from_fragments(fragments: PyObject, dataset: Dataset) -> PyResult<Self> {
+        let fragment_iter = std::iter::from_fn(move || {
+            Python::with_gil(|py| match fragments.call_method0(py, "__next__") {
+                Ok(fragment) => {
+                    let fragment = fragment.extract::<FileFragment>(py).unwrap();
+                    let fragment: LanceFragment = fragment.into();
+                    Some(Ok(FormatFragment::from(fragment)))
+                }
+                Err(err) => {
+                    if err.is_instance_of::<PyStopIteration>(py) {
+                        None
+                    } else {
+                        Some(Err(PyValueError::new_err(format!(
+                            "Failed to get fragment: {}",
+                            err
+                        ))))
+                    }
+                }
+            })
+        });
 
-        if fragments.is_empty() {
-            return Err(PyValueError::new_err("No fragments provided"));
-        }
-
-        // TODO: implement conversion traits so we can avoid the clones.
-
-        let dataset = Arc::new(fragments[0].dataset().clone());
-        let fragments = fragments
-            .into_iter()
-            .map(|f| f.metadata().clone())
-            .collect::<Vec<_>>();
-
-        let scanner = LanceScanner::from_fragments(dataset, fragments);
+        let fragments: Vec<FormatFragment> = fragment_iter.collect::<PyResult<_>>()?;
+        let scanner = LanceScanner::from_fragments(dataset.dataset().clone(), fragments);
 
         Ok(Self::new(Arc::new(scanner), Arc::new(Runtime::new()?)))
     }

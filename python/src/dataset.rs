@@ -55,6 +55,12 @@ pub struct Dataset {
     rt: Arc<Runtime>,
 }
 
+impl Dataset {
+    pub(crate) fn dataset(&self) -> &Arc<LanceDataset> {
+        &self.ds
+    }
+}
+
 #[pymethods]
 impl Dataset {
     #[new]

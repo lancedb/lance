@@ -14,6 +14,7 @@
 #
 
 from __future__ import annotations
+import itertools
 
 import os
 from datetime import datetime, timedelta
@@ -641,16 +642,18 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         LanceScanner
         """
-        # TODO: peek instead of list
-        if not isinstance(fragments, list):
-            fragments = list(iter(fragments))
-
-        if len(fragments) == 0:
+        fragments_iter = iter(fragments)
+        try:
+            first = next(fragments_iter)
+        except StopIteration:
             raise ValueError("Must pass at least one fragment")
-        
-        dataset = fragments[0]._ds
-        # TODO: pass down an iterator
-        scanner = _Scanner.from_fragments([fragment._fragment for fragment in fragments])
+
+        # put first fragment back into iterator after we have peeked at it
+        dataset = first._ds
+        fragments_iter = itertools.chain([first], fragments_iter)
+        fragments_iter = (fragment._fragment for fragment in fragments_iter)
+
+        scanner = _Scanner.from_fragments(fragments_iter, dataset._ds)
         return LanceScanner(scanner, dataset)
 
     @staticmethod
