@@ -84,8 +84,8 @@ pub struct Scanner {
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
-    /// If set, this scanner serves one fragment only.
-    fragment: Option<Fragment>,
+    /// If set, this scanner serves only these fragments.
+    fragments: Option<Vec<Fragment>>,
 }
 
 impl Scanner {
@@ -101,7 +101,7 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
-            fragment: None,
+            fragments: None,
         }
     }
 
@@ -117,7 +117,23 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
-            fragment: Some(fragment),
+            fragments: Some(vec![fragment]),
+        }
+    }
+
+    pub fn from_fragments(dataset: Arc<Dataset>, fragments: Vec<Fragment>) -> Self {
+        let projection = dataset.schema().clone();
+        Self {
+            dataset,
+            projections: projection,
+            filter: None,
+            batch_size: DEFAULT_BATCH_SIZE,
+            batch_readahead: DEFAULT_BATCH_READAHEAD,
+            limit: None,
+            offset: None,
+            nearest: None,
+            with_row_id: false,
+            fragments: Some(fragments),
         }
     }
 
@@ -132,7 +148,7 @@ impl Scanner {
     }
 
     fn is_fragment_scan(&self) -> bool {
-        self.fragment.is_some()
+        self.fragments.is_some()
     }
 
     /// Projection.
@@ -485,8 +501,8 @@ impl Scanner {
 
     /// Create an Execution plan with a scan node
     fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
-        let fragments = if let Some(fragment) = self.fragment.as_ref() {
-            Arc::new(vec![fragment.clone()])
+        let fragments = if let Some(fragment) = self.fragments.as_ref() {
+            Arc::new(fragment.clone())
         } else {
             self.dataset.fragments().clone()
         };

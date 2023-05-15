@@ -42,6 +42,10 @@ impl FileFragment {
     pub fn new(frag: LanceFragment) -> Self {
         Self { fragment: frag }
     }
+
+    pub(crate) fn fragment(&self) -> &LanceFragment {
+        &self.fragment
+    }
 }
 
 #[pymethods]
@@ -280,8 +284,8 @@ impl FragmentMetadata {
         arrow_schema.to_pyarrow(self_.py())
     }
 
-     /// Returns the data file objects associated with this fragment.
-     fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
+    /// Returns the data file objects associated with this fragment.
+    fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
         let data_files: Vec<DataFile> = self_
             .inner
             .files
