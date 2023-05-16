@@ -1182,4 +1182,30 @@ mod tests {
             &Int64Array::from_iter_values(7..25)
         );
     }
+
+    #[tokio::test]
+    async fn test_read_large_manifest() {
+        // Create a very long name, so the manifest is larger than the default buffer size
+        // let long_name: String = rand::thread_rng()
+        //     .sample_iter(&Alphanumeric)
+        //     .take(7)
+        //     .map(char::from)
+        //     .collect();
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("test", DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..100))];
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
+
+        let store = ObjectStore::memory();
+        let path = Path::from("/read_large_manifest");
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        file_writer.write(&[batch]).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let manifest = read_manifest(&store, &path).await.unwrap();
+        assert_eq!(schema, manifest.schema);
+    }
 }
