@@ -337,7 +337,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);
         for i in 0..100 {
-            let neighbors = Arc::new(UInt32Array::from_iter_values(i..i+10));
+            let neighbors = Arc::new(UInt32Array::from_iter_values(i..i + 10));
             builder.set_neighbors(i as usize, neighbors);
         }
         let serde = Arc::new(FooVertexSerDe {});

@@ -282,7 +282,10 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
         let state = greedy_search(graph, medoid, vector, 1, l).await?;
 
         let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
-        graph.set_neighbors(id, Arc::new(neighbors.iter().copied().collect::<UInt32Array>()));
+        graph.set_neighbors(
+            id,
+            Arc::new(neighbors.iter().copied().collect::<UInt32Array>()),
+        );
 
         let fixed_graph: &GraphBuilder<V> = graph;
         let neighbours = stream::iter(neighbors)
