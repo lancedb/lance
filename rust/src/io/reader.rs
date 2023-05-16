@@ -99,8 +99,17 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
         buf2.freeze()
     };
 
-    // Need to trim the magic number at end, and the non-manifest data at the beginning
+    let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
+    // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
+
+    if buf.len() != recorded_length {
+        return Err(Error::IO(format!(
+            "Invalid format: manifest length does not match. Expected {}, got {}",
+            recorded_length,
+            buf.len()
+        )));
+    }
 
     let proto = pb::Manifest::decode(buf)?;
     Ok(Manifest::from(proto))
