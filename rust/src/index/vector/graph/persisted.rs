@@ -270,7 +270,7 @@ pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
             vertex_builder.append_value(serde.serialize(&node.vertex))?;
             neighbors_builder
                 .values()
-                .append_slice(node.neighbors.as_slice());
+                .append_slice(node.neighbors.values());
             neighbors_builder.append(true);
         }
         let batch = RecordBatch::try_new(
@@ -337,9 +337,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);
         for i in 0..100 {
-            for j in i..i + 10 {
-                builder.add_neighbor(i, j);
-            }
+            let neighbors = Arc::new(UInt32Array::from_iter_values(i..i+10));
+            builder.set_neighbors(i as usize, neighbors);
         }
         let serde = Arc::new(FooVertexSerDe {});
         write_graph(

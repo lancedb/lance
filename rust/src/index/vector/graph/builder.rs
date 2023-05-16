@@ -58,7 +58,7 @@ impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
                 .iter()
                 .map(|v| Node {
                     vertex: v.clone(),
-                    neighbors: Vec::new(),
+                    neighbors: Arc::new(UInt32Array::from(vec![] as Vec<u32>)),
                 })
                 .collect(),
             data,
@@ -84,13 +84,8 @@ impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
     }
 
     /// Set neighbors of a node.
-    pub fn set_neighbors(&mut self, id: usize, neighbors: impl Into<Vec<u32>>) {
-        self.nodes[id].neighbors = neighbors.into();
-    }
-
-    /// Add a neighbor to a specific vertex.
-    pub fn add_neighbor(&mut self, vertex: usize, neighbor: usize) {
-        self.nodes[vertex].neighbors.push(neighbor as u32);
+    pub fn set_neighbors(&mut self, id: usize, neighbors: Arc<UInt32Array>) {
+        self.nodes[id].neighbors = neighbors;
     }
 }
 
@@ -127,7 +122,7 @@ impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
     }
 
     async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>> {
-        Ok(self.nodes[id].neighbors)
+        Ok(self.nodes[id].neighbors.clone())
     }
 }
 
@@ -145,8 +140,8 @@ mod tests {
 
     impl Vertex for FooVertex {}
 
-    #[test]
-    fn test_construct_builder() {
+    #[tokio::test]
+    async fn test_construct_builder() {
         let nodes = (0..100)
             .map(|v| FooVertex {
                 id: v as u32,
@@ -158,7 +153,7 @@ mod tests {
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);
         assert_relative_eq!(builder.vertex(77).val, 38.5);
-        assert!(builder.neighbors(55).unwrap().is_empty());
+        assert!(builder.neighbors(55).await.unwrap().is_empty());
 
         builder.vertex_mut(88).val = 22.0;
         assert_relative_eq!(builder.vertex(88).val, 22.0);

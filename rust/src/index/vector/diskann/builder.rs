@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
+use arrow_array::UInt32Array;
 use arrow_array::{cast::as_primitive_array, types::UInt64Type};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -165,15 +167,8 @@ async fn init_graph(
 
         // Make bidirectional connections.
         {
-            let n = graph.neighbors_mut(i);
-            n.clear();
-            n.extend(neighbor_ids.iter().copied());
-            // Release mutable borrow on graph.
-        }
-        {
-            for neighbor_id in neighbor_ids.iter() {
-                graph.add_neighbor(*neighbor_id as usize, i);
-            }
+            let new_neighbors = Arc::new(UInt32Array::from_iter(neighbor_ids.iter().copied()));
+            graph.set_neighbors(i, new_neighbors);
         }
     }
 
@@ -286,12 +281,8 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
 
         let state = greedy_search(graph, medoid, vector, 1, l).await?;
 
-        graph
-            .neighbors_mut(id)
-            .extend(state.visited.iter().map(|id| *id as u32));
-
         let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
-        graph.set_neighbors(id, neighbors.to_vec());
+        graph.set_neighbors(id, Arc::new(neighbors.iter().copied().collect::<UInt32Array>()));
 
         let fixed_graph: &GraphBuilder<V> = graph;
         let neighbours = stream::iter(neighbors)
@@ -319,7 +310,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
             .try_collect::<Vec<_>>()
             .await?;
         for (j, nbs) in neighbours {
-            graph.set_neighbors(j, nbs);
+            graph.set_neighbors(j, Arc::new(nbs.iter().copied().collect::<UInt32Array>()));
         }
     }
 
