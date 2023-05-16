@@ -31,6 +31,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::{concat, concat_batches};
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::{Bytes, BytesMut};
 use futures::stream::{self, TryStreamExt};
 use futures::StreamExt;
 use object_store::path::Path;
@@ -55,8 +56,9 @@ use super::object_store::ObjectStore;
 pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
     let file_size = object_store.inner.head(path).await?.size;
     const PREFETCH_SIZE: usize = 64 * 1024;
+    let initial_start = std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize;
     let range = Range {
-        start: std::cmp::max(file_size as i64 - PREFETCH_SIZE as i64, 0) as usize,
+        start: initial_start,
         end: file_size,
     };
     let buf = object_store.inner.get_range(path, range).await?;
@@ -71,16 +73,51 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
         ));
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
+    let manifest_len = file_size - manifest_pos;
     assert!(
-        file_size - manifest_pos <= buf.len(),
+        manifest_len <= buf.len(),
         "Assert file_size - manifest_pos <= buf.len(), but got file_size = {}, manifest_pos = {}, buf.len() = {}",
         file_size,
         manifest_pos,
         buf.len()
     );
-    let proto =
-        pb::Manifest::decode(&buf[buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16])?;
+    dbg!(buf.len());
+    // let buf = buf.slice(buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16);
+    let buf = &buf[buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16];
+    dbg!(buf.len());
+    dbg!(&buf);
+    let proto = pb::Manifest::decode(buf)?;
     Ok(Manifest::from(proto))
+
+    //     // If needed, make another range request to fetch the first part of the manifest,
+    // // Then concat the buffers and decode
+    // let buf: Bytes = if file_size - manifest_pos < buf.len() {
+    //     // Need to trim the magic number at end, and the non-manifest data at the beginning
+    //     buf.slice(buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16)
+    // } else {
+    //     let mut buf2: BytesMut = object_store
+    //         .inner
+    //         .get_range(path, Range {
+    //             start: manifest_pos,
+    //             end: file_size - PREFETCH_SIZE,
+    //         })
+    //         .await?
+    //         .into_iter()
+    //         .collect();
+    //     buf2.extend_from_slice(&buf);
+    //     let buf = buf2.freeze();
+    //     // Need to trim the magic number at the end
+    //     buf.slice(0..buf.len() - 16)
+    // };
+    // // assert!(
+    // //     file_size - manifest_pos <= buf.len(),
+    // //     "Assert file_size - manifest_pos <= buf.len(), but got file_size = {}, manifest_pos = {}, buf.len() = {}",
+    // //     file_size,
+    // //     manifest_pos,
+    // //     buf.len()
+    // // );
+    // let proto =
+    //     pb::Manifest::decode(buf)?;
 }
 
 /// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
@@ -588,6 +625,7 @@ mod tests {
         RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+    use rand::{distributions::Alphanumeric, Rng};
     use tempfile::tempdir;
 
     use crate::io::FileWriter;
