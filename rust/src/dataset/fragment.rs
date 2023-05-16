@@ -14,10 +14,14 @@
 
 //! Wraps a Fragment of the dataset.
 
+use std::cmp::min;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use datafusion::error::DataFusionError;
+use futures::{stream, Stream, StreamExt};
 use uuid::Uuid;
 
 use crate::arrow::*;
@@ -290,6 +294,26 @@ impl FragmentReader {
         }
 
         merge_batches(&batches)
+    }
+
+    pub(crate) fn scan_batches(
+        &self,
+        read_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = std::result::Result<RecordBatch, DataFusionError>> + Send + '_>>
+    {
+        let batch_stream = stream::iter(0..self.num_batches());
+        let batch_stream = batch_stream.then(move |batch_id| {
+            let rows_in_batch = self.num_rows_in_batch(batch_id);
+            async move {
+                stream::iter((0..rows_in_batch).step_by(read_size)).then(move |start| async move {
+                    self.read_batch(batch_id, start..min(start + read_size, rows_in_batch))
+                        .await
+                        .map_err(|e| DataFusionError::from(e))
+                })
+            }
+        });
+        let batch_stream = batch_stream.flatten();
+        Box::pin(batch_stream)
     }
 
     /// Take rows from this fragment.
