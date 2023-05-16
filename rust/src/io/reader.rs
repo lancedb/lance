@@ -53,6 +53,8 @@ use crate::{
 use super::object_store::ObjectStore;
 
 /// Read Manifest on URI.
+///
+/// This only reads manifest files. It does not read data files.
 pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Manifest> {
     let file_size = object_store.inner.head(path).await?.size;
     const PREFETCH_SIZE: usize = 64 * 1024;
@@ -74,50 +76,34 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
     let manifest_len = file_size - manifest_pos;
-    assert!(
-        manifest_len <= buf.len(),
-        "Assert file_size - manifest_pos <= buf.len(), but got file_size = {}, manifest_pos = {}, buf.len() = {}",
-        file_size,
-        manifest_pos,
-        buf.len()
-    );
-    dbg!(buf.len());
-    // let buf = buf.slice(buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16);
-    let buf = &buf[buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16];
-    dbg!(buf.len());
-    dbg!(&buf);
+
+    let buf: Bytes = if manifest_len <= buf.len() {
+        // The prefetch catpured the entire manifest. We just need to trim the buffer.
+        buf.slice(buf.len() - manifest_len..buf.len())
+    } else {
+        // The prefetch only captured part of the manifest. We need to make an
+        // additional range request to read the remainder.
+        let mut buf2: BytesMut = object_store
+            .inner
+            .get_range(
+                path,
+                Range {
+                    start: manifest_pos,
+                    end: file_size - PREFETCH_SIZE,
+                },
+            )
+            .await?
+            .into_iter()
+            .collect();
+        buf2.extend_from_slice(&buf);
+        buf2.freeze()
+    };
+
+    // Need to trim the magic number at end, and the non-manifest data at the beginning
+    let buf = buf.slice(4..buf.len() - 16);
+
     let proto = pb::Manifest::decode(buf)?;
     Ok(Manifest::from(proto))
-
-    //     // If needed, make another range request to fetch the first part of the manifest,
-    // // Then concat the buffers and decode
-    // let buf: Bytes = if file_size - manifest_pos < buf.len() {
-    //     // Need to trim the magic number at end, and the non-manifest data at the beginning
-    //     buf.slice(buf.len() - (file_size - manifest_pos) + 4..buf.len() - 16)
-    // } else {
-    //     let mut buf2: BytesMut = object_store
-    //         .inner
-    //         .get_range(path, Range {
-    //             start: manifest_pos,
-    //             end: file_size - PREFETCH_SIZE,
-    //         })
-    //         .await?
-    //         .into_iter()
-    //         .collect();
-    //     buf2.extend_from_slice(&buf);
-    //     let buf = buf2.freeze();
-    //     // Need to trim the magic number at the end
-    //     buf.slice(0..buf.len() - 16)
-    // };
-    // // assert!(
-    // //     file_size - manifest_pos <= buf.len(),
-    // //     "Assert file_size - manifest_pos <= buf.len(), but got file_size = {}, manifest_pos = {}, buf.len() = {}",
-    // //     file_size,
-    // //     manifest_pos,
-    // //     buf.len()
-    // // );
-    // let proto =
-    //     pb::Manifest::decode(buf)?;
 }
 
 /// Compute row id from `fragment_id` and the `offset` of the row in the fragment.
@@ -627,8 +613,9 @@ mod tests {
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt;
 
-    use crate::io::FileWriter;
+    use crate::io::{write_manifest, FileWriter};
 
     #[tokio::test]
     async fn read_with_row_id() {
@@ -1221,29 +1208,46 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_read_large_manifest() {
-        // Create a very long name, so the manifest is larger than the default buffer size
-        // let long_name: String = rand::thread_rng()
-        //     .sample_iter(&Alphanumeric)
-        //     .take(7)
-        //     .map(char::from)
-        //     .collect();
-
-        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("test", DataType::Int64, false)]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..100))];
-        let batch = RecordBatch::try_new(Arc::new(arrow_schema), columns).unwrap();
-
+    async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();
         let path = Path::from("/read_large_manifest");
-        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+
+        let mut writer = store.create(&path).await.unwrap();
+
+        // Write prefix we should ignore
+        let prefix: Vec<u8> = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(prefix_size)
+            .collect();
+        writer.write_all(&prefix).await.unwrap();
+
+        let long_name: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(manifest_min_size)
+            .map(char::from)
+            .collect();
+
+        let arrow_schema =
+            ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(&schema, Arc::new(vec![]));
+        let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();
-        file_writer.write(&[batch]).await.unwrap();
-        file_writer.finish().await.unwrap();
+        writer.write_magics(pos).await.unwrap();
+        writer.shutdown().await.unwrap();
 
-        let manifest = read_manifest(&store, &path).await.unwrap();
-        assert_eq!(schema, manifest.schema);
+        let roundtripped_manifest = read_manifest(&store, &path).await.unwrap();
+
+        assert_eq!(manifest, roundtripped_manifest);
+
+        store.inner.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_large_manifest() {
+        test_roundtrip_manifest(0, 100_000).await;
+        test_roundtrip_manifest(1000, 100_000).await;
+        test_roundtrip_manifest(1000, 1000).await;
     }
 }

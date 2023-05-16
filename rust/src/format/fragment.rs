@@ -66,7 +66,7 @@ impl From<&pb::DataFile> for DataFile {
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
 /// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Fragment {
     /// Fragment ID
     pub id: u64,
