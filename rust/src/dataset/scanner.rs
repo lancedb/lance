@@ -630,7 +630,9 @@ mod test {
         ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, RecordBatchReader,
         StringArray, StructArray,
     };
+    use arrow_ord::sort::sort_to_indices;
     use arrow_schema::DataType;
+    use arrow_select::take;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -1052,6 +1054,55 @@ mod test {
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
         assert_eq!(scan.schema().field_names(), &["i", "_rowid"]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_unordered_with_row_id() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, false).await;
+
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+
+        let ordered_batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert!(ordered_batches.len() > 2);
+        let ordered_batch =
+            concat_batches(&ordered_batches[0].schema(), ordered_batches.iter()).unwrap();
+
+        // Attempt to get out-of-order scan, but that might take multiple attempts.
+        scan.ordered_scan(false);
+        for _ in 0..10 {
+            let unordered_batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap();
+            let unordered_batch =
+                concat_batches(&unordered_batches[0].schema(), unordered_batches.iter()).unwrap();
+
+            assert_eq!(ordered_batch.num_rows(), unordered_batch.num_rows());
+
+            // If they aren't equal, they should be equal if we sort by row id
+            if ordered_batch != unordered_batch {
+                let sort_indices = sort_to_indices(&unordered_batch["_rowid"], None, None).unwrap();
+
+                let ordered_i = ordered_batch["i"].clone();
+                let sorted_i = take::take(&unordered_batch["i"], &sort_indices, None).unwrap();
+
+                assert_eq!(&ordered_i, &sorted_i);
+
+                break;
+            }
+        }
     }
 
     /// Test scan with filter.
