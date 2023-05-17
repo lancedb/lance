@@ -89,9 +89,7 @@ impl SearchState {
     /// Return the next unvisited vertex.
     fn pop(&mut self) -> Option<usize> {
         while let Some(vertex) = self.heap.pop() {
-            // println!("Pop {} visited {:?}", vertex.0.id, self.visited);
-
-            if self.is_visited(vertex.0.id) || !self.candidates.contains_key(&vertex.0.distance) {
+            if !self.candidates.contains_key(&vertex.0.distance) {
                 // The vertex has been removed from the candidate lists,
                 // from [`push()`].
                 continue;
@@ -103,8 +101,10 @@ impl SearchState {
         None
     }
 
-    /// Push a new (unvisited) fvertex into the search state.
+    /// Push a new (unvisited) vertex into the search state.
     fn push(&mut self, vertex_id: usize, distance: f32) {
+        assert!(!self.visited.contains(&vertex_id));
+        self.visit(vertex_id);
         self.heap
             .push(Reverse(VertexWithDistance::new(vertex_id, distance)));
         self.candidates.insert(OrderedFloat(distance), vertex_id);
@@ -147,8 +147,9 @@ pub(crate) async fn greedy_search(
     let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
     while let Some(id) = state.pop() {
-        state.visit(id);
-        for neighbor_id in graph.neighbors(id).await?.values() {
+        let neighbors = graph.neighbors(id).await?;
+        // println!("State size: {} neighbors: {}", state.heap.len(), neighbors.len());
+        for neighbor_id in neighbors.values() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
                 // Already visited.

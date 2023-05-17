@@ -80,6 +80,7 @@ impl L2 for Float32Array {
 }
 
 /// Compute L2 distance between two vectors.
+#[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     from.l2(to)
 }
