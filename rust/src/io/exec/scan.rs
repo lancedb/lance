@@ -13,18 +13,19 @@
 // limitations under the License.
 
 use std::any::Any;
+use std::cmp::min;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
-use datafusion::error::Result;
+use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
-use futures::stream;
 use futures::stream::Stream;
+use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
@@ -42,6 +43,34 @@ async fn open_file(
         reader.with_row_id();
     };
     Ok(reader)
+}
+
+/// Convert a [`FragmentReader`] into a [`Stream`] of [`RecordBatch`].
+fn scan_batches(
+    reader: FragmentReader,
+    read_size: usize,
+) -> Pin<Box<dyn Stream<Item = impl Future<Output = Result<RecordBatch>>> + Send + 'static>> {
+    // To make sure the reader lives long enough, we put it in an Arc.
+    let reader = Arc::new(reader);
+    let reader2 = reader.clone();
+
+    let read_params_iter = (0..reader.num_batches()).flat_map(move |batch_id| {
+        let rows_in_batch = reader.num_rows_in_batch(batch_id);
+        (0..rows_in_batch)
+            .step_by(read_size)
+            .map(move |start| (batch_id, start..min(start + read_size, rows_in_batch)))
+    });
+    let batch_stream = stream::iter(read_params_iter).map(move |(batch_id, range)| {
+        let reader = reader2.clone();
+        async move {
+            reader
+                .read_batch(batch_id, range)
+                .await
+                .map_err(|e| DataFusionError::from(e))
+        }
+    });
+
+    Box::pin(batch_stream)
 }
 
 /// Dataset Scan Node.
@@ -84,18 +113,25 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
+        let file_readahead = min(4, batch_readahead);
+
         let inner_stream = if ordered {
             stream::iter(file_fragments)
-                .then(move |file_fragment| open_file(file_fragment, project_schema, with_row_id))
-                .map_ok(|reader| reader.scan_batches(read_size))
+                .then(move |file_fragment| {
+                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                })
+                .map_ok(move |reader| scan_batches(reader, read_size).buffered(batch_readahead))
                 .try_flatten()
                 .boxed()
         } else {
             stream::iter(file_fragments)
-                .map(move |file_fragment| open_file(file_fragment, project_schema, with_row_id))
-                .buffer_unordered(batch_readahead) // Multiple fragments concurrently
-                .map_ok(|reader| reader.scan_batches(read_size))
-                .try_flatten_unordered(batch_readahead)
+                .then(move |file_fragment| {
+                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                })
+                .map_ok(move |reader| {
+                    scan_batches(reader, read_size).buffer_unordered(batch_readahead)
+                })
+                .try_flatten_unordered(file_readahead) // Multiple fragments concurrently
                 .boxed()
         };
 
