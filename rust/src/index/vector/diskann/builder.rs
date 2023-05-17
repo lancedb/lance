@@ -228,6 +228,7 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
                 break;
             }
             let mut to_remove: HashSet<usize> = HashSet::new();
+            // println!("robust_prune: id={id} visited: {}", visited.len());
             for pv in visited.iter() {
                 let dist_prime = distance(&matrix, p.id, *pv)?;
                 let dist_query = distance(&matrix, id, *pv)?;
