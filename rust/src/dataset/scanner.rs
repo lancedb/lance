@@ -627,8 +627,8 @@ mod test {
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, RecordBatchReader,
-        StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
+        RecordBatchIterator, RecordBatchReader, StringArray, StructArray,
     };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::DataType;
@@ -638,6 +638,7 @@ mod test {
 
     use super::*;
     use crate::arrow::*;
+    use crate::dataset::WriteMode;
     use crate::index::{
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
@@ -1103,6 +1104,73 @@ mod test {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_scan_order() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![6, 7, 8]))],
+        )
+        .unwrap();
+
+        let mut params = WriteParams::default();
+        params.mode = WriteMode::Append;
+
+        let write_batch = |batch: RecordBatch| async {
+            let mut reader: Box<dyn RecordBatchReader> =
+                Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+            Dataset::write(&mut reader, test_uri, Some(params.clone())).await
+        };
+
+        write_batch(batch1.clone()).await.unwrap();
+        write_batch(batch2.clone()).await.unwrap();
+
+        let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
+        let fragment1 = dataset.get_fragment(0).unwrap().metadata().clone();
+        let fragment2 = dataset.get_fragment(1).unwrap().metadata().clone();
+
+        // 1 then 2
+        let scanner =
+            Scanner::from_fragments(dataset.clone(), vec![fragment1.clone(), fragment2.clone()]);
+        let output = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0], batch1);
+        assert_eq!(output[1], batch2);
+
+        // 2 then 1
+        let scanner = Scanner::from_fragments(dataset, vec![fragment2, fragment1]);
+        let output = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0], batch2);
+        assert_eq!(output[1], batch1);
     }
 
     /// Test scan with filter.
