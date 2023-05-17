@@ -84,6 +84,9 @@ pub struct Scanner {
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
+    /// Whether to scan in deterministic order (default: true)
+    ordered: bool,
+
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
 }
@@ -101,6 +104,7 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: None,
         }
     }
@@ -117,6 +121,7 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: Some(vec![fragment]),
         }
     }
@@ -133,6 +138,7 @@ impl Scanner {
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: Some(fragments),
         }
     }
@@ -189,6 +195,16 @@ impl Scanner {
     /// Set the prefetch size.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
+        self
+    }
+
+    /// Set whether to read data in order (default: true)
+    ///
+    /// If true, will scan the fragments and batches within fragments in order.
+    /// If false, scan will read fragments concurrently and may yield batches
+    /// out of order, potentially improving throughput.
+    pub fn ordered_scan(&mut self, ordered: bool) -> &mut Self {
+        self.ordered = ordered;
         self
     }
 
@@ -380,10 +396,10 @@ impl Scanner {
         } else if let Some(expr) = filter_expr.as_ref() {
             let columns_in_filter = column_names_in_expr(expr.as_ref());
             let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-            self.scan(true, filter_schema, false)
+            self.scan(true, filter_schema)
         } else {
             // Scan without filter or limits
-            self.scan(self.with_row_id, self.projections.clone().into(), false)
+            self.scan(self.with_row_id, self.projections.clone().into())
         };
 
         // Stage 2: filter
@@ -453,7 +469,7 @@ impl Scanner {
             // No index found. use flat search.
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
-            let scan_node = self.scan(true, vector_scan_projection, true);
+            let scan_node = self.scan(true, vector_scan_projection);
             Ok(self.flat_knn(scan_node, q)?)
         }
     }
@@ -487,7 +503,7 @@ impl Scanner {
                     true,
                     vector_scan_projection,
                     Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
-                    true,
+                    self.ordered,
                 );
                 // first we do flat search on just the new data
                 let topk_appended = self.flat_knn(scan_node, q)?;
@@ -501,18 +517,13 @@ impl Scanner {
     }
 
     /// Create an Execution plan with a scan node
-    fn scan(
-        &self,
-        with_row_id: bool,
-        projection: Arc<Schema>,
-        ordered: bool,
-    ) -> Arc<dyn ExecutionPlan> {
+    fn scan(&self, with_row_id: bool, projection: Arc<Schema>) -> Arc<dyn ExecutionPlan> {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
             Arc::new(fragment.clone())
         } else {
             self.dataset.fragments().clone()
         };
-        self.scan_fragments(with_row_id, projection, fragments, ordered)
+        self.scan_fragments(with_row_id, projection, fragments, self.ordered)
     }
 
     fn scan_fragments(
