@@ -32,7 +32,7 @@ use crate::format::{pb, ProtoStruct};
 ///  * Version
 ///  * Fragments.
 ///  * Indices.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
