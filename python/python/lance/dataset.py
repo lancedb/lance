@@ -235,6 +235,7 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
+        ordered_scan: bool = True,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -512,11 +513,20 @@ class ScannerBuilder:
         self._columns = None
         self._nearest = None
         self._batch_readahead = None
+        self._ordered_scan = True
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         if nbatches is not None and int(nbatches) < 0:
             raise ValueError("batch_readahead must be non-negative")
         self._batch_readahead = nbatches
+        return self
+    
+    def ordered_scan(self, ordered_scan: bool = True) -> ScannerBuilder:
+        """
+        Whether to scan the dataset in order. If set to False, the scanner may
+        read fragments concurrently and yield batches out of order.
+        """
+        self._ordered_scan = ordered_scan
         return self
 
     def limit(self, n: int = 0) -> ScannerBuilder:
@@ -589,6 +599,7 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_readahead,
+            self._ordered_scan
         )
         return LanceScanner(scanner, self.ds)
 

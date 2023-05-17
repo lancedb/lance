@@ -202,6 +202,10 @@ def test_to_batches(tmp_path: Path):
     batches = dataset.to_batches(batch_readahead=20)
     assert pa.Table.from_batches(batches) == table
 
+    unordered_batches = dataset.to_batches(batch_readahead=20, ordered_scan=False)
+    sorted_batches = pa.Table.from_batches(unordered_batches).sort_by("a")
+    assert sorted_batches == table
+
 
 def test_pickle(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
