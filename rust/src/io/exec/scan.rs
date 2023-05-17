@@ -74,7 +74,6 @@ fn scan_batches(
 }
 
 /// Dataset Scan Node.
-// #[derive(Debug)]
 pub struct LanceStream {
     inner_stream: stream::BoxStream<'static, Result<RecordBatch>>,
 
@@ -140,6 +139,15 @@ impl LanceStream {
             projection,
             with_row_id,
         })
+    }
+}
+
+impl core::fmt::Debug for LanceStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanceStream")
+            .field("projection", &self.projection)
+            .field("with_row_id", &self.with_row_id)
+            .finish()
     }
 }
 
