@@ -202,7 +202,7 @@ def test_to_batches(tmp_path: Path):
     batches = dataset.to_batches(batch_readahead=20)
     assert pa.Table.from_batches(batches) == table
 
-    unordered_batches = dataset.to_batches(batch_readahead=20, ordered_scan=False)
+    unordered_batches = dataset.to_batches(batch_readahead=20, scan_in_order=False)
     sorted_batches = pa.Table.from_batches(unordered_batches).sort_by("a")
     assert sorted_batches == table
 

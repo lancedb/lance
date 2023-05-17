@@ -93,8 +93,10 @@ impl LanceStream {
     ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
     ///  - ***batch_readahead***: the number of batches to read ahead.
+    ///  - ***fragment_readahead***: the number of fragments to read ahead (only
+    ///    if scan_in_order = false).
     ///  - ***with_row_id***: load row ID from the datasets.
-    ///  - ***ordered***: whether to scan the fragments in the provided order.
+    ///  - ***scan_in_order***: whether to scan the fragments in the provided order.
     ///read_size: usize,futures::iter::
     pub fn try_new(
         dataset: Arc<Dataset>,
@@ -102,8 +104,9 @@ impl LanceStream {
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
+        fragment_readahead: usize,
         with_row_id: bool,
-        ordered: bool,
+        scan_in_order: bool,
     ) -> Result<Self> {
         let project_schema = projection.clone();
 
@@ -112,9 +115,7 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let file_readahead = min(4, batch_readahead);
-
-        let inner_stream = if ordered {
+        let inner_stream = if scan_in_order {
             stream::iter(file_fragments)
                 .then(move |file_fragment| {
                     open_file(file_fragment, project_schema.clone(), with_row_id)
@@ -130,7 +131,7 @@ impl LanceStream {
                 .map_ok(move |reader| {
                     scan_batches(reader, read_size).buffer_unordered(batch_readahead)
                 })
-                .try_flatten_unordered(file_readahead) // Multiple fragments concurrently
+                .try_flatten_unordered(fragment_readahead) // Multiple fragments concurrently
                 .boxed()
         };
 
@@ -179,6 +180,7 @@ pub struct LanceScanExec {
     projection: Arc<Schema>,
     read_size: usize,
     batch_readahead: usize,
+    fragment_readahead: usize,
     with_row_id: bool,
     ordered_output: bool,
 }
@@ -209,6 +211,7 @@ impl LanceScanExec {
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
+        fragment_readahead: usize,
         with_row_id: bool,
         ordered_ouput: bool,
     ) -> Self {
@@ -218,6 +221,7 @@ impl LanceScanExec {
             projection,
             read_size,
             batch_readahead,
+            fragment_readahead,
             with_row_id,
             ordered_output: ordered_ouput,
         }
@@ -271,6 +275,7 @@ impl ExecutionPlan for LanceScanExec {
             self.projection.clone(),
             self.read_size,
             self.batch_readahead,
+            self.fragment_readahead,
             self.with_row_id,
             self.ordered_output,
         )?))

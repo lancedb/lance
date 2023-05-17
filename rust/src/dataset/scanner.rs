@@ -49,6 +49,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 8192;
 // Same as pyarrow Dataset::scanner()
 const DEFAULT_BATCH_READAHEAD: usize = 16;
 
+// Same as pyarrow Dataset::scanner()
+const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -76,6 +79,9 @@ pub struct Scanner {
     /// Number of batches to prefetch
     batch_readahead: usize,
 
+    /// Number of fragments to read concurrently
+    fragment_readahead: usize,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -100,6 +106,7 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
@@ -117,6 +124,7 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
@@ -134,6 +142,7 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
@@ -198,12 +207,20 @@ impl Scanner {
         self
     }
 
+    /// Set the fragment readahead.
+    ///
+    /// This is only used if ``scan_in_order`` is set to false.
+    pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
+        self.fragment_readahead = nfragments;
+        self
+    }
+
     /// Set whether to read data in order (default: true)
     ///
     /// If true, will scan the fragments and batches within fragments in order.
     /// If false, scan will read fragments concurrently and may yield batches
     /// out of order, potentially improving throughput.
-    pub fn ordered_scan(&mut self, ordered: bool) -> &mut Self {
+    pub fn scan_in_order(&mut self, ordered: bool) -> &mut Self {
         self.ordered = ordered;
         self
     }
@@ -539,6 +556,7 @@ impl Scanner {
             projection,
             self.batch_size,
             self.batch_readahead,
+            self.fragment_readahead,
             with_row_id,
             ordered,
         ))
@@ -1078,7 +1096,7 @@ mod test {
             concat_batches(&ordered_batches[0].schema(), ordered_batches.iter()).unwrap();
 
         // Attempt to get out-of-order scan, but that might take multiple attempts.
-        scan.ordered_scan(false);
+        scan.scan_in_order(false);
         for _ in 0..10 {
             let unordered_batches = scan
                 .try_into_stream()

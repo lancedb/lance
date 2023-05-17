@@ -295,6 +295,7 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
             true,
             true,
         ));
@@ -326,6 +327,7 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
             true,
             true,
         ));
@@ -357,6 +359,7 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
             false,
             true,
         ));
