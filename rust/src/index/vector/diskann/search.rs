@@ -156,8 +156,9 @@ pub(crate) async fn greedy_search(
     let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
     while let Some(id) = state.pop() {
-        let neighbors = graph.neighbors(id).await?;
         state.visit(id);
+
+        let neighbors = graph.neighbors(id).await?;
         // println!("State size: {} neighbors: {}", state.heap.len(), neighbors.len());
         for neighbor_id in neighbors.values() {
             let neighbor_id = *neighbor_id as usize;
