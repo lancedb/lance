@@ -49,7 +49,7 @@ async fn open_file(
 fn scan_batches(
     reader: FragmentReader,
     read_size: usize,
-) -> Pin<Box<dyn Stream<Item = impl Future<Output = Result<RecordBatch>>> + Send + 'static>> {
+) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>>>> {
     // To make sure the reader lives long enough, we put it in an Arc.
     let reader = Arc::new(reader);
     let reader2 = reader.clone();
@@ -62,12 +62,14 @@ fn scan_batches(
     });
     let batch_stream = stream::iter(read_params_iter).map(move |(batch_id, range)| {
         let reader = reader2.clone();
-        async move {
+        // The Ok here is only here because try_flatten_unordered wants both the
+        // outer *and* inner stream to be TryStream.
+        Ok(async move {
             reader
                 .read_batch(batch_id, range)
                 .await
                 .map_err(|e| DataFusionError::from(e))
-        }
+        })
     });
 
     Box::pin(batch_stream)
@@ -120,18 +122,22 @@ impl LanceStream {
                 .then(move |file_fragment| {
                     open_file(file_fragment, project_schema.clone(), with_row_id)
                 })
-                .map_ok(move |reader| scan_batches(reader, read_size).buffered(batch_readahead))
+                .map_ok(move |reader| scan_batches(reader, read_size))
                 .try_flatten()
+                // We buffer up to `batch_readahead` batches across all streams.
+                .try_buffered(batch_readahead)
                 .boxed()
         } else {
             stream::iter(file_fragments)
                 .then(move |file_fragment| {
                     open_file(file_fragment, project_schema.clone(), with_row_id)
                 })
-                .map_ok(move |reader| {
-                    scan_batches(reader, read_size).buffer_unordered(batch_readahead)
-                })
-                .try_flatten_unordered(fragment_readahead) // Multiple fragments concurrently
+                .map_ok(move |reader| scan_batches(reader, read_size))
+                // When we flatten the streams (one stream per fragment), we allow
+                // `fragment_readahead` stream to be read concurrently.
+                .try_flatten_unordered(fragment_readahead)
+                // We buffer up to `batch_readahead` batches across all streams.
+                .try_buffer_unordered(batch_readahead)
                 .boxed()
         };
 
