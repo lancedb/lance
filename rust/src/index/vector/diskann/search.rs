@@ -65,6 +65,14 @@ pub(crate) struct SearchState {
     /// Heap maintains the unvisited vertices, ordered by the distance.
     heap: BinaryHeap<Reverse<VertexWithDistance>>,
 
+    /// Track the ones that have been computed distance with and pushed to heap already.
+    ///
+    /// This is different to visited, mostly because visited has a different meaning in the
+    /// paper, which is the one that has been popped from the heap.
+    /// But we wanted to avoid repeatly computing `argmin` over the heap, so we need another
+    /// meaning for visited.
+    heap_visisted: HashSet<usize>,
+
     /// Search size, `L` parameter in the paper. L must be greater or equal than k.
     l: usize,
 
@@ -81,6 +89,7 @@ impl SearchState {
             visited: HashSet::new(),
             candidates: BTreeMap::new(),
             heap: BinaryHeap::new(),
+            heap_visisted: HashSet::new(),
             k,
             l,
         }
@@ -104,7 +113,7 @@ impl SearchState {
     /// Push a new (unvisited) vertex into the search state.
     fn push(&mut self, vertex_id: usize, distance: f32) {
         assert!(!self.visited.contains(&vertex_id));
-        self.visit(vertex_id);
+        self.heap_visisted.insert(vertex_id);
         self.heap
             .push(Reverse(VertexWithDistance::new(vertex_id, distance)));
         self.candidates.insert(OrderedFloat(distance), vertex_id);
@@ -120,7 +129,7 @@ impl SearchState {
 
     /// Returns true if the vertex has been visited.
     fn is_visited(&self, vertex_id: usize) -> bool {
-        self.visited.contains(&vertex_id)
+        self.visited.contains(&vertex_id) || self.heap_visisted.contains(&vertex_id)
     }
 }
 
@@ -148,6 +157,7 @@ pub(crate) async fn greedy_search(
     state.push(start, dist);
     while let Some(id) = state.pop() {
         let neighbors = graph.neighbors(id).await?;
+        state.visit(id);
         // println!("State size: {} neighbors: {}", state.heap.len(), neighbors.len());
         for neighbor_id in neighbors.values() {
             let neighbor_id = *neighbor_id as usize;
