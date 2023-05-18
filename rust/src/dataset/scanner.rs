@@ -134,25 +134,6 @@ impl Scanner {
         }
     }
 
-    #[deprecated(since = "0.4.13", note = "Please use `with_fragments` instead")]
-    pub fn from_fragments(dataset: Arc<Dataset>, fragments: Vec<Fragment>) -> Self {
-        let projection = dataset.schema().clone();
-        Self {
-            dataset,
-            projections: projection,
-            filter: None,
-            batch_size: DEFAULT_BATCH_SIZE,
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
-            limit: None,
-            offset: None,
-            nearest: None,
-            with_row_id: false,
-            ordered: true,
-            fragments: Some(fragments),
-        }
-    }
-
     /// Set which fragments should be scanned.
     ///
     /// If scan_in_order is set to true, the fragments will be scanned in the order of the vector.

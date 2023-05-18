@@ -24,11 +24,9 @@ use pyo3::{pyclass, PyObject, PyResult};
 use tokio::runtime::Runtime;
 
 use ::lance::dataset::scanner::Scanner as LanceScanner;
-use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use pyo3::exceptions::PyValueError;
 
 use crate::errors::ioerror;
-use crate::fragment::FileFragment;
 use crate::reader::LanceReader;
 
 /// This will be wrapped by a python class to provide
@@ -78,25 +76,5 @@ impl Scanner {
                 }
             }
         })
-    }
-
-    #[staticmethod]
-    fn from_fragments(fragments: Vec<FileFragment>) -> PyResult<Self> {
-        let fragments = fragments
-            .into_iter()
-            .map(LanceFileFragment::from)
-            .collect::<Vec<_>>();
-
-        if fragments.is_empty() {
-            return Err(PyValueError::new_err("No fragments provided"));
-        }
-
-        let dataset = Arc::new(fragments[0].dataset().clone());
-        let fragments = fragments.into_iter().map(|f| f.into()).collect::<Vec<_>>();
-
-        #[allow(deprecated)]
-        let scanner = LanceScanner::from_fragments(dataset, fragments);
-
-        Ok(Self::new(Arc::new(scanner), Arc::new(Runtime::new()?)))
     }
 }

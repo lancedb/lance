@@ -697,34 +697,6 @@ class LanceScanner(pa.dataset.Scanner):
         raise NotImplementedError("from fragment")
 
     @staticmethod
-    def from_fragments(fragments: Iterable[LanceFragment], **kwargs):
-        """
-        Create a scanner from an iterable of fragments.
-
-        Parameters
-        ----------
-        fragments : Iterable[LanceFragment]
-
-        Returns
-        -------
-        LanceScanner
-        """
-        warnings.warn(
-            "Deprecated in version 0.4.13. Use the fragments argument in LanceDataset.scanner() instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        if not isinstance(fragments, list):
-            fragments = list(iter(fragments))
-
-        if len(fragments) == 0:
-            raise ValueError("Must pass at least one fragment")
-        
-        dataset = fragments[0]._ds
-        scanner = _Scanner.from_fragments([fragment._fragment for fragment in fragments])
-        return LanceScanner(scanner, dataset)
-
-    @staticmethod
     def from_batches(*args, **kwargs):
         """
         Not implemented
