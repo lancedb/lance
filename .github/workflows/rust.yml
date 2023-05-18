@@ -18,6 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
@@ -39,6 +41,8 @@ jobs:
       - name: CPU features
         run: sysctl -a | grep cpu
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - name: Install dependencies
         run: brew install protobuf
       - name: Run tests
@@ -56,6 +60,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - uses: ./.github/workflows/install_windows_dependencies
         with:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}

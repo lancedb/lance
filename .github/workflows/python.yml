@@ -14,10 +14,6 @@ on:
       - .github/workflows/build_mac_wheel/**
       - .github/workflows/run_tests/**
 
-env:
-  # Use incremental compilation to take advantage of caching
-  CARGO_INCREMENTAL: "1"
-
 jobs:
   linux:
     timeout-minutes: 45
@@ -39,6 +35,8 @@ jobs:
       with:
         python-version: 3.${{ matrix.python-minor-version }}
     - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
     - uses: ./.github/workflows/run_tests
   mac:
@@ -58,6 +56,8 @@ jobs:
       with:
         python-version: "3.10"
     - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
     - uses: ./.github/workflows/build_mac_wheel
     - uses: ./.github/workflows/run_tests
   windows:
@@ -73,6 +73,8 @@ jobs:
           fetch-depth: 0
           lfs: true
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
       - uses: ./.github/workflows/build_windows_wheel
         with:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
