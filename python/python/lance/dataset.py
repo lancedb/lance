@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -708,8 +709,11 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         LanceScanner
         """
-        # TODO: can we take kwargs here for the scanner builder?
-        # TODO: peek instead of list
+        warnings.warn(
+            "Deprecated in version 0.4.13. Use the fragments argument in LanceDataset.scanner() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         if not isinstance(fragments, list):
             fragments = list(iter(fragments))
 
@@ -717,7 +721,6 @@ class LanceScanner(pa.dataset.Scanner):
             raise ValueError("Must pass at least one fragment")
         
         dataset = fragments[0]._ds
-        # TODO: pass down an iterator
         scanner = _Scanner.from_fragments([fragment._fragment for fragment in fragments])
         return LanceScanner(scanner, dataset)
 

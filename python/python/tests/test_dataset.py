@@ -338,16 +338,19 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     # Deprecated API
     # --------------
     # Create a scanner from first two fragments
-    scanner = lance.LanceScanner.from_fragments(fragments[0:2])
+    with pytest.warns(DeprecationWarning):
+        scanner = lance.LanceScanner.from_fragments(fragments[0:2])
     assert scanner.to_table().num_rows == 2 * 100
 
     # Accepts an iterator
-    scanner = lance.LanceScanner.from_fragments(iter(fragments[0:2]))
+    with pytest.warns(DeprecationWarning):
+        scanner = lance.LanceScanner.from_fragments(iter(fragments[0:2]))
     assert scanner.to_table().num_rows == 2 * 100
 
     # Fails if no fragments passed
     with pytest.raises(ValueError, match="Must pass at least one fragment"):
-        lance.LanceScanner.from_fragments([])
+        with pytest.warns(DeprecationWarning):
+            lance.LanceScanner.from_fragments([])
 
     # New API
     scanner = dataset.scanner(fragments=fragments[0:2])
