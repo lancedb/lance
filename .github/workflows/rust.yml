@@ -8,6 +8,12 @@ on:
       - rust/**
       - protos/**
       - .github/workflows/rust.yml
+
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     runs-on: ubuntu-22.04
