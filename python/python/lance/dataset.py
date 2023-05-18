@@ -602,7 +602,7 @@ class ScannerBuilder:
                 if isinstance(f, LanceFragment):
                     inner_fragments.append(f._fragment)
                 else:
-                    raise TypeError("fragments must be an iterable of LanceFragment")
+                    raise TypeError(f"fragments must be an iterable of LanceFragment. Got {type(f)} instead.")
             fragments = inner_fragments
 
         self._fragments = fragments
