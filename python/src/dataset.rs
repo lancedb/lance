@@ -20,6 +20,7 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use lance::dataset::ReadParams;
 use lance::datatypes::Schema;
 use lance::format::Fragment;
@@ -168,8 +169,11 @@ impl Dataset {
 
         if let Some(fragments) = fragments {
             let fragments = fragments
-                .iter()
-                .map(|f| f.fragment().metadata().clone())
+                .into_iter()
+                .map(|f| {
+                    let file_fragment = LanceFileFragment::from(f);
+                    file_fragment.into()
+                })
                 .collect();
             scanner.with_fragments(fragments);
         }
