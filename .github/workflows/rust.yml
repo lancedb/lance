@@ -27,7 +27,7 @@ jobs:
       - name: Run tests
         run: |
           cargo build --all-features
-          cargo test
+          cargo test --all-features
   mac-build:
     runs-on: macos-12
     timeout-minutes: 30
@@ -44,7 +44,7 @@ jobs:
       - name: Run tests
         run: |
           cargo build --all-features
-          cargo test
+          cargo test --all-features
   windows-build:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -67,4 +67,4 @@ jobs:
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
           cargo build --all-features
-          cargo test
+          cargo test --all-features

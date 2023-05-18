@@ -13,6 +13,11 @@ on:
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
       - .github/workflows/run_tests/**
+
+env:
+  # Use incremental compilation to take advantage of caching
+  CARGO_INCREMENTAL: "1"
+
 jobs:
   linux:
     timeout-minutes: 45
