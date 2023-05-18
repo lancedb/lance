@@ -1154,8 +1154,8 @@ mod test {
         let fragment2 = dataset.get_fragment(1).unwrap().metadata().clone();
 
         // 1 then 2
-        let scanner =
-            Scanner::from_fragments(dataset.clone(), vec![fragment1.clone(), fragment2.clone()]);
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![fragment1.clone(), fragment2.clone()]);
         let output = scanner
             .try_into_stream()
             .await
@@ -1168,7 +1168,8 @@ mod test {
         assert_eq!(output[1], batch2);
 
         // 2 then 1
-        let scanner = Scanner::from_fragments(dataset, vec![fragment2, fragment1]);
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![fragment2, fragment1]);
         let output = scanner
             .try_into_stream()
             .await
