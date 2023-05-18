@@ -98,6 +98,7 @@ impl Scanner {
             .map(|f| f.metadata().clone())
             .collect::<Vec<_>>();
 
+        #[allow(deprecated)]
         let scanner = LanceScanner::from_fragments(dataset, fragments);
 
         Ok(Self::new(Arc::new(scanner), Arc::new(Runtime::new()?)))

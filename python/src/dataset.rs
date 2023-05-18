@@ -138,6 +138,7 @@ impl Dataset {
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
+        fragments: Option<Vec<FileFragment>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -164,6 +165,14 @@ impl Dataset {
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
+
+        if let Some(fragments) = fragments {
+            let fragments = fragments
+                .iter()
+                .map(|f| f.fragment().metadata().clone())
+                .collect();
+            scanner.with_fragments(fragments);
+        }
 
         if let Some(nearest) = nearest {
             let column = nearest

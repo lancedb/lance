@@ -115,7 +115,7 @@ impl Scanner {
             fragments: None,
         }
     }
-
+    
     pub fn from_fragment(dataset: Arc<Dataset>, fragment: Fragment) -> Self {
         let projection = dataset.schema().clone();
         Self {
@@ -134,6 +134,7 @@ impl Scanner {
         }
     }
 
+    #[deprecated(since = "0.4.13", note = "Please use `with_fragments` instead")]
     pub fn from_fragments(dataset: Arc<Dataset>, fragments: Vec<Fragment>) -> Self {
         let projection = dataset.schema().clone();
         Self {
@@ -150,6 +151,14 @@ impl Scanner {
             ordered: true,
             fragments: Some(fragments),
         }
+    }
+
+    /// Set which fragments should be scanned.
+    /// 
+    /// If scan_in_order is set to true, the fragments will be scanned in the order of the vector.
+    pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.fragments = Some(fragments);
+        self
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
