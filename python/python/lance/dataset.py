@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,7 @@ class LanceDataset(pa.dataset.Dataset):
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
         scan_in_order: bool = True,
+        fragments: Optional[Iterable[LanceFragment]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -116,6 +118,9 @@ class LanceDataset(pa.dataset.Dataset):
             Whether to read the fragments and batches in order. If false,
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
+        fragments: iterable of LanceFragment, default None
+            If specified, only scan these fragments. If scan_in_order is True, then
+            the fragments will be scanned in the order given.
 
         Notes
         -----
@@ -147,6 +152,8 @@ class LanceDataset(pa.dataset.Dataset):
             .nearest(**(nearest or {}))
             .batch_readahead(batch_readahead)
             .fragment_readahead(fragment_readahead)
+            .scan_in_order(scan_in_order)
+            .with_fragments(fragments)
             .to_scanner()
         )
 
@@ -539,6 +546,7 @@ class ScannerBuilder:
         self._batch_readahead = None
         self._fragment_readahead = None
         self._scan_in_order = True
+        self._fragments = None
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         if nbatches is not None and int(nbatches) < 0:
@@ -585,6 +593,19 @@ class ScannerBuilder:
         if isinstance(filter, pa.compute.Expression):
             filter = str(filter)
         self._filter = filter
+        return self
+
+    def with_fragments(self, fragments: Optional[Iterable[LanceFragment]]) -> ScannerBuilder:
+        if fragments is not None:
+            inner_fragments = []
+            for f in fragments:
+                if isinstance(f, LanceFragment):
+                    inner_fragments.append(f._fragment)
+                else:
+                    raise TypeError(f"fragments must be an iterable of LanceFragment. Got {type(f)} instead.")
+            fragments = inner_fragments
+
+        self._fragments = fragments
         return self
 
     def nearest(
@@ -635,6 +656,7 @@ class ScannerBuilder:
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,
+            self._fragments,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -673,32 +695,6 @@ class LanceScanner(pa.dataset.Scanner):
         Not implemented
         """
         raise NotImplementedError("from fragment")
-
-    @staticmethod
-    def from_fragments(fragments: Iterable[LanceFragment], **kwargs):
-        """
-        Create a scanner from an iterable of fragments.
-
-        Parameters
-        ----------
-        fragments : Iterable[LanceFragment]
-
-        Returns
-        -------
-        LanceScanner
-        """
-        # TODO: can we take kwargs here for the scanner builder?
-        # TODO: peek instead of list
-        if not isinstance(fragments, list):
-            fragments = list(iter(fragments))
-
-        if len(fragments) == 0:
-            raise ValueError("Must pass at least one fragment")
-        
-        dataset = fragments[0]._ds
-        # TODO: pass down an iterator
-        scanner = _Scanner.from_fragments([fragment._fragment for fragment in fragments])
-        return LanceScanner(scanner, dataset)
 
     @staticmethod
     def from_batches(*args, **kwargs):

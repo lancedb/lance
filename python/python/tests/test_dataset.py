@@ -335,15 +335,9 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     fragments = list(dataset.get_fragments())
     assert len(fragments) == 3
 
-    # Create a scanner from first two fragments
-    scanner = lance.LanceScanner.from_fragments(fragments[0:2])
+    scanner = dataset.scanner(fragments=fragments[0:2])
     assert scanner.to_table().num_rows == 2 * 100
 
     # Accepts an iterator
-    scanner = lance.LanceScanner.from_fragments(iter(fragments[0:2]))
+    scanner = dataset.scanner(fragments=iter(fragments[0:2]), scan_in_order=False)
     assert scanner.to_table().num_rows == 2 * 100
-
-    # Fails if no fragments passed
-    with pytest.raises(ValueError, match="Must pass at least one fragment"):
-        lance.LanceScanner.from_fragments([])
-

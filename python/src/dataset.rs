@@ -20,6 +20,7 @@ use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use lance::dataset::ReadParams;
 use lance::datatypes::Schema;
 use lance::format::Fragment;
@@ -138,6 +139,7 @@ impl Dataset {
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
+        fragments: Option<Vec<FileFragment>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -164,6 +166,17 @@ impl Dataset {
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
+
+        if let Some(fragments) = fragments {
+            let fragments = fragments
+                .into_iter()
+                .map(|f| {
+                    let file_fragment = LanceFileFragment::from(f);
+                    file_fragment.into()
+                })
+                .collect();
+            scanner.with_fragments(fragments);
+        }
 
         if let Some(nearest) = nearest {
             let column = nearest

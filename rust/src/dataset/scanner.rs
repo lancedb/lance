@@ -134,22 +134,12 @@ impl Scanner {
         }
     }
 
-    pub fn from_fragments(dataset: Arc<Dataset>, fragments: Vec<Fragment>) -> Self {
-        let projection = dataset.schema().clone();
-        Self {
-            dataset,
-            projections: projection,
-            filter: None,
-            batch_size: DEFAULT_BATCH_SIZE,
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
-            limit: None,
-            offset: None,
-            nearest: None,
-            with_row_id: false,
-            ordered: true,
-            fragments: Some(fragments),
-        }
+    /// Set which fragments should be scanned.
+    ///
+    /// If scan_in_order is set to true, the fragments will be scanned in the order of the vector.
+    pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
+        self.fragments = Some(fragments);
+        self
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
@@ -1164,8 +1154,8 @@ mod test {
         let fragment2 = dataset.get_fragment(1).unwrap().metadata().clone();
 
         // 1 then 2
-        let scanner =
-            Scanner::from_fragments(dataset.clone(), vec![fragment1.clone(), fragment2.clone()]);
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![fragment1.clone(), fragment2.clone()]);
         let output = scanner
             .try_into_stream()
             .await
@@ -1178,7 +1168,8 @@ mod test {
         assert_eq!(output[1], batch2);
 
         // 2 then 1
-        let scanner = Scanner::from_fragments(dataset, vec![fragment2, fragment1]);
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![fragment2, fragment1]);
         let output = scanner
             .try_into_stream()
             .await

@@ -42,10 +42,6 @@ impl FileFragment {
     pub fn new(frag: LanceFragment) -> Self {
         Self { fragment: frag }
     }
-
-    pub(crate) fn fragment(&self) -> &LanceFragment {
-        &self.fragment
-    }
 }
 
 #[pymethods]
@@ -181,6 +177,12 @@ impl FileFragment {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+}
+
+impl From<FileFragment> for LanceFragment {
+    fn from(fragment: FileFragment) -> Self {
+        fragment.fragment
     }
 }
 
