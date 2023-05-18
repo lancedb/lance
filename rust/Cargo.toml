@@ -47,7 +47,7 @@ prost-types = "0.11"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
 rand = { version = "0.8.3", features = ["small_rng"] }
-futures = "0.3"
+futures = "0.3.27"
 uuid = { version = "1.2", features = ["v4"] }
 path-absolutize = "3.0.14"
 shellexpand = "3.0.0"
