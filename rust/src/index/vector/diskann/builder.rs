@@ -280,7 +280,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     let mut prune_time = 0_f32;
     let mut loop_time = std::time::Instant::now();
     for (i, &id) in ids.iter().enumerate() {
-        if i % 100 == 0 {
+        if i % 1000 == 0 {
             println!("index_once: {}/{}: search_time={greedy_search_time}, prune_time={prune_time}, total={}", i, graph.len(), loop_time.elapsed().as_secs_f32());
             greedy_search_time = 0.0;
             prune_time = 0.0;

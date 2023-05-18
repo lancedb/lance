@@ -159,7 +159,6 @@ pub(crate) async fn greedy_search(
         state.visit(id);
 
         let neighbors = graph.neighbors(id).await?;
-        // println!("State size: {} neighbors: {}", state.heap.len(), neighbors.len());
         for neighbor_id in neighbors.values() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
