@@ -25,20 +25,59 @@ use datafusion::physical_plan::{
     ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::Stream;
-use tokio::sync::mpsc::{self, Receiver};
-use tokio::task::JoinHandle;
+use futures::{stream, Future};
+use futures::{StreamExt, TryStreamExt};
 
-use crate::dataset::fragment::FileFragment;
+use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
 
-/// Dataset Scan Node.
-#[derive(Debug)]
-pub struct LanceStream {
-    rx: Receiver<std::result::Result<RecordBatch, DataFusionError>>,
+async fn open_file(
+    file_fragment: FileFragment,
+    projection: Arc<Schema>,
+    with_row_id: bool,
+) -> Result<FragmentReader> {
+    let mut reader = file_fragment.open(projection.as_ref()).await?;
+    if with_row_id {
+        reader.with_row_id();
+    };
+    Ok(reader)
+}
 
-    _io_thread: JoinHandle<()>,
+/// Convert a [`FragmentReader`] into a [`Stream`] of [`RecordBatch`].
+fn scan_batches(
+    reader: FragmentReader,
+    read_size: usize,
+) -> impl Stream<Item = Result<impl Future<Output = Result<RecordBatch>>>> {
+    // To make sure the reader lives long enough, we put it in an Arc.
+    let reader = Arc::new(reader);
+    let reader2 = reader.clone();
+
+    let read_params_iter = (0..reader.num_batches()).flat_map(move |batch_id| {
+        let rows_in_batch = reader.num_rows_in_batch(batch_id);
+        (0..rows_in_batch)
+            .step_by(read_size)
+            .map(move |start| (batch_id, start..min(start + read_size, rows_in_batch)))
+    });
+    let batch_stream = stream::iter(read_params_iter).map(move |(batch_id, range)| {
+        let reader = reader2.clone();
+        // The Ok here is only here because try_flatten_unordered wants both the
+        // outer *and* inner stream to be TryStream.
+        Ok(async move {
+            reader
+                .read_batch(batch_id, range)
+                .await
+                .map_err(|e| DataFusionError::from(e))
+        })
+    });
+
+    Box::pin(batch_stream)
+}
+
+/// Dataset Scan Node.
+pub struct LanceStream {
+    inner_stream: stream::BoxStream<'static, Result<RecordBatch>>,
 
     /// Manifest of the dataset
     projection: Arc<Schema>,
@@ -56,67 +95,66 @@ impl LanceStream {
     ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
     ///  - ***batch_readahead***: the number of batches to read ahead.
+    ///  - ***fragment_readahead***: the number of fragments to read ahead (only
+    ///    if scan_in_order = false).
     ///  - ***with_row_id***: load row ID from the datasets.
-    ///
+    ///  - ***scan_in_order***: whether to scan the fragments in the provided order.
+    ///read_size: usize,futures::iter::
     pub fn try_new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
+        fragment_readahead: usize,
         with_row_id: bool,
+        scan_in_order: bool,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel(batch_readahead);
-
         let project_schema = projection.clone();
-        let io_thread = tokio::spawn(async move {
-            'outer: for frag in fragments.as_ref() {
-                if tx.is_closed() {
-                    return;
-                }
-                let file_fragment = FileFragment::new(dataset.clone(), frag.clone());
-                let reader = match file_fragment.open(project_schema.as_ref()).await {
-                    Ok(mut r) => {
-                        if with_row_id {
-                            r.with_row_id();
-                        };
-                        r
-                    }
-                    Err(e) => {
-                        tx.send(Err(DataFusionError::from(e)))
-                            .await
-                            .expect("Scanner sending error message");
-                        // Stop reading.
-                        break;
-                    }
-                };
-                for batch_id in 0..reader.num_batches() {
-                    let rows_in_batch = reader.num_rows_in_batch(batch_id);
-                    for start in (0..rows_in_batch).step_by(read_size) {
-                        let result = reader
-                            .read_batch(batch_id, start..min(start + read_size, rows_in_batch))
-                            .await;
-                        if tx.is_closed() {
-                            // Early stop
-                            break 'outer;
-                        }
-                        if let Err(err) = tx.send(result.map_err(|e| e.into())).await {
-                            eprintln!("Failed to scan data: {err}");
-                            break 'outer;
-                        }
-                    }
-                }
-            }
 
-            drop(tx)
-        });
+        let file_fragments = fragments
+            .iter()
+            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
+            .collect::<Vec<_>>();
+
+        let inner_stream = if scan_in_order {
+            stream::iter(file_fragments)
+                .then(move |file_fragment| {
+                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                })
+                .map_ok(move |reader| scan_batches(reader, read_size))
+                .try_flatten()
+                // We buffer up to `batch_readahead` batches across all streams.
+                .try_buffered(batch_readahead)
+                .boxed()
+        } else {
+            stream::iter(file_fragments)
+                .then(move |file_fragment| {
+                    open_file(file_fragment, project_schema.clone(), with_row_id)
+                })
+                .map_ok(move |reader| scan_batches(reader, read_size))
+                // When we flatten the streams (one stream per fragment), we allow
+                // `fragment_readahead` stream to be read concurrently.
+                .try_flatten_unordered(fragment_readahead)
+                // We buffer up to `batch_readahead` batches across all streams.
+                .try_buffer_unordered(batch_readahead)
+                .boxed()
+        };
 
         Ok(Self {
-            rx,
-            _io_thread: io_thread, // Drop the background I/O thread with the stream.
+            inner_stream,
             projection,
             with_row_id,
         })
+    }
+}
+
+impl core::fmt::Debug for LanceStream {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LanceStream")
+            .field("projection", &self.projection)
+            .field("with_row_id", &self.with_row_id)
+            .finish()
     }
 }
 
@@ -137,7 +175,7 @@ impl Stream for LanceStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        Pin::into_inner(self).inner_stream.poll_next_unpin(cx)
     }
 }
 
@@ -148,7 +186,9 @@ pub struct LanceScanExec {
     projection: Arc<Schema>,
     read_size: usize,
     batch_readahead: usize,
+    fragment_readahead: usize,
     with_row_id: bool,
+    ordered_output: bool,
 }
 
 impl std::fmt::Debug for LanceScanExec {
@@ -161,10 +201,11 @@ impl std::fmt::Debug for LanceScanExec {
             .collect::<Vec<_>>();
         write!(
             f,
-            "LanceScan(uri={}, projection={:#?}, row_id={})",
+            "LanceScan(uri={}, projection={:#?}, row_id={}, ordered={})",
             self.dataset.data_dir(),
             columns,
-            self.with_row_id
+            self.with_row_id,
+            self.ordered_output
         )
     }
 }
@@ -176,7 +217,9 @@ impl LanceScanExec {
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
+        fragment_readahead: usize,
         with_row_id: bool,
+        ordered_ouput: bool,
     ) -> Self {
         Self {
             dataset,
@@ -184,7 +227,9 @@ impl LanceScanExec {
             projection,
             read_size,
             batch_readahead,
+            fragment_readahead,
             with_row_id,
+            ordered_output: ordered_ouput,
         }
     }
 }
@@ -236,7 +281,9 @@ impl ExecutionPlan for LanceScanExec {
             self.projection.clone(),
             self.read_size,
             self.batch_readahead,
+            self.fragment_readahead,
             self.with_row_id,
+            self.ordered_output,
         )?))
     }
 

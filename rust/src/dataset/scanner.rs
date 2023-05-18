@@ -49,6 +49,9 @@ pub const DEFAULT_BATCH_SIZE: usize = 8192;
 // Same as pyarrow Dataset::scanner()
 const DEFAULT_BATCH_READAHEAD: usize = 16;
 
+// Same as pyarrow Dataset::scanner()
+const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -76,6 +79,9 @@ pub struct Scanner {
     /// Number of batches to prefetch
     batch_readahead: usize,
 
+    /// Number of fragments to read concurrently
+    fragment_readahead: usize,
+
     limit: Option<i64>,
     offset: Option<i64>,
 
@@ -83,6 +89,9 @@ pub struct Scanner {
 
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
+
+    /// Whether to scan in deterministic order (default: true)
+    ordered: bool,
 
     /// If set, this scanner serves only these fragments.
     fragments: Option<Vec<Fragment>>,
@@ -97,10 +106,12 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: None,
         }
     }
@@ -113,10 +124,12 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: Some(vec![fragment]),
         }
     }
@@ -129,10 +142,12 @@ impl Scanner {
             filter: None,
             batch_size: DEFAULT_BATCH_SIZE,
             batch_readahead: DEFAULT_BATCH_READAHEAD,
+            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
             limit: None,
             offset: None,
             nearest: None,
             with_row_id: false,
+            ordered: true,
             fragments: Some(fragments),
         }
     }
@@ -189,6 +204,24 @@ impl Scanner {
     /// Set the prefetch size.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
+        self
+    }
+
+    /// Set the fragment readahead.
+    ///
+    /// This is only used if ``scan_in_order`` is set to false.
+    pub fn fragment_readahead(&mut self, nfragments: usize) -> &mut Self {
+        self.fragment_readahead = nfragments;
+        self
+    }
+
+    /// Set whether to read data in order (default: true)
+    ///
+    /// If true, will scan the fragments and batches within fragments in order.
+    /// If false, scan will read fragments concurrently and may yield batches
+    /// out of order, potentially improving throughput.
+    pub fn scan_in_order(&mut self, ordered: bool) -> &mut Self {
+        self.ordered = ordered;
         self
     }
 
@@ -487,6 +520,7 @@ impl Scanner {
                     true,
                     vector_scan_projection,
                     Arc::new(self.dataset.manifest.fragments_since(&ds.manifest)?),
+                    self.ordered,
                 );
                 // first we do flat search on just the new data
                 let topk_appended = self.flat_knn(scan_node, q)?;
@@ -506,7 +540,7 @@ impl Scanner {
         } else {
             self.dataset.fragments().clone()
         };
-        self.scan_fragments(with_row_id, projection, fragments)
+        self.scan_fragments(with_row_id, projection, fragments, self.ordered)
     }
 
     fn scan_fragments(
@@ -514,6 +548,7 @@ impl Scanner {
         with_row_id: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
+        ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
@@ -521,7 +556,9 @@ impl Scanner {
             projection,
             self.batch_size,
             self.batch_readahead,
+            self.fragment_readahead,
             with_row_id,
+            ordered,
         ))
     }
 
@@ -608,15 +645,18 @@ mod test {
     use arrow::compute::concat_batches;
     use arrow::datatypes::Int32Type;
     use arrow_array::{
-        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray, RecordBatchReader,
-        StringArray, StructArray,
+        ArrayRef, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
+        RecordBatchIterator, RecordBatchReader, StringArray, StructArray,
     };
+    use arrow_ord::sort::sort_to_indices;
     use arrow_schema::DataType;
+    use arrow_select::take;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
     use super::*;
     use crate::arrow::*;
+    use crate::dataset::WriteMode;
     use crate::index::{
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
@@ -1033,6 +1073,122 @@ mod test {
         let scan = &plan.children()[0];
         assert!(scan.as_any().is::<LanceScanExec>());
         assert_eq!(scan.schema().field_names(), &["i", "_rowid"]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_unordered_with_row_id() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, false).await;
+
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+
+        let ordered_batches = scan
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert!(ordered_batches.len() > 2);
+        let ordered_batch =
+            concat_batches(&ordered_batches[0].schema(), ordered_batches.iter()).unwrap();
+
+        // Attempt to get out-of-order scan, but that might take multiple attempts.
+        scan.scan_in_order(false);
+        for _ in 0..10 {
+            let unordered_batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap();
+            let unordered_batch =
+                concat_batches(&unordered_batches[0].schema(), unordered_batches.iter()).unwrap();
+
+            assert_eq!(ordered_batch.num_rows(), unordered_batch.num_rows());
+
+            // If they aren't equal, they should be equal if we sort by row id
+            if ordered_batch != unordered_batch {
+                let sort_indices = sort_to_indices(&unordered_batch["_rowid"], None, None).unwrap();
+
+                let ordered_i = ordered_batch["i"].clone();
+                let sorted_i = take::take(&unordered_batch["i"], &sort_indices, None).unwrap();
+
+                assert_eq!(&ordered_i, &sorted_i);
+
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_scan_order() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            true,
+        )]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![6, 7, 8]))],
+        )
+        .unwrap();
+
+        let mut params = WriteParams::default();
+        params.mode = WriteMode::Append;
+
+        let write_batch = |batch: RecordBatch| async {
+            let mut reader: Box<dyn RecordBatchReader> =
+                Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()));
+            Dataset::write(&mut reader, test_uri, Some(params.clone())).await
+        };
+
+        write_batch(batch1.clone()).await.unwrap();
+        write_batch(batch2.clone()).await.unwrap();
+
+        let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
+        let fragment1 = dataset.get_fragment(0).unwrap().metadata().clone();
+        let fragment2 = dataset.get_fragment(1).unwrap().metadata().clone();
+
+        // 1 then 2
+        let scanner =
+            Scanner::from_fragments(dataset.clone(), vec![fragment1.clone(), fragment2.clone()]);
+        let output = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0], batch1);
+        assert_eq!(output[1], batch2);
+
+        // 2 then 1
+        let scanner = Scanner::from_fragments(dataset, vec![fragment2, fragment1]);
+        let output = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0], batch2);
+        assert_eq!(output[1], batch1);
     }
 
     /// Test scan with filter.

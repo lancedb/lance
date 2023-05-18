@@ -79,6 +79,8 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
+        fragment_readahead: Optional[int] = None,
+        scan_in_order: bool = True,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -108,6 +110,12 @@ class LanceDataset(pa.dataset.Dataset):
             }`
         batch_readahead: int, optional
             The number of batches to read ahead.
+        fragment_readahead: int, optional
+            The number of fragments to read ahead.
+        scan_in_order: bool, default True
+            Whether to read the fragments and batches in order. If false,
+            throughput may be higher, but batches will be returned out of order
+            and memory use might increase.
 
         Notes
         -----
@@ -138,6 +146,7 @@ class LanceDataset(pa.dataset.Dataset):
             .offset(offset)
             .nearest(**(nearest or {}))
             .batch_readahead(batch_readahead)
+            .fragment_readahead(fragment_readahead)
             .to_scanner()
         )
 
@@ -156,6 +165,8 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
+        fragment_readahead: Optional[int] = None,
+        scan_in_order: bool = True,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -183,6 +194,14 @@ class LanceDataset(pa.dataset.Dataset):
                   "nprobes": 1,
                   "refine_factor": 1
                 }
+        batch_readahead: int, optional
+            The number of batches to read ahead.
+        fragment_readahead: int, optional
+            The number of fragments to read ahead.
+        scan_in_order: bool, default True
+            Whether to read the fragments and batches in order. If false,
+            throughput may be higher, but batches will be returned out of order
+            and memory use might increase.
 
         Notes
         -----
@@ -197,6 +216,8 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            scan_in_order=scan_in_order,
         ).to_table()
 
     @property
@@ -235,6 +256,8 @@ class LanceDataset(pa.dataset.Dataset):
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
+        fragment_readahead: Optional[int] = None,
+        scan_in_order: bool = True,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -255,6 +278,8 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_readahead=batch_readahead,
+            fragment_readahead=fragment_readahead,
+            scan_in_order=scan_in_order,
         ).to_batches()
 
     def take(self, indices, **kwargs):
@@ -512,11 +537,30 @@ class ScannerBuilder:
         self._columns = None
         self._nearest = None
         self._batch_readahead = None
+        self._fragment_readahead = None
+        self._scan_in_order = True
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         if nbatches is not None and int(nbatches) < 0:
             raise ValueError("batch_readahead must be non-negative")
         self._batch_readahead = nbatches
+        return self
+    
+    def fragment_readahead(self, nfragments: Optional[int] = None) -> ScannerBuilder:
+        if nfragments is not None and int(nfragments) < 0:
+            raise ValueError("fragment_readahead must be non-negative")
+        self._fragment_readahead = nfragments
+        return self
+    
+    def scan_in_order(self, scan_in_order: bool = True) -> ScannerBuilder:
+        """
+        Whether to scan the dataset in order of fragments and batches.
+
+        If set to False, the scanner may read fragments concurrently and yield
+        batches out of order. This may improve performance since it allows more
+        concurrency in the scan, but can also use more memory.
+        """
+        self._scan_in_order = scan_in_order
         return self
 
     def limit(self, n: int = 0) -> ScannerBuilder:
@@ -589,6 +633,8 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_readahead,
+            self._fragment_readahead,
+            self._scan_in_order,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -641,6 +687,7 @@ class LanceScanner(pa.dataset.Scanner):
         -------
         LanceScanner
         """
+        # TODO: can we take kwargs here for the scanner builder?
         # TODO: peek instead of list
         if not isinstance(fragments, list):
             fragments = list(iter(fragments))

@@ -136,6 +136,8 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&PyDict>,
         batch_readahead: Option<usize>,
+        fragment_readahead: Option<usize>,
+        scan_in_order: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         if let Some(c) = columns {
@@ -156,6 +158,13 @@ impl Dataset {
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
+
+        if let Some(fragment_readahead) = fragment_readahead {
+            scanner.fragment_readahead(fragment_readahead);
+        }
+
+        scanner.scan_in_order(scan_in_order.unwrap_or(true));
+
         if let Some(nearest) = nearest {
             let column = nearest
                 .get_item("column")

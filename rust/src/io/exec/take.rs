@@ -295,6 +295,8 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
+            true,
             true,
         ));
         let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
@@ -325,6 +327,8 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
+            true,
             true,
         ));
         let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
@@ -355,7 +359,9 @@ mod tests {
             scan_schema.clone(),
             10,
             10,
+            4,
             false,
+            true,
         ));
         assert!(TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).is_err());
     }
