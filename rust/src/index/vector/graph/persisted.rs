@@ -329,8 +329,15 @@ pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{FixedSizeListArray, RecordBatchReader};
+
     use super::*;
-    use crate::{arrow::linalg::MatrixView, index::vector::MetricType};
+    use crate::{
+        arrow::{linalg::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
+        dataset::WriteParams,
+        index::vector::MetricType,
+        utils::testing::generate_random_array,
+    };
 
     #[derive(Clone, Debug)]
     struct FooVertex {
@@ -345,6 +352,10 @@ mod tests {
         }
 
         fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
         }
     }
@@ -372,9 +383,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_persisted_graph() {
-        let store = ObjectStore::memory();
-        let path = Path::from("/graph");
+        use tempfile::tempdir;
 
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dim = 32;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        )]));
+        let data = generate_random_array(10 * dim);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+            )],
+        )
+        .unwrap()]);
+
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let graph_path = dataset.indices_dir().child("graph");
         let nodes = (0..100)
             .map(|v| FooVertex {
                 row_id: v as u32,
@@ -389,18 +429,23 @@ mod tests {
         let serde = Arc::new(FooVertexSerDe {});
         write_graph(
             &builder,
-            &store,
-            &path,
+            dataset.object_store(),
+            &graph_path,
             &WriteGraphParams::default(),
             serde.as_ref(),
         )
         .await
         .unwrap();
 
-        let graph =
-            PersistedGraph::<FooVertex>::try_new(&store, &path, GraphReadParams::default(), serde)
-                .await
-                .unwrap();
+        let graph = PersistedGraph::<FooVertex>::try_new(
+            Arc::new(dataset),
+            "vector",
+            &graph_path,
+            GraphReadParams::default(),
+            serde,
+        )
+        .await
+        .unwrap();
         let vertex = graph.vertex(77).await.unwrap();
         assert_eq!(vertex.row_id, 77);
 
