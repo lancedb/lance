@@ -31,6 +31,8 @@ endif()
 
 include(FetchContent)
 
+find_package(OpenSSL REQUIRED)
+
 FetchContent_Declare(
         Corrosion
         GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
@@ -57,6 +59,7 @@ set_target_properties(${LIB_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(${LIB_NAME}
         "${CMAKE_CURRENT_BINARY_DIR}/libduckdb_lance.a"
         duckdb_static
+	${OPENSSL_LIBRARIES}
 )
 
 if (APPLE)
