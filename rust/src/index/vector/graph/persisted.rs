@@ -186,7 +186,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
 
-            println!("Get vertex: {:?}", cache.get(&id).unwrap());
+            // println!("Get vertex: {:?}", cache.get(&id).unwrap());
             Ok(cache.get(&id).unwrap().clone())
         }
     }
