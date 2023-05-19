@@ -156,9 +156,6 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        if i % 1000 == 0 {
-            println!("init_graph: {}/{}", i, graph.len());
-        }
         let mut neighbor_ids: HashSet<u32> =
             graph.neighbors(i).await?.values().iter().copied().collect();
 
@@ -229,7 +226,6 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
                 break;
             }
             let mut to_remove: HashSet<usize> = HashSet::new();
-            // println!("robust_prune: id={id} visited: {}", visited.len());
             for pv in visited.iter() {
                 let dist_prime = distance(&matrix, p.id, *pv)?;
                 let dist_query = distance(&matrix, id, *pv)?;
@@ -277,28 +273,15 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     let mut ids = (0..graph.len()).collect::<Vec<_>>();
     ids.shuffle(&mut rng);
 
-    let mut greedy_search_time = 0_f32;
-    let mut prune_time = 0_f32;
-    let mut loop_time = std::time::Instant::now();
     for (i, &id) in ids.iter().enumerate() {
-        if i % 1000 == 0 {
-            println!("index_once: {}/{}: search_time={greedy_search_time}, prune_time={prune_time}, total={}", i, graph.len(), loop_time.elapsed().as_secs_f32());
-            greedy_search_time = 0.0;
-            prune_time = 0.0;
-            loop_time = std::time::Instant::now();
-        }
         let vector = graph
             .data
             .row(i)
             .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
 
-        let now = std::time::Instant::now();
         let state = greedy_search(graph, medoid, vector, 1, l).await?;
-        greedy_search_time += now.elapsed().as_secs_f32();
 
-        let now = std::time::Instant::now();
         let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
-        prune_time += now.elapsed().as_secs_f32();
         graph.set_neighbors(
             id,
             Arc::new(neighbors.iter().copied().collect::<UInt32Array>()),

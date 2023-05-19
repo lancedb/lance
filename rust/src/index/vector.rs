@@ -363,9 +363,6 @@ pub(crate) async fn open_index(
         pb::index::Implementation::VectorIndex(vi) => vi,
     };
 
-    let num_stages = vec_idx.stages.len();
-    println!("Num stages: {}, {:?}", num_stages, vec_idx.stages);
-
     let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
         .ok_or(Error::Index(format!(
             "Unsupported metric type value: {}",
@@ -436,8 +433,6 @@ pub(crate) async fn open_index(
                         vec_idx.stages
                     )));
                 };
-                println!("DiskANN protos: {:?}", diskann_proto);
-                // let graph_path = child(diskann_proto.filename.as_str());
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
                 let diskann =
                     Arc::new(DiskANNIndex::try_new(dataset.clone(), column, &graph_path).await?);
