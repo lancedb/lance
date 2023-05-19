@@ -15,7 +15,9 @@
 #  limitations under the License.
 
 import argparse
-import struct
+import platform
+import time
+from subprocess import check_output
 
 import lance
 import numpy as np
@@ -27,10 +29,13 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("uri", help="lance path", metavar="FILE")
+    parser.add_argument("-t", "--index-type", choices=["ivf_pq", "diskann"], default="ivf_pq")
+    parser.add_argument("-m", "--metric", choices=["l2", "cosine"], default="l2")
     parser.add_argument(
         "-c",
         "--column-name",
         type=str,
+        metavar="NAME",
         default="vector",
         help="Name of the vector column",
     )
@@ -53,13 +58,31 @@ def main():
     args = parser.parse_args()
 
     dataset = lance.dataset(args.uri)
+    start = time.time()
     dataset = dataset.create_index(
         args.column_name,
-        index_type="IVF_PQ",
-        # metric="cosine",
+        index_type=args.index_type,
+        metric=args.metric,
         num_partitions=args.ivf_partitions,  # IVF
         num_sub_vectors=args.pq_subvectors,
     )  # PQ
+    end = time.time()
+
+    GIT_COMMIT = (
+        check_output(["git", "rev-parse", "--short", "HEAD"]).strip().decode("utf-8")
+    )
+    bench_results = {
+        "commit": GIT_COMMIT,
+        "name": "index_creation",
+        "platform": platform.platform(),
+        "arch": platform.machine(),
+        "params": {
+            "type": args.index_type,
+        },
+        "duration": end - start,
+    }
+    print(bench_results)
+
     return dataset
 
 
