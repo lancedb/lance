@@ -42,7 +42,7 @@ use crate::{
     index::{
         pb::vector_index_stage::Stage,
         vector::{
-            diskann::{DiskANNParams, DiskANNIndex},
+            diskann::{DiskANNIndex, DiskANNParams},
             ivf::Ivf,
             opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
