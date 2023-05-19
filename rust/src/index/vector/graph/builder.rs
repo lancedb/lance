@@ -138,7 +138,11 @@ mod tests {
         val: f32,
     }
 
-    impl Vertex for FooVertex {}
+    impl Vertex for FooVertex {
+        fn vector(&self) -> &[f32] {
+            todo!()
+        }
+    }
 
     #[tokio::test]
     async fn test_construct_builder() {

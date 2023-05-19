@@ -23,7 +23,6 @@ use crate::Result;
 pub(crate) struct RowVertex {
     pub(crate) row_id: u64,
 
-    #[allow(dead_code)]
     pub(crate) vector: Option<Float32Array>,
 }
 

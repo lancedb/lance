@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{as_list_array, as_primitive_array};
@@ -26,9 +27,9 @@ use object_store::path::Path;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
-use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::datatypes::Schema;
 use crate::io::{FileReader, FileWriter, ObjectStore};
+use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
@@ -54,7 +55,7 @@ impl Default for GraphReadParams {
 }
 
 /// Persisted graph on disk, stored in the file.
-pub(crate) struct PersistedGraph<V: Vertex> {
+pub(crate) struct PersistedGraph<V: Vertex + Debug> {
     reader: FileReader,
 
     /// Vertex size in bytes.
@@ -79,7 +80,7 @@ pub(crate) struct PersistedGraph<V: Vertex> {
     serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
 }
 
-impl<V: Vertex> PersistedGraph<V> {
+impl<V: Vertex + Debug> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
     pub(crate) async fn try_new(
         object_store: &ObjectStore,
@@ -149,8 +150,10 @@ impl<V: Vertex> PersistedGraph<V> {
             let array = as_fixed_size_binary_array(batch.column(0));
             for (i, vertex_bytes) in array.iter().enumerate() {
                 let vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
+                let vol = self.reader.take(indices, projection)
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
+            println!("Get vertex: {:?}", cache.get(&id).unwrap());
             Ok(cache.get(&id).unwrap().clone())
         }
     }
@@ -184,7 +187,7 @@ impl<V: Vertex> PersistedGraph<V> {
 }
 
 #[async_trait]
-impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
+impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vertex_a = self.vertex(a as u32).await?;
         self.distance_to(vertex_a.vector(), b).await
@@ -303,7 +306,11 @@ mod tests {
         pq: Vec<u8>,
     }
 
-    impl Vertex for FooVertex {}
+    impl Vertex for FooVertex {
+        fn vector(&self) -> &[f32] {
+            unimplemented!()
+        }
+    }
 
     struct FooVertexSerDe {}
 
