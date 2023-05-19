@@ -31,7 +31,9 @@ endif()
 
 include(FetchContent)
 
-find_package(OpenSSL REQUIRED)
+if(UNIX AND NOT APPLE)
+        find_package(OpenSSL REQUIRED)
+endif()
 
 FetchContent_Declare(
         Corrosion
