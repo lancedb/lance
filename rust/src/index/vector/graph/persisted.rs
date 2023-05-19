@@ -27,6 +27,7 @@ use object_store::path::Path;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
+use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 use crate::io::{FileReader, FileWriter, ObjectStore};
 use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
@@ -56,6 +57,9 @@ impl Default for GraphReadParams {
 
 /// Persisted graph on disk, stored in the file.
 pub(crate) struct PersistedGraph<V: Vertex + Debug> {
+    /// Reference to the dataset.
+    dataset: Arc<Dataset>,
+
     reader: FileReader,
 
     /// Vertex size in bytes.
@@ -83,11 +87,12 @@ pub(crate) struct PersistedGraph<V: Vertex + Debug> {
 impl<V: Vertex + Debug> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
     pub(crate) async fn try_new(
-        object_store: &ObjectStore,
+        dataset: Arc<Dataset>,
         path: &Path,
         params: GraphReadParams,
         serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
     ) -> Result<PersistedGraph<V>> {
+        let object_store = dataset.object_store();
         let file_reader = FileReader::try_new(object_store, path).await?;
 
         let schema = file_reader.schema();
@@ -110,6 +115,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
 
         Ok(Self {
+            dataset,
             reader: file_reader,
             vertex_size,
             vertex_projection,
@@ -150,7 +156,6 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
             let array = as_fixed_size_binary_array(batch.column(0));
             for (i, vertex_bytes) in array.iter().enumerate() {
                 let vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
-                let vol = self.reader.take(indices, projection)
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
             println!("Get vertex: {:?}", cache.get(&id).unwrap());

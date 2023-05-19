@@ -27,7 +27,7 @@ use ordered_float::OrderedFloat;
 
 use super::row_vertex::{RowVertex, RowVertexSerDe};
 use crate::{
-    dataset::ROW_ID,
+    dataset::{Dataset, ROW_ID},
     index::{
         vector::{
             graph::{GraphReadParams, PersistedGraph},
@@ -35,7 +35,6 @@ use crate::{
         },
         Index,
     },
-    io::ObjectStore,
     Result,
 };
 use crate::{
@@ -186,10 +185,10 @@ impl std::fmt::Debug for DiskANNIndex {
 impl DiskANNIndex {
     /// Creates a new DiskANN index.
 
-    pub async fn try_new(object_store: &ObjectStore, graph_path: &Path) -> Result<Self> {
+    pub async fn try_new(dataset: Arc<Dataset>, graph_path: &Path) -> Result<Self> {
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
-        let graph = PersistedGraph::try_new(object_store, graph_path, params, serde).await?;
+        let graph = PersistedGraph::try_new(dataset, graph_path, params, serde).await?;
         Ok(Self { graph })
     }
 }

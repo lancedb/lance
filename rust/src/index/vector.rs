@@ -438,7 +438,8 @@ pub(crate) async fn open_index<'a>(
                 println!("DiskANN protos: {:?}", diskann_proto);
                 // let graph_path = child(diskann_proto.filename.as_str());
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
-                let diskann = Arc::new(DiskANNIndex::try_new(object_store, &graph_path).await?);
+                let diskann =
+                    Arc::new(DiskANNIndex::try_new(Arc::new(dataset.clone()), &graph_path).await?);
                 last_stage = Some(diskann);
             }
             _ => {}

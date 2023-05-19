@@ -15,7 +15,6 @@
 //! Graph-based vector index.
 //!
 
-use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::UInt32Array;
