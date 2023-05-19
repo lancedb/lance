@@ -76,7 +76,8 @@ pub(crate) async fn build_diskann_index(
     println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
 
     let index_dir = dataset.indices_dir().child(uuid);
-    let graph_file = index_dir.child("diskann_graph.lance");
+    let filename = "diskann_graph.lance";
+    let graph_file = index_dir.child(filename);
 
     let mut write_params = WriteGraphParams::default();
     write_params.batch_size = 2048 * 10;
@@ -97,7 +98,7 @@ pub(crate) async fn build_diskann_index(
         name,
         uuid,
         graph.data.num_columns(),
-        graph_file.to_string().as_str(),
+        filename,
         &[medoid],
         params.metric_type,
         &params,
@@ -155,7 +156,7 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        if i % 100 == 0 {
+        if i % 1000 == 0 {
             println!("init_graph: {}/{}", i, graph.len());
         }
         let mut neighbor_ids: HashSet<u32> =

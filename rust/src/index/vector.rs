@@ -42,7 +42,7 @@ use crate::{
     index::{
         pb::vector_index_stage::Stage,
         vector::{
-            diskann::DiskANNParams,
+            diskann::{DiskANNParams, DiskANNIndex},
             ivf::Ivf,
             opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
@@ -363,9 +363,7 @@ pub(crate) async fn open_index<'a>(
     };
 
     let num_stages = vec_idx.stages.len();
-    if num_stages != 2 && num_stages != 3 {
-        return Err(Error::IO("Only support IVF_(O)PQ now".to_string()));
-    };
+    println!("Num stages: {}, {:?}", num_stages, vec_idx.stages);
 
     let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
         .ok_or(Error::Index(format!(
@@ -429,6 +427,19 @@ pub(crate) async fn open_index<'a>(
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+            }
+            Some(Stage::Diskann(diskann_proto)) => {
+                if last_stage.is_some() {
+                    return Err(Error::Index(format!(
+                        "DiskANN should be the only stage, but we got stages: {:?}",
+                        vec_idx.stages
+                    )));
+                };
+                println!("DiskANN protos: {:?}", diskann_proto);
+                // let graph_path = child(diskann_proto.filename.as_str());
+                let graph_path = index_dir.child(diskann_proto.filename.as_str());
+                let diskann = Arc::new(DiskANNIndex::try_new(object_store, &graph_path).await?);
+                last_stage = Some(diskann);
             }
             _ => {}
         }
