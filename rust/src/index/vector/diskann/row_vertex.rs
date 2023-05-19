@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
+
 use arrow_array::Float32Array;
 use byteorder::{ByteOrder, LE};
 
@@ -35,6 +37,14 @@ impl RowVertex {
 impl Vertex for RowVertex {
     fn vector(&self) -> &[f32] {
         self.vector.as_ref().unwrap().values()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

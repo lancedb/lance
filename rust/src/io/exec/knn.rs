@@ -220,7 +220,7 @@ impl KNNIndexStream {
         let q = query.clone();
         let name = index_name.to_string();
         let bg_thread = tokio::spawn(async move {
-            let index = match open_index(dataset.as_ref(), &name).await {
+            let index = match open_index(dataset, &q.column, &name).await {
                 Ok(idx) => idx,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(

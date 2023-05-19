@@ -185,10 +185,15 @@ impl std::fmt::Debug for DiskANNIndex {
 impl DiskANNIndex {
     /// Creates a new DiskANN index.
 
-    pub async fn try_new(dataset: Arc<Dataset>, graph_path: &Path) -> Result<Self> {
+    pub async fn try_new(
+        dataset: Arc<Dataset>,
+        index_column: &str,
+        graph_path: &Path,
+    ) -> Result<Self> {
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
-        let graph = PersistedGraph::try_new(dataset, graph_path, params, serde).await?;
+        let graph =
+            PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
         Ok(Self { graph })
     }
 }

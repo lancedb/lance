@@ -15,6 +15,7 @@
 //! Graph-based vector index.
 //!
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::UInt32Array;
@@ -41,7 +42,11 @@ pub trait Graph {
 }
 
 /// Vertex (metadata). It does not include the actual data.
-pub trait Vertex {
+pub trait Vertex: Clone {
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
     fn vector(&self) -> &[f32];
 }
 

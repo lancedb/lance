@@ -16,6 +16,8 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{as_list_array, as_primitive_array};
+use arrow_array::cast::AsArray;
+use arrow_array::Float32Array;
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
     Array, RecordBatch, UInt32Array,
@@ -27,8 +29,10 @@ use object_store::path::Path;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
+use crate::arrow::as_fixed_size_list_array;
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
+use crate::index::vector::diskann::RowVertex;
 use crate::io::{FileReader, FileWriter, ObjectStore};
 use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::{Error, Result};
@@ -60,6 +64,9 @@ pub(crate) struct PersistedGraph<V: Vertex + Debug> {
     /// Reference to the dataset.
     dataset: Arc<Dataset>,
 
+    /// Vector column.
+    vector_column_projection: Schema,
+
     reader: FileReader,
 
     /// Vertex size in bytes.
@@ -88,6 +95,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
     pub(crate) async fn try_new(
         dataset: Arc<Dataset>,
+        vector_column: &str,
         path: &Path,
         params: GraphReadParams,
         serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
@@ -114,8 +122,11 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         };
         let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
 
+        let vector_column_projection = dataset.schema().project(&[vector_column])?;
+
         Ok(Self {
             dataset,
+            vector_column_projection,
             reader: file_reader,
             vertex_size,
             vertex_projection,
@@ -144,20 +155,37 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
                 return Ok(vertex.clone());
             }
         }
-        let prefetch_size = self.params.prefetch_byte_size / self.vertex_size + 1;
-        let end = std::cmp::min(self.len(), id as usize + prefetch_size);
+        let end = (id + 1) as usize;
         let batch = self
             .reader
-            .read_range(id as usize..end, &self.vertex_projection)
+            .read_range(id as usize..(id + 1) as usize, &self.vertex_projection)
             .await?;
         assert_eq!(batch.num_rows(), end - id as usize);
+
+        let array = as_fixed_size_binary_array(batch.column(0));
+        let mut vertices = vec![];
+        for vertex_bytes in array.iter() {
+            let mut vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
+            let mut row_vector = vertex.as_any_mut().downcast_mut::<RowVertex>().unwrap();
+            let batch = self
+                .dataset
+                .take_rows(&[row_vector.row_id as u64], &self.vector_column_projection)
+                .await?;
+
+            let column = as_fixed_size_list_array(batch.column(0));
+            let values = column.value(0);
+            let vector: Float32Array = values.as_primitive().clone();
+            row_vector.vector = Some(vector);
+            vertices.push(vertex);
+        }
+
         {
             let mut cache = self.cache.lock().unwrap();
-            let array = as_fixed_size_binary_array(batch.column(0));
-            for (i, vertex_bytes) in array.iter().enumerate() {
-                let vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
+            for i in 0..vertices.len() {
+                let vertex = vertices[i].clone();
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
+
             println!("Get vertex: {:?}", cache.get(&id).unwrap());
             Ok(cache.get(&id).unwrap().clone())
         }
@@ -314,6 +342,10 @@ mod tests {
     impl Vertex for FooVertex {
         fn vector(&self) -> &[f32] {
             unimplemented!()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
