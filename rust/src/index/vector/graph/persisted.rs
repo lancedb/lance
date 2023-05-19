@@ -186,7 +186,6 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
 
-            // println!("Get vertex: {:?}", cache.get(&id).unwrap());
             Ok(cache.get(&id).unwrap().clone())
         }
     }
@@ -335,6 +334,7 @@ mod tests {
     use crate::{
         arrow::{linalg::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
         dataset::WriteParams,
+        index::vector::diskann::row_vertex::RowVertexSerDe,
         index::vector::MetricType,
         utils::testing::generate_random_array,
     };
@@ -387,6 +387,7 @@ mod tests {
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
+        let total = 100;
         let dim = 32;
 
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -397,7 +398,7 @@ mod tests {
             ),
             true,
         )]));
-        let data = generate_random_array(10 * dim);
+        let data = generate_random_array(total * dim);
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(
@@ -415,18 +416,18 @@ mod tests {
             .unwrap();
 
         let graph_path = dataset.indices_dir().child("graph");
-        let nodes = (0..100)
-            .map(|v| FooVertex {
-                row_id: v as u32,
-                pq: vec![0; 16],
+        let nodes = (0..total)
+            .map(|v| RowVertex {
+                row_id: v as u64,
+                vector: Some(generate_random_array(dim).into()),
             })
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);
-        for i in 0..100 {
+        for i in 0..total as u32 {
             let neighbors = Arc::new(UInt32Array::from_iter_values(i..i + 10));
             builder.set_neighbors(i as usize, neighbors);
         }
-        let serde = Arc::new(FooVertexSerDe {});
+        let serde = Arc::new(RowVertexSerDe {});
         write_graph(
             &builder,
             dataset.object_store(),
@@ -437,7 +438,7 @@ mod tests {
         .await
         .unwrap();
 
-        let graph = PersistedGraph::<FooVertex>::try_new(
+        let graph = PersistedGraph::<RowVertex>::try_new(
             Arc::new(dataset),
             "vector",
             &graph_path,

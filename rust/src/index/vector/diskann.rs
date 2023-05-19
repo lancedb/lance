@@ -16,7 +16,7 @@
 ///
 /// Modified from diskann paper. The vector store is backed by the `lance` dataset.
 mod builder;
-mod row_vertex;
+pub(crate) mod row_vertex;
 mod search;
 
 use super::{
