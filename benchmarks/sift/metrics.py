@@ -101,7 +101,16 @@ def test_dataset(
     avg_latency = tot / nsamples
     return recall(np.array(actual_sorted), np.array(results)), avg_latency
 
-def test_ivf_pq(args):
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("uri", help="Dataset URI", metavar="URI")
+    parser.add_argument("out", help="Output file", metavar="FILE")
+    parser.add_argument("-i", "--ivf-partitions", type=int, metavar="N")
+    parser.add_argument("-s", "--samples", default=100, type=int, metavar="N")
+    parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
+    args = parser.parse_args()
+
     columns = [
         "ivf",
         "pq",
@@ -160,19 +169,3 @@ def test_ivf_pq(args):
         }
     )
     df.to_csv(args.out, index=False)
-
-    pass
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("uri", help="Dataset URI", metavar="URI")
-    parser.add_argument("out", help="Output file", metavar="FILE")
-    parser.add_argument("-i", "--ivf-partitions", type=int, metavar="N")
-    parser.add_argument("-s", "--samples", default=100, type=int, metavar="N")
-    parser.add_argument("-k", "--top_k", default=10, type=int, metavar="N")
-    args = parser.parse_args()
-
-    dataset = lance.dataset(args.uri)
-    print(dataset.list_indices())
-    test_dataset(args.uri)
-    #test_ivf_pq(args)
