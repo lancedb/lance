@@ -15,6 +15,7 @@
 //! Graph-based vector index.
 //!
 
+use std::any::Any;
 use std::sync::Arc;
 
 use arrow_array::UInt32Array;
@@ -41,7 +42,9 @@ pub trait Graph {
 }
 
 /// Vertex (metadata). It does not include the actual data.
-pub trait Vertex {}
+pub trait Vertex {
+    fn vector(&self) -> &[f32];
+}
 
 /// Vertex SerDe. Used for serializing and deserializing the vertex.
 pub(crate) trait VertexSerDe<V: Vertex> {

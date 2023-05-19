@@ -26,7 +26,7 @@ use object_store::path::Path;
 
 use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
-use crate::arrow::as_fixed_size_binary_array;
+use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::datatypes::Schema;
 use crate::io::{FileReader, FileWriter, ObjectStore};
 use crate::{Error, Result};
@@ -186,11 +186,13 @@ impl<V: Vertex> PersistedGraph<V> {
 #[async_trait]
 impl<V: Vertex + Send + Sync> Graph for PersistedGraph<V> {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
-        todo!()
+        let vertex_a = self.vertex(a as u32).await?;
+        self.distance_to(vertex_a.vector(), b).await
     }
 
     async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
-        todo!()
+        let vertex = self.vertex(idx as u32).await?;
+        Ok(vertex.vector().l2(query))
     }
 
     /// Get the neighbors of a vertex, specified by its id.

@@ -33,7 +33,11 @@ impl RowVertex {
     }
 }
 
-impl Vertex for RowVertex {}
+impl Vertex for RowVertex {
+    fn vector(&self) -> &[f32] {
+        self.vector.as_ref().unwrap().values()
+    }
+}
 
 pub(crate) struct RowVertexSerDe {}
 
