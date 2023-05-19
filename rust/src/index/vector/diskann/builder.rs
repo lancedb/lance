@@ -313,7 +313,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
             .try_collect::<Vec<_>>()
             .await?;
         for (j, nbs) in neighbours {
-            graph.set_neighbors(j, Arc::new(nbs.iter().copied().collect::<UInt32Array>()));
+            graph.set_neighbors(j, Arc::new(nbs.into_iter().collect::<UInt32Array>()));
         }
     }
 
