@@ -41,13 +41,15 @@ def parse_one(path: Path):
     with (path / "new" / "estimates.json").open() as f:
         estimates = json.load(f)
         duration_ns = estimates["Mean"]["point_estimate"]
+        standard_error = estimates["Mean"]["standard_error"]
     return {
         "name": name,
         "commit": commit_sha,
         "datetime": datetime_str,
         "os": os,
         "arch": arch,
-        "duration_ns": duration_ns,
+        "mean_duration_ns": duration_ns,
+        "standard_error": standard_error
     }
 
 
