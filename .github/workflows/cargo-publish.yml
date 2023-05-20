@@ -1,4 +1,4 @@
-name: Rust
+name: Publish Rust crate
 
 on:
   release:
