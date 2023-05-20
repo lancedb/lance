@@ -40,8 +40,8 @@ def parse_one(path: Path):
     arch = get_arch()
     with (path / "new" / "estimates.json").open() as f:
         estimates = json.load(f)
-        duration_ns = estimates["Mean"]["point_estimate"]
-        standard_error = estimates["Mean"]["standard_error"]
+        duration_ns = estimates["mean"]["point_estimate"]
+        standard_error = estimates["mean"]["standard_error"]
     return {
         "name": name,
         "commit": commit_sha,
@@ -59,5 +59,8 @@ def parse_all(root=ROOT):
     for path in root.iterdir():
         if path.is_dir():
             results.append(parse_one(path))
-    print(results)
     return results
+
+
+if __name__ == "__main__":
+    print(parse_all())
