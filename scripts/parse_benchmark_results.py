@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """Parse the benchmark results and generate a json file for uploading/plotting"""
 import json
-import os
 from pathlib import Path
 import platform
 import subprocess
@@ -63,4 +62,7 @@ def parse_all(root=ROOT):
 
 
 if __name__ == "__main__":
-    print(parse_all())
+    rs = parse_all()
+    commit = get_commit_sha()
+    with (Path(__file__).parent.parent / f"results_{commit}.json").open("w") as f:
+        json.dump(rs, f, indent=2)
