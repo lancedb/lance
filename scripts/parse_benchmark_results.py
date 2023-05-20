@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Parse the benchmark results and generate a json file for uploading/plotting"""
 import json
 from pathlib import Path
