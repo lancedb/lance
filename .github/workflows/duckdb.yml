@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Checkout submodules
         run: |
           git submodule init
