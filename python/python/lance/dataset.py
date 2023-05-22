@@ -76,7 +76,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[list[str]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
-        limit: int = 0,
+        limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
@@ -96,8 +96,8 @@ class LanceDataset(pa.dataset.Dataset):
             Currently only >, <, >=, <=, ==, !=, |, & are supported.
             is_null, is_valid, ~, and others are not yet supported.
             Specifying these will result in an expression parsing error
-        limit: int, default 0
-            Fetch up to this many rows. All rows if 0 or unspecified.
+        limit: int, default None
+            Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
@@ -168,7 +168,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[list[str]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
-        limit: int = 0,
+        limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
@@ -187,8 +187,8 @@ class LanceDataset(pa.dataset.Dataset):
             Currently only >, <, >=, <=, ==, !=, |, & are supported.
             is_null, is_valid, ~, and others are not yet supported.
             Specifying these will result in an expression parsing error
-        limit: int, default 0
-            Fetch up to this many rows. All rows if 0 or unspecified.
+        limit: int, default None
+            Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
@@ -259,7 +259,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[list[str]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
-        limit: int = 0,
+        limit: Optional[int]= None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
@@ -571,8 +571,8 @@ class ScannerBuilder:
         self._scan_in_order = scan_in_order
         return self
 
-    def limit(self, n: int = 0) -> ScannerBuilder:
-        if int(n) < 0:
+    def limit(self, n: Optional[int] = None) -> ScannerBuilder:
+        if n is not None and int(n) < 0:
             raise ValueError("Limit must be non-negative")
         self._limit = n
         return self

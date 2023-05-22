@@ -152,11 +152,11 @@ impl Dataset {
                 .filter(f.as_str())
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        if let Some(limit) = limit {
-            scanner
-                .limit(limit, offset)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        }
+
+        scanner
+            .limit(limit, offset)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }

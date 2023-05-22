@@ -143,11 +143,11 @@ impl FileFragment {
                 .filter(&f)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
-        if let Some(l) = limit {
-            scanner
-                .limit(l, offset)
-                .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        }
+
+        scanner
+            .limit(limit, offset)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn, rt))
     }

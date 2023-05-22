@@ -141,6 +141,22 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
+def test_limit_offset(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    dataset = lance.dataset(base_dir)
+
+    # test just limit
+    assert dataset.to_table(limit=10) == table.slice(0, 10)
+
+    # test just offset
+    assert dataset.to_table(offset=10) == table.slice(10, 100)
+
+    # test both
+    assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
+
+
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
     current_dir = os.getcwd()
