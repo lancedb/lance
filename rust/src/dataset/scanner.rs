@@ -216,8 +216,8 @@ impl Scanner {
     }
 
     /// Set limit and offset.
-    pub fn limit(&mut self, limit: i64, offset: Option<i64>) -> Result<&mut Self> {
-        if limit < 0 {
+    pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
+        if limit.unwrap_or(0) < 0 {
             return Err(Error::IO("Limit must be non-negative".to_string()));
         }
         if let Some(off) = offset {
@@ -225,7 +225,7 @@ impl Scanner {
                 return Err(Error::IO("Offset must be non-negative".to_string()));
             }
         }
-        self.limit = Some(limit);
+        self.limit = limit;
         self.offset = offset;
         Ok(self)
     }
@@ -769,7 +769,7 @@ mod test {
 
         let dataset = Dataset::open(path).await.unwrap();
         let mut scanner = dataset.scan();
-        scanner.limit(2, Some(19)).unwrap();
+        scanner.limit(Some(2), Some(19)).unwrap();
         let actual_batches: Vec<RecordBatch> = scanner
             .try_into_stream()
             .await
