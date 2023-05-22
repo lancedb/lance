@@ -216,8 +216,13 @@ impl Scanner {
     }
 
     /// Set limit and offset.
+    ///
+    /// If offset is set, the first offset rows will be skipped. If limit is set,
+    /// only the provided number of rows will be returned. These can be set
+    /// independently. For example, setting offset to 10 and limit to None will
+    /// skip the first 10 rows and return the rest of the rows in the dataset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
-        if limit.unwrap_or(0) < 0 {
+        if limit.unwrap_or_default() < 0 {
             return Err(Error::IO("Limit must be non-negative".to_string()));
         }
         if let Some(off) = offset {
