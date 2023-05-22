@@ -8,6 +8,12 @@ on:
       - rust/**
       - protos/**
       - .github/workflows/rust.yml
+
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -17,6 +23,9 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
@@ -26,7 +35,7 @@ jobs:
       - name: Run tests
         run: |
           cargo build --all-features
-          cargo test
+          cargo test --all-features
   mac-build:
     runs-on: macos-12
     timeout-minutes: 30
@@ -37,24 +46,15 @@ jobs:
       - uses: actions/checkout@v3
       - name: CPU features
         run: sysctl -a | grep cpu
-      - name: Setup cache
-        uses: actions/cache@v3
-        continue-on-error: false
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: rust
       - name: Install dependencies
         run: brew install protobuf
       - name: Run tests
         run: |
           cargo build --all-features
-          cargo test
+          cargo test --all-features
   windows-build:
     runs-on: windows-latest
     timeout-minutes: 90
@@ -65,18 +65,9 @@ jobs:
       VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
     steps:
       - uses: actions/checkout@v3
-      - name: Setup cache
-        uses: actions/cache@v3
-        continue-on-error: false
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**\Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          workspaces: rust
       - uses: ./.github/workflows/install_windows_dependencies
         with:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
@@ -88,4 +79,4 @@ jobs:
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
           cargo build --all-features
-          cargo test
+          cargo test --all-features
