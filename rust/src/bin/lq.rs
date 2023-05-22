@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
         Commands::Query { uri, n } => {
             let dataset = Dataset::open(uri).await.unwrap();
             let mut scanner = dataset.scan();
-            scanner.limit(*n, None).unwrap();
+            scanner.limit(Some(*n), None).unwrap();
             let stream = scanner.try_into_stream().await.unwrap();
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
 
