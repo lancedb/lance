@@ -390,7 +390,9 @@ mod tests {
             .unwrap();
         let uuid = index_file.file_name().to_str().unwrap().to_string();
 
-        let index = open_index(&dataset, &uuid).await.unwrap();
+        let index = open_index(Arc::new(dataset), "vector", &uuid)
+            .await
+            .unwrap();
 
         if with_opq {
             let opq_idx = index.as_any().downcast_ref::<OPQIndex>().unwrap();

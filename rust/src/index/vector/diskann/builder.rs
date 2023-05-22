@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
 
+use arrow_array::UInt32Array;
 use arrow_array::{cast::as_primitive_array, types::UInt64Type};
 use arrow_select::concat::concat_batches;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -74,7 +76,8 @@ pub(crate) async fn build_diskann_index(
     println!("DiskANN: second pass: {}s", now.elapsed().as_secs_f32());
 
     let index_dir = dataset.indices_dir().child(uuid);
-    let graph_file = index_dir.child("diskann_graph.lance");
+    let filename = "diskann_graph.lance";
+    let graph_file = index_dir.child(filename);
 
     let mut write_params = WriteGraphParams::default();
     write_params.batch_size = 2048 * 10;
@@ -95,7 +98,7 @@ pub(crate) async fn build_diskann_index(
         name,
         uuid,
         graph.data.num_columns(),
-        graph_file.to_string().as_str(),
+        filename,
         &[medoid],
         params.metric_type,
         &params,
@@ -153,7 +156,8 @@ async fn init_graph(
     let distribution = Uniform::new(0, batch.num_rows());
     // Randomly connect to r neighbors.
     for i in 0..graph.len() {
-        let mut neighbor_ids: HashSet<u32> = graph.neighbors(i)?.iter().copied().collect();
+        let mut neighbor_ids: HashSet<u32> =
+            graph.neighbors(i).await?.values().iter().copied().collect();
 
         while neighbor_ids.len() < r {
             let neighbor_id = rng.sample(distribution);
@@ -162,17 +166,9 @@ async fn init_graph(
             }
         }
 
-        // Make bidirectional connections.
         {
-            let n = graph.neighbors_mut(i);
-            n.clear();
-            n.extend(neighbor_ids.iter().copied());
-            // Release mutable borrow on graph.
-        }
-        {
-            for neighbor_id in neighbor_ids.iter() {
-                graph.add_neighbor(*neighbor_id as usize, i);
-            }
+            let new_neighbors = Arc::new(UInt32Array::from_iter(neighbor_ids.iter().copied()));
+            graph.set_neighbors(i, new_neighbors);
         }
     }
 
@@ -192,7 +188,7 @@ fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
 }
 
 /// Algorithm 2 in the paper.
-async fn robust_prune<V: Vertex + Clone>(
+async fn robust_prune<V: Vertex + Clone + Sync + Send>(
     graph: &GraphBuilder<V>,
     id: usize,
     mut visited: HashSet<usize>,
@@ -200,8 +196,8 @@ async fn robust_prune<V: Vertex + Clone>(
     r: usize,
 ) -> Result<Vec<u32>> {
     visited.remove(&id);
-    let neighbors = graph.neighbors(id)?;
-    visited.extend(neighbors.iter().map(|id| *id as usize));
+    let neighbors = graph.neighbors(id).await?;
+    visited.extend(neighbors.values().iter().map(|id| *id as usize));
 
     let mut heap: BinaryHeap<VertexWithDistance> = visited
         .iter()
@@ -266,7 +262,7 @@ async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<us
 }
 
 /// One pass of index building.
-async fn index_once<V: Vertex + Clone>(
+async fn index_once<V: Vertex + Clone + Sync + Send>(
     graph: &mut GraphBuilder<V>,
     medoid: usize,
     alpha: f32,
@@ -283,20 +279,21 @@ async fn index_once<V: Vertex + Clone>(
             .row(i)
             .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
 
-        let state = greedy_search(graph, medoid, vector, 1, l)?;
-
-        graph
-            .neighbors_mut(id)
-            .extend(state.visited.iter().map(|id| *id as u32));
+        let state = greedy_search(graph, medoid, vector, 1, l).await?;
 
         let neighbors = robust_prune(graph, id, state.visited, alpha, r).await?;
-        graph.set_neighbors(id, neighbors.to_vec());
+        graph.set_neighbors(
+            id,
+            Arc::new(neighbors.iter().copied().collect::<UInt32Array>()),
+        );
 
         let fixed_graph: &GraphBuilder<V> = graph;
         let neighbours = stream::iter(neighbors)
             .map(|j| async move {
                 let mut neighbor_set: HashSet<usize> = fixed_graph
-                    .neighbors(j as usize)?
+                    .neighbors(j as usize)
+                    .await?
+                    .values()
                     .iter()
                     .map(|v| *v as usize)
                     .collect();
@@ -316,7 +313,7 @@ async fn index_once<V: Vertex + Clone>(
             .try_collect::<Vec<_>>()
             .await?;
         for (j, nbs) in neighbours {
-            graph.set_neighbors(j, nbs);
+            graph.set_neighbors(j, Arc::new(nbs.into_iter().collect::<UInt32Array>()));
         }
     }
 

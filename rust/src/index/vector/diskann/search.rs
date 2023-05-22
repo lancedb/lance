@@ -13,14 +13,41 @@
 // limitations under the License.
 
 use std::{
+    any::Any,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashSet},
+    sync::Arc,
 };
 
+use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use object_store::path::Path;
 use ordered_float::OrderedFloat;
 
-use crate::index::vector::graph::{Graph, VertexWithDistance};
-use crate::Result;
+use super::row_vertex::{RowVertex, RowVertexSerDe};
+use crate::{
+    dataset::{Dataset, ROW_ID},
+    index::{
+        vector::{
+            graph::{GraphReadParams, PersistedGraph},
+            SCORE_COL,
+        },
+        Index,
+    },
+    Result,
+};
+use crate::{
+    index::{
+        vector::VectorIndex,
+        vector::{
+            graph::{Graph, VertexWithDistance},
+            Query,
+        },
+    },
+    io::object_reader::ObjectReader,
+    Error,
+};
 
 /// DiskANN search state.
 pub(crate) struct SearchState {
@@ -36,6 +63,14 @@ pub(crate) struct SearchState {
 
     /// Heap maintains the unvisited vertices, ordered by the distance.
     heap: BinaryHeap<Reverse<VertexWithDistance>>,
+
+    /// Track the ones that have been computed distance with and pushed to heap already.
+    ///
+    /// This is different to visited, mostly because visited has a different meaning in the
+    /// paper, which is the one that has been popped from the heap.
+    /// But we wanted to avoid repeatly computing `argmin` over the heap, so we need another
+    /// meaning for visited.
+    heap_visisted: HashSet<usize>,
 
     /// Search size, `L` parameter in the paper. L must be greater or equal than k.
     l: usize,
@@ -53,6 +88,7 @@ impl SearchState {
             visited: HashSet::new(),
             candidates: BTreeMap::new(),
             heap: BinaryHeap::new(),
+            heap_visisted: HashSet::new(),
             k,
             l,
         }
@@ -61,9 +97,7 @@ impl SearchState {
     /// Return the next unvisited vertex.
     fn pop(&mut self) -> Option<usize> {
         while let Some(vertex) = self.heap.pop() {
-            // println!("Pop {} visited {:?}", vertex.0.id, self.visited);
-
-            if self.is_visited(vertex.0.id) || !self.candidates.contains_key(&vertex.0.distance) {
+            if !self.candidates.contains_key(&vertex.0.distance) {
                 // The vertex has been removed from the candidate lists,
                 // from [`push()`].
                 continue;
@@ -75,8 +109,10 @@ impl SearchState {
         None
     }
 
-    /// Push a new (unvisited) fvertex into the search state.
+    /// Push a new (unvisited) vertex into the search state.
     fn push(&mut self, vertex_id: usize, distance: f32) {
+        assert!(!self.visited.contains(&vertex_id));
+        self.heap_visisted.insert(vertex_id);
         self.heap
             .push(Reverse(VertexWithDistance::new(vertex_id, distance)));
         self.candidates.insert(OrderedFloat(distance), vertex_id);
@@ -92,7 +128,7 @@ impl SearchState {
 
     /// Returns true if the vertex has been visited.
     fn is_visited(&self, vertex_id: usize) -> bool {
-        self.visited.contains(&vertex_id)
+        self.visited.contains(&vertex_id) || self.heap_visisted.contains(&vertex_id)
     }
 }
 
@@ -105,8 +141,8 @@ impl SearchState {
 /// - query: The query vector.
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
-pub(crate) fn greedy_search(
-    graph: &dyn Graph,
+pub(crate) async fn greedy_search(
+    graph: &(dyn Graph + Send + Sync),
     start: usize,
     query: &[f32],
     k: usize,
@@ -116,22 +152,99 @@ pub(crate) fn greedy_search(
     // A map from distance to vertex id.
     let mut state = SearchState::new(k, search_size);
 
-    let dist = graph.distance_to(query, start)?;
+    let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
     while let Some(id) = state.pop() {
         state.visit(id);
-        for neighbor_id in graph.neighbors(id)?.iter() {
+
+        let neighbors = graph.neighbors(id).await?;
+        for neighbor_id in neighbors.values() {
             let neighbor_id = *neighbor_id as usize;
             if state.is_visited(neighbor_id) {
                 // Already visited.
                 continue;
             }
-            let dist = graph.distance_to(query, neighbor_id)?;
+            let dist = graph.distance_to(query, neighbor_id).await?;
             state.push(neighbor_id, dist);
         }
     }
 
     Ok(state)
+}
+
+pub struct DiskANNIndex {
+    graph: PersistedGraph<RowVertex>,
+}
+
+impl std::fmt::Debug for DiskANNIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DiskANNIndex")
+    }
+}
+
+impl DiskANNIndex {
+    /// Creates a new DiskANN index.
+
+    pub async fn try_new(
+        dataset: Arc<Dataset>,
+        index_column: &str,
+        graph_path: &Path,
+    ) -> Result<Self> {
+        let params = GraphReadParams::default();
+        let serde = Arc::new(RowVertexSerDe::new());
+        let graph =
+            PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
+        Ok(Self { graph })
+    }
+}
+
+impl Index for DiskANNIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[async_trait]
+impl VectorIndex for DiskANNIndex {
+    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+        let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(SCORE_COL, DataType::Float32, false),
+        ]));
+
+        let row_ids: UInt64Array = state
+            .candidates
+            .iter()
+            .take(query.k)
+            .map(|(_, id)| *id as u64)
+            .collect();
+        let scores: Float32Array = state
+            .candidates
+            .iter()
+            .take(query.k)
+            .map(|(d, _)| **d)
+            .collect();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+        )?;
+        Ok(batch)
+    }
+
+    fn is_loadable(&self) -> bool {
+        false
+    }
+
+    async fn load(
+        &self,
+        _reader: &dyn ObjectReader,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        Err(Error::Index("DiskANNIndex is not loadable".to_string()))
+    }
 }
 
 #[cfg(test)]

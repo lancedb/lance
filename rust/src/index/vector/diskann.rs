@@ -16,7 +16,7 @@
 ///
 /// Modified from diskann paper. The vector store is backed by the `lance` dataset.
 mod builder;
-mod row_vertex;
+pub(crate) mod row_vertex;
 mod search;
 
 use super::{
@@ -25,6 +25,8 @@ use super::{
 };
 use crate::index::vector::pq::PQBuildParams;
 pub(crate) use builder::build_diskann_index;
+pub(crate) use row_vertex::RowVertex;
+pub(crate) use search::DiskANNIndex;
 
 #[derive(Clone, Debug)]
 pub struct DiskANNParams {
@@ -48,9 +50,9 @@ pub struct DiskANNParams {
 impl Default for DiskANNParams {
     fn default() -> Self {
         Self {
-            r: 90,
+            r: 50,
             alpha: 1.2,
-            l: 100,
+            l: 70,
             pq_params: PQBuildParams::default(),
             metric_type: MetricType::L2,
         }

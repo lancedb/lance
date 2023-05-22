@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
+
 use arrow_array::Float32Array;
 use byteorder::{ByteOrder, LE};
 
@@ -23,7 +25,6 @@ use crate::Result;
 pub(crate) struct RowVertex {
     pub(crate) row_id: u64,
 
-    #[allow(dead_code)]
     pub(crate) vector: Option<Float32Array>,
 }
 
@@ -33,9 +34,27 @@ impl RowVertex {
     }
 }
 
-impl Vertex for RowVertex {}
+impl Vertex for RowVertex {
+    fn vector(&self) -> &[f32] {
+        self.vector.as_ref().unwrap().values()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
 
 pub(crate) struct RowVertexSerDe {}
+
+impl RowVertexSerDe {
+    pub(crate) fn new() -> Self {
+        Self {}
+    }
+}
 
 impl VertexSerDe<RowVertex> for RowVertexSerDe {
     fn size(&self) -> usize {

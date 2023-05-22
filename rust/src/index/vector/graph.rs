@@ -15,6 +15,11 @@
 //! Graph-based vector index.
 //!
 
+use std::any::Any;
+use std::sync::Arc;
+
+use arrow_array::UInt32Array;
+use async_trait::async_trait;
 use ordered_float::OrderedFloat;
 
 pub(crate) mod builder;
@@ -24,17 +29,26 @@ use crate::Result;
 pub use persisted::*;
 
 /// Graph
+#[async_trait]
 pub trait Graph {
     /// Distance between two vertices, specified by their IDs.
-    fn distance(&self, a: usize, b: usize) -> Result<f32>;
+    async fn distance(&self, a: usize, b: usize) -> Result<f32>;
 
-    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
+    /// Distance from query vector to a vertex identified by the idx.
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32>;
 
-    fn neighbors(&self, id: usize) -> Result<&[u32]>;
+    /// Return the neighbor IDs.
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>>;
 }
 
 /// Vertex (metadata). It does not include the actual data.
-pub trait Vertex {}
+pub trait Vertex: Clone {
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn vector(&self) -> &[f32];
+}
 
 /// Vertex SerDe. Used for serializing and deserializing the vertex.
 pub(crate) trait VertexSerDe<V: Vertex> {

@@ -16,6 +16,9 @@
 
 use std::sync::Arc;
 
+use arrow_array::UInt32Array;
+use async_trait::async_trait;
+
 use super::{Graph, Vertex};
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
@@ -29,13 +32,13 @@ pub(crate) struct Node<V: Vertex> {
 
     /// Neighbors are the ids of vertex in the graph.
     /// This id is not the same as the row_id in the original lance dataset.
-    pub(crate) neighbors: Vec<u32>,
+    pub(crate) neighbors: Arc<UInt32Array>,
 }
 
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub(crate) struct GraphBuilder<V: Vertex + Clone> {
+pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
@@ -48,14 +51,14 @@ pub(crate) struct GraphBuilder<V: Vertex + Clone> {
     distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync>,
 }
 
-impl<'a, V: Vertex + Clone> GraphBuilder<V> {
+impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
     pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
         Self {
             nodes: vertices
                 .iter()
                 .map(|v| Node {
                     vertex: v.clone(),
-                    neighbors: Vec::new(),
+                    neighbors: Arc::new(UInt32Array::from(vec![] as Vec<u32>)),
                 })
                 .collect(),
             data,
@@ -80,23 +83,15 @@ impl<'a, V: Vertex + Clone> GraphBuilder<V> {
         &mut self.nodes[id].vertex
     }
 
-    pub fn neighbors_mut(&mut self, id: usize) -> &mut Vec<u32> {
-        &mut self.nodes[id].neighbors
-    }
-
     /// Set neighbors of a node.
-    pub fn set_neighbors(&mut self, id: usize, neighbors: impl Into<Vec<u32>>) {
-        self.nodes[id].neighbors = neighbors.into();
-    }
-
-    /// Add a neighbor to a specific vertex.
-    pub fn add_neighbor(&mut self, vertex: usize, neighbor: usize) {
-        self.nodes[vertex].neighbors.push(neighbor as u32);
+    pub fn set_neighbors(&mut self, id: usize, neighbors: Arc<UInt32Array>) {
+        self.nodes[id].neighbors = neighbors;
     }
 }
 
-impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
-    fn distance(&self, a: usize, b: usize) -> Result<f32> {
+#[async_trait]
+impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
+    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
         let vector_a = self.data.row(a).ok_or_else(|| {
             Error::Index(format!(
                 "Vector index is out of range: {} >= {}",
@@ -115,7 +110,7 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
         Ok((self.distance_func)(vector_a, vector_b))
     }
 
-    fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
         let vector = self.data.row(idx).ok_or_else(|| {
             Error::Index(format!(
                 "Attempt to access row {} in a matrix with {} rows",
@@ -126,8 +121,8 @@ impl<V: Vertex + Clone> Graph for GraphBuilder<V> {
         Ok((self.distance_func)(query, vector))
     }
 
-    fn neighbors(&self, id: usize) -> Result<&[u32]> {
-        Ok(self.nodes[id].neighbors.as_slice())
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>> {
+        Ok(self.nodes[id].neighbors.clone())
     }
 }
 
@@ -143,10 +138,22 @@ mod tests {
         val: f32,
     }
 
-    impl Vertex for FooVertex {}
+    impl Vertex for FooVertex {
+        fn vector(&self) -> &[f32] {
+            todo!()
+        }
 
-    #[test]
-    fn test_construct_builder() {
+        fn as_any(&self) -> &dyn std::any::Any {
+            todo!()
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            todo!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_construct_builder() {
         let nodes = (0..100)
             .map(|v| FooVertex {
                 id: v as u32,
@@ -158,7 +165,7 @@ mod tests {
         assert_eq!(builder.len(), 100);
         assert_eq!(builder.vertex(77).id, 77);
         assert_relative_eq!(builder.vertex(77).val, 38.5);
-        assert!(builder.neighbors(55).unwrap().is_empty());
+        assert!(builder.neighbors(55).await.unwrap().is_empty());
 
         builder.vertex_mut(88).val = 22.0;
         assert_relative_eq!(builder.vertex(88).val, 22.0);

@@ -12,22 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{as_list_array, as_primitive_array};
+use arrow_array::cast::AsArray;
+use arrow_array::Float32Array;
 use arrow_array::{
     builder::{FixedSizeBinaryBuilder, ListBuilder, UInt32Builder},
     Array, RecordBatch, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use async_trait::async_trait;
 use lru_time_cache::LruCache;
 use object_store::path::Path;
 
-use super::builder::GraphBuilder;
+use super::{builder::GraphBuilder, Graph};
 use super::{Vertex, VertexSerDe};
-use crate::arrow::as_fixed_size_binary_array;
+use crate::arrow::as_fixed_size_list_array;
+use crate::dataset::Dataset;
 use crate::datatypes::Schema;
+use crate::index::vector::diskann::RowVertex;
 use crate::io::{FileReader, FileWriter, ObjectStore};
+use crate::{arrow::as_fixed_size_binary_array, linalg::l2::L2};
 use crate::{Error, Result};
 
 const NEIGHBORS_COL: &str = "neighbors";
@@ -53,7 +60,13 @@ impl Default for GraphReadParams {
 }
 
 /// Persisted graph on disk, stored in the file.
-pub(crate) struct PersistedGraph<V: Vertex> {
+pub(crate) struct PersistedGraph<V: Vertex + Debug> {
+    /// Reference to the dataset.
+    dataset: Arc<Dataset>,
+
+    /// Vector column.
+    vector_column_projection: Schema,
+
     reader: FileReader,
 
     /// Vertex size in bytes.
@@ -75,17 +88,19 @@ pub(crate) struct PersistedGraph<V: Vertex> {
     params: GraphReadParams,
 
     /// SerDe for vertex.
-    serde: Box<dyn VertexSerDe<V>>,
+    serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
 }
 
-impl<V: Vertex> PersistedGraph<V> {
+impl<V: Vertex + Debug> PersistedGraph<V> {
     /// Try open a persisted graph from a given URI.
     pub(crate) async fn try_new(
-        object_store: &ObjectStore,
+        dataset: Arc<Dataset>,
+        vector_column: &str,
         path: &Path,
         params: GraphReadParams,
-        serde: Box<dyn VertexSerDe<V>>,
+        serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
     ) -> Result<PersistedGraph<V>> {
+        let object_store = dataset.object_store();
         let file_reader = FileReader::try_new(object_store, path).await?;
 
         let schema = file_reader.schema();
@@ -107,7 +122,11 @@ impl<V: Vertex> PersistedGraph<V> {
         };
         let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
 
+        let vector_column_projection = dataset.schema().project(&[vector_column])?;
+
         Ok(Self {
+            dataset,
+            vector_column_projection,
             reader: file_reader,
             vertex_size,
             vertex_projection,
@@ -136,20 +155,37 @@ impl<V: Vertex> PersistedGraph<V> {
                 return Ok(vertex.clone());
             }
         }
-        let prefetch_size = self.params.prefetch_byte_size / self.vertex_size + 1;
-        let end = std::cmp::min(self.len(), id as usize + prefetch_size);
+        let end = (id + 1) as usize;
         let batch = self
             .reader
-            .read_range(id as usize..end, &self.vertex_projection)
+            .read_range(id as usize..(id + 1) as usize, &self.vertex_projection)
             .await?;
         assert_eq!(batch.num_rows(), end - id as usize);
+
+        let array = as_fixed_size_binary_array(batch.column(0));
+        let mut vertices = vec![];
+        for vertex_bytes in array.iter() {
+            let mut vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
+            let mut row_vector = vertex.as_any_mut().downcast_mut::<RowVertex>().unwrap();
+            let batch = self
+                .dataset
+                .take_rows(&[row_vector.row_id as u64], &self.vector_column_projection)
+                .await?;
+
+            let column = as_fixed_size_list_array(batch.column(0));
+            let values = column.value(0);
+            let vector: Float32Array = values.as_primitive().clone();
+            row_vector.vector = Some(vector);
+            vertices.push(vertex);
+        }
+
         {
             let mut cache = self.cache.lock().unwrap();
-            let array = as_fixed_size_binary_array(batch.column(0));
-            for (i, vertex_bytes) in array.iter().enumerate() {
-                let vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
+            for i in 0..vertices.len() {
+                let vertex = vertices[i].clone();
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
+
             Ok(cache.get(&id).unwrap().clone())
         }
     }
@@ -182,6 +218,46 @@ impl<V: Vertex> PersistedGraph<V> {
     }
 }
 
+#[async_trait]
+impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
+    async fn distance(&self, a: usize, b: usize) -> Result<f32> {
+        let vertex_a = self.vertex(a as u32).await?;
+        self.distance_to(vertex_a.vector(), b).await
+    }
+
+    async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
+        let vertex = self.vertex(idx as u32).await?;
+        Ok(vertex.vector().l2(query))
+    }
+
+    /// Get the neighbors of a vertex, specified by its id.
+    async fn neighbors(&self, id: usize) -> Result<Arc<UInt32Array>> {
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+            if let Some(neighbors) = cache.get(&(id as u32)) {
+                return Ok(neighbors.clone());
+            }
+        }
+        let batch = self
+            .reader
+            .read_range(id as usize..(id + 1) as usize, &self.neighbors_projection)
+            .await?;
+        {
+            let mut cache = self.neighbors_cache.lock().unwrap();
+
+            let array = as_list_array(batch.column(0));
+            if array.len() < 1 {
+                return Err(Error::Index("Invalid graph".to_string()));
+            }
+            let value = array.value(0);
+            let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
+            let neighbors = Arc::new(nb_array.clone());
+            cache.insert(id as u32, neighbors.clone());
+            Ok(neighbors.clone())
+        }
+    }
+}
+
 /// Parameters for writing the graph index.
 pub struct WriteGraphParams {
     pub batch_size: usize,
@@ -194,7 +270,7 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub(crate) async fn write_graph<V: Vertex + Clone>(
+pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,
@@ -231,7 +307,7 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
             vertex_builder.append_value(serde.serialize(&node.vertex))?;
             neighbors_builder
                 .values()
-                .append_slice(node.neighbors.as_slice());
+                .append_slice(node.neighbors.values());
             neighbors_builder.append(true);
         }
         let batch = RecordBatch::try_new(
@@ -252,8 +328,16 @@ pub(crate) async fn write_graph<V: Vertex + Clone>(
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::{FixedSizeListArray, RecordBatchReader};
+
     use super::*;
-    use crate::{arrow::linalg::MatrixView, index::vector::MetricType};
+    use crate::{
+        arrow::{linalg::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
+        dataset::WriteParams,
+        index::vector::diskann::row_vertex::RowVertexSerDe,
+        index::vector::MetricType,
+        utils::testing::generate_random_array,
+    };
 
     #[derive(Clone, Debug)]
     struct FooVertex {
@@ -262,7 +346,19 @@ mod tests {
         pq: Vec<u8>,
     }
 
-    impl Vertex for FooVertex {}
+    impl Vertex for FooVertex {
+        fn vector(&self) -> &[f32] {
+            unimplemented!()
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
 
     struct FooVertexSerDe {}
 
@@ -287,36 +383,70 @@ mod tests {
 
     #[tokio::test]
     async fn test_persisted_graph() {
-        let store = ObjectStore::memory();
-        let path = Path::from("/graph");
+        use tempfile::tempdir;
 
-        let nodes = (0..100)
-            .map(|v| FooVertex {
-                row_id: v as u32,
-                pq: vec![0; 16],
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let total = 100;
+        let dim = 32;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            true,
+        )]));
+        let data = generate_random_array(total * dim);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+            )],
+        )
+        .unwrap()]);
+
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let graph_path = dataset.indices_dir().child("graph");
+        let nodes = (0..total)
+            .map(|v| RowVertex {
+                row_id: v as u64,
+                vector: Some(generate_random_array(dim).into()),
             })
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);
-        for i in 0..100 {
-            for j in i..i + 10 {
-                builder.add_neighbor(i, j);
-            }
+        for i in 0..total as u32 {
+            let neighbors = Arc::new(UInt32Array::from_iter_values(i..i + 10));
+            builder.set_neighbors(i as usize, neighbors);
         }
-        let serde = Box::new(FooVertexSerDe {});
+        let serde = Arc::new(RowVertexSerDe {});
         write_graph(
             &builder,
-            &store,
-            &path,
+            dataset.object_store(),
+            &graph_path,
             &WriteGraphParams::default(),
             serde.as_ref(),
         )
         .await
         .unwrap();
 
-        let graph =
-            PersistedGraph::<FooVertex>::try_new(&store, &path, GraphReadParams::default(), serde)
-                .await
-                .unwrap();
+        let graph = PersistedGraph::<RowVertex>::try_new(
+            Arc::new(dataset),
+            "vector",
+            &graph_path,
+            GraphReadParams::default(),
+            serde,
+        )
+        .await
+        .unwrap();
         let vertex = graph.vertex(77).await.unwrap();
         assert_eq!(vertex.row_id, 77);
 
