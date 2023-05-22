@@ -13,6 +13,12 @@ on:
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
       - .github/workflows/run_tests/**
+
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+
 jobs:
   linux:
     timeout-minutes: 45
@@ -33,18 +39,9 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: 3.${{ matrix.python-minor-version }}
-    - name: Setup cache
-      uses: actions/cache@v3
-      continue-on-error: false
+    - uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
     - uses: ./.github/workflows/run_tests
   mac:
@@ -63,18 +60,9 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: "3.10"
-    - name: Setup cache
-      uses: actions/cache@v3
-      continue-on-error: false
+    - uses: Swatinem/rust-cache@v2
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-
+        workspaces: python
     - uses: ./.github/workflows/build_mac_wheel
     - uses: ./.github/workflows/run_tests
   windows:
@@ -89,18 +77,9 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
-      - name: Setup cache
-        uses: actions/cache@v3
-        continue-on-error: false
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          workspaces: python
       - uses: ./.github/workflows/build_windows_wheel
         with:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
