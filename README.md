@@ -6,7 +6,7 @@
 **Modern columnar data format for ML. Convert from parquet in 2-lines of code for 100x faster random access, a vector index, data versioning, and more.<br/>**
 **Compatible with pandas, duckdb, polars, pyarrow, with more integrations on the way.**
 
-<a href="https://eto-ai.github.io/lance/">Documentation</a> •
+<a href="https://lancedb.github.io/lance/">Documentation</a> •
 <a href="https://blog.eto.ai/">Blog</a> •
 <a href="https://discord.gg/zMM32dvNtd">Discord</a> •
 <a href="https://twitter.com/etodotai">Twitter</a>
