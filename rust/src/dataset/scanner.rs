@@ -1443,6 +1443,50 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_filter_with_regex() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "ls",
+            DataType::Utf8,
+            true,
+        )]));
+
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..20).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap()]);
+
+        let write_params = WriteParams::default();
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        let mut scan = dataset.scan();
+        scan.filter("regexp_match(ls, 's-1.')").unwrap();
+
+        let stream = scan.try_into_stream().await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = &batches[0];
+
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (10..=19).map(|v| format!("s-{}", v)),
+            ))],
+        )
+        .unwrap();
+
+        assert_eq!(batch, &expected);
+    }
+
+    #[tokio::test]
     async fn test_filter_proj_bug() {
         let struct_i_field = ArrowField::new("i", DataType::Int32, true);
         let struct_o_field = ArrowField::new("o", DataType::Utf8, true);
