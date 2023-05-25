@@ -18,10 +18,11 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    logical_expr::{col, BinaryExpr, Like, Operator},
+    logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator},
+    physical_expr::execution_props::ExecutionProps,
     physical_plan::{
         expressions::{InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr},
-        PhysicalExpr,
+        functions, PhysicalExpr,
     },
     prelude::Expr,
     scalar::ScalarValue,
@@ -31,6 +32,7 @@ use sqlparser::ast::{
     Value,
 };
 
+use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
 use crate::{
     datafusion::logical_expr::resolve_expr, datatypes::Schema, utils::sql::parse_sql_filter, Error,
     Result,
@@ -148,6 +150,24 @@ impl Planner {
             return Ok(Expr::IsNotNull(Box::new(
                 self.parse_function_args(&func.args[0])?,
             )));
+        } else if func.name.to_string() == "regexp_match" {
+            if func.args.len() != 2 {
+                return Err(Error::IO(format!(
+                    "regexp_match only supports 2 args, got {}",
+                    func.args.len()
+                )));
+            }
+
+            let args_vec: Vec<Expr> = func
+                .args
+                .iter()
+                .map(|arg| self.parse_function_args(arg).unwrap())
+                .collect::<Vec<_>>();
+
+            return Ok(Expr::ScalarFunction {
+                fun: BuiltinScalarFunction::RegexpMatch,
+                args: args_vec,
+            });
         }
         Err(Error::IO(format!(
             "function '{}' is not supported",
@@ -214,7 +234,8 @@ impl Planner {
         let ast_expr = parse_sql_filter(filter)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
-        resolve_expr(&expr, &schema)
+        let resolved = resolve_expr(&expr, &schema)?;
+        coerce_filter_type_to_boolean(resolved)
     }
 
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
@@ -253,6 +274,37 @@ impl Planner {
                 self.create_physical_expr(expr.pattern.as_ref())?,
             )),
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
+            Expr::ScalarFunction { fun, args } => {
+                if fun != &BuiltinScalarFunction::RegexpMatch {
+                    return Err(Error::IO(format!(
+                        "Scalar function '{:?}' is not supported",
+                        fun
+                    )));
+                }
+                let execution_props = ExecutionProps::new();
+                let args_vec = args
+                    .iter()
+                    .map(|e| self.create_physical_expr(e).unwrap())
+                    .collect::<Vec<_>>();
+                if args_vec.len() != 2 {
+                    return Err(Error::IO(format!(
+                        "Scalar function '{:?}' only supports 2 args, got {}",
+                        fun,
+                        args_vec.len()
+                    )));
+                }
+
+                let args_array: [Arc<dyn PhysicalExpr>; 2] =
+                    [args_vec[0].clone(), args_vec[1].clone()];
+
+                let physical_expr = functions::create_physical_expr(
+                    fun,
+                    &args_array,
+                    self.schema.as_ref(),
+                    &execution_props,
+                );
+                physical_expr?
+            }
             _ => {
                 return Err(Error::IO(format!(
                     "Expression '{expr}' is not supported as filter in lance"

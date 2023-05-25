@@ -55,7 +55,7 @@ arrow = { version = "37.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 sqlparser-lance = "0.32.0"
 # TODO: use datafusion sub-modules to reduce build size?
-datafusion = { version = "23.0.0", default-features = false }
+datafusion = { version = "23.0.0", default-features = false, features = ["regex_expressions"] }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 lapack = "0.19.0"
 cblas = "0.4.0"
