@@ -73,6 +73,8 @@ jobs:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
           update_vcpkg: true
       - name: Run tests
+        with:
+          root-reserve-mb: 1024
         run: |
           $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH

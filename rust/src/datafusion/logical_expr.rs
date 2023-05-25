@@ -15,7 +15,7 @@
 //! Extends logical expression.
 
 use arrow_schema::DataType;
-use datafusion::logical_expr::Operator;
+use datafusion::logical_expr::{BuiltinScalarFunction, Operator};
 use datafusion::scalar::ScalarValue;
 use datafusion::{logical_expr::BinaryExpr, prelude::*};
 
@@ -113,6 +113,24 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             // Passthrough
             Ok(expr.clone())
         }
+    }
+}
+
+/// Coerce logical expression for filters to bollean.
+///
+/// Parameters
+///
+/// - *expr*: a datafusion logical expression
+pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
+    match expr {
+        // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
+        // instead of hardcoding coerce method for each function
+        Expr::ScalarFunction {
+            fun: BuiltinScalarFunction::RegexpMatch,
+            args: _,
+        } => Ok(Expr::IsNotNull(Box::new(expr.to_owned()))),
+
+        _ => Ok(expr),
     }
 }
 
