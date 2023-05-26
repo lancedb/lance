@@ -13,6 +13,10 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=1"
+  RUST_BACKTRACE: "1"
 
 jobs:
   build:
@@ -73,8 +77,6 @@ jobs:
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
           update_vcpkg: true
       - name: Run tests
-        with:
-          root-reserve-mb: 1024
         run: |
           $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
           $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
