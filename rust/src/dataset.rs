@@ -487,6 +487,35 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
+    /// Count the number of rows in the dataset with filter.
+    pub async fn count_rows_with_filter(&self, expr: &str) -> Result<usize> {
+        // Open file to read metadata.
+        let count = stream::iter(self.get_fragments())
+            .map(|f| async move {
+                let mut scanner = f.scan();
+                let filter = scanner.filter(expr);
+                let filtered_rows = if let Ok(filtered_rows) = filter.as_ref() {
+                    filtered_rows
+                } else {
+                    return Err(Error::IO("No nearest query".to_string()));
+                };
+                filtered_rows
+                    .try_into_stream()
+                    .await
+                    .map_err(Error::from)?
+                    .try_fold(
+                        0usize,
+                        |acc, batch| async move { Ok(acc + batch.num_rows()) },
+                    )
+                    .await
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(count.into_iter().sum())
+    }
+
     pub async fn take(&self, row_indices: &[usize], projection: &Schema) -> Result<RecordBatch> {
         let mut sorted_indices: Vec<u32> =
             Vec::from_iter(row_indices.iter().map(|indice| *indice as u32));
