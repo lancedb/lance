@@ -177,17 +177,16 @@ impl ObjectStore {
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
-    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
+    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<Path>> {
         let path = dir_path.into();
         let path = Path::parse(path.to_string())?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
         output
             .common_prefixes
             .iter()
-            .map(|cp| cp.filename().map(|s| s.to_string()).unwrap_or_default())
-            .chain(output.objects.iter().map(|o| o.location.to_string()))
-            .map(|s| Ok(Path::parse(s)?.filename().unwrap().to_string()))
-            .collect::<Result<Vec<String>>>()
+            .chain(output.objects.iter().map(|o| &o.location))
+            .map(|s| Ok(Path::parse(s.filename().unwrap())?))
+            .collect::<Result<Vec<Path>>>()
     }
 
     /// Check a file exists.
@@ -294,10 +293,16 @@ mod tests {
         )
         .unwrap();
         let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
-        // tmp_dir
 
         let sub_dirs = store.read_dir("foo").await.unwrap();
-        assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+        assert_eq!(
+            sub_dirs,
+            vec![
+                Path::parse("bar").unwrap(),
+                Path::parse("zoo").unwrap(),
+                Path::parse("test_file").unwrap()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -327,8 +332,8 @@ mod tests {
         let drive_letter = get_drive_letter(prefix);
 
         write_to_file(
-            format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
-            "WINDOWS".to_string(),
+            &(format!("{drive_letter}:/test_folder/test.lance") + "/test_file"),
+            "WINDOWS",
         )
         .unwrap();
 
