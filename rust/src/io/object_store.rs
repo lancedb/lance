@@ -176,6 +176,20 @@ impl ObjectStore {
         ObjectWriter::new(self, path).await
     }
 
+    /// Read a directory (start from base directory) and returns all sub-paths in the directory.
+    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
+        let path = dir_path.into();
+        let path = Path::parse(path.to_string())?;
+        let output = self.inner.list_with_delimiter(Some(&path)).await?;
+        output
+            .common_prefixes
+            .iter()
+            .map(|cp| cp.filename().map(|s| s.to_string()).unwrap_or_default())
+            .chain(output.objects.iter().map(|o| o.location.to_string()))
+            .map(|s| Ok(Path::parse(s)?.filename().unwrap().to_string()))
+            .collect::<Result<Vec<String>>>()
+    }
+
     /// Check a file exists.
     pub async fn exists(&self, path: &Path) -> Result<bool> {
         match self.inner.head(path).await {
@@ -195,10 +209,11 @@ impl ObjectStore {
 mod tests {
     use super::*;
     use std::env::set_current_dir;
-    use std::fs::write;
+    use std::fs::{create_dir_all, write};
 
-    fn write_to_fs_file(path_str: String, contents: String) -> std::io::Result<()> {
-        let expanded = tilde(&path_str).to_string();
+    /// Write test content to file.
+    fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
+        let expanded = tilde(path_str).to_string();
         let path = StdPath::new(&expanded);
         std::fs::create_dir_all(path.parent().unwrap())?;
         write(path, contents)
@@ -216,9 +231,9 @@ mod tests {
     async fn test_absolute_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        write_to_fs_file(
-            tmp_path.clone() + "/bar/foo.lance/test_file",
-            "TEST_CONTENT".to_string(),
+        write_to_file(
+            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+            "TEST_CONTENT",
         )
         .unwrap();
 
@@ -240,9 +255,9 @@ mod tests {
     async fn test_relative_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        write_to_fs_file(
-            tmp_path.clone() + "/bar/foo.lance/test_file",
-            "RELATIVE_URL".to_string(),
+        write_to_file(
+            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+            "RELATIVE_URL",
         )
         .unwrap();
 
@@ -258,12 +273,31 @@ mod tests {
     #[tokio::test]
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
-        write_to_fs_file(uri.to_string() + "/test_file", "TILDE".to_string()).unwrap();
+        write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
         let store = ObjectStore::new(uri).await.unwrap();
         let contents = read_from_store(store, &Path::from("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
+    }
+
+    #[tokio::test]
+    async fn test_read_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path();
+        create_dir_all(path.join("foo").join("bar")).unwrap();
+        create_dir_all(path.join("foo").join("zoo")).unwrap();
+        create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
+        write_to_file(
+            path.join("foo").join("test_file").to_str().unwrap(),
+            "read_dir",
+        )
+        .unwrap();
+        let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
+        // tmp_dir
+
+        let sub_dirs = store.read_dir("foo").await.unwrap();
+        assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 
     #[tokio::test]
@@ -292,7 +326,7 @@ mod tests {
         let prefix = get_path_prefix(tmp_path);
         let drive_letter = get_drive_letter(prefix);
 
-        write_to_fs_file(
+        write_to_file(
             format!("{drive_letter}:/test_folder/test.lance") + "/test_file",
             "WINDOWS".to_string(),
         )

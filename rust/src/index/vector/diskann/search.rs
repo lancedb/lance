@@ -102,6 +102,7 @@ impl SearchState {
                 // from [`push()`].
                 continue;
             }
+
             self.visited.insert(vertex.0.id);
             return Some(vertex.0.id);
         }
