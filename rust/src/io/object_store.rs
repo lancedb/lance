@@ -177,16 +177,16 @@ impl ObjectStore {
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
-    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<Path>> {
+    pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
         let path = Path::parse(path.to_string())?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
-        output
+        Ok(output
             .common_prefixes
             .iter()
             .chain(output.objects.iter().map(|o| &o.location))
-            .map(|s| Ok(Path::parse(s.filename().unwrap())?))
-            .collect::<Result<Vec<Path>>>()
+            .map(|s| s.filename().unwrap().to_string())
+            .collect())
     }
 
     /// Check a file exists.
@@ -295,14 +295,7 @@ mod tests {
         let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
 
         let sub_dirs = store.read_dir("foo").await.unwrap();
-        assert_eq!(
-            sub_dirs,
-            vec![
-                Path::parse("bar").unwrap(),
-                Path::parse("zoo").unwrap(),
-                Path::parse("test_file").unwrap()
-            ]
-        );
+        assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 
     #[tokio::test]
