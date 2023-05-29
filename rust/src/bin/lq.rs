@@ -168,18 +168,22 @@ async fn create_index(
     metric_type: &Option<String>,
     use_opq: bool,
 ) -> Result<()> {
-    let col = column
-        .as_ref()
-        .ok_or_else(|| Error::Index("Must specify column".to_string()))?;
-    let _ = index_type.ok_or_else(|| Error::Index("Must specify index type".to_string()))?;
+    let col = column.as_ref().ok_or_else(|| Error::Index {
+        message: "Must specify column".to_string(),
+    })?;
+    let _ = index_type.ok_or_else(|| Error::Index {
+        message: "Must specify index type".to_string(),
+    })?;
     let mt = match metric_type.as_ref().unwrap_or(&"l2".to_string()).as_str() {
         "l2" => MetricType::L2,
         "cosine" => MetricType::Cosine,
         _ => {
-            return Err(Error::Index(format!(
-                "Only l2 and cosine metric type are supported, got: {}",
-                metric_type.as_ref().unwrap_or(&"N/A".to_string())
-            )));
+            return Err(Error::Index {
+                message: format!(
+                    "Only l2 and cosine metric type are supported, got: {}",
+                    metric_type.as_ref().unwrap_or(&"N/A".to_string())
+                ),
+            });
         }
     };
     dataset
