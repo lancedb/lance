@@ -47,8 +47,8 @@ pub async fn flat_search(
             }
             let vectors = batch
                 .column_by_name(&query.column)
-                .ok_or_else(|| {
-                    Error::Schema(format!("column {} does not exist in dataset", query.column))
+                .ok_or_else(|| Error::Schema {
+                    message: format!("column {} does not exist in dataset", query.column),
                 })?
                 .clone();
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();

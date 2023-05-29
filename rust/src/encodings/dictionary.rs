@@ -85,10 +85,12 @@ impl<'a> Encoder for DictionaryEncoder<'a> {
             Int16 => self.write_typed_array::<Int16Type>(array).await,
             Int32 => self.write_typed_array::<Int32Type>(array).await,
             Int64 => self.write_typed_array::<Int64Type>(array).await,
-            _ => Err(Error::Schema(format!(
-                "DictionaryEncoder: unsupported key type: {:?}",
-                self.key_type
-            ))),
+            _ => Err(Error::Schema {
+                message: format!(
+                    "DictionaryEncoder: unsupported key type: {:?}",
+                    self.key_type
+                ),
+            }),
         }
     }
 }
@@ -140,10 +142,9 @@ impl<'a> DictionaryDecoder<'a> {
             assert!(key_type.as_ref().is_dictionary_key_type());
             key_type.as_ref()
         } else {
-            return Err(Error::Arrow(format!(
-                "Not a dictionary type: {}",
-                self.data_type
-            )));
+            return Err(Error::Arrow {
+                message: format!("Not a dictionary type: {}", self.data_type),
+            });
         };
 
         let decoder = PlainDecoder::new(self.reader, index_type, self.position, self.length)?;
@@ -158,9 +159,9 @@ impl<'a> DictionaryDecoder<'a> {
             DataType::UInt16 => self.make_dict_array::<UInt16Type>(keys).await,
             DataType::UInt32 => self.make_dict_array::<UInt32Type>(keys).await,
             DataType::UInt64 => self.make_dict_array::<UInt64Type>(keys).await,
-            _ => Err(Error::Arrow(format!(
-                "Dictionary encoding does not support index type: {index_type}",
-            ))),
+            _ => Err(Error::Arrow {
+                message: format!("Dictionary encoding does not support index type: {index_type}",),
+            }),
         }
     }
 

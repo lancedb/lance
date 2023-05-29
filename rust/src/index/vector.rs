@@ -154,7 +154,9 @@ impl TryFrom<&str> for MetricType {
         match s.to_lowercase().as_str() {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
-            _ => Err(Error::Index(format!("Metric type '{s}' is not supported"))),
+            _ => Err(Error::Index {
+                message: format!("Metric type '{s}' is not supported"),
+            }),
         }
     }
 }
@@ -268,23 +270,23 @@ pub(crate) async fn build_vector_index(
     let stages = &params.stages;
 
     if stages.is_empty() {
-        return Err(Error::Index(
-            "Build Vector Index: must have at least 1 stage".to_string(),
-        ));
+        return Err(Error::Index {
+            message: "Build Vector Index: must have at least 1 stage".to_string(),
+        });
     };
 
     if is_ivf_pq(stages) {
         // This is a IVF PQ index.
         let len = stages.len();
         let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
-            return Err(Error::Index(
+            return Err(Error::Index{message:
                 format!("Build Vector Index: invalid stages: {:?}", stages),
-            ));
+            });
         };
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
-            return Err(Error::Index(
+            return Err(Error::Index{message:
                 format!("Build Vector Index: invalid stages: {:?}", stages),
-            ));
+            });
         };
         build_ivf_pq_index(
             dataset,
@@ -300,16 +302,15 @@ pub(crate) async fn build_vector_index(
         // This is DiskANN index.
         use self::diskann::build_diskann_index;
         let StageParams::DiskANN(params) = stages.last().unwrap() else {
-            return Err(Error::Index(
+            return Err(Error::Index{message:
                 format!("Build Vector Index: invalid stages: {:?}", stages),
-            ));
+            });
         };
         build_diskann_index(dataset, column, name, uuid, params.clone()).await?;
     } else {
-        return Err(Error::Index(format!(
-            "Build Vector Index: invalid stages: {:?}",
-            stages
-        )));
+        return Err(Error::Index {
+            message: format!("Build Vector Index: invalid stages: {:?}", stages),
+        });
     }
 
     Ok(())
@@ -349,14 +350,14 @@ pub(crate) async fn open_index(
     };
 
     if proto.columns.len() != 1 {
-        return Err(Error::Index(
-            "VectorIndex only supports 1 column".to_string(),
-        ));
+        return Err(Error::Index {
+            message: "VectorIndex only supports 1 column".to_string(),
+        });
     }
     assert_eq!(proto.index_type, pb::IndexType::Vector as i32);
 
     let Some(idx_impl) = proto.implementation.as_ref() else {
-        return Err(Error::Index("Invalid protobuf for VectorIndex metadata".to_string()));
+        return Err(Error::Index{message:"Invalid protobuf for VectorIndex metadata".to_string()});
     };
 
     let vec_idx = match idx_impl {
@@ -364,10 +365,9 @@ pub(crate) async fn open_index(
     };
 
     let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
-        .ok_or(Error::Index(format!(
-            "Unsupported metric type value: {}",
-            vec_idx.metric_type
-        )))?
+        .ok_or(Error::Index {
+            message: format!("Unsupported metric type value: {}", vec_idx.metric_type),
+        })?
         .into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
@@ -375,10 +375,9 @@ pub(crate) async fn open_index(
         match stg.stage.as_ref() {
             Some(Stage::Transform(tf)) => {
                 if last_stage.is_none() {
-                    return Err(Error::Index(format!(
-                        "Invalid vector index stages: {:?}",
-                        vec_idx.stages
-                    )));
+                    return Err(Error::Index {
+                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                    });
                 }
                 match tf.r#type() {
                     pb::TransformType::Opq => {
@@ -401,10 +400,9 @@ pub(crate) async fn open_index(
             }
             Some(Stage::Ivf(ivf_pb)) => {
                 if last_stage.is_none() {
-                    return Err(Error::Index(format!(
-                        "Invalid vector index stages: {:?}",
-                        vec_idx.stages
-                    )));
+                    return Err(Error::Index {
+                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                    });
                 }
                 let ivf = Ivf::try_from(ivf_pb)?;
                 last_stage = Some(Arc::new(IVFIndex::try_new(
@@ -418,20 +416,21 @@ pub(crate) async fn open_index(
             }
             Some(Stage::Pq(pq_proto)) => {
                 if last_stage.is_some() {
-                    return Err(Error::Index(format!(
-                        "Invalid vector index stages: {:?}",
-                        vec_idx.stages
-                    )));
+                    return Err(Error::Index {
+                        message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
+                    });
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
                 last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
             }
             Some(Stage::Diskann(diskann_proto)) => {
                 if last_stage.is_some() {
-                    return Err(Error::Index(format!(
-                        "DiskANN should be the only stage, but we got stages: {:?}",
-                        vec_idx.stages
-                    )));
+                    return Err(Error::Index {
+                        message: format!(
+                            "DiskANN should be the only stage, but we got stages: {:?}",
+                            vec_idx.stages
+                        ),
+                    });
                 };
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
                 let diskann =
@@ -443,10 +442,9 @@ pub(crate) async fn open_index(
     }
 
     if last_stage.is_none() {
-        return Err(Error::Index(format!(
-            "Invalid index stages: {:?}",
-            vec_idx.stages
-        )));
+        return Err(Error::Index {
+            message: format!("Invalid index stages: {:?}", vec_idx.stages),
+        });
     }
     let idx = last_stage.unwrap();
     dataset.session.index_cache.insert(uuid, idx.clone());

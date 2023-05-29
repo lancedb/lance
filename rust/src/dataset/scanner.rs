@@ -144,9 +144,9 @@ impl Scanner {
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
         if self.is_fragment_scan() {
-            Err(Error::IO(
-                "This operation is not supported for fragment scan".to_string(),
-            ))
+            Err(Error::IO {
+                message: "This operation is not supported for fragment scan".to_string(),
+            })
         } else {
             Ok(())
         }
@@ -223,11 +223,15 @@ impl Scanner {
     /// skip the first 10 rows and return the rest of the rows in the dataset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         if limit.unwrap_or_default() < 0 {
-            return Err(Error::IO("Limit must be non-negative".to_string()));
+            return Err(Error::IO {
+                message: "Limit must be non-negative".to_string(),
+            });
         }
         if let Some(off) = offset {
             if off < 0 {
-                return Err(Error::IO("Offset must be non-negative".to_string()));
+                return Err(Error::IO {
+                    message: "Offset must be non-negative".to_string(),
+                });
             }
         }
         self.limit = limit;
@@ -240,12 +244,14 @@ impl Scanner {
         self.ensure_not_fragment_scan()?;
 
         if k == 0 {
-            return Err(Error::IO("k must be positive".to_string()));
+            return Err(Error::IO {
+                message: "k must be positive".to_string(),
+            });
         }
         if q.is_empty() {
-            return Err(Error::IO(
-                "Query vector must have non-zero length".to_string(),
-            ));
+            return Err(Error::IO {
+                message: "Query vector must have non-zero length".to_string(),
+            });
         }
         // make sure the field exists
         self.dataset.schema().project(&[column])?;
@@ -313,13 +319,11 @@ impl Scanner {
         let mut extra_columns = vec![];
 
         if let Some(q) = self.nearest.as_ref() {
-            let vector_field = self
-                .dataset
-                .schema()
-                .field(&q.column)
-                .ok_or(Error::IO(format!("Column {} not found", q.column)))?;
-            let vector_field = ArrowField::try_from(vector_field).map_err(|e| {
-                Error::IO(format!("Failed to convert vector field: {}", e.to_string()))
+            let vector_field = self.dataset.schema().field(&q.column).ok_or(Error::IO {
+                message: format!("Column {} not found", q.column),
+            })?;
+            let vector_field = ArrowField::try_from(vector_field).map_err(|e| Error::IO {
+                message: format!("Failed to convert vector field: {}", e.to_string()),
             })?;
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new("score", DataType::Float32, false));
@@ -445,7 +449,7 @@ impl Scanner {
     // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::IO("No nearest query".to_string()));
+            return Err(Error::IO{message:"No nearest query".to_string()});
         };
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
@@ -461,7 +465,9 @@ impl Scanner {
             // We will use the index.
             if let Some(rf) = q.refine_factor {
                 if rf == 0 {
-                    return Err(Error::IO("Refine factor can not be zero".to_string()));
+                    return Err(Error::IO {
+                        message: "Refine factor can not be zero".to_string(),
+                    });
                 }
             }
 
@@ -498,15 +504,16 @@ impl Scanner {
         if version != self.dataset.version().version {
             // If we've added more rows, then we'll have new fragments
             let ds = self.dataset.checkout_version(version).await?;
-            let max_fragment_id_idx = ds
-                .manifest
-                .max_fragment_id()
-                .ok_or_else(|| Error::IO("No fragments in index version".to_string()))?;
-            let max_fragment_id_ds = self
-                .dataset
-                .manifest
-                .max_fragment_id()
-                .ok_or_else(|| Error::IO("No fragments in dataset version".to_string()))?;
+            let max_fragment_id_idx = ds.manifest.max_fragment_id().ok_or_else(|| Error::IO {
+                message: "No fragments in index version".to_string(),
+            })?;
+            let max_fragment_id_ds =
+                self.dataset
+                    .manifest
+                    .max_fragment_id()
+                    .ok_or_else(|| Error::IO {
+                        message: "No fragments in dataset version".to_string(),
+                    })?;
             // If we have new fragments, then we need to do a combined search
             if max_fragment_id_idx < max_fragment_id_ds {
                 let vector_scan_projection =
@@ -621,9 +628,11 @@ impl Stream for DatasetRecordBatchStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
         match this.exec_node.poll_next_unpin(cx) {
-            Poll::Ready(result) => {
-                Poll::Ready(result.map(|r| r.map_err(|e| Error::IO(e.to_string()))))
-            }
+            Poll::Ready(result) => Poll::Ready(result.map(|r| {
+                r.map_err(|e| Error::IO {
+                    message: e.to_string(),
+                })
+            })),
             Poll::Pending => Poll::Pending,
         }
     }

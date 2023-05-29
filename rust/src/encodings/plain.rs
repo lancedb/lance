@@ -141,11 +141,8 @@ impl<'a> PlainEncoder<'a> {
             let list_array = array
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| {
-                    Error::Schema(format!(
-                        "Needed a FixedSizeListArray but got {}",
-                        array.data_type()
-                    ))
+                .ok_or_else(|| Error::Schema {
+                    message: format!("Needed a FixedSizeListArray but got {}", array.data_type()),
                 })?;
             let offset = list_array.value_offset(0) as usize;
             let length = list_array.len() as usize;
@@ -204,10 +201,12 @@ impl<'a> PlainDecoder<'a> {
     ///
     async fn decode_primitive(&self, start: usize, end: usize) -> Result<ArrayRef> {
         if end > self.length {
-            return Err(Error::IO(format!(
-                "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
-                start, end, self.length
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "PlainDecoder: request([{}..{}]) out of range: [0..{}]",
+                    start, end, self.length
+                ),
+            });
         }
         let byte_range = get_byte_range(self.data_type, start..end);
         let range = Range {
@@ -233,10 +232,12 @@ impl<'a> PlainDecoder<'a> {
         end: usize,
     ) -> Result<ArrayRef> {
         if !items.data_type().is_fixed_stride() {
-            return Err(Error::Schema(format!(
-                "Items for fixed size list should be primitives but found {}",
-                items.data_type()
-            )));
+            return Err(Error::Schema {
+                message: format!(
+                    "Items for fixed size list should be primitives but found {}",
+                    items.data_type()
+                ),
+            });
         };
         let item_decoder = PlainDecoder::new(
             self.reader,
@@ -268,8 +269,8 @@ impl<'a> PlainDecoder<'a> {
         let values = bytes_array
             .as_any()
             .downcast_ref::<UInt8Array>()
-            .ok_or_else(|| {
-                Error::Schema("Could not cast to UInt8Array for FixedSizeBinary".to_string())
+            .ok_or_else(|| Error::Schema {
+                message: "Could not cast to UInt8Array for FixedSizeBinary".to_string(),
             })?;
         Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
     }

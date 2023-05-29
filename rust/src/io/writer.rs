@@ -44,15 +44,15 @@ pub async fn write_manifest(
     for field_id in 0..max_field_id + 1 {
         if let Some(field) = manifest.schema.mut_field_by_id(field_id) {
             if field.data_type().is_dictionary() {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                    Error::IO(format!("Lance field {} misses dictionary info", field.name))
+                let dict_info = field.dictionary.as_mut().ok_or_else(|| Error::IO {
+                    message: format!("Lance field {} misses dictionary info", field.name),
                 })?;
 
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                    Error::IO(format!(
+                let value_arr = dict_info.values.as_ref().ok_or_else(|| Error::IO {
+                    message: format!(
                         "Lance field {} is dictionary type, but misses the dictionary value array",
                         field.name
-                    ))
+                    ),
                 })?;
 
                 let data_type = value_arr.data_type();
@@ -66,10 +66,12 @@ pub async fn write_manifest(
                         encoder.encode(&[value_arr]).await?
                     }
                     _ => {
-                        return Err(Error::IO(format!(
-                            "Does not support {} as dictionary value type",
-                            value_arr.data_type()
-                        )));
+                        return Err(Error::IO {
+                            message: format!(
+                                "Does not support {} as dictionary value type",
+                                value_arr.data_type()
+                            ),
+                        });
                     }
                 };
                 dict_info.offset = pos;
@@ -141,8 +143,8 @@ impl FileWriter {
             let arrs = batches
                 .iter()
                 .map(|batch| {
-                    batch.column_by_name(&field.name).ok_or_else(|| {
-                        Error::IO(format!("FileWriter::write: Field {} not found", field.name))
+                    batch.column_by_name(&field.name).ok_or_else(|| Error::IO {
+                        message: format!("FileWriter::write: Field {} not found", field.name),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -201,9 +203,9 @@ impl FileWriter {
                     .await
             }
             _ => {
-                return Err(Error::Schema(format!(
-                    "FileWriter::write: unsupported data type: {data_type}"
-                )))
+                return Err(Error::Schema {
+                    message: format!("FileWriter::write: unsupported data type: {data_type}"),
+                })
             }
         }
     }
@@ -268,11 +270,13 @@ impl FileWriter {
             for struct_array in arrays {
                 let arr = struct_array
                     .column_by_name(&child.name)
-                    .ok_or(Error::Schema(format!(
-                        "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
-                        child.name,
-                        struct_array.data_type()
-                    )))?;
+                    .ok_or(Error::Schema {
+                        message: format!(
+                            "FileWriter: schema mismatch: column {} does not exist in array: {:?}",
+                            child.name,
+                            struct_array.data_type()
+                        ),
+                    })?;
                 arrs.push(arr);
             }
             self.write_array(child, arrs.as_slice()).await?;

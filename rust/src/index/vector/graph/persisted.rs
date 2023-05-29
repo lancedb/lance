@@ -109,16 +109,18 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
             match field.data_type() {
                 DataType::FixedSizeBinary(size) => size as usize,
                 _ => {
-                    return Err(Error::Index(format!(
-                        "Vertex column must be of fixed size binary, got: {}",
-                        field.data_type()
-                    )))
+                    return Err(Error::Index {
+                        message: format!(
+                            "Vertex column must be of fixed size binary, got: {}",
+                            field.data_type()
+                        ),
+                    })
                 }
             }
         } else {
-            return Err(Error::Index(
-                "Vertex column does not exist in the graph".to_string(),
-            ));
+            return Err(Error::Index {
+                message: "Vertex column does not exist in the graph".to_string(),
+            });
         };
         let neighbors_projection = schema.project(&[NEIGHBORS_COL])?;
 
@@ -207,7 +209,9 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
 
             let array = as_list_array(batch.column(0));
             if array.len() < 1 {
-                return Err(Error::Index("Invalid graph".to_string()));
+                return Err(Error::Index {
+                    message: "Invalid graph".to_string(),
+                });
             }
             let value = array.value(0);
             let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
@@ -247,7 +251,9 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
 
             let array = as_list_array(batch.column(0));
             if array.len() < 1 {
-                return Err(Error::Index("Invalid graph".to_string()));
+                return Err(Error::Index {
+                    message: "Invalid graph".to_string(),
+                });
             }
             let value = array.value(0);
             let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
@@ -278,7 +284,9 @@ pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
     serde: &impl VertexSerDe<V>,
 ) -> Result<()> {
     if graph.is_empty() {
-        return Err(Error::Index("Invalid graph".to_string()));
+        return Err(Error::Index {
+            message: "Invalid graph".to_string(),
+        });
     }
     let binary_size = serde.size();
     let arrow_schema = Arc::new(ArrowSchema::new(vec![

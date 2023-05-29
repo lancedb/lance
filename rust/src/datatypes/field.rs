@@ -189,10 +189,12 @@ impl Field {
     ///
     pub(super) fn project_by_field(&self, other: &Self) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Schema(format!(
-                "Attempt to project field by different names: {} and {}",
-                self.name, other.name,
-            )));
+            return Err(Error::Schema {
+                message: format!(
+                    "Attempt to project field by different names: {} and {}",
+                    self.name, other.name,
+                ),
+            });
         };
 
         match (self.data_type(), other.data_type()) {
@@ -202,10 +204,12 @@ impl Field {
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
             {
                 if dt != other_dt {
-                    return Err(Error::Schema(format!(
-                        "Attempt to project field by different types: {} and {}",
-                        dt, other_dt,
-                    )));
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Attempt to project field by different types: {} and {}",
+                            dt, other_dt,
+                        ),
+                    });
                 }
                 Ok(self.clone())
             }
@@ -213,9 +217,9 @@ impl Field {
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
-                        return Err(Error::Schema(format!(
+                        return Err(Error::Schema{message:format!(
                             "Attempt to project non-existed field: {} on {}", other_field.name, self,
-                        )));
+                        )});
                     };
                     fields.push(child.project_by_field(other_field)?);
                 }
@@ -240,10 +244,12 @@ impl Field {
                 DataType::Dictionary(other_key, other_value),
             ) if self_key == other_key && self_value == other_value => Ok(self.clone()),
             (DataType::Null, DataType::Null) => Ok(self.clone()),
-            _ => Err(Error::Schema(format!(
-                "Attempt to project incompatible fields: {} and {}",
-                self, other
-            ))),
+            _ => Err(Error::Schema {
+                message: format!(
+                    "Attempt to project incompatible fields: {} and {}",
+                    self, other
+                ),
+            }),
         }
     }
 
@@ -251,10 +257,12 @@ impl Field {
     ///
     pub(super) fn intersection(&self, other: &Self) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Arrow(format!(
-                "Attempt to intersect different fields: {} and {}",
-                self.name, other.name,
-            )));
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to intersect different fields: {} and {}",
+                    self.name, other.name,
+                ),
+            });
         }
         let self_type = self.data_type();
         let other_type = other.data_type();
@@ -286,10 +294,12 @@ impl Field {
         }
 
         if self_type != other_type || self.name != other.name {
-            return Err(Error::Arrow(format!(
-                "Attempt to intersect different fields: ({}, {}) and ({}, {})",
-                self.name, self_type, other.name, other_type
-            )));
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to intersect different fields: ({}, {}) and ({}, {})",
+                    self.name, self_type, other.name, other_type
+                ),
+            });
         }
 
         Ok(self.clone())
@@ -358,10 +368,12 @@ impl Field {
             }
             _ => {
                 if self.data_type() != other.data_type() {
-                    return Err(Error::Schema(format!(
-                        "Attempt to merge incompatible fields: {} and {}",
-                        self, other
-                    )));
+                    return Err(Error::Schema {
+                        message: format!(
+                            "Attempt to merge incompatible fields: {} and {}",
+                            self, other
+                        ),
+                    });
                 }
             }
         }
@@ -440,10 +452,12 @@ impl Field {
                         );
                     }
                     _ => {
-                        return Err(Error::Schema(format!(
-                            "Does not support {} as dictionary value type",
-                            value_type
-                        )));
+                        return Err(Error::Schema {
+                            message: format!(
+                                "Does not support {} as dictionary value type",
+                                value_type
+                            ),
+                        });
                     }
                 }
             } else {

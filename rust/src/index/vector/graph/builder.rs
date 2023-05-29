@@ -92,31 +92,31 @@ impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
 #[async_trait]
 impl<V: Vertex + Clone + Sync + Send> Graph for GraphBuilder<V> {
     async fn distance(&self, a: usize, b: usize) -> Result<f32> {
-        let vector_a = self.data.row(a).ok_or_else(|| {
-            Error::Index(format!(
+        let vector_a = self.data.row(a).ok_or_else(|| Error::Index {
+            message: format!(
                 "Vector index is out of range: {} >= {}",
                 a,
                 self.data.num_rows()
-            ))
+            ),
         })?;
 
-        let vector_b = self.data.row(b).ok_or_else(|| {
-            Error::Index(format!(
+        let vector_b = self.data.row(b).ok_or_else(|| Error::Index {
+            message: format!(
                 "Vector index is out of range: {} >= {}",
                 b,
                 self.data.num_rows()
-            ))
+            ),
         })?;
         Ok((self.distance_func)(vector_a, vector_b))
     }
 
     async fn distance_to(&self, query: &[f32], idx: usize) -> Result<f32> {
-        let vector = self.data.row(idx).ok_or_else(|| {
-            Error::Index(format!(
+        let vector = self.data.row(idx).ok_or_else(|| Error::Index {
+            message: format!(
                 "Attempt to access row {} in a matrix with {} rows",
                 idx,
                 self.data.num_rows()
-            ))
+            ),
         })?;
         Ok((self.distance_func)(query, vector))
     }

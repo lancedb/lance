@@ -98,8 +98,8 @@ impl PQIndex {
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             let from = key.slice(i * sub_vector_length, sub_vector_length);
-            let subvec_centroids = self.pq.centroids(i).ok_or_else(|| {
-                Error::Index("PQIndex::l2_scores: PQ is not initialized".to_string())
+            let subvec_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
+                message: "PQIndex::l2_scores: PQ is not initialized".to_string(),
             })?;
             let distances = l2_distance_batch(
                 as_primitive_array::<Float32Type>(&from).values(),
@@ -143,8 +143,8 @@ impl PQIndex {
         let sub_vector_length = self.dimension / self.num_sub_vectors;
         for i in 0..self.num_sub_vectors {
             let key_sub_vector: Float32Array = key.slice(i * sub_vector_length, sub_vector_length);
-            let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| {
-                Error::Index("PQIndex::cosine_scores: PQ is not initialized".to_string())
+            let sub_vector_centroids = self.pq.centroids(i).ok_or_else(|| Error::Index {
+                message: "PQIndex::cosine_scores: PQ is not initialized".to_string(),
             })?;
             let xy = sub_vector_centroids
                 .as_ref()
@@ -211,9 +211,9 @@ impl VectorIndex for PQIndex {
     ///
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
-            return Err(Error::Index(
-                "PQIndex::search: PQ is not initialized".to_string(),
-            ));
+            return Err(Error::Index {
+                message: "PQIndex::search: PQ is not initialized".to_string(),
+            });
         }
 
         let code = self.code.as_ref().unwrap();
