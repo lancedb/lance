@@ -531,6 +531,8 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
+        if not isinstance(new_schema, pa.Schema):
+            raise TypeError(f"schema must be pyarrow.Schema, got {type(new_schema)}")
         _Dataset.commit(base_uri, new_schema, fragments)
         return LanceDataset(base_uri)
 
