@@ -41,7 +41,7 @@ use super::object_reader::ObjectReader;
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    pub scheme: String,
+    scheme: String,
     base_path: Path,
     block_size: usize,
 }
