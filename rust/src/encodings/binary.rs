@@ -109,10 +109,9 @@ impl<'a> Encoder for BinaryEncoder<'a> {
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
             _ => {
-                return Err(crate::Error::IO(format!(
-                    "Binary encoder does not support {}",
-                    data_type
-                )))
+                return Err(crate::Error::IO {
+                    message: format!("Binary encoder does not support {}", data_type),
+                })
             }
         }
     }

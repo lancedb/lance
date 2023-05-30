@@ -87,10 +87,12 @@ impl Updater {
         for field in schema.fields.iter() {
             // Just check the first level names.
             if existing_schema.field(&field.name).is_some() {
-                return Err(Error::IO(format!(
-                    "Append column: duplicated column {} already exists",
-                    field.name
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "Append column: duplicated column {} already exists",
+                        field.name
+                    ),
+                });
             }
         }
 
@@ -116,15 +118,17 @@ impl Updater {
     /// Update one batch.
     pub async fn update(&mut self, batch: RecordBatch) -> Result<()> {
         let Some(last) = self.last_input.as_ref() else {
-            return Err(Error::IO("Fragment Updater: no input data is available before update".to_string()));
+            return Err(Error::IO{message:"Fragment Updater: no input data is available before update".to_string()});
         };
 
         if last.num_rows() != batch.num_rows() {
-            return Err(Error::IO(format!(
+            return Err(Error::IO {
+                message: format!(
                 "Fragment Updater: new batch has different size with the source batch: {} != {}",
                 last.num_rows(),
                 batch.num_rows()
-            )));
+            ),
+            });
         };
 
         if self.writer.is_none() {

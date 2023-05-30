@@ -366,11 +366,13 @@ impl RecordBatchExt for RecordBatch {
 
     fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
         if self.num_rows() != other.num_rows() {
-            return Err(Error::Arrow(format!(
-                "Attempt to merge two RecordBatch with different sizes: {} != {}",
-                self.num_rows(),
-                other.num_rows()
-            )));
+            return Err(Error::Arrow {
+                message: format!(
+                    "Attempt to merge two RecordBatch with different sizes: {} != {}",
+                    self.num_rows(),
+                    other.num_rows()
+                ),
+            });
         }
         let left_struct_array: StructArray = self.clone().into();
         let right_struct_array: StructArray = other.clone().into();
@@ -426,10 +428,9 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
                 }
             }
         } else {
-            return Err(Error::Arrow(format!(
-                "field {} does not exist in the RecordBatch",
-                field.name()
-            )));
+            return Err(Error::Arrow {
+                message: format!("field {} does not exist in the RecordBatch", field.name()),
+            });
         }
     }
     Ok(StructArray::from(
@@ -511,8 +512,9 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
         .cloned()
         .zip(columns.iter().cloned())
         .collect::<Vec<_>>();
-    StructArray::try_from(zipped)
-        .map_err(|e| Error::Arrow(format!("Failed to merge RecordBatch: {}", e)))
+    StructArray::try_from(zipped).map_err(|e| Error::Arrow {
+        message: format!("Failed to merge RecordBatch: {}", e),
+    })
 }
 
 fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a ArrayRef> {

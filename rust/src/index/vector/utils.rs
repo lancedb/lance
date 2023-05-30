@@ -43,10 +43,12 @@ pub(crate) async fn maybe_sample_training_data(
         concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index(format!(
-        "Sample training data: column {} does not exist in return",
-        column
-    )))?;
+    let array = batch.column_by_name(column).ok_or(Error::Index {
+        message: format!(
+            "Sample training data: column {} does not exist in return",
+            column
+        ),
+    })?;
     let fixed_size_array = as_fixed_size_list_array(array);
     fixed_size_array.try_into()
 }

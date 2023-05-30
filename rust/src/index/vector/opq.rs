@@ -230,7 +230,9 @@ impl Transformer for OptimizedProductQuantizer {
     async fn save(&self, writer: &mut ObjectWriter) -> Result<Transform> {
         let mut this = self.clone();
         if this.rotation.is_none() {
-            return Err(Error::Index("OPQ is not trained".to_string()));
+            return Err(Error::Index {
+                message: "OPQ is not trained".to_string(),
+            });
         };
         let rotation = this.rotation.as_ref().unwrap();
         let position = writer
@@ -294,7 +296,9 @@ impl VectorIndex for OPQIndex {
         _offset: usize,
         _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index("OPQ does not support load".to_string()))
+        Err(Error::Index {
+            message: "OPQ does not support load".to_string(),
+        })
     }
 }
 
@@ -303,12 +307,13 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
 
     fn try_from(opq: &OptimizedProductQuantizer) -> Result<Self> {
         if opq.file_position.is_none() {
-            return Err(Error::Index("OPQ has not been persisted yet".to_string()));
+            return Err(Error::Index {
+                message: "OPQ has not been persisted yet".to_string(),
+            });
         }
-        let rotation = opq
-            .rotation
-            .as_ref()
-            .ok_or(Error::Index("OPQ is not trained".to_string()))?;
+        let rotation = opq.rotation.as_ref().ok_or(Error::Index {
+            message: "OPQ is not trained".to_string(),
+        })?;
         Ok(Transform {
             position: opq.file_position.unwrap() as u64,
             shape: vec![rotation.num_rows() as u32, rotation.num_columns() as u32],

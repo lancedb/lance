@@ -128,21 +128,25 @@ impl KNNFlatExec {
     /// Returns an error if the preconditions are not met.
     pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
         let schema = input.schema();
-        let field = schema.field_with_name(&query.column).map_err(|_| {
-            Error::IO(format!(
-                "KNNFlatExec node: query column {} not found in input schema",
-                query.column
-            ))
-        })?;
+        let field = schema
+            .field_with_name(&query.column)
+            .map_err(|_| Error::IO {
+                message: format!(
+                    "KNNFlatExec node: query column {} not found in input schema",
+                    query.column
+                ),
+            })?;
         let is_vector = match field.data_type() {
             DataType::FixedSizeList(item, _) => item.as_ref().data_type() == &DataType::Float32,
             _ => false,
         };
         if !is_vector {
-            return Err(Error::IO(format!(
-                "KNNFlatExec node: query column {} is not a vector",
-                query.column
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "KNNFlatExec node: query column {} is not a vector",
+                    query.column
+                ),
+            });
         };
 
         Ok(Self { input, query })
@@ -300,10 +304,12 @@ impl KNNIndexExec {
     pub fn try_new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Result<Self> {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
-            return Err(Error::IO(format!(
-                "KNNIndexExec node: query column {} does not exist in dataset.",
-                query.column
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "KNNIndexExec node: query column {} does not exist in dataset.",
+                    query.column
+                ),
+            });
         };
 
         Ok(Self {

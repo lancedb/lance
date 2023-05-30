@@ -144,11 +144,13 @@ impl Metadata {
     /// It returns a list of (batch_id, in_batch_range) tuples.
     pub(crate) fn range_to_batches(&self, range: Range<usize>) -> Result<Vec<(i32, Range<usize>)>> {
         if range.end > *(self.batch_offsets.last().unwrap()) as usize {
-            return Err(Error::IO(format!(
-                "Range {:?} is out of bounds {}",
-                range,
-                self.batch_offsets.last().unwrap()
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "Range {:?} is out of bounds {}",
+                    range,
+                    self.batch_offsets.last().unwrap()
+                ),
+            });
         }
         let offsets = self.batch_offsets.as_slice();
         let mut batch_id = offsets

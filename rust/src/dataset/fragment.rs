@@ -139,11 +139,13 @@ impl FileFragment {
         }
 
         if opened_files.is_empty() {
-            return Err(Error::IO(format!(
-                "Does not find any data file for schema: {}\nfragment_id={}",
-                projection,
-                self.id()
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "Does not find any data file for schema: {}\nfragment_id={}",
+                    projection,
+                    self.id()
+                ),
+            });
         }
 
         FragmentReader::try_new(self.id(), opened_files)
@@ -153,10 +155,9 @@ impl FileFragment {
     ///
     pub async fn count_rows(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
-            return Err(Error::IO(format!(
-                "Fragment {} does not contain any data",
-                self.id()
-            )));
+            return Err(Error::IO {
+                message: format!("Fragment {} does not contain any data", self.id()),
+            });
         };
 
         // Just open any file. All of them should have same size.
@@ -226,7 +227,9 @@ impl std::fmt::Display for FragmentReader {
 
 fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     if batches.is_empty() {
-        return Err(Error::IO("Cannot merge empty batches".to_string()));
+        return Err(Error::IO {
+            message: "Cannot merge empty batches".to_string(),
+        });
     }
 
     let mut merged = batches[0].clone();
@@ -239,17 +242,18 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 impl FragmentReader {
     fn try_new(fragment_id: usize, readers: Vec<(FileReader, Schema)>) -> Result<Self> {
         if readers.is_empty() {
-            return Err(Error::IO(
-                "Cannot create FragmentReader with zero readers".to_string(),
-            ));
+            return Err(Error::IO {
+                message: "Cannot create FragmentReader with zero readers".to_string(),
+            });
         }
 
         let num_batches = readers[0].0.num_batches();
         if !readers.iter().all(|r| r.0.num_batches() == num_batches) {
-            return Err(Error::IO(
-                "Cannot create FragmentReader from data files with different number of batches"
-                    .to_string(),
-            ));
+            return Err(Error::IO {
+                message:
+                    "Cannot create FragmentReader from data files with different number of batches"
+                        .to_string(),
+            });
         }
         Ok(Self {
             readers,

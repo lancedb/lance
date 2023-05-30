@@ -75,7 +75,9 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
         "ms" => Ok(TimeUnit::Millisecond),
         "us" => Ok(TimeUnit::Microsecond),
         "ns" => Ok(TimeUnit::Nanosecond),
-        _ => Err(Error::Arrow(format!("Unsupported TimeUnit: {unit}"))),
+        _ => Err(Error::Arrow {
+            message: format!("Unsupported TimeUnit: {unit}"),
+        }),
     }
 }
 
@@ -139,7 +141,11 @@ impl TryFrom<&DataType> for LogicalType {
                 *len
             ),
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
-            _ => return Err(Error::Schema(format!("Unsupported data type: {:?}", dt))),
+            _ => {
+                return Err(Error::Schema {
+                    message: format!("Unsupported data type: {:?}", dt),
+                })
+            }
         };
 
         Ok(Self(type_str))
@@ -187,12 +193,14 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(Error::Schema {
+                            message: format!("Unsupported logical type: {}", lt),
+                        })
                     } else {
                         let elem_type = (&LogicalType(splits[1].to_string())).try_into()?;
-                        let size: i32 = splits[2]
-                            .parse::<i32>()
-                            .map_err(|e: _| Error::Schema(e.to_string()))?;
+                        let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
+                            message: e.to_string(),
+                        })?;
                         Ok(FixedSizeList(
                             Arc::new(ArrowField::new("item", elem_type, true)),
                             size,
@@ -201,17 +209,21 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(Error::Schema(format!("Unsupported logical type: {}", lt)))
+                        Err(Error::Schema {
+                            message: format!("Unsupported logical type: {}", lt),
+                        })
                     } else {
-                        let size: i32 = splits[1]
-                            .parse::<i32>()
-                            .map_err(|e: _| Error::Schema(e.to_string()))?;
+                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| Error::Schema {
+                            message: e.to_string(),
+                        })?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema(format!("Unsupport dictionary type: {}", lt)))
+                        Err(Error::Schema {
+                            message: format!("Unsupport dictionary type: {}", lt),
+                        })
                     } else {
                         let value_type: Self = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
@@ -220,32 +232,39 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "decimal" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema(format!("Unsupport decimal type: {}", lt)))
+                        Err(Error::Schema {
+                            message: format!("Unsupport decimal type: {}", lt),
+                        })
                     } else {
-                        let bits: i16 = splits[1]
-                            .parse::<i16>()
-                            .map_err(|err| Error::Schema(err.to_string()))?;
-                        let precision: u8 = splits[2]
-                            .parse::<u8>()
-                            .map_err(|err| Error::Schema(err.to_string()))?;
-                        let scale: i8 = splits[3]
-                            .parse::<i8>()
-                            .map_err(|err| Error::Schema(err.to_string()))?;
+                        let bits: i16 = splits[1].parse::<i16>().map_err(|err| Error::Schema {
+                            message: err.to_string(),
+                        })?;
+                        let precision: u8 =
+                            splits[2].parse::<u8>().map_err(|err| Error::Schema {
+                                message: err.to_string(),
+                            })?;
+                        let scale: i8 = splits[3].parse::<i8>().map_err(|err| Error::Schema {
+                            message: err.to_string(),
+                        })?;
 
                         if bits == 128 {
                             Ok(Decimal128(precision, scale))
                         } else if bits == 256 {
                             Ok(Decimal256(precision, scale))
                         } else {
-                            Err(Error::Schema(format!(
-                                "Only Decimal128 and Decimal256 is supported. Found {bits}"
-                            )))
+                            Err(Error::Schema {
+                                message: format!(
+                                    "Only Decimal128 and Decimal256 is supported. Found {bits}"
+                                ),
+                            })
                         }
                     }
                 }
                 "timestamp" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema(format!("Unsupported timestamp type: {}", lt)))
+                        Err(Error::Schema {
+                            message: format!("Unsupported timestamp type: {}", lt),
+                        })
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
                         let tz: Option<Arc<str>> = if splits[2] == "-" {
@@ -256,7 +275,9 @@ impl TryFrom<&LogicalType> for DataType {
                         Ok(Timestamp(timeunit, tz))
                     }
                 }
-                _ => Err(Error::Schema(format!("Unsupported logical type: {}", lt))),
+                _ => Err(Error::Schema {
+                    message: format!("Unsupported logical type: {}", lt),
+                }),
             }
         }
     }

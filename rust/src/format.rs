@@ -44,7 +44,9 @@ impl TryFrom<&pb::Uuid> for Uuid {
 
     fn try_from(p: &pb::Uuid) -> Result<Self> {
         if p.uuid.len() != 16 {
-            return Err(Error::IO("Protobuf UUID is malformed".to_string()));
+            return Err(Error::IO {
+                message: "Protobuf UUID is malformed".to_string(),
+            });
         }
         let mut buf: [u8; 16] = [0; 16];
         buf.copy_from_slice(p.uuid.to_byte_slice());

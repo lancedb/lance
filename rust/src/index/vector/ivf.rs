@@ -80,10 +80,9 @@ impl IVFIndex {
         metric_type: MetricType,
     ) -> Result<Self> {
         if !sub_index.is_loadable() {
-            return Err(Error::Index(format!(
-                "IVF sub index must be loadable, got: {:?}",
-                sub_index
-            )));
+            return Err(Error::Index {
+                message: format!("IVF sub index must be loadable, got: {:?}", sub_index),
+            });
         }
         Ok(Self {
             uuid: uuid.to_owned(),
@@ -147,11 +146,8 @@ impl VectorIndex for IVFIndex {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let score_col = batch.column_by_name("score").ok_or_else(|| {
-            Error::IO(format!(
-                "score column does not exist in batch: {}",
-                batch.schema()
-            ))
+        let score_col = batch.column_by_name("score").ok_or_else(|| Error::IO {
+            message: format!("score column does not exist in batch: {}", batch.schema()),
         })?;
 
         // TODO: Use a heap sort to get the top-k.
@@ -172,7 +168,9 @@ impl VectorIndex for IVFIndex {
         _offset: usize,
         _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index("Flat index does not support load".to_string()))
+        Err(Error::Index {
+            message: "Flat index does not support load".to_string(),
+        })
     }
 }
 
@@ -293,11 +291,13 @@ impl Ivf {
         metric_type: MetricType,
     ) -> Result<UInt32Array> {
         if query.len() != self.dimension() {
-            return Err(Error::IO(format!(
-                "Ivf::find_partition: dimension mismatch: {} != {}",
-                query.len(),
-                self.dimension()
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "Ivf::find_partition: dimension mismatch: {} != {}",
+                    query.len(),
+                    self.dimension()
+                ),
+            });
         }
         let dist_func = metric_type.batch_func();
         let centroid_values = self.centroids.values();
@@ -342,11 +342,13 @@ impl Ivf {
             part_id_builder.append_value(part_id);
             let cent = centroids.row(part_id as usize).unwrap();
             if vector.len() != cent.len() {
-                return Err(Error::IO(format!(
-                    "Ivf::compute_residual: dimension mismatch: {} != {}",
-                    vector.len(),
-                    cent.len()
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "Ivf::compute_residual: dimension mismatch: {} != {}",
+                        vector.len(),
+                        cent.len()
+                    ),
+                });
             }
             unsafe {
                 residual_builder
@@ -378,7 +380,9 @@ impl TryFrom<&Ivf> for pb::Ivf {
 
     fn try_from(ivf: &Ivf) -> Result<Self> {
         if ivf.offsets.len() != ivf.centroids.len() {
-            return Err(Error::IO("Ivf model has not been populated".to_string()));
+            return Err(Error::IO {
+                message: "Ivf model has not been populated".to_string(),
+            });
         }
         let centroids_arr = ivf.centroids.values();
         let f32_centroids: &Float32Array = as_primitive_array(&centroids_arr);
@@ -411,23 +415,25 @@ impl TryFrom<&pb::Ivf> for Ivf {
 
 fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
     let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::IO(format!(
+        return Err(Error::IO{message:format!(
             "Building index: column {} does not exist in dataset: {:?}",
             column, dataset
-        )));
+        )});
     };
     if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
         if !matches!(elem_type.data_type(), DataType::Float32) {
             return Err(
-        Error::Index(
+        Error::Index{message:
             format!("VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-            elem_type.data_type())));
+            elem_type.data_type())});
         }
     } else {
-        return Err(Error::Index(format!(
+        return Err(Error::Index {
+            message: format!(
             "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
             field.data_type()
-        )));
+        ),
+        });
     }
     Ok(())
 }
@@ -483,11 +489,13 @@ fn compute_residual_matrix(
         let part_id = argmin(dist_func(row, centroids.data().values(), dim).as_ref()).unwrap();
         let centroid = centroids.row(part_id as usize).unwrap();
         if row.len() != centroid.len() {
-            return Err(Error::IO(format!(
-                "Ivf::compute_residual: dimension mismatch: {} != {}",
-                row.len(),
-                centroid.len()
-            )));
+            return Err(Error::IO {
+                message: format!(
+                    "Ivf::compute_residual: dimension mismatch: {} != {}",
+                    row.len(),
+                    centroid.len()
+                ),
+            });
         };
         unsafe {
             builder.append_trusted_len_iter(row.iter().zip(centroid.iter()).map(|(v, c)| v - c))
@@ -564,9 +572,9 @@ pub async fn build_ivf_pq_index(
         .await?
         .map(|b| async move {
             let batch = b?;
-            let arr = batch
-                .column_by_name(column)
-                .ok_or_else(|| Error::IO(format!("Dataset does not have column {column}")))?;
+            let arr = batch.column_by_name(column).ok_or_else(|| Error::IO {
+                message: format!("Dataset does not have column {column}"),
+            })?;
             let mut vectors: MatrixView = as_fixed_size_list_array(arr).try_into()?;
 
             // Transform the vectors if pre-transforms are used.

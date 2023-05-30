@@ -37,35 +37,41 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
             _ => {
-                return Err(Error::IO(format!(
-                    "DataType '{data_type:?}' does not match to the value: {expr}"
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "DataType '{data_type:?}' does not match to the value: {expr}"
+                    ),
+                });
             }
         },
         Expr::Literal(ScalarValue::Float64(v)) => match data_type {
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(*v))),
             _ => {
-                return Err(Error::IO(format!(
-                    "DataType '{data_type:?}' does not match to the value: {expr}"
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "DataType '{data_type:?}' does not match to the value: {expr}"
+                    ),
+                });
             }
         },
         Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
             DataType::Utf8 => Ok(expr.clone()),
             DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
             _ => {
-                return Err(Error::IO(format!(
-                    "DataType '{data_type:?}' does not match to the value: {expr}"
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "DataType '{data_type:?}' does not match to the value: {expr}"
+                    ),
+                });
             }
         },
         Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
             Ok(expr.clone())
         }
-        _ => Err(Error::IO(format!(
-            "DataType '{data_type:?}' does not match to the value: {expr}"
-        ))),
+        _ => Err(Error::IO {
+            message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+        }),
     }
 }
 
@@ -88,7 +94,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(l), Expr::Literal(_)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
-                        return Err(Error::IO(format!("Column {} does not exist in the dataset.", l.flat_name())))
+                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
                     return Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
@@ -98,7 +104,7 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }
                 (Expr::Literal(_), Expr::Column(l)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
-                        return Err(Error::IO(format!("Column {} does not exist in the dataset.", l.flat_name())))
+                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
                     return Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(right.as_ref(), &field.data_type())?),

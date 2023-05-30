@@ -71,7 +71,11 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
-            _ => return Err(Error::IO(format!("Operator {op} is not supported"))),
+            _ => {
+                return Err(Error::IO {
+                    message: format!("Operator {op} is not supported"),
+                })
+            }
         })
     }
 
@@ -89,10 +93,9 @@ impl Planner {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
             _ => {
-                return Err(Error::IO(format!(
-                    "Unary operator '{:?}' is not supported",
-                    op
-                )))
+                return Err(Error::IO {
+                    message: format!("Unary operator '{:?}' is not supported", op),
+                })
             }
         })
     }
@@ -103,10 +106,9 @@ impl Planner {
         if let Ok(n) = value.parse::<i64>() {
             Ok(lit(n))
         } else {
-            value
-                .parse::<f64>()
-                .map(lit)
-                .map_err(|_| Error::IO(format!("'{value}' is not supported number value.")))
+            value.parse::<f64>().map(lit).map_err(|_| Error::IO {
+                message: format!("'{value}' is not supported number value."),
+            })
         }
     }
 
@@ -132,30 +134,27 @@ impl Planner {
     fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::IO(format!(
-                "Unsupported function args: {:?}",
-                func_args
-            ))),
+            _ => Err(Error::IO {
+                message: format!("Unsupported function args: {:?}", func_args),
+            }),
         }
     }
 
     fn parse_function(&self, func: &Function) -> Result<Expr> {
         if func.name.to_string() == "is_valid" {
             if func.args.len() != 1 {
-                return Err(Error::IO(format!(
-                    "is_valid only support 1 args, got {}",
-                    func.args.len()
-                )));
+                return Err(Error::IO {
+                    message: format!("is_valid only support 1 args, got {}", func.args.len()),
+                });
             }
             return Ok(Expr::IsNotNull(Box::new(
                 self.parse_function_args(&func.args[0])?,
             )));
         } else if func.name.to_string() == "regexp_match" {
             if func.args.len() != 2 {
-                return Err(Error::IO(format!(
-                    "regexp_match only supports 2 args, got {}",
-                    func.args.len()
-                )));
+                return Err(Error::IO {
+                    message: format!("regexp_match only supports 2 args, got {}", func.args.len()),
+                });
             }
 
             let args_vec: Vec<Expr> = func
@@ -169,10 +168,9 @@ impl Planner {
                 args: args_vec,
             });
         }
-        Err(Error::IO(format!(
-            "function '{}' is not supported",
-            func.name
-        )))
+        Err(Error::IO {
+            message: format!("function '{}' is not supported", func.name),
+        })
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
@@ -220,9 +218,9 @@ impl Planner {
                 *escape_char,
             ))),
             _ => {
-                return Err(Error::IO(format!(
-                    "Expression '{expr}' is not supported as filter in lance"
-                )))
+                return Err(Error::IO {
+                    message: format!("Expression '{expr}' is not supported as filter in lance"),
+                })
             }
         }
     }
@@ -276,10 +274,9 @@ impl Planner {
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
             Expr::ScalarFunction { fun, args } => {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
-                    return Err(Error::IO(format!(
-                        "Scalar function '{:?}' is not supported",
-                        fun
-                    )));
+                    return Err(Error::IO {
+                        message: format!("Scalar function '{:?}' is not supported", fun),
+                    });
                 }
                 let execution_props = ExecutionProps::new();
                 let args_vec = args
@@ -287,11 +284,13 @@ impl Planner {
                     .map(|e| self.create_physical_expr(e).unwrap())
                     .collect::<Vec<_>>();
                 if args_vec.len() != 2 {
-                    return Err(Error::IO(format!(
-                        "Scalar function '{:?}' only supports 2 args, got {}",
-                        fun,
-                        args_vec.len()
-                    )));
+                    return Err(Error::IO {
+                        message: format!(
+                            "Scalar function '{:?}' only supports 2 args, got {}",
+                            fun,
+                            args_vec.len()
+                        ),
+                    });
                 }
 
                 let args_array: [Arc<dyn PhysicalExpr>; 2] =
@@ -306,9 +305,9 @@ impl Planner {
                 physical_expr?
             }
             _ => {
-                return Err(Error::IO(format!(
-                    "Expression '{expr}' is not supported as filter in lance"
-                )))
+                return Err(Error::IO {
+                    message: format!("Expression '{expr}' is not supported as filter in lance"),
+                })
             }
         })
     }
