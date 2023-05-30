@@ -41,7 +41,7 @@ use super::object_reader::ObjectReader;
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    scheme: String,
+    pub scheme: String,
     base_path: Path,
     block_size: usize,
 }
@@ -145,6 +145,11 @@ impl ObjectStore {
             base_path: Path::from("/"),
             block_size: 64 * 1024,
         }
+    }
+
+    /// Returns true if the object store pointed to a local file system.
+    pub fn is_local(&self) -> bool {
+        self.scheme == "file"
     }
 
     pub fn block_size(&self) -> usize {
