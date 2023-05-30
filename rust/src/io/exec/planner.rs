@@ -14,11 +14,11 @@
 
 //! Exec plan planner
 
-use std::sync::Arc;
+use std::{string, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use datafusion::{
-    logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator},
+    logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator, ScalarUDF},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::{
         expressions::{InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr},
@@ -41,6 +41,26 @@ use crate::{
 pub struct Planner {
     schema: SchemaRef,
 }
+
+enum SqlScalarFunctionImpl {
+    Builtin(BuiltinScalarFunction),
+    UDF(ScalarUDF),
+}
+struct SqlScalarFunction {
+    arity: usize,
+    fun: SqlScalarFunctionImpl,
+}
+
+static DISPATCHABLE_FUNCTIONS: HashMap<&str, SqlScalarFunction> = [(
+    "regexp_match",
+    SqlScalarFunctionImpl {
+        arity: 2,
+        fun: SqlScalarFunctionImpl::Builtin(BuiltinScalarFunction::RegexpMatch),
+    },
+)]
+.iter()
+.cloned()
+.collect();
 
 impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
@@ -140,6 +160,8 @@ impl Planner {
     }
 
     fn parse_function(&self, func: &Function) -> Result<Expr> {
+        // TODO: make this whole block more succinct
+        // consider making a look up table for supported functions + arity
         if func.name.to_string() == "is_valid" {
             if func.args.len() != 1 {
                 return Err(Error::IO(format!(
@@ -166,6 +188,24 @@ impl Planner {
 
             return Ok(Expr::ScalarFunction {
                 fun: BuiltinScalarFunction::RegexpMatch,
+                args: args_vec,
+            });
+        } else if func.name.to_string() == "binary_length" {
+            if func.args.len() != 1 {
+                return Err(Error::IO(format!(
+                    "binary_length only supports 1 args, got {}",
+                    func.args.len()
+                )));
+            }
+
+            let args_vec: Vec<Expr> = func
+                .args
+                .iter()
+                .map(|arg| self.parse_function_args(arg).unwrap())
+                .collect::<Vec<_>>();
+
+            return Ok(Expr::ScalarFunction {
+                fun: BuiltinScalarFunction::CharacterLength,
                 args: args_vec,
             });
         }
@@ -274,7 +314,10 @@ impl Planner {
                 self.create_physical_expr(expr.pattern.as_ref())?,
             )),
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::ScalarFunction { fun, args } => {
+            Expr::ScalarFunction {
+                fun: BuiltinScalarFunction::RegexpMatch,
+                args,
+            } => {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
                     return Err(Error::IO(format!(
                         "Scalar function '{:?}' is not supported",
