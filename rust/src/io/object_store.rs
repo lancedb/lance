@@ -112,7 +112,7 @@ impl ObjectStore {
 
         Ok(Self {
             inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
-            scheme: String::from("flle"),
+            scheme: String::from("file"),
             base_path: Path::from(object_store::path::DELIMITER),
             block_size: 4 * 1024, // 4KB block size
         })
