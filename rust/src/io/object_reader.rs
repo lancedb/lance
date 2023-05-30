@@ -103,7 +103,9 @@ pub(crate) async fn read_message<M: Message + Default>(
 ) -> Result<M> {
     let file_size = reader.size().await?;
     if pos > file_size {
-        return Err(Error::IO("file size is too small".to_string()));
+        return Err(Error::IO {
+            message: "file size is too small".to_string(),
+        });
     }
 
     let range = pos..min(pos + 4096, file_size);
@@ -145,9 +147,9 @@ pub(crate) async fn read_fixed_stride_array(
     params: impl Into<ReadBatchParams>,
 ) -> Result<ArrayRef> {
     if !data_type.is_fixed_stride() {
-        return Err(Error::Schema(format!(
-            "{data_type} is not a fixed stride type"
-        )));
+        return Err(Error::Schema {
+            message: format!("{data_type} is not a fixed stride type"),
+        });
     }
     // TODO: support more than plain encoding here.
     let decoder = PlainDecoder::new(reader, data_type, position, length)?;
@@ -176,7 +178,11 @@ pub(crate) async fn read_binary_array(
         LargeBinary => Box::new(BinaryDecoder::<LargeBinaryType>::new(
             reader, position, length, nullable,
         )),
-        _ => return Err(Error::IO(format!("Unsupported binary type: {data_type}",))),
+        _ => {
+            return Err(Error::IO {
+                message: format!("Unsupported binary type: {data_type}",),
+            })
+        }
     };
     let fut = decoder.as_ref().get(params.into());
     fut.await

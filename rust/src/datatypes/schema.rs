@@ -55,10 +55,9 @@ impl Schema {
                     candidates.push(projected_field)
                 }
             } else {
-                return Err(Error::Schema(format!(
-                    "Column {} does not exist",
-                    col.as_ref()
-                )));
+                return Err(Error::Schema {
+                    message: format!("Column {} does not exist", col.as_ref()),
+                });
             }
         }
 
@@ -73,10 +72,10 @@ impl Schema {
     pub(crate) fn validate(&self) -> Result<bool> {
         for field in self.fields.iter() {
             if field.name.contains('.') {
-                return Err(Error::Schema(format!(
+                return Err(Error::Schema{message:format!(
                     "Top level field {} cannot contain `.`. Maybe you meant to create a struct field?",
                     field.name.clone()
-                )));
+                )});
             }
         }
         Ok(true)
@@ -122,7 +121,9 @@ impl Schema {
             if let Some(self_field) = self.field(&field.name) {
                 new_fields.push(self_field.project_by_field(field)?);
             } else {
-                return Err(Error::Schema(format!("Field {} not found", field.name)));
+                return Err(Error::Schema {
+                    message: format!("Field {} not found", field.name),
+                });
             }
         }
         Ok(Self {
@@ -133,8 +134,8 @@ impl Schema {
 
     /// Exclude the fields from `other` Schema, and returns a new Schema.
     pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
-        let other = schema.try_into().map_err(|_| {
-            Error::Schema("The other schema is not compatible with this schema".to_string())
+        let other = schema.try_into().map_err(|_| Error::Schema {
+            message: "The other schema is not compatible with this schema".to_string(),
         })?;
         let mut fields = vec![];
         for field in self.fields.iter() {
@@ -166,7 +167,9 @@ impl Schema {
     pub(crate) fn field_id(&self, column: &str) -> Result<i32> {
         self.field(column)
             .map(|f| f.id)
-            .ok_or_else(|| Error::Schema("Vector column not in schema".to_string()))
+            .ok_or_else(|| Error::Schema {
+                message: "Vector column not in schema".to_string(),
+            })
     }
 
     /// Recursively collect all the field IDs,
@@ -203,12 +206,11 @@ impl Schema {
     /// Recursively attach set up dictionary values to the dictionary fields.
     pub(crate) fn set_dictionary(&mut self, batch: &RecordBatch) -> Result<()> {
         for field in self.fields.as_mut_slice() {
-            let column = batch.column_by_name(&field.name).ok_or_else(|| {
-                Error::Schema(format!(
-                    "column '{}' does not exist in the record batch",
-                    field.name
-                ))
-            })?;
+            let column = batch
+                .column_by_name(&field.name)
+                .ok_or_else(|| Error::Schema {
+                    message: format!("column '{}' does not exist in the record batch", field.name),
+                })?;
             field.set_dictionary(column);
         }
         Ok(())

@@ -65,14 +65,14 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     };
     let buf = object_store.inner.get_range(path, range).await?;
     if buf.len() < 16 {
-        return Err(Error::IO(
-            "Invalid format: file size is smaller than 16 bytes".to_string(),
-        ));
+        return Err(Error::IO {
+            message: "Invalid format: file size is smaller than 16 bytes".to_string(),
+        });
     }
     if !buf.ends_with(super::MAGIC) {
-        return Err(Error::IO(
-            "Invalid format: magic number does not match".to_string(),
-        ));
+        return Err(Error::IO {
+            message: "Invalid format: magic number does not match".to_string(),
+        });
     }
     let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
     let manifest_len = file_size - manifest_pos;
@@ -104,11 +104,13 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let buf = buf.slice(4..buf.len() - 16);
 
     if buf.len() != recorded_length {
-        return Err(Error::IO(format!(
-            "Invalid format: manifest length does not match. Expected {}, got {}",
-            recorded_length,
-            buf.len()
-        )));
+        return Err(Error::IO {
+            message: format!(
+                "Invalid format: manifest length does not match. Expected {}, got {}",
+                recorded_length,
+                buf.len()
+            ),
+        });
     }
 
     let proto = pb::Manifest::decode(buf)?;
@@ -320,7 +322,9 @@ async fn read_batch(
         let batch_offset = reader
             .metadata
             .get_offset(batch_id)
-            .ok_or_else(|| Error::IO(format!("batch {batch_id} does not exist")))?;
+            .ok_or_else(|| Error::IO {
+                message: format!("batch {batch_id} does not exist"),
+            })?;
         let row_id_arr = Arc::new(UInt64Array::from_iter_values(
             ids_in_batch
                 .iter()
@@ -369,11 +373,11 @@ fn get_page_info<'a>(
     field: &'a Field,
     batch_id: i32,
 ) -> Result<&'a PageInfo> {
-    page_table.get(field.id, batch_id).ok_or_else(|| {
-        Error::IO(format!(
+    page_table.get(field.id, batch_id).ok_or_else(|| Error::IO {
+        message: format!(
             "No page info found for field: {}, field_id={} batch={}",
             field.name, field.id, batch_id
-        ))
+        ),
     })
 }
 
@@ -411,10 +415,12 @@ fn read_null_array(
             } else {
                 let idx_max = *indices.values().iter().max().unwrap() as u64;
                 if idx_max >= page_info.length.try_into().unwrap() {
-                    return Err(Error::IO(format!(
-                        "NullArray Reader: request([{}]) out of range: [0..{}]",
-                        idx_max, page_info.length
-                    )));
+                    return Err(Error::IO {
+                        message: format!(
+                            "NullArray Reader: request([{}]) out of range: [0..{}]",
+                            idx_max, page_info.length
+                        ),
+                    });
                 }
                 indices.len()
             }
@@ -428,10 +434,12 @@ fn read_null_array(
                 _ => unreachable!(),
             };
             if idx_end > page_info.length {
-                return Err(Error::IO(format!(
-                    "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
-                    idx_start, idx_end, page_info.length
-                )));
+                return Err(Error::IO {
+                    message: format!(
+                        "NullArray Reader: request([{}..{}]) out of range: [0..{}]",
+                        idx_start, idx_end, page_info.length
+                    ),
+                });
             }
             idx_end - idx_start
         }

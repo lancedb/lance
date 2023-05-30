@@ -54,9 +54,13 @@ impl TryFrom<&pb::IndexMetadata> for Index {
 
     fn try_from(proto: &pb::IndexMetadata) -> Result<Self> {
         Ok(Self {
-            uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
-                Error::IO("uuid field does not exist in Index metadata".to_string())
-            })??,
+            uuid: proto
+                .uuid
+                .as_ref()
+                .map(Uuid::try_from)
+                .ok_or_else(|| Error::IO {
+                    message: "uuid field does not exist in Index metadata".to_string(),
+                })??,
             name: proto.name.clone(),
             fields: proto.fields.clone(),
             dataset_version: proto.dataset_version,

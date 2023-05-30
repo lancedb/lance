@@ -135,16 +135,15 @@ async fn init_graph(
     let batches = stream.try_collect::<Vec<_>>().await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-    let row_ids = as_primitive_array::<UInt64Type>(
-        batch
-            .column_by_qualified_name(ROW_ID)
-            .ok_or(Error::Index("row_id not found".to_string()))?,
-    );
-    let vectors = as_fixed_size_list_array(
-        batch
-            .column_by_qualified_name(column)
-            .ok_or(Error::Index(format!("column {} not found", column)))?,
-    );
+    let row_ids = as_primitive_array::<UInt64Type>(batch.column_by_qualified_name(ROW_ID).ok_or(
+        Error::Index {
+            message: "row_id not found".to_string(),
+        },
+    )?);
+    let vectors =
+        as_fixed_size_list_array(batch.column_by_qualified_name(column).ok_or(Error::Index {
+            message: format!("column {} not found", column),
+        })?);
     let matrix: MatrixView = vectors.try_into()?;
     let nodes = row_ids
         .values()
@@ -177,12 +176,12 @@ async fn init_graph(
 
 /// Distance between two vectors in the matrix.
 fn distance(matrix: &MatrixView, i: usize, j: usize) -> Result<f32> {
-    let vector_i = matrix
-        .row(i)
-        .ok_or(Error::Index("Invalid row index".to_string()))?;
-    let vector_j = matrix
-        .row(j)
-        .ok_or(Error::Index("Invalid row index".to_string()))?;
+    let vector_i = matrix.row(i).ok_or(Error::Index {
+        message: "Invalid row index".to_string(),
+    })?;
+    let vector_j = matrix.row(j).ok_or(Error::Index {
+        message: "Invalid row index".to_string(),
+    })?;
 
     Ok(l2_distance(vector_i, vector_j))
 }
@@ -246,9 +245,9 @@ async fn robust_prune<V: Vertex + Clone + Sync + Send>(
 
 /// Find the index of the medoid vector in all vectors.
 async fn find_medoid(vectors: &MatrixView, metric_type: MetricType) -> Result<usize> {
-    let centroid = vectors
-        .centroid()
-        .ok_or_else(|| Error::Index("Cannot find the medoid of an empty matrix".to_string()))?;
+    let centroid = vectors.centroid().ok_or_else(|| Error::Index {
+        message: "Cannot find the medoid of an empty matrix".to_string(),
+    })?;
 
     let dist_func = metric_type.batch_func();
     // Find the closest vertex to the centroid.
@@ -274,10 +273,9 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     ids.shuffle(&mut rng);
 
     for (i, &id) in ids.iter().enumerate() {
-        let vector = graph
-            .data
-            .row(i)
-            .ok_or_else(|| Error::Index(format!("Cannot find vector with id {}", id)))?;
+        let vector = graph.data.row(i).ok_or_else(|| Error::Index {
+            message: format!("Cannot find vector with id {}", id),
+        })?;
 
         let state = greedy_search(graph, medoid, vector, 1, l).await?;
 

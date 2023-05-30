@@ -46,7 +46,9 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
         .parse_statements()?;
 
     if stmts.len() != 1 {
-        return Err(Error::IO(format!("Filter is not valid: {filter}")));
+        return Err(Error::IO {
+            message: format!("Filter is not valid: {filter}"),
+        });
     }
     let selection = if let Statement::Query(query) = &stmts[0] {
         if let SetExpr::Select(s) = query.body.as_ref() {
@@ -57,7 +59,9 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     } else {
         None
     };
-    let expr = selection.ok_or_else(|| Error::IO(format!("Filter is not valid: {filter}")))?;
+    let expr = selection.ok_or_else(|| Error::IO {
+        message: format!("Filter is not valid: {filter}"),
+    })?;
     Ok(expr.clone())
 }
 

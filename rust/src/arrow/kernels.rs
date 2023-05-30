@@ -107,10 +107,12 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
         DataType::Int64 => hash_numeric_type(as_primitive_array::<Int64Type>(array)),
         DataType::Utf8 => hash_string_type(as_string_array(array)),
         DataType::LargeUtf8 => hash_string_type(as_largestring_array(array)),
-        _ => Err(Error::Arrow(format!(
-            "Hash only supports integer or string array, got: {}",
-            array.data_type()
-        ))),
+        _ => Err(Error::Arrow {
+            message: format!(
+                "Hash only supports integer or string array, got: {}",
+                array.data_type()
+            ),
+        }),
     }
 }
 

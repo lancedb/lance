@@ -106,15 +106,15 @@ impl DatasetIndexExt for Dataset {
         params: &dyn IndexParams,
     ) -> Result<Self> {
         if columns.len() != 1 {
-            return Err(Error::Index(
-                "Only support building index on 1 column at the moment".to_string(),
-            ));
+            return Err(Error::Index {
+                message: "Only support building index on 1 column at the moment".to_string(),
+            });
         }
         let column = columns[0];
         let Some(field) = self.schema().field(column) else {
-            return Err(Error::Index(format!(
+            return Err(Error::Index{message: format!(
                 "CreateIndex: column '{column}' does not exist"
-            )));
+            )});
         };
 
         // Load indices from the disk.
@@ -122,9 +122,9 @@ impl DatasetIndexExt for Dataset {
 
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if indices.iter().any(|i| i.name == index_name) {
-            return Err(Error::Index(format!(
-                "Index name '{index_name} already exists'"
-            )));
+            return Err(Error::Index {
+                message: format!("Index name '{index_name} already exists'"),
+            });
         }
 
         let index_id = Uuid::new_v4();
@@ -134,8 +134,8 @@ impl DatasetIndexExt for Dataset {
                 let vec_params = params
                     .as_any()
                     .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| {
-                        Error::Index("Vector index type must take a VectorIndexParams".to_string())
+                    .ok_or_else(|| Error::Index {
+                        message: "Vector index type must take a VectorIndexParams".to_string(),
                     })?;
 
                 build_vector_index(

@@ -39,9 +39,9 @@ pub async fn train_kmeans(
 ) -> Result<Float32Array> {
     let num_rows = array.len() / dimension;
     if num_rows < k {
-        return Err(crate::Error::Index(format!(
+        return Err(crate::Error::Index{message: format!(
             "KMeans: can not train {k} centroids with {num_rows} vectors, choose a smaller K (< {num_rows}) instead"
-        )));
+        )});
     }
     // Ony sample 256 * num_clusters. See Faiss
     let data = if num_rows > 256 * k {

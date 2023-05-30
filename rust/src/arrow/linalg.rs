@@ -185,10 +185,12 @@ impl MatrixView {
         let k = self.num_columns() as i32;
         let n = rhs.num_columns() as i32;
         if self.num_columns() != rhs.num_rows() {
-            return Err(Error::Arrow(format!(
-                "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
-                rhs.num_rows()
-            )));
+            return Err(Error::Arrow {
+                message: format!(
+                    "MatMul dimension mismatch: A({m}x{k}) * B({}x{n}",
+                    rhs.num_rows()
+                ),
+            });
         }
 
         let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
@@ -267,10 +269,12 @@ impl TryFrom<&FixedSizeListArray> for MatrixView {
 
     fn try_from(fsl: &FixedSizeListArray) -> Result<Self> {
         if !matches!(fsl.value_type(), DataType::Float32) {
-            return Err(Error::Arrow(format!(
-                "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
-                fsl.data_type()
-            )));
+            return Err(Error::Arrow {
+                message: format!(
+                    "Only support convert f32 FixedSizeListArray to MatrixView, got {}",
+                    fsl.data_type()
+                ),
+            });
         }
         let values = fsl.values();
         Ok(Self {
@@ -348,7 +352,9 @@ impl SingularValueDecomposition for MatrixView {
             );
         }
         if info > 0 {
-            return Err(Error::Arrow("Failed to compute SVD".to_string()));
+            return Err(Error::Arrow {
+                message: "Failed to compute SVD".to_string(),
+            });
         }
 
         let lwork = work[0] as i32;
@@ -372,7 +378,9 @@ impl SingularValueDecomposition for MatrixView {
             );
         }
         if info != 0 {
-            return Err(Error::Arrow("Failed to compute SVD".to_string()));
+            return Err(Error::Arrow {
+                message: "Failed to compute SVD".to_string(),
+            });
         }
 
         let u_values = Arc::new(Float32Array::from_iter_values(u));

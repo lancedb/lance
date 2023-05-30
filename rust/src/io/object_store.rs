@@ -107,7 +107,9 @@ impl ObjectStore {
         if !expanded_path.try_exists()? {
             std::fs::create_dir_all(expanded_path.clone())?;
         } else if !expanded_path.is_dir() {
-            return Err(Error::IO(format!("{} is not a lance directory", str_path)));
+            return Err(Error::IO {
+                message: format!("{} is not a lance directory", str_path),
+            });
         }
 
         Ok(Self {
@@ -133,7 +135,9 @@ impl ObjectStore {
                 block_size: 64 * 1024,
             }),
             "file" => Self::new_from_path(url.path()),
-            s => Err(Error::IO(format!("Unsupported scheme {}", s))),
+            s => Err(Error::IO {
+                message: format!("Unsupported scheme {}", s),
+            }),
         }
     }
 

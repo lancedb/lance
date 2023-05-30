@@ -244,7 +244,9 @@ impl VectorIndex for DiskANNIndex {
         _offset: usize,
         _length: usize,
     ) -> Result<Arc<dyn VectorIndex>> {
-        Err(Error::Index("DiskANNIndex is not loadable".to_string()))
+        Err(Error::Index {
+            message: "DiskANNIndex is not loadable".to_string(),
+        })
     }
 }
 

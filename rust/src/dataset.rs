@@ -231,7 +231,18 @@ impl Dataset {
         session: Arc<Session>,
     ) -> Result<Self> {
         let object_reader = object_store.open(manifest_path).await?;
-        let bytes = object_store.inner.get(manifest_path).await?.bytes().await?;
+        let get_result = object_store
+            .inner
+            .get(manifest_path)
+            .await
+            .map_err(|e| match e {
+                object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
+                    path: base_path.to_string(),
+                    source,
+                },
+                _ => e.into(),
+            })?;
+        let bytes = get_result.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
         manifest
@@ -273,15 +284,15 @@ impl Dataset {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
         } else {
-            return Err(Error::IO(
-                "Attempt to write empty record batches".to_string(),
-            ));
+            return Err(Error::EmptyDataset);
         }
 
         // Running checks for the different write modes
         // create + dataset already exists = error
         if flag_dataset_exists && matches!(params.mode, WriteMode::Create) {
-            return Err(Error::IO(format!("Dataset already exists: {uri}")));
+            return Err(Error::DatasetAlreadyExists {
+                uri: uri.to_owned(),
+            });
         }
 
         // append + dataset doesn't already exists = warn + switch to create mode
@@ -308,10 +319,10 @@ impl Dataset {
             if let Some(d) = dataset.as_ref() {
                 let m = d.manifest.as_ref();
                 if schema != m.schema {
-                    return Err(Error::IO(format!(
-                        "Append with different schema: original={} new={}",
-                        m.schema, schema
-                    )));
+                    return Err(Error::SchemaMismatch {
+                        original: m.schema.clone(),
+                        new: schema,
+                    });
                 }
             }
         }
@@ -833,6 +844,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_empty_dataset() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::empty());
+        let result = Dataset::write(&mut reader, test_uri, None).await;
+        assert!(matches!(result.unwrap_err(), Error::EmptyDataset { .. }));
+    }
+
+    #[tokio::test]
     async fn append_dataset() {
         let test_dir = tempdir().unwrap();
 
@@ -1243,5 +1263,11 @@ mod tests {
     async fn test_bad_field_name() {
         // don't allow `.` in the field name
         assert!(create_bad_file().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_open_dataset_not_found() {
+        let result = Dataset::open(".").await;
+        assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 }
