@@ -151,6 +151,11 @@ impl ObjectStore {
         }
     }
 
+    /// Returns true if the object store pointed to a local file system.
+    pub fn is_local(&self) -> bool {
+        self.scheme == "file"
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
