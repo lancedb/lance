@@ -169,7 +169,7 @@ class LanceFragment(pa.dataset.Fragment):
         return updater.finish()
 
     @property
-    def schema(self):
+    def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
 
         return self._fragment.schema()
