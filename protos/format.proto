@@ -110,6 +110,8 @@ message DataFragment {
   uint64 id = 1;
 
   repeated DataFile files = 2;
+
+  DeletionFile deletion_file = 3;
 }
 
 // Lance Data File
@@ -118,6 +120,31 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file
   repeated int32 fields = 2;
+}
+
+// Deletion File
+// 
+// The path of the deletion file is constructed as:
+//   <root>/_deletions/{fragment_id}-{read_version}-{checksum}.{extension}
+// where {extension} is `.arrow` or `.bin` depending on the type of deletion.
+message DeletionFile {
+  // Type of deletion file. If it is NONE, then the remaining fields will be missing.
+  DeletionFileType type = 1;
+  // The version of the dataset this deletion file was built from.
+  uint64 read_version = 2;
+  // An xxhash64 checksum of the deletion file. This is used both as a checksum
+  // and to prevent collisions between deletion files from concurrent writes.
+  uint64 checksum = 3;
+}
+
+enum DeletionFileType {
+  // No deletion file. All rows are valid.
+  NONE = 0;
+  // Deletion file is a single Int32Array of deleted row ids. This is stored as
+  // an Arrow IPC file with one batch and one column. Has a .arrow extension.
+  ARROW_ARRAY = 1;
+  // Deletion file is a Roaring Bitmap of deleted row ids. Has a .bin extension.
+  BIT_MAP = 2;
 }
 
 // Metadata of one Lane file.
