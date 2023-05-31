@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=10", "pandas>=1.4", "numpy"]
+dependencies = ["pyarrow>=10", "pandas>=1.4", "numpy>=1.22"]
 description = "python wrapper for lance-rs"
 authors = [
     { name = "Lance Devs", email = "dev@eto.ai" },
