@@ -20,7 +20,14 @@ use snafu::Snafu;
 
 use crate::datatypes::Schema;
 
+type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+pub(crate) fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
+    Box::new(e)
+}
+
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("Attempt to write empty record batches"))]
     EmptyDataset,
@@ -29,9 +36,12 @@ pub enum Error {
     #[snafu(display("Append with different schema: original={original} new={new}"))]
     SchemaMismatch { original: Schema, new: Schema },
     #[snafu(display("Dataset at path {path} was not found: {source}"))]
-    DatasetNotFound {
-        path: String,
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    DatasetNotFound { path: String, source: BoxedError },
+    #[snafu(display("Encountered corrupt file {path}: {source}"))]
+    CorruptFile {
+        path: object_store::path::Path,
+        source: BoxedError,
+        // TODO: add backtrace?
     },
     #[snafu(display("LanceError(Arrow): {message}"))]
     Arrow { message: String },
@@ -43,6 +53,16 @@ pub enum Error {
     Index { message: String },
     /// Stream early stop
     Stop,
+}
+
+impl Error {
+    pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::CorruptFile {
+            path,
+            source: message.into(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

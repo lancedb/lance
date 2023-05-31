@@ -9,7 +9,9 @@ use bytes::Buf;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
+use snafu::ResultExt;
 
+use crate::error::{box_error, CorruptFileSnafu};
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
 use crate::{Error, Result};
@@ -200,22 +202,30 @@ pub(crate) async fn read_deletion_file(
             let data = object_store.inner.get(&path).await?.bytes().await?;
             let data = std::io::Cursor::new(data);
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
-                .collect::<std::result::Result<_, ArrowError>>()?;
+                .collect::<std::result::Result<_, ArrowError>>()
+                .map_err(box_error)
+                .context(CorruptFileSnafu { path: path.clone() })?;
 
             if batches.len() != 1 {
-                return Err(Error::IO(format!(
-                    "Expected exactly one batch in deletion file, got {}",
-                    batches.len()
-                )));
+                return Err(Error::corrupt_file(
+                    path,
+                    format!(
+                        "Expected exactly one batch in deletion file, got {}",
+                        batches.len()
+                    ),
+                ));
             }
 
             let batch = batches.pop().unwrap();
             if batch.schema() != deletion_arrow_schema() {
-                return Err(Error::IO(format!(
-                    "Expected schema {:?} in deletion file, got {:?}",
-                    deletion_arrow_schema(),
-                    batch.schema()
-                )));
+                return Err(Error::corrupt_file(
+                    path,
+                    format!(
+                        "Expected schema {:?} in deletion file, got {:?}",
+                        deletion_arrow_schema(),
+                        batch.schema()
+                    ),
+                ));
             }
 
             let array = batch.columns()[0]
@@ -228,8 +238,9 @@ pub(crate) async fn read_deletion_file(
                 if let Some(val) = val {
                     set.insert(val);
                 } else {
-                    return Err(Error::IO(
-                        "Null values are not allowed in deletion files".to_string(),
+                    return Err(Error::corrupt_file(
+                        path,
+                        "Null values are not allowed in deletion files",
                     ));
                 }
             }
@@ -246,7 +257,9 @@ pub(crate) async fn read_deletion_file(
 
             let data = object_store.inner.get(&path).await?.bytes().await?;
             let reader = data.reader();
-            let bitmap = RoaringBitmap::deserialize_from(reader)?;
+            let bitmap = RoaringBitmap::deserialize_from(reader)
+                .map_err(box_error)
+                .context(CorruptFileSnafu { path })?;
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }
