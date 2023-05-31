@@ -203,4 +203,25 @@ mod tests {
             }]
         )
     }
+
+    #[test]
+    fn test_roundtrip_fragment() {
+        let mut fragment = Fragment::new(123);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+        });
+
+        let proto = pb::DataFragment::from(&fragment);
+        let fragment2 = Fragment::from(&proto);
+        assert_eq!(fragment, fragment2);
+
+        fragment.deletion_file = None;
+        let proto = pb::DataFragment::from(&fragment);
+        let fragment2 = Fragment::from(&proto);
+        assert_eq!(fragment, fragment2);
+    }
 }

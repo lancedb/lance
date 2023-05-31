@@ -93,6 +93,7 @@ impl FromIterator<u32> for DeletionVector {
     }
 }
 
+/// Get the Arrow schema for an Arrow deletion file.
 fn deletion_arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new(
         "row_id",
@@ -101,13 +102,18 @@ fn deletion_arrow_schema() -> Arc<Schema> {
     )]))
 }
 
+/// Get the file path for a deletion file. This is relative to the dataset root.
 fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str) -> Path {
     Path::from(format!(
         "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
     ))
 }
 
-#[allow(dead_code)]
+/// Write a deletion file for a fragment for a given deletion vector.
+///
+/// Returns the deletion file if one was written. If no deletions were present,
+/// returns `Ok(None)`.
+#[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn write_deletion_file(
     fragment_id: u64,
     read_version: u64,
@@ -166,7 +172,12 @@ pub(crate) async fn write_deletion_file(
     }
 }
 
-#[allow(dead_code)]
+/// Read a deletion file for a fragment.
+///
+/// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
+///
+/// Will return an error if the file is present but invalid.
+#[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn read_deletion_file(
     fragment: Fragment,
     object_store: &ObjectStore,

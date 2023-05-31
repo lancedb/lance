@@ -130,7 +130,7 @@ message DataFile {
 // where {extension} is `.arrow` or `.bin` depending on the type of deletion.
 message DeletionFile {
   // Type of deletion file, which varies depending on what is the most efficient
-  // way to store the deleted row ids. If none, then will be NONE. If there are
+  // way to store the deleted row ids. If none, then will be unspecified. If there are
   // sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there are
   // densely deleted rows, then BIT_MAP is the most efficient.
   enum DeletionFileType {
@@ -141,16 +141,16 @@ message DeletionFile {
     BITMAP = 1;
   }
 
-  // Type of deletion file. If it is NONE, then the remaining fields will be missing.
+  // Type of deletion file. If it is unspecified, then the remaining fields will be missing.
   DeletionFileType file_type = 1;
   // The version of the dataset this deletion file was built from.
   uint64 read_version = 2;
-  // An opaque id used to differentiate this file from others 
+  // An opaque id used to differentiate this file from others written by concurrent
+  // writers.
   uint64 id = 3;
 }
 
-
-// Metadata of one Lane file.
+// Metadata of one Lance file.
 message Metadata {
   // Position of the manifest in the file. If it is zero, the manifest is stored
   // externally.
