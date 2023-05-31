@@ -32,6 +32,7 @@ pub mod object_writer;
 mod reader;
 mod stream;
 mod writer;
+pub(crate) mod deletion;
 
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 

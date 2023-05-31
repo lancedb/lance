@@ -44,6 +44,7 @@ aws-credential-types = "0.54.1"
 pin-project = "1.0"
 prost = "0.11"
 prost-types = "0.11"
+roaring = "0.10.1"
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 url = "2.3"
 rand = { version = "0.8.3", features = ["small_rng"] }

@@ -62,6 +62,33 @@ impl From<&pb::DataFile> for DataFile {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeletionFileType {
+    Array,
+    Bitmap,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletionFile {
+    pub read_version: i64,
+    pub id: i64,
+    pub file_type: DeletionFileType,
+}
+
+impl From<&pb::DeletionFile> for DeletionFile {
+    fn from(value: &pb::DeletionFile) -> Self {
+        let file_type = match value.file_type {
+            pb::deletion_file::DeletionFileType::Array => DeletionFileType::Array,
+            pb::deletion_file::DeletionFileType::Bitmap => DeletionFileType::Bitmap,
+        };
+        Self {
+            read_version: value.read_version,
+            id: value.id,
+            file_type,
+        }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -73,11 +100,14 @@ pub struct Fragment {
 
     /// Files within the fragment.
     pub files: Vec<DataFile>,
+
+    /// Optional file with deleted row ids.
+    pub deletion_file: Option<DeletionFile>,
 }
 
 impl Fragment {
     pub fn new(id: u64) -> Self {
-        Self { id, files: vec![] }
+        Self { id, files: vec![], deletion_file: None }
     }
 
     /// Create a `Fragment` with one DataFile
@@ -85,6 +115,7 @@ impl Fragment {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
+            deletion_file: None,
         }
     }
 
@@ -106,6 +137,7 @@ impl From<&pb::DataFragment> for Fragment {
         Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
+            deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
         }
     }
 }
