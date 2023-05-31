@@ -17,10 +17,21 @@
 
 //! Testing utilities
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::iter::repeat_with;
 
 use arrow_array::Float32Array;
+
+/// Create a random float32 array.
+pub fn generate_random_array_with_seed(n: usize, seed: [u8; 32]) -> Float32Array {
+    let mut rng = StdRng::from_seed(seed);
+    Float32Array::from(
+        repeat_with(|| rng.gen::<f32>())
+            .take(n)
+            .collect::<Vec<f32>>(),
+    )
+}
 
 /// Create a random float32 array.
 pub fn generate_random_array(n: usize) -> Float32Array {
