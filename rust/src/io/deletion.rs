@@ -1,19 +1,28 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
-use arrow_array::UInt32Array;
+use arrow::ipc::reader::FileReader as ArrowFileReader;
+use arrow::ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
+use arrow::ipc::CompressionType;
+use arrow_array::{RecordBatch, UInt32Array};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
+use bytes::Buf;
+use object_store::path::Path;
+use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 
-use crate::format::{Fragment, DeletionFile, DeletionFileType};
+use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
+use crate::{Error, Result};
+
+use super::ObjectStore;
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
-const BITMAP_THRESDHOLD: u32 = 5_000;
+const BITMAP_THRESDHOLD: usize = 5_000;
 // TODO: Benchmark to find a better value.
 
-
 /// Represents a set of deleted row ids in a single fragment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DeletionVector {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DeletionVector {
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
@@ -26,7 +35,8 @@ enum DeletionVector {
 /// impl BitAnd for DeletionVector { ... }
 
 impl IntoIterator for DeletionVector {
-    type Item = Box<dyn Iterator<Item = u32>>;
+    type IntoIter = Box<dyn Iterator<Item = Self::Item>>;
+    type Item = u32;
 
     fn into_iter(self) -> Self::IntoIter {
         match self {
@@ -37,20 +47,19 @@ impl IntoIterator for DeletionVector {
     }
 }
 
-impl FromIterator for DeletionVector {
+impl FromIterator<u32> for DeletionVector {
     fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self {
-        
         let iter = iter.into_iter();
         match iter.size_hint() {
             (_, Some(0)) => DeletionVector::NoDeletions,
-            (lower, Some(upper)) if lower > BITMAP_THRESDHOLD => {
+            (lower, _) if lower > BITMAP_THRESDHOLD => {
                 let bitmap = iter.collect::<RoaringBitmap>();
                 DeletionVector::Bitmap(bitmap)
             }
-            (lower, Some(upper)) if upper < BITMAP_THRESDHOLD => {
+            (_, Some(upper)) if upper < BITMAP_THRESDHOLD => {
                 let set = iter.collect::<HashSet<_>>();
                 DeletionVector::Set(set)
-            },
+            }
             _ => {
                 // We don't know the size, so just try as a set and move to bitmap
                 // if it ends up being big.
@@ -61,58 +70,156 @@ impl FromIterator for DeletionVector {
                 } else {
                     DeletionVector::Set(set)
                 }
-            },
+            }
         }
     }
 }
 
-pub async fn write_deletion_file(fragment_id: i64, read_version: i64, removed_rows: DeletionVector) -> Result<Option<DeletionFile>> {
+fn deletion_arrow_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "row_id",
+        DataType::UInt32,
+        false,
+    )]))
+}
+
+fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str) -> Path {
+    Path::from(format!(
+        "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
+    ))
+}
+
+#[allow(dead_code)]
+pub(crate) async fn write_deletion_file(
+    fragment_id: u64,
+    read_version: u64,
+    removed_rows: &DeletionVector,
+    object_store: &ObjectStore,
+) -> Result<Option<DeletionFile>> {
     match removed_rows {
-        DeletionVector::NoDeletions => { Ok(None) },
+        DeletionVector::NoDeletions => Ok(None),
         DeletionVector::Set(set) => {
-            let id = rand::thread_rng().gen::<i64>();
-            let path = format!("_deletions/{fragment_id}-{read_version}-{id}.arrow");
+            let id = rand::thread_rng().gen::<u64>();
+            let path = deletion_file_path(fragment_id, read_version, id, "arrow");
 
-            let array = UInt32Array::from_iter(removed_rows);
+            let array = UInt32Array::from_iter(set.iter().copied());
+            let array = Arc::new(array);
 
-            todo!("Write array as file");
+            let schema = deletion_arrow_schema();
+            let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
+
+            let mut out: Vec<u8> = Vec::new();
+            let write_options =
+                IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
+            {
+                let mut writer = ArrowFileWriter::try_new_with_options(
+                    &mut out,
+                    schema.as_ref(),
+                    write_options,
+                )?;
+                writer.write(&batch)?;
+                writer.finish()?;
+                // Drop writer so out is no longer borrowed.
+            }
+
+            object_store.inner.put(&path, out.into()).await?;
 
             Ok(Some(DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Array,
             }))
-        },
+        }
         DeletionVector::Bitmap(bitmap) => {
-            let id = rand::thread_rng().gen::<i64>();
-            let path = format!("_deletions/{fragment_id}-{read_version}-{id}.bin");
+            let id = rand::thread_rng().gen::<u64>();
+            let path = deletion_file_path(fragment_id, read_version, id, "bin");
 
-            todo!("write bitmap to file");
+            let mut out: Vec<u8> = Vec::new();
+            bitmap.serialize_into(&mut out)?;
+
+            object_store.inner.put(&path, out.into()).await?;
 
             Ok(Some(DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Bitmap,
             }))
-        },
+        }
     }
 }
 
-pub async fn read_deletion_file(fragment: Fragment) -> Result<Option<DeletionVector>> {
-    let deletion_file = fragment.deletion_file?;
+#[allow(dead_code)]
+pub(crate) async fn read_deletion_file(
+    fragment: Fragment,
+    object_store: &ObjectStore,
+) -> Result<Option<DeletionVector>> {
+    let deletion_file = if let Some(file) = fragment.deletion_file {
+        file
+    } else {
+        return Ok(None);
+    };
 
     match deletion_file.file_type {
         DeletionFileType::Array => {
-            let path = format!("_deletions/{fragment.id}-{deletion_file.read_version}-{deletion_file.id}.arrow");
-            let array: UInt32Array = todo!("Read array from file");
+            let path = deletion_file_path(
+                fragment.id,
+                deletion_file.read_version,
+                deletion_file.id,
+                "arrow",
+            );
 
-            Ok(Some(DeletionVector::from_iter(array)))
-        },
+            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let data = std::io::Cursor::new(data);
+            let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
+                .collect::<std::result::Result<_, ArrowError>>()?;
+
+            if batches.len() != 1 {
+                return Err(Error::IO(format!(
+                    "Expected exactly one batch in deletion file, got {}",
+                    batches.len()
+                )));
+            }
+
+            let batch = batches.pop().unwrap();
+            if batch.schema() != deletion_arrow_schema() {
+                return Err(Error::IO(format!(
+                    "Expected schema {:?} in deletion file, got {:?}",
+                    deletion_arrow_schema(),
+                    batch.schema()
+                )));
+            }
+
+            let array = batch.columns()[0]
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap();
+
+            let mut set = HashSet::with_capacity(array.len());
+            for val in array.iter() {
+                if let Some(val) = val {
+                    set.insert(val);
+                } else {
+                    return Err(Error::IO(
+                        "Null values are not allowed in deletion files".to_string(),
+                    ));
+                }
+            }
+
+            Ok(Some(DeletionVector::Set(set)))
+        }
         DeletionFileType::Bitmap => {
-            let path = format!("_deletions/{fragment.id}-{deletion_file.read_version}-{deletion_file.id}.bin");
-            let bitmap: RoaringBitmap = todo!("Read bitmap from file");
+            let path = deletion_file_path(
+                fragment.id,
+                deletion_file.read_version,
+                deletion_file.id,
+                "bin",
+            );
+
+            let data = object_store.inner.get(&path).await?.bytes().await?;
+            let reader = data.reader();
+            let bitmap = RoaringBitmap::deserialize_from(reader)?;
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
-        },
+        }
     }
 }

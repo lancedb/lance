@@ -70,16 +70,17 @@ pub enum DeletionFileType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeletionFile {
-    pub read_version: i64,
-    pub id: i64,
+    pub read_version: u64,
+    pub id: u64,
     pub file_type: DeletionFileType,
 }
 
 impl From<&pb::DeletionFile> for DeletionFile {
     fn from(value: &pb::DeletionFile) -> Self {
         let file_type = match value.file_type {
-            pb::deletion_file::DeletionFileType::Array => DeletionFileType::Array,
-            pb::deletion_file::DeletionFileType::Bitmap => DeletionFileType::Bitmap,
+            0 => DeletionFileType::Array,
+            1 => DeletionFileType::Bitmap,
+            _ => panic!("Invalid deletion file type"),
         };
         Self {
             read_version: value.read_version,
@@ -107,7 +108,11 @@ pub struct Fragment {
 
 impl Fragment {
     pub fn new(id: u64) -> Self {
-        Self { id, files: vec![], deletion_file: None }
+        Self {
+            id,
+            files: vec![],
+            deletion_file: None,
+        }
     }
 
     /// Create a `Fragment` with one DataFile
@@ -144,9 +149,17 @@ impl From<&pb::DataFragment> for Fragment {
 
 impl From<&Fragment> for pb::DataFragment {
     fn from(f: &Fragment) -> Self {
+        let deletion_file = f.deletion_file.as_ref().map(|f| {
+            let file_type = match f.file_type {
+                DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
+                DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
+            };
+            pb::DeletionFile { read_version: f.read_version, id: f.id, file_type: file_type.into() }
+        });
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
+            deletion_file
         }
     }
 }

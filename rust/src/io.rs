@@ -24,6 +24,7 @@ use prost::bytes::Bytes;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+pub(crate) mod deletion;
 pub(crate) mod exec;
 pub mod local;
 pub mod object_reader;
@@ -32,7 +33,6 @@ pub mod object_writer;
 mod reader;
 mod stream;
 mod writer;
-pub(crate) mod deletion;
 
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
