@@ -154,12 +154,16 @@ impl From<&Fragment> for pb::DataFragment {
                 DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
                 DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
             };
-            pb::DeletionFile { read_version: f.read_version, id: f.id, file_type: file_type.into() }
+            pb::DeletionFile {
+                read_version: f.read_version,
+                id: f.id,
+                file_type: file_type.into(),
+            }
         });
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
-            deletion_file
+            deletion_file,
         }
     }
 }

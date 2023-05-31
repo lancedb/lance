@@ -21,11 +21,29 @@ const BITMAP_THRESDHOLD: usize = 5_000;
 // TODO: Benchmark to find a better value.
 
 /// Represents a set of deleted row ids in a single fragment.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum DeletionVector {
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
+}
+
+impl PartialEq for DeletionVector {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DeletionVector::NoDeletions, DeletionVector::NoDeletions) => true,
+            (DeletionVector::Set(set1), DeletionVector::Set(set2)) => set1 == set2,
+            (DeletionVector::Bitmap(bitmap1), DeletionVector::Bitmap(bitmap2)) => {
+                bitmap1 == bitmap2
+            }
+            (DeletionVector::Set(set), DeletionVector::Bitmap(bitmap))
+            | (DeletionVector::Bitmap(bitmap), DeletionVector::Set(set)) => {
+                let set = set.iter().copied().collect::<RoaringBitmap>();
+                set == *bitmap
+            }
+            _ => false,
+        }
+    }
 }
 
 // TODO: impl methods for DeletionVector
@@ -52,7 +70,7 @@ impl FromIterator<u32> for DeletionVector {
         let iter = iter.into_iter();
         match iter.size_hint() {
             (_, Some(0)) => DeletionVector::NoDeletions,
-            (lower, _) if lower > BITMAP_THRESDHOLD => {
+            (lower, _) if lower >= BITMAP_THRESDHOLD => {
                 let bitmap = iter.collect::<RoaringBitmap>();
                 DeletionVector::Bitmap(bitmap)
             }
@@ -221,5 +239,170 @@ pub(crate) async fn read_deletion_file(
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_deletion_vector() {
+        let set = HashSet::from_iter(0..100);
+        let bitmap = RoaringBitmap::from_iter(0..100);
+
+        let set_dv = DeletionVector::Set(set);
+        let bitmap_dv = DeletionVector::Bitmap(bitmap);
+
+        assert_eq!(set_dv, bitmap_dv);
+    }
+
+    #[test]
+    fn test_threshold() {
+        let dv = DeletionVector::from_iter(0..(BITMAP_THRESDHOLD as u32));
+        assert!(matches!(dv, DeletionVector::Bitmap(_)));
+    }
+
+    #[tokio::test]
+    async fn test_write_no_deletions() {
+        let dv = DeletionVector::NoDeletions;
+
+        let object_store = ObjectStore::memory();
+        let file = write_deletion_file(0, 0, &dv, &object_store).await.unwrap();
+        assert!(file.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_write_array() {
+        let dv = DeletionVector::Set(HashSet::from_iter(0..100));
+
+        let fragment_id = 21;
+        let read_version = 12;
+
+        let object_store = ObjectStore::memory();
+        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            file,
+            Some(DeletionFile {
+                file_type: DeletionFileType::Array,
+                ..
+            })
+        ));
+
+        let file = file.unwrap();
+        let path = deletion_file_path(fragment_id, read_version, file.id, "arrow");
+        assert_eq!(
+            path,
+            Path::from(format!("_deletions/21-12-{}.arrow", file.id))
+        );
+
+        let data = object_store
+            .inner
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let data = std::io::Cursor::new(data);
+        let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)
+            .unwrap()
+            .collect::<std::result::Result<_, ArrowError>>()
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = batches.pop().unwrap();
+        assert_eq!(batch.schema(), deletion_arrow_schema());
+        let array = batch["row_id"]
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let read_dv = DeletionVector::from_iter(array.iter().map(|v| v.unwrap()));
+        assert_eq!(read_dv, dv);
+    }
+
+    #[tokio::test]
+    async fn test_write_bitmap() {
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter(0..100));
+
+        let fragment_id = 21;
+        let read_version = 12;
+
+        let object_store = ObjectStore::memory();
+        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            file,
+            Some(DeletionFile {
+                file_type: DeletionFileType::Bitmap,
+                ..
+            })
+        ));
+
+        let file = file.unwrap();
+        let path = deletion_file_path(fragment_id, read_version, file.id, "bin");
+        assert_eq!(
+            path,
+            Path::from(format!("_deletions/21-12-{}.bin", file.id))
+        );
+
+        let data = object_store
+            .inner
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let reader = data.reader();
+        let read_bitmap = RoaringBitmap::deserialize_from(reader).unwrap();
+        assert_eq!(read_bitmap, dv.into_iter().collect::<RoaringBitmap>());
+    }
+
+    #[tokio::test]
+    async fn test_roundtrip_array() {
+        let dv = DeletionVector::Set(HashSet::from_iter(0..100));
+
+        let fragment_id = 21;
+        let read_version = 12;
+
+        let object_store = ObjectStore::memory();
+        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+            .await
+            .unwrap();
+
+        let mut fragment = Fragment::new(fragment_id);
+        fragment.deletion_file = file;
+        let read_dv = read_deletion_file(fragment, &object_store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_dv, dv);
+    }
+
+    #[tokio::test]
+    async fn test_roundtrip_bitmap() {
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter(0..100));
+
+        let fragment_id = 21;
+        let read_version = 12;
+
+        let object_store = ObjectStore::memory();
+        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+            .await
+            .unwrap();
+
+        let mut fragment = Fragment::new(fragment_id);
+        fragment.deletion_file = file;
+        let read_dv = read_deletion_file(fragment, &object_store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_dv, dv);
     }
 }
