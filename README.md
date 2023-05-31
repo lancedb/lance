@@ -157,7 +157,7 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 ## What makes Lance different
 
-Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://eto-ai.github.io/lance/format.html).
+Here we will highlight a few aspects of Lance’s design. For more details, see the full [Lance design document](https://lancedb.github.io/lance/format.html).
 
 **Vector index**: Vector index for similarity search over embedding space
 
