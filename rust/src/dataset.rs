@@ -1192,7 +1192,7 @@ mod tests {
         // Make sure valid arguments should create index successfully
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
         let dataset = dataset
-            .create_index(&["embeddings"], IndexType::Vector, None, &params)
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 

@@ -152,6 +152,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
             IndexType::Vector,
             Some("ivf_pq_index".to_string()),
             &params,
+            true,
         )
         .await
         .unwrap();

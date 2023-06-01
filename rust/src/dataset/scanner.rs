@@ -875,6 +875,7 @@ mod test {
                     IndexType::Vector,
                     Some("idx".to_string()),
                     &params,
+                    true,
                 )
                 .await
                 .unwrap();

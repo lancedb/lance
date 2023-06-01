@@ -87,12 +87,14 @@ pub trait DatasetIndexExt {
     ///  - `name`: optional index name. Must be unique in the dataset.
     ///            if not provided, it will auto-generate one.
     ///  - `params`: index parameters.
+    ///  - `replace`: replace the existing index if it exists.
     async fn create_index(
         &self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
+        replace: bool,
     ) -> Result<Dataset>;
 }
 
@@ -104,6 +106,7 @@ impl DatasetIndexExt for Dataset {
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
+        replace: bool,
     ) -> Result<Self> {
         if columns.len() != 1 {
             return Err(Error::Index {
@@ -121,6 +124,14 @@ impl DatasetIndexExt for Dataset {
         let indices = self.load_indices().await?;
         let index_name = name.unwrap_or(format!("{column}_idx"));
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
+            if idx.fields == [field.id] && !replace {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists, \
+                        please specify a different name or use replace=True"
+                    ),
+                });
+            };
             if idx.fields != [field.id] {
                 return Err(Error::Index {
                     message: format!(
@@ -221,17 +232,17 @@ mod tests {
 
         let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
         let dataset = dataset
-            .create_index(&["v"], IndexType::Vector, None, &params)
+            .create_index(&["v"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
         let dataset = dataset
-            .create_index(&["o"], IndexType::Vector, None, &params)
+            .create_index(&["o"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
         // Create index again
         let dataset = dataset
-            .create_index(&["v"], IndexType::Vector, None, &params)
+            .create_index(&["v"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
@@ -241,7 +252,8 @@ mod tests {
                 &["v"],
                 IndexType::Vector,
                 Some("o_idx".to_string()),
-                &params
+                &params,
+                true,
             )
             .await
             .is_err());
