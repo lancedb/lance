@@ -187,7 +187,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
-    use crate::{arrow::*, utils::testing::generate_random_array};
+    use crate::{arrow::*, index::vector::MetricType, utils::testing::generate_random_array};
 
     #[tokio::test]
     async fn test_recreate_index() {
@@ -218,5 +218,32 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
+        let dataset = dataset
+            .create_index(&["v"], IndexType::Vector, None, &params)
+            .await
+            .unwrap();
+        let dataset = dataset
+            .create_index(&["o"], IndexType::Vector, None, &params)
+            .await
+            .unwrap();
+
+        // Create index again
+        let dataset = dataset
+            .create_index(&["v"], IndexType::Vector, None, &params)
+            .await
+            .unwrap();
+
+        // Can not overwrite an index on different columns.
+        assert!(dataset
+            .create_index(
+                &["v"],
+                IndexType::Vector,
+                Some("o_idx".to_string()),
+                &params
+            )
+            .await
+            .is_err());
     }
 }
