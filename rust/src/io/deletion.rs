@@ -30,6 +30,12 @@ pub(crate) enum DeletionVector {
     Bitmap(RoaringBitmap),
 }
 
+impl Default for DeletionVector {
+    fn default() -> Self {
+        DeletionVector::NoDeletions
+    }
+}
+
 impl PartialEq for DeletionVector {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -45,6 +51,49 @@ impl PartialEq for DeletionVector {
             }
             _ => false,
         }
+    }
+}
+
+impl Extend<u32> for DeletionVector {
+    fn extend<T: IntoIterator<Item = u32>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        // The mem::replace allows changing the variant of Self when we only
+        // have &mut Self.
+        *self = match (std::mem::replace(self, Self::default()), iter.size_hint()) {
+            (DeletionVector::NoDeletions, (_, Some(0))) => DeletionVector::NoDeletions,
+            (DeletionVector::NoDeletions, (lower, _)) if lower >= BITMAP_THRESDHOLD => {
+                let bitmap = iter.collect::<RoaringBitmap>();
+                DeletionVector::Bitmap(bitmap)
+            }
+            (DeletionVector::NoDeletions, (_, Some(upper))) if upper < BITMAP_THRESDHOLD => {
+                let set = iter.collect::<HashSet<_>>();
+                DeletionVector::Set(set)
+            }
+            (DeletionVector::NoDeletions, _) => {
+                // We don't know the size, so just try as a set and move to bitmap
+                // if it ends up being big.
+                let set = iter.collect::<HashSet<_>>();
+                if set.len() > BITMAP_THRESDHOLD {
+                    let bitmap = set.into_iter().collect::<RoaringBitmap>();
+                    DeletionVector::Bitmap(bitmap)
+                } else {
+                    DeletionVector::Set(set)
+                }
+            }
+            (DeletionVector::Set(mut set), _) => {
+                set.extend(iter);
+                if set.len() > BITMAP_THRESDHOLD {
+                    let bitmap = set.drain().collect::<RoaringBitmap>();
+                    DeletionVector::Bitmap(bitmap)
+                } else {
+                    DeletionVector::Set(set)
+                }
+            }
+            (DeletionVector::Bitmap(mut bitmap), _) => {
+                bitmap.extend(iter);
+                DeletionVector::Bitmap(bitmap)
+            }
+        };
     }
 }
 
@@ -69,29 +118,9 @@ impl IntoIterator for DeletionVector {
 
 impl FromIterator<u32> for DeletionVector {
     fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self {
-        let iter = iter.into_iter();
-        match iter.size_hint() {
-            (_, Some(0)) => DeletionVector::NoDeletions,
-            (lower, _) if lower >= BITMAP_THRESDHOLD => {
-                let bitmap = iter.collect::<RoaringBitmap>();
-                DeletionVector::Bitmap(bitmap)
-            }
-            (_, Some(upper)) if upper < BITMAP_THRESDHOLD => {
-                let set = iter.collect::<HashSet<_>>();
-                DeletionVector::Set(set)
-            }
-            _ => {
-                // We don't know the size, so just try as a set and move to bitmap
-                // if it ends up being big.
-                let set = iter.collect::<HashSet<_>>();
-                if set.len() > BITMAP_THRESDHOLD {
-                    let bitmap = set.into_iter().collect::<RoaringBitmap>();
-                    DeletionVector::Bitmap(bitmap)
-                } else {
-                    DeletionVector::Set(set)
-                }
-            }
-        }
+        let mut deletion_vector = DeletionVector::default();
+        deletion_vector.extend(iter);
+        deletion_vector
     }
 }
 
@@ -105,8 +134,14 @@ fn deletion_arrow_schema() -> Arc<Schema> {
 }
 
 /// Get the file path for a deletion file. This is relative to the dataset root.
-fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str) -> Path {
-    Path::from(format!(
+fn deletion_file_path(
+    base_path: &Path,
+    fragment_id: u64,
+    read_version: u64,
+    id: u64,
+    suffix: &str,
+) -> Path {
+    base_path.child(format!(
         "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
     ))
 }
@@ -121,12 +156,13 @@ pub(crate) async fn write_deletion_file(
     read_version: u64,
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
+    base_path: &Path,
 ) -> Result<Option<DeletionFile>> {
     match removed_rows {
         DeletionVector::NoDeletions => Ok(None),
         DeletionVector::Set(set) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(fragment_id, read_version, id, "arrow");
+            let path = deletion_file_path(base_path, fragment_id, read_version, id, "arrow");
 
             let array = UInt32Array::from_iter(set.iter().copied());
             let array = Arc::new(array);
@@ -158,7 +194,7 @@ pub(crate) async fn write_deletion_file(
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(fragment_id, read_version, id, "bin");
+            let path = deletion_file_path(base_path, fragment_id, read_version, id, "bin");
 
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
@@ -181,10 +217,11 @@ pub(crate) async fn write_deletion_file(
 /// Will return an error if the file is present but invalid.
 #[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn read_deletion_file(
-    fragment: Fragment,
+    fragment: &Fragment,
     object_store: &ObjectStore,
+    base_path: &Path,
 ) -> Result<Option<DeletionVector>> {
-    let deletion_file = if let Some(file) = fragment.deletion_file {
+    let deletion_file = if let Some(file) = &fragment.deletion_file {
         file
     } else {
         return Ok(None);
@@ -193,6 +230,7 @@ pub(crate) async fn read_deletion_file(
     match deletion_file.file_type {
         DeletionFileType::Array => {
             let path = deletion_file_path(
+                base_path,
                 fragment.id,
                 deletion_file.read_version,
                 deletion_file.id,
@@ -249,6 +287,7 @@ pub(crate) async fn read_deletion_file(
         }
         DeletionFileType::Bitmap => {
             let path = deletion_file_path(
+                base_path,
                 fragment.id,
                 deletion_file.read_version,
                 deletion_file.id,
@@ -292,7 +331,9 @@ mod test {
         let dv = DeletionVector::NoDeletions;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(0, 0, &dv, &object_store).await.unwrap();
+        let file = write_deletion_file(0, 0, &dv, &object_store, &Path::default())
+            .await
+            .unwrap();
         assert!(file.is_none());
     }
 
@@ -304,9 +345,15 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let file = write_deletion_file(
+            fragment_id,
+            read_version,
+            &dv,
+            &object_store,
+            &Path::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             file,
@@ -317,7 +364,13 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(fragment_id, read_version, file.id, "arrow");
+        let path = deletion_file_path(
+            &Path::default(),
+            fragment_id,
+            read_version,
+            file.id,
+            "arrow",
+        );
         assert_eq!(
             path,
             Path::from(format!("_deletions/21-12-{}.arrow", file.id))
@@ -356,9 +409,15 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let file = write_deletion_file(
+            fragment_id,
+            read_version,
+            &dv,
+            &object_store,
+            &Path::default(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(
             file,
@@ -369,7 +428,7 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(fragment_id, read_version, file.id, "bin");
+        let path = deletion_file_path(&Path::default(), fragment_id, read_version, file.id, "bin");
         assert_eq!(
             path,
             Path::from(format!("_deletions/21-12-{}.bin", file.id))
@@ -396,13 +455,19 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let file = write_deletion_file(
+            fragment_id,
+            read_version,
+            &dv,
+            &object_store,
+            &Path::default(),
+        )
+        .await
+        .unwrap();
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(fragment, &object_store)
+        let read_dv = read_deletion_file(&fragment, &object_store, &Path::default())
             .await
             .unwrap()
             .unwrap();
@@ -417,13 +482,19 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
-            .await
-            .unwrap();
+        let file = write_deletion_file(
+            fragment_id,
+            read_version,
+            &dv,
+            &object_store,
+            &Path::default(),
+        )
+        .await
+        .unwrap();
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(fragment, &object_store)
+        let read_dv = read_deletion_file(&fragment, &object_store, &Path::default())
             .await
             .unwrap()
             .unwrap();

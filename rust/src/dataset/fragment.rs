@@ -17,7 +17,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::cast::as_primitive_array;
+use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
+use crate::io::deletion::{read_deletion_file, write_deletion_file};
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
@@ -202,7 +204,6 @@ impl FileFragment {
         Ok(Updater::new(self.clone(), reader))
     }
 
-    /// Merge columns from joiner.
     pub(crate) async fn merge(
         mut self,
         join_column: &str,
@@ -240,6 +241,56 @@ impl FileFragment {
         self.metadata.add_file(&filename, &file_schema);
 
         Ok(self)
+    }
+
+    ///
+    /// Will modify self to have the new deletion file. This should be
+    /// persisted to the manifest file.
+    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
+        // Load existing deletion vector
+        let mut deletion_vector = read_deletion_file(
+            &self.metadata,
+            self.dataset.object_store(),
+            &self.dataset.base,
+        )
+        .await?
+        .unwrap_or_default();
+
+        // scan with predicate and row ids
+        let mut scanner = self.scan();
+        scanner
+            .with_row_id()
+            .filter(predicate)?
+            .project(&["_row_id"])?;
+
+        // As we get row ids, add them into our deletion vector
+        scanner
+            .try_into_stream()
+            .await?
+            .try_for_each(|batch| {
+                let array = batch["_row_id"].clone();
+                let int_array: &UInt64Array = as_primitive_array(array.as_ref());
+
+                // _row_id is global, not within fragment level. The high bits
+                // are the fragment_id, the low bits are the row_id within the
+                // fragment.
+                let local_row_ids = int_array.iter().map(|v| v.unwrap() as u32);
+
+                deletion_vector.extend(local_row_ids);
+                async { Ok(()) }
+            })
+            .await?;
+
+        self.metadata.deletion_file = write_deletion_file(
+            self.metadata.id,
+            self.dataset.version().version,
+            &deletion_vector,
+            self.dataset.object_store(),
+            &self.dataset.base,
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -491,14 +542,9 @@ mod tests {
 
         // Scan again
         let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = Dataset::commit(
-            test_uri,
-            &full_schema,
-            &[new_fragment],
-            crate::dataset::WriteMode::Create,
-        )
-        .await
-        .unwrap();
+        let dataset = Dataset::commit(test_uri, &full_schema, &[new_fragment], false)
+            .await
+            .unwrap();
         assert_eq!(dataset.version().version, 2);
         let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
 
