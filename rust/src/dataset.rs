@@ -704,6 +704,11 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
+        dbg!("wrote deletion files");
+
+        dbg!(&self.base);
+        dbg!(self.object_store.base_path());
+
         Dataset::commit(
             &self.base,
             self.schema(),
@@ -711,6 +716,8 @@ impl Dataset {
             true, // keep indices
         )
         .await?;
+
+        dbg!("committed data");
 
         Ok(())
     }
@@ -850,18 +857,22 @@ async fn write_manifest_file_to_path(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::ops::Range;
+
     use super::*;
     use crate::index::vector::MetricType;
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use crate::io::deletion::read_deletion_file;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
-    use arrow_array::Float32Array;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
+    use arrow_array::{Float32Array, UInt32Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -1478,5 +1489,74 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        }
+
+        // Write a dataset
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        dbg!(&test_uri);
+        let data = sequence_data(0..100);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
+        let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        // Delete rows
+        dataset.delete("i < 10 OR i > 90").await.unwrap();
+
+        // Verify result:
+        // There should be a deletion file in the metadata
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+
+        // The deletion file should contain 20 rows
+        let store = ObjectStore::new(test_uri).await.unwrap();
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store, &dataset.base)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 20);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..10).chain(91..100).collect::<HashSet<_>>()
+        );
+
+        // Delete more rows
+        dataset.delete("i < 20").await.unwrap();
+
+        // Verify result
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store, &dataset.base)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 30);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..20).chain(91..100).collect::<HashSet<_>>()
+        );
+
+        // Delete full fragment
+        dataset.delete("i >= 20").await.unwrap();
+
+        // Verify fragment is fully gone
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 0);
     }
 }

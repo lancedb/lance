@@ -256,19 +256,21 @@ impl FileFragment {
         .await?
         .unwrap_or_default();
 
+        dbg!("hello");
+
         // scan with predicate and row ids
         let mut scanner = self.scan();
         scanner
             .with_row_id()
             .filter(predicate)?
-            .project(&["_row_id"])?;
+            .project::<&str>(&[])?;
 
         // As we get row ids, add them into our deletion vector
         scanner
             .try_into_stream()
             .await?
             .try_for_each(|batch| {
-                let array = batch["_row_id"].clone();
+                let array = batch["_rowid"].clone();
                 let int_array: &UInt64Array = as_primitive_array(array.as_ref());
 
                 // _row_id is global, not within fragment level. The high bits
@@ -277,7 +279,7 @@ impl FileFragment {
                 let local_row_ids = int_array.iter().map(|v| v.unwrap() as u32);
 
                 deletion_vector.extend(local_row_ids);
-                async { Ok(()) }
+                futures::future::ready(Ok(()))
             })
             .await?;
 
@@ -289,6 +291,7 @@ impl FileFragment {
             &self.dataset.base,
         )
         .await?;
+        dbg!("wrote file");
 
         Ok(())
     }

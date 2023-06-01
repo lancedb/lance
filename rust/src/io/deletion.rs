@@ -30,6 +30,16 @@ pub(crate) enum DeletionVector {
     Bitmap(RoaringBitmap),
 }
 
+impl DeletionVector {
+    pub fn len(&self) -> usize {
+        match self {
+            DeletionVector::NoDeletions => 0,
+            DeletionVector::Set(set) => set.len(),
+            DeletionVector::Bitmap(bitmap) => bitmap.len() as usize,
+        }
+    }
+}
+
 impl Default for DeletionVector {
     fn default() -> Self {
         DeletionVector::NoDeletions
@@ -141,8 +151,12 @@ fn deletion_file_path(
     id: u64,
     suffix: &str,
 ) -> Path {
-    base_path.child(format!(
-        "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
+    // base_path.child("_deletions").child(format!(
+    //     "{fragment_id}-{read_version}-{id}.{suffix}"
+    // ))
+    Path::from(format!(
+        "_deletions/{}-{}-{}.{}",
+        fragment_id, read_version, id, suffix
     ))
 }
 
