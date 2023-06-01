@@ -112,6 +112,10 @@ harness = false
 name = "kmeans"
 harness = false
 
+[[bench]]
+name = "argmin"
+harness = false
+
 [profile.release]
 strip = true
 opt-level = "s"
