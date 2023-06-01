@@ -27,7 +27,7 @@ use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, Se
 use accelerate_src;
 
 #[allow(unused_imports)]
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(all(any(target_os = "linux", target_os = "windows"), not(docsrc)))]
 use openblas_src;
 
 use crate::{Error, Result};
