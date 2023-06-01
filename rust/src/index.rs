@@ -118,13 +118,17 @@ impl DatasetIndexExt for Dataset {
         };
 
         // Load indices from the disk.
-        let mut indices = self.load_indices().await?;
-
+        let indices = self.load_indices().await?;
         let index_name = name.unwrap_or(format!("{column}_idx"));
-        if indices.iter().any(|i| i.name == index_name) {
-            return Err(Error::Index {
-                message: format!("Index name '{index_name} already exists'"),
-            });
+        if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
+            if idx.fields != [field.id] {
+                return Err(Error::Index {
+                    message: format!(
+                        "Index name '{index_name} already exists with different fields, \
+                        please specify a different name"
+                    ),
+                });
+            }
         }
 
         let index_id = Uuid::new_v4();
@@ -155,6 +159,13 @@ impl DatasetIndexExt for Dataset {
 
         // Write index metadata down
         let new_idx = IndexMetadata::new(index_id, &index_name, &[field.id], new_manifest.version);
+        // Exclude the old index if it exists.
+        // We already checked that there is no index with the same name but on different fields.
+        let mut indices = indices
+            .iter()
+            .filter(|idx| idx.name != index_name)
+            .map(|i| i.clone())
+            .collect::<Vec<_>>();
         indices.push(new_idx);
 
         write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
@@ -165,5 +176,47 @@ impl DatasetIndexExt for Dataset {
             manifest: Arc::new(new_manifest),
             session: Arc::new(Session::default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::tempdir;
+
+    use crate::{arrow::*, utils::testing::generate_random_array};
+
+    #[tokio::test]
+    async fn test_recreate_index() {
+        const DIM: i32 = 8;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                true,
+            ),
+            Field::new(
+                "o",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+                true,
+            ),
+        ]));
+        let data = generate_random_array(2048 * DIM as usize);
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
+                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
+            ],
+        )
+        .unwrap()]);
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
     }
 }
