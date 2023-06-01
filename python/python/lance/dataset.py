@@ -259,7 +259,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         columns: Optional[list[str]] = None,
         filter: Optional[Union[str, pa.compute.Expression]] = None,
-        limit: Optional[int]= None,
+        limit: Optional[int] = None,
         offset: Optional[int] = None,
         nearest: Optional[dict] = None,
         batch_readahead: Optional[int] = None,
@@ -601,14 +601,18 @@ class ScannerBuilder:
         self._filter = filter
         return self
 
-    def with_fragments(self, fragments: Optional[Iterable[LanceFragment]]) -> ScannerBuilder:
+    def with_fragments(
+        self, fragments: Optional[Iterable[LanceFragment]]
+    ) -> ScannerBuilder:
         if fragments is not None:
             inner_fragments = []
             for f in fragments:
                 if isinstance(f, LanceFragment):
                     inner_fragments.append(f._fragment)
                 else:
-                    raise TypeError(f"fragments must be an iterable of LanceFragment. Got {type(f)} instead.")
+                    raise TypeError(
+                        f"fragments must be an iterable of LanceFragment. Got {type(f)} instead."
+                    )
             fragments = inner_fragments
 
         self._fragments = fragments
