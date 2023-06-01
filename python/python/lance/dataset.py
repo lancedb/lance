@@ -384,6 +384,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type: str,
         name: Optional[str] = None,
         metric: str = "L2",
+        replace: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -402,6 +403,8 @@ class LanceDataset(pa.dataset.Dataset):
         metric : str
             The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
             Default is "L2".
+        replace : bool
+            Replace the existing index if it exists.
         kwargs :
             Parameters passed to the index building process.
 
@@ -480,6 +483,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
 
+        kwargs["replace"] = replace
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
@@ -555,13 +559,13 @@ class ScannerBuilder:
             raise ValueError("batch_readahead must be non-negative")
         self._batch_readahead = nbatches
         return self
-    
+
     def fragment_readahead(self, nfragments: Optional[int] = None) -> ScannerBuilder:
         if nfragments is not None and int(nfragments) < 0:
             raise ValueError("fragment_readahead must be non-negative")
         self._fragment_readahead = nfragments
         return self
-    
+
     def scan_in_order(self, scan_in_order: bool = True) -> ScannerBuilder:
         """
         Whether to scan the dataset in order of fragments and batches.
