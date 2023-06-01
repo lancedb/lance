@@ -1,3 +1,7 @@
+
+.. image:: _static/lance_logo.png
+  :width: 400
+
 Lance: modern columnar data format for ML
 ======================================================================================
 
