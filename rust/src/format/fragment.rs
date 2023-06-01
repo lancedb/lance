@@ -62,6 +62,34 @@ impl From<&pb::DataFile> for DataFile {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeletionFileType {
+    Array,
+    Bitmap,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeletionFile {
+    pub read_version: u64,
+    pub id: u64,
+    pub file_type: DeletionFileType,
+}
+
+impl From<&pb::DeletionFile> for DeletionFile {
+    fn from(value: &pb::DeletionFile) -> Self {
+        let file_type = match value.file_type {
+            0 => DeletionFileType::Array,
+            1 => DeletionFileType::Bitmap,
+            _ => panic!("Invalid deletion file type"),
+        };
+        Self {
+            read_version: value.read_version,
+            id: value.id,
+            file_type,
+        }
+    }
+}
+
 /// Data fragment.
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
@@ -73,11 +101,18 @@ pub struct Fragment {
 
     /// Files within the fragment.
     pub files: Vec<DataFile>,
+
+    /// Optional file with deleted row ids.
+    pub deletion_file: Option<DeletionFile>,
 }
 
 impl Fragment {
     pub fn new(id: u64) -> Self {
-        Self { id, files: vec![] }
+        Self {
+            id,
+            files: vec![],
+            deletion_file: None,
+        }
     }
 
     /// Create a `Fragment` with one DataFile
@@ -85,6 +120,7 @@ impl Fragment {
         Self {
             id,
             files: vec![DataFile::new(path, schema)],
+            deletion_file: None,
         }
     }
 
@@ -106,15 +142,28 @@ impl From<&pb::DataFragment> for Fragment {
         Self {
             id: p.id,
             files: p.files.iter().map(DataFile::from).collect(),
+            deletion_file: p.deletion_file.as_ref().map(DeletionFile::from),
         }
     }
 }
 
 impl From<&Fragment> for pb::DataFragment {
     fn from(f: &Fragment) -> Self {
+        let deletion_file = f.deletion_file.as_ref().map(|f| {
+            let file_type = match f.file_type {
+                DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
+                DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
+            };
+            pb::DeletionFile {
+                read_version: f.read_version,
+                id: f.id,
+                file_type: file_type.into(),
+            }
+        });
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
+            deletion_file,
         }
     }
 }
@@ -153,5 +202,26 @@ mod tests {
                 fields: vec![0, 1, 2, 3]
             }]
         )
+    }
+
+    #[test]
+    fn test_roundtrip_fragment() {
+        let mut fragment = Fragment::new(123);
+        let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
+        fragment.add_file("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.deletion_file = Some(DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Array,
+        });
+
+        let proto = pb::DataFragment::from(&fragment);
+        let fragment2 = Fragment::from(&proto);
+        assert_eq!(fragment, fragment2);
+
+        fragment.deletion_file = None;
+        let proto = pb::DataFragment::from(&fragment);
+        let fragment2 = Fragment::from(&proto);
+        assert_eq!(fragment, fragment2);
     }
 }
