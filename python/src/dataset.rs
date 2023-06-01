@@ -332,6 +332,12 @@ impl Dataset {
             None => MetricType::L2,
         };
 
+        let replace = if let Some(replace) = kwargs.and_then(|k| k.get_item("replace")) {
+            PyAny::downcast::<PyBool>(replace)?.extract()?
+        } else {
+            false
+        };
+
         // Only VectorParams are supported.
         let params = match index_type.to_uppercase().as_str() {
             "IVF_PQ" => {
@@ -389,7 +395,7 @@ impl Dataset {
             .block_on(async {
                 self_
                     .ds
-                    .create_index(columns.as_slice(), idx_type, name, &params)
+                    .create_index(columns.as_slice(), idx_type, name, &params, replace)
                     .await
             })
             .map_err(|e| PyIOError::new_err(e.to_string()))?;

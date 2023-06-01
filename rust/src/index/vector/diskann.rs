@@ -157,7 +157,7 @@ mod tests {
         let params =
             VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::default());
         let dataset = dataset
-            .create_index(&["embeddings"], IndexType::Vector, None, &params)
+            .create_index(&["embeddings"], IndexType::Vector, None, &params, false)
             .await
             .unwrap();
 
