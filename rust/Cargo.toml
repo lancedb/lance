@@ -111,6 +111,10 @@ name = "vector_index"
 harness = false
 
 [[bench]]
+name = "vector_index_build"
+harness = false
+
+[[bench]]
 name = "kmeans"
 harness = false
 
