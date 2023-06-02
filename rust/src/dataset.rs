@@ -1509,6 +1509,14 @@ mod tests {
         let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
         let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
+        // Delete nothing
+        dataset.delete("i < 0").await.unwrap();
+
+        // We should not have any deletion file still
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_none());
+
         // Delete rows
         dataset.delete("i < 10 OR i >= 90").await.unwrap();
 
