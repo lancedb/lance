@@ -32,6 +32,7 @@ pub(crate) enum DeletionVector {
 }
 
 impl DeletionVector {
+    #[allow(dead_code)] // Used in tests
     pub fn len(&self) -> usize {
         match self {
             Self::NoDeletions => 0,
@@ -155,8 +156,7 @@ fn deletion_arrow_schema() -> Arc<Schema> {
 /// Get the file path for a deletion file. This is relative to the dataset root.
 fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str) -> Path {
     Path::from(format!(
-        "_deletions/{}-{}-{}.{}",
-        fragment_id, read_version, id, suffix
+        "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
     ))
 }
 

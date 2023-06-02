@@ -427,17 +427,12 @@ impl Dataset {
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
-    ///
-    /// `keep_indices`: whether to keep the indices. If the write was an overwrite,
-    /// then this should be false, since none of the fragments the indices reference
-    /// are valid anymore.
     pub async fn commit(
-        base_uri: impl AsRef<str>,
+        base_uri: &str,
         schema: &Schema,
         fragments: &[Fragment],
-        keep_indices: bool,
+        mode: WriteMode,
     ) -> Result<Self> {
-        let base_uri: &str = base_uri.as_ref();
         let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
         let latest_manifest = latest_manifest_path(object_store.base_path());
         let mut indices = vec![];
@@ -446,7 +441,7 @@ impl Dataset {
             let dataset = Self::open(base_uri).await?;
             version = dataset.version().version + 1;
 
-            if keep_indices {
+            if matches!(mode, WriteMode::Append) {
                 // Append mode: inherit indices from previous version.
                 indices = dataset.load_indices().await?;
             }
@@ -693,6 +688,7 @@ impl Dataset {
     pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
         let updated_fragments = stream::iter(self.get_fragments())
             .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
+            // Handle up to 16 fragments concurrently
             .buffer_unordered(16)
             // Drop the fragments that were deleted.
             .try_filter_map(|f| futures::future::ready(Ok(f)))

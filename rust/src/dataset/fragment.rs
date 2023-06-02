@@ -544,9 +544,14 @@ mod tests {
 
         // Scan again
         let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = Dataset::commit(test_uri, &full_schema, &[new_fragment], false)
-            .await
-            .unwrap();
+        let dataset = Dataset::commit(
+            test_uri,
+            &full_schema,
+            &[new_fragment],
+            crate::dataset::WriteMode::Create,
+        )
+        .await
+        .unwrap();
         assert_eq!(dataset.version().version, 2);
         let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
 
