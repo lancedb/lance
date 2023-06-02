@@ -16,18 +16,41 @@
 
 use sqlparser::{
     ast::{Expr, SetExpr, Statement},
-    dialect::GenericDialect,
+    dialect::{Dialect, GenericDialect},
     parser::Parser,
     tokenizer::{Token, Tokenizer},
 };
 
 use crate::{Error, Result};
 
+#[derive(Debug, Default)]
+struct LanceDialect(GenericDialect);
+
+impl LanceDialect {
+    fn new() -> Self {
+        Self(GenericDialect {})
+    }
+}
+
+impl Dialect for LanceDialect {
+    fn is_identifier_start(&self, ch: char) -> bool {
+        self.0.is_identifier_start(ch)
+    }
+
+    fn is_identifier_part(&self, ch: char) -> bool {
+        self.0.is_identifier_part(ch)
+    }
+
+    fn is_delimited_identifier_start(&self, ch: char) -> bool {
+        ch == '`'
+    }
+}
+
 /// Parse sql filter to Expression.
 pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
-    let dialect = GenericDialect {};
+    let dialect = LanceDialect::new();
     let mut tokenizer = Tokenizer::new(&dialect, &sql);
     let tokens = tokenizer
         .tokenize()?
@@ -93,6 +116,19 @@ mod tests {
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
                 pattern: Box::new(Expr::Value(Value::SingleQuotedString("abc%".to_string()))),
                 escape_char: None
+            },
+            expr
+        );
+    }
+
+    #[test]
+    fn test_quoted_ident() {
+        let expr = parse_sql_filter("`a:Test_Something` == `test'STR`").unwrap();
+        assert_eq!(
+            Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::with_quote('`', "a:Test_Something"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::with_quote('`', "test'STR")))
             },
             expr
         );

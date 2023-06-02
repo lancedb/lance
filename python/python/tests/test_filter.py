@@ -98,6 +98,15 @@ def test_match(tmp_path: Path):
     pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["aaa", "abc"]}))
 
 
+def test_escaped_name(tmp_path: Path):
+    table = pa.table({"silly :name": pa.array([1, 2, 3])})
+    dataset = lance.write_dataset(table, tmp_path / "test_escaped_name")
+
+    dataset = lance.dataset(tmp_path / "test_escaped_name")
+    result = dataset.to_table(filter='`silly :name` > 2').to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"silly :name": [3]}))
+
+
 def create_table_for_duckdb(nvec=10000, ndim=768):
     mat = np.random.randn(nvec, ndim)
     price = (np.random.rand(nvec) + 1) * 100
