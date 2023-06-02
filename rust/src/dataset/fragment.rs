@@ -243,20 +243,16 @@ impl FileFragment {
         Ok(self)
     }
 
+    /// Delete rows from the fragment.
     ///
-    /// Will modify self to have the new deletion file. This should be
-    /// persisted to the manifest file.
-    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
+    /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
+    /// fragment with the updated deletion vector. This must be persisted to
+    /// the manifest.
+    pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
-        let mut deletion_vector = read_deletion_file(
-            &self.metadata,
-            self.dataset.object_store(),
-            &self.dataset.base,
-        )
-        .await?
-        .unwrap_or_default();
-
-        dbg!("hello");
+        let mut deletion_vector = read_deletion_file(&self.metadata, self.dataset.object_store())
+            .await?
+            .unwrap_or_default();
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
@@ -283,17 +279,20 @@ impl FileFragment {
             })
             .await?;
 
+        let num_rows = self.count_rows().await? as u32;
+        if deletion_vector.contains_range(0..num_rows) {
+            return Ok(None);
+        }
+
         self.metadata.deletion_file = write_deletion_file(
             self.metadata.id,
             self.dataset.version().version,
             &deletion_vector,
             self.dataset.object_store(),
-            &self.dataset.base,
         )
         .await?;
-        dbg!("wrote file");
 
-        Ok(())
+        Ok(Some(self))
     }
 }
 

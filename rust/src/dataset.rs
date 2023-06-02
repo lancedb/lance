@@ -409,21 +409,12 @@ impl Dataset {
                 .unwrap_or(1),
             None => 1,
         };
+        manifest.set_timestamp(None);
         // Inherit the index if we're just appending rows
-        let indices = if matches!(params.mode, WriteMode::Append) {
-            if let Some(d) = dataset.as_ref() {
-                Some(d.load_indices().await?)
-            } else {
-                None
-            }
-        } else {
-            None
+        let indices = match (&dataset, &params.mode) {
+            (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
+            _ => None,
         };
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
         write_manifest_file(&object_store, &mut manifest, indices).await?;
 
         let base = object_store.base_path().clone();
@@ -697,27 +688,35 @@ impl Dataset {
         Ok(self.take(&ids[..], &projection).await?)
     }
 
-    pub(crate) async fn delete(&self, predicate: &str) -> Result<()> {
+    /// Delete rows based on a predicate.
+    #[allow(dead_code)] // TODO: remove once this is public
+    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
         let updated_fragments = stream::iter(self.get_fragments())
-            .map(|mut f| async move { f.delete(predicate).await.map(|_| f.metadata) })
+            .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
             .buffer_unordered(16)
+            // Drop the fragments that were deleted.
+            .try_filter_map(|f| futures::future::ready(Ok(f)))
             .try_collect::<Vec<_>>()
             .await?;
 
-        dbg!("wrote deletion files");
+        // Inherit the index, unless we deleted all the fragments.
+        let indices = if updated_fragments.is_empty() {
+            None
+        } else {
+            Some(self.load_indices().await?)
+        };
 
-        dbg!(&self.base);
-        dbg!(self.object_store.base_path());
+        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        manifest.set_timestamp(None);
 
-        Dataset::commit(
-            &self.base,
-            self.schema(),
-            &updated_fragments,
-            true, // keep indices
-        )
-        .await?;
+        write_manifest_file(&self.object_store, &mut manifest, indices).await?;
 
-        dbg!("committed data");
+        self.manifest = Arc::new(manifest);
 
         Ok(())
     }
@@ -1509,13 +1508,13 @@ mod tests {
         // Write a dataset
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        dbg!(&test_uri);
+
         let data = sequence_data(0..100);
         let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
-        let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
         // Delete rows
-        dataset.delete("i < 10 OR i > 90").await.unwrap();
+        dataset.delete("i < 10 OR i >= 90").await.unwrap();
 
         // Verify result:
         // There should be a deletion file in the metadata
@@ -1524,15 +1523,15 @@ mod tests {
         assert!(fragments[0].metadata.deletion_file.is_some());
 
         // The deletion file should contain 20 rows
-        let store = ObjectStore::new(test_uri).await.unwrap();
-        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store, &dataset.base)
+        let store = dataset.object_store().clone();
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(deletion_vector.len(), 20);
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
-            (0..10).chain(91..100).collect::<HashSet<_>>()
+            (0..10).chain(90..100).collect::<HashSet<_>>()
         );
 
         // Delete more rows
@@ -1542,14 +1541,14 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store, &dataset.base)
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(deletion_vector.len(), 30);
         assert_eq!(
             deletion_vector.into_iter().collect::<HashSet<_>>(),
-            (0..20).chain(91..100).collect::<HashSet<_>>()
+            (0..20).chain(90..100).collect::<HashSet<_>>()
         );
 
         // Delete full fragment
