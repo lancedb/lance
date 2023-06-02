@@ -123,12 +123,26 @@ mod tests {
 
     #[test]
     fn test_quoted_ident() {
-        let expr = parse_sql_filter("`a:Test_Something` == `test'STR`").unwrap();
+        // CUBE is a SQL keyword, so it must be quoted.
+        let expr = parse_sql_filter("`a:Test_Something` == `CUBE`").unwrap();
         assert_eq!(
             Expr::BinaryOp {
                 left: Box::new(Expr::Identifier(Ident::with_quote('`', "a:Test_Something"))),
                 op: BinaryOperator::Eq,
-                right: Box::new(Expr::Identifier(Ident::with_quote('`', "test'STR")))
+                right: Box::new(Expr::Identifier(Ident::with_quote('`', "CUBE")))
+            },
+            expr
+        );
+
+        let expr = parse_sql_filter("`outer field`.`inner field` == 1").unwrap();
+        assert_eq!(
+            Expr::BinaryOp {
+                left: Box::new(Expr::CompoundIdentifier(vec![
+                    Ident::with_quote('`', "outer field"),
+                    Ident::with_quote('`', "inner field")
+                ])),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Value(Value::Number("1".to_string(), false))),
             },
             expr
         );
