@@ -493,47 +493,70 @@ impl Dataset {
     /// Returns: a new version of dataset.
     ///
     /// It performs a left-join on the two datasets.
-    pub fn merge(
-        &self,
+    pub async fn merge(
+        &mut self,
         stream: &mut dyn RecordBatchReader,
         left_on: &str,
         right_on: &str,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         // Sanity check.
         if self.schema().field(left_on).is_none() {
-            return Err(Error::IO { message: format!(
-                "Column {} does not exist in the left side dataset",
-                left_on
-        )});
+            return Err(Error::IO {
+                message: format!("Column {} does not exist in the left side dataset", left_on),
+            });
         };
         let right_schema = stream.schema();
         if right_schema.field_with_name(right_on).is_err() {
-            return Err(Error::IO { message: format!(
-                "Column {} does not exist in the right side dataset",
-                right_on
-            )});
+            return Err(Error::IO {
+                message: format!(
+                    "Column {} does not exist in the right side dataset",
+                    right_on
+                ),
+            });
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
-                return Err(Error::IO { message: format!(
-                    "Column {} exists in both sides of the dataset",
-                    field.name()
-                )});
+                return Err(Error::IO {
+                    message: format!(
+                        "Column {} exists in both sides of the dataset",
+                        field.name()
+                    ),
+                });
             }
         }
 
         // Hash join
-        let mut joiner = HashJoiner::try_new(stream, right_on)?;
-        joiner.build()?;
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
 
-        // Write new data file to each fragment.
-        let mut new_fragments: Vec<Fragment> = vec![];
-        for fragment in self.get_fragments().iter() {}
+        // Write new data file to each fragment. Parallism is done over columns,
+        // so no parallelism done at this level.
+        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+            .then(|f| {
+                let joiner = joiner.clone();
+                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        todo!()
+        // Inherit the index, since we are just adding columns.
+        let indices = self.load_indices().await?;
+
+        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        manifest.set_timestamp(None);
+
+        write_manifest_file(&self.object_store, &mut manifest, Some(indices)).await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
     }
 
     /// Create a Scanner to scan the dataset.

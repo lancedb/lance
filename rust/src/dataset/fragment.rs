@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
 use super::hash_joiner::HashJoiner;
@@ -202,8 +203,40 @@ impl FileFragment {
     }
 
     /// Merge columns from joiner.
-    pub(crate) async fn merge(&self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        todo!()
+    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        let mut scanner = self.scan();
+        scanner.project(&[join_column])?;
+
+        let mut batch_stream = scanner
+            .try_into_stream()
+            .await?
+            .and_then(|batch| joiner.collect(batch.column(0).clone()))
+            .boxed();
+
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let full_path = self
+            .dataset
+            .object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(filename.clone());
+        let mut writer = FileWriter::try_new(
+            &self.dataset.object_store,
+            &full_path,
+            self.dataset.schema().clone(),
+        )
+        .await?;
+
+        while let Some(batch) = batch_stream.try_next().await? {
+            writer.write(&[batch]).await?;
+        }
+
+        writer.finish().await?;
+
+        let schema = crate::datatypes::Schema::try_from(joiner.out_schema().as_ref())?;
+        self.metadata.add_file(full_path.as_ref(), &schema);
+
+        Ok(self)
     }
 }
 

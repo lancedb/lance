@@ -14,91 +14,175 @@
 
 //! HashJoiner
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow_array::StructArray;
-use arrow_array::{
-    builder::UInt64Builder, cast::as_struct_array, Array, RecordBatch, RecordBatchReader,
-};
-use arrow_select::{concat::concat_batches, take::take};
+use arrow_array::{new_null_array, Array, RecordBatch, RecordBatchReader};
+use arrow_array::ArrayRef;
+use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
+use arrow_schema::SchemaRef;
+use arrow_select::interleave::interleave;
+use dashmap::{DashMap, ReadOnlyView};
+use futures::{StreamExt, TryStreamExt};
+use tokio::task;
 
-use crate::arrow::hash;
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
 pub(crate) struct HashJoiner {
-    /// Hash value to row index map.
-    index_map: HashMap<u64, usize>,
+    index_map: ReadOnlyView<OwnedRow, (usize, usize)>,
 
-    batch: RecordBatch,
+    batches: Vec<RecordBatch>,
 
-    on_column: String,
+    out_schema: SchemaRef,
+}
+
+fn column_to_rows(column: ArrayRef) -> Result<Rows> {
+    let mut row_converter = RowConverter::new(vec![SortField::new(column.data_type().clone())])?;
+    let rows = row_converter.convert_columns(&[column])?;
+    Ok(rows)
 }
 
 impl HashJoiner {
-    /// Create a new `HashJoiner`.
-    pub fn try_new(reader: &mut dyn RecordBatchReader, on: &str) -> Result<Self> {
+    /// Create a new `HashJoiner`, building the hash index.
+    ///
+    /// Will run in parallel over batches using all available cores.
+    pub async fn try_new(reader: &mut dyn RecordBatchReader, on: &str) -> Result<Self> {
         // Check column exist
         reader.schema().field_with_name(on)?;
 
         // Hold all data in memory for simple implementation. Can do external sort later.
         let batches = reader.collect::<std::result::Result<Vec<RecordBatch>, _>>()?;
         if batches.is_empty() {
-            return Err(Error::IO { message: "HashJoiner: No data".to_string()});
+            return Err(Error::IO {
+                message: "HashJoiner: No data".to_string(),
+            });
         };
-        let batch = concat_batches(&batches[0].schema(), &batches)?;
+
+        let map = DashMap::new();
+
+        let schema = reader.schema();
+
+        let keep_indices: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, field)| if field.name() == on { None } else { Some(i) })
+            .collect();
+        let out_schema: Arc<arrow_schema::Schema> = Arc::new(schema.project(&keep_indices)?);
+        let right_batches = batches
+            .iter()
+            .map(|batch| {
+                let mut columns = Vec::with_capacity(keep_indices.len());
+                for i in &keep_indices {
+                    columns.push(batch.column(*i).clone());
+                }
+                RecordBatch::try_new(out_schema.clone(), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let map_ref = &map;
+
+        futures::stream::iter(batches.iter().enumerate().map(Ok::<_, Error>))
+            // Not sure if this can actually run in parallel though
+            // TODO: use spawn_blocking instead
+            .try_for_each_concurrent(num_cpus::get(), |(batch_i, batch)| async move {
+                let column = batch[on].clone();
+                let map_ref = map_ref.clone();
+                let task_result = task::spawn(async move {
+                    let rows = column_to_rows(column)?;
+                    for (row_i, row) in rows.iter().enumerate() {
+                        map_ref.insert(row.owned(), (batch_i, row_i));
+                    }
+                    Ok(())
+                })
+                .await;
+                match task_result {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(err)) => Err(err),
+                    Err(err) => Err(Error::IO {
+                        message: format!("HashJoiner: {}", err),
+                    }),
+                }
+            })
+            .await?;
 
         Ok(Self {
-            index_map: HashMap::new(),
-            batch,
-            on_column: on.to_string(),
+            index_map: map.into_read_only(),
+            batches: right_batches,
+            out_schema,
         })
     }
 
-    /// Build the hash index.
-    pub(super) fn build(&mut self) -> Result<()> {
-        let key_column = self
-            .batch
-            .column_by_name(&self.on_column)
-            .ok_or_else(|| Error::IO { message: format!("HashJoiner: Column {} not found", self.on_column) })?;
-
-        let hashes = hash(key_column.as_ref())?;
-        for (i, hash_value) in hashes.iter().enumerate() {
-            let Some(key) = hash_value else {
-                    continue;
-                };
-
-            if self.index_map.contains_key(&key) {
-                return Err(Error::IO { message:format!("HashJoiner: Duplicate key {}", key) } );
-            }
-            // TODO: use [`HashMap::try_insert`] when it's stable.
-            self.index_map.insert(key, i);
-        }
-
-        Ok(())
+    pub fn out_schema(&self) -> &SchemaRef {
+        &self.out_schema
     }
 
     /// Collecting the data using the index column from left table.
-    pub(super) fn collect(&self, index_column: &dyn Array) -> Result<RecordBatch> {
-        let hashes = hash(index_column)?;
-        let mut builder = UInt64Builder::with_capacity(index_column.len());
-        for hash_value in hashes.iter() {
-            let Some(key) = hash_value else {
-                builder.append_null();
-                continue;
-            };
+    ///
+    /// Will run in parallel over columns using all available cores.
+    pub(super) async fn collect(&self, index_column: ArrayRef) -> Result<RecordBatch> {
+        // Index to use for null values
+        let null_index = self.batches.len();
 
-            if let Some(idx) = self.index_map.get(&key) {
-                builder.append_value(*idx as u64);
-            } else {
-                builder.append_null();
-            }
-        }
-        let indices = builder.finish();
+        let index_type = index_column.data_type().clone();
 
-        let struct_arr = StructArray::from(self.batch.clone());
-        let results = take(&struct_arr, &indices, None)?;
-        Ok(as_struct_array(&results).into())
+        // collect indices
+        let indices = column_to_rows(index_column)?
+            .into_iter()
+            .map(|row| {
+                self.index_map
+                    .get(&row.owned())
+                    .map(|(batch_i, row_i)| (*batch_i, *row_i))
+                    .unwrap_or((null_index, 0))
+            })
+            .collect::<Vec<_>>();
+        let indices = Arc::new(indices);
+
+        // Use interleave to get the data
+        // https://docs.rs/arrow/40.0.0/arrow/compute/kernels/interleave/fn.interleave.html
+        // To handle nulls, we'll add an extra null array at the end
+        let null_array = Arc::new(new_null_array(&index_type, 1));
+
+        // Do this in parallel over the columns
+        let columns = futures::stream::iter(0..self.batches[0].num_columns())
+            .map(|column_i| {
+                // TODO: we need to drop the join_on column
+
+                let mut arrays = Vec::with_capacity(self.batches.len() + 1);
+                for batch in &self.batches {
+                    arrays.push(batch.column(column_i).clone());
+                }
+                arrays.push(null_array.clone());
+
+                let indices = indices.clone();
+
+                async move {
+                    let task_result = task::spawn(async move {
+                        let array_refs = arrays.iter().map(|x| x.as_ref()).collect::<Vec<_>>();
+                        interleave(array_refs.as_ref(), indices.as_ref())
+                            .map_err(|err| Error::IO {
+                                message: format!("HashJoiner: {}", err),
+                            })
+                            .map(|x| x.clone())
+                    })
+                    .await;
+                    match task_result {
+                        Ok(Ok(array)) => Ok(array),
+                        Ok(Err(err)) => Err(err),
+                        Err(err) => Err(Error::IO {
+                            message: format!("HashJoiner: {}", err),
+                        }),
+                    }
+                }
+            })
+            .buffered(num_cpus::get())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(RecordBatch::try_new(
+            self.batches[0].schema().clone(),
+            columns,
+        )?)
     }
 }
 
@@ -114,8 +198,8 @@ mod tests {
 
     use crate::arrow::RecordBatchBuffer;
 
-    #[test]
-    fn test_joiner_collect() {
+    #[tokio::test]
+    async fn test_joiner_collect() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, false),
@@ -136,10 +220,9 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let mut joiner = HashJoiner::try_new(&mut batch_buffer, "i").unwrap();
-        joiner.build().unwrap();
+        let joiner = HashJoiner::try_new(&mut batch_buffer, "i").await.unwrap();
 
-        let indices = UInt32Array::from_iter(&[
+        let indices = Arc::new(UInt32Array::from_iter(&[
             Some(15),
             None,
             Some(10),
@@ -148,8 +231,8 @@ mod tests {
             None,
             Some(22),
             Some(11111), // not found
-        ]);
-        let results = joiner.collect(&indices).unwrap();
+        ]));
+        let results = joiner.collect(indices).await.unwrap();
 
         assert_eq!(
             results.column_by_name("s").unwrap().as_ref(),
