@@ -23,7 +23,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
 use lance::linalg::l2::l2_distance_batch;
-use lance::utils::testing::generate_random_array;
+use lance::utils::testing::generate_random_array_with_seed;
 
 #[inline]
 fn l2_arrow(x: &Float32Array, y: &Float32Array) -> f32 {
@@ -50,9 +50,9 @@ fn bench_distance(c: &mut Criterion) {
     const DIMENSION: usize = 1024;
     const TOTAL: usize = 1024 * 1024; // 1M vectors
 
-    let key = generate_random_array(DIMENSION);
+    let key = generate_random_array_with_seed(DIMENSION, [0; 32]);
     // 1M of 1024 D vectors. 4GB in memory.
-    let target = generate_random_array(TOTAL * DIMENSION);
+    let target = generate_random_array_with_seed(TOTAL * DIMENSION, [42; 32]);
 
     c.bench_function("L2(simd)", |b| {
         b.iter(|| {
@@ -79,6 +79,44 @@ fn bench_distance(c: &mut Criterion) {
     });
 
     c.bench_function("L2(auto-vectorization)", |b| {
+        let x = key.values();
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let y = target.values()[idx * DIMENSION..(idx + 1) * DIMENSION].as_ref();
+                Some(l2_auto_vectorization(x, y))
+            }))
+        });
+    });
+
+    let key = generate_random_array_with_seed(DIMENSION, [5; 32]);
+    // 1M of 1024 D vectors. 4GB in memory.
+    let target = generate_random_array_with_seed(TOTAL * DIMENSION, [7; 32]);
+
+    c.bench_function("L2(simd) second rng seed", |b| {
+        b.iter(|| {
+            l2_distance_batch(key.values(), target.values(), DIMENSION);
+        })
+    });
+
+    c.bench_function("L2(arrow) second rng seed", |b| {
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(l2_arrow(&key, &arr))
+            }))
+        });
+    });
+
+    c.bench_function("L2(arrow_artiy) second rng seed", |b| {
+        b.iter(|| unsafe {
+            Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
+                let arr = target.slice(idx * DIMENSION, DIMENSION);
+                Some(l2_arrow_arity(&key, as_primitive_array(&arr)))
+            }))
+        });
+    });
+
+    c.bench_function("L2(auto-vectorization) second rng seed", |b| {
         let x = key.values();
         b.iter(|| unsafe {
             Float32Array::from_trusted_len_iter((0..target.len() / DIMENSION).map(|idx| {
