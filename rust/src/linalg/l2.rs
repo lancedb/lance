@@ -149,20 +149,63 @@ mod aarch64 {
         use super::super::l2_scalar;
         use std::arch::aarch64::*;
 
+        // TODO: learn rust macro and refactor to macro instead of manually unroll
+        const UNROLL_FACTOR: usize = 4;
+        const INSTRUCTION_WIDTH: usize = 4;
+
+        const STEP_SIZE: usize = UNROLL_FACTOR * INSTRUCTION_WIDTH;
+
         #[inline]
         pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             unsafe {
-                let len = from.len() / 4 * 4;
+                let len_aligned_to_unroll = from.len() / STEP_SIZE * STEP_SIZE;
                 let buf = [0.0_f32; 4];
-                let mut sum = vld1q_f32(buf.as_ptr());
-                for i in (0..len).step_by(4) {
+                let mut sum1 = vld1q_f32(buf.as_ptr());
+                let mut sum2 = vld1q_f32(buf.as_ptr());
+                let mut sum3 = vld1q_f32(buf.as_ptr());
+                let mut sum4 = vld1q_f32(buf.as_ptr());
+                for i in (0..len_aligned_to_unroll).step_by(STEP_SIZE) {
+                    let left = vld1q_f32(from.as_ptr().add(i));
+                    let right = vld1q_f32(to.as_ptr().add(i));
+                    let sub1 = vsubq_f32(left, right);
+                    sum1 = vfmaq_f32(sum1, sub1, sub1);
+
+                    let left = vld1q_f32(from.as_ptr().add(i + 4));
+                    let right = vld1q_f32(to.as_ptr().add(i + 4));
+                    let sub2 = vsubq_f32(left, right);
+                    sum2 = vfmaq_f32(sum2, sub2, sub2);
+
+                    let left = vld1q_f32(from.as_ptr().add(i + 8));
+                    let right = vld1q_f32(to.as_ptr().add(i + 8));
+                    let sub3 = vsubq_f32(left, right);
+                    sum3 = vfmaq_f32(sum3, sub3, sub3);
+
+                    let left = vld1q_f32(from.as_ptr().add(i + 12));
+                    let right = vld1q_f32(to.as_ptr().add(i + 12));
+                    let sub4 = vsubq_f32(left, right);
+                    sum4 = vfmaq_f32(sum4, sub4, sub4);
+                }
+
+                let mut sum = vaddq_f32(vaddq_f32(sum1, sum2), vaddq_f32(sum3, sum4));
+
+                let len_aligned_to_instruction = from.len() / INSTRUCTION_WIDTH * INSTRUCTION_WIDTH;
+
+                // non-unrolled tail
+                for i in
+                    (len_aligned_to_unroll..len_aligned_to_instruction).step_by(INSTRUCTION_WIDTH)
+                {
                     let left = vld1q_f32(from.as_ptr().add(i));
                     let right = vld1q_f32(to.as_ptr().add(i));
                     let sub = vsubq_f32(left, right);
                     sum = vfmaq_f32(sum, sub, sub);
                 }
+
+                // non vectorized tail
                 let mut sum = vaddvq_f32(sum);
-                sum += l2_scalar(&from[len..], &to[len..]);
+                sum += l2_scalar(
+                    &from[len_aligned_to_instruction..],
+                    &to[len_aligned_to_instruction..],
+                );
                 sum
             }
         }
