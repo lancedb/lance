@@ -388,8 +388,6 @@ mod tests {
             .await
             .unwrap();
 
-        println!("Open index file: {:?}", tmp_dir.path());
-
         let index_file = std::fs::read_dir(tmp_dir.path().join("_indices"))
             .unwrap()
             .next()

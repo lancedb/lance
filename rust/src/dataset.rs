@@ -106,11 +106,6 @@ fn manifest_path(base: &Path, version: u64) -> Path {
 
 /// Get the latest manifest path
 pub(crate) fn latest_manifest_path(base: &Path) -> Path {
-    println!(
-        "Latest manifest path: base={}, path={}",
-        base,
-        base.child(LATEST_MANIFEST_NAME)
-    );
     base.child(LATEST_MANIFEST_NAME)
 }
 
@@ -1371,7 +1366,6 @@ mod tests {
     #[tokio::test]
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
-        println!("{:?}", result);
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 

@@ -126,7 +126,6 @@ impl FileFragment {
             let schema_per_file = data_file_schema.intersection(projection)?;
             if !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
-                println!("Opening file: {:?}", path);
                 let reader = FileReader::try_new_with_fragment(
                     &self.dataset.object_store,
                     &path,
@@ -166,11 +165,6 @@ impl FileFragment {
             .dataset
             .data_dir()
             .child(self.metadata.files[0].path.as_str());
-        println!(
-            "Opening file: data_dir: {} {:?}",
-            self.dataset.data_dir(),
-            path
-        );
         let reader = FileReader::try_new_with_fragment(
             &self.dataset.object_store,
             &path,
