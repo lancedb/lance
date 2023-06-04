@@ -49,7 +49,7 @@ jobs:
       if: ${{ inputs.dry_run }} == "false"
       uses: ad-m/github-push-action@master
       with:
-        github_token: ${{ secrets.RELEASE_TOKEN }}
+        github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         branch: main
         tags: true
 
