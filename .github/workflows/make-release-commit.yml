@@ -41,6 +41,7 @@ jobs:
       with:
         part: ${{ inputs.part }}
     - name: Create tag
+      working-directory: rust
       run: |
         export TAG="v$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version')"
         git tag $TAG
