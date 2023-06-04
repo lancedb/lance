@@ -232,13 +232,15 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
-        println!("Checkout manifest: {}", manifest_path);
-        println!(
-            "List dataset dir: {:?}",
-            object_store.read_dir(base_path.clone()).await
-        );
-        let object_reader = object_store.open(manifest_path).await?;
-        println!("XXXX: Manifest reader opened");
+        let object_reader = object_store.open(&manifest_path.to_string()).await.
+            map_err(|e| match e {
+                object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
+                    path: base_path.to_string(),
+                    source,
+                },
+                _ => e.into(),
+            })?;
+
         let get_result = object_store
             .inner
             .get(manifest_path)
@@ -792,7 +794,7 @@ impl Dataset {
         if let Some(pos) = self.manifest.index_section.as_ref() {
             let manifest_file = self.manifest_file(self.version().version);
 
-            let reader = self.object_store.open(&manifest_file).await?;
+            let reader = self.object_store.open(&manifest_file.to_string()).await?;
             let section: pb::IndexSection = read_message(reader.as_ref(), *pos).await?;
 
             Ok(section
@@ -1369,6 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
+        println!("{:?}", result);
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 

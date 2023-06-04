@@ -245,7 +245,7 @@ mod tests {
             object_writer.shutdown().await.unwrap();
         }
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/foo").await.unwrap();
         let decoder = DictionaryDecoder::new(
             reader.as_ref(),
             pos,

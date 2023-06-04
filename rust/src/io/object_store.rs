@@ -159,12 +159,12 @@ impl ObjectStore {
     }
 
     /// Open a file for path
-    pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
+    pub async fn open(&self, path: &str) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(&path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
                 self,
-                path.clone(),
+                path.into(),
                 self.block_size,
             )?)),
         }
@@ -229,8 +229,9 @@ mod tests {
     async fn test_absolute_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let file_path = tmp_path.clone() + "/bar/foo.lance/test_file";
         write_to_file(
-            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+            &file_path,
             "TEST_CONTENT",
         )
         .unwrap();
@@ -242,9 +243,7 @@ mod tests {
             tmp_path.clone() + "/bar/foo.lance/../foo.lance",
         ] {
             let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file"))
-                .await
-                .unwrap();
+            let contents = read_from_store(store, &file_path).await.unwrap();
             assert_eq!(contents, "TEST_CONTENT");
         }
     }
@@ -253,8 +252,8 @@ mod tests {
     async fn test_relative_paths() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        write_to_file(
-            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+        let file_path = tmp_path.clone() + "/bar/foo.lance/test_file";
+        write_to_file(&file_path,
             "RELATIVE_URL",
         )
         .unwrap();
@@ -262,7 +261,7 @@ mod tests {
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let contents = read_from_store(store, &file_path)
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -273,7 +272,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
         let store = ObjectStore::new(uri).await.unwrap();
-        let contents = read_from_store(store, &Path::from("~/foo.lance/test_file"))
+        let contents = read_from_store(store, "~/foo.lance/test_file")
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -337,7 +336,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file"))
+            let contents = read_from_store(store, "test_file")
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");

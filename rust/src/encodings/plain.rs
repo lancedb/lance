@@ -519,7 +519,7 @@ mod tests {
         );
         object_writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/foo").await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
         // Expected size is the total of all arrays
         let expected_size = expected.iter().map(|e| e.len()).sum();
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/scalar").await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder =
             PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(encoder.encode(&[&array]).await.unwrap(), 0);
         writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/takes").await.unwrap();
         assert!(reader.size().await.unwrap() > 0);
         let decoder =
             PlainDecoder::new(reader.as_ref(), array.data_type(), 0, array.len()).unwrap();

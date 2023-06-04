@@ -330,7 +330,7 @@ pub(crate) async fn open_index(
     let index_file = index_dir.child(INDEX_FILE_NAME);
 
     let object_store = dataset.object_store();
-    let reader: Arc<dyn ObjectReader> = object_store.open(&index_file).await?.into();
+    let reader: Arc<dyn ObjectReader> = object_store.open(&index_file.to_string()).await?.into();
 
     let file_size = reader.size().await?;
     let block_size = object_store.block_size();

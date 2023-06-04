@@ -420,7 +420,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, arrs).await.unwrap();
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/foo").await.unwrap();
         let read_len = arrs.iter().map(|a| a.len()).sum();
         let decoder =
             BinaryDecoder::<GenericStringType<O>>::new(reader.as_ref(), pos, read_len, true);
@@ -476,8 +476,9 @@ mod tests {
     async fn test_range_query() {
         let data = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
 
+        let path_str = "/foo";
         let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+        let path = Path::from(path_str);
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         // Write some gabage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
@@ -485,7 +486,7 @@ mod tests {
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open(path_str).await.unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
         assert_eq!(
             decoder.decode().await.unwrap().as_ref(),
@@ -526,7 +527,7 @@ mod tests {
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/foo").await.unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let actual = decoder
@@ -547,7 +548,7 @@ mod tests {
         let path = Path::from("/foo");
         let pos = write_test_data(&store, &path, &[&data]).await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/foo").await.unwrap();
         let decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), pos, data.len(), false);
 
         let positions = decoder.get_positions(1..999998).await.unwrap();
@@ -607,7 +608,7 @@ mod tests {
         let pos = encoder.encode(&[&data]).await.unwrap();
         object_writer.shutdown().await.unwrap();
 
-        let reader = store.open(&path).await.unwrap();
+        let reader = store.open("/slices").await.unwrap();
         let decoder = BinaryDecoder::<BinaryType>::new(reader.as_ref(), pos, data.len(), true);
         let idx = UInt32Array::from(vec![0_u32, 5_u32, 59996_u32]);
         let actual = decoder.take(&idx).await.unwrap();

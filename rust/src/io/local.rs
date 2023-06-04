@@ -15,8 +15,8 @@
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::path::Path as StdPath;
 use std::ops::Range;
+use std::path::Path as StdPath;
 use std::sync::Arc;
 
 // TODO: Clean up windows/unix stuff
@@ -47,23 +47,15 @@ pub struct LocalObjectReader {
 
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
-    pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
-        let expanded = tilde(&path.to_string()).to_string();
+    pub fn open(path: &str, block_size: usize) -> Result<Box<dyn ObjectReader>> {
+        let expanded = tilde(path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
         let local_path = format!("/{}", expanded_path.to_str().unwrap());
-        println!(
-            "Local object path path: {},
-            local_path: {}, {:?}",
-            path,
-            local_path,
-            File::open(&local_path)
-        );
-
         Ok(Box::new(Self {
+            path: local_path.clone().into(),
             file: File::open(local_path)?.into(),
             block_size,
-            path: path.clone(),
         }))
     }
 }
