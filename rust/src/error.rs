@@ -37,8 +37,8 @@ pub enum Error {
     DatasetAlreadyExists { uri: String },
     #[snafu(display("Append with different schema: original={original} new={new}"))]
     SchemaMismatch { original: Schema, new: Schema },
-    #[snafu(display("Dataset at path {path} was not found: {source}"))]
-    DatasetNotFound { path: String, source: BoxedError },
+    #[snafu(display("Dataset at path {path} was not found"))]
+    DatasetNotFound { path: String },
     #[snafu(display("Encountered corrupt file {path}: {source}"))]
     CorruptFile {
         path: object_store::path::Path,
@@ -49,6 +49,8 @@ pub enum Error {
     Arrow { message: String },
     #[snafu(display("LanceError(Schema): {message}"))]
     Schema { message: String },
+    #[snafu(display("LanceError(I/O): File not found {uri}"))]
+    NotFound { uri: String },
     #[snafu(display("LanceError(IO): {message}"))]
     IO { message: String },
     #[snafu(display("LanceError(Index): {message}"))]

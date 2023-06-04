@@ -149,8 +149,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     ///
     /// async {
     ///     let object_store = ObjectStore::new(":memory:").await.unwrap();
-    ///     let path = Path::from("/data.lance");
-    ///     let reader = object_store.open(&path).await.unwrap();
+    ///     let reader = object_store.open("/data.lance").await.unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
     /// };
     /// ```

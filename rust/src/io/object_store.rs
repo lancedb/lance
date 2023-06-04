@@ -230,11 +230,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
         let file_path = tmp_path.clone() + "/bar/foo.lance/test_file";
-        write_to_file(
-            &file_path,
-            "TEST_CONTENT",
-        )
-        .unwrap();
+        write_to_file(&file_path, "TEST_CONTENT").unwrap();
 
         // test a few variations of the same path
         for uri in &[
@@ -253,17 +249,12 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
         let file_path = tmp_path.clone() + "/bar/foo.lance/test_file";
-        write_to_file(&file_path,
-            "RELATIVE_URL",
-        )
-        .unwrap();
+        write_to_file(&file_path, "RELATIVE_URL").unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
         let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &file_path)
-            .await
-            .unwrap();
+        let contents = read_from_store(store, &file_path).await.unwrap();
         assert_eq!(contents, "RELATIVE_URL");
     }
 
@@ -336,9 +327,7 @@ mod tests {
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
             let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, "test_file")
-                .await
-                .unwrap();
+            let contents = read_from_store(store, "test_file").await.unwrap();
             assert_eq!(contents, "WINDOWS");
         }
     }

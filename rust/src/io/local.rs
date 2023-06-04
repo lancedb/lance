@@ -31,7 +31,7 @@ use object_store::path::Path;
 use shellexpand::tilde;
 
 use super::object_reader::ObjectReader;
-use crate::Result;
+use crate::{Error, Result};
 
 /// [ObjectReader] for local file system.
 pub struct LocalObjectReader {
@@ -52,9 +52,17 @@ impl LocalObjectReader {
         let expanded_path = StdPath::new(&expanded);
 
         let local_path = format!("/{}", expanded_path.to_str().unwrap());
+        let file = File::open(&local_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::NotFound {
+                uri: local_path.clone(),
+            },
+            _ => Error::IO {
+                message: format!("Failed to open file {}: {}", local_path, e),
+            },
+        })?;
         Ok(Box::new(Self {
             path: local_path.clone().into(),
-            file: File::open(local_path)?.into(),
+            file: file.into(),
             block_size,
         }))
     }

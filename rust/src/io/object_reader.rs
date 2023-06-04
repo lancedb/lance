@@ -16,7 +16,6 @@
 // under the License.
 
 use std::cmp::min;
-
 use std::ops::Range;
 
 use arrow_array::{
@@ -62,12 +61,13 @@ pub struct CloudObjectReader {
     // File path
     pub path: Path,
 
+    // Preferred I/O size per request.
     block_size: usize,
 }
 
-impl<'a> CloudObjectReader {
+impl CloudObjectReader {
     /// Create an ObjectReader from URI
-    pub fn new(object_store: &'a ObjectStore, path: Path, block_size: usize) -> Result<Self> {
+    pub fn new(object_store: &ObjectStore, path: Path, block_size: usize) -> Result<Self> {
         Ok(Self {
             object_store: object_store.clone(),
             path,

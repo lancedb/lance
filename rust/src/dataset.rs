@@ -232,11 +232,12 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(&manifest_path.to_string()).await.
-            map_err(|e| match e {
-                object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
+        let object_reader = object_store
+            .open(&manifest_path.to_string())
+            .await
+            .map_err(|e| match e {
+                Error::NotFound { .. } => Error::DatasetNotFound {
                     path: base_path.to_string(),
-                    source,
                 },
                 _ => e.into(),
             })?;
@@ -246,9 +247,8 @@ impl Dataset {
             .get(manifest_path)
             .await
             .map_err(|e| match e {
-                object_store::Error::NotFound { path: _, source } => Error::DatasetNotFound {
+                object_store::Error::NotFound { path: _, .. } => Error::DatasetNotFound {
                     path: base_path.to_string(),
-                    source,
                 },
                 _ => e.into(),
             })?;

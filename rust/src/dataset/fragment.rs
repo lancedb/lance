@@ -460,9 +460,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_count() {
-        // let test_dir = tempdir().unwrap();
-        // let test_uri = test_dir.path().to_str().unwrap();
-        let test_uri = "/Users/lei/tmp/test_dataset";
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
         let fragment = &dataset.get_fragments()[3];
 
