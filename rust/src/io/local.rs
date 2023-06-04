@@ -51,7 +51,12 @@ impl LocalObjectReader {
         let expanded = tilde(path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
-        let local_path = format!("/{}", expanded_path.to_str().unwrap());
+        let local_path = {
+            #[cfg(unix)]
+            format!("/{}", expanded_path.to_str().unwrap())
+            #[cfg(windows)]
+            expanded.to_str().unwrap().to_string()
+        };
         let file = File::open(&local_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Error::NotFound {
                 uri: local_path.clone(),
