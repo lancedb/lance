@@ -44,6 +44,7 @@ pub struct ObjectWriter {
 
 impl ObjectWriter {
     pub async fn new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
+        println!("Object Writer::new: path={:?}", path);
         let (multipart_id, writer) = object_store.inner.put_multipart(path).await?;
 
         Ok(Self {

@@ -159,6 +159,7 @@ impl FileReader {
         fragment_id: u64,
         manifest: Option<&Manifest>,
     ) -> Result<FileReader> {
+        println!("FileReader open: {}", path);
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -207,6 +208,7 @@ impl FileReader {
 
     /// Open one Lance data file for read.
     pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
+        println!("FileReader::try_new: path={:?}", path);
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 

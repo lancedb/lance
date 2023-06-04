@@ -179,7 +179,13 @@ impl DatasetIndexExt for Dataset {
             .collect::<Vec<_>>();
         indices.push(new_idx);
 
-        write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut new_manifest,
+            Some(indices),
+        )
+        .await?;
 
         Ok(Self {
             object_store: self.object_store.clone(),

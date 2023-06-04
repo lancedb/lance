@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use futures::{StreamExt, TryStreamExt};
+use object_store::path::Path;
 use uuid::Uuid;
 
 use super::hash_joiner::HashJoiner;
@@ -65,13 +66,10 @@ impl FileFragment {
 
         let schema = Schema::try_from(reader.schema().as_ref())?;
         let object_store = ObjectStore::new(dataset_uri).await?;
-        let filename = format!("{}.lance", Uuid::new_v4());
-        let fragment = Fragment::with_file(id as u64, &filename, &schema);
-
-        let full_path = object_store
-            .base_path()
+        let full_path = Path::from(dataset_uri)
             .child(DATA_DIR)
-            .child(filename.clone());
+            .child(format!("{}.lance", Uuid::new_v4()));
+        let fragment = Fragment::with_file(id as u64, full_path.filename().unwrap(), &schema);
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
@@ -128,6 +126,7 @@ impl FileFragment {
             let schema_per_file = data_file_schema.intersection(projection)?;
             if !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
+                println!("Opening file: {:?}", path);
                 let reader = FileReader::try_new_with_fragment(
                     &self.dataset.object_store,
                     &path,
@@ -167,6 +166,7 @@ impl FileFragment {
             .dataset
             .data_dir()
             .child(self.metadata.files[0].path.as_str());
+        println!("Opening file: data_dir: {} {:?}", self.dataset.data_dir(), path);
         let reader = FileReader::try_new_with_fragment(
             &self.dataset.object_store,
             &path,
@@ -456,8 +456,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_fragment_count() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        // let test_dir = tempdir().unwrap();
+        // let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = "/Users/lei/tmp/test_dataset";
         let dataset = create_dataset(test_uri).await;
         let fragment = &dataset.get_fragments()[3];
 

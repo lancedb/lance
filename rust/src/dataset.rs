@@ -89,17 +89,13 @@ impl From<&Manifest> for Version {
     }
 }
 
-/// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
+/// Create a new [FileWriter].
 async fn new_file_writer(
     object_store: &ObjectStore,
-    data_file_path: &str,
+    data_file_path: &Path,
     schema: &Schema,
 ) -> Result<FileWriter> {
-    let full_path = object_store
-        .base_path()
-        .child(DATA_DIR)
-        .child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema.clone()).await
+    FileWriter::try_new(object_store, &data_file_path, schema.clone()).await
 }
 
 /// Get the manifest file path for a version.
@@ -110,6 +106,7 @@ fn manifest_path(base: &Path, version: u64) -> Path {
 
 /// Get the latest manifest path
 pub(crate) fn latest_manifest_path(base: &Path) -> Path {
+    println!("Latest manifest path: base={}, path={}", base, base.child(LATEST_MANIFEST_NAME));
     base.child(LATEST_MANIFEST_NAME)
 }
 
@@ -168,9 +165,8 @@ impl Dataset {
             object_store.set_block_size(block_size);
         }
 
-        let base_path = object_store.base_path().clone();
+        let base_path = Path::from(uri);
         let latest_manifest_path = latest_manifest_path(&base_path);
-
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
@@ -202,7 +198,7 @@ impl Dataset {
             object_store.set_block_size(block_size);
         };
 
-        let base_path = object_store.base_path().clone();
+        let base_path: Path = uri.into();
         let manifest_file = manifest_path(&base_path, version);
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -215,7 +211,7 @@ impl Dataset {
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
-        let base_path = self.object_store.base_path().clone();
+        let base_path = self.base.clone();
         let manifest_file = manifest_path(&base_path, version);
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -232,7 +228,10 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
+        println!("Checkout manifest: {}", manifest_path);
+        println!("List dataset dir: {:?}", object_store.read_dir(base_path.clone()).await);
         let object_reader = object_store.open(manifest_path).await?;
+        println!("XXXX: Manifest reader opened");
         let get_result = object_store
             .inner
             .get(manifest_path)
@@ -271,7 +270,8 @@ impl Dataset {
         let mut params = params.unwrap_or_default();
 
         // Read expected manifest path for the dataset
-        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let base = Path::from(uri);
+        let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
         // Read schema for the input batches
@@ -356,6 +356,7 @@ impl Dataset {
 
         let mut writer = None;
         let mut buffer = RecordBatchBuffer::empty();
+        let data_dir = base.child(DATA_DIR);
         for batch_result in peekable {
             let batch = batch_result?;
             buffer.batches.push(batch);
@@ -363,8 +364,12 @@ impl Dataset {
                 // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
                     writer = {
-                        let file_path = format!("{}.lance", Uuid::new_v4());
-                        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                        let file_path = data_dir.child(format!("{}.lance", Uuid::new_v4()));
+                        let fragment = Fragment::with_file(
+                            fragment_id,
+                            file_path.filename().unwrap(),
+                            &schema,
+                        );
                         fragments.push(fragment);
                         fragment_id += 1;
                         Some(new_file_writer(&object_store, &file_path, &schema).await?)
@@ -385,8 +390,9 @@ impl Dataset {
         if buffer.num_rows() > 0 {
             if writer.is_none() {
                 writer = {
-                    let file_path = format!("{}.lance", Uuid::new_v4());
-                    let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
+                    let file_path = data_dir.child(format!("{}.lance", Uuid::new_v4()));
+                    let fragment =
+                        Fragment::with_file(fragment_id, file_path.filename().unwrap(), &schema);
                     fragments.push(fragment);
                     Some(new_file_writer(&object_store, &file_path, &schema).await?)
                 }
@@ -424,12 +430,11 @@ impl Dataset {
             .unwrap();
         let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
         manifest.timestamp_nanos = timestamp_nanos;
-        write_manifest_file(&object_store, &mut manifest, indices).await?;
+        write_manifest_file(&object_store, &base, &mut manifest, indices).await?;
 
-        let base = object_store.base_path().clone();
         Ok(Self {
             object_store,
-            base: base.into(),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
@@ -443,7 +448,8 @@ impl Dataset {
         mode: WriteMode,
     ) -> Result<Self> {
         let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
-        let latest_manifest = latest_manifest_path(object_store.base_path());
+        let base: Path = base_uri.into();
+        let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
         let schema = if object_store.exists(&latest_manifest).await? {
@@ -471,12 +477,11 @@ impl Dataset {
         manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        write_manifest_file(&object_store, &mut manifest, Some(indices)).await?;
-        let base = object_store.base_path().clone();
+        write_manifest_file(&object_store, &base, &mut manifest, Some(indices)).await?;
 
         Ok(Self {
             object_store,
-            base: base.into(),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
@@ -798,12 +803,13 @@ impl Dataset {
 /// to this version.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
+    base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
 ) -> Result<()> {
     let paths = vec![
-        manifest_path(object_store.base_path(), manifest.version),
-        latest_manifest_path(object_store.base_path()),
+        manifest_path(base_path, manifest.version),
+        latest_manifest_path(base_path),
     ];
 
     for p in paths {

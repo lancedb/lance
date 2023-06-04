@@ -14,7 +14,6 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
-use std::ops::Deref;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
@@ -42,7 +41,6 @@ pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
-    base_path: Path,
     block_size: usize,
 }
 
@@ -113,9 +111,8 @@ impl ObjectStore {
         }
 
         Ok(Self {
-            inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
-            scheme: String::from("flle"),
-            base_path: Path::from(object_store::path::DELIMITER),
+            inner: Arc::new(LocalFileSystem::new()),
+            scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
         })
     }
@@ -125,13 +122,11 @@ impl ObjectStore {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("s3"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
-                base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
             "file" => Self::new_from_path(url.path()),
@@ -146,7 +141,6 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
-            base_path: Path::from("/"),
             block_size: 64 * 1024,
         }
     }
@@ -164,14 +158,10 @@ impl ObjectStore {
         self.block_size = new_size;
     }
 
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
-    }
-
     /// Open a file for path
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size),
+            "file" => LocalObjectReader::open(&path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
                 self,
                 path.clone(),

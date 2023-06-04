@@ -47,6 +47,13 @@ impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
+        println!(
+            "Local object path path: {},
+            local_path: {}, {:?}",
+            path, local_path,
+            File::open(&local_path)
+        );
+
         Ok(Box::new(Self {
             file: File::open(local_path)?.into(),
             block_size,
@@ -73,7 +80,6 @@ impl ObjectReader for LocalObjectReader {
     /// Reads a range of data.
     ///
     /// TODO: return [arrow_buffer::Buffer] to avoid one memory copy from Bytes to Buffer.
-
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
