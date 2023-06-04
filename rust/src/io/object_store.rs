@@ -217,8 +217,8 @@ mod tests {
         write(path, contents)
     }
 
-    async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
-        let test_file_store = store.open(&path).await.unwrap();
+    async fn read_from_store(store: ObjectStore, path: &str) -> Result<String> {
+        let test_file_store = store.open(path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
@@ -273,7 +273,7 @@ mod tests {
         let uri = "~/foo.lance";
         write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
         let store = ObjectStore::new(uri).await.unwrap();
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let contents = read_from_store(store, &Path::from("~/foo.lance/test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -293,7 +293,10 @@ mod tests {
         .unwrap();
         let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
 
-        let sub_dirs = store.read_dir("foo").await.unwrap();
+        let sub_dirs = store
+            .read_dir(path.join("foo").as_path().to_str().unwrap())
+            .await
+            .unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 

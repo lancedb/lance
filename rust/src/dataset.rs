@@ -106,7 +106,11 @@ fn manifest_path(base: &Path, version: u64) -> Path {
 
 /// Get the latest manifest path
 pub(crate) fn latest_manifest_path(base: &Path) -> Path {
-    println!("Latest manifest path: base={}, path={}", base, base.child(LATEST_MANIFEST_NAME));
+    println!(
+        "Latest manifest path: base={}, path={}",
+        base,
+        base.child(LATEST_MANIFEST_NAME)
+    );
     base.child(LATEST_MANIFEST_NAME)
 }
 
@@ -229,7 +233,10 @@ impl Dataset {
         session: Arc<Session>,
     ) -> Result<Self> {
         println!("Checkout manifest: {}", manifest_path);
-        println!("List dataset dir: {:?}", object_store.read_dir(base_path.clone()).await);
+        println!(
+            "List dataset dir: {:?}",
+            object_store.read_dir(base_path.clone()).await
+        );
         let object_reader = object_store.open(manifest_path).await?;
         println!("XXXX: Manifest reader opened");
         let get_result = object_store

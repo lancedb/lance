@@ -166,7 +166,11 @@ impl FileFragment {
             .dataset
             .data_dir()
             .child(self.metadata.files[0].path.as_str());
-        println!("Opening file: data_dir: {} {:?}", self.dataset.data_dir(), path);
+        println!(
+            "Opening file: data_dir: {} {:?}",
+            self.dataset.data_dir(),
+            path
+        );
         let reader = FileReader::try_new_with_fragment(
             &self.dataset.object_store,
             &path,
