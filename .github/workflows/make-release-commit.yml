@@ -51,3 +51,4 @@ jobs:
         github_token: ${{ secrets.RELEASE_TOKEN }}
         branch: main
         tags: true
+
