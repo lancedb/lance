@@ -103,6 +103,8 @@ Currently, Lance supports a growing list of expressions.
 * ``IS NULL``, ``IS NOT NULL``
 * ``IS TRUE``, ``IS NOT TRUE``, ``IS FALSE``, ``IS NOT FALSE``
 * ``IN``
+* ``LIKE``, ``NOT LIKE``
+* ``regexp_match(column, pattern)``
 
 For example, the following filter string is acceptable:
 
@@ -111,11 +113,18 @@ For example, the following filter string is acceptable:
     ((label IN [10, 20]) AND (note.email IS NOT NULL))
         OR NOT note.created
 
- .. warning::
+If your column name contains special characters or is a `SQL Keyword <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>`_,
+you can use backtick (`````) to escape it. For nested fields, each segment of the
+path must be wrapped in backticks. 
 
-    Currently limitation: it does not support filter on columns that are
-    `SQL Keywords <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>_`.
-    We are working on a resolution. For now please rename the column for filter predicates to work
+  .. code-block:: SQL
+
+    `CUBE` = 10 AND `column name with space` IS NOT NULL
+      AND `nested with space`.`inner with space` < 2
+
+.. warning::
+
+  Field names containing periods (``.``) are not supported.
 
 Random read
 ~~~~~~~~~~~

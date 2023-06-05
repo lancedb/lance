@@ -93,9 +93,31 @@ def test_match(tmp_path: Path):
     table = pa.Table.from_arrays([array], names=["str"])
     dataset = lance.write_dataset(table, tmp_path / "test_match")
 
-    dataset = lance.dataset(tmp_path / "test_match")
     result = dataset.to_table(filter="str LIKE 'a%'").to_pandas()
     pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["aaa", "abc"]}))
+
+    result = dataset.to_table(filter="str NOT LIKE 'a%'").to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["bbb", "bca", "cab", "cba"]}))
+
+    result = dataset.to_table(filter="regexp_match(str, 'c.+')").to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["bca", "cab", "cba"]}))
+
+
+def test_escaped_name(tmp_path: Path):
+    table = pa.table({"silly :name": pa.array([0, 1, 2])})
+    dataset = lance.write_dataset(table, tmp_path / "test_escaped_name")
+
+    dataset = lance.dataset(tmp_path / "test_escaped_name")
+    result = dataset.to_table(filter='`silly :name` > 1').to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"silly :name": [2]}))
+
+    # nested case
+    table = pa.table({"outer field": pa.array([{"inner field": i} for i in range(3)])})
+    dataset = lance.write_dataset(table, tmp_path / "test_escaped_name_nested")
+
+    dataset = lance.dataset(tmp_path / "test_escaped_name_nested")
+    result = dataset.to_table(filter='`outer field`.`inner field` > 1').to_pandas()
+    pd.testing.assert_frame_equal(result, pd.DataFrame({"outer field": [{"inner field": 2}]}))
 
 
 def create_table_for_duckdb(nvec=10000, ndim=768):
