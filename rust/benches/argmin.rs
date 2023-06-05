@@ -65,4 +65,13 @@ criterion_group!(
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_argmin);
 
+// Non-linux version does not support pprof.
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default()
+        .measurement_time(Duration::from_secs(10))
+        .sample_size(32);
+    targets = bench_argmin);
+
 criterion_main!(benches);

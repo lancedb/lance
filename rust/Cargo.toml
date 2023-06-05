@@ -122,6 +122,10 @@ harness = false
 name = "argmin"
 harness = false
 
+[[bench]]
+name = "cosine"
+harness = false
+
 [profile.release]
 strip = true
 opt-level = "s"
