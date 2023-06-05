@@ -86,8 +86,8 @@ impl HashJoiner {
         let map = Arc::new(map);
 
         futures::stream::iter(batches.iter().enumerate().map(Ok::<_, Error>))
-            // Not sure if this can actually run in parallel though
             .try_for_each_concurrent(num_cpus::get(), |(batch_i, batch)| {
+                // A clone of map we can send to a new thread
                 let map = map.clone();
                 async move {
                     let column = batch[on].clone();
@@ -145,7 +145,9 @@ impl HashJoiner {
         // Index to use for null values
         let null_index = self.batches.len();
 
-        // collect indices
+        // Indices are a pair of (batch_i, row_i). We'll add a null batch at the
+        // end with one null element, and that's what we resolve when no match is
+        // found.
         let indices = column_to_rows(index_column)?
             .into_iter()
             .map(|row| {
@@ -169,6 +171,7 @@ impl HashJoiner {
                 }
                 arrays.push(Arc::new(new_null_array(&arrays[0].data_type(), 1)));
 
+                // Clone of indices we can send to a new thread
                 let indices = indices.clone();
 
                 async move {
