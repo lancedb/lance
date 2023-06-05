@@ -138,16 +138,42 @@ mod aarch64 {
         #[inline]
         pub(crate) fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
             unsafe {
-                let len = x.len() / 4 * 4;
+                let len = x.len() / 16 * 16;
                 let buf = [0.0_f32; 4];
                 let mut xy = vld1q_f32(buf.as_ptr());
                 let mut y_sq = xy;
-                for i in (0..len).step_by(4) {
+
+                let mut xy1 = vld1q_f32(buf.as_ptr());
+                let mut y_sq1 = xy1;
+
+                let mut xy2 = vld1q_f32(buf.as_ptr());
+                let mut y_sq2 = xy2;
+
+                let mut xy3 = vld1q_f32(buf.as_ptr());
+                let mut y_sq3 = xy3;
+                for i in (0..len).step_by(16) {
                     let left = vld1q_f32(x.as_ptr().add(i));
                     let right = vld1q_f32(y.as_ptr().add(i));
                     xy = vfmaq_f32(xy, left, right);
                     y_sq = vfmaq_f32(y_sq, right, right);
+
+                    let left1 = vld1q_f32(x.as_ptr().add(i + 4));
+                    let right1 = vld1q_f32(y.as_ptr().add(i + 4));
+                    xy1 = vfmaq_f32(xy1, left1, right1);
+                    y_sq1 = vfmaq_f32(y_sq1, right1, right1);
+
+                    let left2 = vld1q_f32(x.as_ptr().add(i + 8));
+                    let right2 = vld1q_f32(y.as_ptr().add(i + 8));
+                    xy2 = vfmaq_f32(xy2, left2, right2);
+                    y_sq2 = vfmaq_f32(y_sq2, right2, right2);
+
+                    let left3 = vld1q_f32(x.as_ptr().add(i + 12));
+                    let right3 = vld1q_f32(y.as_ptr().add(i + 12));
+                    xy3 = vfmaq_f32(xy3, left3, right3);
+                    y_sq3 = vfmaq_f32(y_sq3, right3, right3);
                 }
+                xy = vaddq_f32(vaddq_f32(xy, xy3), vaddq_f32(xy1, xy2));
+                y_sq = vaddq_f32(vaddq_f32(y_sq, y_sq3), vaddq_f32(y_sq1, y_sq2));
                 // handle remaining elements
                 let mut dotprod = vaddvq_f32(xy);
                 dotprod += dot(&x[len..], &y[len..]);
