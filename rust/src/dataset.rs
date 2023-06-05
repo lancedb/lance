@@ -688,8 +688,7 @@ impl Dataset {
     pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
         let updated_fragments = stream::iter(self.get_fragments())
             .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
-            // Handle up to 16 fragments concurrently
-            .buffer_unordered(16)
+            .buffer_unordered(num_cpus::get())
             // Drop the fragments that were deleted.
             .try_filter_map(|f| futures::future::ready(Ok(f)))
             .try_collect::<Vec<_>>()

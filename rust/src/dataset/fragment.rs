@@ -279,9 +279,26 @@ impl FileFragment {
             })
             .await?;
 
-        let num_rows = self.count_rows().await? as u32;
-        if deletion_vector.contains_range(0..num_rows) {
+        // TODO: could we keep the number of rows in memory when we first get
+        // the fragment metadata?
+        let num_rows = self.count_rows().await?;
+        if deletion_vector.len() == num_rows && deletion_vector.contains_range(0..num_rows as u32) {
             return Ok(None);
+        } else if deletion_vector.len() >= num_rows {
+            let dv_len = deletion_vector.len();
+            let examples: Vec<u32> = deletion_vector
+                .into_iter()
+                .filter(|x| *x >= num_rows as u32)
+                .take(5)
+                .collect();
+            return Err(Error::Internal {
+                message: format!(
+                    "Deletion vector includes rows that aren't in the fragment. \
+                Fragment length: {}; Deletion vector length: {}; \
+                Examples: {:?}",
+                    num_rows, dv_len, examples
+                ),
+            });
         }
 
         self.metadata.deletion_file = write_deletion_file(
