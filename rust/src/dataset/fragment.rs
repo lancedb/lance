@@ -203,7 +203,12 @@ impl FileFragment {
     }
 
     /// Merge columns from joiner.
-    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+    pub(crate) async fn merge(
+        mut self,
+        join_column: &str,
+        joiner: &HashJoiner,
+        full_schema: &Schema,
+    ) -> Result<Self> {
         let mut scanner = self.scan();
         scanner.project(&[join_column])?;
 
@@ -213,6 +218,8 @@ impl FileFragment {
             .and_then(|batch| joiner.collect(batch.column(0).clone()))
             .boxed();
 
+        let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
+
         let filename = format!("{}.lance", Uuid::new_v4());
         let full_path = self
             .dataset
@@ -220,12 +227,9 @@ impl FileFragment {
             .base_path()
             .child(DATA_DIR)
             .child(filename.clone());
-        let mut writer = FileWriter::try_new(
-            &self.dataset.object_store,
-            &full_path,
-            self.dataset.schema().clone(),
-        )
-        .await?;
+        let mut writer =
+            FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
+                .await?;
 
         while let Some(batch) = batch_stream.try_next().await? {
             writer.write(&[batch]).await?;
@@ -233,8 +237,7 @@ impl FileFragment {
 
         writer.finish().await?;
 
-        let schema = crate::datatypes::Schema::try_from(joiner.out_schema().as_ref())?;
-        self.metadata.add_file(full_path.as_ref(), &schema);
+        self.metadata.add_file(&filename, &file_schema);
 
         Ok(self)
     }
