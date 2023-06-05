@@ -281,6 +281,22 @@ impl Dataset {
         batch.to_pyarrow(self_.py())
     }
 
+    fn merge(
+        &mut self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: &str,
+        right_on: &str,
+    ) -> PyResult<()> {
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(reader.0);
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.merge(&mut reader, left_on, right_on);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let versions = self_
             .list_versions()

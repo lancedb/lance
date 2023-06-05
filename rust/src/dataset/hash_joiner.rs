@@ -25,6 +25,7 @@ use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
 use tokio::task;
 
+use crate::datatypes::lance_supports_nulls;
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
@@ -181,7 +182,16 @@ impl HashJoiner {
                     })
                     .await;
                     match task_result {
-                        Ok(Ok(array)) => Ok(array),
+                        Ok(Ok(array)) => {
+                            if array.null_count() > 0 && !lance_supports_nulls(array.data_type()) {
+                                return Err(Error::invalid_input(format!(
+                                    "Found rows on LHS that do not match any rows on RHS. Lance would need to write \
+                                    nulls on the RHS, but Lance does not yet support nulls for type {:?}.",
+                                    array.data_type()
+                                )));
+                            }
+                            Ok(array)
+                        },
                         Ok(Err(err)) => Err(err),
                         Err(err) => Err(Error::IO {
                             message: format!("HashJoiner: {}", err),
