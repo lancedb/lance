@@ -33,7 +33,8 @@ runs:
       shell: powershell
       run: |
         cd $env:VCPKG_INSTALLATION_ROOT
-        git pull
+        git fetch
+        git checkout eb597bb2f157c30f0c74e02177cfc30ac6102d8d
         .\bootstrap-vcpkg.bat  -disableMetrics
     - name: Setup Dependencies with vcpkg
       shell: powershell
