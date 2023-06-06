@@ -160,6 +160,7 @@ impl ObjectStore {
 
     /// Open a file for path
     pub async fn open(&self, path: &str) -> Result<Box<dyn ObjectReader>> {
+        println!("Rust: ObjectStore::open: path: {}, schema: {}", path, self.scheme);
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(&path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -172,6 +173,7 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<ObjectWriter> {
+        println!("Rust: ObjectStore::create: path: {}, schema: {}", path, self.scheme);
         ObjectWriter::new(self, path).await
     }
 
