@@ -30,6 +30,7 @@ use object_store::path::Path;
 use uuid::Uuid;
 
 pub mod fragment;
+mod hash_joiner;
 pub mod scanner;
 pub mod updater;
 mod write;
@@ -45,6 +46,7 @@ use crate::io::{
 };
 use crate::session::Session;
 use crate::{Error, Result};
+use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
 pub use write::*;
 
@@ -480,6 +482,91 @@ impl Dataset {
         })
     }
 
+    /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
+    ///
+    /// Parameters:
+    ///
+    /// - `stream`: the stream of [`RecordBatch`] to merge.
+    /// - `left_on`: the column name to join on the left side (self).
+    /// - `right_on`: the column name to join on the right side (stream).
+    ///
+    /// Returns: a new version of dataset.
+    ///
+    /// It performs a left-join on the two datasets.
+    pub async fn merge(
+        &mut self,
+        stream: &mut Box<dyn RecordBatchReader>,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        // Sanity check.
+        if self.schema().field(left_on).is_none() {
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side dataset",
+                left_on
+            )));
+        };
+        let right_schema = stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side dataset",
+                right_on
+            )));
+        };
+        for field in right_schema.fields() {
+            if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
+                continue;
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(Error::invalid_input(format!(
+                    "Column {} exists in both sides of the dataset",
+                    field.name()
+                )));
+            }
+        }
+
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
+        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+
+        // Write new data file to each fragment. Parallelism is done over columns,
+        // so no parallelism done at this level.
+        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+            .then(|f| {
+                let joiner = joiner.clone();
+                let full_schema = new_schema.clone();
+                async move {
+                    f.merge(left_on, &joiner, &full_schema)
+                        .await
+                        .map(|f| f.metadata)
+                }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Inherit the index, since we are just adding columns.
+        let indices = self.load_indices().await?;
+
+        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        manifest.set_timestamp(None);
+        manifest.schema = new_schema;
+
+        write_manifest_file(&self.object_store, &mut manifest, Some(indices)).await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -747,6 +834,7 @@ mod tests {
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
+    use arrow_array::Float32Array;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
@@ -1269,5 +1357,103 @@ mod tests {
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_merge() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Float32, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2])),
+                Arc::new(Float32Array::from(vec![3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut write_params = WriteParams::default();
+        write_params.mode = WriteMode::Append;
+
+        let mut batches: Box<dyn RecordBatchReader> =
+            Box::new(RecordBatchBuffer::from_iter(vec![batch1]));
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let mut batches: Box<dyn RecordBatchReader> =
+            Box::new(RecordBatchBuffer::from_iter(vec![batch2]));
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i2", DataType::Int32, false),
+            Field::new("y", DataType::Utf8, true),
+        ]));
+        let right_batch1 = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let mut batches: Box<dyn RecordBatchReader> =
+            Box::new(RecordBatchBuffer::from_iter(vec![right_batch1]));
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.merge(&mut batches, "i", "i2").await.unwrap();
+
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.fragments()[0].files.len(), 2);
+        assert_eq!(dataset.fragments()[1].files.len(), 2);
+
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        let expected = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("i", DataType::Int32, false),
+                Field::new("x", DataType::Float32, false),
+                Field::new("y", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some("b"),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
     }
 }

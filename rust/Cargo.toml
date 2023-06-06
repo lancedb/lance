@@ -34,6 +34,7 @@ arrow-cast = "37.0.0"
 arrow-data = "37.0"
 arrow-ipc = { version = "37.0", features = ["zstd"] }
 arrow-ord = "37.0"
+arrow-row = "37.0"
 arrow-schema = "37.0"
 arrow-select = "37.0"
 async-recursion = "1.0"
@@ -41,6 +42,8 @@ async-trait = "0.1.60"
 byteorder = "1.4.3"
 chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+# This is already used by datafusion
+dashmap = "5"
 object_store = { version = "0.5.6", features = ["aws_profile", "gcp"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"

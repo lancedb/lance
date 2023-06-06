@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
+use std::time::SystemTime;
 
 use super::Fragment;
 use crate::datatypes::Schema;
@@ -77,6 +78,16 @@ impl Manifest {
             NaiveDateTime::from_timestamp_opt(seconds, nanos as u32).unwrap_or(NaiveDateTime::MIN),
             Utc,
         )
+    }
+
+    /// Set the `timestamp_nanos` value from a Utc DateTime
+    pub fn set_timestamp(&mut self, timestamp: Option<SystemTime>) {
+        let timestamp = timestamp.unwrap_or_else(SystemTime::now);
+        let nanos = timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        self.timestamp_nanos = nanos as u128;
     }
 
     /// Return the max fragment id.

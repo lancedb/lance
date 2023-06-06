@@ -356,6 +356,39 @@ class LanceDataset(pa.dataset.Dataset):
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
+    
+    def merge(
+        self,
+        data_obj: ReaderLike,
+        left_on: str,
+        right_on: Optional[str] = None,
+    ):
+        """
+        Merge another dataset into this one.
+
+        Performs a left join, where the dataset is the left side and data_obj
+        is the right side. Rows existing in the dataset but not on the left will
+        be filled with null values, unless Lance doesn't support null values for
+        some types, in which case an error will be raised.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be merged. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        left_on: str
+            The name of the column in the dataset to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to
+            left_on.
+        """
+        if right_on is None:
+            right_on = left_on
+        
+        reader = _coerce_reader(data_obj)
+
+        self._ds.merge(reader, left_on, right_on)
+
 
     def versions(self):
         """
@@ -808,18 +841,7 @@ def write_dataset(
         The max number of rows before starting a new group (in the same file)
 
     """
-    if isinstance(data_obj, pd.DataFrame):
-        reader = pa.Table.from_pandas(data_obj, schema=schema).to_reader()
-    elif isinstance(data_obj, pa.Table):
-        reader = data_obj.to_reader()
-    elif isinstance(data_obj, pa.dataset.Dataset):
-        reader = pa.dataset.Scanner.from_dataset(data_obj).to_reader()
-    elif isinstance(data_obj, pa.dataset.Scanner):
-        reader = data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatchReader):
-        reader = data_obj
-    else:
-        raise TypeError(f"Unknown data_obj type {type(data_obj)}")
+    reader = _coerce_reader(data_obj)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
@@ -831,3 +853,18 @@ def write_dataset(
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
     _write_dataset(reader, uri, params)
     return LanceDataset(uri)
+
+
+def _coerce_reader(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
+    if isinstance(data_obj, pd.DataFrame):
+        return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
+    elif isinstance(data_obj, pa.Table):
+        return data_obj.to_reader()
+    elif isinstance(data_obj, pa.dataset.Dataset):
+        return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
+    elif isinstance(data_obj, pa.dataset.Scanner):
+        return data_obj.to_reader()
+    elif isinstance(data_obj, pa.RecordBatchReader):
+        return data_obj
+    else:
+        raise TypeError(f"Unknown data_obj type {type(data_obj)}")

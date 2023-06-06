@@ -29,6 +29,8 @@ pub(crate) fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> Bo
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    #[snafu(display("Invalid user input: {source}"))]
+    InvalidInput { source: BoxedError },
     #[snafu(display("Attempt to write empty record batches"))]
     EmptyDataset,
     #[snafu(display("Dataset already exists: {uri}"))]
@@ -60,6 +62,13 @@ impl Error {
         let message: String = message.into();
         Self::CorruptFile {
             path,
+            source: message.into(),
+        }
+    }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::InvalidInput {
             source: message.into(),
         }
     }

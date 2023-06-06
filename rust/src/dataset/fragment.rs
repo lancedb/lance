@@ -18,8 +18,12 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
+use futures::{StreamExt, TryStreamExt};
 use uuid::Uuid;
 
+use super::hash_joiner::HashJoiner;
+use super::scanner::Scanner;
+use super::updater::Updater;
 use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
@@ -27,13 +31,11 @@ use crate::format::Fragment;
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
-use super::scanner::Scanner;
-use super::updater::Updater;
 use super::WriteParams;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
-/// The interface is similar to `pyarrow.dataset.Fragment`.
+/// The interface is modeled after `pyarrow.dataset.Fragment`.
 #[derive(Debug, Clone)]
 pub struct FileFragment {
     dataset: Arc<Dataset>,
@@ -198,6 +200,46 @@ impl FileFragment {
         let reader = self.open(&schema).await?;
 
         Ok(Updater::new(self.clone(), reader))
+    }
+
+    /// Merge columns from joiner.
+    pub(crate) async fn merge(
+        mut self,
+        join_column: &str,
+        joiner: &HashJoiner,
+        full_schema: &Schema,
+    ) -> Result<Self> {
+        let mut scanner = self.scan();
+        scanner.project(&[join_column])?;
+
+        let mut batch_stream = scanner
+            .try_into_stream()
+            .await?
+            .and_then(|batch| joiner.collect(batch.column(0).clone()))
+            .boxed();
+
+        let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
+
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let full_path = self
+            .dataset
+            .object_store
+            .base_path()
+            .child(DATA_DIR)
+            .child(filename.clone());
+        let mut writer =
+            FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
+                .await?;
+
+        while let Some(batch) = batch_stream.try_next().await? {
+            writer.write(&[batch]).await?;
+        }
+
+        writer.finish().await?;
+
+        self.metadata.add_file(&filename, &file_schema);
+
+        Ok(self)
     }
 }
 
