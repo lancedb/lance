@@ -126,6 +126,9 @@ impl HashJoiner {
         })
     }
 
+    /// Returns the schema of data yielded by `collect()`.
+    ///
+    /// This excludes the index column on the right-hand side.
     pub fn out_schema(&self) -> &SchemaRef {
         &self.out_schema
     }

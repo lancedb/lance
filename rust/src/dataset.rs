@@ -515,6 +515,8 @@ impl Dataset {
         };
         for field in right_schema.fields() {
             if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
                 continue;
             }
             if self.schema().field(field.name()).is_some() {
@@ -527,6 +529,8 @@ impl Dataset {
 
         // Hash join
         let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
         let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
 
         // Write new data file to each fragment. Parallelism is done over columns,
