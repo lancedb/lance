@@ -317,6 +317,7 @@ pub(crate) fn lance_supports_nulls(datatype: &DataType) -> bool {
         DataType::Utf8
         | DataType::LargeUtf8
         | DataType::Binary
+        | DataType::List(_)
         | DataType::FixedSizeBinary(_)
         | DataType::FixedSizeList(_, _) => true,
         _ => false,
