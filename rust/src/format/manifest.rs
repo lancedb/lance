@@ -17,10 +17,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use chrono::prelude::*;
 use prost_types::Timestamp;
-use std::time::SystemTime;
 
 use super::Fragment;
 use crate::datatypes::Schema;

@@ -409,21 +409,12 @@ impl Dataset {
                 .unwrap_or(1),
             None => 1,
         };
+        manifest.set_timestamp(None);
         // Inherit the index if we're just appending rows
-        let indices = if matches!(params.mode, WriteMode::Append) {
-            if let Some(d) = dataset.as_ref() {
-                Some(d.load_indices().await?)
-            } else {
-                None
-            }
-        } else {
-            None
+        let indices = match (&dataset, &params.mode) {
+            (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
+            _ => None,
         };
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
         write_manifest_file(&object_store, &mut manifest, indices).await?;
 
         let base = object_store.base_path().clone();
@@ -692,6 +683,39 @@ impl Dataset {
         Ok(self.take(&ids[..], &projection).await?)
     }
 
+    /// Delete rows based on a predicate.
+    #[allow(dead_code)] // TODO: remove once this is public
+    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
+        let updated_fragments = stream::iter(self.get_fragments())
+            .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
+            .buffer_unordered(num_cpus::get())
+            // Drop the fragments that were deleted.
+            .try_filter_map(|f| futures::future::ready(Ok(f)))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Inherit the index, unless we deleted all the fragments.
+        let indices = if updated_fragments.is_empty() {
+            None
+        } else {
+            Some(self.load_indices().await?)
+        };
+
+        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        manifest.set_timestamp(None);
+
+        write_manifest_file(&self.object_store, &mut manifest, indices).await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
@@ -827,18 +851,22 @@ async fn write_manifest_file_to_path(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::ops::Range;
+
     use super::*;
     use crate::index::vector::MetricType;
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use crate::io::deletion::read_deletion_file;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
-    use arrow_array::Float32Array;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
         DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
+    use arrow_array::{Float32Array, UInt32Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -1455,5 +1483,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(UInt32Array::from_iter_values(range))],
+            )
+            .unwrap()
+        }
+
+        // Write a dataset
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = sequence_data(0..100);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
+        let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        // Delete nothing
+        dataset.delete("i < 0").await.unwrap();
+
+        // We should not have any deletion file still
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_none());
+
+        // Delete rows
+        dataset.delete("i < 10 OR i >= 90").await.unwrap();
+
+        // Verify result:
+        // There should be a deletion file in the metadata
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+
+        // The deletion file should contain 20 rows
+        let store = dataset.object_store().clone();
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 20);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..10).chain(90..100).collect::<HashSet<_>>()
+        );
+
+        // Delete more rows
+        dataset.delete("i < 20").await.unwrap();
+
+        // Verify result
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 30);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..20).chain(90..100).collect::<HashSet<_>>()
+        );
+
+        // Delete full fragment
+        dataset.delete("i >= 20").await.unwrap();
+
+        // Verify fragment is fully gone
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 0);
     }
 }

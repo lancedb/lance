@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::ipc::reader::FileReader as ArrowFileReader;
@@ -30,6 +31,31 @@ pub(crate) enum DeletionVector {
     Bitmap(RoaringBitmap),
 }
 
+impl DeletionVector {
+    #[allow(dead_code)] // Used in tests
+    pub fn len(&self) -> usize {
+        match self {
+            Self::NoDeletions => 0,
+            Self::Set(set) => set.len(),
+            Self::Bitmap(bitmap) => bitmap.len() as usize,
+        }
+    }
+
+    pub fn contains_range(&self, mut range: Range<u32>) -> bool {
+        match self {
+            Self::NoDeletions => range.is_empty(),
+            Self::Set(set) => range.all(|i| set.contains(&i)),
+            Self::Bitmap(bitmap) => bitmap.contains_range(range),
+        }
+    }
+}
+
+impl Default for DeletionVector {
+    fn default() -> Self {
+        DeletionVector::NoDeletions
+    }
+}
+
 impl PartialEq for DeletionVector {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -48,6 +74,49 @@ impl PartialEq for DeletionVector {
     }
 }
 
+impl Extend<u32> for DeletionVector {
+    fn extend<T: IntoIterator<Item = u32>>(&mut self, iter: T) {
+        let iter = iter.into_iter();
+        // The mem::replace allows changing the variant of Self when we only
+        // have &mut Self.
+        *self = match (std::mem::replace(self, Self::default()), iter.size_hint()) {
+            (Self::NoDeletions, (_, Some(0))) => Self::NoDeletions,
+            (Self::NoDeletions, (lower, _)) if lower >= BITMAP_THRESDHOLD => {
+                let bitmap = iter.collect::<RoaringBitmap>();
+                Self::Bitmap(bitmap)
+            }
+            (Self::NoDeletions, (_, Some(upper))) if upper < BITMAP_THRESDHOLD => {
+                let set = iter.collect::<HashSet<_>>();
+                Self::Set(set)
+            }
+            (Self::NoDeletions, _) => {
+                // We don't know the size, so just try as a set and move to bitmap
+                // if it ends up being big.
+                let set = iter.collect::<HashSet<_>>();
+                if set.len() > BITMAP_THRESDHOLD {
+                    let bitmap = set.into_iter().collect::<RoaringBitmap>();
+                    Self::Bitmap(bitmap)
+                } else {
+                    Self::Set(set)
+                }
+            }
+            (Self::Set(mut set), _) => {
+                set.extend(iter);
+                if set.len() > BITMAP_THRESDHOLD {
+                    let bitmap = set.drain().collect::<RoaringBitmap>();
+                    Self::Bitmap(bitmap)
+                } else {
+                    Self::Set(set)
+                }
+            }
+            (Self::Bitmap(mut bitmap), _) => {
+                bitmap.extend(iter);
+                Self::Bitmap(bitmap)
+            }
+        };
+    }
+}
+
 // TODO: impl methods for DeletionVector
 /// impl DeletionVector {
 ///     pub fn get(i: u32) -> bool { ... }
@@ -60,38 +129,18 @@ impl IntoIterator for DeletionVector {
 
     fn into_iter(self) -> Self::IntoIter {
         match self {
-            DeletionVector::NoDeletions => Box::new(std::iter::empty()),
-            DeletionVector::Set(set) => Box::new(set.into_iter()),
-            DeletionVector::Bitmap(bitmap) => Box::new(bitmap.into_iter()),
+            Self::NoDeletions => Box::new(std::iter::empty()),
+            Self::Set(set) => Box::new(set.into_iter()),
+            Self::Bitmap(bitmap) => Box::new(bitmap.into_iter()),
         }
     }
 }
 
 impl FromIterator<u32> for DeletionVector {
     fn from_iter<T: IntoIterator<Item = u32>>(iter: T) -> Self {
-        let iter = iter.into_iter();
-        match iter.size_hint() {
-            (_, Some(0)) => DeletionVector::NoDeletions,
-            (lower, _) if lower >= BITMAP_THRESDHOLD => {
-                let bitmap = iter.collect::<RoaringBitmap>();
-                DeletionVector::Bitmap(bitmap)
-            }
-            (_, Some(upper)) if upper < BITMAP_THRESDHOLD => {
-                let set = iter.collect::<HashSet<_>>();
-                DeletionVector::Set(set)
-            }
-            _ => {
-                // We don't know the size, so just try as a set and move to bitmap
-                // if it ends up being big.
-                let set = iter.collect::<HashSet<_>>();
-                if set.len() > BITMAP_THRESDHOLD {
-                    let bitmap = set.into_iter().collect::<RoaringBitmap>();
-                    DeletionVector::Bitmap(bitmap)
-                } else {
-                    DeletionVector::Set(set)
-                }
-            }
-        }
+        let mut deletion_vector = Self::default();
+        deletion_vector.extend(iter);
+        deletion_vector
     }
 }
 
@@ -181,10 +230,10 @@ pub(crate) async fn write_deletion_file(
 /// Will return an error if the file is present but invalid.
 #[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn read_deletion_file(
-    fragment: Fragment,
+    fragment: &Fragment,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionVector>> {
-    let deletion_file = if let Some(file) = fragment.deletion_file {
+    let deletion_file = if let Some(file) = &fragment.deletion_file {
         file
     } else {
         return Ok(None);
@@ -402,7 +451,7 @@ mod test {
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(fragment, &object_store)
+        let read_dv = read_deletion_file(&fragment, &object_store)
             .await
             .unwrap()
             .unwrap();
@@ -423,7 +472,7 @@ mod test {
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(fragment, &object_store)
+        let read_dv = read_deletion_file(&fragment, &object_store)
             .await
             .unwrap()
             .unwrap();
