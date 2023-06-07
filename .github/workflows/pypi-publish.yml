@@ -6,7 +6,7 @@ on:
 
 jobs:
   linux:
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       matrix:
         python-minor-version: [ "8"]
@@ -30,7 +30,7 @@ jobs:
         token: ${{ secrets.PYPI_TOKEN }}
         repo: "pypi"
   mac:
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: "macos-12"
     strategy:
       matrix:
@@ -58,7 +58,7 @@ jobs:
         token: ${{ secrets.PYPI_TOKEN }}
         repo: "pypi"
   windows:
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: windows-latest
     strategy:
       matrix:
