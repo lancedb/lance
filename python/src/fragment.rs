@@ -22,11 +22,13 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
 use lance::format::pb;
 use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance::io::deletion_file_path;
 use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyBytes, PyDict};
+use std::fmt::Write as _;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -46,8 +48,29 @@ impl FileFragment {
 
 #[pymethods]
 impl FileFragment {
-    fn __repr__(&self) -> String {
-        format!("LanceFileFragment(id={})", self.fragment.id())
+    fn __repr__(&self) -> PyResult<String> {
+        let mut s = String::new();
+        write!(
+            s,
+            "LanceFileFragment(id={}, data_files=[",
+            self.fragment.id()
+        )
+        .unwrap();
+        let file_path = self
+            .fragment
+            .metadata()
+            .files
+            .iter()
+            .map(|f| format!("'{}'", f.path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(s, "{}]", file_path).unwrap();
+        if let Some(deletion) = &self.fragment.metadata().deletion_file {
+            let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
+            write!(s, ", deletion_file='{}'", path).unwrap();
+        }
+        write!(s, ")").unwrap();
+        Ok(s)
     }
 
     #[staticmethod]

@@ -322,6 +322,8 @@ impl FileFragment {
         .await?
         .unwrap_or_default();
 
+        let starting_length = deletion_vector.len();
+
         // scan with predicate and row ids
         let mut scanner = self.scan();
         scanner
@@ -346,6 +348,11 @@ impl FileFragment {
                 futures::future::ready(Ok(()))
             })
             .await?;
+        
+        // If we haven't deleted any additional rows, we can return the fragment as-is.
+        if deletion_vector.len() == starting_length {
+            return Ok(Some(self));
+        }
 
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?

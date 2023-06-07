@@ -297,6 +297,16 @@ impl Dataset {
         Ok(())
     }
 
+    fn delete(&mut self, predicate: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.delete(&predicate);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
         let versions = self_
             .list_versions()

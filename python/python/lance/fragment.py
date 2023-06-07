@@ -35,6 +35,9 @@ class LanceFragment(pa.dataset.Fragment):
         self._fragment = dataset.get_fragment(fragment_id)
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
+    
+    def __repr__(self):
+        return self._fragment.__repr__()
 
     def __reduce__(self):
         from .dataset import LanceDataset
@@ -184,3 +187,7 @@ class LanceFragment(pa.dataset.Fragment):
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
+
+    def deletion_file(self):
+        """Return the deletion file, if any"""    
+        return self._fragment.deletion_file()

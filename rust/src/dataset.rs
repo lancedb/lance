@@ -726,9 +726,8 @@ impl Dataset {
     }
 
     /// Delete rows based on a predicate.
-    #[allow(dead_code)] // TODO: remove once this is public
-    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
-        let mut updated_fragments = stream::iter(self.get_fragments())
+    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+        let updated_fragments = stream::iter(self.get_fragments())
             .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
             .buffer_unordered(num_cpus::get())
             // Drop the fragments that were deleted.

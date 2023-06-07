@@ -41,6 +41,7 @@ pub use reader::read_manifest;
 pub use reader::FileReader;
 pub use stream::RecordBatchStream;
 pub use writer::*;
+pub use deletion::deletion_file_path;
 
 #[async_trait]
 pub trait AsyncWriteProtoExt {

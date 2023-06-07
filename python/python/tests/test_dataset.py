@@ -27,6 +27,7 @@ import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pyarrow.dataset as pa_ds
 import pytest
 
 
@@ -384,11 +385,25 @@ def test_merge_data(tmp_path: Path):
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table(
-        {
-            "a": range(100),
-            "b": range(100),
-            "c": range(100),
-            "d": ["a", "b", "c", "d", "e"] + [None] * 95,
-        }
-    )
+    assert dataset.to_table() == pa.table({
+        "a": range(100),
+        "b": range(100),
+        "c": range(100),
+        "d": ["a", "b", "c", "d", "e"] + [None] * 95
+    })
+
+
+def test_delete_data(tmp_path: Path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    lance.write_dataset(tab, tmp_path / "dataset", mode="append")
+
+    dataset = lance.dataset(tmp_path / "dataset")
+
+    dataset.delete("a < 10")
+    dataset.delete("b in (98, 99)")
+    assert dataset.version == 3
+    assert dataset.to_table() == pa.table({"a": range(10, 98), "b": range(10, 98)})
+
+    dataset.delete(pa_ds.field("a") < 20)
+    assert dataset.version == 4
+    assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
