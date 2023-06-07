@@ -27,6 +27,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
@@ -247,6 +248,10 @@ impl VectorIndex for PQIndex {
             ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
+    }
+
+    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+        todo!()
     }
 
     fn is_loadable(&self) -> bool {

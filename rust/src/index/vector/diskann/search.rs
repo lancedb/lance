@@ -22,6 +22,7 @@ use std::{
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use futures::{stream::BoxStream, StreamExt};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 
@@ -71,25 +72,25 @@ pub(crate) struct SearchState {
     /// paper, which is the one that has been popped from the heap.
     /// But we wanted to avoid repeatly computing `argmin` over the heap, so we need another
     /// meaning for visited.
-    heap_visisted: HashSet<usize>,
+    heap_visited: HashSet<usize>,
 
     /// Search size, `L` parameter in the paper. L must be greater or equal than k.
-    l: usize,
+    l: Option<usize>,
 
     /// Number of results to return.
     //TODO: used during search.
     #[allow(dead_code)]
-    k: usize,
+    k: Option<usize>,
 }
 
 impl SearchState {
     /// Creates a new search state.
-    pub(crate) fn new(k: usize, l: usize) -> Self {
+    pub(crate) fn new(k: Option<usize>, l: Option<usize>) -> Self {
         Self {
             visited: HashSet::new(),
             candidates: BTreeMap::new(),
             heap: BinaryHeap::new(),
-            heap_visisted: HashSet::new(),
+            heap_visited: HashSet::new(),
             k,
             l,
         }
@@ -114,12 +115,14 @@ impl SearchState {
     /// Push a new (unvisited) vertex into the search state.
     fn push(&mut self, vertex_id: usize, distance: f32) {
         assert!(!self.visited.contains(&vertex_id));
-        self.heap_visisted.insert(vertex_id);
+        self.heap_visited.insert(vertex_id);
         self.heap
             .push(Reverse(VertexWithDistance::new(vertex_id, distance)));
         self.candidates.insert(OrderedFloat(distance), vertex_id);
-        if self.candidates.len() > self.l {
-            self.candidates.pop_last();
+        if let Some(limit) = self.l {
+            if self.candidates.len() > limit {
+                self.candidates.pop_last();
+            }
         }
     }
 
@@ -130,7 +133,7 @@ impl SearchState {
 
     /// Returns true if the vertex has been visited.
     fn is_visited(&self, vertex_id: usize) -> bool {
-        self.visited.contains(&vertex_id) || self.heap_visisted.contains(&vertex_id)
+        self.visited.contains(&vertex_id) || self.heap_visited.contains(&vertex_id)
     }
 }
 
@@ -152,7 +155,7 @@ pub(crate) async fn greedy_search(
 ) -> Result<SearchState> {
     // L in the paper.
     // A map from distance to vertex id.
-    let mut state = SearchState::new(k, search_size);
+    let mut state = SearchState::new(Some(k), Some(search_size));
 
     let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
@@ -172,6 +175,49 @@ pub(crate) async fn greedy_search(
     }
 
     Ok(state)
+}
+
+
+pub(crate) async fn greedy_search_stream(
+    graph: &(dyn Graph + Send + Sync),
+    start: usize,
+    query: &[f32],
+) -> Result<BoxStream<'static, (usize, f32)>> {
+
+    let mut state = SearchState::new(None, None);
+
+    let dist = graph.distance_to(query, start).await?;
+    state.push(start, dist);
+    
+    Ok(futures::stream::repeat_with(move || async {
+        loop {
+            if let Some(candidate) = state.candidates.pop_first() {
+                // If we have candidates, yield those
+                return Ok(Some(candidate))
+            } else {
+                // Otherwise, find new candidates
+                let current_round_count = state.heap.len();
+                for _ in 0..current_round_count {
+                    if let Some(id) = state.pop() {
+                        state.visit(id);
+                
+                        let neighbors = graph.neighbors(id).await?;
+                        for neighbor_id in neighbors.values() {
+                            let neighbor_id = *neighbor_id as usize;
+                            if state.is_visited(neighbor_id) {
+                                // Already visited.
+                                continue;
+                            }
+                            let dist = graph.distance_to(query, neighbor_id).await?;
+                            state.push(neighbor_id, dist);
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .buffered(5)
+    .boxed())
 }
 
 pub struct DiskANNIndex {
@@ -245,6 +291,10 @@ impl VectorIndex for DiskANNIndex {
         Ok(batch)
     }
 
+    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+        todo!()
+    }
+
     fn is_loadable(&self) -> bool {
         false
     }
@@ -271,7 +321,7 @@ mod test {
         let k: usize = 10;
         let l: usize = 20;
 
-        let mut state = SearchState::new(k, l);
+        let mut state = SearchState::new(Some(k), Some(l));
         for i in (0..40).rev() {
             state.push(i, i as f32);
         }

@@ -29,7 +29,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 use async_trait::async_trait;
 use futures::{
-    stream::{self, StreamExt},
+    stream::{self, StreamExt, BoxStream},
     TryStreamExt,
 };
 use rand::{rngs::SmallRng, SeedableRng};
@@ -157,6 +157,13 @@ impl VectorIndex for IVFIndex {
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_scores).into())
+    }
+
+    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+        // Create a stream for each partition
+
+        // Merge the streams preserving score order
+        todo!();
     }
 
     fn is_loadable(&self) -> bool {

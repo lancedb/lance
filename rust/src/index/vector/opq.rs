@@ -22,6 +22,7 @@ use arrow::array::{as_primitive_array, Float32Builder};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 use super::{
     pq::{PQBuildParams, ProductQuantizer},
@@ -284,6 +285,10 @@ impl VectorIndex for OPQIndex {
         let mut transformed_query = query.clone();
         transformed_query.key = transformed.data();
         self.sub_index.search(&transformed_query).await
+    }
+
+    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+        todo!()
     }
 
     fn is_loadable(&self) -> bool {
