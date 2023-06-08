@@ -16,20 +16,23 @@
 
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_cast::DEFAULT_CAST_OPTIONS;
+use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
 use datafusion::{
     logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::{
-        expressions::{InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr},
+        expressions::{
+            CastExpr, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+        },
         functions, PhysicalExpr,
     },
     prelude::Expr,
     scalar::ScalarValue,
 };
 use sqlparser::ast::{
-    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, UnaryOperator,
-    Value,
+    BinaryOperator, DataType as SQLDataType, Expr as SQLExpr, Function, FunctionArg,
+    FunctionArgExpr, Ident, UnaryOperator, Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -173,6 +176,42 @@ impl Planner {
         })
     }
 
+    fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
+        match data_type {
+            SQLDataType::String => Ok(ArrowDataType::Utf8),
+            SQLDataType::Float(None) => Ok(ArrowDataType::Float32),
+            SQLDataType::Float(Some(16)) => Ok(ArrowDataType::Float16),
+            SQLDataType::Float(Some(32)) => Ok(ArrowDataType::Float32),
+            SQLDataType::Float(Some(64)) => Ok(ArrowDataType::Float64),
+            SQLDataType::Double => Ok(ArrowDataType::Float64),
+            SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
+            SQLDataType::Int(None) | SQLDataType::Integer(None) => Ok(ArrowDataType::Int32),
+            SQLDataType::Int(Some(32)) | SQLDataType::Integer(Some(32)) => Ok(ArrowDataType::Int32),
+            SQLDataType::Int(Some(8)) | SQLDataType::Integer(Some(8)) => Ok(ArrowDataType::Int8),
+            SQLDataType::Int(Some(16)) | SQLDataType::Integer(Some(16)) => Ok(ArrowDataType::Int16),
+            SQLDataType::Int(Some(64)) | SQLDataType::Integer(Some(64)) => Ok(ArrowDataType::Int64),
+            SQLDataType::Date => Ok(ArrowDataType::Date32),
+            SQLDataType::Datetime(resolution) => {
+                let time_unit = match resolution {
+                    None => TimeUnit::Microsecond,
+                    Some(0) => TimeUnit::Second,
+                    Some(3) => TimeUnit::Millisecond,
+                    Some(6) => TimeUnit::Microsecond,
+                    Some(9) => TimeUnit::Nanosecond,
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!("Unsupported datetime resolution: {:?}", resolution),
+                        })
+                    }
+                };
+                Ok(ArrowDataType::Timestamp(time_unit, None))
+            }
+            _ => Err(Error::IO {
+                message: format!("Unsupported data type: {:?}. Supports: float, double, boolean, int, integer, date, datetime", data_type),
+            }),
+        }
+    }
+
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
         match expr {
             SQLExpr::Identifier(id) => {
@@ -217,6 +256,10 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 *escape_char,
             ))),
+            SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                expr: Box::new(self.parse_sql_expr(expr)?),
+                data_type: self.parse_type(data_type)?,
+            })),
             _ => {
                 return Err(Error::IO {
                     message: format!("Expression '{expr}' is not supported as filter in lance"),
@@ -272,6 +315,10 @@ impl Planner {
                 self.create_physical_expr(expr.pattern.as_ref())?,
             )),
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
+            Expr::Cast(datafusion::logical_expr::Cast { expr, data_type }) => {
+                let expr = self.create_physical_expr(expr.as_ref())?;
+                Arc::new(CastExpr::new(expr, data_type.clone(), DEFAULT_CAST_OPTIONS))
+            }
             Expr::ScalarFunction { fun, args } => {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
                     return Err(Error::IO {

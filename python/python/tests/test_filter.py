@@ -14,6 +14,7 @@
 
 """Tests for predicate pushdown"""
 
+from datetime import date, datetime, timedelta
 import random
 from pathlib import Path
 
@@ -32,11 +33,13 @@ def create_table(nrows=100):
     floatcol = pa.array(np.arange(nrows) * 2 / 3, type=pa.float32())
     arr = np.arange(nrows) < nrows / 2
     structcol = pa.StructArray.from_arrays(
-        [pa.array(arr, type=pa.bool_())], names=["bool"]
+        [pa.array(arr, type=pa.bool_()),
+         pa.array([date(2021, 1, 1) + timedelta(days=i) for i in range(nrows)]),
+         pa.array([datetime(2021, 1, 1) + timedelta(hours=i) for i in range(nrows)])], names=["bool", "date", "dt"]
     )
-
+    random.seed(42)
     def gen_str(n):
-        return "".join(random.choices("abc"))
+        return "".join(random.choices("abc", k=n))
 
     stringcol = pa.array([gen_str(2) for _ in range(nrows)])
 
@@ -57,16 +60,42 @@ def test_simple_predicates(dataset):
         pc.field("int") >= 50,
         pc.field("int") == 50,
         pc.field("int") != 50,
-        pc.field("float") < 90.0,
-        pc.field("float") > 90.0,
-        pc.field("float") <= 90.0,
-        pc.field("float") >= 90.0,
+        pc.field("float") < 30.0,
+        pc.field("float") > 30.0,
+        pc.field("float") <= 30.0,
+        pc.field("float") >= 30.0,
         pc.field("str") != "aa",
         pc.field("str") == "aa",
     ]
     # test simple
     for expr in predicates:
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
+
+
+def test_sql_predicates(dataset):
+    print(dataset.to_table())
+    # Predicate and expected number of rows
+    predicates_nrows = [
+        ("int >= 50", 50),
+        ("int = 50", 1),
+        ("int != 50", 99),
+        ("float < 30.0", 45),
+        ("str = 'aa'", 16),
+        ("str in ('aa', 'bb')", 26),
+        ("rec.bool", 50),
+        # TODO: Get dates to work without casting
+        # ("rec.date = '2021-01-01'", 1),
+        # ("rec.dt = '2021-01-01 00:00:00'", 1),
+        ("rec.date = cast('2021-01-01' as date)", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as datetime(6))", 1),
+        # Default is microsecond
+        ("rec.dt = cast('2021-01-01 00:00:00' as datetime)", 1),
+        ("rec.date >= cast('2021-01-31' as date)", 70),
+        ("cast(rec.date as string) = '2021-01-01'", 1),
+    ]
+
+    for expr, expected_num_rows in predicates_nrows:
+        assert dataset.to_table(filter=expr).num_rows == expected_num_rows
 
 
 def test_compound(dataset):
