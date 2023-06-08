@@ -87,6 +87,8 @@ def test_sql_predicates(dataset):
         # ("rec.date = '2021-01-01'", 1),
         # ("rec.dt = '2021-01-01 00:00:00'", 1),
         ("rec.date = cast('2021-01-01' as date)", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as timestamp(6))", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as timestamp)", 1),
         ("rec.dt = cast('2021-01-01 00:00:00' as datetime(6))", 1),
         # Default is microsecond
         ("rec.dt = cast('2021-01-01 00:00:00' as datetime)", 1),

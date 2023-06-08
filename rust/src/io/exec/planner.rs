@@ -32,7 +32,7 @@ use datafusion::{
 };
 use sqlparser::ast::{
     BinaryOperator, DataType as SQLDataType, Expr as SQLExpr, Function, FunctionArg,
-    FunctionArgExpr, Ident, UnaryOperator, Value,
+    FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -191,6 +191,30 @@ impl Planner {
             SQLDataType::Int(Some(16)) | SQLDataType::Integer(Some(16)) => Ok(ArrowDataType::Int16),
             SQLDataType::Int(Some(64)) | SQLDataType::Integer(Some(64)) => Ok(ArrowDataType::Int64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
+            SQLDataType::Timestamp(resolution, tz) => {
+                match tz {
+                    TimezoneInfo::None => {},
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!("Timezone not supported in timestamp"),
+                        })
+                    }
+                };
+                let time_unit = match resolution {
+                    // Default to microsecond to match PyArrow
+                    None => TimeUnit::Microsecond,
+                    Some(0) => TimeUnit::Second,
+                    Some(3) => TimeUnit::Millisecond,
+                    Some(6) => TimeUnit::Microsecond,
+                    Some(9) => TimeUnit::Nanosecond,
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!("Unsupported datetime resolution: {:?}", resolution),
+                        })
+                    }
+                };
+                Ok(ArrowDataType::Timestamp(time_unit, None))
+            }
             SQLDataType::Datetime(resolution) => {
                 let time_unit = match resolution {
                     None => TimeUnit::Microsecond,
