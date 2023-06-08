@@ -14,8 +14,10 @@
 
 """Tests for predicate pushdown"""
 
+from datetime import date, datetime, timedelta
 import random
 from pathlib import Path
+from decimal import Decimal
 
 import lance
 import numpy as np
@@ -32,16 +34,20 @@ def create_table(nrows=100):
     floatcol = pa.array(np.arange(nrows) * 2 / 3, type=pa.float32())
     arr = np.arange(nrows) < nrows / 2
     structcol = pa.StructArray.from_arrays(
-        [pa.array(arr, type=pa.bool_())], names=["bool"]
+        [pa.array(arr, type=pa.bool_()),
+         pa.array([date(2021, 1, 1) + timedelta(days=i) for i in range(nrows)]),
+         pa.array([datetime(2021, 1, 1) + timedelta(hours=i) for i in range(nrows)])], names=["bool", "date", "dt"]
     )
-
+    random.seed(42)
     def gen_str(n):
-        return "".join(random.choices("abc"))
+        return "".join(random.choices("abc", k=n))
 
-    stringcol = pa.array([gen_str(2) for _ in range(nrows)])
+    string_col = pa.array([gen_str(2) for _ in range(nrows)])
+
+    decimal_col = pa.array([Decimal(f"{str(i)}.000") for i in range(nrows)])
 
     tbl = pa.Table.from_arrays(
-        [intcol, floatcol, structcol, stringcol], names=["int", "float", "rec", "str"]
+        [intcol, floatcol, structcol, string_col, decimal_col], names=["int", "float", "rec", "str", "decimal"]
     )
     return tbl
 
@@ -57,16 +63,45 @@ def test_simple_predicates(dataset):
         pc.field("int") >= 50,
         pc.field("int") == 50,
         pc.field("int") != 50,
-        pc.field("float") < 90.0,
-        pc.field("float") > 90.0,
-        pc.field("float") <= 90.0,
-        pc.field("float") >= 90.0,
+        pc.field("float") < 30.0,
+        pc.field("float") > 30.0,
+        pc.field("float") <= 30.0,
+        pc.field("float") >= 30.0,
         pc.field("str") != "aa",
         pc.field("str") == "aa",
     ]
     # test simple
     for expr in predicates:
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
+
+
+def test_sql_predicates(dataset):
+    print(dataset.to_table())
+    # Predicate and expected number of rows
+    predicates_nrows = [
+        ("int >= 50", 50),
+        ("int = 50", 1),
+        ("int != 50", 99),
+        ("float < 30.0", 45),
+        ("str = 'aa'", 16),
+        ("str in ('aa', 'bb')", 26),
+        ("rec.bool", 50),
+        ("rec.date = cast('2021-01-01' as date)", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as timestamp(6))", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as timestamp)", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as datetime(6))", 1),
+        ("rec.dt = cast('2021-01-01 00:00:00' as datetime)", 1),
+        ("rec.dt = TIMESTAMP '2021-01-01 00:00:00'", 1),
+        ("rec.dt = TIMESTAMP(6) '2021-01-01 00:00:00'", 1),
+        ("rec.date = DATE '2021-01-01'", 1),
+        ("rec.date >= cast('2021-01-31' as date)", 70),
+        ("cast(rec.date as string) = '2021-01-01'", 1),
+        ("decimal = DECIMAL(5,3) '12.000'", 1),
+        ("decimal >= DECIMAL(5,3) '50.000'", 50),
+    ]
+
+    for expr, expected_num_rows in predicates_nrows:
+        assert dataset.to_table(filter=expr).num_rows == expected_num_rows
 
 
 def test_compound(dataset):
