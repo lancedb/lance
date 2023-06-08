@@ -250,6 +250,13 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
+            // For example, DATE '2020-01-01'
+            SQLExpr::TypedString { data_type, value } => {
+                Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
+                    data_type: self.parse_type(data_type)?,
+                }))
+            }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
