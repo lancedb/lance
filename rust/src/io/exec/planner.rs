@@ -179,17 +179,18 @@ impl Planner {
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
         match data_type {
             SQLDataType::String => Ok(ArrowDataType::Utf8),
-            SQLDataType::Float(None) => Ok(ArrowDataType::Float32),
-            SQLDataType::Float(Some(16)) => Ok(ArrowDataType::Float16),
-            SQLDataType::Float(Some(32)) => Ok(ArrowDataType::Float32),
-            SQLDataType::Float(Some(64)) => Ok(ArrowDataType::Float64),
+            SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
+            SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
             SQLDataType::Double => Ok(ArrowDataType::Float64),
             SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
-            SQLDataType::Int(None) | SQLDataType::Integer(None) => Ok(ArrowDataType::Int32),
-            SQLDataType::Int(Some(32)) | SQLDataType::Integer(Some(32)) => Ok(ArrowDataType::Int32),
-            SQLDataType::Int(Some(8)) | SQLDataType::Integer(Some(8)) => Ok(ArrowDataType::Int8),
-            SQLDataType::Int(Some(16)) | SQLDataType::Integer(Some(16)) => Ok(ArrowDataType::Int16),
-            SQLDataType::Int(Some(64)) | SQLDataType::Integer(Some(64)) => Ok(ArrowDataType::Int64),
+            SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
+            SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
+            SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
+            SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
+            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
+            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
+            SQLDataType::UnsignedInt(_) => Ok(ArrowDataType::UInt32),
+            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
             SQLDataType::Timestamp(resolution, tz) => {
                 match tz {
