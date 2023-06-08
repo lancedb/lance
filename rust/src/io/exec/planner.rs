@@ -31,8 +31,8 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, Expr as SQLExpr, Function, FunctionArg,
-    FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
+    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -177,6 +177,21 @@ impl Planner {
     }
 
     fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
+        const SUPPORTED_TYPES: [&str; 13] = [
+            "int [unsigned]",
+            "tinyint [unsigned]",
+            "smallint [unsigned]",
+            "bigint [unsigned]",
+            "float",
+            "double",
+            "string",
+            "binary",
+            "date",
+            "timestamp(precision)",
+            "datetime(precision)",
+            "decimal(precision,scale)",
+            "boolean",
+        ];
         match data_type {
             SQLDataType::String => Ok(ArrowDataType::Utf8),
             SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
@@ -189,12 +204,14 @@ impl Planner {
             SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
             SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
             SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
-            SQLDataType::UnsignedInt(_) => Ok(ArrowDataType::UInt32),
+            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
+                Ok(ArrowDataType::UInt32)
+            }
             SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
             SQLDataType::Date => Ok(ArrowDataType::Date32),
             SQLDataType::Timestamp(resolution, tz) => {
                 match tz {
-                    TimezoneInfo::None => {},
+                    TimezoneInfo::None => {}
                     _ => {
                         return Err(Error::IO {
                             message: format!("Timezone not supported in timestamp"),
@@ -231,8 +248,24 @@ impl Planner {
                 };
                 Ok(ArrowDataType::Timestamp(time_unit, None))
             }
+            SQLDataType::Decimal(number_info) => match number_info {
+                ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+                    Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
+                }
+                _ => {
+                    return Err(Error::IO {
+                        message: format!(
+                            "Must provide precision and scale for decimal: {:?}",
+                            number_info
+                        ),
+                    })
+                }
+            },
             _ => Err(Error::IO {
-                message: format!("Unsupported data type: {:?}. Supports: float, double, boolean, int, integer, date, datetime", data_type),
+                message: format!(
+                    "Unsupported data type: {:?}. Supported types: {:?}",
+                    data_type, SUPPORTED_TYPES
+                ),
             }),
         }
     }
@@ -402,7 +435,7 @@ mod tests {
         ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{col, lit, Cast};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -624,5 +657,136 @@ mod tests {
                 false, true, true, false, true, true, false, true, true, false
             ])
         );
+    }
+
+    #[test]
+    fn test_sql_cast() {
+        let cases = &[
+            (
+                "x = cast('2021-01-01 00:00:00' as timestamp)",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00' as timestamp(0))",
+                ArrowDataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00.123' as timestamp(9))",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00.123' as datetime(9))",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            ("x = cast('2021-01-01' as date)", ArrowDataType::Date32),
+            (
+                "x = cast('1.238' as decimal(9,3))",
+                ArrowDataType::Decimal128(9, 3),
+            ),
+            ("x = cast(1 as float)", ArrowDataType::Float32),
+            ("x = cast(1 as double)", ArrowDataType::Float64),
+            ("x = cast(1 as tinyint)", ArrowDataType::Int8),
+            ("x = cast(1 as smallint)", ArrowDataType::Int16),
+            ("x = cast(1 as int)", ArrowDataType::Int32),
+            ("x = cast(1 as integer)", ArrowDataType::Int32),
+            ("x = cast(1 as bigint)", ArrowDataType::Int64),
+            ("x = cast(1 as tinyint unsigned)", ArrowDataType::UInt8),
+            ("x = cast(1 as smallint unsigned)", ArrowDataType::UInt16),
+            ("x = cast(1 as int unsigned)", ArrowDataType::UInt32),
+            ("x = cast(1 as integer unsigned)", ArrowDataType::UInt32),
+            ("x = cast(1 as bigint unsigned)", ArrowDataType::UInt64),
+            ("x = cast(1 as boolean)", ArrowDataType::Boolean),
+            ("x = cast(1 as string)", ArrowDataType::Utf8),
+            ("x = cast(1 as binary)", ArrowDataType::Binary),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+
+            // Get the thing after 'cast(` but before ' as'.
+            let expected_value_str = sql
+                .split("cast(")
+                .skip(1)
+                .next()
+                .unwrap()
+                .split(" as")
+                .next()
+                .unwrap();
+            // Remove any quote marks
+            let expected_value_str = expected_value_str.trim_matches('\'');
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Cast(Cast { expr, data_type }) => {
+                        match expr.as_ref() {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                                assert_eq!(value_str, expected_value_str);
+                            }
+                            Expr::Literal(ScalarValue::Int64(Some(value))) => {
+                                assert_eq!(*value, 1);
+                            }
+                            _ => panic!("Expected cast to be applied to literal"),
+                        }
+                        assert_eq!(data_type, expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_literals() {
+        let cases = &[
+            (
+                "x = timestamp '2021-01-01 00:00:00'",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "x = timestamp(0) '2021-01-01 00:00:00'",
+                ArrowDataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                "x = timestamp(9) '2021-01-01 00:00:00.123'",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            ("x = date '2021-01-01'", ArrowDataType::Date32),
+            ("x = decimal(9,3) '1.238'", ArrowDataType::Decimal128(9, 3)),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+
+            let expected_value_str = sql.split('\'').skip(1).next().unwrap();
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Cast(Cast { expr, data_type }) => {
+                        match expr.as_ref() {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                                assert_eq!(value_str, expected_value_str);
+                            }
+                            _ => panic!("Expected cast to be applied to literal"),
+                        }
+                        assert_eq!(data_type, expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
     }
 }

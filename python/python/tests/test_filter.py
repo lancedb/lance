@@ -17,6 +17,7 @@
 from datetime import date, datetime, timedelta
 import random
 from pathlib import Path
+from decimal import Decimal
 
 import lance
 import numpy as np
@@ -41,10 +42,12 @@ def create_table(nrows=100):
     def gen_str(n):
         return "".join(random.choices("abc", k=n))
 
-    stringcol = pa.array([gen_str(2) for _ in range(nrows)])
+    string_col = pa.array([gen_str(2) for _ in range(nrows)])
+
+    decimal_col = pa.array([Decimal(f"{str(i)}.000") for i in range(nrows)])
 
     tbl = pa.Table.from_arrays(
-        [intcol, floatcol, structcol, stringcol], names=["int", "float", "rec", "str"]
+        [intcol, floatcol, structcol, string_col, decimal_col], names=["int", "float", "rec", "str", "decimal"]
     )
     return tbl
 
@@ -96,6 +99,8 @@ def test_sql_predicates(dataset):
         ("rec.date = DATE '2021-01-01'", 1),
         ("rec.date >= cast('2021-01-31' as date)", 70),
         ("cast(rec.date as string) = '2021-01-01'", 1),
+        ("decimal = DECIMAL(5,3) '12.000'", 1),
+        ("decimal >= DECIMAL(5,3) '50.000'", 50),
     ]
 
     for expr, expected_num_rows in predicates_nrows:
