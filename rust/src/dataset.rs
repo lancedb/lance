@@ -163,12 +163,11 @@ impl Dataset {
 
     /// Open a dataset with read params.
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let mut object_store = ObjectStore::new(uri).await?;
+        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
         }
 
-        let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -197,14 +196,12 @@ impl Dataset {
         version: u64,
         params: &ReadParams,
     ) -> Result<Self> {
-        let mut object_store = ObjectStore::new(uri).await?;
+        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
         };
 
-        let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
@@ -215,7 +212,7 @@ impl Dataset {
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
-        let base_path = self.object_store.base_path().clone();
+        let base_path = self.base.clone();
         let manifest_file = manifest_path(&base_path, version);
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -267,11 +264,11 @@ impl Dataset {
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri).await?);
+        let (object_store, base) = ObjectStore::from_uri(uri).await?;
         let mut params = params.unwrap_or_default();
 
         // Read expected manifest path for the dataset
-        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
         // Read schema for the input batches
@@ -415,12 +412,11 @@ impl Dataset {
             (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
             _ => None,
         };
-        write_manifest_file(&object_store, &mut manifest, indices).await?;
+        write_manifest_file(&object_store, &base, &mut manifest, indices).await?;
 
-        let base = object_store.base_path().clone();
         Ok(Self {
-            object_store,
-            base: base.into(),
+            object_store: Arc::new(object_store),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
@@ -433,8 +429,8 @@ impl Dataset {
         fragments: &[Fragment],
         mode: WriteMode,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
-        let latest_manifest = latest_manifest_path(object_store.base_path());
+        let (object_store, base) = ObjectStore::from_uri(&base_uri).await?;
+        let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
         let schema = if object_store.exists(&latest_manifest).await? {
@@ -462,12 +458,10 @@ impl Dataset {
         manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        write_manifest_file(&object_store, &mut manifest, Some(indices)).await?;
-        let base = object_store.base_path().clone();
-
+        write_manifest_file(&object_store, &base, &mut manifest, Some(indices)).await?;
         Ok(Self {
-            object_store,
-            base: base.into(),
+            object_store: Arc::new(object_store),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
@@ -551,7 +545,7 @@ impl Dataset {
         manifest.set_timestamp(None);
         manifest.schema = new_schema;
 
-        write_manifest_file(&self.object_store, &mut manifest, Some(indices)).await?;
+        write_manifest_file(&self.object_store, &self.base, &mut manifest, Some(indices)).await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -709,7 +703,7 @@ impl Dataset {
             .unwrap_or(1);
         manifest.set_timestamp(None);
 
-        write_manifest_file(&self.object_store, &mut manifest, indices).await?;
+        write_manifest_file(&self.object_store, &self.base, &mut manifest, indices).await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -822,12 +816,13 @@ impl Dataset {
 /// to this version.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
+    base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
 ) -> Result<()> {
     let paths = vec![
-        manifest_path(object_store.base_path(), manifest.version),
-        latest_manifest_path(object_store.base_path()),
+        manifest_path(base_path, manifest.version),
+        latest_manifest_path(base_path),
     ];
 
     for p in paths {

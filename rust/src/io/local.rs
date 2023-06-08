@@ -47,6 +47,7 @@ impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
+        println!("LocalObjectReader: {}", local_path);
         Ok(Box::new(Self {
             file: File::open(local_path)?.into(),
             block_size,

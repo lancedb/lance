@@ -66,14 +66,11 @@ impl FileFragment {
         let params = params.unwrap_or_default();
 
         let schema = Schema::try_from(reader.schema().as_ref())?;
-        let object_store = ObjectStore::new(dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
 
-        let full_path = object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(filename.clone());
+        let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
@@ -473,6 +470,7 @@ mod tests {
             .await
             .unwrap();
 
+        println!("Open test dataset at {}", test_uri);
         let dataset = Dataset::open(test_uri).await.unwrap();
 
         dataset
@@ -538,6 +536,7 @@ mod tests {
     async fn test_append_new_columns() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
+        let test_uri = "~/tmp/test_dataset";
         let dataset = create_dataset(test_uri).await;
 
         let fragment = &mut dataset.get_fragments()[0];

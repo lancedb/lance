@@ -86,6 +86,23 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
 }
 
 impl ObjectStore {
+    /// Parse from a string URI.
+    ///
+    /// Returns the ObjectStore instance and the absolute path to the object.
+    pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
+        match Url::parse(uri) {
+            Ok(url) => {
+                let store = Self::new_from_url(url.clone()).await?;
+                let path = Path::from(url.path());
+                Ok((store, path))
+            }
+            Err(_) => {
+                let store = Self::new_from_path(uri)?;
+                Ok((store, Path::from_filesystem_path(uri)?))
+            }
+        }
+    }
+
     /// Create a ObjectStore instance from a given URL.
     pub async fn new(uri: &str) -> Result<Self> {
         if uri == ":memory:" {
@@ -114,7 +131,7 @@ impl ObjectStore {
 
         Ok(Self {
             inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
-            scheme: String::from("flle"),
+            scheme: String::from("file"),
             base_path: Path::from(object_store::path::DELIMITER),
             block_size: 4 * 1024, // 4KB block size
         })
@@ -136,7 +153,7 @@ impl ObjectStore {
             }),
             "file" => Self::new_from_path(url.path()),
             s => Err(Error::IO {
-                message: format!("Unsupported scheme {}", s),
+                message: format!("Unsupported URI scheme: {}", s),
             }),
         }
     }
@@ -170,6 +187,7 @@ impl ObjectStore {
 
     /// Open a file for path
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
+        println!("open path: {:?} schema: {}", path, self.scheme);
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -224,12 +242,14 @@ mod tests {
         let expanded = tilde(path_str).to_string();
         let path = StdPath::new(&expanded);
         std::fs::create_dir_all(path.parent().unwrap())?;
+        println!("Write data to file: {}", path.to_str().unwrap());
         write(path, contents)
     }
 
     async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
         let test_file_store = store.open(&path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
+        println!("Path: {:?}", path);
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
@@ -251,8 +271,8 @@ mod tests {
             tmp_path.clone() + "/./bar/foo.lance",
             tmp_path.clone() + "/bar/foo.lance/../foo.lance",
         ] {
-            let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file"))
+            let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+            let contents = read_from_store(store, &path.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -305,6 +325,11 @@ mod tests {
 
         let sub_dirs = store.read_dir("foo").await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[test]
+    fn test_parse_url() {
+        println!("{:?}", Url::parse("file:///a/b/c"));
     }
 
     #[tokio::test]
