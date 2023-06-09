@@ -164,7 +164,6 @@ impl FileReader {
         fragment_id: u64,
         manifest: Option<&Manifest>,
     ) -> Result<FileReader> {
-        println!("FileReader::open: {} {}", path, object_store);
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
