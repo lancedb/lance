@@ -47,7 +47,11 @@ pub struct LocalObjectReader {
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
-        let local_path = format!("/{path}");
+        let local_path = if cfg!(window) {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
         let file = File::open(local_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound {
                 uri: path.to_string(),
