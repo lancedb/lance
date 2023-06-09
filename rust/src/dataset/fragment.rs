@@ -243,7 +243,7 @@ impl FileFragment {
     pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
-            self.dataset.base.clone(),
+            &self.dataset.base,
             &self.metadata,
             self.dataset.object_store(),
         )
@@ -298,7 +298,7 @@ impl FileFragment {
         }
 
         self.metadata.deletion_file = write_deletion_file(
-            self.dataset.base.clone(),
+            &self.dataset.base,
             self.metadata.id,
             self.dataset.version().version,
             &deletion_vector,

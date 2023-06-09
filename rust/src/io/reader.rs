@@ -234,7 +234,7 @@ impl FileReader {
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
+    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -850,7 +850,9 @@ mod tests {
 
         // delete even rows
         let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
-        let deletion_file = write_deletion_file(fragment, 0, &dv, &store).await.unwrap();
+        let deletion_file = write_deletion_file(&Path::from("/foo"), fragment, 0, &dv, &store)
+            .await
+            .unwrap();
 
         let mut frag_struct = Fragment::new(fragment);
         frag_struct.deletion_file = deletion_file;
@@ -906,7 +908,9 @@ mod tests {
 
         // delete even rows
         let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
-        let deletion_file = write_deletion_file(fragment, 0, &dv, &store).await.unwrap();
+        let deletion_file = write_deletion_file(&Path::from("/foo"), fragment, 0, &dv, &store)
+            .await
+            .unwrap();
 
         let mut frag_struct = Fragment::new(fragment);
         frag_struct.deletion_file = deletion_file;

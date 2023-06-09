@@ -54,6 +54,7 @@ pub use write::*;
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
+pub(crate) const DELETION_DIRS: &str = "_deletions";
 const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 
@@ -1533,7 +1534,8 @@ mod tests {
 
         // The deletion file should contain 20 rows
         let store = dataset.object_store().clone();
-        let deletion_vector = read_deletion_file(test_uri, &fragments[0].metadata, &store)
+        let path = Path::from_filesystem_path(test_uri).unwrap();
+        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
@@ -1550,7 +1552,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = read_deletion_file(test_uri, &fragments[0].metadata, &store)
+        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
