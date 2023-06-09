@@ -19,7 +19,7 @@ use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader,
 };
-use arrow_array::{Int32Array, PrimitiveArray};
+use arrow_array::{PrimitiveArray, UInt32Array};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -114,7 +114,7 @@ async fn vector_query(
         .nprobs(nprobes)
         .refine(refine)
         .with_row_id()
-        .project(&["id", "vector", "_rowid"])
+        .project(&["id", "vector"])
         .unwrap()
         .try_into_stream()
         .await
@@ -130,7 +130,7 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
     // Create a multi-file dataset
     let config = DatasetConfig {
         num_batches: 100,
-        batch_size: 1000,
+        batch_size: 10_000,
         num_files: 10,
         ..Default::default()
     };
@@ -149,26 +149,17 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
         let q = as_fixed_size_list_array(&q).value(0);
         as_primitive_array(&q).clone()
     });
-    dbg!(&q);
 
     async fn run_query(dataset: &Dataset, q: &PrimitiveArray<Float32Type>) -> Vec<RecordBatch> {
         vector_query(&dataset, &q, 10, 10, 2).await
     }
 
-    // Let's figure out which row_ids and fragments ids are in the result, so we
-    // know where to delete later.
+    // Figure out which ids are in the result, so we know if we delete whether
+    // we are deleting ones in the result set or not.
     let results = rt.block_on(async { run_query(&dataset, &q).await });
     let results = concat_batches(&results[0].schema(), results.iter()).unwrap();
-    let row_ids: &PrimitiveArray<UInt64Type> = as_primitive_array(results["_rowid"].as_ref());
-    let fragments_ids = row_ids
-        .iter()
-        .filter_map(|row_id| row_id.map(|row_id| row_id >> 32))
-        .collect::<HashSet<u64>>();
     let id_col: &PrimitiveArray<UInt32Type> = as_primitive_array(results["id"].as_ref());
     let id_col: HashSet<u32> = id_col.iter().map(|id| id.unwrap()).collect();
-
-    dbg!(&fragments_ids);
-    dbg!(&id_col);
 
     // Run query
     c.bench_function(format!("Ivf_PQ_Refine/no-deletions").as_str(), |b| {
@@ -244,8 +235,8 @@ struct DatasetConfig {
 impl Default for DatasetConfig {
     fn default() -> Self {
         Self {
-            num_batches: 1_000,
-            batch_size: 10_000,
+            num_batches: 10,
+            batch_size: 100_000,
             num_files: 1,
             seed: [42; 32],
         }
@@ -262,20 +253,20 @@ async fn create_dataset(path: &std::path::Path, mode: WriteMode, config: Dataset
             ),
             false,
         ),
-        Field::new("i", DataType::Int32, false),
+        Field::new("id", DataType::UInt32, false),
     ]));
 
     let batches = RecordBatchBuffer::new(
-        (0..config.num_batches as i32)
+        (0..config.num_batches as u32)
             .map(|batch_i| {
                 let vectors = FixedSizeListArray::try_new(
                     generate_random_array_with_seed(config.batch_size * 128, config.seed),
                     128,
                 )
                 .unwrap();
-                let ids = (batch_i * config.batch_size as i32
-                    ..(batch_i + 1) * config.batch_size as i32)
-                    .collect::<Int32Array>();
+                let ids = (batch_i * config.batch_size as u32
+                    ..(batch_i + 1) * config.batch_size as u32)
+                    .collect::<UInt32Array>();
                 RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors), Arc::new(ids)])
                     .unwrap()
             })
