@@ -14,8 +14,6 @@
 
 use std::collections::BTreeSet;
 
-use object_store::path::Path;
-
 use crate::datatypes::Schema;
 use crate::format::pb;
 use crate::io::deletion::{read_deletion_file, DeletionVector};

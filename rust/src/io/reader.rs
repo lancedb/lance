@@ -828,8 +828,7 @@ mod tests {
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
 
         // Write 10 batches.
         let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
@@ -886,8 +885,7 @@ mod tests {
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let store = ObjectStore::memory();
-        let path = Path::from("/foo");
+        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
 
         // Write 10 batches.
         let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())

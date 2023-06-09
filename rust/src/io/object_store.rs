@@ -107,12 +107,13 @@ impl ObjectStore {
                 message: format!("{} is not a lance directory", str_path),
             });
         }
+        let expanded_path = expanded_path.canonicalize()?;
 
         Ok((
             Self {
                 inner: Arc::new(LocalFileSystem::new()),
                 scheme: String::from("file"),
-                base_path: Path::from(object_store::path::DELIMITER),
+                base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
             },
             Path::from_filesystem_path(&expanded_path)?,
@@ -134,6 +135,12 @@ impl ObjectStore {
                 block_size: 64 * 1024,
             }),
             "file" => Ok(Self::new_from_path(url.path())?.0),
+            "memory" => Ok(Self {
+                inner: Arc::new(InMemory::new()),
+                scheme: String::from("memory"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
             }),
@@ -226,14 +233,12 @@ mod tests {
         let expanded = tilde(path_str).to_string();
         let path = StdPath::new(&expanded);
         std::fs::create_dir_all(path.parent().unwrap())?;
-        println!("Write data to file: {}", path.to_str().unwrap());
         write(path, contents)
     }
 
     async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
         let test_file_store = store.open(&path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
-        println!("Path: {:?}", path);
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
         Ok(contents)
