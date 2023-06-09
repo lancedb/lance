@@ -47,9 +47,54 @@ fn bench_scan(c: &mut Criterion) {
     rt.block_on(async {
         create_file(std::path::Path::new("./test.lance"), WriteMode::Create).await
     });
-    let dataset = rt.block_on(async { Dataset::open("./test.lance").await.unwrap() });
+    let mut dataset = rt.block_on(async { Dataset::open("./test.lance").await.unwrap() });
 
     c.bench_function("Scan full dataset", |b| {
+        b.to_async(&rt).iter(|| async {
+            let count = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(count.len() >= 1);
+        })
+    });
+
+    let mut dataset = rt.block_on(async move {
+        // Delete a few random values
+        dataset
+            .delete("s in ('s-10', 's-4003', 's-64000')")
+            .await
+            .unwrap();
+
+        dataset
+    });
+
+    c.bench_function("Scan dataset with sparse deletions", |b| {
+        b.to_async(&rt).iter(|| async {
+            let count = dataset
+                .scan()
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(count.len() >= 1);
+        })
+    });
+
+    let dataset = rt.block_on(async move {
+        // Delete a range
+        dataset.delete("f < 20000 and i > 10000").await.unwrap();
+
+        dataset
+    });
+
+    c.bench_function("Scan dataset with range deletions", |b| {
         b.to_async(&rt).iter(|| async {
             let count = dataset
                 .scan()

@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader,
 };
+use arrow_array::{Int32Array, PrimitiveArray};
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
+use arrow_select::concat::concat_batches;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::TryStreamExt;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use lance::arrow::{FixedSizeListArrayExt, RecordBatchBuffer};
@@ -32,15 +36,21 @@ use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
 use lance::index::vector::{MetricType, VectorIndexParams};
 use lance::index::{DatasetIndexExt, IndexType};
+use lance::utils::testing::generate_random_array_with_seed;
 use lance::{arrow::as_fixed_size_list_array, dataset::Dataset};
 
+// Benchmarks on a single file, comparing flat and ivf_pq index.
 fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        create_file(std::path::Path::new("./vec_data.lance"), WriteMode::Create).await
+    let dataset = rt.block_on(async {
+        create_dataset(
+            std::path::Path::new("./vec_data.lance"),
+            WriteMode::Create,
+            Default::default(),
+        )
+        .await
     });
-    let dataset = rt.block_on(async { Dataset::open("./vec_data.lance").await.unwrap() });
     let first_batch = rt.block_on(async {
         dataset
             .scan()
@@ -83,47 +93,191 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
         format!("Ivf_PQ_Refine(d={},top_k=10,nprobes=10, refine=2)", q.len()).as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
-                let results = dataset
-                    .scan()
-                    .nearest("vector", q, 10)
-                    .unwrap()
-                    .nprobs(10)
-                    .refine(2)
-                    .try_into_stream()
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
+                let results = vector_query(&dataset, q, 10, 10, 2).await;
                 assert!(results.len() >= 1);
             })
         },
     );
 }
 
-async fn create_file(path: &std::path::Path, mode: WriteMode) {
-    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "vector",
-        DataType::FixedSizeList(
-            FieldRef::new(Field::new("item", DataType::Float32, true)),
-            128,
-        ),
-        false,
-    )]));
+async fn vector_query(
+    dataset: &Dataset,
+    q: &PrimitiveArray<Float32Type>,
+    top_k: usize,
+    nprobes: usize,
+    refine: u32,
+) -> Vec<RecordBatch> {
+    dataset
+        .scan()
+        .nearest("vector", q, top_k)
+        .unwrap()
+        .nprobs(nprobes)
+        .refine(refine)
+        .with_row_id()
+        .project(&["id", "vector", "_rowid"])
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+}
 
-    let num_rows = 100_000;
-    let batch_size = 10000;
+// Benchmarks on multiple files, comparing different amounts of deletions.
+fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Create a multi-file dataset
+    let config = DatasetConfig {
+        num_batches: 100,
+        batch_size: 1000,
+        num_files: 10,
+        ..Default::default()
+    };
+    let mut dataset = rt.block_on(async {
+        create_dataset(
+            std::path::Path::new("./vec_data.lance"),
+            WriteMode::Create,
+            config.clone(),
+        )
+        .await
+    });
+
+    // Choose a particular vector we will search for
+    let q = rt.block_on(async {
+        let q = dataset.take(&[42000], dataset.schema()).await.unwrap()["vector"].clone();
+        let q = as_fixed_size_list_array(&q).value(0);
+        as_primitive_array(&q).clone()
+    });
+    dbg!(&q);
+
+    async fn run_query(dataset: &Dataset, q: &PrimitiveArray<Float32Type>) -> Vec<RecordBatch> {
+        vector_query(&dataset, &q, 10, 10, 2).await
+    }
+
+    // Let's figure out which row_ids and fragments ids are in the result, so we
+    // know where to delete later.
+    let results = rt.block_on(async { run_query(&dataset, &q).await });
+    let results = concat_batches(&results[0].schema(), results.iter()).unwrap();
+    let row_ids: &PrimitiveArray<UInt64Type> = as_primitive_array(results["_rowid"].as_ref());
+    let fragments_ids = row_ids
+        .iter()
+        .filter_map(|row_id| row_id.map(|row_id| row_id >> 32))
+        .collect::<HashSet<u64>>();
+    let id_col: &PrimitiveArray<UInt32Type> = as_primitive_array(results["id"].as_ref());
+    let id_col: HashSet<u32> = id_col.iter().map(|id| id.unwrap()).collect();
+
+    dbg!(&fragments_ids);
+    dbg!(&id_col);
+
+    // Run query
+    c.bench_function(format!("Ivf_PQ_Refine/no-deletions").as_str(), |b| {
+        b.to_async(&rt).iter(|| run_query(&dataset, &q))
+    });
+
+    // Delete some rows, only in one fragment
+    let id_col_ref = &id_col;
+    let mut dataset = rt.block_on(async move {
+        let ids_to_delete = (0..config.batch_size as u32)
+            .filter(|id| !id_col_ref.contains(id))
+            .map(|id| format!("{}", id))
+            .take(20)
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        // Delete a few random values
+        dataset
+            .delete(&format!("id in ({ids_to_delete})"))
+            .await
+            .unwrap();
+
+        dataset
+    });
+
+    // Run query again
+    c.bench_function(
+        format!("Ivf_PQ_Refine/irrelevant-deletions").as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let results = vector_query(&dataset, &q, 10, 10, 2).await;
+                assert!(results.len() >= 1);
+            })
+        },
+    );
+
+    // Delete some rows inside the query
+    let dataset = rt.block_on(async move {
+        // Delete a few random values
+        let ids_to_delete = id_col
+            .iter()
+            .take(10)
+            .map(|id| format!("{}", id))
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        // Delete a few random values
+        dataset
+            .delete(&format!("id in ({ids_to_delete})"))
+            .await
+            .unwrap();
+
+        dataset
+    });
+
+    // Run query again
+    c.bench_function(format!("Ivf_PQ_Refine/few-deletions").as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let results = vector_query(&dataset, &q, 10, 10, 2).await;
+            assert!(results.len() >= 1);
+        })
+    });
+}
+
+#[derive(Clone)]
+struct DatasetConfig {
+    num_batches: usize,
+    batch_size: usize,
+    num_files: usize,
+    seed: [u8; 32],
+}
+
+impl Default for DatasetConfig {
+    fn default() -> Self {
+        Self {
+            num_batches: 1_000,
+            batch_size: 10_000,
+            num_files: 1,
+            seed: [42; 32],
+        }
+    }
+}
+
+async fn create_dataset(path: &std::path::Path, mode: WriteMode, config: DatasetConfig) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                FieldRef::new(Field::new("item", DataType::Float32, true)),
+                128,
+            ),
+            false,
+        ),
+        Field::new("i", DataType::Int32, false),
+    ]));
+
     let batches = RecordBatchBuffer::new(
-        (0..(num_rows / batch_size) as i32)
-            .map(|_| {
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(
-                        FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128)
-                            .unwrap(),
-                    )],
+        (0..config.num_batches as i32)
+            .map(|batch_i| {
+                let vectors = FixedSizeListArray::try_new(
+                    generate_random_array_with_seed(config.batch_size * 128, config.seed),
+                    128,
                 )
-                .unwrap()
+                .unwrap();
+                let ids = (batch_i * config.batch_size as i32
+                    ..(batch_i + 1) * config.batch_size as i32)
+                    .collect::<Int32Array>();
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors), Arc::new(ids)])
+                    .unwrap()
             })
             .collect(),
     );
@@ -131,8 +285,9 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let test_uri = path.to_str().unwrap();
     std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
     let mut write_params = WriteParams::default();
-    write_params.max_rows_per_file = num_rows as usize;
-    write_params.max_rows_per_group = batch_size as usize;
+    write_params.max_rows_per_file =
+        config.batch_size * config.num_batches / config.num_files as usize;
+    write_params.max_rows_per_group = config.batch_size as usize;
     write_params.mode = mode;
     let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
     let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
@@ -155,17 +310,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
             true,
         )
         .await
-        .unwrap();
-}
-
-fn create_float32_array(num_elements: i32) -> Float32Array {
-    // generate an Arrow Float32Array with 10000*128 elements randomly
-    let mut rng = rand::thread_rng();
-    let mut values = Vec::with_capacity(num_elements as usize);
-    for _ in 0..num_elements {
-        values.push(rng.gen_range(0.0..1.0));
-    }
-    Float32Array::from(values)
+        .unwrap()
 }
 
 #[cfg(target_os = "linux")]
@@ -173,11 +318,11 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_ivf_pq_index);
+    targets = bench_ivf_pq_index, bench_ivf_pq_index_deletions);
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_ivf_pq_index);
+    targets = bench_ivf_pq_index, bench_ivf_pq_index_deletions);
 criterion_main!(benches);
