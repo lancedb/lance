@@ -15,6 +15,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
+use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -47,10 +48,13 @@ impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
-        println!("LocalObjectReader: {}", local_path);
-
-        let file = File::open(local_path).map_err(|e| Error::IO {
-            message: format!("Open local file: {}, {}", path.to_string(), e.to_string()),
+        let file = File::open(local_path).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::NotFound {
+                uri: path.to_string(),
+            },
+            _ => Error::IO {
+                message: e.to_string(),
+            },
         })?;
         Ok(Box::new(Self {
             file: Arc::new(file),
@@ -78,7 +82,6 @@ impl ObjectReader for LocalObjectReader {
     /// Reads a range of data.
     ///
     /// TODO: return [arrow_buffer::Buffer] to avoid one memory copy from Bytes to Buffer.
-
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {

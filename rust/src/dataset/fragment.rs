@@ -470,7 +470,6 @@ mod tests {
             .await
             .unwrap();
 
-        println!("Open test dataset at {}", test_uri);
         let dataset = Dataset::open(test_uri).await.unwrap();
 
         dataset
@@ -536,7 +535,6 @@ mod tests {
     async fn test_append_new_columns() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let test_uri = "~/tmp/test_dataset";
         let dataset = create_dataset(test_uri).await;
 
         let fragment = &mut dataset.get_fragments()[0];

@@ -39,6 +39,7 @@ use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use crate::arrow::*;
 use crate::datatypes::Schema;
+use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
 use crate::io::{
     object_reader::{read_message, read_struct},
@@ -227,7 +228,14 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(manifest_path).await?;
+        let object_reader = object_store.open(manifest_path).await.map_err(|e| match &e {
+            Error::NotFound { uri } => Error::DatasetNotFound {
+                path: uri.clone(),
+                source: box_error(e),
+            },
+            _ => e.into(),
+        })?;
+        // TODO: remove reference to inner.
         let get_result = object_store
             .inner
             .get(manifest_path)
@@ -1378,6 +1386,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
+        println!("{:?}", result);
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 

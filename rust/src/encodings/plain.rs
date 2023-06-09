@@ -504,7 +504,7 @@ mod tests {
     }
 
     async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);

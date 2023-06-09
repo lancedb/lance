@@ -14,7 +14,6 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
-use std::ops::Deref;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
@@ -185,7 +184,9 @@ impl ObjectStore {
         &self.base_path
     }
 
-    /// Open a file for path
+    /// Open a file for path.
+    ///
+    /// The [path] is absolute path.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         println!("open path: {:?} schema: {}", path, self.scheme);
         match self.scheme.as_str() {
