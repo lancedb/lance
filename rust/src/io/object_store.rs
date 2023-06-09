@@ -141,6 +141,10 @@ impl ObjectStore {
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
+            s if s.len() == 1 && cfg!(windows) => {
+                // On Windows, the path is parsed as a scheme
+                Ok(Self::new_from_path(url.as_str())?.0)
+            }
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
             }),
