@@ -19,11 +19,8 @@ use std::sync::Arc;
 
 use ::object_store::{
     aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
+    gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, ClientOptions
 };
-use futures::{future, TryFutureExt};
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::local::LocalFileSystem;
-use object_store::ClientOptions;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -95,28 +92,11 @@ impl ObjectStore {
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
-            Err(_) => {
-                let store = Self::new_from_path(uri)?;
-                Ok((store, Path::from_filesystem_path(uri)?))
-            }
+            Err(_) => Self::new_from_path(uri),
         }
     }
 
-    /// Create a ObjectStore instance from a given URL.
-    pub async fn new(uri: &str) -> Result<Self> {
-        if uri == ":memory:" {
-            return Ok(Self::memory());
-        };
-
-        // Try to parse the provided string as a Url, if that fails treat it as local FS
-        future::ready(Url::parse(uri))
-            .map_err(Error::from)
-            .and_then(|url| Self::new_from_url(url))
-            .or_else(|_| future::ready(Self::new_from_path(uri)))
-            .await
-    }
-
-    fn new_from_path(str_path: &str) -> Result<Self> {
+    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
@@ -128,12 +108,15 @@ impl ObjectStore {
             });
         }
 
-        Ok(Self {
-            inner: Arc::new(LocalFileSystem::new()),
-            scheme: String::from("file"),
-            base_path: Path::from(object_store::path::DELIMITER),
-            block_size: 4 * 1024, // 4KB block size
-        })
+        Ok((
+            Self {
+                inner: Arc::new(LocalFileSystem::new()),
+                scheme: String::from("file"),
+                base_path: Path::from(object_store::path::DELIMITER),
+                block_size: 4 * 1024, // 4KB block size
+            },
+            Path::from_filesystem_path(&expanded_path)?,
+        ))
     }
 
     async fn new_from_url(url: Url) -> Result<Self> {
@@ -150,7 +133,7 @@ impl ObjectStore {
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
-            "file" => Self::new_from_path(url.path()),
+            "file" => Ok(Self::new_from_path(url.path())?.0),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
             }),
@@ -291,9 +274,9 @@ mod tests {
         .unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
-        let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
+        let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let contents = read_from_store(store, &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -303,8 +286,8 @@ mod tests {
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
-        let store = ObjectStore::new(uri).await.unwrap();
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+        let contents = read_from_store(store, &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -322,15 +305,10 @@ mod tests {
             "read_dir",
         )
         .unwrap();
-        let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
+        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
 
-        let sub_dirs = store.read_dir("foo").await.unwrap();
+        let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
-    }
-
-    #[test]
-    fn test_parse_url() {
-        println!("{:?}", Url::parse("file:///a/b/c"));
     }
 
     #[tokio::test]

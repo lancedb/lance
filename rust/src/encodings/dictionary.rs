@@ -234,7 +234,7 @@ mod tests {
         let keys2_ref = arr2.keys() as &dyn Array;
         let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let pos;

@@ -228,13 +228,16 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(manifest_path).await.map_err(|e| match &e {
-            Error::NotFound { uri } => Error::DatasetNotFound {
-                path: uri.clone(),
-                source: box_error(e),
-            },
-            _ => e.into(),
-        })?;
+        let object_reader = object_store
+            .open(manifest_path)
+            .await
+            .map_err(|e| match &e {
+                Error::NotFound { uri } => Error::DatasetNotFound {
+                    path: uri.clone(),
+                    source: box_error(e),
+                },
+                _ => e.into(),
+            })?;
         // TODO: remove reference to inner.
         let get_result = object_store
             .inner
