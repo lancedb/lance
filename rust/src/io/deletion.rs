@@ -1,10 +1,11 @@
 use std::ops::Range;
+use std::slice::Iter;
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::ipc::reader::FileReader as ArrowFileReader;
 use arrow::ipc::writer::{FileWriter as ArrowFileWriter, IpcWriteOptions};
 use arrow::ipc::CompressionType;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{BooleanArray, RecordBatch, UInt32Array};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use object_store::path::Path;
@@ -48,6 +49,23 @@ impl DeletionVector {
             Self::Set(set) => range.all(|i| set.contains(&i)),
             Self::Bitmap(bitmap) => bitmap.contains_range(range),
         }
+    }
+
+    pub fn build_predicate(&self, row_ids: Iter<u64>) -> Option<BooleanArray> {
+        match self {
+            Self::Bitmap(bitmap) => Some(
+                row_ids
+                    .map(|&id| !bitmap.contains(id as u32))
+                    .collect::<Vec<_>>(),
+            ),
+            Self::Set(set) => Some(
+                row_ids
+                    .map(|&id| !set.contains(&(id as u32)))
+                    .collect::<Vec<_>>(),
+            ),
+            Self::NoDeletions => None,
+        }
+        .map(|v| BooleanArray::from(v))
     }
 }
 

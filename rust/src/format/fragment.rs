@@ -19,6 +19,8 @@ use std::collections::BTreeSet;
 
 use crate::datatypes::Schema;
 use crate::format::pb;
+use crate::io::deletion::{read_deletion_file, DeletionVector};
+use crate::io::ObjectStore;
 
 /// Lance Data File
 ///
@@ -134,6 +136,13 @@ impl Fragment {
         BTreeSet::from_iter(self.files.iter().flat_map(|f| f.fields.clone()))
             .into_iter()
             .collect()
+    }
+
+    pub(crate) async fn deletion_vector(
+        &self,
+        object_store: &ObjectStore,
+    ) -> Option<DeletionVector> {
+        read_deletion_file(self, object_store).await.unwrap()
     }
 }
 
