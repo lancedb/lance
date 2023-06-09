@@ -47,7 +47,7 @@ pub struct LocalObjectReader {
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
-        let local_path = if cfg!(window) {
+        let local_path = if cfg!(windows) {
             path.to_string()
         } else {
             format!("/{path}")
