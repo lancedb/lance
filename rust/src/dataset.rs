@@ -1533,7 +1533,7 @@ mod tests {
 
         // The deletion file should contain 20 rows
         let store = dataset.object_store().clone();
-        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
+        let deletion_vector = read_deletion_file(test_uri, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();
@@ -1550,7 +1550,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
-        let deletion_vector = read_deletion_file(&fragments[0].metadata, &store)
+        let deletion_vector = read_deletion_file(test_uri, &fragments[0].metadata, &store)
             .await
             .unwrap()
             .unwrap();

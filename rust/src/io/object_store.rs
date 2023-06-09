@@ -18,8 +18,8 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 
 use ::object_store::{
-    aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
-    gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, ClientOptions
+    aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
+    path::Path, ClientOptions, ObjectStore as OSObjectStore,
 };
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
@@ -140,7 +140,8 @@ impl ObjectStore {
         }
     }
 
-    /// Create a in-memory object store directly.
+    /// Create a in-memory object store directly for testing.
+    #[allow(dead_code)]
     pub(crate) fn memory() -> Self {
         Self {
             inner: Arc::new(InMemory::new()),
