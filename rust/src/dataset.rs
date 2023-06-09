@@ -835,7 +835,6 @@ pub(crate) async fn write_manifest_file(
         latest_manifest_path(base_path),
     ];
 
-    println!("Writting manifest file to {:?}", paths);
     for p in paths {
         write_manifest_file_to_path(object_store, manifest, indices.clone(), &p).await?
     }
@@ -1390,7 +1389,6 @@ mod tests {
     #[tokio::test]
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
-        println!("{:?}", result);
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 

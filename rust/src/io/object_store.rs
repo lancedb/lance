@@ -178,7 +178,6 @@ impl ObjectStore {
     ///
     /// The [path] is absolute path.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
-        println!("open path: {:?} schema: {}", path, self.scheme);
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
             _ => Ok(Box::new(CloudObjectReader::new(
@@ -352,8 +351,7 @@ mod tests {
             format!("{drive_letter}:/test_folder/test.lance"),
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
-            let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
-            let store = ObjectStore::new(uri).await.unwrap();
+            let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
             let contents = read_from_store(store, &base.child("test_file"))
                 .await
                 .unwrap();
