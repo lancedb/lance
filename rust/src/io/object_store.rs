@@ -87,6 +87,10 @@ impl ObjectStore {
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
         match Url::parse(uri) {
+            Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
+                // On Windows, the drive is parsed as a scheme
+                Self::new_from_path(uri)
+            }
             Ok(url) => {
                 let store = Self::new_from_url(url.clone()).await?;
                 let path = Path::from(url.path());
@@ -141,10 +145,6 @@ impl ObjectStore {
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
-            s if s.len() == 1 && cfg!(windows) => {
-                // On Windows, the path is parsed as a scheme
-                Ok(Self::new_from_path(url.as_str())?.0)
-            }
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
             }),
