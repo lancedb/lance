@@ -148,7 +148,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// use lance::encodings::binary::BinaryDecoder;
     ///
     /// async {
-    ///     let object_store = ObjectStore::new(":memory:").await.unwrap();
+    ///     let object_store = ObjectStore::memory();
     ///     let path = Path::from("/data.lance");
     ///     let reader = object_store.open(&path).await.unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);

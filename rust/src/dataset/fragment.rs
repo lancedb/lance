@@ -219,10 +219,7 @@ impl FileFragment {
         let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
 
         let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = self
-            .dataset
-            .data_dir()
-            .child(filename.clone());
+        let full_path = self.dataset.data_dir().child(filename.clone());
         let mut writer =
             FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
                 .await?;

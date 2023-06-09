@@ -141,8 +141,7 @@ impl ObjectStore {
     }
 
     /// Create a in-memory object store directly for testing.
-    #[allow(dead_code)]
-    pub(crate) fn memory() -> Self {
+    pub fn memory() -> Self {
         Self {
             inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),

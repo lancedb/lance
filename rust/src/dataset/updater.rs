@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use uuid::Uuid;
 
 use super::fragment::FragmentReader;
-use super::{Dataset, DATA_DIR};
+use super::Dataset;
 use crate::dataset::FileFragment;
 use crate::datatypes::Schema;
 use crate::format::Fragment;
@@ -99,13 +99,7 @@ impl Updater {
         let file_name = format!("{}.lance", Uuid::new_v4());
         self.fragment.metadata.add_file(&file_name, &schema);
 
-        let full_path = self
-            .fragment
-            .dataset()
-            .object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(file_name.as_str());
+        let full_path = self.fragment.dataset().data_dir().child(file_name.as_str());
 
         FileWriter::try_new(
             self.fragment.dataset().object_store.as_ref(),
