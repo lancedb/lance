@@ -52,6 +52,7 @@ impl LocalObjectReader {
         } else {
             format!("/{path}")
         };
+        println!("LocalObjectReader:open: {:?}", local_path);
         let file = File::open(local_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound {
                 uri: path.to_string(),
