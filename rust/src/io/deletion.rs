@@ -13,12 +13,11 @@ use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 use snafu::ResultExt;
 
+use super::ObjectStore;
+use crate::dataset::DELETION_DIRS;
 use crate::error::{box_error, CorruptFileSnafu};
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
-
 use crate::{Error, Result};
-
-use super::ObjectStore;
 
 /// Threshold for when a DeletionVector::Set should be promoted to a DeletionVector::Bitmap.
 const BITMAP_THRESDHOLD: usize = 5_000;
@@ -172,10 +171,15 @@ fn deletion_arrow_schema() -> Arc<Schema> {
 }
 
 /// Get the file path for a deletion file. This is relative to the dataset root.
-fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str) -> Path {
-    Path::from(format!(
-        "_deletions/{fragment_id}-{read_version}-{id}.{suffix}"
-    ))
+fn deletion_file_path(
+    base: &Path,
+    fragment_id: u64,
+    read_version: u64,
+    id: u64,
+    suffix: &str,
+) -> Path {
+    base.child(DELETION_DIRS)
+        .child(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
 }
 
 /// Write a deletion file for a fragment for a given deletion vector.
@@ -184,6 +188,7 @@ fn deletion_file_path(fragment_id: u64, read_version: u64, id: u64, suffix: &str
 /// returns `Ok(None)`.
 #[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn write_deletion_file(
+    base: &Path,
     fragment_id: u64,
     read_version: u64,
     removed_rows: &DeletionVector,
@@ -193,7 +198,7 @@ pub(crate) async fn write_deletion_file(
         DeletionVector::NoDeletions => Ok(None),
         DeletionVector::Set(set) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(fragment_id, read_version, id, "arrow");
+            let path = deletion_file_path(base, fragment_id, read_version, id, "arrow");
 
             let array = UInt32Array::from_iter(set.iter().copied());
             let array = Arc::new(array);
@@ -225,7 +230,7 @@ pub(crate) async fn write_deletion_file(
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(fragment_id, read_version, id, "bin");
+            let path = deletion_file_path(base, fragment_id, read_version, id, "bin");
 
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
@@ -248,6 +253,7 @@ pub(crate) async fn write_deletion_file(
 /// Will return an error if the file is present but invalid.
 #[allow(dead_code)] // TODO: remove once used
 pub(crate) async fn read_deletion_file(
+    base: &Path,
     fragment: &Fragment,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionVector>> {
@@ -260,6 +266,7 @@ pub(crate) async fn read_deletion_file(
     match deletion_file.file_type {
         DeletionFileType::Array => {
             let path = deletion_file_path(
+                base,
                 fragment.id,
                 deletion_file.read_version,
                 deletion_file.id,
@@ -316,6 +323,7 @@ pub(crate) async fn read_deletion_file(
         }
         DeletionFileType::Bitmap => {
             let path = deletion_file_path(
+                base,
                 fragment.id,
                 deletion_file.read_version,
                 deletion_file.id,
@@ -358,8 +366,12 @@ mod test {
     async fn test_write_no_deletions() {
         let dv = DeletionVector::NoDeletions;
 
-        let object_store = ObjectStore::memory();
-        let file = write_deletion_file(0, 0, &dv, &object_store).await.unwrap();
+        let (object_store, path) = ObjectStore::from_uri("memory:///no_deletion")
+            .await
+            .unwrap();
+        let file = write_deletion_file(&path, 0, 0, &dv, &object_store)
+            .await
+            .unwrap();
         assert!(file.is_none());
     }
 
@@ -371,7 +383,8 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+        let path = Path::from("/write");
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 
@@ -384,10 +397,10 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(fragment_id, read_version, file.id, "arrow");
+        let path = deletion_file_path(&path, fragment_id, read_version, file.id, "arrow");
         assert_eq!(
             path,
-            Path::from(format!("_deletions/21-12-{}.arrow", file.id))
+            Path::from(format!("/write/_deletions/21-12-{}.arrow", file.id))
         );
 
         let data = object_store
@@ -423,7 +436,8 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+        let path = Path::from("/bitmap");
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 
@@ -436,10 +450,10 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(fragment_id, read_version, file.id, "bin");
+        let path = deletion_file_path(&path, fragment_id, read_version, file.id, "bin");
         assert_eq!(
             path,
-            Path::from(format!("_deletions/21-12-{}.bin", file.id))
+            Path::from(format!("/bitmap/_deletions/21-12-{}.bin", file.id))
         );
 
         let data = object_store
@@ -463,13 +477,14 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+        let path = Path::from("/roundtrip");
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&fragment, &object_store)
+        let read_dv = read_deletion_file(&path, &fragment, &object_store)
             .await
             .unwrap()
             .unwrap();
@@ -484,13 +499,14 @@ mod test {
         let read_version = 12;
 
         let object_store = ObjectStore::memory();
-        let file = write_deletion_file(fragment_id, read_version, &dv, &object_store)
+        let path = Path::from("/bitmap");
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
             .await
             .unwrap();
 
         let mut fragment = Fragment::new(fragment_id);
         fragment.deletion_file = file;
-        let read_dv = read_deletion_file(&fragment, &object_store)
+        let read_dv = read_deletion_file(&path, &fragment, &object_store)
             .await
             .unwrap()
             .unwrap();
