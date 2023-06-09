@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
 
 use super::object_reader::ObjectReader;
-use crate::Result;
+use crate::{Error, Result};
 
 /// [ObjectReader] for local file system.
 pub struct LocalObjectReader {
@@ -48,8 +48,12 @@ impl LocalObjectReader {
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
         let local_path = format!("/{path}");
         println!("LocalObjectReader: {}", local_path);
+
+        let file = File::open(local_path).map_err(|e| Error::IO {
+            message: format!("Open local file: {}, {}", path.to_string(), e.to_string()),
+        })?;
         Ok(Box::new(Self {
-            file: File::open(local_path)?.into(),
+            file: Arc::new(file),
             block_size,
             path: path.clone(),
         }))

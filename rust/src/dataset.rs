@@ -92,13 +92,11 @@ impl From<&Manifest> for Version {
 /// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
 async fn new_file_writer(
     object_store: &ObjectStore,
+    base_dir: &Path,
     data_file_path: &str,
     schema: &Schema,
 ) -> Result<FileWriter> {
-    let full_path = object_store
-        .base_path()
-        .child(DATA_DIR)
-        .child(data_file_path);
+    let full_path = base_dir.child(DATA_DIR).child(data_file_path);
     FileWriter::try_new(object_store, &full_path, schema.clone()).await
 }
 
@@ -364,7 +362,7 @@ impl Dataset {
                         let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                         fragments.push(fragment);
                         fragment_id += 1;
-                        Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                        Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                     }
                 };
 
@@ -385,7 +383,7 @@ impl Dataset {
                     let file_path = format!("{}.lance", Uuid::new_v4());
                     let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                     fragments.push(fragment);
-                    Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                    Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                 }
             };
             let batches = buffer.finish()?;
@@ -825,6 +823,7 @@ pub(crate) async fn write_manifest_file(
         latest_manifest_path(base_path),
     ];
 
+    println!("Writting manifest file to {:?}", paths);
     for p in paths {
         write_manifest_file_to_path(object_store, manifest, indices.clone(), &p).await?
     }
