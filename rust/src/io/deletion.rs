@@ -366,16 +366,12 @@ mod test {
     async fn test_write_no_deletions() {
         let dv = DeletionVector::NoDeletions;
 
-        let object_store = ObjectStore::memory();
-        let file = write_deletion_file(
-            &Path::from_absolute_path("/no_deletion").unwrap(),
-            0,
-            0,
-            &dv,
-            &object_store,
-        )
-        .await
-        .unwrap();
+        let (object_store, path) = ObjectStore::from_uri("memory:///no_deletion")
+            .await
+            .unwrap();
+        let file = write_deletion_file(&path, 0, 0, &dv, &object_store)
+            .await
+            .unwrap();
         assert!(file.is_none());
     }
 
