@@ -544,8 +544,10 @@ pub async fn build_ivf_pq_index(
         ivf_params.num_partitions,
         ProductQuantizer::num_centroids(pq_params.num_bits as u32),
     ) * 256;
-
+    // TODO: only sample data if training is necessary.
+    let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+
     // Train IVF partitions.
     let ivf_model = if let Some(centroids) = &ivf_params.centroids {
         if centroids.len() != ivf_params.num_partitions * dim {
@@ -559,9 +561,6 @@ pub async fn build_ivf_pq_index(
         }
         Ivf::new(centroids.clone())
     } else {
-        let mut training_data =
-            maybe_sample_training_data(dataset, column, sample_size_hint).await?;
-
         // Pre-transforms
         if pq_params.use_opq {
             let opq = train_opq(&training_data, pq_params).await?;
@@ -577,7 +576,7 @@ pub async fn build_ivf_pq_index(
     };
 
     let pq = if let Some(codebook) = &pq_params.codebook {
-        if codebook.len() != pq_params.num_sub_vectors * dim {
+        if codebook.len() != pq_params. * dim {
             return Err(Error::Index {
                 message: format!(
                     "PQ codebook length mismatch: {} != {}",
@@ -593,14 +592,6 @@ pub async fn build_ivf_pq_index(
             codebook.clone(),
         )
     } else {
-        let mut training_data =
-            maybe_sample_training_data(dataset, column, sample_size_hint).await?;
-
-        // Transform training data if necessary.
-        for transform in transforms.iter() {
-            training_data = transform.transform(&training_data).await?;
-        }
-
         // Compute the residual vector for training PQ
         let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
         let residual_data = compute_residual_matrix(&training_data, &ivf_centroids, metric_type)?;

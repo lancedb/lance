@@ -316,6 +316,7 @@ impl ProductQuantizer {
         }
     }
 
+    /// Create a [`ProductQuantizer`] with pre-trained codebook.
     pub fn new_with_codebook(
         m: usize,
         nbits: u32,
