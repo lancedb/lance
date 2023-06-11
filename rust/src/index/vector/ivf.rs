@@ -43,6 +43,7 @@ use super::{
 use crate::{
     arrow::{linalg::MatrixView, *},
     dataset::{Dataset, ROW_ID},
+    datatypes::Field,
     index::{pb, vector::Transformer, Index},
 };
 use crate::{io::object_reader::ObjectReader, session::Session};
@@ -413,7 +414,7 @@ impl TryFrom<&pb::Ivf> for Ivf {
     }
 }
 
-fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
+fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
     let Some(field) = dataset.schema().field(column) else {
         return Err(Error::IO{message:format!(
             "Building index: column {} does not exist in dataset: {:?}",
@@ -435,7 +436,7 @@ fn sanity_check(dataset: &Dataset, column: &str) -> Result<()> {
         ),
         });
     }
-    Ok(())
+    Ok(field)
 }
 
 /// Parameters to build IVF partitions
@@ -447,6 +448,9 @@ pub struct IvfBuildParams {
     // ---- kmeans parameters
     /// Max number of iterations to train kmeans.
     pub max_iters: usize,
+
+    /// Use provided IVF centroids.
+    pub centroids: Option<Arc<FixedSizeListArray>>,
 }
 
 impl Default for IvfBuildParams {
@@ -454,6 +458,7 @@ impl Default for IvfBuildParams {
         Self {
             num_partitions: 32,
             max_iters: 50,
+            centroids: None,
         }
     }
 }
@@ -522,7 +527,17 @@ pub async fn build_ivf_pq_index(
         metric_type,
     );
 
-    sanity_check(dataset, column)?;
+    let field = sanity_check(dataset, column)?;
+    let dim = if let DataType::FixedSizeList(elem_type, d) = field.data_type() {
+        d as usize
+    } else {
+        return Err(Error::Index {
+            message: format!(
+                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
+                field.data_type()
+            ),
+        });
+    };
 
     // Maximum to train 256 vectors per centroids, see Faiss.
     let sample_size_hint = std::cmp::max(
@@ -530,30 +545,69 @@ pub async fn build_ivf_pq_index(
         ProductQuantizer::num_centroids(pq_params.num_bits as u32),
     ) * 256;
 
-    let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
-
-    // Pre-transforms
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
-    if pq_params.use_opq {
-        let opq = train_opq(&training_data, pq_params).await?;
-        transforms.push(Box::new(opq));
-    }
-
-    // Transform training data if necessary.
-    for transform in transforms.iter() {
-        training_data = transform.transform(&training_data).await?;
-    }
-
     // Train IVF partitions.
-    let ivf_model = train_ivf_model(&training_data, metric_type, ivf_params).await?;
+    let ivf_model = if let Some(centroids) = &ivf_params.centroids {
+        if centroids.len() != ivf_params.num_partitions * dim {
+            return Err(Error::Index {
+                message: format!(
+                    "IVF centroids length mismatch: {} != {}",
+                    centroids.len(),
+                    ivf_params.num_partitions
+                ),
+            });
+        }
+        Ivf::new(centroids.clone())
+    } else {
+        let mut training_data =
+            maybe_sample_training_data(dataset, column, sample_size_hint).await?;
 
-    // Compute the residual vector for training PQ
-    let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
-    let residual_data = compute_residual_matrix(&training_data, &ivf_centroids, metric_type)?;
-    let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
+        // Pre-transforms
+        if pq_params.use_opq {
+            let opq = train_opq(&training_data, pq_params).await?;
+            transforms.push(Box::new(opq));
+        }
 
-    // The final train of PQ sub-vectors
-    let pq = train_pq(&pq_training_data, pq_params).await?;
+        // Transform training data if necessary.
+        for transform in transforms.iter() {
+            training_data = transform.transform(&training_data).await?;
+        }
+
+        train_ivf_model(&training_data, metric_type, ivf_params).await?
+    };
+
+    let pq = if let Some(codebook) = &pq_params.codebook {
+        if codebook.len() != pq_params.num_sub_vectors * dim {
+            return Err(Error::Index {
+                message: format!(
+                    "PQ codebook length mismatch: {} != {}",
+                    codebook.len(),
+                    pq_params.num_sub_vectors * dim
+                ),
+            });
+        }
+        ProductQuantizer::new_with_codebook(
+            pq_params.num_sub_vectors,
+            pq_params.num_bits as u32,
+            dim,
+            codebook.clone(),
+        )
+    } else {
+        let mut training_data =
+            maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+
+        // Transform training data if necessary.
+        for transform in transforms.iter() {
+            training_data = transform.transform(&training_data).await?;
+        }
+
+        // Compute the residual vector for training PQ
+        let ivf_centroids = ivf_model.centroids.as_ref().try_into()?;
+        let residual_data = compute_residual_matrix(&training_data, &ivf_centroids, metric_type)?;
+        let pq_training_data = MatrixView::new(residual_data, training_data.num_columns());
+
+        train_pq(&pq_training_data, pq_params).await?
+    };
 
     // Transform data, compute residuals and sort by partition ids.
     let mut scanner = dataset.scan();
