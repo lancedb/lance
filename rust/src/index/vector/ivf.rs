@@ -471,6 +471,27 @@ impl IvfBuildParams {
             ..Default::default()
         }
     }
+
+    /// Create a new instance of [`IvfBuildParams`] with centroids.
+    pub fn try_with_centroids(
+        num_partitions: usize,
+        centroids: Arc<FixedSizeListArray>,
+    ) -> Result<Self> {
+        if num_partitions != centroids.len() {
+            return Err(Error::Index {
+                message: format!(
+                    "IvfBuildParams::try_with_centroids: num_partitions {} != centroids.len() {}",
+                    num_partitions,
+                    centroids.len()
+                ),
+            });
+        }
+        Ok(Self {
+            num_partitions,
+            centroids: Some(centroids),
+            ..Default::default()
+        })
+    }
 }
 
 /// Compute residual matrix.

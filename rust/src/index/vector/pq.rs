@@ -626,6 +626,7 @@ pub struct PQBuildParams {
     /// Max number of iterations to train OPQ, if `use_opq` is true.
     pub max_opq_iters: usize,
 
+    /// User provided codebook.
     pub codebook: Option<Arc<Float32Array>>,
 }
 
@@ -639,6 +640,29 @@ impl Default for PQBuildParams {
             max_iters: 50,
             max_opq_iters: 50,
             codebook: None,
+        }
+    }
+}
+
+impl PQBuildParams {
+    pub fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_codebook(
+        num_sub_vectors: usize,
+        num_bits: usize,
+        codebook: Arc<Float32Array>,
+    ) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            codebook: Some(codebook),
+            ..Default::default()
         }
     }
 }
