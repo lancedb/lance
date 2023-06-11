@@ -528,7 +528,7 @@ pub async fn build_ivf_pq_index(
     );
 
     let field = sanity_check(dataset, column)?;
-    let dim = if let DataType::FixedSizeList(elem_type, d) = field.data_type() {
+    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
         d as usize
     } else {
         return Err(Error::Index {
@@ -576,15 +576,6 @@ pub async fn build_ivf_pq_index(
     };
 
     let pq = if let Some(codebook) = &pq_params.codebook {
-        if codebook.len() != pq_params. * dim {
-            return Err(Error::Index {
-                message: format!(
-                    "PQ codebook length mismatch: {} != {}",
-                    codebook.len(),
-                    pq_params.num_sub_vectors * dim
-                ),
-            });
-        }
         ProductQuantizer::new_with_codebook(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
