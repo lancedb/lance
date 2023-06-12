@@ -356,7 +356,7 @@ class LanceDataset(pa.dataset.Dataset):
         Not implemented (just override pyarrow dataset to prevent segfault)
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
-    
+
     def merge(
         self,
         data_obj: ReaderLike,
@@ -384,11 +384,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if right_on is None:
             right_on = left_on
-        
+
         reader = _coerce_reader(data_obj)
 
         self._ds.merge(reader, left_on, right_on)
-
 
     def versions(self):
         """
@@ -418,6 +417,9 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
+        num_sub_vectors: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -438,14 +440,18 @@ class LanceDataset(pa.dataset.Dataset):
             Default is "L2".
         replace : bool
             Replace the existing index if it exists.
+        num_partitions : int, optional
+            The number of partitions of IVF (Inverted File Index).
+        ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`.
+            A `num_partitions` x `dimension` array of K-mean centroids for IVF clustering.
+        num_sub_vectors : int, optional
+            The number of sub-vectors for PQ (Product Quantization).
         kwargs :
             Parameters passed to the index building process.
 
-
         If `index_type` is "IVF_PQ", then the following parameters are required:
-
-        - **num_partitions**: the number of partitions of IVF (Inverted File Index).
-        - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+        - **num_partitions**
+        - **num_sub_vectors**
 
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
@@ -511,12 +517,29 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
             )
         if index_type == "IVF_PQ":
-            if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+            if num_partitions is None or num_sub_vectors is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
+            kwargs["num_partitions"] = num_partitions
+            if ivf_centroids is not None:
+                # User provided IVF centroids
+                if isinstance(ivf_centroids, np.ndarray):
+                    if len(ivf_centroids.shape) != 2 or ivf_centroids.shape[0] != num_partitions:
+                        raise ValueError(
+                            f"Ivf centroids must be 2D array: (clusters, dim), got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.dtype != np.float32:
+                        raise TypeError(
+                            f"IVF centroids must be float32, got {ivf_centroids.dtype}"
+                        )
+                    ivf_centroids = pa.array(ivf_centroids)
+                # Convert it to RecordBatch because Rust
+                ivf_centroids_batch = pa.RecordBatch.from_arrays([ivf_centroids], ["_ivf_centroids"])
+                kwargs["ivf_centroids"] = ivf_centroids_batch
 
         kwargs["replace"] = replace
+
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
@@ -855,7 +878,9 @@ def write_dataset(
     return LanceDataset(uri)
 
 
-def _coerce_reader(data_obj: ReaderLike, schema: Optional[pa.Schema] = None) -> pa.RecordBatchReader:
+def _coerce_reader(
+    data_obj: ReaderLike, schema: Optional[pa.Schema] = None
+) -> pa.RecordBatchReader:
     if isinstance(data_obj, pd.DataFrame):
         return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
     elif isinstance(data_obj, pa.Table):
