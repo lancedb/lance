@@ -38,7 +38,7 @@ use futures::StreamExt;
 use object_store::path::Path;
 use prost::Message;
 
-use super::deletion::DeletionVector;
+use super::deletion::{read_deletion_file, DeletionVector};
 use super::ReadBatchParams;
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
@@ -217,11 +217,11 @@ impl FileReader {
             .map(|f| f.to_owned());
 
         let deletion_vector = match &fragment {
-            Some(frag) => frag.deletion_vector(object_store).await,
-            None => None,
+            Some(frag) => read_deletion_file(object_store.base_path(), frag, object_store).await,
+            None => Ok(None),
         };
 
-        Ok(Self {
+        deletion_vector.map(|deletion_vector| Self {
             object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
