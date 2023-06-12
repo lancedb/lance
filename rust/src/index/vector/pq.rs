@@ -316,6 +316,22 @@ impl ProductQuantizer {
         }
     }
 
+    /// Create a [`ProductQuantizer`] with pre-trained codebook.
+    pub fn new_with_codebook(
+        m: usize,
+        nbits: u32,
+        dimension: usize,
+        codebook: Arc<Float32Array>,
+    ) -> Self {
+        assert!(nbits == 8, "nbits can only be 8");
+        Self {
+            num_bits: nbits,
+            num_sub_vectors: m,
+            dimension,
+            codebook: Some(codebook),
+        }
+    }
+
     pub fn num_centroids(num_bits: u32) -> usize {
         2_usize.pow(num_bits)
     }
@@ -609,6 +625,9 @@ pub struct PQBuildParams {
 
     /// Max number of iterations to train OPQ, if `use_opq` is true.
     pub max_opq_iters: usize,
+
+    /// User provided codebook.
+    pub codebook: Option<Arc<Float32Array>>,
 }
 
 impl Default for PQBuildParams {
@@ -620,6 +639,30 @@ impl Default for PQBuildParams {
             use_opq: false,
             max_iters: 50,
             max_opq_iters: 50,
+            codebook: None,
+        }
+    }
+}
+
+impl PQBuildParams {
+    pub fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_codebook(
+        num_sub_vectors: usize,
+        num_bits: usize,
+        codebook: Arc<Float32Array>,
+    ) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            codebook: Some(codebook),
+            ..Default::default()
         }
     }
 }

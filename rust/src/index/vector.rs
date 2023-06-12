@@ -214,6 +214,7 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
         metric_type: MetricType,
         ivf: IvfBuildParams,
