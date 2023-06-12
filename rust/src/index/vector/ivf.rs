@@ -571,12 +571,12 @@ pub async fn build_ivf_pq_index(
 
     // Train IVF partitions.
     let ivf_model = if let Some(centroids) = &ivf_params.centroids {
-        if centroids.len() != ivf_params.num_partitions * dim {
+        if centroids.values().len() != ivf_params.num_partitions * dim {
             return Err(Error::Index {
                 message: format!(
                     "IVF centroids length mismatch: {} != {}",
                     centroids.len(),
-                    ivf_params.num_partitions
+                    ivf_params.num_partitions * dim,
                 ),
             });
         }
@@ -786,4 +786,71 @@ async fn train_ivf_model(
         centroids,
         data.num_columns() as i32,
     )?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::cast::AsArray;
+    use arrow_schema::{DataType, Field, Schema};
+    use tempfile::tempdir;
+
+    use crate::{
+        index::{vector::VectorIndexParams, DatasetIndexExt, IndexType},
+        utils::testing::generate_random_array,
+    };
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_with_centroids() {
+        const DIM: usize = 32;
+        let vectors = generate_random_array(1000 * DIM);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let array = Arc::new(FixedSizeListArray::try_new(&vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut batches: Box<dyn arrow_array::RecordBatchReader> =
+            Box::new(RecordBatchBuffer::new(vec![batch]));
+        let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new(&centroids, DIM as i32).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+
+        let codebook = Arc::new(generate_random_array(256 * DIM));
+        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+
+        let params = VectorIndexParams::with_ivf_pq_params(MetricType::L2, ivf_params, pq_params);
+
+        let dataset = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let elem = array.value(10);
+        let query = elem.as_primitive::<Float32Type>();
+        let results = dataset
+            .scan()
+            .nearest("vector", query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(5, results[0].num_rows());
+    }
 }
