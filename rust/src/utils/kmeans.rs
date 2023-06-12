@@ -28,7 +28,8 @@ use rand::{distributions::WeightedIndex, Rng};
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
 use crate::Result;
-use crate::{arrow::*, Error};
+use crate::Error;
+use crate::linalg::argmin::Argmin;
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -415,7 +416,7 @@ impl KMeans {
                         let value_arr = data.slice(idx * dimension, dimension);
                         let vector: &Float32Array = as_primitive_array(&value_arr);
                         let distances = dist(vector.values(), centroids.values(), dimension);
-                        let cluster_id = argmin(distances.as_ref()).unwrap();
+                        let cluster_id = (distances.as_ref().values()).argmin().unwrap();
                         let distance = distances.value(cluster_id as usize);
                         results.push((cluster_id, distance))
                     }
