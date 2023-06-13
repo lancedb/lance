@@ -191,14 +191,14 @@ impl Dataset {
             let data = ArrayData::from_pyarrow(qval)?;
             let q = Float32Array::from(data);
 
-            let k: usize = if let Some(k) = nearest.get_item("k") {
+            let k: Option<usize> = if let Some(k) = nearest.get_item("k") {
                 if k.is_none() {
-                    10
+                    None
                 } else {
                     PyAny::downcast::<PyLong>(k)?.extract()?
                 }
             } else {
-                10
+                None
             };
 
             let nprobes: usize = if let Some(nprobes) = nearest.get_item("nprobes") {

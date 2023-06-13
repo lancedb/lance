@@ -73,9 +73,6 @@ pub struct Query {
     /// The vector to be searched.
     pub key: Arc<Float32Array>,
 
-    /// Top k results to return.
-    pub k: usize,
-
     /// The number of probes to load and search.
     pub nprobes: usize,
 

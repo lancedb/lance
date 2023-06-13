@@ -88,6 +88,8 @@ pub struct Scanner {
 
     nearest: Option<Query>,
 
+    nearest_k: Option<usize>,
+
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
@@ -111,6 +113,7 @@ impl Scanner {
             limit: None,
             offset: None,
             nearest: None,
+            nearest_k: None,
             with_row_id: false,
             ordered: true,
             fragments: None,
@@ -129,6 +132,7 @@ impl Scanner {
             limit: None,
             offset: None,
             nearest: None,
+            nearest_k: None,
             with_row_id: false,
             ordered: true,
             fragments: Some(vec![fragment]),
@@ -241,25 +245,32 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest(
+        &mut self,
+        column: &str,
+        q: &Float32Array,
+        k: Option<usize>,
+    ) -> Result<&mut Self> {
         self.ensure_not_fragment_scan()?;
 
-        if k == 0 {
-            return Err(Error::IO {
-                message: "k must be positive".to_string(),
-            });
-        }
         if q.is_empty() {
             return Err(Error::IO {
                 message: "Query vector must have non-zero length".to_string(),
             });
+        }
+        if let Some(k) = k {
+            if k == 0 {
+                return Err(Error::IO {
+                    message: "k must be positive".to_string(),
+                });
+            }
+            self.nearest_k = Some(k);
         }
         // make sure the field exists
         self.dataset.schema().project(&[column])?;
         self.nearest = Some(Query {
             column: column.to_string(),
             key: Arc::new(q.clone()),
-            k,
             nprobes: 1,
             refine_factor: None,
             metric_type: MetricType::L2,
@@ -454,6 +465,13 @@ impl Scanner {
 
     // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        // If there's no filter but there is a limit, it's more optimal to specify k
+        let nearest_k = if self.nearest_k.is_none() && self.filter.is_none() && self.limit.is_some() {
+            self.limit.map(|x| x as usize)
+        } else {
+            self.nearest_k
+        };
+
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO{message:"No nearest query".to_string()});
         };
@@ -477,11 +495,11 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, &index)?; // score, _rowid
+            let knn_node = self.ann(q, &index, nearest_k)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let mut knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(knn_node_with_vector, q)?
+                self.flat_knn(knn_node_with_vector, q, nearest_k)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
@@ -494,7 +512,7 @@ impl Scanner {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(scan_node, q)?)
+            Ok(self.flat_knn(scan_node, q, nearest_k)?)
         }
     }
 
@@ -531,7 +549,7 @@ impl Scanner {
                     self.ordered,
                 );
                 // first we do flat search on just the new data
-                let topk_appended = self.flat_knn(scan_node, q)?;
+                let topk_appended = self.flat_knn(scan_node, q, self.nearest_k)?;
 
                 // To do a union, we need to make the schemas match. Right now
                 // knn_node: score, _rowid, vector
@@ -547,7 +565,7 @@ impl Scanner {
                     datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
                 )?;
                 // then we do a flat search on KNN(new data) + ANN(indexed data)
-                return self.flat_knn(Arc::new(unioned), q);
+                return self.flat_knn(Arc::new(unioned), q, self.nearest_k);
             }
         }
         Ok(knn_node)
@@ -583,16 +601,22 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone())?))
+    fn flat_knn(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &Query,
+        k: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(KNNFlatExec::try_new(input, q.clone(), k)?))
     }
 
     /// Create an Execution plan to do indexed ANN search
-    fn ann(&self, q: &Query, index: &Index) -> Result<Arc<dyn ExecutionPlan>> {
+    fn ann(&self, q: &Query, index: &Index, k: Option<usize>) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(KNNIndexExec::try_new(
             self.dataset.clone(),
             &index.uuid.to_string(),
             q,
+            k,
         )?))
     }
 
@@ -911,7 +935,7 @@ mod test {
             let dataset = create_vector_dataset(test_uri, *build_index).await;
             let mut scan = dataset.scan();
             let key: Float32Array = (32..64).map(|v| v as f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
+            scan.nearest("vec", &key, Some(5)).unwrap();
             scan.refine(5);
 
             let results = scan
@@ -1066,7 +1090,7 @@ mod test {
         let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 5).unwrap();
+        scan.nearest("vec", &key, Some(5)).unwrap();
         scan.filter("i > 100").unwrap();
         scan.project(&["i"]).unwrap();
         scan.refine(5);
@@ -1117,7 +1141,7 @@ mod test {
         let dataset = create_vector_dataset(test_uri, true).await;
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 5).unwrap();
+        scan.nearest("vec", &key, Some(5)).unwrap();
         scan.refine(5);
 
         let results = scan
@@ -1372,7 +1396,7 @@ mod test {
 
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
+        scan.nearest("vec", &key, Some(10)).unwrap();
         scan.project(&["s"]).unwrap();
         scan.filter("i > 10 and i < 20").unwrap();
 
@@ -1455,7 +1479,7 @@ mod test {
 
         let mut scan = dataset.scan();
         let key: Float32Array = (32..64).map(|v| v as f32).collect();
-        scan.nearest("vec", &key, 10).unwrap();
+        scan.nearest("vec", &key, Some(10)).unwrap();
         scan.refine(10);
         scan.project(&["s"]).unwrap();
         scan.filter("i > 10 and i < 20").unwrap();

@@ -47,12 +47,13 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// *WARNINGS*:
     ///  - Only supports `f32` now. Will add f64/f16 later.
-    async fn search(&self, query: &Query) -> Result<RecordBatch>;
+    async fn search(&self, query: &Query, k: usize) -> Result<RecordBatch>;
 
     /// Start search for nearest neighbors without a bound.
     ///
     /// Returns a stream of record batches.
-    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>>;
+    async fn search_stream(&self, query: &Query)
+        -> Result<BoxStream<'static, Result<RecordBatch>>>;
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

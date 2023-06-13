@@ -65,7 +65,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let results = dataset
                     .scan()
-                    .nearest("vector", q, 10)
+                    .nearest("vector", q, Some(10))
                     .unwrap()
                     .nprobs(10)
                     .try_into_stream()
@@ -85,7 +85,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let results = dataset
                     .scan()
-                    .nearest("vector", q, 10)
+                    .nearest("vector", q, Some(10))
                     .unwrap()
                     .nprobs(10)
                     .refine(2)

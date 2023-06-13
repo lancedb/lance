@@ -25,6 +25,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
+use futures::StreamExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -44,17 +45,17 @@ pub struct KNNFlatStream {
 
 impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
-    pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
+    pub(crate) fn new(child: SendableRecordBatchStream, query: &Query, k: Option<usize>) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
-        KNNFlatStream::from_stream(stream, query)
+        KNNFlatStream::from_stream(stream, query, k)
     }
 
-    fn from_stream(stream: impl RecordBatchStream, query: &Query) -> Self {
+    fn from_stream(stream: impl RecordBatchStream, query: &Query, k: Option<usize>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let bg_thread = tokio::spawn(async move {
-            let batch = match flat_search(stream, &q).await {
+            let batch = match flat_search(stream, &q, k).await {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
@@ -110,14 +111,17 @@ pub struct KNNFlatExec {
 
     /// The query to execute.
     query: Query,
+
+    /// The k to scan
+    k: Option<usize>,
 }
 
 impl std::fmt::Debug for KNNFlatExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "KNN(flat, k={}, metric={})",
-            self.query.k, self.query.metric_type
+            "KNN(flat, k={:?}, metric={})",
+            self.k, self.query.metric_type
         )
     }
 }
@@ -126,7 +130,7 @@ impl KNNFlatExec {
     /// Create a new [KNNFlatExec] node.
     ///
     /// Returns an error if the preconditions are not met.
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query) -> Result<Self> {
+    pub fn try_new(input: Arc<dyn ExecutionPlan>, query: Query, k: Option<usize>) -> Result<Self> {
         let schema = input.schema();
         let field = schema
             .field_with_name(&query.column)
@@ -149,7 +153,7 @@ impl KNNFlatExec {
             });
         };
 
-        Ok(Self { input, query })
+        Ok(Self { input, query, k })
     }
 }
 
@@ -199,12 +203,13 @@ impl ExecutionPlan for KNNFlatExec {
         Ok(Box::pin(KNNFlatStream::new(
             self.input.execute(partition, context)?,
             &self.query,
+            self.k,
         )))
     }
 
     fn statistics(&self) -> Statistics {
         Statistics {
-            num_rows: Some(self.query.k as usize),
+            num_rows: self.k.map(|x| x as usize),
             ..Default::default()
         }
     }
@@ -218,42 +223,67 @@ pub struct KNNIndexStream {
 }
 
 impl KNNIndexStream {
-    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Self {
+    pub fn new(dataset: Arc<Dataset>, index_name: &str, query: &Query, k: Option<usize>) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
 
         let q = query.clone();
         let name = index_name.to_string();
-        let bg_thread = tokio::spawn(async move {
-            let index = match open_index(dataset, &q.column, &name).await {
-                Ok(idx) => idx,
-                Err(e) => {
-                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to open vector index: {name}: {e}"
-                    ))))
-                    .await
-                    .expect("KNNFlat failed to send message");
-                    return;
-                }
-            };
-            let result = match index.search(&q).await {
-                Ok(b) => b,
-                Err(e) => {
-                    tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
-                    ))))
+        let bg_thread = if let Some(k) = k {
+            tokio::spawn(async move {
+                let fut = async move {
+                    let index = open_index(dataset, &q.column, &name).await.map_err(|err| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "Failed to open vector index: {name}: {err}"
+                        ))
+                    })?;
+                    index.search(&q, k).await.map_err(|err| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "Failed to compute scores: {err}"
+                        ))
+                    })
+                };
+                tx.send(fut.await)
                     .await
                     .expect("KNNIndex failed to send message");
-                    return;
-                }
-            };
-
-            if !tx.is_closed() {
-                if let Err(e) = tx.send(Ok(result)).await {
-                    eprintln!("KNNIndex tx.send error: {e}")
+                drop(tx);
+            })
+        } else {
+            tokio::spawn(async move {
+                let fut = async move {
+                    let index = open_index(dataset, &q.column, &name).await.map_err(|err| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "Failed to open vector index: {name}: {err}"
+                        ))
+                    })?;
+                    index.search_stream(&q).await.map_err(|err| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "Failed to compute scores: {err}"
+                        ))
+                    })
                 };
-            }
-            drop(tx);
-        });
+                let mut stream = match fut.await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tx.send(Err(err))
+                            .await
+                            .expect("KNNIndex failed to send message");
+                        drop(tx);
+                        return;
+                    }
+                };
+
+                while let Some(res) = stream.next().await {
+                    let res = res.map_err(|err| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "Failed to get next batch of vector search results: {err}"
+                        ))
+                    });
+                    tx.send(res).await.expect("KNNIndex failed to send message");
+                }
+
+                drop(tx);
+            })
+        };
 
         Self {
             rx,
@@ -287,21 +317,24 @@ pub struct KNNIndexExec {
     index_name: String,
     /// The vector query to execute.
     query: Query,
+    /// The number of results to get. If None, will be an unbounded search.
+    k: Option<usize>,
 }
 
 impl std::fmt::Debug for KNNIndexExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "KNN(index, name={}, k={})",
-            self.index_name, self.query.k
-        )
+        write!(f, "KNN(index, name={}, k={:?})", self.index_name, self.k)
     }
 }
 
 impl KNNIndexExec {
     /// Create a new [KNNIndexExec].
-    pub fn try_new(dataset: Arc<Dataset>, index_name: &str, query: &Query) -> Result<Self> {
+    pub fn try_new(
+        dataset: Arc<Dataset>,
+        index_name: &str,
+        query: &Query,
+        k: Option<usize>,
+    ) -> Result<Self> {
         let schema = dataset.schema();
         if schema.field(query.column.as_str()).is_none() {
             return Err(Error::IO {
@@ -316,6 +349,7 @@ impl KNNIndexExec {
             dataset,
             index_name: index_name.to_string(),
             query: query.clone(),
+            k,
         })
     }
 }
@@ -361,12 +395,16 @@ impl ExecutionPlan for KNNIndexExec {
             self.dataset.clone(),
             &self.index_name,
             &self.query,
+            self.k,
         )))
     }
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
+        let num_rows = self
+            .k
+            .map(|k| k * self.query.refine_factor.unwrap_or(1) as usize);
         Statistics {
-            num_rows: Some(self.query.k * self.query.refine_factor.unwrap_or(1) as usize),
+            num_rows,
             ..Default::default()
         }
     }
@@ -444,7 +482,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", as_primitive_array(&q), 10)
+            .nearest("vector", as_primitive_array(&q), Some(10))
             .unwrap()
             .try_into_stream()
             .await
@@ -461,12 +499,12 @@ mod tests {
             &Query {
                 column: "vector".to_string(),
                 key: Arc::new(as_primitive_array(&q).clone()),
-                k: 10,
                 nprobes: 0,
                 refine_factor: None,
                 metric_type: MetricType::L2,
                 use_index: false,
             },
+            Some(10),
         )
         .await
         .unwrap();
@@ -494,7 +532,6 @@ mod tests {
         let query = Query {
             column: "vector".to_string(),
             key: Arc::new(generate_random_array(dim)),
-            k: 10,
             nprobes: 0,
             refine_factor: None,
             metric_type: MetricType::L2,
@@ -502,7 +539,7 @@ mod tests {
         };
 
         let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
-        let idx = KNNFlatExec::try_new(input, query).unwrap();
+        let idx = KNNFlatExec::try_new(input, query, Some(10)).unwrap();
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![

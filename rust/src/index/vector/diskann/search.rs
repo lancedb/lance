@@ -340,15 +340,8 @@ impl Index for DiskANNIndex {
 
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        let state = greedy_search(
-            self.graph.as_ref(),
-            0,
-            query.key.values(),
-            query.k,
-            query.k * 2,
-        )
-        .await?;
+    async fn search(&self, query: &Query, k: usize) -> Result<RecordBatch> {
+        let state = greedy_search(self.graph.as_ref(), 0, query.key.values(), k, k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new(SCORE_COL, DataType::Float32, false),
@@ -366,7 +359,7 @@ impl VectorIndex for DiskANNIndex {
 
         let row_ids: UInt64Array = candidates
             .iter()
-            .take(query.k)
+            .take(k)
             .map(|(_, id)| *id as u64)
             .collect();
         let scores: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
@@ -378,7 +371,10 @@ impl VectorIndex for DiskANNIndex {
         Ok(batch)
     }
 
-    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+    async fn search_stream(
+        &self,
+        query: &Query,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let stream = greedy_search_stream(self.graph.clone(), 0, query.key.values()).await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),

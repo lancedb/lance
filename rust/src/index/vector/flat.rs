@@ -31,6 +31,7 @@ use crate::{Error, Result};
 pub async fn flat_search(
     stream: impl Stream<Item = Result<RecordBatch>>,
     query: &Query,
+    k: Option<usize>,
 ) -> Result<RecordBatch> {
     let batches = stream
         .filter(|batch| {
@@ -39,7 +40,7 @@ pub async fn flat_search(
         })
         .zip(repeat_with(|| query.metric_type))
         .map(|(batch, mt)| async move {
-            let k = query.key.clone();
+            let key = query.key.clone();
             let mut batch = batch?;
             if batch.column_by_name(SCORE_COL).is_some() {
                 // Ignore the score calculated from inner vector index.
@@ -54,15 +55,15 @@ pub async fn flat_search(
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
             let scores = tokio::task::spawn_blocking(move || {
                 mt.batch_func()(
-                    k.values(),
+                    key.values(),
                     as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
-                    k.len(),
+                    key.len(),
                 )
             })
             .await? as ArrayRef;
 
             // TODO: use heap
-            let indices = sort_to_indices(&scores, None, Some(query.k))?;
+            let indices = sort_to_indices(&scores, None, k)?;
             let batch_with_score = batch
                 .try_with_column(ArrowField::new(SCORE_COL, DataType::Float32, false), scores)?;
             let struct_arr = StructArray::from(batch_with_score);
@@ -74,7 +75,7 @@ pub async fn flat_search(
         .await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
     let scores = batch.column_by_name(SCORE_COL).unwrap();
-    let indices = sort_to_indices(scores, None, Some(query.k))?;
+    let indices = sort_to_indices(scores, None, k)?;
 
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;

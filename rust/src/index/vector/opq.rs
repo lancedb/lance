@@ -279,16 +279,23 @@ impl Index for OPQIndex {
 
 #[async_trait]
 impl VectorIndex for OPQIndex {
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, k: usize) -> Result<RecordBatch> {
         let mat = MatrixView::new(query.key.clone(), query.key.len());
         let transformed = self.opq.transform(&mat).await?;
         let mut transformed_query = query.clone();
         transformed_query.key = transformed.data();
-        self.sub_index.search(&transformed_query).await
+        self.sub_index.search(&transformed_query, k).await
     }
 
-    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
-        todo!()
+    async fn search_stream(
+        &self,
+        query: &Query,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let mat = MatrixView::new(query.key.clone(), query.key.len());
+        let transformed = self.opq.transform(&mat).await?;
+        let mut transformed_query = query.clone();
+        transformed_query.key = transformed.data();
+        self.sub_index.search_stream(&transformed_query).await
     }
 
     fn is_loadable(&self) -> bool {
@@ -417,14 +424,13 @@ mod tests {
 
         let query = Query {
             column: "vector".to_string(),
-            k: 4,
             nprobes: 10,
             refine_factor: None,
             metric_type: MetricType::L2,
             use_index: true,
             key: Float32Array::from_iter_values((0..64).map(|x| x as f32 + 640.0)).into(),
         };
-        let results = index.search(&query).await.unwrap();
+        let results = index.search(&query, 4).await.unwrap();
         let row_ids: &UInt64Array = as_primitive_array(&results[ROW_ID]);
         assert_eq!(row_ids.len(), 4);
         assert!(row_ids.values().contains(&10));

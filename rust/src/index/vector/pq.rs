@@ -221,7 +221,7 @@ impl Index for PQIndex {
 impl VectorIndex for PQIndex {
     /// Search top-k nearest neighbors for `key` within one PQ partition.
     ///
-    async fn search(&self, query: &Query) -> Result<RecordBatch> {
+    async fn search(&self, query: &Query, k: usize) -> Result<RecordBatch> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
@@ -238,7 +238,7 @@ impl VectorIndex for PQIndex {
             self.cosine_scores(&query.key)?
         };
 
-        let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
+        let limit = k * query.refine_factor.unwrap_or(1) as usize;
         let indices = sort_to_indices(&scores, None, Some(limit))?;
         let scores = take(&scores, &indices, None)?;
         let row_ids = take(row_ids.as_ref(), &indices, None)?;
@@ -250,7 +250,10 @@ impl VectorIndex for PQIndex {
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)
     }
 
-    async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
+    async fn search_stream(
+        &self,
+        query: &Query,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         if self.code.is_none() || self.row_ids.is_none() {
             return Err(Error::Index {
                 message: "PQIndex::search: PQ is not initialized".to_string(),
