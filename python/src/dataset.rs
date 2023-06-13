@@ -17,9 +17,10 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatchReader, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use lance::dataset::ReadParams;
 use lance::datatypes::Schema;
@@ -378,6 +379,17 @@ impl Dataset {
 
                     if let Some(o) = kwargs.get_item("max_opq_iterations") {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
+                    };
+
+                    if let Some(c) = kwargs.get_item("ivf_centroids") {
+                        let batch = RecordBatch::from_pyarrow(c)?;
+                        if "_ivf_centroids" != batch.schema().field(0).name() {
+                            return Err(PyValueError::new_err(
+                                "Expected '_ivf_centroids' as the first column name.",
+                            ));
+                        }
+                        let centroids = as_fixed_size_list_array(batch.column(0));
+                        ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
                 }
                 VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)

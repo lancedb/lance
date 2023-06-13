@@ -12,10 +12,10 @@
 #  limitations under the License.
 
 import os
-import platform
 import random
 import string
 import time
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -160,3 +160,21 @@ def test_has_index(dataset, tmp_path):
     assert ann_ds.has_index
 
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
+    centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
+    dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        ivf_centroids=centroids,
+        num_partitions=5,
+        num_sub_vectors=8,
+    )
+
+    q = np.random.randn(128)
+    actual = dataset.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
+    )["id"].to_numpy()
+    assert len(actual) == 10
