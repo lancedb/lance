@@ -661,6 +661,7 @@ mod test {
     use super::*;
     use crate::arrow::*;
     use crate::dataset::WriteMode;
+    use crate::index::vector::diskann::DiskANNParams;
     use crate::index::{
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
@@ -1585,5 +1586,109 @@ mod test {
             .await
             .unwrap();
         concat_batches(&batches[0].schema(), &batches).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ann_with_deletion() {
+        let vec_params = vec![
+            VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
+            VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
+        ];
+        for params in vec_params {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            // make dataset
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
+                ),
+            ]));
+
+            // vectors are [0, 0, 0, ...] [1, 1, 1, ...]
+            let vector_values: Float32Array = (0..32 * 512).map(|v| (v / 32) as f32).collect();
+            let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+
+            let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..512)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()]);
+
+            let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+            let mut dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+
+            dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut scan = dataset.scan();
+            // closest be i = 0..5
+            let key: Float32Array = (0..32).map(|_v| 1.0 as f32).collect();
+            scan.nearest("vec", &key, 5).unwrap();
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            let expected_i = BTreeSet::from_iter(vec![0, 1, 2, 3, 4]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+
+            // DELETE top result and search again
+
+            dataset.delete("i = 1").await.unwrap();
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &key, 5).unwrap();
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            // i=1 was deleted, and 5 is the next best, the reset shouldn't change
+            let expected_i = BTreeSet::from_iter(vec![0, 2, 3, 4, 5]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+        }
     }
 }
