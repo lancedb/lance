@@ -526,7 +526,10 @@ class LanceDataset(pa.dataset.Dataset):
             if ivf_centroids is not None:
                 # User provided IVF centroids
                 if isinstance(ivf_centroids, np.ndarray):
-                    if len(ivf_centroids.shape) != 2 or ivf_centroids.shape[0] != num_partitions:
+                    if (
+                        len(ivf_centroids.shape) != 2
+                        or ivf_centroids.shape[0] != num_partitions
+                    ):
                         raise ValueError(
                             f"Ivf centroids must be 2D array: (clusters, dim), got {ivf_centroids.shape}"
                         )
@@ -534,9 +537,13 @@ class LanceDataset(pa.dataset.Dataset):
                         raise TypeError(
                             f"IVF centroids must be float32, got {ivf_centroids.dtype}"
                         )
-                    ivf_centroids = pa.array(ivf_centroids)
+                    dim = ivf_centroids.shape[1]
+                    values = pa.array(ivf_centroids.reshape(-1), type=pa.float32())
+                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
                 # Convert it to RecordBatch because Rust side only accepts RecordBatch.
-                ivf_centroids_batch = pa.RecordBatch.from_arrays([ivf_centroids], ["_ivf_centroids"])
+                ivf_centroids_batch = pa.RecordBatch.from_arrays(
+                    [ivf_centroids], ["_ivf_centroids"]
+                )
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
         kwargs["replace"] = replace
