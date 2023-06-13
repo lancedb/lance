@@ -301,7 +301,7 @@ pub(crate) async fn greedy_search_stream(
 }
 
 pub struct DiskANNIndex {
-    graph: PersistedGraph<RowVertex>,
+    graph: Arc<PersistedGraph<RowVertex>>,
 
     deletion_cache: Arc<LruDeletionVectorStore>,
 }
@@ -326,7 +326,7 @@ impl DiskANNIndex {
         let graph =
             PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
         Ok(Self {
-            graph,
+            graph: Arc::new(graph),
             deletion_cache,
         })
     }
@@ -347,9 +347,9 @@ impl VectorIndex for DiskANNIndex {
             Field::new(SCORE_COL, DataType::Float32, false),
         ]));
 
-        let mut candidates = Vec::with_capacity(query.k);
+        let mut candidates = Vec::with_capacity(k);
         for (score, row) in state.candidates {
-            if candidates.len() == query.k {
+            if candidates.len() == k {
                 break;
             }
             if !self.deletion_cache.as_ref().is_deleted(row as u64).await? {
@@ -362,7 +362,7 @@ impl VectorIndex for DiskANNIndex {
             .take(k)
             .map(|(_, id)| *id as u64)
             .collect();
-        let scores: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
+        let scores: Float32Array = candidates.iter().take(k).map(|(d, _)| **d).collect();
 
         let batch = RecordBatch::try_new(
             schema,

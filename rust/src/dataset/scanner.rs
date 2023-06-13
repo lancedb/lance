@@ -66,6 +66,7 @@ const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 ///   .buffered(16)
 ///   .sum()
 /// ```
+#[derive(Debug)]
 pub struct Scanner {
     dataset: Arc<Dataset>,
 
@@ -466,7 +467,8 @@ impl Scanner {
     // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // If there's no filter but there is a limit, it's more optimal to specify k
-        let nearest_k = if self.nearest_k.is_none() && self.filter.is_none() && self.limit.is_some() {
+        let nearest_k = if self.nearest_k.is_none() && self.filter.is_none() && self.limit.is_some()
+        {
             self.limit.map(|x| x as usize)
         } else {
             self.nearest_k
@@ -683,7 +685,7 @@ impl Stream for DatasetRecordBatchStream {
 #[cfg(test)]
 mod test {
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::path::PathBuf;
     use std::vec;
 
@@ -1788,7 +1790,7 @@ mod test {
             let mut scan = dataset.scan();
             // closest be i = 0..5
             let key: Float32Array = (0..32).map(|_v| 1.0 as f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
+            scan.nearest("vec", &key, Some(5)).unwrap();
 
             let results = scan
                 .try_into_stream()
@@ -1814,7 +1816,7 @@ mod test {
 
             dataset.delete("i = 1").await.unwrap();
             let mut scan = dataset.scan();
-            scan.nearest("vec", &key, 5).unwrap();
+            scan.nearest("vec", &key, Some(5)).unwrap();
 
             let results = scan
                 .try_into_stream()
@@ -1836,6 +1838,114 @@ mod test {
                 .copied()
                 .collect();
             assert_eq!(expected_i, actual_i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_vector_search() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
+
+        let num_rows = dataset.count_rows().await.unwrap();
+
+        #[derive(Debug)]
+        struct TestCase {
+            use_index: bool,
+            limit: Option<i64>,
+            filter: Option<&'static str>,
+        }
+
+        // Handle all combinations of use_index, limit, and filter
+        let mut cases = vec![];
+        for use_index in &[true, false] {
+            for limit in &[None, Some(5)] {
+                for filter in &[None, Some("i > 100")] {
+                    cases.push(TestCase {
+                        use_index: *use_index,
+                        limit: *limit,
+                        filter: *filter,
+                    });
+                }
+            }
+        }
+
+        for case in cases {
+            // First, build a scanner *with* k for comparison
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vec", &Float32Array::from(vec![0.0; 32]), Some(num_rows))
+                .unwrap()
+                .limit(case.limit, None)
+                .unwrap()
+                .use_index(case.use_index);
+            if let Some(filter) = case.filter {
+                scanner.filter(filter).unwrap();
+            }
+
+            let expected = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert!(expected.len() > 0);
+            let expected = concat_batches(&expected[0].schema(), expected.iter()).unwrap();
+
+            // Now get our actual result
+            scanner
+                .nearest("vec", &Float32Array::from(vec![0.0; 32]), None)
+                .unwrap()
+                .use_index(case.use_index);
+            let result = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(result.len() > 0);
+            let result = concat_batches(&result[0].schema(), result.iter()).unwrap();
+
+            if let Some(limit) = case.limit {
+                // If there was a limit, then result is a subset of expected
+                assert_eq!(result.num_rows(), limit as usize);
+                // Column "i" is unique, so it's sufficient to show subset
+                // relationship on that column.
+                let result_arr: &Int32Array = as_primitive_array(&result["i"]);
+                let result_set = result_arr.iter().flat_map(|i| i).collect::<HashSet<_>>();
+
+                let expected_arr: &Int32Array = as_primitive_array(&expected["i"]);
+                let expected_set = expected_arr.iter().flat_map(|i| i).collect::<HashSet<_>>();
+
+                assert!(result_set.is_subset(&expected_set));
+            } else {
+                // If there was no limit, then result is the same as expected
+                // (except for order)
+                assert_eq!(result.num_rows(), expected.num_rows());
+                let sort_indices = sort_to_indices(&result["score"], None, None).unwrap();
+                // It should be sufficient to check the "score" column. Because of ties
+                // we can't guarantee the order of the other columns.
+                let sorted_i = take::take(&result["score"], &sort_indices, None).unwrap();
+                assert_eq!(&sorted_i, &expected["score"]);
+            }
+
+            // Also, demonstrate that order is consistent across multiple calls
+            for _ in 0..10 {
+                let new_result = scanner
+                    .try_into_stream()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert!(new_result.len() > 0);
+                let new_result =
+                    concat_batches(&new_result[0].schema(), new_result.iter()).unwrap();
+                assert_eq!(&result["score"], &new_result["score"]);
+            }
         }
     }
 }

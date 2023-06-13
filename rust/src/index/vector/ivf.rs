@@ -1036,7 +1036,7 @@ mod tests {
         let query = elem.as_primitive::<Float32Type>();
         let results = dataset
             .scan()
-            .nearest("vector", query, 5)
+            .nearest("vector", query, Some(5))
             .unwrap()
             .try_into_stream()
             .await
