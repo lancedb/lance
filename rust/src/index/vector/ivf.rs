@@ -14,31 +14,32 @@
 
 //! IVF - Inverted File index.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::BTreeMap, sync::Arc};
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::arithmetic::subtract_dyn;
 use arrow_array::{
-    builder::{Float32Builder, UInt32Builder},
+    builder::{Float32Builder, UInt32Builder, UInt64Builder},
     cast::{as_primitive_array, as_struct_array},
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, StructArray,
-    UInt32Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 use async_trait::async_trait;
 use futures::{
-    stream::{self, StreamExt, BoxStream},
+    stream::{self, BoxStream, StreamExt},
     TryStreamExt,
 };
+use ordered_float::OrderedFloat;
 use rand::{rngs::SmallRng, SeedableRng};
 
 use super::{
     opq::train_opq,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
-    MetricType, Query, VectorIndex, INDEX_FILE_NAME,
+    MetricType, Query, VectorIndex, INDEX_FILE_NAME, SCORE_COL,
 };
 use crate::{
     arrow::{linalg::MatrixView, *},
@@ -161,6 +162,13 @@ impl VectorIndex for IVFIndex {
 
     async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
         // Create a stream for each partition
+        let partition_ids =
+            self.ivf
+                .find_partitions(&query.key, query.nprobes, self.metric_type)?;
+        assert!(partition_ids.len() <= query.nprobes as usize);
+        let part_ids = partition_ids.values().to_vec();
+
+        
 
         // Merge the streams preserving score order
         todo!();
@@ -793,6 +801,127 @@ async fn train_ivf_model(
         centroids,
         data.num_columns() as i32,
     )?)))
+}
+
+struct MergeStreamItem {
+    row_id: usize,
+    stream: BoxStream<'static, Result<(usize, f32)>>,
+}
+
+struct KMergeStream {
+    streams: BTreeMap<OrderedFloat<f32>, MergeStreamItem>,
+}
+
+impl KMergeStream {
+    async fn new(streams: Vec<BoxStream<'static, Result<(usize, f32)>>>) -> Result<Self> {
+        let streams = futures::stream::iter(streams)
+            .map(|mut stream| async move {
+                match stream.next().await {
+                    Some(Ok(item)) => Some(Ok((
+                        OrderedFloat(item.1),
+                        MergeStreamItem {
+                            row_id: item.0,
+                            stream,
+                        },
+                    ))),
+                    Some(Err(e)) => Some(Err(e)),
+                    None => None,
+                }
+            })
+            .buffer_unordered(10)
+            .flat_map(|x| futures::stream::iter(x))
+            .try_collect::<BTreeMap<_, _>>()
+            .await?;
+        Ok(Self { streams })
+    }
+
+    async fn next(&mut self) -> Option<Result<(usize, f32)>> {
+        let (score, item) = self.streams.pop_first()?;
+        let MergeStreamItem { row_id, mut stream } = item;
+        match stream.next().await {
+            Some(Ok(item)) => {
+                self.streams.insert(
+                    OrderedFloat(item.1),
+                    MergeStreamItem {
+                        row_id: item.0,
+                        stream,
+                    },
+                );
+            }
+            Some(Err(e)) => return Some(Err(e)),
+            None => {}
+        }
+        Some(Ok((item.row_id, score.into_inner())))
+    }
+}
+
+fn convert_search_stream(
+    stream: BoxStream<'static, Result<RecordBatch>>,
+) -> BoxStream<'static, Result<(usize, f32)>> {
+    stream
+        .map(|batch| {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(err) => return Err(err),
+            };
+            let stream = futures::stream::iter(0..batch.num_rows()).map(move |i| {
+                let score_col: &Float32Array = as_primitive_array(&batch[SCORE_COL]);
+                let row_id_col: &UInt64Array = as_primitive_array(&batch[ROW_ID]);
+                Ok((row_id_col.value(i) as usize, score_col.value(i)))
+            });
+            Ok(stream)
+        })
+        .try_flatten()
+        .boxed()
+}
+
+async fn merge_search_streams(
+    streams: Vec<BoxStream<'static, Result<RecordBatch>>>,
+    batch_size: usize,
+) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    let streams = streams
+        .into_iter()
+        .map(convert_search_stream)
+        .collect::<Vec<_>>();
+    let kmerge = KMergeStream::new(streams).await?;
+
+    Ok(futures::stream::unfold(kmerge, move |mut kmerge| async move {
+        let mut row_ids = UInt64Builder::with_capacity(batch_size);
+        let mut scores = Float32Builder::with_capacity(batch_size);
+
+        let mut i = 0;
+        while i < batch_size {
+            match kmerge.next().await {
+                Some(Ok((row_id, score))) => {
+                    row_ids.append_value(row_id as u64);
+                    scores.append_value(score);
+                    i += 1;
+                }
+                Some(Err(err)) => return Some((Err(err), kmerge)),
+                None => {
+                    break;
+                }
+            }
+        }
+
+        if i == 0 {
+            None
+        } else {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(ROW_ID, DataType::UInt64, false),
+                ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ]));
+            let maybe_batch = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(row_ids.finish()), Arc::new(scores.finish())],
+            );
+            match maybe_batch {
+                Ok(batch) => Some((Ok(batch), kmerge)),
+                Err(err) => Some((Err(err.into()), kmerge)),
+            }
+        }
+    })
+    .boxed())
 }
 
 #[cfg(test)]

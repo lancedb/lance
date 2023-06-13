@@ -19,10 +19,13 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_array::{
+    builder::{Float32Builder, UInt64Builder},
+    ArrayRef, Float32Array, RecordBatch, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use ordered_float::OrderedFloat;
 
@@ -99,6 +102,7 @@ impl SearchState {
     /// Return the next unvisited vertex.
     fn pop(&mut self) -> Option<usize> {
         while let Some(vertex) = self.heap.pop() {
+            // TODO: what if there are two who have the same distance??
             if !self.candidates.contains_key(&vertex.0.distance) {
                 // The vertex has been removed from the candidate lists,
                 // from [`push()`].
@@ -110,6 +114,26 @@ impl SearchState {
         }
 
         None
+    }
+
+    /// Drain up to N unvisited vertices
+    fn drain(&mut self, n: usize) -> Vec<usize> {
+        let mut result = Vec::with_capacity(n);
+        while let Some(vertex) = self.heap.pop() {
+            if !self.candidates.contains_key(&vertex.0.distance) {
+                // The vertex has been removed from the candidate lists,
+                // from [`push()`].
+                continue;
+            }
+
+            self.visited.insert(vertex.0.id);
+            result.push(vertex.0.id);
+            if result.len() >= n {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Push a new (unvisited) vertex into the search state.
@@ -177,46 +201,102 @@ pub(crate) async fn greedy_search(
     Ok(state)
 }
 
+async fn load_next_neighbors(
+    graph: Arc<dyn Graph + Send + Sync>,
+    state: &mut SearchState,
+    query: &[f32],
+    max_num_neighbors: usize,
+) -> Result<()> {
+    // Keep it to a max so that we don't have too much latency
+    // Otherwise, each round of neighbors may get progressively larger until
+    // we are processing thousands per call of this method.
+    let current_round_count = std::cmp::min(state.heap.len(), max_num_neighbors);
 
+    let ids = state.drain(current_round_count);
+    for id in &ids {
+        state.visit(*id);
+    }
+    let neighbors = futures::stream::iter(ids)
+        .map(|id| {
+            let graph = graph.clone();
+            async move {
+                match graph.neighbors(id.clone()).await {
+                    Ok(neighbors) => Ok(neighbors
+                        .into_iter()
+                        .map(|maybe_id| {
+                            maybe_id.ok_or(Error::Internal {
+                                message: "Neighbor ID is null".to_string(),
+                            })
+                        })
+                        .collect::<Vec<Result<u32>>>()),
+                    Err(e) => Err(e),
+                }
+            }
+        })
+        .buffer_unordered(5)
+        .map_ok(|neighbor_ids| futures::stream::iter(neighbor_ids))
+        .try_flatten_unordered(10);
+    let mut neighbor_distances = neighbors
+        .map_ok(|id| {
+            let graph = graph.clone();
+            async move {
+                let distance = graph.distance_to(query, id as usize).await?;
+                Ok((id, distance))
+            }
+        })
+        .try_buffer_unordered(10);
+
+    while let Some((id, distance)) = neighbor_distances.try_next().await? {
+        if state.is_visited(id as usize) {
+            continue;
+        }
+        state.push(id as usize, distance);
+    }
+
+    Ok(())
+}
+
+/// Create a stream of search results.
+///
+/// The stream will yield a (row_id, distance) pair.
+///
+/// The stream will not be strictly ordered by distance, but will be approximately
+/// ordered by distance.
 pub(crate) async fn greedy_search_stream(
-    graph: &(dyn Graph + Send + Sync),
+    graph: Arc<dyn Graph + Send + Sync>,
     start: usize,
     query: &[f32],
-) -> Result<BoxStream<'static, (usize, f32)>> {
-
+) -> Result<BoxStream<'static, Result<(usize, f32)>>> {
     let mut state = SearchState::new(None, None);
 
     let dist = graph.distance_to(query, start).await?;
     state.push(start, dist);
-    
-    Ok(futures::stream::repeat_with(move || async {
-        loop {
+
+    let query: Arc<Vec<f32>> = Arc::new(query.to_vec());
+
+    Ok(futures::stream::unfold(state, move |mut state| {
+        let graph = graph.clone();
+        let query = query.clone();
+        async move {
+            // If we have run out of candidates, try loading some more. We limit to
+            // 30 neighbors at a time to avoid too much latency.
+            if state.candidates.is_empty() {
+                match load_next_neighbors(graph, &mut state, &query, 30).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Some((Err(e), state));
+                    }
+                };
+            }
+
             if let Some(candidate) = state.candidates.pop_first() {
                 // If we have candidates, yield those
-                return Ok(Some(candidate))
+                Some((Ok((candidate.1, *candidate.0)), state))
             } else {
-                // Otherwise, find new candidates
-                let current_round_count = state.heap.len();
-                for _ in 0..current_round_count {
-                    if let Some(id) = state.pop() {
-                        state.visit(id);
-                
-                        let neighbors = graph.neighbors(id).await?;
-                        for neighbor_id in neighbors.values() {
-                            let neighbor_id = *neighbor_id as usize;
-                            if state.is_visited(neighbor_id) {
-                                // Already visited.
-                                continue;
-                            }
-                            let dist = graph.distance_to(query, neighbor_id).await?;
-                            state.push(neighbor_id, dist);
-                        }
-                    }
-                }
+                None
             }
         }
     })
-    .buffered(5)
     .boxed())
 }
 
@@ -261,7 +341,14 @@ impl Index for DiskANNIndex {
 #[async_trait]
 impl VectorIndex for DiskANNIndex {
     async fn search(&self, query: &Query) -> Result<RecordBatch> {
-        let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
+        let state = greedy_search(
+            self.graph.as_ref(),
+            0,
+            query.key.values(),
+            query.k,
+            query.k * 2,
+        )
+        .await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new(SCORE_COL, DataType::Float32, false),
@@ -292,7 +379,45 @@ impl VectorIndex for DiskANNIndex {
     }
 
     async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
-        todo!()
+        let stream = greedy_search_stream(self.graph.clone(), 0, query.key.values()).await?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(SCORE_COL, DataType::Float32, false),
+        ]));
+
+        let stream = stream
+            // TODO: make chunk size a parameter
+            .chunks(20)
+            .map(move |results| {
+                let schema = schema.clone();
+
+                let mut row_ids: UInt64Builder = UInt64Builder::with_capacity(results.len());
+                let mut scores: Float32Builder = Float32Builder::with_capacity(results.len());
+
+                for result in results {
+                    match result {
+                        // TODO: why is row_id a usize earlier?
+                        Ok((row_id, score)) => {
+                            row_ids.append_value(row_id as u64);
+                            scores.append_value(score);
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+
+                let row_ids = row_ids.finish();
+                let scores = scores.finish();
+
+                let batch = RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+                )?;
+                Ok(batch)
+            });
+
+        Ok(stream.boxed())
     }
 
     fn is_loadable(&self) -> bool {

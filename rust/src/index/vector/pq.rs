@@ -251,7 +251,33 @@ impl VectorIndex for PQIndex {
     }
 
     async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>> {
-        todo!()
+        if self.code.is_none() || self.row_ids.is_none() {
+            return Err(Error::Index {
+                message: "PQIndex::search: PQ is not initialized".to_string(),
+            });
+        }
+
+        let code = self.code.as_ref().unwrap();
+        let row_ids = self.row_ids.as_ref().unwrap();
+        assert_eq!(code.len() % self.num_sub_vectors, 0);
+
+        let scores = if self.metric_type == MetricType::L2 {
+            self.fast_l2_scores(&query.key)?
+        } else {
+            self.cosine_scores(&query.key)?
+        };
+
+        // No limit
+        let indices = sort_to_indices(&scores, None, None)?;
+        let scores = take(&scores, &indices, None)?;
+        let row_ids = take(row_ids.as_ref(), &indices, None)?;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![scores, row_ids])?;
+        Ok(futures::stream::once(async { Ok(batch) }).boxed())
     }
 
     fn is_loadable(&self) -> bool {

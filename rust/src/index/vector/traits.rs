@@ -50,7 +50,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     async fn search(&self, query: &Query) -> Result<RecordBatch>;
 
     /// Start search for nearest neighbors without a bound.
-    /// 
+    ///
     /// Returns a stream of record batches.
     async fn search_stream(&self, query: &Query) -> Result<BoxStream<Result<RecordBatch>>>;
 
