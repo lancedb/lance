@@ -192,7 +192,8 @@ class LanceDataset(pa.dataset.Dataset):
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors.
+            Get the rows corresponding to the K most similar vectors. ``k`` is
+            optional. See the note below.
                 Example: {
                   "column": <embedding col name>,
                   "q": <query vector as pa.Float32Array>,
@@ -212,9 +213,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         Notes
         -----
-        For now, if BOTH filter and nearest is specified, then:
-        1. nearest is executed first.
-        2. The results are filtered afterwards.
+        If ``k`` is specified in ``nearest``, that limit is applied **before**
+        ``filter``. So if ``k=10``, the first 10 nearest matches are found and
+        then filtered to get a final result, which might have fewer than 10 result.
+        
+        To get the top 10 matches **after** filtering, use ``limit`` and omit ``k``
+        from ``nearest``.
         """
         return self.scanner(
             columns=columns,

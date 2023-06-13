@@ -11,7 +11,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import os
+from itertools import product
 import random
 import string
 import time
@@ -64,6 +64,7 @@ def run(ds, q=None, assert_func=None):
     refine = [None, 1, 2]
     filters = [None, pc.field("price") > 50.0]
     times = []
+    use_k_opts = [True, False]
 
     for columns in project:
         expected_columns = []
@@ -75,32 +76,37 @@ def run(ds, q=None, assert_func=None):
             if c not in expected_columns:
                 expected_columns.append(c)
 
-        for filter_ in filters:
-            for rf in refine:
-                start = time.time()
-                rs = ds.to_table(
-                    columns=columns,
-                    nearest={
-                        "column": "vector",
-                        "q": q,
-                        "k": 15,
-                        "nprobes": 1,
-                        "refine_factor": rf,
-                    },
-                    filter=filter_,
-                )
-                end = time.time()
-                times.append(end - start)
-                assert rs.column_names == expected_columns
-                if filter_ is not None:
-                    inmem = pa.dataset.dataset(rs)
-                    assert len(inmem.to_table(filter=filter_)) == len(rs)
-                else:
-                    assert len(rs) == 15
-                    scores = rs["score"].to_numpy()
-                    assert (scores.max() - scores.min()) > 1e-6
-                    if assert_func is not None:
-                        assert_func(rs)
+        for filter_, rf, use_k in product(filters, refine, use_k_opts):
+            query = {
+                "column": "vector",
+                "q": q,
+                "nprobes": 1,
+                "refine_factor": rf,
+            }
+            if use_k:
+                query["k"] = 15
+                limit = None
+            else:
+                limit = 15
+            start = time.time()
+            rs = ds.to_table(
+                columns=columns,
+                nearest=query,
+                filter=filter_,
+                limit=limit,
+            )
+            end = time.time()
+            times.append(end - start)
+            assert rs.column_names == expected_columns
+            if filter_ is not None:
+                inmem = pa.dataset.dataset(rs)
+                assert len(inmem.to_table(filter=filter_)) == len(rs)
+            else:
+                assert len(rs) == 15
+                scores = rs["score"].to_numpy()
+                assert (scores.max() - scores.min()) > 1e-6
+                if assert_func is not None:
+                    assert_func(rs)
     return times
 
 
