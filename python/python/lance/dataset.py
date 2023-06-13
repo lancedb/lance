@@ -457,6 +457,7 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
+        - **ivf_centroids**: K-mean centroids for IVF clustering.
 
         If `index_type` is "DISKANN", then the following parameters are optional:
 
@@ -523,6 +524,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
             kwargs["num_partitions"] = num_partitions
+            kwargs["num_sub_vectors"] = num_sub_vectors
             if ivf_centroids is not None:
                 # User provided IVF centroids
                 if isinstance(ivf_centroids, np.ndarray):
