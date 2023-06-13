@@ -442,8 +442,9 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`.
+        ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`. Optional.
             A `num_partitions` x `dimension` array of K-mean centroids for IVF clustering.
+            If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         kwargs :
@@ -534,7 +535,7 @@ class LanceDataset(pa.dataset.Dataset):
                             f"IVF centroids must be float32, got {ivf_centroids.dtype}"
                         )
                     ivf_centroids = pa.array(ivf_centroids)
-                # Convert it to RecordBatch because Rust
+                # Convert it to RecordBatch because Rust side only accepts RecordBatch.
                 ivf_centroids_batch = pa.RecordBatch.from_arrays([ivf_centroids], ["_ivf_centroids"])
                 kwargs["ivf_centroids"] = ivf_centroids_batch
 
