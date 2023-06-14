@@ -77,7 +77,6 @@ def run(ds, q=None, assert_func=None):
 
         for filter_ in filters:
             for rf in refine:
-                print(rf)
                 start = time.time()
                 rs = ds.to_table(
                     columns=columns,
