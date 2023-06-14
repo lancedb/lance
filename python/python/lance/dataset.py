@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -101,7 +100,8 @@ class LanceDataset(pa.dataset.Dataset):
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors.
+            Get the rows corresponding to the K most similar vectors. ``k`` is
+            optional. See the note below.
 
             Example: `{
                 "column": <embedding col name>,
@@ -124,10 +124,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         Notes
         -----
-
-        For now, if BOTH filter and nearest is specified, then:
-        1. nearest is executed first.
-        2. The results are filtered afterwards.
+        If ``k`` is specified in ``nearest``, that limit is applied **before**
+        ``filter``. So if ``k=10``, the first 10 nearest matches are found and
+        then filtered to get a final result, which might have fewer than 10 matches.
+        
+        To get the top 10 matches **after** filtering, use ``limit`` and omit ``k``
+        from ``nearest``.
 
         For debugging ANN results, you can choose to not use the index
         even if present by specifying `use_index=False`. For example,
@@ -215,7 +217,7 @@ class LanceDataset(pa.dataset.Dataset):
         -----
         If ``k`` is specified in ``nearest``, that limit is applied **before**
         ``filter``. So if ``k=10``, the first 10 nearest matches are found and
-        then filtered to get a final result, which might have fewer than 10 result.
+        then filtered to get a final result, which might have fewer than 10 matches.
         
         To get the top 10 matches **after** filtering, use ``limit`` and omit ``k``
         from ``nearest``.

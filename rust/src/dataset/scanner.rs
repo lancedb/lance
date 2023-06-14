@@ -461,19 +461,13 @@ impl Scanner {
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
 
+        dbg!(&plan);
+
         Ok(plan)
     }
 
     // KNN search execution node.
     async fn knn(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        // If there's no filter but there is a limit, it's more optimal to specify k
-        let nearest_k = if self.nearest_k.is_none() && self.filter.is_none() && self.limit.is_some()
-        {
-            self.limit.map(|x| x as usize)
-        } else {
-            self.nearest_k
-        };
-
         let Some(q) = self.nearest.as_ref() else {
             return Err(Error::IO{message:"No nearest query".to_string()});
         };
@@ -497,11 +491,11 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, &index, nearest_k)?; // score, _rowid
+            let knn_node = self.ann(q, &index, self.nearest_k)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let mut knn_node = if q.refine_factor.is_some() {
-                self.flat_knn(knn_node_with_vector, q, nearest_k)?
+                self.flat_knn(knn_node_with_vector, q, self.nearest_k)?
             } else {
                 knn_node_with_vector
             }; // vector, score, _rowid
@@ -514,7 +508,7 @@ impl Scanner {
             let vector_scan_projection =
                 Arc::new(self.dataset.schema().project(&[&q.column]).unwrap());
             let scan_node = self.scan(true, vector_scan_projection);
-            Ok(self.flat_knn(scan_node, q, nearest_k)?)
+            Ok(self.flat_knn(scan_node, q, self.nearest_k)?)
         }
     }
 
@@ -1858,20 +1852,21 @@ mod test {
 
         // Handle all combinations of use_index, limit, and filter
         let mut cases = vec![];
-        for use_index in &[true, false] {
-            for limit in &[None, Some(5)] {
-                for filter in &[None, Some("i > 100")] {
+        for use_index in [true, false] {
+            for limit in [None, Some(5)] {
+                for filter in [None, Some("i > 100")] {
                     cases.push(TestCase {
-                        use_index: *use_index,
-                        limit: *limit,
-                        filter: *filter,
+                        use_index,
+                        limit,
+                        filter,
                     });
                 }
             }
         }
 
         for case in cases {
-            // First, build a scanner *with* k for comparison
+            // First, build a scanner *with* k for comparison. The idea is that
+            // scanning with k = None is just like scanning with k = num_rows.
             let mut scanner = dataset.scan();
             scanner
                 .nearest("vec", &Float32Array::from(vec![0.0; 32]), Some(num_rows))

@@ -24,6 +24,7 @@ import pyarrow.compute as pc
 import pytest
 from lance.vector import vec_to_table
 
+np.random.seed(0)
 
 def create_table(nvec=1000, ndim=128):
     mat = np.random.randn(nvec, ndim)
@@ -184,3 +185,26 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
     )["id"].to_numpy()
     assert len(actual) == 10
+
+
+def test_paginate_over_stream_search(dataset):
+    q = np.random.randn(128)
+    full_results = dataset.to_table(
+        nearest={"column": "vector", "q": q}
+    )
+
+    assert full_results.num_rows == 1000
+
+    offset = 0
+    limit = 10
+    while offset < full_results.num_rows:
+        print(offset, limit)
+        results = dataset.to_table(
+            nearest={"column": "vector", "q": q},
+            offset=offset,
+            limit=limit,
+        )
+        expected_num_rows = min([limit, full_results.num_rows - offset])
+        assert results.num_rows == expected_num_rows
+        assert results == full_results.slice(offset, limit)
+        offset += limit

@@ -138,8 +138,7 @@ impl IVFIndex {
         partition_id: usize,
         query: &Query,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
-        let part_query = self.get_partition_query(partition_id, query);
-        let part_query = part_query?;
+        let part_query = self.get_partition_query(partition_id, query)?;
         let part_index = self.get_partition_index(partition_id).await?;
         part_index.search_stream(&part_query).await
     }
@@ -843,11 +842,13 @@ struct MergeStreamItem {
     stream: BoxStream<'static, Result<(usize, f32)>>,
 }
 
+/// A collection of ordered streams. Used to merge into a single ordered stream.
 struct KMergeStream {
     streams: BTreeMap<OrderedFloat<f32>, MergeStreamItem>,
 }
 
 impl KMergeStream {
+    /// Create a new instance of `KMergeStream`. Inserts all the streams into the collection.
     async fn new(streams: Vec<BoxStream<'static, Result<(usize, f32)>>>) -> Result<Self> {
         let mut streams_map = BTreeMap::new();
 
@@ -880,6 +881,7 @@ impl KMergeStream {
         })
     }
 
+    /// Get the next value in the full stream.
     async fn next(&mut self) -> Option<Result<(usize, f32)>> {
         let (score, item) = self.streams.pop_first()?;
         let MergeStreamItem { row_id, mut stream } = item;
@@ -900,6 +902,7 @@ impl KMergeStream {
     }
 }
 
+/// Convert a stream of record batches with row ids and scores into a stream of (row_id, score).
 fn convert_search_stream(
     stream: BoxStream<'static, Result<RecordBatch>>,
 ) -> BoxStream<'static, Result<(usize, f32)>> {
