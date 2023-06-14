@@ -83,7 +83,7 @@ def run(ds, q=None, assert_func=None):
                     nearest={
                         "column": "vector",
                         "q": q,
-                        "k": 10,
+                        "k": 15,
                         "nprobes": 1,
                         "refine_factor": rf,
                     },
@@ -96,7 +96,7 @@ def run(ds, q=None, assert_func=None):
                     inmem = pa.dataset.dataset(rs)
                     assert len(inmem.to_table(filter=filter_)) == len(rs)
                 else:
-                    assert len(rs) == 10
+                    assert len(rs) == 15
                     scores = rs["score"].to_numpy()
                     assert (scores.max() - scores.min()) > 1e-6
                     if assert_func is not None:
@@ -118,7 +118,7 @@ def test_ann_append(tmp_path):
     dataset = dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    new_data = create_table(nvec=100)
+    new_data = create_table(nvec=10)
     dataset = lance.write_dataset(new_data, dataset.uri, mode="append")
     q = new_data["vector"][0].as_py()
 
