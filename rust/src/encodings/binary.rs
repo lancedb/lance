@@ -34,6 +34,7 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
@@ -204,7 +205,12 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        let bytes = self.reader.get_range(start as usize..end as usize).await?;
+        let bytes: Bytes;
+        if start >= end {
+            bytes = Bytes::new();
+        } else {
+            bytes = self.reader.get_range(start as usize..end as usize).await?;
+        }
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(range.len())
