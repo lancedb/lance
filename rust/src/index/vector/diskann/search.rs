@@ -381,7 +381,24 @@ impl VectorIndex for DiskANNIndex {
             Field::new(SCORE_COL, DataType::Float32, false),
         ]));
 
+        let deletion_cache = self.deletion_cache.clone();
         let stream = stream
+            .filter_map(move |result| {
+                let deletion_cache = deletion_cache.clone();
+                async move {
+                    match result {
+                        Ok((row_id, score)) => {
+                            let row_id = row_id as u64;
+                            match deletion_cache.clone().is_deleted(row_id).await {
+                                Ok(false) => Some(Ok((row_id, score))),
+                                Ok(true) => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+            })
             // TODO: make chunk size a parameter
             .chunks(20)
             .map(move |results| {
