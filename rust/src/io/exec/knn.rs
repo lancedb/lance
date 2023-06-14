@@ -167,7 +167,7 @@ impl ExecutionPlan for KNNFlatExec {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
         if !input_schema.field_with_name(SCORE_COL).is_ok() {
-            fields.insert(0, Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
+            fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
         }
 
         Arc::new(Schema::new_with_metadata(

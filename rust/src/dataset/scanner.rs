@@ -461,7 +461,6 @@ impl Scanner {
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
 
-        dbg!(&plan);
         Ok(plan)
     }
 
@@ -1044,7 +1043,7 @@ mod test {
         for case in cases {
             let mut scanner = dataset.scan();
             scanner
-                .nearest("vec", &key, k)
+                .nearest("vec", &key, Some(k))
                 .unwrap()
                 .limit(case.limit, None)
                 .unwrap()

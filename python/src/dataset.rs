@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatchReader, RecordBatch};
+use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
