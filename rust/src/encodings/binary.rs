@@ -206,7 +206,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         };
 
         let bytes: Bytes;
-        if start == end {
+        if start >= end {
             bytes = Bytes::new();
         } else {
             bytes = self.reader.get_range(start as usize..end as usize).await?;
