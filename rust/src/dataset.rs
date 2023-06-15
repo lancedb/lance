@@ -870,10 +870,19 @@ impl Dataset {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,  // default false
+    auto_set_feature_flags: bool,  // default true
     timestamp: Option<SystemTime>, // default None
+}
+
+impl Default for ManifestWriteConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp: None,
+        }
+    }
 }
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
@@ -1102,7 +1111,16 @@ mod tests {
         )
         .unwrap()]);
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        let write_result = Dataset::write(&mut batches, test_uri, None).await;
+        let write_result = Dataset::write(
+            &mut batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+
         assert!(matches!(write_result, Err(Error::NotSupported { .. })));
     }
 
