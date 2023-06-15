@@ -1034,20 +1034,74 @@ mod tests {
     #[tokio::test]
     async fn test_write_manifest() {
         let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();   
-        // TODO: create a manifest without deletion files
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
         // Check it has no flags
+        let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+            .await
+            .unwrap();
+        assert_eq!(manifest.writer_feature_flags, 0);
+        assert_eq!(manifest.reader_feature_flags, 0);
 
-        // Create one with
+        // Create one with deletions
+        dataset.delete("i < 10").await.unwrap();
 
-        // Check it has no flags
+        // Check it set the flag
+        let mut manifest =
+            read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+                .await
+                .unwrap();
+        assert_eq!(
+            manifest.writer_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+        assert_eq!(
+            manifest.reader_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
 
         // Write with custom manifest
+        manifest.writer_feature_flags = 5; // Set another flag
+        manifest.reader_feature_flags = 5;
+        write_manifest_file(
+            dataset.object_store(),
+            &dataset.base,
+            &mut manifest,
+            None,
+            ManifestWriteConfig {
+                auto_set_feature_flags: false,
+                timestamp: None,
+            },
+        )
+        .await
+        .unwrap();
 
         // Check it rejects reading it
+        let read_result = Dataset::open(test_uri).await;
+        assert!(matches!(read_result, Err(Error::NotSupported { .. })));
 
         // Check it rejects writing to it.
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let write_result = Dataset::write(&mut batches, test_uri, None).await;
+        assert!(matches!(write_result, Err(Error::NotSupported { .. })));
     }
 
     #[tokio::test]
