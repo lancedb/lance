@@ -261,7 +261,7 @@ impl Dataset {
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
                 "This dataset cannot be read by this version of Lance. \
-                                           Please upgrade Lance to read this dataset.\n Flags: {}",
+                 Please upgrade Lance to read this dataset.\n Flags: {}",
                 manifest.reader_feature_flags
             );
             return Err(Error::NotSupported {
@@ -353,9 +353,11 @@ impl Dataset {
 
         if let Some(d) = dataset.as_ref() {
             if !can_write_dataset(d.manifest.writer_feature_flags) {
-                let message = format!("This dataset cannot be written by this version of Lance. \
-                                               Please upgrade Lance to write to this dataset.\n Flags: {}",
-                                               d.manifest.writer_feature_flags);
+                let message = format!(
+                    "This dataset cannot be written by this version of Lance. \
+                    Please upgrade Lance to write to this dataset.\n Flags: {}",
+                    d.manifest.writer_feature_flags
+                );
                 return Err(Error::NotSupported {
                     source: message.into(),
                 });
