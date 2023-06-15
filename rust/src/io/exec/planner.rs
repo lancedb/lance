@@ -95,6 +95,12 @@ impl Planner {
             UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
+
+            UnaryOperator::Minus => {
+                let num_literal = format!("-{}", expr.to_string());
+                return self.number(&num_literal);
+            }
+
             _ => {
                 return Err(Error::IO {
                     message: format!("Unary operator '{:?}' is not supported", op),
