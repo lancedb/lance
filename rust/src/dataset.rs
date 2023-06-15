@@ -443,6 +443,7 @@ impl Dataset {
         let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
+        let mut dataset_fragments: Vec<Fragment> = Vec::new();
         let schema = if object_store.exists(&latest_manifest).await? {
             let dataset = Self::open(base_uri).await?;
             version = dataset.version().version + 1;
@@ -450,6 +451,7 @@ impl Dataset {
             if matches!(mode, WriteMode::Append) {
                 // Append mode: inherit indices from previous version.
                 indices = dataset.load_indices().await?;
+                dataset_fragments = dataset.fragments().iter().map(|f| f.clone()).collect();
             }
 
             let dataset_schema = dataset.schema();
@@ -459,7 +461,9 @@ impl Dataset {
             schema.clone()
         };
 
-        let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
+        dataset_fragments.extend(fragments.to_vec());
+
+        let mut manifest = Manifest::new(&schema, Arc::new(dataset_fragments));
         manifest.version = version;
         let duration_since_epoch = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1117,6 +1121,41 @@ mod tests {
         let first_ver = Dataset::checkout(test_uri, 1).await.unwrap();
         assert_eq!(first_ver.version().version, 1);
         assert_eq!(&ArrowSchema::from(first_ver.schema()), schema.as_ref());
+    }
+
+    #[tokio::test]
+    async fn test_commit_append() {
+        let test_dir = tempdir().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams::default();
+        write_params.max_rows_per_file = 40;
+        write_params.max_rows_per_group = 10;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(20, dataset.count_rows().await.unwrap());
+
+        let fragments: Vec<Fragment> = dataset.fragments().iter().map(|f| f.clone()).collect();
+
+        let new_dataset =
+            Dataset::commit(test_uri, dataset.schema(), &fragments, WriteMode::Append)
+                .await
+                .unwrap();
+
+        assert_eq!(40, new_dataset.count_rows().await.unwrap());
     }
 
     #[tokio::test]
