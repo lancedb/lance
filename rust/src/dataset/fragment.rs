@@ -447,7 +447,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{arrow::RecordBatchBuffer, dataset::{WriteParams, WriteMode}};
+    use crate::{
+        arrow::RecordBatchBuffer,
+        dataset::{WriteMode, WriteParams},
+    };
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -550,11 +553,20 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(test_uri, path, idx).await.unwrap();
+            let f = FileFragment::create_from_file(test_uri, path, idx)
+                .await
+                .unwrap();
             fragments.push(f)
         }
 
-        let new_dataset = Dataset::commit(test_uri, schema, &fragments, crate::dataset::WriteMode::Create).await.unwrap();
+        let new_dataset = Dataset::commit(
+            test_uri,
+            schema,
+            &fragments,
+            crate::dataset::WriteMode::Create,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
