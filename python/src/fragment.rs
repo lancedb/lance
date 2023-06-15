@@ -18,10 +18,12 @@ use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
+use lance::dataset::Dataset;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
 use lance::format::pb;
 use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use tokio::runtime::Runtime;
 use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
@@ -29,6 +31,7 @@ use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyBytes, PyDict};
 
 use crate::dataset::get_write_params;
+
 use crate::updater::Updater;
 use crate::Scanner;
 
@@ -48,6 +51,26 @@ impl FileFragment {
 impl FileFragment {
     fn __repr__(&self) -> String {
         format!("LanceFileFragment(id={})", self.fragment.id())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (dataset_uri, datafile_uri, fragment_id))]
+    fn create_from_file(
+        dataset_uri: &str,
+        datafile_uri: &str,
+        fragment_id: usize,
+    ) -> PyResult<FragmentMetadata> {
+        let rt = Runtime::new()?;
+        let dataset = rt.block_on(async {
+            Dataset::open(dataset_uri).await.unwrap()
+        });
+        let schema = dataset.schema();
+        let metadata = rt.block_on(async {
+            LanceFragment::create_from_file(dataset_uri, datafile_uri, fragment_id)
+            .await
+            .map_err(|err| PyIOError::new_err(err.to_string()))
+        })?;
+        Ok(FragmentMetadata::new(metadata, schema.clone()))
     }
 
     #[staticmethod]

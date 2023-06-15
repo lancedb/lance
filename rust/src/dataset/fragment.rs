@@ -96,6 +96,17 @@ impl FileFragment {
         Ok(fragment)
     }
 
+    pub async fn create_from_file(
+        dataset_uri: &str,
+        datafile: &str,
+        fragment_id: usize,
+    ) -> Result<Fragment> {
+        let dataset = Dataset::open(dataset_uri).await.unwrap();
+        let schema = dataset.schema();
+        let fragment = Fragment::with_file(fragment_id as u64, datafile, schema);
+        Ok(fragment)
+    }
+
     pub fn dataset(&self) -> &Dataset {
         self.dataset.as_ref()
     }
@@ -436,7 +447,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
+    use crate::{arrow::RecordBatchBuffer, dataset::{WriteParams, WriteMode}};
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -519,6 +530,33 @@ mod tests {
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from_iter_values(vec![121, 122, 124, 125, 128])
         );
+    }
+
+    #[tokio::test]
+    async fn test_recommit_from_file() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let schema = dataset.schema();
+        let dataset_rows = dataset.count_rows().await.unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for f in dataset.get_fragments() {
+            for file in Fragment::from(f.clone()).files {
+                let p = file.path.clone();
+                paths.push(p.to_string())
+            }
+        }
+
+        let mut fragments: Vec<Fragment> = Vec::new();
+        for (idx, path) in paths.iter().enumerate() {
+            let f = FileFragment::create_from_file(test_uri, path, idx).await.unwrap();
+            fragments.push(f)
+        }
+
+        let new_dataset = Dataset::commit(test_uri, schema, &fragments, crate::dataset::WriteMode::Create).await.unwrap();
+
+        assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
 
     #[tokio::test]
