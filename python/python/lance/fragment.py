@@ -44,15 +44,15 @@ class LanceFragment(pa.dataset.Fragment):
         datafile_uri: Union[str, Path],
         fragment_id: int,
     ) -> LanceFragment:
-        """Get a fragment from the given fragment uri.
+        """Create a fragment from the given datafile uri.
 
-        This can be used if the fragment is loss from dataset.
+        This can be used if the datafile is loss from dataset.
 
         Parameters
         ----------
         dataset_uri: str
             The URI of the dataset.
-        datafile_uri: List[Union[str, Path]]
+        datafile_uri: str
             The URI of the datafile.
         fragment_id: int
             The ID of the fragment.       
