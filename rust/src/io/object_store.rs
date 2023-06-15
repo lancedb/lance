@@ -23,6 +23,7 @@ use ::object_store::{
 };
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
+use snafu::ResultExt;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -223,6 +224,21 @@ impl ObjectStore {
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
     }
+
+    /// Deletes a Path from the underlying storage
+    pub async fn delete(&self, path: &Path) -> Result<()> {
+        self.inner.delete(path).await?;
+        Ok(())
+    }
+
+    /// Deletes a directory from the underlying storage, only supported in local file systems
+    pub async fn remove_dir(&self, path: &Path) -> Result<()> {
+        if self.is_local() {
+            // FIXME cross-platform
+            std::fs::remove_dir(format!("/{}", path.to_string()))?
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +333,24 @@ mod tests {
 
         let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap();
+        let (store, path) = ObjectStore::from_uri(tmp_path).await.unwrap();
+        write_to_file(
+            tmp_dir.path().join("test_file").to_str().unwrap(),
+            "TEST_CONTENT",
+        )
+        .unwrap();
+
+        let exists = store.exists(&path.child("test_file")).await;
+        assert!(exists.ok().unwrap());
+        store.delete(&path.child("test_file")).await.unwrap();
+        let exists = store.exists(&path.child("test_file")).await;
+        assert!(!exists.ok().unwrap());
     }
 
     #[tokio::test]

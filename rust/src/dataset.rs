@@ -21,12 +21,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arrow_array::{
-    cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
+    cast::as_struct_array, Array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
+use async_recursion::async_recursion;
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::TryFutureExt;
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -868,6 +870,52 @@ impl Dataset {
             Ok(vec![])
         }
     }
+
+    /// Delete the Dataset and all its data files.
+    ///
+    /// WARNING This operation cannot be undone.
+    #[async_recursion]
+    pub async fn delete_dataset(&self) -> Result<()> {
+        for fragment in self.fragments().clone().iter() {
+            for data_file in fragment.files.clone() {
+                let path = self.data_dir().child(data_file.path);
+                self.object_store.delete(&path).await.unwrap();
+            }
+        }
+        let curr_version = self.version().version;
+        self.object_store
+            .delete(&self.manifest_file(curr_version))
+            .await?;
+
+        let latest_manifest_path = &self.latest_manifest_path();
+        if self.object_store.exists(latest_manifest_path).await? {
+            self.object_store.delete(latest_manifest_path).await?;
+        }
+
+        // If there are multiple versions, recursivelly call delete
+        let versions = self.versions().await?;
+        if !versions.is_empty() {
+            let other_version = versions.first().unwrap().version;
+            self.checkout_version(other_version)
+                .await?
+                .delete_dataset()
+                .await?
+        }
+
+        let lance_dirs = [self.data_dir(), self.versions_dir(), self.base.clone()];
+        for dir in lance_dirs {
+            let contents = self.object_store.read_dir(self.data_dir()).await;
+            if contents.is_ok() && contents.unwrap().is_empty() {
+                self.object_store.remove_dir(&dir).await?
+            }
+        }
+
+        // let latest = self.versions().await.unwrap().iter().max_by_key(|v| v.version);
+
+        // TODO delete manifest
+        // TODO delete older versions
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -933,7 +981,7 @@ mod tests {
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
-    use crate::{datatypes::Schema, utils::testing::generate_random_array};
+    use crate::{dataset, datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
@@ -947,7 +995,7 @@ mod tests {
     use futures::stream::TryStreamExt;
     use tempfile::tempdir;
 
-    async fn create_file(path: &std::path::Path, mode: WriteMode) {
+    async fn create_file(path: &std::path::Path, mode: WriteMode) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new(
@@ -1021,7 +1069,8 @@ mod tests {
                 .map(|f| f.id)
                 .collect::<Vec<_>>(),
             (0..10).collect::<Vec<_>>()
-        )
+        );
+        actual_ds
     }
 
     #[tokio::test]
@@ -1029,7 +1078,7 @@ mod tests {
         // Appending / Overwriting a dataset that does not exist is treated as Create
         for mode in [WriteMode::Create, WriteMode::Append, Overwrite] {
             let test_dir = tempdir().unwrap();
-            create_file(test_dir.path(), mode).await
+            create_file(test_dir.path(), mode).await;
         }
     }
 
@@ -1717,5 +1766,43 @@ mod tests {
         // Verify fragment is fully gone
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_dataset() {
+        let test_dir = tempdir().unwrap();
+        let test_path = test_dir.path();
+        let test_path = std::path::Path::new("/tmp/test_delete.lance");
+
+        // Create a test dataset with > 1 version
+        let dataset = create_file(test_path, WriteMode::Create).await;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(20..40))],
+        )
+        .unwrap()]);
+
+        let mut write_params = WriteParams::default();
+        write_params.mode = WriteMode::Overwrite;
+
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let dataset = Dataset::write(
+            &mut batches,
+            test_path.to_str().unwrap(),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.versions().await.unwrap().len(), 2);
+
+        // Delete the dataset
+        dataset.delete_dataset().await.unwrap()
     }
 }
