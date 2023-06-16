@@ -72,6 +72,26 @@ message Manifest {
 
   // Optional version tag
   string tag = 8;
+
+  // Feature flags for readers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // read the table. If a reader does not recognize a flag that is set, it
+  // should not attempt to read the dataset.
+  //
+  // Known flags:
+  // * 1: deletion files are present
+  uint64 reader_feature_flags = 9;
+
+  // Feature flags for writers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // write to the dataset. if a writer does not recognize a flag that is set, it
+  // should not attempt to write to the dataset.
+  //
+  // The flags are the same as for reader_feature_flags, although they will not
+  // always apply to both.
+  uint64 writer_feature_flags = 10;
 }
 
 // Auxiliary Data attached to a version.
