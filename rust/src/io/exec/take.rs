@@ -19,7 +19,9 @@ use std::task::{Context, Poll};
 use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
-use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
@@ -228,6 +230,17 @@ impl ExecutionPlan for TakeExec {
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
         self.input.statistics()
+    }
+
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let columns = self
+            .output_schema
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<Vec<_>>();
+
+        write!(f, "LanceTakeExec: projection={:?}", columns)
     }
 }
 

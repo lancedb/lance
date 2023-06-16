@@ -22,7 +22,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{
-    ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
+    DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream, SendableRecordBatchStream,
 };
 use futures::stream::Stream;
 use futures::{stream, Future};
@@ -289,5 +289,21 @@ impl ExecutionPlan for LanceScanExec {
 
     fn statistics(&self) -> datafusion::physical_plan::Statistics {
         todo!()
+    }
+
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // LanceScanExec: uri=dataset/data, projection=["col1", "col2"], row_id=true, ordered=false
+        write!(
+            f,
+            "LanceScanExec: uri={}, projection={:?}, row_id={}, ordered={}",
+            self.dataset.data_dir(),
+            self.projection
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            self.with_row_id,
+            self.ordered_output
+        )
     }
 }

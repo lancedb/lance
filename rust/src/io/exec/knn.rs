@@ -213,6 +213,10 @@ impl ExecutionPlan for KNNFlatExec {
             ..Default::default()
         }
     }
+
+    fn fmt_as(&self, _t: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "KNNFlatExec: k={:?}, metric={}", self.k.unwrap_or(0), self.query.metric_type)
+    }
 }
 
 /// KNN Node from reading a vector index.

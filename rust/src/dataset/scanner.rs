@@ -391,9 +391,19 @@ impl Scanner {
     ///
     ///  - **Use KNN Index (with filter and/or limits)**
     ///
+    /// OLD:
     /// ```ignore
     /// KNNIndex() -> Take(vector) -> FlatRefine()
     ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> (*LimitExec(limit, offset))
+    ///     -> Take(remaining_cols) -> Projection()
+    /// ```
+    ///
+    /// NEW:
+    /// ```ignore
+    /// KNNIndex()
+    ///     -> Take(filtered_cols) -> Filter(expr)
+    ///     -> Take(vector) -> FlatRefine()
     ///     -> (*LimitExec(limit, offset))
     ///     -> Take(remaining_cols) -> Projection()
     /// ```
@@ -448,6 +458,22 @@ impl Scanner {
             plan = Arc::new(FilterExec::try_new(predicates.clone(), plan)?);
         }
 
+        // (for vector search: refine)
+        // if let Some(query) = &self.nearest {
+        //     // limit to refine_factor * k
+        //     let k = if let Some(k) = self.nearest_k {
+        //         k
+        //     } else {
+        //         let sum = self.limit.unwrap_or(0) + self.offset.unwrap_or(0);
+        //         sum as usize
+        //     };
+        //     let refine_factor = query.refine_factor.unwrap_or(1);
+        //     plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(k * refine_factor as usize)));
+
+        //     // refine
+
+        // }
+
         // Stage 3: limit / offset
         if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
             plan = self.limit_node(plan);
@@ -459,7 +485,11 @@ impl Scanner {
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema)?;
         }
-        plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
+
+        let output_arrow_schema: ArrowSchema = output_schema.as_ref().into();
+        if plan.schema().as_ref() != &output_arrow_schema {
+            plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
+        }
 
         Ok(plan)
     }
@@ -1940,5 +1970,98 @@ mod test {
                 assert_eq!(&result["score"], &new_result["score"]);
             }
         }
+    }
+
+    fn assert_plan_equal(plan: &dyn ExecutionPlan, expected_repr: &str) {
+        use datafusion::physical_plan::displayable;
+
+        let plan_display = displayable(plan);
+        let plan_repr = format!("{}", plan_display.indent());
+
+        assert_eq!(&plan_repr, expected_repr);
+    }
+
+    #[tokio::test]
+    async fn test_created_plans() {
+        let test_dir = tempdir().unwrap();
+        let test_dir_path = test_dir.path().canonicalize().unwrap();
+        let test_uri = test_dir_path.to_str().unwrap();
+        // To match the path, need to slice off initial slash.
+        let expected_path = &test_uri[1..];
+        let dataset = create_vector_dataset(test_uri, true).await;
+
+        // Plain scan
+        let plan = Scanner::new(dataset.clone()).create_plan().await.unwrap();
+        let expected = format!("LanceScanExec: uri={expected_path}/data, projection=[\"i\", \"s\", \"vec\"], row_id=false, ordered=true\n");
+        assert_plan_equal(plan.as_ref(), &expected);
+
+        // Scan with filter and limit
+        let plan = Scanner::new(dataset.clone())
+            .filter("i > 10")
+            .unwrap()
+            .limit(Some(10), Some(15))
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        let expected = format!("LanceProjectionExec: projection=[\"i\", \"s\", \"vec\"]\
+        \n  LanceTakeExec: projection=[\"i\", \"_rowid\", \"s\", \"vec\"]\
+        \n    GlobalLimitExec: skip=15, fetch=10\
+        \n      FilterExec: i > 10\
+        \n        LanceScanExec: uri={expected_path}/data, projection=[\"i\"], row_id=true, ordered=true\n");
+        assert_plan_equal(plan.as_ref(), &expected);
+
+        // Scan with filter and projection and with row id
+        let plan = Scanner::new(dataset.clone())
+            .filter("i > 10")
+            .unwrap()
+            .project(&["s"])
+            .unwrap()
+            .with_row_id()
+            .create_plan()
+            .await
+            .unwrap();
+        let expected = format!("LanceProjectionExec: projection=[\"s\", \"_rowid\"]\
+        \n  LanceTakeExec: projection=[\"i\", \"_rowid\", \"s\"]\
+        \n    FilterExec: i > 10\
+        \n      LanceScanExec: uri={expected_path}/data, projection=[\"i\"], row_id=true, ordered=true\n");
+        assert_plan_equal(plan.as_ref(), &expected);
+    
+        // Vector search without index
+        let plan = Scanner::new(dataset.clone())
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), Some(5))
+            .unwrap()
+            .use_index(false)
+            .create_plan()
+            .await
+            .unwrap();
+        let expected = format!("LanceProjectionExec: projection=[\"i\", \"s\", \"vec\", \"score\"]\
+        \n  LanceTakeExec: projection=[\"vec\", \"_rowid\", \"score\", \"i\", \"s\"]\
+        \n    KNNFlatExec: k=5, metric=l2\
+        \n      LanceScanExec: uri={expected_path}/data, projection=[\"vec\"], row_id=true, ordered=true\n");
+        assert_plan_equal(plan.as_ref(), &expected);
+
+        // Vector search without index, plus filter, projection, and limit
+        let plan = Scanner::new(dataset.clone())
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), Some(20))
+            .unwrap()
+            .filter("i > 10")
+            .unwrap()
+            .project(&["vec", "s"])
+            .unwrap()
+            .limit(Some(10), Some(15))
+            .unwrap()
+            .use_index(false)
+            .create_plan()
+            .await
+            .unwrap();
+        let expected = format!("LanceProjectionExec: projection=[\"vec\", \"s\", \"score\"]\
+        \n  LanceTakeExec: projection=[\"vec\", \"_rowid\", \"score\", \"i\", \"s\"]\
+        \n    GlobalLimitExec: skip=15, fetch=10\
+        \n      FilterExec: i > 10\
+        \n        LanceTakeExec: projection=[\"vec\", \"_rowid\", \"score\", \"i\"]\
+        \n          KNNFlatExec: k=20, metric=l2\
+        \n            LanceScanExec: uri={expected_path}/data, projection=[\"vec\"], row_id=true, ordered=true\n");
+        assert_plan_equal(plan.as_ref(), &expected);
     }
 }
