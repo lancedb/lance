@@ -205,12 +205,11 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        let bytes: Bytes;
-        if start >= end {
-            bytes = Bytes::new();
+        let bytes: Bytes = if start >= end {
+            Bytes::new()
         } else {
-            bytes = self.reader.get_range(start as usize..end as usize).await?;
-        }
+            self.reader.get_range(start as usize..end as usize).await?
+        };
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(range.len())

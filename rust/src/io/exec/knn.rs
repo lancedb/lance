@@ -46,7 +46,7 @@ impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
-        KNNFlatStream::from_stream(stream, query)
+        Self::from_stream(stream, query)
     }
 
     fn from_stream(stream: impl RecordBatchStream, query: &Query) -> Self {
@@ -162,7 +162,7 @@ impl ExecutionPlan for KNNFlatExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
-        if !input_schema.field_with_name(SCORE_COL).is_ok() {
+        if input_schema.field_with_name(SCORE_COL).is_err() {
             fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
         }
 
@@ -204,7 +204,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn statistics(&self) -> Statistics {
         Statistics {
-            num_rows: Some(self.query.k as usize),
+            num_rows: Some(self.query.k),
             ..Default::default()
         }
     }

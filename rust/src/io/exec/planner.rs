@@ -214,7 +214,7 @@ impl Planner {
                     TimezoneInfo::None => {}
                     _ => {
                         return Err(Error::IO {
-                            message: format!("Timezone not supported in timestamp"),
+                            message: "Timezone not supported in timestamp".to_string(),
                         })
                     }
                 };
@@ -252,14 +252,12 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => {
-                    return Err(Error::IO {
-                        message: format!(
-                            "Must provide precision and scale for decimal: {:?}",
-                            number_info
-                        ),
-                    })
-                }
+                _ => Err(Error::IO {
+                    message: format!(
+                        "Must provide precision and scale for decimal: {:?}",
+                        number_info
+                    ),
+                }),
             },
             _ => Err(Error::IO {
                 message: format!(
@@ -325,11 +323,9 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Expression '{expr}' is not supported as filter in lance"),
-                })
-            }
+            _ => Err(Error::IO {
+                message: format!("Expression '{expr}' is not supported as filter in lance"),
+            }),
         }
     }
 

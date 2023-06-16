@@ -105,7 +105,7 @@ impl ObjectStore {
         let expanded_path = StdPath::new(&expanded);
 
         if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path.clone())?;
+            std::fs::create_dir_all(expanded_path)?;
         } else if !expanded_path.is_dir() {
             return Err(Error::IO {
                 message: format!("{} is not a lance directory", str_path),
@@ -200,7 +200,7 @@ impl ObjectStore {
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
-        let path = Path::parse(path.to_string())?;
+        let path = Path::parse(&path)?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
         Ok(output
             .common_prefixes

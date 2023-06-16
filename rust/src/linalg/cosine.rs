@@ -97,11 +97,11 @@ mod x86_64 {
     use super::dot;
     use super::norm_l2;
 
-    pub(crate) mod avx {
+    pub mod avx {
         use super::*;
 
         #[inline]
-        pub(crate) fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
+        pub fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
             unsafe {
                 use crate::linalg::x86_64::avx::add_f32_register;
 
@@ -132,11 +132,11 @@ mod aarch64 {
     use super::dot;
     use super::norm_l2;
 
-    pub(crate) mod neon {
+    pub mod neon {
         use super::*;
 
         #[inline]
-        pub(crate) fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
+        pub fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
             unsafe {
                 let len = x.len() / 16 * 16;
                 let buf = [0.0_f32; 4];

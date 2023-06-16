@@ -163,7 +163,7 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-    ) -> Result<FileReader> {
+    ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -228,12 +228,12 @@ impl FileReader {
             page_table,
             fragment_id,
             with_row_id: false,
-            deletion_vector: deletion_vector,
+            deletion_vector,
         })
     }
 
     /// Open one Lance data file for read.
-    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
+    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -387,10 +387,7 @@ async fn read_batch(
     // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
     // so I'm going to just leave deletion filter at this layer for now.
     // We should push this down futurther when we get to statistics-based predicate pushdown
-    let deletion_mask = deletion_vector
-        .clone()
-        .map(|v| v.build_predicate(row_ids.unwrap().iter()))
-        .flatten();
+    let deletion_mask = deletion_vector.and_then(|v| v.build_predicate(row_ids.unwrap().iter()));
 
     match deletion_mask {
         None => Ok(batch),

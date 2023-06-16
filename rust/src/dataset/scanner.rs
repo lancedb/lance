@@ -324,7 +324,7 @@ impl Scanner {
                 message: format!("Column {} not found", q.column),
             })?;
             let vector_field = ArrowField::try_from(vector_field).map_err(|e| Error::IO {
-                message: format!("Failed to convert vector field: {}", e.to_string()),
+                message: format!("Failed to convert vector field: {}", e),
             })?;
             extra_columns.push(vector_field);
             extra_columns.push(ArrowField::new("score", DataType::Float32, false));
@@ -447,7 +447,7 @@ impl Scanner {
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema)?;
         }
-        plan = Arc::new(ProjectionExec::try_new(plan, output_schema.clone())?);
+        plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
 
         Ok(plan)
     }
@@ -477,7 +477,7 @@ impl Scanner {
                 }
             }
 
-            let knn_node = self.ann(q, &index)?; // score, _rowid
+            let knn_node = self.ann(q, index)?; // score, _rowid
             let with_vector = self.dataset.schema().project(&[&q.column])?;
             let knn_node_with_vector = self.take(knn_node, &with_vector)?;
             let mut knn_node = if q.refine_factor.is_some() {

@@ -40,7 +40,7 @@ use crate::{Error, Result};
 use super::row_vertex::RowVertex;
 use super::search::greedy_search;
 
-pub(crate) async fn build_diskann_index(
+pub async fn build_diskann_index(
     dataset: &Dataset,
     column: &str,
     name: &str,
@@ -79,8 +79,9 @@ pub(crate) async fn build_diskann_index(
     let filename = "diskann_graph.lance";
     let graph_file = index_dir.child(filename);
 
-    let mut write_params = WriteGraphParams::default();
-    write_params.batch_size = 2048 * 10;
+    let write_params = WriteGraphParams {
+        batch_size: 2048 * 10,
+    };
     let serde = RowVertexSerDe {};
 
     write_graph(
@@ -318,6 +319,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_index_file(
     dataset: &Dataset,
     column: &str,

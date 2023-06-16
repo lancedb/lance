@@ -108,9 +108,9 @@ impl ColumnVisitor {
     }
 
     fn visit(&mut self, expr: &dyn PhysicalExpr) {
-        expr.as_any()
-            .downcast_ref::<Column>()
-            .map(|c| self.columns.push(c.name.clone()));
+        if let Some(c) = expr.as_any().downcast_ref::<Column>() {
+            self.columns.push(c.name.clone())
+        }
 
         expr.children().iter().for_each(|e| self.visit(e.as_ref()))
     }

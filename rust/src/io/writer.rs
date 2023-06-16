@@ -112,11 +112,7 @@ pub struct FileWriter {
 }
 
 impl FileWriter {
-    pub async fn try_new(
-        object_store: &ObjectStore,
-        path: &Path,
-        schema: Schema,
-    ) -> Result<FileWriter> {
+    pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
         Ok(Self {
             object_writer,
@@ -133,12 +129,7 @@ impl FileWriter {
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         // Copy a list of fields to avoid borrow checker error.
-        let fields = self
-            .schema
-            .fields
-            .iter()
-            .map(|f| f.clone())
-            .collect::<Vec<_>>();
+        let fields = self.schema.fields.clone();
         for field in fields.iter() {
             let arrs = batches
                 .iter()
@@ -202,11 +193,9 @@ impl FileWriter {
                 self.write_large_list_array(field, arrs_ref.as_slice())
                     .await
             }
-            _ => {
-                return Err(Error::Schema {
-                    message: format!("FileWriter::write: unsupported data type: {data_type}"),
-                })
-            }
+            _ => Err(Error::Schema {
+                message: format!("FileWriter::write: unsupported data type: {data_type}"),
+            }),
         }
     }
 
@@ -309,7 +298,7 @@ impl FileWriter {
                 .skip(1)
                 .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i32));
-            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1_usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
@@ -344,7 +333,7 @@ impl FileWriter {
                 .skip(1)
                 .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i64));
-            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1_usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();

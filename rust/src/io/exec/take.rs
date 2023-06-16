@@ -124,7 +124,7 @@ impl RecordBatchStream for Take {
 /// The rows are identified by the inexplicit row IDs from `input` plan.
 ///
 /// The output schema will be the input schema, merged with extra schemas from the dataset.
-pub(crate) struct TakeExec {
+pub struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
 

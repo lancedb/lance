@@ -74,7 +74,7 @@ impl L2 for Float32Array {
     type Output = f32;
 
     #[inline]
-    fn l2(&self, other: &Float32Array) -> f32 {
+    fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
     }
 }
@@ -104,11 +104,11 @@ pub fn l2_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Floa
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
-    pub(crate) mod avx {
+    pub mod avx {
         use super::super::l2_scalar;
 
         #[inline]
-        pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             unsafe {
                 use std::arch::x86_64::*;
                 debug_assert_eq!(from.len(), to.len());

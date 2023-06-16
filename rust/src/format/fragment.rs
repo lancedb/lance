@@ -72,6 +72,8 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
 }
 
+// TODO: should we convert this to TryFrom and surface the error?
+#[allow(clippy::fallible_impl_from)]
 impl From<&pb::DeletionFile> for DeletionFile {
     fn from(value: &pb::DeletionFile) -> Self {
         let file_type = match value.file_type {

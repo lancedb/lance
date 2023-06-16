@@ -18,10 +18,10 @@ mod projection;
 mod scan;
 mod take;
 #[cfg(test)]
-pub(crate) mod testing;
+pub mod testing;
 
 pub use knn::*;
 pub use planner::Planner;
-pub(crate) use projection::ProjectionExec;
+pub use projection::ProjectionExec;
 pub use scan::LanceScanExec;
-pub(crate) use take::TakeExec;
+pub use take::TakeExec;

@@ -241,7 +241,7 @@ impl Dataset {
                     path: uri.clone(),
                     source: box_error(e),
                 },
-                _ => e.into(),
+                _ => e,
             })?;
         // TODO: remove reference to inner.
         let get_result = object_store
@@ -336,7 +336,7 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Dataset::open(uri).await?)
+            Some(Self::open(uri).await?)
         };
 
         // append + input schema different from existing schema = error
@@ -474,7 +474,7 @@ impl Dataset {
         fragments: &[Fragment],
         mode: WriteMode,
     ) -> Result<Self> {
-        let (object_store, base) = ObjectStore::from_uri(&base_uri).await?;
+        let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
         let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
@@ -583,7 +583,7 @@ impl Dataset {
         // Inherit the index, since we are just adding columns.
         let indices = self.load_indices().await?;
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await
@@ -727,7 +727,7 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows().await?;
         let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-        Ok(self.take(&ids[..], &projection).await?)
+        self.take(&ids[..], projection).await
     }
 
     /// Delete rows based on a predicate.
@@ -748,7 +748,7 @@ impl Dataset {
             Some(self.load_indices().await?)
         };
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await

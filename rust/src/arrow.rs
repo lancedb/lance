@@ -364,7 +364,7 @@ impl RecordBatchExt for RecordBatch {
         Ok(Self::try_new(new_schema, new_columns)?)
     }
 
-    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
+    fn merge(&self, other: &Self) -> Result<Self> {
         if self.num_rows() != other.num_rows() {
             return Err(Error::Arrow {
                 message: format!(
@@ -379,7 +379,7 @@ impl RecordBatchExt for RecordBatch {
         merge(&left_struct_array, &right_struct_array).map(|arr| arr.into())
     }
 
-    fn drop_column(&self, name: &str) -> Result<RecordBatch> {
+    fn drop_column(&self, name: &str) -> Result<Self> {
         let mut fields = vec![];
         let mut columns = vec![];
         for i in 0..self.schema().fields.len() {
@@ -407,9 +407,9 @@ impl RecordBatchExt for RecordBatch {
             .and_then(|arr| get_sub_array(arr, &split[1..]))
     }
 
-    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
+    fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
-        project(&struct_array, schema.fields()).map(|arr| RecordBatch::from(arr))
+        project(&struct_array, schema.fields()).map(Self::from)
     }
 }
 
