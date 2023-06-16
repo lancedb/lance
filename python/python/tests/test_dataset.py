@@ -387,3 +387,12 @@ def test_merge_data(tmp_path: Path):
         "c": range(100),
         "d": ["a", "b", "c", "d", "e"] + [None] * 95
     })
+
+def test_delete_dataset(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table1, base_dir)
+    assert ds.count_rows() == 2
+
+    ds.delete_dataset()
+    assert os.path.exists(base_dir) == False

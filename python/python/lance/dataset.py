@@ -554,6 +554,10 @@ class LanceDataset(pa.dataset.Dataset):
         return LanceDataset(self.uri)
 
     def delete_dataset(self):
+        """"Delete the Dataset and all the data contained in it.
+
+        WARNING This operation cannot be undone.
+        """
         return self._ds.delete_dataset()
 
 
