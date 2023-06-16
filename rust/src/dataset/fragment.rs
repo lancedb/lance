@@ -97,13 +97,11 @@ impl FileFragment {
     }
 
     pub async fn create_from_file(
-        dataset_uri: &str,
-        datafile: &str,
+        filename: &str,
+        schema: &Schema,
         fragment_id: usize,
     ) -> Result<Fragment> {
-        let dataset = Dataset::open(dataset_uri).await.unwrap();
-        let schema = dataset.schema();
-        let fragment = Fragment::with_file(fragment_id as u64, datafile, schema);
+        let fragment = Fragment::with_file(fragment_id as u64, filename, schema);
         Ok(fragment)
     }
 

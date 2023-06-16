@@ -19,7 +19,6 @@ use arrow::pyarrow::PyArrowConvert;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::Dataset;
 use lance::datatypes::Schema;
 use lance::format::pb;
 use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
@@ -54,17 +53,22 @@ impl FileFragment {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (dataset_uri, datafile_uri, fragment_id))]
+    #[pyo3(signature = (filename, schema, fragment_id))]
     fn create_from_file(
-        dataset_uri: &str,
-        datafile_uri: &str,
+        filename: &str,
+        schema: &PyAny,
         fragment_id: usize,
     ) -> PyResult<FragmentMetadata> {
         let rt = Runtime::new()?;
-        let dataset = rt.block_on(async { Dataset::open(dataset_uri).await.unwrap() });
-        let schema = dataset.schema();
+        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })?;
         let metadata = rt.block_on(async {
-            LanceFragment::create_from_file(dataset_uri, datafile_uri, fragment_id)
+            LanceFragment::create_from_file(filename, &schema, fragment_id)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })?;
