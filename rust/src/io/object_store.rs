@@ -18,10 +18,10 @@ use std::ops::Deref;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
-use ::object_store::{
-    aws::AmazonS3Builder, memory::InMemory, path::Path, ObjectStore as OSObjectStore,
-};
+use ::object_store::aws::AmazonS3Builder;
+use ::object_store::{memory::InMemory, path::Path, ObjectStore as OSObjectStore};
 use futures::{future, TryFutureExt};
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::ClientOptions;
@@ -85,6 +85,12 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
+async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    Ok(Arc::new(
+        MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
+    ))
+}
+
 impl ObjectStore {
     /// Create a ObjectStore instance from a given URL.
     pub async fn new(uri: &str) -> Result<Self> {
@@ -131,6 +137,12 @@ impl ObjectStore {
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
+            "az" => Ok(Self {
+                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
