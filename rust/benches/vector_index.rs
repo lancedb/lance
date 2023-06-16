@@ -176,11 +176,15 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
             .collect::<Vec<String>>()
             .join(", ");
 
+        let old_num_rows = dataset.count_rows().await.unwrap();
+
         // Delete a few random values
         dataset
             .delete(&format!("id in ({ids_to_delete})"))
             .await
             .unwrap();
+
+        assert_eq!(dataset.count_rows().await.unwrap(), old_num_rows - 20);
 
         dataset
     });
@@ -206,12 +210,15 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
             .collect::<Vec<String>>()
             .join(", ");
 
-        dbg!(&ids_to_delete);
+        let old_num_rows = dataset.count_rows().await.unwrap();
+
         // Delete a few random values
         dataset
             .delete(&format!("id in ({ids_to_delete})"))
             .await
             .unwrap();
+
+        assert_eq!(dataset.count_rows().await.unwrap(), old_num_rows - 20);
 
         dataset
     });
