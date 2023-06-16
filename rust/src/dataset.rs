@@ -893,7 +893,7 @@ impl Dataset {
         Ok(())
     }
 
-    pub async fn delete_dataset_version(&self, version: Version) -> Result<()> {
+    async fn delete_dataset_version(&self, version: Version) -> Result<()> {
         let manifest_path = self.manifest_file(version.version);
         let manifest = read_manifest(&self.object_store, &manifest_path).await?;
 
@@ -971,7 +971,7 @@ mod tests {
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
     use crate::io::deletion::read_deletion_file;
-    use crate::{dataset, datatypes::Schema, utils::testing::generate_random_array};
+    use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
@@ -1792,6 +1792,9 @@ mod tests {
 
         // Delete the dataset
         dataset.delete_dataset().await.unwrap();
+
+        // The folder should be empty - if not it means we forgot to delete some files
+        assert!(std::fs::read_dir(test_path).is_err());
 
         let result = Dataset::open(test_path.to_str().unwrap()).await;
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));

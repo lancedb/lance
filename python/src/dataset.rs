@@ -481,6 +481,14 @@ impl Dataset {
             uri: dataset_uri.to_string(),
         })
     }
+
+    fn delete_dataset(
+        &mut self,
+    ) -> PyResult<()> {
+        self.rt.block_on(async { self.ds.delete_dataset().await })
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl Dataset {

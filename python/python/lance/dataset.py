@@ -553,6 +553,10 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
+    def delete_dataset(self):
+        return self._ds.delete_dataset()
+
+
     @staticmethod
     def _commit(
         base_uri: Union[str, Path],
