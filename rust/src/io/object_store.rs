@@ -234,14 +234,18 @@ impl ObjectStore {
     pub async fn remove_dir(&self, path: &Path) -> Result<()> {
         // Adapted object_storage::LocalFileSystem, since there is no public Path -> std::io::Path
         fn path_to_filesystem(location: &Path) -> Result<PathBuf> {
-            let mut url =  Url::parse("file:///").unwrap();
+            let mut url = Url::parse("file:///").unwrap();
             url.path_segments_mut()
                 .expect("url path")
                 .pop_if_empty()
                 .extend(location.parts());
 
-            url.to_file_path()
-                .map_err(|_| Error::IO { message: format!("Invalid URL {}", url) }.into())
+            url.to_file_path().map_err(|_| {
+                Error::IO {
+                    message: format!("Invalid URL {}", url),
+                }
+                .into()
+            })
         }
 
         // aws / gcloud removes empty folders so there is no need to explicitly delete them

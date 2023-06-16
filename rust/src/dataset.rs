@@ -897,7 +897,7 @@ impl Dataset {
         let manifest_path = self.manifest_file(version.version);
         let manifest = read_manifest(&self.object_store, &manifest_path).await?;
 
-        for fragment in  manifest.fragments.iter() {
+        for fragment in manifest.fragments.iter() {
             for data_file in fragment.files.clone() {
                 let path = self.data_dir().child(data_file.path);
                 self.object_store.delete_file(&path).await.unwrap();
