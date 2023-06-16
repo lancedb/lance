@@ -21,14 +21,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use arrow_array::{
-    cast::as_struct_array, Array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
+    cast::as_struct_array, RecordBatch, RecordBatchReader, StructArray, UInt64Array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
-use async_recursion::async_recursion;
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
-use futures::TryFutureExt;
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -874,34 +872,17 @@ impl Dataset {
     /// Delete the Dataset and all its data files.
     ///
     /// WARNING This operation cannot be undone.
-    #[async_recursion]
     pub async fn delete_dataset(&self) -> Result<()> {
-        for fragment in self.fragments().clone().iter() {
-            for data_file in fragment.files.clone() {
-                let path = self.data_dir().child(data_file.path);
-                self.object_store.delete(&path).await.unwrap();
-            }
+        // Delete  data / manifest files for all versions
+        for version in self.versions().await? {
+            self.delete_dataset_version(version).await?;
         }
-        let curr_version = self.version().version;
-        self.object_store
-            .delete(&self.manifest_file(curr_version))
-            .await?;
 
+        // Delete _latest.manifest file
         let latest_manifest_path = &self.latest_manifest_path();
-        if self.object_store.exists(latest_manifest_path).await? {
-            self.object_store.delete(latest_manifest_path).await?;
-        }
+        self.object_store.delete_file(latest_manifest_path).await?;
 
-        // If there are multiple versions, recursivelly call delete
-        let versions = self.versions().await?;
-        if !versions.is_empty() {
-            let other_version = versions.first().unwrap().version;
-            self.checkout_version(other_version)
-                .await?
-                .delete_dataset()
-                .await?
-        }
-
+        // Delete the directory structure
         let lance_dirs = [self.data_dir(), self.versions_dir(), self.base.clone()];
         for dir in lance_dirs {
             let contents = self.object_store.read_dir(self.data_dir()).await;
@@ -909,11 +890,20 @@ impl Dataset {
                 self.object_store.remove_dir(&dir).await?
             }
         }
+        Ok(())
+    }
 
-        // let latest = self.versions().await.unwrap().iter().max_by_key(|v| v.version);
+    pub async fn delete_dataset_version(&self, version: Version) -> Result<()> {
+        let manifest_path = self.manifest_file(version.version);
+        let manifest = read_manifest(&self.object_store, &manifest_path).await?;
 
-        // TODO delete manifest
-        // TODO delete older versions
+        for fragment in  manifest.fragments.iter() {
+            for data_file in fragment.files.clone() {
+                let path = self.data_dir().child(data_file.path);
+                self.object_store.delete_file(&path).await.unwrap();
+            }
+        }
+        self.object_store.delete_file(&manifest_path).await?;
         Ok(())
     }
 }
@@ -1772,11 +1762,9 @@ mod tests {
     async fn test_delete_dataset() {
         let test_dir = tempdir().unwrap();
         let test_path = test_dir.path();
-        let test_path = std::path::Path::new("/tmp/test_delete.lance");
 
         // Create a test dataset with > 1 version
-        let dataset = create_file(test_path, WriteMode::Create).await;
-
+        create_file(test_path, WriteMode::Create).await;
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "i",
             DataType::Int32,
@@ -1803,6 +1791,9 @@ mod tests {
         assert_eq!(dataset.versions().await.unwrap().len(), 2);
 
         // Delete the dataset
-        dataset.delete_dataset().await.unwrap()
+        dataset.delete_dataset().await.unwrap();
+
+        let result = Dataset::open(test_path.to_str().unwrap()).await;
+        assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
     }
 }

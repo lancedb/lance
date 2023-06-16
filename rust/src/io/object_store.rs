@@ -14,7 +14,7 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use ::object_store::{
@@ -23,7 +23,6 @@ use ::object_store::{
 };
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
-use snafu::ResultExt;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -225,17 +224,29 @@ impl ObjectStore {
         Ok(self.inner.head(path).await?.size)
     }
 
-    /// Deletes a Path from the underlying storage
-    pub async fn delete(&self, path: &Path) -> Result<()> {
+    /// Deletes a file from the underlying storage
+    pub async fn delete_file(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;
         Ok(())
     }
 
     /// Deletes a directory from the underlying storage, only supported in local file systems
     pub async fn remove_dir(&self, path: &Path) -> Result<()> {
+        // Adapted object_storage::LocalFileSystem, since there is no public Path -> std::io::Path
+        fn path_to_filesystem(location: &Path) -> Result<PathBuf> {
+            let mut url =  Url::parse("file:///").unwrap();
+            url.path_segments_mut()
+                .expect("url path")
+                .pop_if_empty()
+                .extend(location.parts());
+
+            url.to_file_path()
+                .map_err(|_| Error::IO { message: format!("Invalid URL {}", url) }.into())
+        }
+
+        // aws / gcloud removes empty folders so there is no need to explicitly delete them
         if self.is_local() {
-            // FIXME cross-platform
-            std::fs::remove_dir(format!("/{}", path.to_string()))?
+            std::fs::remove_dir(path_to_filesystem(path)?)?
         }
         Ok(())
     }
@@ -348,7 +359,7 @@ mod tests {
 
         let exists = store.exists(&path.child("test_file")).await;
         assert!(exists.ok().unwrap());
-        store.delete(&path.child("test_file")).await.unwrap();
+        store.delete_file(&path.child("test_file")).await.unwrap();
         let exists = store.exists(&path.child("test_file")).await;
         assert!(!exists.ok().unwrap());
     }
