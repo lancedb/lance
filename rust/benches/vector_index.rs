@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
+use arrow_array::types::{Float32Type, UInt32Type};
 use arrow_array::{
     cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader,
 };
@@ -162,7 +162,7 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
     let id_col: HashSet<u32> = id_col.iter().map(|id| id.unwrap()).collect();
 
     // Run query
-    c.bench_function(format!("Ivf_PQ_Refine/no-deletions").as_str(), |b| {
+    c.bench_function(format!("Ivf_PQ_Refine/deletions/none").as_str(), |b| {
         b.to_async(&rt).iter(|| run_query(&dataset, &q))
     });
 
@@ -187,7 +187,7 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
 
     // Run query again
     c.bench_function(
-        format!("Ivf_PQ_Refine/irrelevant-deletions").as_str(),
+        format!("Ivf_PQ_Refine/deletions/irrelevant").as_str(),
         |b| {
             b.to_async(&rt).iter(|| async {
                 let results = vector_query(&dataset, &q, 10, 10, 2).await;
@@ -206,6 +206,7 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
             .collect::<Vec<String>>()
             .join(", ");
 
+        dbg!(&ids_to_delete);
         // Delete a few random values
         dataset
             .delete(&format!("id in ({ids_to_delete})"))
@@ -216,7 +217,7 @@ fn bench_ivf_pq_index_deletions(c: &mut Criterion) {
     });
 
     // Run query again
-    c.bench_function(format!("Ivf_PQ_Refine/few-deletions").as_str(), |b| {
+    c.bench_function(format!("Ivf_PQ_Refine/deletions/few").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let results = vector_query(&dataset, &q, 10, 10, 2).await;
             assert!(results.len() >= 1);
