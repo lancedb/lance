@@ -18,7 +18,7 @@ use crate::format::Manifest;
 pub const FLAG_DELETION_FILES: u64 = 1;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest) {
+pub(crate) fn apply_feature_flags(manifest: &mut Manifest) {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -34,11 +34,11 @@ pub fn apply_feature_flags(manifest: &mut Manifest) {
     }
 }
 
-pub fn can_read_dataset(reader_flags: u64) -> bool {
+pub(crate) fn can_read_dataset(reader_flags: u64) -> bool {
     reader_flags <= 1
 }
 
-pub fn can_write_dataset(writer_flags: u64) -> bool {
+pub(crate) fn can_write_dataset(writer_flags: u64) -> bool {
     writer_flags <= 1
 }
 
