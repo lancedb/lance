@@ -55,6 +55,12 @@ pub struct Manifest {
 
     /// An optional string tag for this version
     pub tag: Option<String>,
+
+    /// The reader flags
+    pub reader_feature_flags: u64,
+
+    /// The writer flags
+    pub writer_feature_flags: u64,
 }
 
 impl Manifest {
@@ -67,6 +73,8 @@ impl Manifest {
             index_section: None,
             timestamp_nanos: 0,
             tag: None,
+            reader_feature_flags: 0,
+            writer_feature_flags: 0,
         }
     }
 
@@ -136,6 +144,8 @@ impl From<pb::Manifest> for Manifest {
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
+            reader_feature_flags: p.reader_feature_flags,
+            writer_feature_flags: p.writer_feature_flags,
         }
     }
 }
@@ -161,6 +171,8 @@ impl From<&Manifest> for pb::Manifest {
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
             tag: m.tag.clone().unwrap_or("".to_string()),
+            reader_feature_flags: m.reader_feature_flags,
+            writer_feature_flags: m.writer_feature_flags,
         }
     }
 }
