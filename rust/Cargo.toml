@@ -119,6 +119,10 @@ name = "vector_index"
 harness = false
 
 [[bench]]
+name = "ivf_pq"
+harness = false
+
+[[bench]]
 name = "kmeans"
 harness = false
 
@@ -132,6 +136,9 @@ harness = false
 
 [profile.release]
 strip = true
-opt-level = "s"
 lto = true
 codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+debug = true
