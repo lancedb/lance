@@ -368,6 +368,9 @@ impl KMeans {
                 stddev = last_membership.hist_stddev();
                 kmeans = last_membership.to_kmeans().await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
+                    info!(
+                        "KMeans training: converged at iteration {} / {}, redo={}",
+                        i, params.max_iters, redo);
                     break;
                 }
                 dist_sum = last_dist_sum;

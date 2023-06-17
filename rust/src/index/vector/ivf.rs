@@ -33,6 +33,7 @@ use futures::{
     TryStreamExt,
 };
 use rand::{rngs::SmallRng, SeedableRng};
+use log::info;
 
 use super::{
     opq::train_opq,
@@ -540,7 +541,7 @@ pub async fn build_ivf_pq_index(
     ivf_params: &IvfBuildParams,
     pq_params: &PQBuildParams,
 ) -> Result<()> {
-    println!(
+    info!(
         "Building vector index: IVF{},{}PQ{}, metric={}",
         ivf_params.num_partitions,
         if pq_params.use_opq { "O" } else { "" },
