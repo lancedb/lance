@@ -71,6 +71,7 @@ lru_time_cache = "0.11"
 num-traits = "0.2"
 ordered-float = "3.6.0"
 snafu = "0.7.4"
+log = "0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = "0.3.2"
