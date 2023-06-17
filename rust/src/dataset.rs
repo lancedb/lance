@@ -27,6 +27,7 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use log::warn;
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -324,7 +325,7 @@ impl Dataset {
             && (matches!(params.mode, WriteMode::Append)
                 || matches!(params.mode, WriteMode::Overwrite))
         {
-            eprintln!("Warning: No existing dataset at {uri}, it will be created");
+            warn!("No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
                 ..params
