@@ -142,4 +142,3 @@ codegen-units = 1
 [profile.bench]
 opt-level = 3
 debug = true
-strip = false
