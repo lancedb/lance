@@ -39,7 +39,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
         false,
     )]));
 
-    let num_rows = 100_000;
+    let num_rows = 1_000_000;
     let batch_size = 10_000;
     let batches = RecordBatchBuffer::new(
         (0..(num_rows / batch_size) as i32)
@@ -48,7 +48,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
                     schema.clone(),
                     vec![Arc::new(
                         FixedSizeListArray::try_new(
-                            generate_random_array(num_rows * dim),
+                            generate_random_array(batch_size * dim),
                             dim as i32,
                         )
                         .unwrap(),
@@ -82,22 +82,29 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
 
     let dataset = rt.block_on(async { Dataset::open(&uri).await.unwrap() });
 
-    c.bench_function(format!("CreateIVF256,PQ32(d={})", DIM).as_str(), |b| {
-        b.to_async(&rt).iter(|| async {
-            let params = VectorIndexParams::ivf_pq(256, 8, 96, false, MetricType::L2, 50);
+    let ivf_partition = 256;
+    let pq = 96;
 
-            dataset
-                .create_index(
-                    vec!["vector"].as_slice(),
-                    IndexType::Vector,
-                    None,
-                    &params,
-                    true,
-                )
-                .await
-                .unwrap();
-        });
-    });
+    c.bench_function(
+        format!("CreateIVF{},PQ{}(d={})", ivf_partition, pq, DIM).as_str(),
+        |b| {
+            b.to_async(&rt).iter(|| async {
+                let params =
+                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, false, MetricType::L2, 50);
+
+                dataset
+                    .create_index(
+                        vec!["vector"].as_slice(),
+                        IndexType::Vector,
+                        None,
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+            });
+        },
+    );
 }
 
 #[cfg(target_os = "linux")]
