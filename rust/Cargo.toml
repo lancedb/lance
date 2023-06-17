@@ -119,6 +119,10 @@ name = "vector_index"
 harness = false
 
 [[bench]]
+name = "ivf_pq"
+harness = false
+
+[[bench]]
 name = "kmeans"
 harness = false
 
