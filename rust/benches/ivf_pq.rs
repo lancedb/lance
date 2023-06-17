@@ -14,13 +14,22 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, RecordBatch};
+use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lance::{arrow::*, dataset::WriteMode};
+use lance::{
+    arrow::*,
+    dataset::{WriteMode, WriteParams},
+    index::{
+        vector::{MetricType, VectorIndexParams},
+        DatasetIndexExt, IndexType,
+    },
+    utils::testing::generate_random_array,
+    Dataset,
+};
 use pprof::criterion::{Output, PProfProfiler};
 
-async fn create_file(path: &std::path::Path, dim: usize, mode: WriteMode) {
+async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "vector",
         DataType::FixedSizeList(
@@ -38,27 +47,56 @@ async fn create_file(path: &std::path::Path, dim: usize, mode: WriteMode) {
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![Arc::new(
-                        FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128)
-                            .unwrap(),
+                        FixedSizeListArray::try_new(
+                            generate_random_array(num_rows * dim),
+                            dim as i32,
+                        )
+                        .unwrap(),
                     )],
                 )
                 .unwrap()
             })
             .collect(),
     );
+
+    let mut write_params = WriteParams::default();
+    write_params.max_rows_per_file = num_rows as usize;
+    write_params.max_rows_per_group = batch_size as usize;
+    write_params.mode = mode;
+    let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+    Dataset::write(&mut reader, path.to_str().unwrap(), Some(write_params))
+        .await
+        .unwrap();
 }
 
 fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    rt.block_on(async {
-        create_file(
-            std::path::Path::new("./ivf_pq_768d.lance"),
-            768,
-            WriteMode::Create,
-        )
-        .await
+    const DIM: usize = 768;
+    let uri = format!("./ivf_pq_{}d.lance", DIM);
+    std::fs::remove_dir_all(uri.to_string())
+        .map_or_else(|_| println!("{} not exists", uri), |_| {});
+
+    rt.block_on(async { create_dataset(std::path::Path::new(&uri), DIM, WriteMode::Create).await });
+
+    let dataset = rt.block_on(async { Dataset::open(&uri).await.unwrap() });
+
+    c.bench_function(format!("CreateIVF256,PQ32(d={})", DIM).as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let params = VectorIndexParams::ivf_pq(256, 8, 96, false, MetricType::L2, 50);
+
+            dataset
+                .create_index(
+                    vec!["vector"].as_slice(),
+                    IndexType::Vector,
+                    None,
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+        });
     });
 }
 
