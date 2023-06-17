@@ -66,14 +66,11 @@ impl FileFragment {
         let params = params.unwrap_or_default();
 
         let schema = Schema::try_from(reader.schema().as_ref())?;
-        let object_store = ObjectStore::new(dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let fragment = Fragment::with_file(id as u64, &filename, &schema);
 
-        let full_path = object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(filename.clone());
+        let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
@@ -222,12 +219,7 @@ impl FileFragment {
         let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
 
         let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = self
-            .dataset
-            .object_store
-            .base_path()
-            .child(DATA_DIR)
-            .child(filename.clone());
+        let full_path = self.dataset.data_dir().child(filename.clone());
         let mut writer =
             FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
                 .await?;
@@ -250,9 +242,13 @@ impl FileFragment {
     /// the manifest.
     pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
-        let mut deletion_vector = read_deletion_file(&self.metadata, self.dataset.object_store())
-            .await?
-            .unwrap_or_default();
+        let mut deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .await?
+        .unwrap_or_default();
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
@@ -302,6 +298,7 @@ impl FileFragment {
         }
 
         self.metadata.deletion_file = write_deletion_file(
+            &self.dataset.base,
             self.metadata.id,
             self.dataset.version().version,
             &deletion_vector,

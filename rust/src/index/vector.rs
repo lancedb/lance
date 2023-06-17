@@ -49,6 +49,7 @@ use crate::{
         },
     },
     io::{
+        deletion::LruDeletionVectorStore,
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
@@ -214,6 +215,7 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
         metric_type: MetricType,
         ivf: IvfBuildParams,
@@ -371,6 +373,13 @@ pub(crate) async fn open_index(
         .into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+
+    let deletion_cache = Arc::new(LruDeletionVectorStore::new(
+        Arc::new(dataset.object_store().clone()),
+        object_store.base_path().clone(),
+        dataset.manifest.clone(),
+        100_usize,
+    ));
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
             Some(Stage::Transform(tf)) => {
@@ -421,7 +430,11 @@ pub(crate) async fn open_index(
                     });
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+                last_stage = Some(Arc::new(PQIndex::new(
+                    pq,
+                    metric_type,
+                    deletion_cache.clone(),
+                )));
             }
             Some(Stage::Diskann(diskann_proto)) => {
                 if last_stage.is_some() {
@@ -433,8 +446,15 @@ pub(crate) async fn open_index(
                     });
                 };
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
-                let diskann =
-                    Arc::new(DiskANNIndex::try_new(dataset.clone(), column, &graph_path).await?);
+                let diskann = Arc::new(
+                    DiskANNIndex::try_new(
+                        dataset.clone(),
+                        column,
+                        &graph_path,
+                        deletion_cache.clone(),
+                    )
+                    .await?,
+                );
                 last_stage = Some(diskann);
             }
             _ => {}

@@ -23,6 +23,7 @@ use datafusion::execution::{
     context::SessionState,
     runtime_env::{RuntimeConfig, RuntimeEnv},
 };
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     filter::FilterExec, limit::GlobalLimitExec, union::UnionExec, ExecutionPlan,
     SendableRecordBatchStream,
@@ -348,6 +349,9 @@ impl Scanner {
         let runtime_config = RuntimeConfig::new();
         let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
         let session_state = SessionState::with_config_rt(session_config, runtime_env);
+        // NOTE: we are only executing the first partition here. Therefore, if
+        // the plan has more than one partition, we will be missing data.
+        assert_eq!(plan.output_partitioning().partition_count(), 1);
         Ok(DatasetRecordBatchStream::new(
             plan.execute(0, session_state.task_ctx())?,
         ))
@@ -398,6 +402,8 @@ impl Scanner {
     /// 3. Limit / Offset
     /// 4. Take remaining columns / Projection
     async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        // NOTE: we only support node that have one partition. So any nodes that
+        // produce multiple need to be repartitioned to 1.
         let filter_expr = if let Some(filter) = self.filter.as_ref() {
             let planner = Planner::new(Arc::new(self.dataset.schema().into()));
             let logical_expr = planner.parse_filter(filter)?;
@@ -526,8 +532,20 @@ impl Scanner {
                 );
                 // first we do flat search on just the new data
                 let topk_appended = self.flat_knn(scan_node, q)?;
+
+                // To do a union, we need to make the schemas match. Right now
+                // knn_node: score, _rowid, vector
+                // topk_appended: vector, _rowid, score
+                let new_schema = Schema::try_from(&topk_appended.schema().project(&[2, 1, 0])?)?;
+                let topk_appended = ProjectionExec::try_new(topk_appended, Arc::new(new_schema))?;
+                assert_eq!(topk_appended.schema(), knn_node.schema());
                 // union
-                let unioned = UnionExec::new(vec![topk_appended, knn_node]);
+                let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
+                // Enforce only 1 partition.
+                let unioned = RepartitionExec::try_new(
+                    Arc::new(unioned),
+                    datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+                )?;
                 // then we do a flat search on KNN(new data) + ANN(indexed data)
                 return self.flat_knn(Arc::new(unioned), q);
             }
@@ -661,6 +679,7 @@ mod test {
     use super::*;
     use crate::arrow::*;
     use crate::dataset::WriteMode;
+    use crate::index::vector::diskann::DiskANNParams;
     use crate::index::{
         DatasetIndexExt,
         {vector::VectorIndexParams, IndexType},
@@ -932,6 +951,111 @@ mod test {
                 .copied()
                 .collect();
             assert_eq!(expected_i, actual_i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_knn_with_new_data() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_vector_dataset(test_uri, true).await;
+
+        // Insert more data
+        // (0, 0, ...), (1, 1, ...), (2, 2, ...)
+        let vector_values: Float32Array =
+            (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
+        let new_vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+        let new_data: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
+            Arc::new(StringArray::from_iter_values(
+                (400..410).map(|v| format!("s-{}", v)),
+            )),
+            Arc::new(new_vectors),
+        ];
+        let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().try_into().unwrap());
+        let new_data =
+            RecordBatchBuffer::new(vec![RecordBatch::try_new(schema, new_data).unwrap()]);
+        let mut new_data_reader: Box<dyn RecordBatchReader> = Box::new(new_data);
+        let dataset = Dataset::write(
+            &mut new_data_reader,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Create a bunch of queries
+        let key: Float32Array = [0f32; 32].into_iter().collect();
+        // Set as larger than the number of new rows that aren't in the index to
+        // force result sets to be combined between index and flat scan.
+        let k = 20;
+
+        #[derive(Debug)]
+        struct TestCase {
+            filter: Option<&'static str>,
+            limit: Option<i64>,
+            use_index: bool,
+        }
+
+        let mut cases = vec![];
+        for filter in [Some("i > 100"), None] {
+            for limit in [None, Some(10)] {
+                for use_index in [true, false] {
+                    cases.push(TestCase {
+                        filter,
+                        limit,
+                        use_index,
+                    });
+                }
+            }
+        }
+
+        // Validate them all.
+        for case in cases {
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vec", &key, k)
+                .unwrap()
+                .limit(case.limit, None)
+                .unwrap()
+                .refine(3)
+                .use_index(case.use_index);
+            if let Some(filter) = case.filter {
+                scanner.filter(filter).unwrap();
+            }
+
+            let result = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(result.len() > 0);
+            let result = concat_batches(&result[0].schema(), result.iter()).unwrap();
+
+            if case.filter.is_some() {
+                let result_rows = result.num_rows();
+                let expected_rows = case.limit.unwrap_or(k as i64) as usize;
+                assert!(
+                    result_rows <= expected_rows,
+                    "Expected less than {} rows, got {}",
+                    expected_rows,
+                    result_rows
+                );
+            } else {
+                // Exactly equal count
+                assert_eq!(result.num_rows(), case.limit.unwrap_or(k as i64) as usize);
+            }
+
+            // Top one should be the first value of new data
+            assert_eq!(
+                as_primitive_array::<Int32Type>(result.column(0).as_ref()).value(0),
+                400
+            );
         }
     }
 
@@ -1585,5 +1709,109 @@ mod test {
             .await
             .unwrap();
         concat_batches(&batches[0].schema(), &batches).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ann_with_deletion() {
+        let vec_params = vec![
+            VectorIndexParams::with_diskann_params(MetricType::L2, DiskANNParams::new(10, 1.5, 10)),
+            VectorIndexParams::ivf_pq(4, 8, 2, false, MetricType::L2, 2),
+        ];
+        for params in vec_params {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            // make dataset
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
+                ),
+            ]));
+
+            // vectors are [0, 0, 0, ...] [1, 1, 1, ...]
+            let vector_values: Float32Array = (0..32 * 512).map(|v| (v / 32) as f32).collect();
+            let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+
+            let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..512)),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap()]);
+
+            let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+            let mut dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+
+            dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            let mut scan = dataset.scan();
+            // closest be i = 0..5
+            let key: Float32Array = (0..32).map(|_v| 1.0 as f32).collect();
+            scan.nearest("vec", &key, 5).unwrap();
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            let expected_i = BTreeSet::from_iter(vec![0, 1, 2, 3, 4]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+
+            // DELETE top result and search again
+
+            dataset.delete("i = 1").await.unwrap();
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &key, 5).unwrap();
+
+            let results = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(results.len(), 1);
+            let batch = &results[0];
+
+            // i=1 was deleted, and 5 is the next best, the reset shouldn't change
+            let expected_i = BTreeSet::from_iter(vec![0, 2, 3, 4, 5]);
+            let column_i = batch.column_by_name("i").unwrap();
+            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(expected_i, actual_i);
+        }
     }
 }

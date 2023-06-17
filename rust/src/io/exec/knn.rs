@@ -93,7 +93,7 @@ impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("score", DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 }
@@ -266,7 +266,7 @@ impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(SCORE_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 }
@@ -328,7 +328,7 @@ impl ExecutionPlan for KNNIndexExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(SCORE_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 

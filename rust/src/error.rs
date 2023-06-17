@@ -45,12 +45,16 @@ pub enum Error {
         source: BoxedError,
         // TODO: add backtrace?
     },
+    #[snafu(display("Not supported: {source}"))]
+    NotSupported { source: BoxedError },
     #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
     Internal { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]
     Arrow { message: String },
     #[snafu(display("LanceError(Schema): {message}"))]
     Schema { message: String },
+    #[snafu(display("Not found: {uri}"))]
+    NotFound { uri: String },
     #[snafu(display("LanceError(IO): {message}"))]
     IO { message: String },
     #[snafu(display("LanceError(Index): {message}"))]

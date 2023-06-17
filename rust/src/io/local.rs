@@ -15,6 +15,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
+use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -29,7 +30,7 @@ use bytes::{Bytes, BytesMut};
 use object_store::path::Path;
 
 use super::object_reader::ObjectReader;
-use crate::Result;
+use crate::{Error, Result};
 
 /// [ObjectReader] for local file system.
 pub struct LocalObjectReader {
@@ -46,9 +47,21 @@ pub struct LocalObjectReader {
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
-        let local_path = format!("/{path}");
+        let local_path = if cfg!(windows) {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let file = File::open(local_path).map_err(|e| match e.kind() {
+            ErrorKind::NotFound => Error::NotFound {
+                uri: path.to_string(),
+            },
+            _ => Error::IO {
+                message: e.to_string(),
+            },
+        })?;
         Ok(Box::new(Self {
-            file: File::open(local_path)?.into(),
+            file: Arc::new(file),
             block_size,
             path: path.clone(),
         }))
@@ -73,7 +86,6 @@ impl ObjectReader for LocalObjectReader {
     /// Reads a range of data.
     ///
     /// TODO: return [arrow_buffer::Buffer] to avoid one memory copy from Bytes to Buffer.
-
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {

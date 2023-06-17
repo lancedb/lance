@@ -14,17 +14,14 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
-use std::ops::Deref;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
-use ::object_store::aws::AmazonS3Builder;
-use ::object_store::{memory::InMemory, path::Path, ObjectStore as OSObjectStore};
-use futures::{future, TryFutureExt};
-use object_store::azure::MicrosoftAzureBuilder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::local::LocalFileSystem;
-use object_store::ClientOptions;
+use ::object_store::{
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions,
+    ObjectStore as OSObjectStore,
+};
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -92,21 +89,25 @@ async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
 }
 
 impl ObjectStore {
-    /// Create a ObjectStore instance from a given URL.
-    pub async fn new(uri: &str) -> Result<Self> {
-        if uri == ":memory:" {
-            return Ok(Self::memory());
-        };
-
-        // Try to parse the provided string as a Url, if that fails treat it as local FS
-        future::ready(Url::parse(uri))
-            .map_err(Error::from)
-            .and_then(|url| Self::new_from_url(url))
-            .or_else(|_| future::ready(Self::new_from_path(uri)))
-            .await
+    /// Parse from a string URI.
+    ///
+    /// Returns the ObjectStore instance and the absolute path to the object.
+    pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
+        match Url::parse(uri) {
+            Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
+                // On Windows, the drive is parsed as a scheme
+                Self::new_from_path(uri)
+            }
+            Ok(url) => {
+                let store = Self::new_from_url(url.clone()).await?;
+                let path = Path::from(url.path());
+                Ok((store, path))
+            }
+            Err(_) => Self::new_from_path(uri),
+        }
     }
 
-    fn new_from_path(str_path: &str) -> Result<Self> {
+    fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
         let expanded = tilde(str_path).to_string();
         let expanded_path = StdPath::new(&expanded);
 
@@ -117,13 +118,17 @@ impl ObjectStore {
                 message: format!("{} is not a lance directory", str_path),
             });
         }
+        let expanded_path = expanded_path.canonicalize()?;
 
-        Ok(Self {
-            inner: Arc::new(LocalFileSystem::new_with_prefix(expanded_path.deref())?),
-            scheme: String::from("flle"),
-            base_path: Path::from(object_store::path::DELIMITER),
-            block_size: 4 * 1024, // 4KB block size
-        })
+        Ok((
+            Self {
+                inner: Arc::new(LocalFileSystem::new()),
+                scheme: String::from("file"),
+                base_path: Path::from_absolute_path(&expanded_path)?,
+                block_size: 4 * 1024, // 4KB block size
+            },
+            Path::from_filesystem_path(&expanded_path)?,
+        ))
     }
 
     async fn new_from_url(url: Url) -> Result<Self> {
@@ -146,15 +151,21 @@ impl ObjectStore {
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
-            "file" => Self::new_from_path(url.path()),
+            "file" => Ok(Self::new_from_path(url.path())?.0),
+            "memory" => Ok(Self {
+                inner: Arc::new(InMemory::new()),
+                scheme: String::from("memory"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
             s => Err(Error::IO {
-                message: format!("Unsupported scheme {}", s),
+                message: format!("Unsupported URI scheme: {}", s),
             }),
         }
     }
 
-    /// Create a in-memory object store directly.
-    pub(crate) fn memory() -> Self {
+    /// Create a in-memory object store directly for testing.
+    pub fn memory() -> Self {
         Self {
             inner: Arc::new(InMemory::new()),
             scheme: String::from("memory"),
@@ -180,7 +191,9 @@ impl ObjectStore {
         &self.base_path
     }
 
-    /// Open a file for path
+    /// Open a file for path.
+    ///
+    /// The [path] is absolute path.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
@@ -263,8 +276,8 @@ mod tests {
             tmp_path.clone() + "/./bar/foo.lance",
             tmp_path.clone() + "/bar/foo.lance/../foo.lance",
         ] {
-            let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file"))
+            let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+            let contents = read_from_store(store, &path.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
@@ -282,9 +295,9 @@ mod tests {
         .unwrap();
 
         set_current_dir(StdPath::new(&tmp_path)).expect("Error changing current dir");
-        let store = ObjectStore::new("./bar/foo.lance").await.unwrap();
+        let (store, path) = ObjectStore::from_uri("./bar/foo.lance").await.unwrap();
 
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let contents = read_from_store(store, &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "RELATIVE_URL");
@@ -294,8 +307,8 @@ mod tests {
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
-        let store = ObjectStore::new(uri).await.unwrap();
-        let contents = read_from_store(store, &Path::from("test_file"))
+        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
+        let contents = read_from_store(store, &path.child("test_file"))
             .await
             .unwrap();
         assert_eq!(contents, "TILDE");
@@ -313,9 +326,9 @@ mod tests {
             "read_dir",
         )
         .unwrap();
-        let store = ObjectStore::new(path.to_str().unwrap()).await.unwrap();
+        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
 
-        let sub_dirs = store.read_dir("foo").await.unwrap();
+        let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
     }
 
@@ -355,8 +368,8 @@ mod tests {
             format!("{drive_letter}:/test_folder/test.lance"),
             format!("{drive_letter}:\\test_folder\\test.lance"),
         ] {
-            let store = ObjectStore::new(uri).await.unwrap();
-            let contents = read_from_store(store, &Path::from("test_file"))
+            let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
+            let contents = read_from_store(store, &base.child("test_file"))
                 .await
                 .unwrap();
             assert_eq!(contents, "WINDOWS");

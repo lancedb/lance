@@ -53,19 +53,37 @@ impl Default for Session {
 mod tests {
     use super::*;
 
-    use crate::index::vector::{
-        pq::{PQIndex, ProductQuantizer},
-        MetricType,
+    use crate::{
+        datatypes::Schema,
+        format::Manifest,
+        index::vector::{
+            pq::{PQIndex, ProductQuantizer},
+            MetricType,
+        },
+        io::{deletion::LruDeletionVectorStore, ObjectStore},
     };
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
-    #[test]
-    fn test_disable_index_cache() {
+    #[tokio::test]
+    async fn test_disable_index_cache() {
         let no_cache = Session::new(0);
         assert!(no_cache.index_cache.get("abc").is_none());
 
+        let schema = Schema {
+            fields: vec![],
+            metadata: HashMap::new(),
+        };
+        let manifest = Arc::new(Manifest::new(&schema, Arc::new(vec![])));
+        let object_store = Arc::new(ObjectStore::from_uri("memory://").await.unwrap().0);
+        let deletion_cache = Arc::new(LruDeletionVectorStore::new(
+            object_store.clone(),
+            object_store.as_ref().base_path().clone(),
+            manifest,
+            100,
+        ));
+
         let pq = Arc::new(ProductQuantizer::new(1, 8, 1));
-        let idx = Arc::new(PQIndex::new(pq, MetricType::L2));
+        let idx = Arc::new(PQIndex::new(pq, MetricType::L2, deletion_cache));
         no_cache.index_cache.insert("abc", idx);
 
         assert!(no_cache.index_cache.get("abc").is_none());

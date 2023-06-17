@@ -105,6 +105,7 @@ Currently, Lance supports a growing list of expressions.
 * ``IN``
 * ``LIKE``, ``NOT LIKE``
 * ``regexp_match(column, pattern)``
+* ``CAST``
 
 For example, the following filter string is acceptable:
 
@@ -125,6 +126,70 @@ path must be wrapped in backticks.
 .. warning::
 
   Field names containing periods (``.``) are not supported.
+
+Literals for dates, timestamps, and decimals can be written by writing the string
+value after the type name. For example
+
+  .. code-block:: SQL
+
+    date_col = date '2021-01-01'
+    and timestamp_col = timestamp '2021-01-01 00:00:00'
+    and decimal_col = decimal(8,3) '1.000'
+
+For timestamp columns, the precision can be specified as a number in the type
+parameter. Microsecond precision (6) is the default.
+
+.. list-table::
+    :widths: 30 40
+    :header-rows: 1
+
+    * - SQL
+      - Time unit
+    * - ``timestamp(0)``
+      - Seconds
+    * - ``timestamp(3)``
+      - Milliseconds
+    * - ``timestamp(6)``
+      - Microseconds
+    * - ``timestamp(9)``
+      - Nanoseconds
+
+Lance internally stores data in Arrow format. The mapping from SQL types to Arrow
+is:
+
+.. list-table::
+    :widths: 30 40
+    :header-rows: 1
+
+    * - SQL type
+      - Arrow type
+    * - ``boolean``
+      - ``Boolean``
+    * - ``tinyint`` / ``tinyint unsigned``
+      - ``Int8`` / ``UInt8``
+    * - ``smallint`` / ``smallint unsigned``
+      - ``Int16`` / ``UInt16``
+    * - ``int`` or ``integer`` / ``int unsigned`` or ``integer unsigned``
+      - ``Int32`` / ``UInt32``
+    * - ``bigint`` / ``bigint unsigned``
+      - ``Int64`` / ``UInt64``
+    * - ``float``
+      - ``Float32``
+    * - ``double``
+      - ``Float64``
+    * - ``decimal(precision, scale)``
+      - ``Decimal128``
+    * - ``date``
+      - ``Date32``
+    * - ``timestamp``
+      - ``Timestamp`` (1)
+    * - ``string``
+      - ``Utf8``
+    * - ``binary``
+      - ``Binary``
+
+(1) See precision mapping in previous table.
+
 
 Random read
 ~~~~~~~~~~~
