@@ -138,3 +138,7 @@ harness = false
 strip = true
 lto = true
 codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+debug = true
