@@ -370,7 +370,8 @@ impl KMeans {
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}",
-                        i, params.max_iters, redo);
+                        i, params.max_iters, redo
+                    );
                     break;
                 }
                 dist_sum = last_dist_sum;

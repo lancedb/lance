@@ -32,8 +32,8 @@ use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
 };
-use rand::{rngs::SmallRng, SeedableRng};
 use log::info;
+use rand::{rngs::SmallRng, SeedableRng};
 
 use super::{
     opq::train_opq,
