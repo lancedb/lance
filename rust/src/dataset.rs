@@ -16,6 +16,7 @@
 //!
 
 use std::collections::BTreeMap;
+use std::default::Default;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -30,12 +31,14 @@ use log::warn;
 use object_store::path::Path;
 use uuid::Uuid;
 
+mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod scanner;
 pub mod updater;
 mod write;
 
+use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use crate::arrow::*;
@@ -255,6 +258,18 @@ impl Dataset {
         let bytes = get_result.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+
+        if !can_read_dataset(manifest.reader_feature_flags) {
+            let message = format!(
+                "This dataset cannot be read by this version of Lance. \
+                 Please upgrade Lance to read this dataset.\n Flags: {}",
+                manifest.reader_feature_flags
+            );
+            return Err(Error::NotSupported {
+                source: message.into(),
+            });
+        }
+
         manifest
             .schema
             .load_dictionary(object_reader.as_ref())
@@ -334,6 +349,19 @@ impl Dataset {
                         new: schema,
                     });
                 }
+            }
+        }
+
+        if let Some(d) = dataset.as_ref() {
+            if !can_write_dataset(d.manifest.writer_feature_flags) {
+                let message = format!(
+                    "This dataset cannot be written by this version of Lance. \
+                    Please upgrade Lance to write to this dataset.\n Flags: {}",
+                    d.manifest.writer_feature_flags
+                );
+                return Err(Error::NotSupported {
+                    source: message.into(),
+                });
             }
         }
 
@@ -417,13 +445,19 @@ impl Dataset {
                 .unwrap_or(1),
             None => 1,
         };
-        manifest.set_timestamp(None);
         // Inherit the index if we're just appending rows
         let indices = match (&dataset, &params.mode) {
             (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
             _ => None,
         };
-        write_manifest_file(&object_store, &base, &mut manifest, indices).await?;
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
 
         Ok(Self {
             object_store: Arc::new(object_store),
@@ -462,14 +496,16 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
         manifest.version = version;
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        write_manifest_file(&object_store, &base, &mut manifest, Some(indices)).await?;
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
         Ok(Self {
             object_store: Arc::new(object_store),
             base,
@@ -553,10 +589,16 @@ impl Dataset {
             .await
             .map(|m| m.version + 1)
             .unwrap_or(1);
-        manifest.set_timestamp(None);
         manifest.schema = new_schema;
 
-        write_manifest_file(&self.object_store, &self.base, &mut manifest, Some(indices)).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -712,9 +754,15 @@ impl Dataset {
             .await
             .map(|m| m.version + 1)
             .unwrap_or(1);
-        manifest.set_timestamp(None);
 
-        write_manifest_file(&self.object_store, &self.base, &mut manifest, indices).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -823,6 +871,21 @@ impl Dataset {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ManifestWriteConfig {
+    auto_set_feature_flags: bool,  // default true
+    timestamp: Option<SystemTime>, // default None
+}
+
+impl Default for ManifestWriteConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp: None,
+        }
+    }
+}
+
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
 /// to this version.
 pub(crate) async fn write_manifest_file(
@@ -830,7 +893,13 @@ pub(crate) async fn write_manifest_file(
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
+    config: ManifestWriteConfig,
 ) -> Result<()> {
+    if config.auto_set_feature_flags {
+        apply_feature_flags(manifest);
+    }
+    manifest.set_timestamp(config.timestamp);
+
     let paths = vec![
         manifest_path(base_path, manifest.version),
         latest_manifest_path(base_path),
@@ -972,6 +1041,88 @@ mod tests {
         let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::empty());
         let result = Dataset::write(&mut reader, test_uri, None).await;
         assert!(matches!(result.unwrap_err(), Error::EmptyDataset { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        // Check it has no flags
+        let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+            .await
+            .unwrap();
+        assert_eq!(manifest.writer_feature_flags, 0);
+        assert_eq!(manifest.reader_feature_flags, 0);
+
+        // Create one with deletions
+        dataset.delete("i < 10").await.unwrap();
+
+        // Check it set the flag
+        let mut manifest =
+            read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+                .await
+                .unwrap();
+        assert_eq!(
+            manifest.writer_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+        assert_eq!(
+            manifest.reader_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+
+        // Write with custom manifest
+        manifest.writer_feature_flags = 5; // Set another flag
+        manifest.reader_feature_flags = 5;
+        write_manifest_file(
+            dataset.object_store(),
+            &dataset.base,
+            &mut manifest,
+            None,
+            ManifestWriteConfig {
+                auto_set_feature_flags: false,
+                timestamp: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Check it rejects reading it
+        let read_result = Dataset::open(test_uri).await;
+        assert!(matches!(read_result, Err(Error::NotSupported { .. })));
+
+        // Check it rejects writing to it.
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let write_result = Dataset::write(
+            &mut batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(matches!(write_result, Err(Error::NotSupported { .. })));
     }
 
     #[tokio::test]
