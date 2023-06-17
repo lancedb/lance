@@ -135,7 +135,6 @@ name = "cosine"
 harness = false
 
 [profile.release]
-#strip = true
-#opt-level = "s"
+strip = true
 lto = true
 codegen-units = 1
