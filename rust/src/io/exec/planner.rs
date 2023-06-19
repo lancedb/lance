@@ -97,8 +97,22 @@ impl Planner {
             }
 
             UnaryOperator::Minus => {
-                let num_literal = format!("-{}", expr.to_string());
-                return self.number(&num_literal);
+                use datafusion::logical_expr::lit;
+                match expr {
+                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                        Ok(n) => lit(-n),
+                        Err(_) => lit(-n
+                            .parse::<f64>()
+                            .map_err(|_e| {
+                                Error::IO{
+                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}")
+                                }
+                            })?),
+                    },
+                    _ => {
+                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
+                    }
+                }
             }
 
             _ => {
@@ -353,16 +367,24 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         use crate::datafusion::physical_expr::Column;
-        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, NegativeExpr};
+
 
         Ok(match expr {
             Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
-            Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
+            Expr::BinaryExpr(expr) => {
+                Arc::new(BinaryExpr::new(
                 self.create_physical_expr(expr.left.as_ref())?,
                 expr.op,
                 self.create_physical_expr(expr.right.as_ref())?,
-            )),
+                ))
+            },
+            Expr::Negative(expr) => {
+                Arc::new(NegativeExpr::new(
+                    self.create_physical_expr(expr.as_ref())?
+                ))
+            },
             Expr::IsNotNull(expr) => Arc::new(IsNotNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsTrue(expr) => self.create_physical_expr(expr)?,

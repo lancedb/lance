@@ -112,6 +112,22 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         right: right.clone(),
                     }));
                 }
+                (Expr::Column(l), Expr::BinaryExpr(r)) => {
+                    let Some(field) = schema.field(&l.flat_name()) else {
+                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
+                    };
+                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(Expr::BinaryExpr( BinaryExpr {
+                            left: coerce_expr(&r.left, &field.data_type()).map_err(|e| e).map(Box::new)?,
+                            op: r.op,
+                            right: coerce_expr(&r.right, &field.data_type()).map_err(|e| e).map(Box::new)?
+                        })),
+                    }));
+
+                }
+
                 _ => Ok(expr.clone()),
             }
         }
@@ -121,6 +137,29 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
         }
     }
 }
+
+/// Coerce expression of literals to column type.
+///
+/// Parameters
+///
+/// - *expr*: a datafusion logical expression
+/// - *dtype*: a lance data type
+pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {left, op, right}) => {
+            Ok(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(coerce_expr(left, dtype)?),
+                op: *op,
+                right: Box::new(coerce_expr(right, dtype)?),
+            }))
+        }
+        Expr::Literal(l) => {
+            Ok(resolve_value(&Expr::Literal(l.clone()), &dtype)?)
+        }
+        _ => Ok(expr.clone())
+    }
+}
+
 
 /// Coerce logical expression for filters to bollean.
 ///
