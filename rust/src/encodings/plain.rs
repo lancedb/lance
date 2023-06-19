@@ -479,7 +479,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input: Vec<i64> = Vec::from_iter(1..127 as i64);
+        let input: Vec<i64> = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
@@ -554,7 +554,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input = Vec::from_iter(1..127 as i64);
+        let input = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let list_type =
@@ -576,7 +576,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
+            let values = UInt8Array::from(Vec::from_iter(1..127_u8));
             let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
@@ -591,7 +591,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = Int64Array::from_iter_values(1..=120 as i64);
+            let values = Int64Array::from_iter_values(1..=120_i64);
             let arr =
                 FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
                     .unwrap();
@@ -605,7 +605,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from_iter_values(1..=120 as u8);
+            let values = UInt8Array::from_iter_values(1..=120_u8);
             let arr =
                 FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
                     .unwrap();
@@ -659,7 +659,7 @@ mod tests {
         );
 
         assert_eq!(
-            &decoder.get(5..2).await.unwrap(),
+            &decoder.get(5..5).await.unwrap(),
             &new_empty_array(&DataType::Int32)
         );
 

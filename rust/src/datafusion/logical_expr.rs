@@ -151,7 +151,7 @@ mod tests {
                     &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())))
                 )
             }
-            _ => assert!(false, "Expected BinaryExpr"),
+            _ => unreachable!("Expected BinaryExpr"),
         };
     }
 }

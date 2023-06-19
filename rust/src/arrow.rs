@@ -552,7 +552,7 @@ mod tests {
             ),
         ]);
         let left_batch = RecordBatch::try_new(
-            Arc::new(left_schema.clone()),
+            Arc::new(left_schema),
             vec![
                 Arc::new(a_array.clone()),
                 Arc::new(StructArray::from(vec![(
@@ -572,7 +572,7 @@ mod tests {
             ),
         ]);
         let right_batch = RecordBatch::try_new(
-            Arc::new(right_schema.clone()),
+            Arc::new(right_schema),
             vec![
                 Arc::new(e_array.clone()),
                 Arc::new(StructArray::from(vec![(
@@ -599,7 +599,7 @@ mod tests {
             Field::new("e", DataType::Int32, true),
         ]);
         let merged_batch = RecordBatch::try_new(
-            Arc::new(merged_schema.clone()),
+            Arc::new(merged_schema),
             vec![
                 Arc::new(a_array) as ArrayRef,
                 Arc::new(StructArray::from(vec![

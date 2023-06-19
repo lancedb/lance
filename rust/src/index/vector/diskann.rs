@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-///! DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node
+/// DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node
 ///
 /// Modified from diskann paper. The vector store is backed by the `lance` dataset.
 mod builder;

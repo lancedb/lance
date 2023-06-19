@@ -258,7 +258,7 @@ mod tests {
                         value_range.clone().map(|v| v as f32),
                     )),
                     Arc::new(StringArray::from_iter_values(
-                        value_range.clone().map(|v| format!("str-{v}")),
+                        value_range.map(|v| format!("str-{v}")),
                     )),
                 ];
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
@@ -268,8 +268,10 @@ mod tests {
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut params = WriteParams::default();
-        params.max_rows_per_group = 10;
+        let params = WriteParams {
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(params))
             .await
@@ -292,14 +294,14 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -324,14 +326,14 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -356,13 +358,13 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             false,
             true,
         ));
-        assert!(TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).is_err());
+        assert!(TakeExec::try_new(dataset, input, extra_schema).is_err());
     }
 }

@@ -45,7 +45,7 @@ impl Cosine for [f32] {
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
         #[cfg(target_arch = "aarch64")]
         {
-            return aarch64::neon::cosine_f32(self, other, x_norm);
+            aarch64::neon::cosine_f32(self, other, x_norm)
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -197,19 +197,19 @@ mod tests {
         let y: Float32Array = (100..108).map(|v| v as f32).collect();
         let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from scipy.spatial.distance.cosine
-        assert_relative_eq!(d.value(0), 1.0 - 0.90095701);
+        assert_relative_eq!(d.value(0), 1.0 - 0.900_957);
 
         let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
         let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
         let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
-        assert_relative_eq!(d.value(0), 1.0 - 0.8735806510613104);
+        assert_relative_eq!(d.value(0), 1.0 - 0.873_580_63);
     }
 
     #[test]
     fn test_cosine_not_aligned() {
-        let x: Float32Array = vec![16 as f32, 32 as f32].into();
-        let y: Float32Array = vec![1 as f32, 2 as f32, 4 as f32, 8 as f32].into();
+        let x: Float32Array = vec![16_f32, 32_f32].into();
+        let y: Float32Array = vec![1_f32, 2_f32, 4_f32, 8_f32].into();
         let d = cosine_distance_batch(x.values(), y.values(), 2);
         assert_relative_eq!(d.value(0), 0.0);
         assert_relative_eq!(d.value(1), 0.0);

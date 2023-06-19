@@ -410,7 +410,7 @@ mod tests {
         path: &Path,
         arr: &[&GenericStringArray<O>],
     ) -> Result<usize> {
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut object_writer = ObjectWriter::new(store, path).await.unwrap();
         // Write some garbage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);

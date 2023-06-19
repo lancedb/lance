@@ -474,7 +474,7 @@ mod tests {
         println!("Physical expr: {:#?}", physical_expr);
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(
@@ -518,7 +518,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -546,7 +546,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -574,7 +574,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -601,7 +601,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter((0..10).map(|v| {
                 if v % 3 == 0 {
                     Some(format!("str-{}", v))
@@ -640,7 +640,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(BooleanArray::from_iter(
                 (0..10).map(|v| Some(v % 3 == 0)),
             ))],
@@ -708,8 +708,7 @@ mod tests {
             // Get the thing after 'cast(` but before ' as'.
             let expected_value_str = sql
                 .split("cast(")
-                .skip(1)
-                .next()
+                .nth(1)
                 .unwrap()
                 .split(" as")
                 .next()
@@ -766,7 +765,7 @@ mod tests {
             let planner = Planner::new(schema.clone());
             let expr = planner.parse_filter(sql).unwrap();
 
-            let expected_value_str = sql.split('\'').skip(1).next().unwrap();
+            let expected_value_str = sql.split('\'').nth(1).unwrap();
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {

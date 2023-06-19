@@ -190,7 +190,7 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, &path, &schema);
+        let fragment = Fragment::with_file(123, path, &schema);
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);

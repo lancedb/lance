@@ -148,18 +148,18 @@ mod tests {
 
         let column = Column::new("i".to_string());
         assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Int32);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+        assert!(!column.nullable(schema.as_ref()).unwrap());
 
         let column = Column::new("s".to_string());
         assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+        assert!(column.nullable(schema.as_ref()).unwrap());
 
         let column = Column::new("st.x".to_string());
         assert_eq!(
             column.data_type(schema.as_ref()).unwrap(),
             DataType::Float32
         );
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+        assert!(!column.nullable(schema.as_ref()).unwrap());
     }
 
     #[test]
@@ -178,7 +178,7 @@ mod tests {
         ]));
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(

@@ -370,8 +370,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(vectors)],
         )
-        .unwrap()
-        .into()]);
+        .unwrap()]);
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
         Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
             .await

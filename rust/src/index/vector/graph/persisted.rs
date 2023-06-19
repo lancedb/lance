@@ -414,9 +414,11 @@ mod tests {
         )
         .unwrap()]);
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -426,7 +428,7 @@ mod tests {
         let nodes = (0..total)
             .map(|v| RowVertex {
                 row_id: v as u64,
-                vector: Some(generate_random_array(dim).into()),
+                vector: Some(generate_random_array(dim)),
             })
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);

@@ -461,18 +461,18 @@ mod tests {
                 .collect(),
         );
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 2;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 2,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
 
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
-
-        dataset
+        Dataset::open(test_uri).await.unwrap()
     }
 
     #[tokio::test]
@@ -546,7 +546,7 @@ mod tests {
         )]));
         while let Some(batch) = updater.next().await.unwrap() {
             let input_col = batch.column_by_name("i").unwrap();
-            let result_col: Int32Array = multiply_scalar(&input_col.as_primitive(), 2).unwrap();
+            let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
             let batch =
                 RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
                     .unwrap();
