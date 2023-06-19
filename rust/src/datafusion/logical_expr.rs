@@ -15,6 +15,7 @@
 //! Extends logical expression.
 
 use arrow_schema::DataType;
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BuiltinScalarFunction, Operator};
 use datafusion::scalar::ScalarValue;
 use datafusion::{logical_expr::BinaryExpr, prelude::*};
@@ -153,10 +154,10 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
     match expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction {
+        Expr::ScalarFunction(ScalarFunction {
             fun: BuiltinScalarFunction::RegexpMatch,
             args: _,
-        } => Ok(Expr::IsNotNull(Box::new(expr))),
+        }) => Ok(Expr::IsNotNull(Box::new(expr))),
 
         _ => Ok(expr),
     }
