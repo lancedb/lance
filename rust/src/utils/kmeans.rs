@@ -15,7 +15,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::divide_scalar;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
@@ -217,7 +216,7 @@ impl KMeanMembership {
                             let s = Float32Array::from_iter_values(
                                 sum
                             );
-                            divide_scalar(&s, total).unwrap()
+                            s.unary_mut(|x| x / total).unwrap()
                         } else {
                             warn!("Warning: KMean: cluster {} has no value, does not change centroids.", cluster);
                             prev_centroids.slice(cluster * dimension, dimension)
