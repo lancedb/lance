@@ -15,7 +15,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{add, divide_scalar};
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
@@ -187,13 +186,12 @@ impl KMeanMembership {
     async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
-        let data = self.data.clone();
 
         // New centroids for each cluster
         let means = stream::iter(0..self.k)
             .zip(repeat_with(|| {
                 (
-                    data.clone(),
+                    self.data.clone(),
                     cluster_ids.clone(),
                     self.centroids.clone(),
                 )
@@ -201,19 +199,24 @@ impl KMeanMembership {
             .map(
                 |(cluster, (data, cluster_ids, prev_centroids))| async move {
                     tokio::task::spawn_blocking(move || {
-                        let mut sum = Float32Array::from_iter_values(
-                            (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
-                        );
+                        let mut sum = vec![0.0; dimension];
+                        let data = data.values();
                         let mut total = 0.0;
+                        // Eager group-by cluster id.
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
-                                sum =
-                                    add(&sum, &data.slice(i * dimension, dimension)).unwrap();
+                                // TODO: use simd ADD
+                                for j in 0..dimension {
+                                    sum[j] += data[i * dimension + j];
+                                }
                                 total += 1.0;
                             };
                         }
                         if total > 0.0 {
-                            divide_scalar(&sum, total).unwrap()
+                            let s = Float32Array::from_iter_values(
+                                sum
+                            );
+                            s.unary_mut(|x| x / total).unwrap()
                         } else {
                             warn!("Warning: KMean: cluster {} has no value, does not change centroids.", cluster);
                             prev_centroids.slice(cluster * dimension, dimension)
@@ -222,7 +225,7 @@ impl KMeanMembership {
                     .await
                 },
             )
-            .buffered(16)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
 
