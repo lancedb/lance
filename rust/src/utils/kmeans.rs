@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{divide_scalar};
+use arrow_arith::arithmetic::divide_scalar;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
@@ -206,6 +206,7 @@ impl KMeanMembership {
                         // Eager group-by cluster id.
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
+                                // TODO: use simd ADD
                                 for j in 0..dimension {
                                     sum[j] += data[i * dimension + j];
                                 }
