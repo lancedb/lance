@@ -104,8 +104,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
                             FixedSizeListArray::try_new(
                                 Float32Array::from_iter_values(
                                     (i * batch_size..(i + 2) * batch_size)
-                                        .map(|x| (batch_size + (x - batch_size) / 2) as f32)
-                                        .collect::<Vec<_>>(),
+                                        .map(|x| (batch_size + (x - batch_size) / 2) as f32),
                                 ),
                                 2,
                             )
@@ -113,8 +112,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
                         ),
                         Arc::new(BinaryArray::from_iter_values(
                             (i * batch_size..(i + 1) * batch_size)
-                                .map(|x| format!("blob-{}", x).into_bytes())
-                                .collect::<Vec<_>>(),
+                                .map(|x| format!("blob-{}", x).into_bytes()),
                         )),
                     ],
                 )

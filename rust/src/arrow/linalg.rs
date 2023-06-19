@@ -72,11 +72,10 @@ impl MatrixView {
     /// Randomly initialize a matrix of shape `(num_rows, num_columns)`.
     pub fn random(num_rows: usize, num_columns: usize) -> Self {
         let mut rng = SmallRng::from_entropy();
-        let data = Arc::new(Float32Array::from_iter(
+        let data = Arc::new(Float32Array::from_iter_values(
             (&mut rng)
                 .sample_iter(Standard)
-                .take(num_columns * num_rows)
-                .collect::<Vec<f32>>(),
+                .take(num_columns * num_rows),
         ));
         Self {
             data,

@@ -774,10 +774,7 @@ mod tests {
                     value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from_iter_values(
-                    value_range
-                        .clone()
-                        .map(|n| format!("str-{}", n))
-                        .collect::<Vec<_>>(),
+                    value_range.clone().map(|n| format!("str-{}", n)),
                 )),
                 Arc::new(DictionaryArray::<UInt8Type>::try_new(&keys, &values).unwrap()),
             ];

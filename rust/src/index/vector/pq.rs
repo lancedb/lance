@@ -467,7 +467,7 @@ impl ProductQuantizer {
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
-            Ok::<UInt8Array, Error>(UInt8Array::from_iter_values(builder))
+            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
         })
         .await??;
 

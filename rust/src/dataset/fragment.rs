@@ -517,7 +517,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(vec![121, 122, 124, 125, 128])
+            &Int32Array::from(vec![121, 122, 124, 125, 128])
         );
     }
 
