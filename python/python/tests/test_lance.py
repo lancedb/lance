@@ -11,14 +11,12 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-import os
-import platform
 
 import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.dataset
+import pyarrow.dataset as pa_ds
 import pytest
 from lance.vector import vec_to_table
 
@@ -57,11 +55,11 @@ def test_input_types(tmp_path):
     _check_roundtrip(tbl, uri / "table.lance", tbl)
 
     parquet_uri = str(uri / "dataset.parquet")
-    pa.dataset.write_dataset(tbl, parquet_uri, format="parquet")
-    ds = pa.dataset.dataset(parquet_uri)
+    pa.ds.write_dataset(tbl, parquet_uri, format="parquet")
+    ds = pa_ds.dataset(parquet_uri)
     _check_roundtrip(ds, uri / "ds.lance", tbl)
 
-    scanner = pa.dataset.Scanner.from_dataset(ds)
+    scanner = pa_ds.Scanner.from_dataset(ds)
     _check_roundtrip(scanner, uri / "scanner.lance", tbl)
 
     reader = scanner.to_reader()

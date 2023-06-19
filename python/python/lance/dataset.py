@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -30,7 +29,7 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
-from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .lance import _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -395,8 +394,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a separate Version object is
-            # implemented, expose the precise timestamp (ns) to python.
+            # TODO: python datetime supports only microsecond precision. When a
+            # separate Version object is implemented, expose the precise timestamp
+            # (ns) to python.
             ts_nanos = v["timestamp"]
             v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
                 microseconds=(ts_nanos % 1e9) // 1e3
@@ -443,8 +443,8 @@ class LanceDataset(pa.dataset.Dataset):
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
         ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`. Optional.
-            A `num_partitions` x `dimension` array of K-mean centroids for IVF clustering.
-            If not provided, a new Kmean model will be trained.
+            A `num_partitions` x `dimension` array of K-mean centroids for IVF
+            clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         kwargs :
@@ -484,8 +484,10 @@ class LanceDataset(pa.dataset.Dataset):
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
-        * IVF introduced in `Video Google: a text retrieval approach to object matching in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
-        * `Product quantization for nearest neighbor search <https://hal.inria.fr/inria-00514462v2/document>`_
+        * IVF introduced in `Video Google: a text retrieval approach to object matching
+          in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
+        * `Product quantization for nearest neighbor search
+          <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
         # Only support building index for 1 column from the API aspect, however
@@ -504,7 +506,8 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
-                    f"Vector column {c} must have float32 value type, got {field.type.value_type}"
+                    f"Vector column {c} must have float32 value type, "
+                    f"got {field.type.value_type}"
                 )
 
         if not isinstance(metric, str) or metric.lower() not in [
@@ -533,7 +536,8 @@ class LanceDataset(pa.dataset.Dataset):
                         or ivf_centroids.shape[0] != num_partitions
                     ):
                         raise ValueError(
-                            f"Ivf centroids must be 2D array: (clusters, dim), got {ivf_centroids.shape}"
+                            f"Ivf centroids must be 2D array: (clusters, dim), "
+                            f"got {ivf_centroids.shape}"
                         )
                     if ivf_centroids.dtype != np.float32:
                         raise TypeError(
@@ -562,7 +566,8 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 
-        This method allows users to commit a version of dataset in a distributed environment.
+        This method allows users to commit a version of dataset in a distributed
+        environment.
 
         Examples
         --------
@@ -580,7 +585,9 @@ class LanceDataset(pa.dataset.Dataset):
         >>> # send(new_fragment) to one single master node.
 
         # In master node
-        >>> dataset._create_version_from_fragments(new_schema, [new_fragment1, new_fragment2, ...])
+        >>> dataset._create_version_from_fragments(
+        ...     new_schema,
+        ...     [new_fragment1, new_fragment2, ...])
 
         Parameters
         ----------
@@ -677,7 +684,8 @@ class ScannerBuilder:
                     inner_fragments.append(f._fragment)
                 else:
                     raise TypeError(
-                        f"fragments must be an iterable of LanceFragment. Got {type(f)} instead."
+                        f"fragments must be an iterable of LanceFragment. "
+                        f"Got {type(f)} instead."
                     )
             fragments = inner_fragments
 

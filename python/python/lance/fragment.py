@@ -17,12 +17,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
 import pandas as pd
 import pyarrow as pa
 
-from .lance import _DataFile, _Fragment, _FragmentMetadata
+from .lance import _Fragment
+
+if TYPE_CHECKING:
+    from .dataset import LanceDataset, LanceScanner
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -59,7 +62,8 @@ class LanceFragment(pa.dataset.Fragment):
         data: pa.Table
             The data to write to this fragment.
         schema: pa.Schema, optional
-            The schema of the data. If not specified, the schema will be inferred from the data.
+            The schema of the data. If not specified, the schema will be inferred
+            from the data.
         """
         if isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
@@ -146,8 +150,8 @@ class LanceFragment(pa.dataset.Fragment):
         value_func: Callable.
             A function that takes a RecordBatch as input and returns a RecordBatch.
         columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the value_func.
-            Otherwise, all columns will be passed to the value_func.
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
 
         Returns
         -------
@@ -162,7 +166,8 @@ class LanceFragment(pa.dataset.Fragment):
             new_value = value_func(batch)
             if not isinstance(new_value, pa.RecordBatch):
                 raise ValueError(
-                    f"value_func must return a Pyarrow RecordBatch, got {type(new_value)}"
+                    f"value_func must return a Pyarrow RecordBatch, "
+                    f"got {type(new_value)}"
                 )
 
             updater.update(new_value)
@@ -178,4 +183,3 @@ class LanceFragment(pa.dataset.Fragment):
         """Return the data files of this fragment."""
 
         return self._fragment.data_files()
-

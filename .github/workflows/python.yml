@@ -39,14 +39,19 @@ jobs:
       run: |
         cargo fmt --all -- --check
         cargo clippy --all-features --tests
-    - name: Install linting tools
-      run: |
-        pip install black isort ruff
     - name: lint Python
       run: |
         black --check python
         isort --check-only python
         ruff check python
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y protobuf-compiler libssl-dev
+    - name: Install linting tools
+      run: |
+        pip install black isort ruff
+    
   linux:
     timeout-minutes: 45
     strategy:
