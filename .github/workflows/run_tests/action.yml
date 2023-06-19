@@ -21,4 +21,4 @@ runs:
   - name: Run python doctests
     shell: bash
     working-directory: python
-    run: pytest --doctest-modules python/pylance
+    run: pytest --doctest-modules python/lance

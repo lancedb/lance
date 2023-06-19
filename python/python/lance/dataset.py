@@ -569,26 +569,6 @@ class LanceDataset(pa.dataset.Dataset):
         This method allows users to commit a version of dataset in a distributed
         environment.
 
-        Examples
-        --------
-
-        >>> dataset = lance.dataset("~/sift.lance")
-        >>> fragments = dataset.get_fragments()
-        >>> # Distributed fragment to each worker
-
-        # In worker
-        >>> def my_udf(input: pa.RecordBatch) -> pa.RecordBatch:
-        ...    output = process(input)
-        ...    return output
-
-        >>> new_fragment = fragment.add_column(my_udf, columns=["a", "b"])
-        >>> # send(new_fragment) to one single master node.
-
-        # In master node
-        >>> dataset._create_version_from_fragments(
-        ...     new_schema,
-        ...     [new_fragment1, new_fragment2, ...])
-
         Parameters
         ----------
         new_schema : pa.Schema

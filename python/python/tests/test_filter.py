@@ -184,7 +184,7 @@ def create_table_for_duckdb(nvec=10000, ndim=768):
 def test_duckdb(tmp_path):
     duckdb = pytest.importorskip("duckdb")
     tbl = create_table_for_duckdb()
-    lance.write_dataset(tbl, str(tmp_path))
+    ds = lance.write_dataset(tbl, str(tmp_path))  # noqa: F841
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE id==1000").to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()

@@ -55,7 +55,7 @@ def test_input_types(tmp_path):
     _check_roundtrip(tbl, uri / "table.lance", tbl)
 
     parquet_uri = str(uri / "dataset.parquet")
-    pa.ds.write_dataset(tbl, parquet_uri, format="parquet")
+    pa_ds.write_dataset(tbl, parquet_uri, format="parquet")
     ds = pa_ds.dataset(parquet_uri)
     _check_roundtrip(ds, uri / "ds.lance", tbl)
 

@@ -4,6 +4,7 @@ version = "0.4.21"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 rust-version = "1.65"
+exclude = ["python/lance/conftest.py"]
 
 [lib]
 name = "lance"
