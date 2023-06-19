@@ -123,8 +123,7 @@ impl Dataset {
                     .unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
-                dict.set_item("version", idx.dataset_version)
-                    .unwrap();
+                dict.set_item("version", idx.dataset_version).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
@@ -266,8 +265,7 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         self.rt.block_on(async {
-            self
-                .ds
+            self.ds
                 .count_rows()
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
