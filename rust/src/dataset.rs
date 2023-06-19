@@ -45,6 +45,7 @@ use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::object_cache::ObjectCache;
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
@@ -212,6 +213,15 @@ impl Dataset {
             Arc::new(Session::new(params.index_cache_size))
         };
         Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file, session).await
+    }
+
+    pub fn with_object_cache(&self, object_cache: Arc<dyn ObjectCache>) -> Self {
+        let new_store = self.object_store.with_cache(object_cache);
+        let object_store = Arc::new(new_store);
+        Self {
+            object_store,
+            ..self.clone()
+        }
     }
 
     /// Check out the specified version of this dataset

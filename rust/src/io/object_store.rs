@@ -21,6 +21,7 @@ use ::object_store::{
     aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
     path::Path, ClientOptions, ObjectStore as OSObjectStore,
 };
+use log::warn;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -30,6 +31,7 @@ use crate::io::object_reader::CloudObjectReader;
 use crate::io::object_writer::ObjectWriter;
 
 use super::local::LocalObjectReader;
+use super::object_cache::{ObjectCache, ObjectCaches};
 use super::object_reader::ObjectReader;
 
 /// Wraps [ObjectStore](object_store::ObjectStore)
@@ -40,6 +42,9 @@ pub struct ObjectStore {
     scheme: String,
     base_path: Path,
     block_size: usize,
+
+    // cache
+    cache: Arc<dyn ObjectCache>,
 }
 
 impl std::fmt::Display for ObjectStore {
@@ -119,6 +124,7 @@ impl ObjectStore {
                 scheme: String::from("file"),
                 base_path: Path::from_absolute_path(&expanded_path)?,
                 block_size: 4 * 1024, // 4KB block size
+                cache: ObjectCaches::no_op(),
             },
             Path::from_filesystem_path(&expanded_path)?,
         ))
@@ -131,12 +137,14 @@ impl ObjectStore {
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                cache: ObjectCaches::no_op(),
             }),
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                cache: ObjectCaches::no_op(),
             }),
             "file" => Ok(Self::new_from_path(url.path())?.0),
             "memory" => Ok(Self {
@@ -144,6 +152,7 @@ impl ObjectStore {
                 scheme: String::from("memory"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
+                cache: ObjectCaches::no_op(),
             }),
             s => Err(Error::IO {
                 message: format!("Unsupported URI scheme: {}", s),
@@ -158,6 +167,7 @@ impl ObjectStore {
             scheme: String::from("memory"),
             base_path: Path::from("/"),
             block_size: 64 * 1024,
+            cache: ObjectCaches::no_op(),
         }
     }
 
@@ -178,17 +188,28 @@ impl ObjectStore {
         &self.base_path
     }
 
+    pub fn with_cache(&self, cache: Arc<dyn ObjectCache>) -> Self {
+        if self.is_local() {
+            warn!("Adding cache to local object store has no effect.");
+            return self.clone();
+        }
+        Self {
+            cache,
+            ..self.clone()
+        }
+    }
+
     /// Open a file for path.
     ///
     /// The [path] is absolute path.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self,
-                path.clone(),
-                self.block_size,
-            )?)),
+            _ => {
+                let reader = Box::new(CloudObjectReader::new(self, path.clone(), self.block_size)?);
+
+                Ok(self.cache.to_cached_reader(reader).await)
+            }
         }
     }
 
