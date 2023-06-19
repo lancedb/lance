@@ -38,7 +38,7 @@ jobs:
     - name: Install linting tools
       run: |
         pip install black isort ruff
-    - name: lint Python
+    - name: Lint Python
       run: |
         black --check python
         isort --check-only python
@@ -47,7 +47,7 @@ jobs:
       run: |
         sudo apt update
         sudo apt install -y protobuf-compiler libssl-dev
-    - name: lint Rust
+    - name: Lint Rust
       run: |
         cargo fmt --all -- --check
         cargo clippy --all-features --tests
