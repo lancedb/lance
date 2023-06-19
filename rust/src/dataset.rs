@@ -1663,6 +1663,8 @@ mod tests {
         let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
         let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
+        let original_row_count = dataset.count_rows().await.unwrap();
+
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
 
@@ -1692,6 +1694,10 @@ mod tests {
             deletion_vector.into_iter().collect::<HashSet<_>>(),
             (0..10).chain(90..100).collect::<HashSet<_>>()
         );
+        
+        // The dataset should have 20 fewer rows
+        let row_count = dataset.count_rows().await.unwrap();
+        assert_eq!(row_count, original_row_count - 20);
 
         // Delete more rows
         dataset.delete("i < 20").await.unwrap();
@@ -1709,6 +1715,27 @@ mod tests {
             deletion_vector.into_iter().collect::<HashSet<_>>(),
             (0..20).chain(90..100).collect::<HashSet<_>>()
         );
+        let row_count = dataset.count_rows().await.unwrap();
+        assert_eq!(row_count, original_row_count - 30);
+
+        // Delete with in predicate
+        dataset.delete("i IN (20, 21, 22, 23, 24)").await.unwrap();
+
+        // Verify result
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 35);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..25).chain(90..100).collect::<HashSet<_>>()
+        );
+        let row_count = dataset.count_rows().await.unwrap();
+        assert_eq!(row_count, original_row_count - 35);
 
         // Delete full fragment
         dataset.delete("i >= 20").await.unwrap();
@@ -1716,5 +1743,8 @@ mod tests {
         // Verify fragment is fully gone
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 0);
+        let row_count = dataset.count_rows().await.unwrap();
+        assert_eq!(row_count, 0);
+
     }
 }

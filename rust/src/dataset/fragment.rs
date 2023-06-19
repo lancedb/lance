@@ -174,7 +174,15 @@ impl FileFragment {
         )
         .await?;
 
-        Ok(reader.len())
+        // TODO: should we save the deletion count somewhere so we don't have to
+        // read it here?
+        let deletion_count = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        ).await?.map(|v| v.len()).unwrap_or_default();
+
+        Ok(reader.len() - deletion_count)
     }
 
     /// Take rows from this fragment.

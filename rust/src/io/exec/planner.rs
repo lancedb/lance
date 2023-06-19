@@ -365,14 +365,29 @@ impl Planner {
                 expr,
                 list,
                 negated,
-            } => Arc::new(InListExpr::new(
-                self.create_physical_expr(expr)?,
-                list.iter()
-                    .map(|e| self.create_physical_expr(e))
-                    .collect::<Result<Vec<_>>>()?,
-                *negated,
-                self.schema.as_ref(),
-            )),
+            } => {
+                // It's important that all the values in the list are casted to match
+                // the datatype of the column.
+                let expr = self.create_physical_expr(expr)?;
+                let datatype = expr.data_type(self.schema.as_ref())?;
+
+                let list = list
+                    .iter()
+                    .map(|e| {
+                        let e = self.create_physical_expr(e)?;
+                        if e.data_type(self.schema.as_ref())? == datatype {
+                            Ok(e)
+                        } else {
+                            // Cast the value to the column's datatype
+                            let e: Arc<dyn PhysicalExpr> =
+                                Arc::new(CastExpr::new(e, datatype.clone(), DEFAULT_CAST_OPTIONS));
+                            Ok(e)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Arc::new(InListExpr::new(expr, list, *negated, self.schema.as_ref()))
+            }
             Expr::Like(expr) => Arc::new(LikeExpr::new(
                 expr.negated,
                 true,
