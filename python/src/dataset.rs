@@ -123,13 +123,14 @@ impl Dataset {
                     .unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
-                dict.set_item("version", idx.dataset_version.clone())
+                dict.set_item("version", idx.dataset_version)
                     .unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -265,11 +266,11 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         self.rt.block_on(async {
-            Ok(self
+            self
                 .ds
                 .count_rows()
                 .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?)
+                .map_err(|err| PyIOError::new_err(err.to_string()))
         })
     }
 
@@ -277,7 +278,7 @@ impl Dataset {
         let projection = self_.ds.schema();
         let batch = self_
             .rt
-            .block_on(async { self_.ds.take(&row_indices, &projection).await })
+            .block_on(async { self_.ds.take(&row_indices, projection).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
@@ -444,7 +445,7 @@ impl Dataset {
 
     fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {
         if let Some(fragment) = self_.ds.get_fragment(fragment_id) {
-            Ok(Some(FileFragment::new(fragment.clone())))
+            Ok(Some(FileFragment::new(fragment)))
         } else {
             Ok(None)
         }
