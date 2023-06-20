@@ -275,9 +275,17 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
         }
-        let reader = self.open(&schema).await?;
+        let reader = self.open(&schema);
+        let deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        );
+        let (reader, deletion_vector) = join!(reader, deletion_vector);
+        let reader = reader?;
+        let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Ok(Updater::new(self.clone(), reader))
+        Ok(Updater::new(self.clone(), reader, deletion_vector))
     }
 
     pub(crate) async fn merge(
@@ -649,65 +657,86 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_new_columns() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
-        dataset.validate().await.unwrap();
+        for with_delete in [true, false] {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let mut dataset = create_dataset(test_uri).await;
+            dataset.validate().await.unwrap();
+            assert_eq!(dataset.count_rows().await.unwrap(), 200);
 
-        let fragment = &mut dataset.get_fragments()[0];
-        let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
-        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "double_i",
-            DataType::Int32,
-            true,
-        )]));
-        while let Some(batch) = updater.next().await.unwrap() {
-            let input_col = batch.column_by_name("i").unwrap();
-            let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
-            let batch =
-                RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
-                    .unwrap();
-            updater.update(batch).await.unwrap();
-        }
-        let new_fragment = updater.finish().await.unwrap();
+            if with_delete {
+                dataset.delete("i >= 15 and i < 20").await.unwrap();
+                dataset.validate().await.unwrap();
+                assert_eq!(dataset.count_rows().await.unwrap(), 195);
+            }
 
-        assert_eq!(new_fragment.files.len(), 2);
+            let fragment = &mut dataset.get_fragment(0).unwrap();
+            let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
+            let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "double_i",
+                DataType::Int32,
+                true,
+            )]));
+            while let Some(batch) = updater.next().await.unwrap() {
+                let input_col = batch.column_by_name("i").unwrap();
+                let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
+                let batch = RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![Arc::new(result_col) as ArrayRef],
+                )
+                .unwrap();
+                updater.update(batch).await.unwrap();
+            }
+            let new_fragment = updater.finish().await.unwrap();
 
-        // Scan again
-        let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = Dataset::commit(
-            test_uri,
-            &full_schema,
-            &[new_fragment],
-            crate::dataset::WriteMode::Create,
-        )
-        .await
-        .unwrap();
-        assert_eq!(dataset.version().version, 2);
-        dataset.validate().await.unwrap();
-        let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
+            assert_eq!(new_fragment.files.len(), 2);
 
-        let stream = dataset
-            .scan()
-            .project(&["i", "double_i"])
-            .unwrap()
-            .try_into_stream()
+            // Scan again
+            let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+            let before_version = dataset.version().version;
+            let dataset = Dataset::commit(
+                test_uri,
+                &full_schema,
+                &[new_fragment],
+                crate::dataset::WriteMode::Create,
+            )
             .await
             .unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
 
-        assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
-        let expected_batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("i", DataType::Int32, true),
-                ArrowField::new("double_i", DataType::Int32, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..20)),
-                Arc::new(Int32Array::from_iter_values((0..40).step_by(2))),
-            ],
-        )
-        .unwrap();
-        assert_eq!(batches[0], expected_batch);
+            // We only kept the first fragment of 40 rows
+            assert_eq!(
+                dataset.count_rows().await.unwrap(),
+                if with_delete { 35 } else { 40 }
+            );
+            assert_eq!(dataset.version().version, before_version + 1);
+            dataset.validate().await.unwrap();
+            let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
+
+            let stream = dataset
+                .scan()
+                .project(&["i", "double_i"])
+                .unwrap()
+                .try_into_stream()
+                .await
+                .unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+            assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
+            let max_value_in_batch = if with_delete { 15 } else { 20 };
+            let expected_batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new("double_i", DataType::Int32, true),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..max_value_in_batch)),
+                    Arc::new(Int32Array::from_iter_values(
+                        (0..(2 * max_value_in_batch)).step_by(2),
+                    )),
+                ],
+            )
+            .unwrap();
+            assert_eq!(batches[0], expected_batch);
+        }
     }
 }

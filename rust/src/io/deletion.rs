@@ -43,6 +43,14 @@ impl DeletionVector {
         }
     }
 
+    pub fn contains(&self, i: u32) -> bool {
+        match self {
+            Self::NoDeletions => false,
+            Self::Set(set) => set.contains(&i),
+            Self::Bitmap(bitmap) => bitmap.contains(i),
+        }
+    }
+
     pub fn contains_range(&self, mut range: Range<u32>) -> bool {
         match self {
             Self::NoDeletions => range.is_empty(),
