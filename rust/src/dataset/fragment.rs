@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use uuid::Uuid;
 
 use super::hash_joiner::HashJoiner;
@@ -153,8 +153,28 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    ///
     pub async fn count_rows(&self) -> Result<usize> {
+        let total_rows = self.local_row_id_limit();
+
+        let deletion_count = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default());
+
+        let (total_rows, deletion_count) =
+            futures::future::try_join(total_rows, deletion_count).await?;
+
+        Ok(total_rows - deletion_count)
+    }
+
+    /// Get the value that all local row ids (first 32-bits of _rowid) must
+    /// be less than.
+    ///
+    /// If there are no deleted rows, this is equal to the number of rows in the
+    /// fragment.
+    pub async fn local_row_id_limit(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
@@ -591,5 +611,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(batches[0], expected_batch);
+    }
+
+    #[tokio::test]
+    async fn test_count_rows() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let fragment = dataset.get_fragments().pop().unwrap();
+
+        assert_eq!(fragment.count_rows().await.unwrap(), 40);
+        assert_eq!(fragment.local_row_id_limit().await.unwrap(), 40);
+
+        let fragment = fragment
+            .delete("i >= 160 and i <= 172")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(fragment.count_rows().await.unwrap(), 27);
+        assert_eq!(fragment.local_row_id_limit().await.unwrap(), 40);
     }
 }
