@@ -29,6 +29,7 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
+from .lance import __version__ as __version__
 from .lance import _Dataset, _Scanner, _write_dataset
 
 

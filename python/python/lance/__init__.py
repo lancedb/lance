@@ -18,13 +18,8 @@ from typing import Optional, Union
 
 import pandas as pd
 
-from .dataset import (
-    LanceDataset,
-    LanceScanner,
-    __version__,
-    _FragmentMetadata,
-    write_dataset,
-)
+from .dataset import LanceDataset, LanceScanner, __version__, write_dataset
+from .fragment import _FragmentMetadata
 from .util import sanitize_ts
 
 __all__ = [

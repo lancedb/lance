@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 import pandas as pd
 import pyarrow as pa
 
-from .lance import __version__ as __version__
 from .lance import _Fragment
 from .lance import _FragmentMetadata as _FragmentMetadata
 
