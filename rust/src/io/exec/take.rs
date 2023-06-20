@@ -21,6 +21,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
@@ -35,7 +36,7 @@ use crate::{arrow::*, Error};
 /// It uses the `_rowid` to random access on [Dataset] to gather the final results.
 pub struct Take {
     rx: Receiver<Result<RecordBatch>>,
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 
     output_schema: SchemaRef,
 }
@@ -98,7 +99,7 @@ impl Take {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
             output_schema,
         }
     }
@@ -108,7 +109,28 @@ impl Stream for Take {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 

@@ -589,7 +589,7 @@ mod tests {
     async fn test_fragment_take() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri).await;
         let fragment = &dataset.get_fragments()[3];
 
         let batch = fragment
@@ -599,6 +599,19 @@ mod tests {
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 122, 124, 125, 128])
+        );
+
+        dataset.delete("i in (122, 124)").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Cannot get rows 2 and 4 anymore
+        let batch = fragment
+            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 125, 128])
         );
     }
 
