@@ -869,6 +869,16 @@ impl Dataset {
             Ok(vec![])
         }
     }
+
+    pub async fn validate(&self) -> Result<()> {
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.validate().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

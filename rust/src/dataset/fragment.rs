@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
-use futures::{StreamExt, TryFutureExt, TryStreamExt};
+use futures::future::try_join_all;
+use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use object_store::path::Path;
 use uuid::Uuid;
 
 use super::hash_joiner::HashJoiner;
@@ -29,7 +31,7 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::deletion::{read_deletion_file, write_deletion_file};
+use crate::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
@@ -154,7 +156,7 @@ impl FileFragment {
 
     /// Count the rows in this fragment.
     pub async fn count_rows(&self) -> Result<usize> {
-        let total_rows = self.local_row_id_limit();
+        let total_rows = self.fragment_length();
 
         let deletion_count = read_deletion_file(
             &self.dataset.base,
@@ -169,12 +171,11 @@ impl FileFragment {
         Ok(total_rows - deletion_count)
     }
 
-    /// Get the value that all local row ids (first 32-bits of _rowid) must
-    /// be less than.
+    /// Get the number of physical rows in the fragment. This includes deleted rows.
     ///
     /// If there are no deleted rows, this is equal to the number of rows in the
     /// fragment.
-    pub async fn local_row_id_limit(&self) -> Result<usize> {
+    pub async fn fragment_length(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
@@ -195,6 +196,64 @@ impl FileFragment {
         .await?;
 
         Ok(reader.len())
+    }
+
+    /// Validate the fragment
+    ///
+    /// Verifies:
+    /// * All data files exist and have the same length
+    /// * Deletion file exists and has rowids in the correct range
+    pub async fn validate(&self) -> Result<()> {
+        let data_file_paths: Vec<Path> = self
+            .metadata
+            .files
+            .iter()
+            .map(|data_file| self.dataset.data_dir().child(data_file.path.as_str()))
+            .collect::<Vec<_>>();
+        let get_lengths = data_file_paths.iter().map(|path| {
+            let reader = FileReader::try_new_with_fragment(
+                &self.dataset.object_store,
+                path,
+                self.id() as u64,
+                None,
+            );
+            reader.map_ok(|r| r.len())
+        });
+        let get_lengths = try_join_all(get_lengths);
+
+        let deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        );
+
+        let (get_lengths, deletion_vector) = join!(get_lengths, deletion_vector);
+
+        let get_lengths = get_lengths?;
+        let expected_length = get_lengths.first().unwrap_or(&0);
+        for (length, path) in get_lengths.iter().zip(data_file_paths.into_iter()) {
+            if length != expected_length {
+                return Err(Error::corrupt_file(path, "data file has incorrect length"));
+            }
+        }
+
+        if let Some(deletion_vector) = deletion_vector? {
+            for row_id in deletion_vector {
+                if row_id >= *expected_length as u32 {
+                    let deletion_file_meta = self.metadata.deletion_file.clone().unwrap();
+                    return Err(Error::corrupt_file(
+                        deletion_file_path(
+                            &self.dataset.base,
+                            self.metadata.id,
+                            &deletion_file_meta,
+                        ),
+                        "deletion vector contains row id that is out of range",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Take rows from this fragment.
@@ -297,14 +356,16 @@ impl FileFragment {
 
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
-        let num_rows = self.count_rows().await?;
-        if deletion_vector.len() == num_rows && deletion_vector.contains_range(0..num_rows as u32) {
+        let fragment_length = self.fragment_length().await?;
+        if deletion_vector.len() == fragment_length
+            && deletion_vector.contains_range(0..fragment_length as u32)
+        {
             return Ok(None);
-        } else if deletion_vector.len() >= num_rows {
+        } else if deletion_vector.len() >= fragment_length {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
                 .into_iter()
-                .filter(|x| *x >= num_rows as u32)
+                .filter(|x| *x >= fragment_length as u32)
                 .take(5)
                 .collect();
             return Err(Error::Internal {
@@ -312,7 +373,7 @@ impl FileFragment {
                     "Deletion vector includes rows that aren't in the fragment. \
                 Fragment length: {}; Deletion vector length: {}; \
                 Examples: {:?}",
-                    num_rows, dv_len, examples
+                    fragment_length, dv_len, examples
                 ),
             });
         }
@@ -546,9 +607,21 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
-        let fragment = &dataset.get_fragments()[3];
+        let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
+        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+
+        let fragment = fragment
+            .delete("i >= 160 and i <= 172")
+            .await
+            .unwrap()
+            .unwrap();
+
+        fragment.validate().await.unwrap();
+
+        assert_eq!(fragment.count_rows().await.unwrap(), 27);
+        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
     }
 
     #[tokio::test]
@@ -556,6 +629,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
+        dataset.validate().await.unwrap();
 
         let fragment = &mut dataset.get_fragments()[0];
         let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
@@ -587,6 +661,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(dataset.version().version, 2);
+        dataset.validate().await.unwrap();
         let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
 
         let stream = dataset
@@ -611,25 +686,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(batches[0], expected_batch);
-    }
-
-    #[tokio::test]
-    async fn test_count_rows() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
-        let fragment = dataset.get_fragments().pop().unwrap();
-
-        assert_eq!(fragment.count_rows().await.unwrap(), 40);
-        assert_eq!(fragment.local_row_id_limit().await.unwrap(), 40);
-
-        let fragment = fragment
-            .delete("i >= 160 and i <= 172")
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(fragment.count_rows().await.unwrap(), 27);
-        assert_eq!(fragment.local_row_id_limit().await.unwrap(), 40);
     }
 }
