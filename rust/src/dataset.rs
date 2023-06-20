@@ -15,7 +15,7 @@
 //! Lance Dataset
 //!
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -871,6 +871,29 @@ impl Dataset {
     }
 
     pub async fn validate(&self) -> Result<()> {
+        // All fragments have unique ids
+        let id_counts =
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id)
+                .fold(HashMap::new(), |mut acc, id| {
+                    *acc.entry(id).or_insert(0) += 1;
+                    acc
+                });
+        for (id, count) in id_counts {
+            if count > 1 {
+                return Err(Error::corrupt_file(
+                    self.base.clone(),
+                    format!(
+                        "Duplicate fragment id {} found in dataset {:?}",
+                        id, self.base
+                    ),
+                ));
+            }
+        }
+
+        // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
             .buffer_unordered(num_cpus::get() * 4)
@@ -1081,6 +1104,7 @@ mod tests {
 
         // Create one with deletions
         dataset.delete("i < 10").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Check it set the flag
         let mut manifest =
@@ -1454,6 +1478,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(10, dataset.fragments().len());
         assert_eq!(400, dataset.count_rows().await.unwrap());
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]
@@ -1482,6 +1507,7 @@ mod tests {
 
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
@@ -1489,6 +1515,7 @@ mod tests {
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
 
         // Check the version is set correctly
         let indices = dataset.load_indices().await.unwrap();
@@ -1514,6 +1541,7 @@ mod tests {
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
+        dataset.validate().await.unwrap();
 
         // Overwrite should invalidate index
         let write_params = WriteParams {
@@ -1530,6 +1558,7 @@ mod tests {
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
         assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset.validate().await.unwrap();
     }
 
     async fn create_bad_file() -> Result<Dataset> {
@@ -1632,6 +1661,7 @@ mod tests {
             Box::new(RecordBatchBuffer::from_iter(vec![right_batch1]));
         let mut dataset = Dataset::open(test_uri).await.unwrap();
         dataset.merge(&mut batches, "i", "i2").await.unwrap();
+        dataset.validate().await.unwrap();
 
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().len(), 2);
@@ -1691,6 +1721,7 @@ mod tests {
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // We should not have any deletion file still
         let fragments = dataset.get_fragments();
@@ -1699,6 +1730,7 @@ mod tests {
 
         // Delete rows
         dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify result:
         // There should be a deletion file in the metadata
@@ -1721,6 +1753,7 @@ mod tests {
 
         // Delete more rows
         dataset.delete("i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify result
         let fragments = dataset.get_fragments();
@@ -1738,6 +1771,7 @@ mod tests {
 
         // Delete full fragment
         dataset.delete("i >= 20").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify fragment is fully gone
         let fragments = dataset.get_fragments();

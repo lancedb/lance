@@ -590,7 +590,11 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut dataset = create_dataset(test_uri).await;
-        let fragment = &dataset.get_fragments()[3];
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
 
         let batch = fragment
             .take(&[1, 2, 4, 5, 8], dataset.schema())
@@ -605,6 +609,12 @@ mod tests {
         dataset.validate().await.unwrap();
 
         // Cannot get rows 2 and 4 anymore
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+        assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
             .take(&[1, 2, 4, 5, 8], dataset.schema())
             .await

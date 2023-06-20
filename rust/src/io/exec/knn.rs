@@ -75,7 +75,10 @@ impl KNNFlatStream {
             drop(tx);
         });
 
-        Self { rx, bg_thread: Some(bg_thread) }
+        Self {
+            rx,
+            bg_thread: Some(bg_thread),
+        }
     }
 }
 
@@ -274,7 +277,10 @@ impl KNNIndexStream {
             drop(tx);
         });
 
-        Self { rx, bg_thread: Some(bg_thread) }
+        Self {
+            rx,
+            bg_thread: Some(bg_thread),
+        }
     }
 }
 
