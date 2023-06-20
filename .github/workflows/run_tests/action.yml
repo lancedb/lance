@@ -18,7 +18,3 @@ runs:
     working-directory: python
     run: |
       pytest -x -v --durations=30 python/tests
-  - name: Run python doctests
-    shell: bash
-    working-directory: python
-    run: pytest --doctest-modules python/lance
