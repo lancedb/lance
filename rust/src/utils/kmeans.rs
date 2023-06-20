@@ -419,15 +419,17 @@ impl KMeans {
         let metric_type = self.metric_type;
         let cluster_with_distances = stream::iter(0..n)
             // make tiles of input data to split between threads.
-            .chunks(1024)
+            .chunks(2048)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
             .map(|(indices, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
+                    let array = data.values();
+                    let centroids_array = centroids.values();
                     let dist = metric_type.batch_func();
                     let mut results = vec![];
                     for idx in indices {
-                        let vector = data.slice(idx * dimension, dimension);
-                        let distances = dist(vector.values(), centroids.values(), dimension);
+                        let vector = &array[idx * dimension..(idx + 1) *dimension];
+                        let distances = dist(vector, centroids_array, dimension);
                         let cluster_id = argmin(distances.as_ref()).unwrap();
                         let distance = distances.value(cluster_id as usize);
                         results.push((cluster_id, distance))
