@@ -36,35 +36,23 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::UInt64 => Ok(Expr::Literal(ScalarValue::UInt64(v.map(|v| v as u64)))),
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Float64(v)) => match data_type {
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(*v))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
             DataType::Utf8 => Ok(expr.clone()),
             DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
             Ok(expr.clone())
@@ -96,21 +84,21 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
-                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                    Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
                         right: Box::new(resolve_value(right.as_ref(), &field.data_type())?),
-                    }));
+                    }))
                 }
                 (Expr::Literal(_), Expr::Column(l)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
-                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                    Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(right.as_ref(), &field.data_type())?),
                         op: *op,
                         right: right.clone(),
-                    }));
+                    }))
                 }
                 (Expr::Column(l), Expr::BinaryExpr(r)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
@@ -173,7 +161,7 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
         Expr::ScalarFunction {
             fun: BuiltinScalarFunction::RegexpMatch,
             args: _,
-        } => Ok(Expr::IsNotNull(Box::new(expr.to_owned()))),
+        } => Ok(Expr::IsNotNull(Box::new(expr))),
 
         _ => Ok(expr),
     }
@@ -202,7 +190,7 @@ mod tests {
                     &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())))
                 )
             }
-            _ => assert!(false, "Expected BinaryExpr"),
+            _ => unreachable!("Expected BinaryExpr"),
         };
     }
 }

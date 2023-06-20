@@ -35,7 +35,6 @@ fn argmin_arrow_batch(x: &Float32Array, dimension: usize) -> Arc<UInt32Array> {
         UInt32Array::from_trusted_len_iter(
             (0..x.len())
                 .step_by(dimension)
-                .into_iter()
                 .map(|start| Some(argmin_arrow(&x.slice(start, dimension)))),
         )
     };

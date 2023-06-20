@@ -68,7 +68,7 @@ fn scan_batches(
             reader
                 .read_batch(batch_id, range)
                 .await
-                .map_err(|e| DataFusionError::from(e))
+                .map_err(DataFusionError::from)
         })
     });
 
@@ -99,7 +99,7 @@ impl LanceStream {
     ///    if scan_in_order = false).
     ///  - ***with_row_id***: load row ID from the datasets.
     ///  - ***scan_in_order***: whether to scan the fragments in the provided order.
-    ///read_size: usize,futures::iter::
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
@@ -211,6 +211,7 @@ impl std::fmt::Debug for LanceScanExec {
 }
 
 impl LanceScanExec {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,

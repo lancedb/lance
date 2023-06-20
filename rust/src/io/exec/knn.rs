@@ -46,7 +46,7 @@ impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
-        KNNFlatStream::from_stream(stream, query)
+        Self::from_stream(stream, query)
     }
 
     fn from_stream(stream: impl RecordBatchStream, query: &Query) -> Self {
@@ -162,7 +162,7 @@ impl ExecutionPlan for KNNFlatExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
-        if !input_schema.field_with_name(SCORE_COL).is_ok() {
+        if input_schema.field_with_name(SCORE_COL).is_err() {
             fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
         }
 
@@ -204,7 +204,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn statistics(&self) -> Statistics {
         Statistics {
-            num_rows: Some(self.query.k as usize),
+            num_rows: Some(self.query.k),
             ..Default::default()
         }
     }
@@ -430,9 +430,11 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
@@ -489,7 +491,7 @@ mod tests {
             ),
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::new_empty(schema.clone());
+        let batch = RecordBatch::new_empty(schema);
 
         let query = Query {
             column: "vector".to_string(),
@@ -501,7 +503,7 @@ mod tests {
             use_index: false,
         };
 
-        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
         let idx = KNNFlatExec::try_new(input, query).unwrap();
         assert_eq!(
             idx.schema().as_ref(),
