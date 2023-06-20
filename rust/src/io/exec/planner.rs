@@ -214,7 +214,7 @@ impl Planner {
                     TimezoneInfo::None => {}
                     _ => {
                         return Err(Error::IO {
-                            message: format!("Timezone not supported in timestamp"),
+                            message: "Timezone not supported in timestamp".to_string(),
                         })
                     }
                 };
@@ -252,14 +252,12 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => {
-                    return Err(Error::IO {
-                        message: format!(
-                            "Must provide precision and scale for decimal: {:?}",
-                            number_info
-                        ),
-                    })
-                }
+                _ => Err(Error::IO {
+                    message: format!(
+                        "Must provide precision and scale for decimal: {:?}",
+                        number_info
+                    ),
+                }),
             },
             _ => Err(Error::IO {
                 message: format!(
@@ -325,11 +323,9 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Expression '{expr}' is not supported as filter in lance"),
-                })
-            }
+            _ => Err(Error::IO {
+                message: format!("Expression '{expr}' is not supported as filter in lance"),
+            }),
         }
     }
 
@@ -478,7 +474,7 @@ mod tests {
         println!("Physical expr: {:#?}", physical_expr);
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(
@@ -522,7 +518,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -550,7 +546,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -578,7 +574,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -605,7 +601,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter((0..10).map(|v| {
                 if v % 3 == 0 {
                     Some(format!("str-{}", v))
@@ -644,7 +640,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(BooleanArray::from_iter(
                 (0..10).map(|v| Some(v % 3 == 0)),
             ))],
@@ -712,8 +708,7 @@ mod tests {
             // Get the thing after 'cast(` but before ' as'.
             let expected_value_str = sql
                 .split("cast(")
-                .skip(1)
-                .next()
+                .nth(1)
                 .unwrap()
                 .split(" as")
                 .next()
@@ -770,7 +765,7 @@ mod tests {
             let planner = Planner::new(schema.clone());
             let expr = planner.parse_filter(sql).unwrap();
 
-            let expected_value_str = sql.split('\'').skip(1).next().unwrap();
+            let expected_value_str = sql.split('\'').nth(1).unwrap();
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {

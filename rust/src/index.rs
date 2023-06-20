@@ -56,7 +56,7 @@ pub enum IndexType {
 impl fmt::Display for IndexType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            IndexType::Vector => write!(f, "Vector"),
+            Self::Vector => write!(f, "Vector"),
         }
     }
 }
@@ -153,14 +153,8 @@ impl DatasetIndexExt for Dataset {
                         message: "Vector index type must take a VectorIndexParams".to_string(),
                     })?;
 
-                build_vector_index(
-                    self,
-                    column,
-                    &index_name,
-                    &index_id.to_string(),
-                    &vec_params,
-                )
-                .await?;
+                build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
+                    .await?;
             }
         }
 
@@ -175,7 +169,7 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| idx.name != index_name)
-            .map(|i| i.clone())
+            .cloned()
             .collect::<Vec<_>>();
         indices.push(new_idx);
 
@@ -226,8 +220,8 @@ mod tests {
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
-                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
+                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
+                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
             ],
         )
         .unwrap()]);

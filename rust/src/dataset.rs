@@ -241,7 +241,7 @@ impl Dataset {
                     path: uri.clone(),
                     source: box_error(e),
                 },
-                _ => e.into(),
+                _ => e,
             })?;
         // TODO: remove reference to inner.
         let get_result = object_store
@@ -336,7 +336,7 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Dataset::open(uri).await?)
+            Some(Self::open(uri).await?)
         };
 
         // append + input schema different from existing schema = error
@@ -474,7 +474,7 @@ impl Dataset {
         fragments: &[Fragment],
         mode: WriteMode,
     ) -> Result<Self> {
-        let (object_store, base) = ObjectStore::from_uri(&base_uri).await?;
+        let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
         let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
@@ -583,7 +583,7 @@ impl Dataset {
         // Inherit the index, since we are just adding columns.
         let indices = self.load_indices().await?;
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await
@@ -727,7 +727,7 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows().await?;
         let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-        Ok(self.take(&ids[..], &projection).await?)
+        self.take(&ids[..], projection).await
     }
 
     /// Delete rows based on a predicate.
@@ -748,7 +748,7 @@ impl Dataset {
             Some(self.load_indices().await?)
         };
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await
@@ -981,10 +981,11 @@ mod tests {
         let expected_batches = batches.batches.clone();
 
         let test_uri = path.to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        write_params.mode = mode;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            mode,
+        };
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
@@ -1141,9 +1142,11 @@ mod tests {
         .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1216,9 +1219,11 @@ mod tests {
         .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1296,9 +1301,11 @@ mod tests {
                 .collect(),
         );
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1360,9 +1367,11 @@ mod tests {
                 .collect(),
         );
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1422,9 +1431,11 @@ mod tests {
         );
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1476,8 +1487,10 @@ mod tests {
         assert_eq!(actual, expected);
 
         // Append should inherit index
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Append;
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![vectors.clone()],
@@ -1493,8 +1506,10 @@ mod tests {
         assert_eq!(actual, expected);
 
         // Overwrite should invalidate index
-        let mut write_params = WriteParams::default();
-        write_params.mode = Overwrite;
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
         let batches =
             RecordBatchBuffer::new(vec![
                 RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
@@ -1570,8 +1585,10 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Append;
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
 
         let mut batches: Box<dyn RecordBatchReader> =
             Box::new(RecordBatchBuffer::from_iter(vec![batch1]));
@@ -1650,11 +1667,8 @@ mod tests {
                 DataType::UInt32,
                 false,
             )]));
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt32Array::from_iter_values(range))],
-            )
-            .unwrap()
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
         }
 
         // Write a dataset

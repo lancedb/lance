@@ -99,7 +99,7 @@ impl RecordBatchStream for ProjectionStream {
     }
 }
 
-pub(crate) struct ProjectionExec {
+pub struct ProjectionExec {
     input: Arc<dyn ExecutionPlan>,
     project: Arc<Schema>,
 }

@@ -344,7 +344,7 @@ impl KMeans {
         for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
-                KMeans::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+                Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
             } else {
                 match params.init {
                     KMeanInit::Random => {

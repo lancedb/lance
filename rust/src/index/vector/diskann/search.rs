@@ -51,7 +51,7 @@ use crate::{
 };
 
 /// DiskANN search state.
-pub(crate) struct SearchState {
+pub struct SearchState {
     /// Visited vertices.
     pub visited: HashSet<usize>,
 
@@ -143,7 +143,7 @@ impl SearchState {
 /// - query: The query vector.
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
-pub(crate) async fn greedy_search(
+pub async fn greedy_search(
     graph: &(dyn Graph + Send + Sync),
     start: usize,
     query: &[f32],

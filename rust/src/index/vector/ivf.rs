@@ -139,7 +139,7 @@ impl VectorIndex for IVFIndex {
         let partition_ids =
             self.ivf
                 .find_partitions(&query.key, query.nprobes, self.metric_type)?;
-        assert!(partition_ids.len() <= query.nprobes as usize);
+        assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
             .map(|part_id| async move { self.search_in_partition(part_id as usize, query).await })
@@ -700,6 +700,7 @@ pub async fn build_ivf_pq_index(
 
 /// Write the index to the index file.
 ///
+#[allow(clippy::too_many_arguments)]
 async fn write_index_file(
     dataset: &Dataset,
     column: &str,
@@ -724,7 +725,7 @@ async fn write_index_file(
                 .unwrap_or_else(|| panic!("{PARTITION_ID_COLUMN} does not exist"));
             let partition_ids: &UInt32Array = as_primitive_array(part_col);
             let predicates = BooleanArray::from_unary(partition_ids, |x| x == part_id);
-            let parted_batch = filter_record_batch(&batch, &predicates)?;
+            let parted_batch = filter_record_batch(batch, &predicates)?;
             batches_for_parq.push(parted_batch);
         }
         let parted_batch = concat_batches(&batches_for_parq[0].schema(), &batches_for_parq)?;

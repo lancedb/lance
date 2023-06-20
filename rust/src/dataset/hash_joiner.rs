@@ -29,7 +29,7 @@ use crate::datatypes::lance_supports_nulls;
 use crate::{Error, Result};
 
 /// `HashJoiner` does hash join on two datasets.
-pub(crate) struct HashJoiner {
+pub struct HashJoiner {
     index_map: ReadOnlyView<OwnedRow, (usize, usize)>,
 
     index_type: ArrowDataType,
@@ -172,7 +172,7 @@ impl HashJoiner {
                 for batch in &self.batches {
                     arrays.push(batch.column(column_i).clone());
                 }
-                arrays.push(Arc::new(new_null_array(&arrays[0].data_type(), 1)));
+                arrays.push(Arc::new(new_null_array(arrays[0].data_type(), 1)));
 
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
@@ -184,7 +184,6 @@ impl HashJoiner {
                             .map_err(|err| Error::IO {
                                 message: format!("HashJoiner: {}", err),
                             })
-                            .map(|x| x.clone())
                     })
                     .await;
                     match task_result {
@@ -209,10 +208,7 @@ impl HashJoiner {
             .try_collect::<Vec<_>>()
             .await?;
 
-        Ok(RecordBatch::try_new(
-            self.batches[0].schema().clone(),
-            columns,
-        )?)
+        Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
 }
 

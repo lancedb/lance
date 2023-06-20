@@ -35,7 +35,7 @@ impl SchemaExt for Schema {
         };
         let mut fields: Vec<FieldRef> = self.fields().iter().cloned().collect();
         fields.push(FieldRef::new(field));
-        Ok(Schema::new_with_metadata(fields, self.metadata.clone()))
+        Ok(Self::new_with_metadata(fields, self.metadata.clone()))
     }
 
     fn field_names(&self) -> Vec<&String> {

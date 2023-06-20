@@ -22,8 +22,8 @@ use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use ordered_float::OrderedFloat;
 
-pub(crate) mod builder;
-pub(crate) mod persisted;
+pub mod builder;
+pub mod persisted;
 
 use crate::Result;
 pub use persisted::*;
@@ -51,7 +51,7 @@ pub trait Vertex: Clone {
 }
 
 /// Vertex SerDe. Used for serializing and deserializing the vertex.
-pub(crate) trait VertexSerDe<V: Vertex> {
+pub trait VertexSerDe<V: Vertex> {
     /// The size of the serialized vertex, in bytes.
     fn size(&self) -> usize;
 
@@ -63,7 +63,7 @@ pub(crate) trait VertexSerDe<V: Vertex> {
 }
 
 /// Vertex With Distance. Used for traversing the graph.
-pub(crate) struct VertexWithDistance {
+pub struct VertexWithDistance {
     /// Vertex ID.
     pub id: usize,
 
