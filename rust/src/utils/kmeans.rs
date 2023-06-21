@@ -213,7 +213,7 @@ impl KMeanMembership {
                             };
                         }
                         if total > 0.0 {
-                            let s = Float32Array::from_iter_values(
+                            let s = Float32Array::from(
                                 sum
                             );
                             s.unary_mut(|x| x / total).unwrap()
