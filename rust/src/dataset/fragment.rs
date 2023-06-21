@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
 use futures::future::try_join_all;
-use futures::{join, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{join, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
 use uuid::Uuid;
 
@@ -288,36 +288,43 @@ impl FileFragment {
         Ok(Updater::new(self.clone(), reader, deletion_vector))
     }
 
-    pub(crate) async fn merge(
-        mut self,
-        join_column: &str,
-        joiner: &HashJoiner,
-        full_schema: &Schema,
-    ) -> Result<Self> {
-        let mut scanner = self.scan();
-        scanner.project(&[join_column])?;
+    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        let mut updater = self.updater(Some(&[join_column])).await?;
 
-        let mut batch_stream = scanner
-            .try_into_stream()
-            .await?
-            .and_then(|batch| joiner.collect(batch.column(0).clone()))
-            .boxed();
-
-        let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
-
-        let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = self.dataset.data_dir().child(filename.clone());
-        let mut writer =
-            FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
-                .await?;
-
-        while let Some(batch) = batch_stream.try_next().await? {
-            writer.write(&[batch]).await?;
+        while let Some(batch) = updater.next().await? {
+            let batch = joiner.collect(batch[join_column].clone()).await?;
+            updater.update(batch).await?;
         }
 
-        writer.finish().await?;
+        self.metadata = updater.finish().await?;
 
-        self.metadata.add_file(&filename, &file_schema);
+        // let mut scanner = self.scan();
+        // scanner.project(&[join_column])?
+        //     .with_row_id();
+
+        // let mut batch_stream = scanner
+        //     .try_into_stream()
+        //     .await?
+        //     .and_then(|batch| joiner.collect(batch.column(0).clone()))
+        //     .boxed();
+
+        // let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
+
+        // let filename = format!("{}.lance", Uuid::new_v4());
+        // let full_path = self.dataset.data_dir().child(filename.clone());
+        // let mut writer =
+        //     FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
+        //         .await?;
+
+        // let start_row_id = 0;
+        // while let Some(batch) = batch_stream.try_next().await? {
+
+        //     writer.write(&[batch]).await?;
+        // }
+
+        // writer.finish().await?;
+
+        // self.metadata.add_file(&filename, &file_schema);
 
         Ok(self)
     }
@@ -519,8 +526,11 @@ impl FragmentReader {
 mod tests {
 
     use arrow_arith::arithmetic::multiply_scalar;
-    use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchReader, StringArray};
+    use arrow_array::{
+        cast::AsArray, ArrayRef, Int32Array, RecordBatchIterator, RecordBatchReader, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -737,6 +747,69 @@ mod tests {
             )
             .unwrap();
             assert_eq!(batches[0], expected_batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_fragment() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = create_dataset(test_uri).await;
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 200);
+
+        let deleted_range = 15..20;
+        dataset.delete("i >= 15 and i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 195);
+
+        // Create data to merge: merge in double the data
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("double_i", DataType::Int32, true),
+        ]));
+        let to_merge = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values((0..400).step_by(2))),
+            ],
+        )
+        .unwrap();
+
+        let mut stream: Box<dyn RecordBatchReader> =
+            Box::new(RecordBatchIterator::new(vec![Ok(to_merge)], schema.clone()));
+        dataset.merge(&mut stream, "i", "i").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Validate the resulting data
+        let batches = dataset
+            .scan()
+            .project(&["i", "double_i"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+        dbg!(&batch);
+
+        let mut row_id: i32 = 0;
+        let mut i: usize = 0;
+        let array_i: &Int32Array = as_primitive_array(&batch["i"]);
+        let array_double_i: &Int32Array = as_primitive_array(&batch["double_i"]);
+        while row_id < 200 {
+            if deleted_range.contains(&row_id) {
+                row_id += 1;
+                // dbg!(i);
+                continue;
+            }
+            assert_eq!(array_i.value(i), row_id);
+            assert_eq!(array_double_i.value(i), 2 * row_id);
+            row_id += 1;
+            i += 1;
         }
     }
 }

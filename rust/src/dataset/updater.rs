@@ -195,7 +195,7 @@ impl Updater {
 }
 
 /// Add blank rows where there are deleted rows
-fn add_blanks(
+pub(crate) fn add_blanks(
     batch: RecordBatch,
     row_id_range: Range<u32>,
     deletion_vector: &DeletionVector,

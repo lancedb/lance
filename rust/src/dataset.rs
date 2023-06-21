@@ -570,12 +570,7 @@ impl Dataset {
         let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
             .then(|f| {
                 let joiner = joiner.clone();
-                let full_schema = new_schema.clone();
-                async move {
-                    f.merge(left_on, &joiner, &full_schema)
-                        .await
-                        .map(|f| f.metadata)
-                }
+                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -733,13 +728,16 @@ impl Dataset {
     /// Delete rows based on a predicate.
     #[allow(dead_code)] // TODO: remove once this is public
     pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
-        let updated_fragments = stream::iter(self.get_fragments())
+        let mut updated_fragments = stream::iter(self.get_fragments())
             .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
             .buffer_unordered(num_cpus::get())
             // Drop the fragments that were deleted.
             .try_filter_map(|f| futures::future::ready(Ok(f)))
             .try_collect::<Vec<_>>()
             .await?;
+
+        // Maintain the order of fragment IDs.
+        updated_fragments.sort_by_key(|f| f.id);
 
         // Inherit the index, unless we deleted all the fragments.
         let indices = if updated_fragments.is_empty() {
