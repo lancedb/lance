@@ -43,7 +43,7 @@ use super::{
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
-    arrow::{linalg::MatrixView, *},
+    arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
     index::{pb, vector::Transformer, Index},

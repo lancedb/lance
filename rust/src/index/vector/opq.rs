@@ -32,7 +32,7 @@ use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
 };
-use crate::{arrow::linalg::*, index::Index};
+use crate::{arrow::linalg::matrix::*, arrow::linalg::svd::*, index::Index};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;

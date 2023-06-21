@@ -456,7 +456,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **num_sub_vectors**
 
         Optional parameters for "IVF_PQ":
-        - **use_opq**: whether to use OPQ (Optimized Product Quantization).
+        - **use_opq**: whether to use OPQ (Optimized Product Quantization). Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 

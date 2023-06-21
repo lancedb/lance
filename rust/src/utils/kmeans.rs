@@ -25,7 +25,7 @@ use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use crate::arrow::linalg::MatrixView;
+use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::MetricType;
 use crate::Result;
 use crate::{arrow::*, Error};

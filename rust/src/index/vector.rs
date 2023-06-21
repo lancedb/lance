@@ -386,13 +386,14 @@ pub(crate) async fn open_index(
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
-            #[cfg(feature = "opq")]
+            #[allow(unused_variables)]
             Some(Stage::Transform(tf)) => {
                 if last_stage.is_none() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
                     });
                 }
+                #[cfg(feature = "opq")]
                 match tf.r#type() {
                     pb::TransformType::Opq => {
                         let opq = OptimizedProductQuantizer::load(
