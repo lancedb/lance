@@ -331,7 +331,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
-    use crate::arrow::{linalg::MatrixView, *};
+    use crate::arrow::{linalg::matrix::MatrixView, *};
     use crate::dataset::{Dataset, ROW_ID};
     use crate::index::DatasetIndexExt;
     use crate::index::{

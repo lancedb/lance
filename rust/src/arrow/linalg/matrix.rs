@@ -293,6 +293,8 @@ impl TryFrom<&FixedSizeListArray> for MatrixView {
 mod tests {
     use std::collections::HashSet;
 
+    use approx::assert_relative_eq;
+
     use super::*;
 
     #[test]
