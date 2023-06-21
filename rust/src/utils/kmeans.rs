@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -27,8 +28,9 @@ use rand::{distributions::WeightedIndex, Rng};
 
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
+use crate::linalg::{cosine::Cosine, l2::L2};
+use crate::Error;
 use crate::Result;
-use crate::{arrow::*, Error};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -417,21 +419,38 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        let cluster_with_distances = stream::iter(0..n)
+        const CHUNK_SIZE: usize = 1024;
+        let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
-            .chunks(1024)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
-            .map(|(indices, (data, centroids))| async move {
+            .map(|(start_idx, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
-                    let dist = metric_type.batch_func();
-                    let mut results = vec![];
-                    for idx in indices {
-                        let vector = data.slice(idx * dimension, dimension);
-                        let distances = dist(vector.values(), centroids.values(), dimension);
-                        let cluster_id = argmin(distances.as_ref()).unwrap();
-                        let distance = distances.value(cluster_id as usize);
-                        results.push((cluster_id, distance))
-                    }
+                    let array = data.values();
+                    let centroids_array = centroids.values();
+                    let results = (start_idx..min(start_idx + CHUNK_SIZE, n))
+                        .map(|idx| {
+                            let vector = &array[idx * dimension..(idx + 1) * dimension];
+                            let mut min = std::f32::MAX;
+                            let mut min_idx = 0;
+                            for (idx, other) in centroids_array.chunks_exact(dimension).enumerate()
+                            {
+                                // We've found about 40% performance improvement by using static dispatch instead
+                                // of dynamic dispatch.
+                                //
+                                // NOTE: Please make sure run benchmark when changing the following code.
+                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
+                                let dist = match metric_type {
+                                    MetricType::L2 => vector.l2(other),
+                                    MetricType::Cosine => vector.cosine(other),
+                                };
+                                if dist < min {
+                                    min = dist;
+                                    min_idx = idx;
+                                }
+                            }
+                            (min_idx as u32, min)
+                        })
+                        .collect::<Vec<_>>();
                     results
                 })
                 .await?;
