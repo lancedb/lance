@@ -55,6 +55,12 @@ pub struct Manifest {
 
     /// An optional string tag for this version
     pub tag: Option<String>,
+
+    /// The reader flags
+    pub reader_feature_flags: u64,
+
+    /// The writer flags
+    pub writer_feature_flags: u64,
 }
 
 impl Manifest {
@@ -67,6 +73,8 @@ impl Manifest {
             index_section: None,
             timestamp_nanos: 0,
             tag: None,
+            reader_feature_flags: 0,
+            writer_feature_flags: 0,
         }
     }
 
@@ -87,7 +95,7 @@ impl Manifest {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        self.timestamp_nanos = nanos as u128;
+        self.timestamp_nanos = nanos;
     }
 
     /// Return the max fragment id.
@@ -98,7 +106,7 @@ impl Manifest {
 
     /// Return the fragments that are newer than the given manifest.
     /// Note this does not support recycling of fragment ids.
-    pub fn fragments_since(&self, since: &Manifest) -> Result<Vec<Fragment>> {
+    pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
             return Err(Error::IO {
                 message: format!(
@@ -112,7 +120,7 @@ impl Manifest {
             .fragments
             .iter()
             .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
-            .map(|f| f.clone())
+            .cloned()
             .collect())
     }
 }
@@ -136,6 +144,8 @@ impl From<pb::Manifest> for Manifest {
             index_section: p.index_section.map(|i| i as usize),
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
+            reader_feature_flags: p.reader_feature_flags,
+            writer_feature_flags: p.writer_feature_flags,
         }
     }
 }
@@ -161,6 +171,8 @@ impl From<&Manifest> for pb::Manifest {
             index_section: m.index_section.map(|i| i as u64),
             timestamp: timestamp_nanos,
             tag: m.tag.clone().unwrap_or("".to_string()),
+            reader_feature_flags: m.reader_feature_flags,
+            writer_feature_flags: m.writer_feature_flags,
         }
     }
 }

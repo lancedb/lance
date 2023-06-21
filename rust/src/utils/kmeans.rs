@@ -15,13 +15,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{add, divide_scalar};
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
@@ -186,13 +186,12 @@ impl KMeanMembership {
     async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
-        let data = self.data.clone();
 
         // New centroids for each cluster
         let means = stream::iter(0..self.k)
             .zip(repeat_with(|| {
                 (
-                    data.clone(),
+                    self.data.clone(),
                     cluster_ids.clone(),
                     self.centroids.clone(),
                 )
@@ -200,28 +199,33 @@ impl KMeanMembership {
             .map(
                 |(cluster, (data, cluster_ids, prev_centroids))| async move {
                     tokio::task::spawn_blocking(move || {
-                        let mut sum = Float32Array::from_iter_values(
-                            (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
-                        );
+                        let mut sum = vec![0.0; dimension];
+                        let data = data.values();
                         let mut total = 0.0;
+                        // Eager group-by cluster id.
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
-                                sum =
-                                    add(&sum, &data.slice(i * dimension, dimension)).unwrap();
+                                // TODO: use simd ADD
+                                for j in 0..dimension {
+                                    sum[j] += data[i * dimension + j];
+                                }
                                 total += 1.0;
                             };
                         }
                         if total > 0.0 {
-                            divide_scalar(&sum, total).unwrap()
+                            let s = Float32Array::from(
+                                sum
+                            );
+                            s.unary_mut(|x| x / total).unwrap()
                         } else {
-                            eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
+                            warn!("Warning: KMean: cluster {} has no value, does not change centroids.", cluster);
                             prev_centroids.slice(cluster * dimension, dimension)
                         }
                     })
                     .await
                 },
             )
-            .buffered(16)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -337,10 +341,10 @@ impl KMeans {
 
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
-        for _ in 1..=params.redos {
+        for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
-                KMeans::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+                Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
             } else {
                 match params.init {
                     KMeanInit::Random => {
@@ -355,12 +359,22 @@ impl KMeans {
 
             let mut dist_sum: f32 = f32::MAX;
             let mut stddev: f32 = f32::MAX;
-            for _ in 1..=params.max_iters {
+            for i in 1..=params.max_iters {
+                if i % 10 == 0 {
+                    info!(
+                        "KMeans training: iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
+                };
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
                 stddev = last_membership.hist_stddev();
                 kmeans = last_membership.to_kmeans().await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
+                    info!(
+                        "KMeans training: converged at iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
                     break;
                 }
                 dist_sum = last_dist_sum;
@@ -412,8 +426,7 @@ impl KMeans {
                     let dist = metric_type.batch_func();
                     let mut results = vec![];
                     for idx in indices {
-                        let value_arr = data.slice(idx * dimension, dimension);
-                        let vector: &Float32Array = as_primitive_array(&value_arr);
+                        let vector = data.slice(idx * dimension, dimension);
                         let distances = dist(vector.values(), centroids.values(), dimension);
                         let cluster_id = argmin(distances.as_ref()).unwrap();
                         let distance = distances.value(cluster_id as usize);

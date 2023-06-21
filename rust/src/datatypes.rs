@@ -313,13 +313,13 @@ impl From<&Dictionary> for pb::Dictionary {
 
 /// Returns true if Lance supports writing this datatype with nulls.
 pub(crate) fn lance_supports_nulls(datatype: &DataType) -> bool {
-    match datatype {
+    matches!(
+        datatype,
         DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Binary
-        | DataType::List(_)
-        | DataType::FixedSizeBinary(_)
-        | DataType::FixedSizeList(_, _) => true,
-        _ => false,
-    }
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::List(_)
+            | DataType::FixedSizeBinary(_)
+            | DataType::FixedSizeList(_, _)
+    )
 }

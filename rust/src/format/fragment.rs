@@ -72,6 +72,8 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
 }
 
+// TODO: should we convert this to TryFrom and surface the error?
+#[allow(clippy::fallible_impl_from)]
 impl From<&pb::DeletionFile> for DeletionFile {
     fn from(value: &pb::DeletionFile) -> Self {
         let file_type = match value.file_type {
@@ -188,7 +190,7 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, &path, &schema);
+        let fragment = Fragment::with_file(123, path, &schema);
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);

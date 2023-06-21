@@ -163,7 +163,7 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-    ) -> Result<FileReader> {
+    ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -228,12 +228,12 @@ impl FileReader {
             page_table,
             fragment_id,
             with_row_id: false,
-            deletion_vector: deletion_vector,
+            deletion_vector,
         })
     }
 
     /// Open one Lance data file for read.
-    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
+    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -387,10 +387,7 @@ async fn read_batch(
     // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
     // so I'm going to just leave deletion filter at this layer for now.
     // We should push this down futurther when we get to statistics-based predicate pushdown
-    let deletion_mask = deletion_vector
-        .clone()
-        .map(|v| v.build_predicate(row_ids.unwrap().iter()))
-        .flatten();
+    let deletion_mask = deletion_vector.and_then(|v| v.build_predicate(row_ids.unwrap().iter()));
 
     match deletion_mask {
         None => Ok(batch),
@@ -737,7 +734,7 @@ mod tests {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
             let row_ids_col = &batch["_rowid"];
             // Do the same computation as `compute_row_id`.
-            let start_pos = (fragment << 32) as u64 + 10 * b as u64;
+            let start_pos = (fragment << 32) + 10 * b as u64;
 
             assert_eq!(
                 &UInt64Array::from_iter_values(start_pos..start_pos + 10),
@@ -777,10 +774,7 @@ mod tests {
                     value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from_iter_values(
-                    value_range
-                        .clone()
-                        .map(|n| format!("str-{}", n))
-                        .collect::<Vec<_>>(),
+                    value_range.clone().map(|n| format!("str-{}", n)),
                 )),
                 Arc::new(DictionaryArray::<UInt8Type>::try_new(&keys, &values).unwrap()),
             ];
@@ -867,7 +861,7 @@ mod tests {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
             let row_ids_col = &batch["_rowid"];
             // Do the same computation as `compute_row_id`.
-            let start_pos = (fragment << 32) as u64 + 10 * b as u64;
+            let start_pos = (fragment << 32) + 10 * b as u64;
 
             assert_eq!(
                 &UInt64Array::from_iter_values((start_pos..start_pos + 10).filter(|i| i % 2 == 1)),
@@ -923,13 +917,12 @@ mod tests {
         for b in 0..10 {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
             // if we didn't request rowid we should not get it back
-            assert!(batch
+            assert!(!batch
                 .schema()
                 .fields()
                 .iter()
                 .map(|f| f.name().as_str())
-                .find(|&name| name == "_rowid")
-                .is_none())
+                .any(|name| name == "_rowid"))
         }
     }
 
@@ -1212,10 +1205,9 @@ mod tests {
             field: &Field,
             params: ReadBatchParams,
         ) -> ArrayRef {
-            let arr = read_array(reader, field, 0, &params)
+            read_array(reader, field, 0, &params)
                 .await
-                .expect("Error reading back the null array from file");
-            arr
+                .expect("Error reading back the null array from file") as _
         }
 
         let arr = read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFull).await;
@@ -1350,13 +1342,13 @@ mod tests {
         let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),
             Some(vec![Some(3), Some(4)]),
-            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..2_000).map(Some).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
         let large_list_array = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(10), Some(11)]),
             Some(vec![Some(12), Some(13)]),
-            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..2_000).map(Some).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
 

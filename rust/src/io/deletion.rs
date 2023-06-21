@@ -27,7 +27,7 @@ const BITMAP_THRESDHOLD: usize = 5_000;
 
 /// Represents a set of deleted row ids in a single fragment.
 #[derive(Debug, Clone)]
-pub(crate) enum DeletionVector {
+pub enum DeletionVector {
     NoDeletions,
     Set(HashSet<u32>),
     Bitmap(RoaringBitmap),
@@ -65,26 +65,23 @@ impl DeletionVector {
             ),
             Self::NoDeletions => None,
         }
-        .map(|v| BooleanArray::from(v))
+        .map(BooleanArray::from)
     }
 }
 
 impl Default for DeletionVector {
     fn default() -> Self {
-        DeletionVector::NoDeletions
+        Self::NoDeletions
     }
 }
 
 impl PartialEq for DeletionVector {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (DeletionVector::NoDeletions, DeletionVector::NoDeletions) => true,
-            (DeletionVector::Set(set1), DeletionVector::Set(set2)) => set1 == set2,
-            (DeletionVector::Bitmap(bitmap1), DeletionVector::Bitmap(bitmap2)) => {
-                bitmap1 == bitmap2
-            }
-            (DeletionVector::Set(set), DeletionVector::Bitmap(bitmap))
-            | (DeletionVector::Bitmap(bitmap), DeletionVector::Set(set)) => {
+            (Self::NoDeletions, Self::NoDeletions) => true,
+            (Self::Set(set1), Self::Set(set2)) => set1 == set2,
+            (Self::Bitmap(bitmap1), Self::Bitmap(bitmap2)) => bitmap1 == bitmap2,
+            (Self::Set(set), Self::Bitmap(bitmap)) | (Self::Bitmap(bitmap), Self::Set(set)) => {
                 let set = set.iter().copied().collect::<RoaringBitmap>();
                 set == *bitmap
             }
@@ -98,7 +95,7 @@ impl Extend<u32> for DeletionVector {
         let iter = iter.into_iter();
         // The mem::replace allows changing the variant of Self when we only
         // have &mut Self.
-        *self = match (std::mem::replace(self, Self::default()), iter.size_hint()) {
+        *self = match (std::mem::take(self), iter.size_hint()) {
             (Self::NoDeletions, (_, Some(0))) => Self::NoDeletions,
             (Self::NoDeletions, (lower, _)) if lower >= BITMAP_THRESDHOLD => {
                 let bitmap = iter.collect::<RoaringBitmap>();
@@ -189,7 +186,7 @@ fn deletion_file_path(
 /// Returns the deletion file if one was written. If no deletions were present,
 /// returns `Ok(None)`.
 #[allow(dead_code)] // TODO: remove once used
-pub(crate) async fn write_deletion_file(
+pub async fn write_deletion_file(
     base: &Path,
     fragment_id: u64,
     read_version: u64,
@@ -254,7 +251,7 @@ pub(crate) async fn write_deletion_file(
 ///
 /// Will return an error if the file is present but invalid.
 #[allow(dead_code)] // TODO: remove once used
-pub(crate) async fn read_deletion_file(
+pub async fn read_deletion_file(
     base: &Path,
     fragment: &Fragment,
     object_store: &ObjectStore,
@@ -373,7 +370,7 @@ impl LruDeletionVectorStore {
         let deletion_vec = {
             let val_in_cache: Option<Arc<DeletionVector>> = {
                 let mut cache = self.cache.lock().unwrap();
-                cache.get(&frag_id).map(|v| v.clone())
+                cache.get(&frag_id).cloned()
             };
 
             // Lock is released while we do IO so we block others or poision the lock

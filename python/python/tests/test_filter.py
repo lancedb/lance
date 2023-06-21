@@ -14,10 +14,10 @@
 
 """Tests for predicate pushdown"""
 
-from datetime import date, datetime, timedelta
 import random
-from pathlib import Path
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -34,11 +34,15 @@ def create_table(nrows=100):
     floatcol = pa.array(np.arange(nrows) * 2 / 3, type=pa.float32())
     arr = np.arange(nrows) < nrows / 2
     structcol = pa.StructArray.from_arrays(
-        [pa.array(arr, type=pa.bool_()),
-         pa.array([date(2021, 1, 1) + timedelta(days=i) for i in range(nrows)]),
-         pa.array([datetime(2021, 1, 1) + timedelta(hours=i) for i in range(nrows)])], names=["bool", "date", "dt"]
+        [
+            pa.array(arr, type=pa.bool_()),
+            pa.array([date(2021, 1, 1) + timedelta(days=i) for i in range(nrows)]),
+            pa.array([datetime(2021, 1, 1) + timedelta(hours=i) for i in range(nrows)]),
+        ],
+        names=["bool", "date", "dt"],
     )
     random.seed(42)
+
     def gen_str(n):
         return "".join(random.choices("abc", k=n))
 
@@ -47,7 +51,8 @@ def create_table(nrows=100):
     decimal_col = pa.array([Decimal(f"{str(i)}.000") for i in range(nrows)])
 
     tbl = pa.Table.from_arrays(
-        [intcol, floatcol, structcol, string_col, decimal_col], names=["int", "float", "rec", "str", "decimal"]
+        [intcol, floatcol, structcol, string_col, decimal_col],
+        names=["int", "float", "rec", "str", "decimal"],
     )
     return tbl
 
@@ -132,7 +137,9 @@ def test_match(tmp_path: Path):
     pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["aaa", "abc"]}))
 
     result = dataset.to_table(filter="str NOT LIKE 'a%'").to_pandas()
-    pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["bbb", "bca", "cab", "cba"]}))
+    pd.testing.assert_frame_equal(
+        result, pd.DataFrame({"str": ["bbb", "bca", "cab", "cba"]})
+    )
 
     result = dataset.to_table(filter="regexp_match(str, 'c.+')").to_pandas()
     pd.testing.assert_frame_equal(result, pd.DataFrame({"str": ["bca", "cab", "cba"]}))
@@ -143,7 +150,7 @@ def test_escaped_name(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path / "test_escaped_name")
 
     dataset = lance.dataset(tmp_path / "test_escaped_name")
-    result = dataset.to_table(filter='`silly :name` > 1').to_pandas()
+    result = dataset.to_table(filter="`silly :name` > 1").to_pandas()
     pd.testing.assert_frame_equal(result, pd.DataFrame({"silly :name": [2]}))
 
     # nested case
@@ -151,8 +158,24 @@ def test_escaped_name(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path / "test_escaped_name_nested")
 
     dataset = lance.dataset(tmp_path / "test_escaped_name_nested")
-    result = dataset.to_table(filter='`outer field`.`inner field` > 1').to_pandas()
-    pd.testing.assert_frame_equal(result, pd.DataFrame({"outer field": [{"inner field": 2}]}))
+    result = dataset.to_table(filter="`outer field`.`inner field` > 1").to_pandas()
+    pd.testing.assert_frame_equal(
+        result, pd.DataFrame({"outer field": [{"inner field": 2}]})
+    )
+
+
+def test_negative_expressions(tmp_path: Path):
+    table = pa.table({"x": [-1, 0, 1, 1], "y": [1, 2, 3, 4]})
+    dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
+    filters_expected = [
+        ("x = -1", [-1]),
+        ("x > -1", [0, 1, 1]),
+        ("x = 1 * -1", [-1]),
+        ("x <= 2 + -2 ", [-1, 0]),
+        ("x = y - 2", [-1, 0, 1]),
+    ]
+    for filter, expected in filters_expected:
+        assert dataset.scanner(filter=filter).to_table()["x"].to_pylist() == expected
 
 
 def create_table_for_duckdb(nvec=10000, ndim=768):
@@ -175,7 +198,7 @@ def create_table_for_duckdb(nvec=10000, ndim=768):
 def test_duckdb(tmp_path):
     duckdb = pytest.importorskip("duckdb")
     tbl = create_table_for_duckdb()
-    ds = lance.write_dataset(tbl, str(tmp_path))
+    ds = lance.write_dataset(tbl, str(tmp_path))  # noqa: F841
 
     actual = duckdb.query("SELECT id, meta, price FROM ds WHERE id==1000").to_df()
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()

@@ -60,7 +60,7 @@ impl Default for GraphReadParams {
 }
 
 /// Persisted graph on disk, stored in the file.
-pub(crate) struct PersistedGraph<V: Vertex + Debug> {
+pub struct PersistedGraph<V: Vertex + Debug> {
     /// Reference to the dataset.
     dataset: Arc<Dataset>,
 
@@ -99,7 +99,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         path: &Path,
         params: GraphReadParams,
         serde: Arc<dyn VertexSerDe<V> + Send + Sync>,
-    ) -> Result<PersistedGraph<V>> {
+    ) -> Result<Self> {
         let object_store = dataset.object_store();
         let file_reader = FileReader::try_new(object_store, path).await?;
 
@@ -171,7 +171,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
             let mut row_vector = vertex.as_any_mut().downcast_mut::<RowVertex>().unwrap();
             let batch = self
                 .dataset
-                .take_rows(&[row_vector.row_id as u64], &self.vector_column_projection)
+                .take_rows(&[row_vector.row_id], &self.vector_column_projection)
                 .await?;
 
             let column = as_fixed_size_list_array(batch.column(0));
@@ -183,8 +183,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
 
         {
             let mut cache = self.cache.lock().unwrap();
-            for i in 0..vertices.len() {
-                let vertex = vertices[i].clone();
+            for (i, vertex) in vertices.into_iter().enumerate() {
                 cache.insert(id + i as u32, Arc::new(vertex));
             }
 
@@ -244,7 +243,7 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
         }
         let batch = self
             .reader
-            .read_range(id as usize..(id + 1) as usize, &self.neighbors_projection)
+            .read_range(id..(id + 1), &self.neighbors_projection)
             .await?;
         {
             let mut cache = self.neighbors_cache.lock().unwrap();
@@ -259,7 +258,7 @@ impl<V: Vertex + Send + Sync + Debug> Graph for PersistedGraph<V> {
             let nb_array: &UInt32Array = as_primitive_array(value.as_ref());
             let neighbors = Arc::new(nb_array.clone());
             cache.insert(id as u32, neighbors.clone());
-            Ok(neighbors.clone())
+            Ok(neighbors)
         }
     }
 }
@@ -276,7 +275,7 @@ impl Default for WriteGraphParams {
 }
 
 /// Write the graph to a file.
-pub(crate) async fn write_graph<V: Vertex + Clone + Sync + Send>(
+pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
     graph: &GraphBuilder<V>,
     object_store: &ObjectStore,
     path: &Path,
@@ -415,9 +414,11 @@ mod tests {
         )
         .unwrap()]);
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -427,7 +428,7 @@ mod tests {
         let nodes = (0..total)
             .map(|v| RowVertex {
                 row_id: v as u64,
-                vector: Some(generate_random_array(dim).into()),
+                vector: Some(generate_random_array(dim)),
             })
             .collect::<Vec<_>>();
         let mut builder = GraphBuilder::new(&nodes, MatrixView::random(100, 16), MetricType::L2);

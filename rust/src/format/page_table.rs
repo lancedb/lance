@@ -120,10 +120,7 @@ impl PageTable {
     }
 
     pub fn get(&self, column: i32, batch: i32) -> Option<&PageInfo> {
-        self.pages
-            .get(&column)
-            .map(|c_map| c_map.get(&batch))
-            .flatten()
+        self.pages.get(&column).and_then(|c_map| c_map.get(&batch))
     }
 }
 

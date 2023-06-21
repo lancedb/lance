@@ -23,7 +23,6 @@ from unittest import mock
 
 import lance
 import lance.fragment
-import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
@@ -346,7 +345,7 @@ def test_load_scanner_from_fragments(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100)})
     for _ in range(3):
         lance.write_dataset(tab, tmp_path / "dataset", mode="append")
-    
+
     dataset = lance.dataset(tmp_path / "dataset")
     fragments = list(dataset.get_fragments())
     assert len(fragments) == 3
@@ -368,22 +367,28 @@ def test_merge_data(tmp_path: Path):
     # rejects partial data for non-nullable types
     new_tab = pa.table({"a": range(40), "c": range(40)})
     # TODO: this should be ValueError
-    with pytest.raises(OSError, match=".+Lance does not yet support nulls for type Int64."):
+    with pytest.raises(
+        OSError, match=".+Lance does not yet support nulls for type Int64."
+    ):
         dataset.merge(new_tab, "a")
-    
+
     # accepts a full merge
     new_tab = pa.table({"a": range(100), "c": range(100)})
     dataset.merge(new_tab, "a")
     assert dataset.version == 2
-    assert dataset.to_table() == pa.table({"a": range(100), "b": range(100), "c": range(100)})
+    assert dataset.to_table() == pa.table(
+        {"a": range(100), "b": range(100), "c": range(100)}
+    )
 
     # accepts a partial for string
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table({
-        "a": range(100),
-        "b": range(100),
-        "c": range(100),
-        "d": ["a", "b", "c", "d", "e"] + [None] * 95
-    })
+    assert dataset.to_table() == pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+            "c": range(100),
+            "d": ["a", "b", "c", "d", "e"] + [None] * 95,
+        }
+    )

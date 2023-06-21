@@ -99,11 +99,12 @@ pub enum MetricType {
     Cosine,
 }
 
+type DistanceFunc = dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static;
+type BatchDistanceFunc = dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static;
+
 impl MetricType {
     /// Compute the distance from one vector to a batch of vectors.
-    pub fn batch_func(
-        &self,
-    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static> {
+    pub fn batch_func(&self) -> Arc<BatchDistanceFunc> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance_batch),
@@ -111,7 +112,7 @@ impl MetricType {
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static> {
+    pub fn func(&self) -> Arc<DistanceFunc> {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),
@@ -202,13 +203,15 @@ impl VectorIndexParams {
         let mut stages: Vec<StageParams> = vec![];
         stages.push(StageParams::Ivf(IvfBuildParams::new(num_partitions)));
 
-        let mut pq_params = PQBuildParams::default();
-        pq_params.num_bits = num_bits as usize;
-        pq_params.num_sub_vectors = num_sub_vectors as usize;
-        pq_params.use_opq = use_opq;
-        pq_params.metric_type = metric_type;
-        pq_params.max_iters = max_iterations;
-        pq_params.max_opq_iters = max_iterations;
+        let pq_params = PQBuildParams {
+            num_bits: num_bits as usize,
+            num_sub_vectors,
+            use_opq,
+            metric_type,
+            max_iters: max_iterations,
+            max_opq_iters: max_iterations,
+            ..Default::default()
+        };
         stages.push(StageParams::PQ(pq_params));
 
         Self {
@@ -295,8 +298,8 @@ pub(crate) async fn build_vector_index(
         build_ivf_pq_index(
             dataset,
             column,
-            &name,
-            &uuid,
+            name,
+            uuid,
             params.metric_type,
             ivf_params,
             pq_params,
@@ -364,9 +367,7 @@ pub(crate) async fn open_index(
         return Err(Error::Index{message:"Invalid protobuf for VectorIndex metadata".to_string()});
     };
 
-    let vec_idx = match idx_impl {
-        pb::index::Implementation::VectorIndex(vi) => vi,
-    };
+    let pb::index::Implementation::VectorIndex(vec_idx) = idx_impl;
 
     let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
         .ok_or(Error::Index {

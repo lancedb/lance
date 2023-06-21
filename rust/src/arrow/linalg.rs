@@ -76,11 +76,10 @@ impl MatrixView {
     /// Randomly initialize a matrix of shape `(num_rows, num_columns)`.
     pub fn random(num_rows: usize, num_columns: usize) -> Self {
         let mut rng = SmallRng::from_entropy();
-        let data = Arc::new(Float32Array::from_iter(
+        let data = Arc::new(Float32Array::from_iter_values(
             (&mut rng)
                 .sample_iter(Standard)
-                .take(num_columns * num_rows)
-                .collect::<Vec<f32>>(),
+                .take(num_columns * num_rows),
         ));
         Self {
             data,
@@ -423,27 +422,27 @@ mod tests {
         // Results obtained from `numpy.linalg.svd()`.
         let expected_u = vec![
             -0.59114238,
-            0.26316781,
+            0.263_167_8,
             0.35543017,
             0.31426436,
             0.22993832,
-            0.55075318,
-            -0.39756679,
+            0.550_753_2,
+            -0.397_566_8,
             0.24379903,
             -0.22239,
-            -0.75346615,
-            -0.36358969,
+            -0.753_466_1,
+            -0.363_589_7,
             0.18203479,
             -0.03347897,
-            -0.60027258,
+            -0.600_272_6,
             -0.45083927,
             0.23344966,
             -0.30547573,
-            0.53617327,
+            0.536_173_3,
             -0.4297069,
-            0.23616681,
+            0.236_166_8,
             -0.68586286,
-            0.33186002,
+            0.331_86,
             0.16492763,
             -0.38966287,
             -0.46974792,
@@ -453,7 +452,7 @@ mod tests {
             -0.51825744,
             -0.46077223,
             0.29335876,
-            0.57626212,
+            0.576_262_1,
             -0.02085292,
             0.37907767,
             -0.6525516,
@@ -467,24 +466,24 @@ mod tests {
                 assert_relative_eq!(a, b, epsilon = 0.0001);
             });
 
-        let expected = vec![27.46873242, 22.64318501, 8.55838823, 5.9857232, 2.01489966];
+        let expected = vec![27.468_733, 22.643_185, 8.558_388, 5.985_723, 2.014_899_7];
         sigma.values().iter().zip(expected).for_each(|(&a, b)| {
             assert_relative_eq!(a, b, epsilon = 0.0001);
         });
 
         // Obtained from `numpy.linagl.svd()`.
         let expected_vt = vec![
-            -0.25138279,
+            -0.251_382_8,
             -0.39684555,
-            -0.69215101,
+            -0.692_151,
             -0.36617044,
             -0.40763524,
-            0.81483669,
+            0.814_836_7,
             0.3586615,
             -0.24888801,
             -0.36859354,
             -0.09796257,
-            -0.26061851,
+            -0.260_618_5,
             0.70076821,
             -0.22081145,
             0.38593848,
