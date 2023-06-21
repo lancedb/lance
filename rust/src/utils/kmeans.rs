@@ -427,10 +427,9 @@ impl KMeans {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
-                    let mut results = vec![];
-                    for idx in start_idx..min(start_idx + CHUNK_SIZE, n) {
-                        let vector = &array[idx * dimension..(idx + 1) * dimension];
-                        let (cluster_id, distance) = {
+                    let results = (start_idx..min(start_idx + CHUNK_SIZE, n))
+                        .map(|idx| {
+                            let vector = &array[idx * dimension..(idx + 1) * dimension];
                             let mut min = std::f32::MAX;
                             let mut min_idx = 0;
                             for (idx, other) in centroids_array.chunks_exact(dimension).enumerate()
@@ -449,10 +448,9 @@ impl KMeans {
                                     min_idx = idx;
                                 }
                             }
-                            (min_idx, min)
-                        };
-                        results.push((cluster_id as u32, distance))
-                    }
+                            (min_idx as u32, min)
+                        })
+                        .collect::<Vec<_>>();
                     results
                 })
                 .await?;
