@@ -164,6 +164,20 @@ def test_escaped_name(tmp_path: Path):
     )
 
 
+def test_negative_expressions(tmp_path: Path):
+    table = pa.table({"x": [-1, 0, 1, 1], "y": [1, 2, 3, 4]})
+    dataset = lance.write_dataset(table, tmp_path / "test_neg_expr")
+    filters_expected = [
+        ("x = -1", [-1]),
+        ("x > -1", [0, 1, 1]),
+        ("x = 1 * -1", [-1]),
+        ("x <= 2 + -2 ", [-1, 0]),
+        ("x = y - 2", [-1, 0, 1]),
+    ]
+    for filter, expected in filters_expected:
+        assert dataset.scanner(filter=filter).to_table()["x"].to_pylist() == expected
+
+
 def create_table_for_duckdb(nvec=10000, ndim=768):
     mat = np.random.randn(nvec, ndim)
     price = (np.random.rand(nvec) + 1) * 100
