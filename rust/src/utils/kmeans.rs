@@ -27,9 +27,9 @@ use rand::{distributions::WeightedIndex, Rng};
 
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
+use crate::linalg::{l2::L2, cosine::Cosine};
 use crate::Result;
-use crate::linalg::l2::L2;
-use crate::{arrow::*, Error};
+use crate::{Error};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -428,8 +428,27 @@ impl KMeans {
                     let centroids_array = centroids.values();
                     let mut results = vec![];
                     for idx in indices {
-                        let vector = &array[idx * dimension..(idx + 1) *dimension];
-                        let (cluster_id, distance) = vector.l2_argmin(&centroids_array);
+                        let vector = &array[idx * dimension..(idx + 1) * dimension];
+                        let (cluster_id, distance) = {
+                            let mut min = std::f32::MAX;
+                            let mut min_idx = 0;
+                            for (idx, other) in centroids_array.chunks_exact(dimension).enumerate()
+                            {
+                                // We've found about 40% performance improvement by using static dispatch instead
+                                // of dynamic dispatch.
+                                //
+                                // NOTE: Please make sure run benchmark when changing the following code.
+                                let dist =  match metric_type {
+                                    MetricType::L2 => vector.l2(other),
+                                    MetricType::Cosine => vector.cosine(other),
+                                };
+                                if dist < min {
+                                    min = dist;
+                                    min_idx = idx;
+                                }
+                            }
+                            (min_idx, min)
+                        };
                         results.push((cluster_id as u32, distance))
                     }
                     results
