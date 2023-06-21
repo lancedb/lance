@@ -39,13 +39,7 @@ use self::{
 
 use super::{pb, IndexParams};
 #[cfg(feature = "opq")]
-use crate::{
-    index::{
-        vector::{
-            opq::{OPQIndex, OptimizedProductQuantizer},
-        }
-    }
-};
+use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{
     dataset::Dataset,
     index::{

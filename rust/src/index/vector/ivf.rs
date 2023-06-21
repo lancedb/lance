@@ -35,9 +35,7 @@ use futures::{
 use rand::{rngs::SmallRng, SeedableRng};
 
 #[cfg(feature = "opq")]
-use super::{
-    opq::train_opq,
-};
+use super::opq::train_opq;
 use super::{
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
