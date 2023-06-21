@@ -34,8 +34,11 @@ use futures::{
 };
 use rand::{rngs::SmallRng, SeedableRng};
 
+#[cfg(feature = "opq")]
 use super::{
     opq::train_opq,
+};
+use super::{
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
@@ -567,7 +570,10 @@ pub async fn build_ivf_pq_index(
     ) * 256;
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+    #[cfg(not(feature = "opq"))]
+    let transforms: Vec<Box<dyn Transformer>> = vec![];
 
     // Train IVF partitions.
     let ivf_model = if let Some(centroids) = &ivf_params.centroids {
@@ -583,6 +589,7 @@ pub async fn build_ivf_pq_index(
         Ivf::new(centroids.clone())
     } else {
         // Pre-transforms
+        #[cfg(feature = "opq")]
         if pq_params.use_opq {
             let opq = train_opq(&training_data, pq_params).await?;
             transforms.push(Box::new(opq));

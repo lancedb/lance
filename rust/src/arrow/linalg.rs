@@ -23,11 +23,11 @@ use arrow_schema::DataType;
 use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, SeedableRng};
 
 #[allow(unused_imports)]
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "opq", target_os = "macos"))]
 use accelerate_src;
 
 #[allow(unused_imports)]
-#[cfg(all(any(target_os = "linux", target_os = "windows"), not(docsrs)))]
+#[cfg(all(feature = "opq", any(target_os = "linux", target_os = "windows"), not(docsrs)))]
 use openblas_src;
 
 use crate::{Error, Result};
@@ -178,6 +178,7 @@ impl MatrixView {
     }
 
     /// Dot multiply
+    #[cfg(feature = "opq")]
     pub fn dot(&self, rhs: &Self) -> Result<Self> {
         use cblas::{sgemm, Layout, Transpose};
 
@@ -288,6 +289,7 @@ impl TryFrom<&FixedSizeListArray> for MatrixView {
 /// Single Value Decomposition.
 ///
 /// <https://en.wikipedia.org/wiki/Singular_value_decomposition>
+#[cfg(feature = "opq")]
 pub trait SingularValueDecomposition {
     /// Matrix type
     type Matrix;
@@ -300,6 +302,7 @@ pub trait SingularValueDecomposition {
     fn svd(&self) -> Result<(Self::Matrix, Self::Sigma, Self::Matrix)>;
 }
 
+#[cfg(feature = "opq")]
 impl SingularValueDecomposition for MatrixView {
     type Matrix = Self;
     type Sigma = Float32Array;
@@ -401,7 +404,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(all(feature = "opq", unix))]
     fn test_svd() {
         // A 6 x 5 matrix, from
         // https://www.intel.com/content/www/us/en/develop/documentation/onemkl-lapack-examples/top/least-squares-and-eigenvalue-problems/singular-value-decomposition/gesvd-function/sgesvd-example/lapacke-sgesvd-example-c-row.html
@@ -503,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opq")]
     fn test_matrix_dot() {
         // A[2,3]
         let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
@@ -522,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "opq")]
     fn test_dot_on_transposed_mat() {
         // A[2,3]
         let a_data = Arc::new(Float32Array::from_iter((1..=6).map(|v| v as f32)));
