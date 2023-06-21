@@ -95,6 +95,26 @@ impl Planner {
             UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
+
+            UnaryOperator::Minus => {
+                use datafusion::logical_expr::lit;
+                match expr {
+                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                        Ok(n) => lit(-n),
+                        Err(_) => lit(-n
+                            .parse::<f64>()
+                            .map_err(|_e| {
+                                Error::IO{
+                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}")
+                                }
+                            })?),
+                    },
+                    _ => {
+                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
+                    }
+                }
+            }
+
             _ => {
                 return Err(Error::IO {
                     message: format!("Unary operator '{:?}' is not supported", op),
@@ -343,7 +363,7 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         use crate::datafusion::physical_expr::Column;
-        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, NegativeExpr};
 
         Ok(match expr {
             Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
@@ -353,6 +373,9 @@ impl Planner {
                 expr.op,
                 self.create_physical_expr(expr.right.as_ref())?,
             )),
+            Expr::Negative(expr) => {
+                Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
+            }
             Expr::IsNotNull(expr) => Arc::new(IsNotNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
@@ -428,7 +451,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
+        ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        StructArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::logical_expr::{col, lit, Cast};
@@ -501,6 +525,36 @@ mod tests {
             predicates.into_array(0).as_ref(),
             &BooleanArray::from(vec![
                 false, false, false, false, true, true, false, false, false, false
+            ])
+        );
+    }
+
+    #[test]
+    fn test_negative_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("x")
+            .gt(lit(-3_i64))
+            .and(col("x").lt(-(lit(-5_i64) + lit(3_i64))));
+
+        let expr = planner.parse_filter("x > -3 AND x < -(-5 + 3)").unwrap();
+
+        assert_eq!(expr, expected);
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(-5..5)) as ArrayRef],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, false, false, false
             ])
         );
     }
