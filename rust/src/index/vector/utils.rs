@@ -23,7 +23,7 @@ use crate::dataset::Dataset;
 use crate::{Error, Result};
 
 /// Maybe sample training data from dataset, specified by column name.
-pub(crate) async fn maybe_sample_training_data(
+pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,

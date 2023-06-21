@@ -154,7 +154,7 @@ impl FileFragment {
 
     fn updater(self_: PyRef<'_, Self>, columns: Option<Vec<String>>) -> PyResult<Updater> {
         let rt = tokio::runtime::Runtime::new()?;
-        let cols = columns.as_ref().map(|col| col.as_slice());
+        let cols = columns.as_deref();
         let inner = rt
             .block_on(async { self_.fragment.updater(cols).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;

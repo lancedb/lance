@@ -75,7 +75,7 @@ impl FileFragment {
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
         let mut buffer = RecordBatchBuffer::empty();
 
-        while let Some(rst) = reader.next() {
+        for rst in reader {
             let batch = rst?; // TODO: close writer on Error?
             buffer.batches.push(batch);
             if buffer.num_rows() >= params.max_rows_per_group {
@@ -123,7 +123,7 @@ impl FileFragment {
 
         let mut opened_files = vec![];
         for data_file in self.metadata.files.iter() {
-            let data_file_schema = data_file.schema(&full_schema);
+            let data_file_schema = data_file.schema(full_schema);
             let schema_per_file = data_file_schema.intersection(projection)?;
             if !schema_per_file.fields.is_empty() {
                 let path = self.dataset.data_dir().child(data_file.path.as_str());
@@ -194,7 +194,7 @@ impl FileFragment {
     pub async fn updater<T: AsRef<str>>(&self, columns: Option<&[T]>) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
         if let Some(columns) = columns {
-            schema = schema.project(&columns)?;
+            schema = schema.project(columns)?;
         }
         let reader = self.open(&schema).await?;
 
@@ -342,8 +342,8 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
     }
 
     let mut merged = batches[0].clone();
-    for i in 1..batches.len() {
-        merged = merged.merge(&batches[i])?;
+    for batch in batches.iter() {
+        merged = merged.merge(batch)?;
     }
     Ok(merged)
 }
@@ -418,7 +418,7 @@ impl FragmentReader {
         // TODO: Putting this loop in async blocks cause lifetime issues.
         // We need to fix
         for (reader, schema) in self.readers.iter() {
-            let batch = reader.take(indices, &schema).await?;
+            let batch = reader.take(indices, schema).await?;
             batches.push(batch);
         }
 
@@ -461,18 +461,18 @@ mod tests {
                 .collect(),
         );
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 2;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 2,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
 
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let dataset = Dataset::open(test_uri).await.unwrap();
-
-        dataset
+        Dataset::open(test_uri).await.unwrap()
     }
 
     #[tokio::test]
@@ -517,7 +517,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
-            &Int32Array::from_iter_values(vec![121, 122, 124, 125, 128])
+            &Int32Array::from(vec![121, 122, 124, 125, 128])
         );
     }
 
@@ -546,7 +546,7 @@ mod tests {
         )]));
         while let Some(batch) = updater.next().await.unwrap() {
             let input_col = batch.column_by_name("i").unwrap();
-            let result_col: Int32Array = multiply_scalar(&input_col.as_primitive(), 2).unwrap();
+            let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
             let batch =
                 RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
                     .unwrap();

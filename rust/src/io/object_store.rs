@@ -105,7 +105,7 @@ impl ObjectStore {
         let expanded_path = StdPath::new(&expanded);
 
         if !expanded_path.try_exists()? {
-            std::fs::create_dir_all(expanded_path.clone())?;
+            std::fs::create_dir_all(expanded_path)?;
         } else if !expanded_path.is_dir() {
             return Err(Error::IO {
                 message: format!("{} is not a lance directory", str_path),
@@ -200,7 +200,7 @@ impl ObjectStore {
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
     pub async fn read_dir(&self, dir_path: impl Into<Path>) -> Result<Vec<String>> {
         let path = dir_path.into();
-        let path = Path::parse(path.to_string())?;
+        let path = Path::parse(&path)?;
         let output = self.inner.list_with_delimiter(Some(&path)).await?;
         Ok(output
             .common_prefixes
@@ -240,7 +240,7 @@ mod tests {
     }
 
     async fn read_from_store(store: ObjectStore, path: &Path) -> Result<String> {
-        let test_file_store = store.open(&path).await.unwrap();
+        let test_file_store = store.open(path).await.unwrap();
         let size = test_file_store.size().await.unwrap();
         let bytes = test_file_store.get_range(0..size).await.unwrap();
         let contents = String::from_utf8(bytes.to_vec()).unwrap();
@@ -252,16 +252,16 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
         write_to_file(
-            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+            &format!("{tmp_path}/bar/foo.lance/test_file"),
             "TEST_CONTENT",
         )
         .unwrap();
 
         // test a few variations of the same path
         for uri in &[
-            tmp_path.clone() + "/bar/foo.lance",
-            tmp_path.clone() + "/./bar/foo.lance",
-            tmp_path.clone() + "/bar/foo.lance/../foo.lance",
+            format!("{tmp_path}/bar/foo.lance"),
+            format!("{tmp_path}/./bar/foo.lance"),
+            format!("{tmp_path}/bar/foo.lance/../foo.lance"),
         ] {
             let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
             let contents = read_from_store(store, &path.child("test_file"))
@@ -276,7 +276,7 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
         write_to_file(
-            &(tmp_path.clone() + "/bar/foo.lance/test_file"),
+            &format!("{tmp_path}/bar/foo.lance/test_file"),
             "RELATIVE_URL",
         )
         .unwrap();
@@ -293,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
-        write_to_file(&(uri.to_string() + "/test_file"), "TILDE").unwrap();
+        write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
         let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
         let contents = read_from_store(store, &path.child("test_file"))
             .await

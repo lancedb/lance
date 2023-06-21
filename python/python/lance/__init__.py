@@ -46,10 +46,11 @@ def dataset(
     uri : str
         Address to the Lance dataset.
     version : optional, int
-        If specified, load a specific version of the Lance dataset. Else, loads the latest version.
+        If specified, load a specific version of the Lance dataset. Else, loads the
+        latest version.
     asof : optional, datetime or str
-        If specified, find the latest version created on or earlier than the given argument value.
-        If a version is already specified, this arg is ignored.
+        If specified, find the latest version created on or earlier than the given
+        argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     """

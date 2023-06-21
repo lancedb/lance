@@ -74,7 +74,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();
-                assert!(results.len() >= 1);
+                assert!(!results.is_empty());
             })
         },
     );
@@ -95,7 +95,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();
-                assert!(results.len() >= 1);
+                assert!(!results.is_empty());
             })
         },
     );
@@ -114,7 +114,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     let num_rows = 100_000;
     let batch_size = 10000;
     let batches = RecordBatchBuffer::new(
-        (0..(num_rows / batch_size) as i32)
+        (0..(num_rows / batch_size))
             .map(|_| {
                 RecordBatch::try_new(
                     schema.clone(),
@@ -174,6 +174,7 @@ criterion_group!(
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_ivf_pq_index);
+
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(

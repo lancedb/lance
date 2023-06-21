@@ -369,9 +369,7 @@ impl ProductQuantizer {
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
     pub fn centroids(&self, sub_vector_idx: usize) -> Option<Arc<Float32Array>> {
         assert!(sub_vector_idx < self.num_sub_vectors);
-        if self.codebook.is_none() {
-            return None;
-        };
+        self.codebook.as_ref()?;
 
         let num_centroids = Self::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
@@ -469,7 +467,7 @@ impl ProductQuantizer {
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
-            Ok::<UInt8Array, Error>(UInt8Array::from_iter_values(builder))
+            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
         })
         .await??;
 
@@ -589,6 +587,7 @@ impl From<&pb::Pq> for ProductQuantizer {
     }
 }
 
+#[allow(clippy::fallible_impl_from)]
 impl From<&ProductQuantizer> for pb::Pq {
     fn from(pq: &ProductQuantizer) -> Self {
         Self {

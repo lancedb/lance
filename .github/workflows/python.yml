@@ -18,8 +18,53 @@ env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
   # key, so we set it to make sure it is always consistent.
   CARGO_TERM_COLOR: always
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=1"
+  RUST_BACKTRACE: "1"
 
 jobs:
+  lint:
+    timeout-minutes: 45
+    runs-on: "ubuntu-22.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
+    - name: Install linting tools
+      run: |
+        pip install black isort ruff maturin
+    - name: Lint Python
+      run: |
+        black --check python
+        isort --check-only python
+        ruff check python
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y protobuf-compiler libssl-dev
+    - name: Lint Rust
+      run: |
+        cargo fmt --all -- --check
+        cargo clippy --all-features --tests
+    - name: Build
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        maturin develop --extras tests
+    - name: Run doctest
+      run: |
+        source venv/bin/activate
+        pytest --doctest-modules python/lance
+    
   linux:
     timeout-minutes: 45
     strategy:

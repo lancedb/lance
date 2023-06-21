@@ -36,6 +36,8 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run cargo fmt
         run: cargo fmt --check
+      - name: Run clippy
+        run: cargo clippy --all-features --tests
       - name: Run tests
         run: |
           cargo build --all-features
