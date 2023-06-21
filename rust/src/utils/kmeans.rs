@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -418,16 +419,16 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        let cluster_with_distances = stream::iter(0..n)
+        const CHUNK_SIZE: usize = 1024;
+        let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
-            .chunks(2048)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
-            .map(|(indices, (data, centroids))| async move {
+            .map(|(start_idx, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
                     let mut results = vec![];
-                    for idx in indices {
+                    for idx in start_idx..min(start_idx + CHUNK_SIZE, n) {
                         let vector = &array[idx * dimension..(idx + 1) * dimension];
                         let (cluster_id, distance) = {
                             let mut min = std::f32::MAX;
@@ -438,6 +439,7 @@ impl KMeans {
                                 // of dynamic dispatch.
                                 //
                                 // NOTE: Please make sure run benchmark when changing the following code.
+                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
                                 let dist = match metric_type {
                                     MetricType::L2 => vector.l2(other),
                                     MetricType::Cosine => vector.cosine(other),
