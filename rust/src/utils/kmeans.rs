@@ -28,6 +28,7 @@ use rand::{distributions::WeightedIndex, Rng};
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
 use crate::Result;
+use crate::linalg::l2::L2;
 use crate::{arrow::*, Error};
 
 /// KMean initialization method.
@@ -425,14 +426,11 @@ impl KMeans {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
-                    let dist = metric_type.batch_func();
                     let mut results = vec![];
                     for idx in indices {
                         let vector = &array[idx * dimension..(idx + 1) *dimension];
-                        let distances = dist(vector, centroids_array, dimension);
-                        let cluster_id = argmin(distances.as_ref()).unwrap();
-                        let distance = distances.value(cluster_id as usize);
-                        results.push((cluster_id, distance))
+                        let (cluster_id, distance) = vector.l2_argmin(&centroids_array);
+                        results.push((cluster_id as u32, distance))
                     }
                     results
                 })

@@ -28,6 +28,8 @@ pub trait L2 {
 
     /// Calculate the L2 distance between two vectors.
     fn l2(&self, other: &Self) -> Self::Output;
+
+    fn l2_argmin(&self, other: &Self) -> (usize, Self::Output);
 }
 
 /// Calculate the L2 distance between two vectors, using scalar operations.
@@ -68,6 +70,19 @@ impl L2 for [f32] {
         #[cfg(not(target_arch = "aarch64"))]
         l2_scalar(self, other)
     }
+
+    fn l2_argmin(&self, others: &[f32]) -> (usize, f32) {
+        let mut min = std::f32::MAX;
+        let mut min_idx = 0;
+        for (idx, other) in others.chunks_exact(self.len()).enumerate() {
+            let dist = self.l2(other);
+            if dist < min {
+                min = dist;
+                min_idx = idx;
+            }
+        }
+        (min_idx, min)
+    }
 }
 
 impl L2 for Float32Array {
@@ -76,6 +91,10 @@ impl L2 for Float32Array {
     #[inline]
     fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
+    }
+
+    fn l2_argmin(&self, others: &Self) -> (usize, f32) {
+        self.values().l2_argmin(others.values())
     }
 }
 
