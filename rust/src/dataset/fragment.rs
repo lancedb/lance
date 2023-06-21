@@ -233,7 +233,13 @@ impl FileFragment {
         let expected_length = get_lengths.first().unwrap_or(&0);
         for (length, path) in get_lengths.iter().zip(data_file_paths.into_iter()) {
             if length != expected_length {
-                return Err(Error::corrupt_file(path, "data file has incorrect length"));
+                return Err(Error::corrupt_file(
+                    path,
+                    format!(
+                        "data file has incorrect length. Expected: {} Got: {}",
+                        expected_length, length
+                    ),
+                ));
             }
         }
 
@@ -247,7 +253,7 @@ impl FileFragment {
                             self.metadata.id,
                             &deletion_file_meta,
                         ),
-                        "deletion vector contains row id that is out of range",
+                        format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
                     ));
                 }
             }
@@ -297,34 +303,6 @@ impl FileFragment {
         }
 
         self.metadata = updater.finish().await?;
-
-        // let mut scanner = self.scan();
-        // scanner.project(&[join_column])?
-        //     .with_row_id();
-
-        // let mut batch_stream = scanner
-        //     .try_into_stream()
-        //     .await?
-        //     .and_then(|batch| joiner.collect(batch.column(0).clone()))
-        //     .boxed();
-
-        // let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
-
-        // let filename = format!("{}.lance", Uuid::new_v4());
-        // let full_path = self.dataset.data_dir().child(filename.clone());
-        // let mut writer =
-        //     FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
-        //         .await?;
-
-        // let start_row_id = 0;
-        // while let Some(batch) = batch_stream.try_next().await? {
-
-        //     writer.write(&[batch]).await?;
-        // }
-
-        // writer.finish().await?;
-
-        // self.metadata.add_file(&filename, &file_schema);
 
         Ok(self)
     }
