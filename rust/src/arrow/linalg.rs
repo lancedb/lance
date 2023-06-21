@@ -25,7 +25,6 @@ use rand::{distributions::Standard, rngs::SmallRng, seq::IteratorRandom, Rng, Se
 #[allow(unused_imports)]
 #[cfg(target_os = "macos")]
 use accelerate_src;
-
 #[allow(unused_imports)]
 #[cfg(all(any(target_os = "linux", target_os = "windows"), not(docsrs)))]
 use openblas_src;
@@ -261,6 +260,85 @@ impl MatrixView {
             num_columns: self.num_columns,
             transpose: false,
         }
+    }
+
+    fn vec_sub(a1: Vec<f32>, a2: Vec<f32>) -> Vec<f32> {
+        return a1
+            .into_iter()
+            .zip(a2.into_iter())
+            .map(|(a, b)| a - b)
+            .collect();
+    }
+
+    fn vec_dot(a1: Vec<f32>, a2: Vec<f32>) -> f32 {
+        return a1.into_iter().zip(a2.into_iter()).map(|(a, b)| a * b).sum();
+    }
+
+    fn scalar_mult(a1: Vec<f32>, k: f32) -> Vec<f32> {
+        return a1.into_iter().map(|a| k * a).collect();
+    }
+
+    // Gram-Schmidt algorithm: https://en.wikipedia.org/wiki/Gram%E2%80%93Schmidt_process
+    fn qr(&self) -> (MatrixView, MatrixView) {
+        let dim = self.num_rows();
+        self.transpose();
+        let col_basis = self.data.values().chunks_mut(dim);
+        let orth_basis = self.data.values().chunks_mut(dim);
+        orth_basis.enumerate().for_each(|(i, col)| {
+            orth_basis
+                .enumerate()
+                .filter(|(j, _)| *j < i)
+                .for_each(|(_, col2)| {
+                    let vec1 = (*col).to_vec();
+                    let vec2 = (*col2).to_vec();
+                    //vec1 - proj_{vec2} vec1
+                    col.clone_from_slice(
+                        Self::vec_sub(
+                            vec1,
+                            Self::scalar_mult(
+                                vec2,
+                                Self::vec_dot(vec1, vec2) / Self::vec_dot(vec2, vec2),
+                            ),
+                        )
+                        .as_slice(),
+                    );
+                });
+        });
+
+        orth_basis.for_each(|col| {
+            let vec = (*col).to_vec();
+            col.clone_from_slice(Self::scalar_mult(vec, 1.0 / Self::vec_dot(vec, vec)).as_slice());
+        });
+
+        let mut q_builder = Float32Builder::with_capacity(dim * self.num_columns());
+        orth_basis.for_each(|col| q_builder.append_slice(col));
+        let q_data = Arc::new(q_builder.finish());
+        let q = MatrixView::new(q_data, self.num_columns());
+
+        let r_slice = orth_basis.enumerate().map(|(i, col)| {
+            let row = Float32Builder::with_capacity(dim).values_slice();
+            row.iter().enumerate().for_each(|(j, el)| {
+                if j < i {
+                    *el = 0.0;
+                } else {
+                    let q = (*col).to_vec();
+                    let a = orth_basis
+                        .nth(j)
+                        .expect("Column index not within range")
+                        .to_vec();
+                    *el = Self::vec_dot(q, a);
+                }
+            });
+            return row;
+        });
+
+        let mut r_builder = Float32Builder::with_capacity(self.num_columns() * self.num_columns());
+        r_slice.for_each(|col| r_builder.append_slice(col));
+
+        let r_data = Arc::new(r_builder.finish());
+        let r = MatrixView::new(r_data, self.num_columns());
+
+        return (q, r);
     }
 }
 
