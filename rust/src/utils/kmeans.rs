@@ -27,9 +27,9 @@ use rand::{distributions::WeightedIndex, Rng};
 
 use crate::arrow::linalg::MatrixView;
 use crate::index::vector::MetricType;
-use crate::linalg::{l2::L2, cosine::Cosine};
+use crate::linalg::{cosine::Cosine, l2::L2};
+use crate::Error;
 use crate::Result;
-use crate::{Error};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -438,7 +438,7 @@ impl KMeans {
                                 // of dynamic dispatch.
                                 //
                                 // NOTE: Please make sure run benchmark when changing the following code.
-                                let dist =  match metric_type {
+                                let dist = match metric_type {
                                     MetricType::L2 => vector.l2(other),
                                     MetricType::Cosine => vector.cosine(other),
                                 };
