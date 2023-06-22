@@ -26,6 +26,7 @@ use arrow_schema::Schema;
 use env_logger::Env;
 use pyo3::prelude::*;
 
+pub(crate) mod arrow;
 pub(crate) mod dataset;
 pub(crate) mod errors;
 pub(crate) mod fragment;
@@ -33,6 +34,7 @@ pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod updater;
 
+pub use crate::arrow::{bfloat16_array, BFloat16};
 pub use dataset::write_dataset;
 pub use dataset::Dataset;
 pub use fragment::FragmentMetadata;
@@ -52,6 +54,8 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<DataFile>()?;
+    m.add_class::<BFloat16>()?;
+    m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
