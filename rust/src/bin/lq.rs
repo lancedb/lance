@@ -187,6 +187,15 @@ async fn create_index(
             });
         }
     };
+    #[cfg(not(feature = "opq"))]
+    let _ = match use_opq {
+        false => (),
+        true => {
+            return Err(Error::Index {
+                message: "Feature 'opq' not installed.".to_string(),
+            });
+        }
+    };
     dataset
         .create_index(
             &[col],

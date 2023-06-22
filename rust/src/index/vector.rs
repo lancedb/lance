@@ -26,6 +26,7 @@ pub mod flat;
 mod graph;
 pub mod ivf;
 mod kmeans;
+#[cfg(feature = "opq")]
 pub mod opq;
 pub mod pq;
 mod traits;
@@ -37,6 +38,8 @@ use self::{
 };
 
 use super::{pb, IndexParams};
+#[cfg(feature = "opq")]
+use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{
     dataset::Dataset,
     index::{
@@ -44,7 +47,6 @@ use crate::{
         vector::{
             diskann::{DiskANNIndex, DiskANNParams},
             ivf::Ivf,
-            opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
         },
     },
@@ -381,14 +383,17 @@ pub(crate) async fn open_index(
         dataset.manifest.clone(),
         100_usize,
     ));
+
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
+            #[allow(unused_variables)]
             Some(Stage::Transform(tf)) => {
                 if last_stage.is_none() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
                     });
                 }
+                #[cfg(feature = "opq")]
                 match tf.r#type() {
                     pb::TransformType::Opq => {
                         let opq = OptimizedProductQuantizer::load(

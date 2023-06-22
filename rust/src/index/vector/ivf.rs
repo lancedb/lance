@@ -35,14 +35,15 @@ use futures::{
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 
+#[cfg(feature = "opq")]
+use super::opq::train_opq;
 use super::{
-    opq::train_opq,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
-    arrow::{linalg::MatrixView, *},
+    arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
     index::{pb, vector::Transformer, Index},
@@ -568,7 +569,10 @@ pub async fn build_ivf_pq_index(
     ) * 256;
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+    #[cfg(not(feature = "opq"))]
+    let transforms: Vec<Box<dyn Transformer>> = vec![];
 
     // Train IVF partitions.
     let ivf_model = if let Some(centroids) = &ivf_params.centroids {
@@ -585,8 +589,15 @@ pub async fn build_ivf_pq_index(
     } else {
         // Pre-transforms
         if pq_params.use_opq {
-            let opq = train_opq(&training_data, pq_params).await?;
-            transforms.push(Box::new(opq));
+            #[cfg(not(feature = "opq"))]
+            return Err(Error::Index {
+                message: format!("Feature 'opq' is not installed."),
+            });
+            #[cfg(feature = "opq")]
+            {
+                let opq = train_opq(&training_data, pq_params).await?;
+                transforms.push(Box::new(opq));
+            }
         }
 
         // Transform training data if necessary.

@@ -24,7 +24,7 @@ use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::arrow::{linalg::MatrixView, *};
+use crate::arrow::{linalg::matrix::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;

@@ -18,7 +18,7 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 
-use crate::arrow::{linalg::MatrixView, *};
+use crate::arrow::{linalg::matrix::MatrixView, *};
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 

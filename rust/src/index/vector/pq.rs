@@ -31,7 +31,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
 use super::{MetricType, Query, VectorIndex};
-use crate::arrow::linalg::MatrixView;
+use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::Index;
