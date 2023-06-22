@@ -19,7 +19,7 @@ use lru_time_cache::LruCache;
 use super::vector::VectorIndex;
 
 #[derive(Clone)]
-pub(crate) struct IndexCache {
+pub struct IndexCache {
     /// The maximum number of indices to cache.
     capacity: usize,
 
@@ -44,7 +44,7 @@ impl IndexCache {
     pub(crate) fn get(&self, key: &str) -> Option<Arc<dyn VectorIndex>> {
         let mut cache = self.cache.lock().unwrap();
         let idx = cache.get(key);
-        idx.map(|idx| idx.clone())
+        idx.cloned()
     }
 
     /// Insert a new entry into the cache.

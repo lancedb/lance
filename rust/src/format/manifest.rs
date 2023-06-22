@@ -95,7 +95,7 @@ impl Manifest {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        self.timestamp_nanos = nanos as u128;
+        self.timestamp_nanos = nanos;
     }
 
     /// Return the max fragment id.
@@ -106,7 +106,7 @@ impl Manifest {
 
     /// Return the fragments that are newer than the given manifest.
     /// Note this does not support recycling of fragment ids.
-    pub fn fragments_since(&self, since: &Manifest) -> Result<Vec<Fragment>> {
+    pub fn fragments_since(&self, since: &Self) -> Result<Vec<Fragment>> {
         if since.version >= self.version {
             return Err(Error::IO {
                 message: format!(
@@ -120,7 +120,7 @@ impl Manifest {
             .fragments
             .iter()
             .filter(|&f| start.map(|s| f.id > s).unwrap_or(true))
-            .map(|f| f.clone())
+            .cloned()
             .collect())
     }
 }
