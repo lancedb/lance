@@ -50,33 +50,33 @@ For example, imagine we have a dataset of embeddings and ids:
 
 .. testcode::
 
-   import lance
-   import pyarrow as pa
-   import numpy as np
-   table = pa.table({
-      "id": pa.array([1, 2, 3]),
-      "embedding": pa.array([np.array([1, 2, 3]), np.array([4, 5, 6]),
-                             np.array([7, 8, 9])])
-   })
-   dataset = lance.write_dataset(table, "embeddings")
+    import lance
+    import pyarrow as pa
+    import numpy as np
+    table = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "embedding": pa.array([np.array([1, 2, 3]), np.array([4, 5, 6]),
+                              np.array([7, 8, 9])])
+    })
+    dataset = lance.write_dataset(table, "embeddings")
 
 Now if we want to add a column of labels we have generated, we can do so by merging a new table:
 
 .. testcode::
 
-  new_data = pa.table({
-     "id": pa.array([1, 2, 3]),
-     "label": pa.array(["horse", "rabbit", "cat"])
-  })
-  dataset.merge(new_data, "id")
-  dataset.to_table().to_pandas()
+    new_data = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "label": pa.array(["horse", "rabbit", "cat"])
+    })
+    dataset.merge(new_data, "id")
+    dataset.to_table().to_pandas()
 
 .. testoutput::
 
-     id   embedding   label
-  0   1   [1, 2, 3]   horse
-  1   2   [4, 5, 6]  rabbit
-  2   3   [7, 8, 9]     cat
+       id  embedding   label
+    0   1  [1, 2, 3]   horse
+    1   2  [4, 5, 6]  rabbit
+    2   3  [7, 8, 9]     cat
 
 
 Reading Lance Dataset

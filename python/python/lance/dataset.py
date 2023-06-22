@@ -381,7 +381,7 @@ class LanceDataset(pa.dataset.Dataset):
         right_on: str or None
             The name of the column in data_obj to join on. If None, defaults to
             left_on.
-        
+
         Examples
         --------
 
