@@ -105,19 +105,17 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
-                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                    Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
                         right: Box::new(Expr::BinaryExpr(BinaryExpr {
                             left: coerce_expr(&r.left, &field.data_type())
-                                .map_err(|e| e)
                                 .map(Box::new)?,
                             op: r.op,
                             right: coerce_expr(&r.right, &field.data_type())
-                                .map_err(|e| e)
                                 .map(Box::new)?,
                         })),
-                    }));
+                    }))
                 }
 
                 _ => Ok(expr.clone()),
@@ -143,7 +141,7 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
             op: *op,
             right: Box::new(coerce_expr(right, dtype)?),
         })),
-        Expr::Literal(l) => Ok(resolve_value(&Expr::Literal(l.clone()), &dtype)?),
+        Expr::Literal(l) => Ok(resolve_value(&Expr::Literal(l.clone()), dtype)?),
         _ => Ok(expr.clone()),
     }
 }
@@ -219,9 +217,9 @@ mod tests {
                         &Expr::Literal(ScalarValue::Float64(Some(-1.0)))
                     );
                 }
-                _ => assert!(false, "Expected BinaryExpr"),
+                _ => panic!("Expected BinaryExpr"),
             },
-            _ => assert!(false, "Expected BinaryExpr"),
+            _ => panic!("Expected BinaryExpr"),
         }
     }
 }

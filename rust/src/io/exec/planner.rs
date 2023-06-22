@@ -546,7 +546,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(Int64Array::from_iter_values(-5..5)) as ArrayRef],
         )
         .unwrap();
