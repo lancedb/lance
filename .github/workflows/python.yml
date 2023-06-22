@@ -54,7 +54,7 @@ jobs:
     - name: Lint Rust
       run: |
         cargo fmt --all -- --check
-        cargo clippy --all-features --tests
+        cargo clippy --all-features --tests -- -D warnings
     - name: Build
       run: |
         python -m venv venv
