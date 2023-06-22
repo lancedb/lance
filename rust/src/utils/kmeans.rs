@@ -427,7 +427,8 @@ impl KMeans {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
-                    let results = (start_idx..min(start_idx + CHUNK_SIZE, n))
+
+                    (start_idx..min(start_idx + CHUNK_SIZE, n))
                         .map(|idx| {
                             let vector = &array[idx * dimension..(idx + 1) * dimension];
                             let mut min = std::f32::MAX;
@@ -450,8 +451,7 @@ impl KMeans {
                             }
                             (min_idx as u32, min)
                         })
-                        .collect::<Vec<_>>();
-                    results
+                        .collect::<Vec<_>>()
                 })
                 .await?;
                 Ok::<Vec<_>, Error>(data)

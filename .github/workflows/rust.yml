@@ -37,7 +37,7 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --check
       - name: Run clippy
-        run: cargo clippy --all-features --tests
+        run: cargo clippy --all-features --tests -- -D warnings
       - name: Run tests
         run: |
           cargo build --all-features
