@@ -16,7 +16,6 @@ use std::cmp::Ordering;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow::array::{as_largestring_array, as_string_array};
-use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
     cast::as_primitive_array,
     types::{
@@ -35,25 +34,20 @@ pub fn argmax<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
     T::Native: PartialOrd,
 {
-    let mut max: Option<(u32, <T as ArrowPrimitiveType>::Native)> = None;
-    for (idx, value) in array.iter().enumerate() {
-        if let Some(value) = value {
-            if let Some((_, max_value)) = max {
-                match value.partial_cmp(&max_value) {
-                    Some(Ordering::Greater) => max = Some((idx as u32, value)),
-                    Some(Ordering::Equal) => {}
-                    _ => {}
-                }
-            } else {
-                // Ignore NaN values
-                if let Some(Ordering::Equal) = value.partial_cmp(&value) {
-                    max = Some((idx as u32, value));
-                }
-            }
-        }
-    }
-
-    max.map(|(idx, _)| idx)
+    array
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| match value {
+            // Remove None and NaN values
+            Some(v) => v.partial_cmp(&v).is_some(),
+            None => false,
+        })
+        .max_by(|(_, x), (_, y)| match (x, y) {
+            (None, _) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(vx), Some(vy)) => vx.partial_cmp(vy).unwrap(),
+        })
+        .map(|(idx, _)| idx as u32)
 }
 
 /// Argmin on a [PrimitiveArray].
@@ -63,25 +57,20 @@ pub fn argmin<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
     T::Native: PartialOrd,
 {
-    let mut min: Option<(u32, <T as ArrowPrimitiveType>::Native)> = None;
-    for (idx, value) in array.iter().enumerate() {
-        if let Some(value) = value {
-            if let Some((_, min_value)) = min {
-                match value.partial_cmp(&min_value) {
-                    Some(Ordering::Less) => min = Some((idx as u32, value)),
-                    Some(Ordering::Equal) => {}
-                    _ => {}
-                }
-            } else {
-                // Ignore NaN values
-                if let Some(Ordering::Equal) = value.partial_cmp(&value) {
-                    min = Some((idx as u32, value));
-                }
-            }
-        }
-    }
-
-    min.map(|(idx, _)| idx)
+    array
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| match value {
+            // Remove None and NaN values
+            Some(v) => v.partial_cmp(&v).is_some(),
+            None => false,
+        })
+        .max_by(|(_, x), (_, y)| match (x, y) {
+            (None, _) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(vx), Some(vy)) => vy.partial_cmp(vx).unwrap(),
+        })
+        .map(|(idx, _)| idx as u32)
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
