@@ -109,11 +109,9 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         left: left.clone(),
                         op: *op,
                         right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                            left: coerce_expr(&r.left, &field.data_type())
-                                .map(Box::new)?,
+                            left: coerce_expr(&r.left, &field.data_type()).map(Box::new)?,
                             op: r.op,
-                            right: coerce_expr(&r.right, &field.data_type())
-                                .map(Box::new)?,
+                            right: coerce_expr(&r.right, &field.data_type()).map(Box::new)?,
                         })),
                     }))
                 }

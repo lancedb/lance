@@ -427,7 +427,7 @@ impl KMeans {
                 let data = tokio::task::spawn_blocking(move || {
                     let array = data.values();
                     let centroids_array = centroids.values();
-                    
+
                     (start_idx..min(start_idx + CHUNK_SIZE, n))
                         .map(|idx| {
                             let vector = &array[idx * dimension..(idx + 1) * dimension];
