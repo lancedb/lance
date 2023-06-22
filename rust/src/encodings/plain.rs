@@ -756,7 +756,7 @@ mod tests {
         for i in 0..10 {
             let data = array.slice(i * 12, 12); // one and half byte
             file_writer
-                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
+                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
                 .await
                 .unwrap();
         }

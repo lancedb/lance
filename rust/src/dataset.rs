@@ -967,8 +967,8 @@ mod tests {
                             Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                             Arc::new(
                                 DictionaryArray::try_new(
-                                    &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
-                                    &dict_values,
+                                    UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                    Arc::new(dict_values.clone()),
                                 )
                                 .unwrap(),
                             ),

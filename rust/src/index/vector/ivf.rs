@@ -591,7 +591,7 @@ pub async fn build_ivf_pq_index(
         if pq_params.use_opq {
             #[cfg(not(feature = "opq"))]
             return Err(Error::Index {
-                message: format!("Feature 'opq' is not installed."),
+                message: "Feature 'opq' is not installed.".to_string(),
             });
             #[cfg(feature = "opq")]
             {
