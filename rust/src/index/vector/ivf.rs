@@ -588,10 +588,16 @@ pub async fn build_ivf_pq_index(
         Ivf::new(centroids.clone())
     } else {
         // Pre-transforms
-        #[cfg(feature = "opq")]
         if pq_params.use_opq {
-            let opq = train_opq(&training_data, pq_params).await?;
-            transforms.push(Box::new(opq));
+            #[cfg(not(feature = "opq"))]
+            return Err(Error::Index {
+                message: format!("Feature 'opq' is not installed."),
+            });
+            #[cfg(feature = "opq")]
+            {
+                let opq = train_opq(&training_data, pq_params).await?;
+                transforms.push(Box::new(opq));
+            }
         }
 
         // Transform training data if necessary.

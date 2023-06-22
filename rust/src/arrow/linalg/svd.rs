@@ -8,7 +8,7 @@ use arrow_array::Float32Array;
 use accelerate_src;
 
 #[allow(unused_imports)]
-#[cfg(all(any(target_os = "linux", target_os = "windows"), not(docsrs)))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use openblas_src;
 
 use crate::{Error, Result};
