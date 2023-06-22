@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 use std::{collections::hash_map::DefaultHasher, hash::Hash, hash::Hasher};
 
 use arrow::array::{as_largestring_array, as_string_array};
+use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{
     cast::as_primitive_array,
     types::{
@@ -34,15 +35,25 @@ pub fn argmax<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
     T::Native: PartialOrd,
 {
-    array
-        .iter()
-        .enumerate()
-        .max_by(|(_, x), (_, y)| match (x, y) {
-            (None, _) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => vx.partial_cmp(vy).unwrap(),
-        })
-        .map(|(idx, _)| idx as u32)
+    let mut max: Option<(u32, <T as ArrowPrimitiveType>::Native)> = None;
+    for (idx, value) in array.iter().enumerate() {
+        if let Some(value) = value {
+            if let Some((_, max_value)) = max {
+                match value.partial_cmp(&max_value) {
+                    Some(Ordering::Greater) => max = Some((idx as u32, value)),
+                    Some(Ordering::Equal) => {}
+                    _ => {}
+                }
+            } else {
+                // Ignore NaN values
+                if let Some(Ordering::Equal) = value.partial_cmp(&value) {
+                    max = Some((idx as u32, value));
+                }
+            }
+        }
+    }
+
+    max.map(|(idx, _)| idx)
 }
 
 /// Argmin on a [PrimitiveArray].
@@ -52,15 +63,25 @@ pub fn argmin<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
     T::Native: PartialOrd,
 {
-    array
-        .iter()
-        .enumerate()
-        .max_by(|(_, x), (_, y)| match (x, y) {
-            (None, _) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(vx), Some(vy)) => vy.partial_cmp(vx).unwrap(),
-        })
-        .map(|(idx, _)| idx as u32)
+    let mut min: Option<(u32, <T as ArrowPrimitiveType>::Native)> = None;
+    for (idx, value) in array.iter().enumerate() {
+        if let Some(value) = value {
+            if let Some((_, min_value)) = min {
+                match value.partial_cmp(&min_value) {
+                    Some(Ordering::Less) => min = Some((idx as u32, value)),
+                    Some(Ordering::Equal) => {}
+                    _ => {}
+                }
+            } else {
+                // Ignore NaN values
+                if let Some(Ordering::Equal) = value.partial_cmp(&value) {
+                    min = Some((idx as u32, value));
+                }
+            }
+        }
+    }
+
+    min.map(|(idx, _)| idx)
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
@@ -120,7 +141,10 @@ pub fn hash(array: &dyn Array) -> Result<UInt64Array> {
 mod tests {
     use super::*;
 
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        f32::{INFINITY, NAN, NEG_INFINITY},
+    };
 
     use arrow_array::{
         Float32Array, Int16Array, Int8Array, LargeStringArray, StringArray, UInt32Array, UInt8Array,
@@ -128,13 +152,19 @@ mod tests {
 
     #[test]
     fn test_argmax() {
-        let f = Float32Array::from_iter(vec![1.0, 5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
+        let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
         assert_eq!(argmax(&f), Some(4));
 
-        let i = Int16Array::from_iter(vec![1, 5, 3, 2, 20, 8, 16]);
+        let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, INFINITY, 3.5]);
+        assert_eq!(argmax(&f), Some(5));
+
+        let f = Float32Array::from(vec![NAN, NAN, NAN]);
+        assert_eq!(argmax(&f), None);
+
+        let i = Int16Array::from(vec![1, 5, 3, 2, 20, 8, 16]);
         assert_eq!(argmax(&i), Some(4));
 
-        let u = UInt32Array::from_iter(vec![1, 5, 3, 2, 20, 8, 16]);
+        let u = UInt32Array::from(vec![1, 5, 3, 2, 20, 8, 16]);
         assert_eq!(argmax(&u), Some(4));
 
         let empty_vec: Vec<i16> = vec![];
@@ -144,6 +174,18 @@ mod tests {
 
     #[test]
     fn test_argmin() {
+        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
+        assert_eq!(argmin(&f), Some(2));
+
+        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, NAN]);
+        assert_eq!(argmin(&f), Some(2));
+
+        let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, NEG_INFINITY, NAN]);
+        assert_eq!(argmin(&f), Some(3));
+
+        let f = Float32Array::from_iter(vec![NAN, NAN, NAN, NAN]);
+        assert_eq!(argmin(&f), None);
+
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
         assert_eq!(argmin(&f), Some(2));
 
