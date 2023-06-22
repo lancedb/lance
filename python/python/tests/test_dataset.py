@@ -15,6 +15,7 @@
 import os
 import pickle
 import platform
+import re
 import time
 import uuid
 from datetime import datetime
@@ -26,8 +27,8 @@ import lance.fragment
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pyarrow.dataset as pa_ds
+import pyarrow.parquet as pq
 import pytest
 
 
@@ -321,6 +322,30 @@ def test_data_files(tmp_path: Path):
     # it is a valid uuid
     uuid.UUID(os.path.splitext(data_files[0].path())[0])
 
+    assert fragment.deletion_file() is None
+
+
+def test_deletion_file(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(table, base_dir)
+    fragment = dataset.get_fragment(0)
+
+    assert fragment.deletion_file() is None
+
+    new_fragment = fragment.delete("a < 10")
+
+    # Old fragment unchanged
+    assert fragment.deletion_file() is None
+
+    # New fragment has deletion file
+    assert new_fragment.deletion_file() is not None
+    assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
+    dataset = lance.LanceDataset._commit(
+        base_dir, table.schema, [new_fragment.metadata()]
+    )
+    assert dataset.count_rows() == 90
+
 
 def test_commit_fragments_via_scanner(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -385,12 +410,14 @@ def test_merge_data(tmp_path: Path):
     new_tab = pa.table({"a2": range(5), "d": ["a", "b", "c", "d", "e"]})
     dataset.merge(new_tab, left_on="a", right_on="a2")
     assert dataset.version == 3
-    assert dataset.to_table() == pa.table({
-        "a": range(100),
-        "b": range(100),
-        "c": range(100),
-        "d": ["a", "b", "c", "d", "e"] + [None] * 95
-    })
+    assert dataset.to_table() == pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+            "c": range(100),
+            "d": ["a", "b", "c", "d", "e"] + [None] * 95,
+        }
+    )
 
 
 def test_delete_data(tmp_path: Path):

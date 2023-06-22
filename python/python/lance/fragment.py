@@ -35,7 +35,7 @@ class LanceFragment(pa.dataset.Fragment):
         self._fragment = dataset.get_fragment(fragment_id)
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
-    
+
     def __repr__(self):
         return self._fragment.__repr__()
 
@@ -177,6 +177,38 @@ class LanceFragment(pa.dataset.Fragment):
             updater.update(new_value)
         return updater.finish()
 
+    def delete(self, predicate: str) -> LanceFragment | None:
+        """Delete rows from this Fragment.
+
+        This will add or update the deletion file of this fragment. It does not
+        modify or delete the data files of this fragment. If no rows are left after
+        the deletion, this method will return None.
+
+        Parameters
+        ----------
+        predicate: str
+            A SQL predicate that specifies the rows to delete.
+
+        Returns
+        -------
+        LanceFragment or None
+            A new fragment containing the new deletion file, or None if no rows left.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+        >>> dataset = lance.write_dataset(tab, "dataset")
+        >>> frag = dataset.get_fragment(0)
+        >>> frag.delete("a > 1")
+        LanceFileFragment(id=0, data_files=['....lance'], \
+deletion_file='_deletions/0-1-....arrow')
+        >>> frag.delete("a > 0") is None
+        True
+        """
+        self._fragment.delete(predicate)
+
     @property
     def schema(self) -> pa.Schema:
         """Return the schema of this fragment."""
@@ -189,5 +221,11 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.data_files()
 
     def deletion_file(self):
-        """Return the deletion file, if any"""    
+        """Return the deletion file, if any"""
         return self._fragment.deletion_file()
+
+    @property
+    def metadata(self) -> _FragmentMetadata:
+        """Return the metadata of this fragment."""
+
+        return self._fragment.metadata()

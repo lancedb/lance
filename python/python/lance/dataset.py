@@ -409,10 +409,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
-    def delete(
-        self,
-        predicate: Union[str, pa.compute.Expression]
-    ):
+    def delete(self, predicate: Union[str, pa.compute.Expression]):
         """
         Delete rows from the dataset.
 
@@ -424,7 +421,7 @@ class LanceDataset(pa.dataset.Dataset):
         predicate : str or pa.compute.Expression
             The predicate to use to select rows to delete. May either be a SQL
             string or a pyarrow Expression.
-        
+
         Examples
         --------
         >>> import lance

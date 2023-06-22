@@ -115,6 +115,10 @@ impl FileFragment {
         self.fragment.id()
     }
 
+    fn metadata(&self) -> FragmentMetadata {
+        FragmentMetadata::new(self.fragment.metadata().clone(), self.fragment.dataset().schema().clone())
+    }
+
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
@@ -184,6 +188,18 @@ impl FileFragment {
         Ok(Updater::new(inner))
     }
 
+    fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
+        let old_fragment = self.fragment.clone();
+        let rt = tokio::runtime::Runtime::new()?;
+        let updated_fragment = rt.block_on(async { old_fragment.delete(predicate).await })
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        match updated_fragment {
+            Some(frag) => Ok(Some(FileFragment::new(frag))),
+            None => Ok(None),
+        }
+    }
+
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let schema = self_.fragment.dataset().schema();
         let arrow_schema: ArrowSchema = schema.into();
@@ -200,6 +216,11 @@ impl FileFragment {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+
+    fn deletion_file(&self) -> PyResult<Option<String>> {
+        let deletion = self.fragment.metadata().deletion_file.clone();
+        Ok(deletion.map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
     }
 }
 
@@ -318,5 +339,10 @@ impl FragmentMetadata {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+
+    fn deletion_file(&self) -> PyResult<Option<String>> {
+        let deletion = self.inner.deletion_file.clone();
+        Ok(deletion.map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()))
     }
 }

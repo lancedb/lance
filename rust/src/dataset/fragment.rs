@@ -312,7 +312,7 @@ impl FileFragment {
     /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
     /// fragment with the updated deletion vector. This must be persisted to
     /// the manifest.
-    pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
+    pub async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
             &self.dataset.base,
