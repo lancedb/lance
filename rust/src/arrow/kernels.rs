@@ -24,38 +24,16 @@ use arrow_array::{
     Array, ArrowNumericType, GenericStringArray, OffsetSizeTrait, PrimitiveArray, UInt64Array,
 };
 use arrow_schema::DataType;
+use num_traits::bounds::Bounded;
 
 use crate::{Error, Result};
-
-pub trait NumericMaxMin {
-    fn max_value() -> Self;
-    fn min_value() -> Self;
-}
-
-macro_rules! impl_numeric_max_min {
-    ($ty:ty) => {
-        impl NumericMaxMin for $ty {
-            fn max_value() -> Self {
-                Self::MAX
-            }
-            fn min_value() -> Self {
-                Self::MIN
-            }
-        }
-    };
-}
-
-impl_numeric_max_min!(f32);
-impl_numeric_max_min!(f64);
-impl_numeric_max_min!(i16);
-impl_numeric_max_min!(u32);
 
 /// Argmax on a [PrimitiveArray].
 ///
 /// Returns the index of the max value in the array.
 pub fn argmax<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
-    T::Native: PartialOrd + NumericMaxMin,
+    T::Native: PartialOrd + Bounded,
 {
     let mut max_idx: Option<u32> = None;
     let mut max_value = T::Native::min_value();
@@ -75,7 +53,7 @@ where
 /// Returns the index of the min value in the array.
 pub fn argmin<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
-    T::Native: PartialOrd + NumericMaxMin,
+    T::Native: PartialOrd + Bounded,
 {
     let mut min_idx: Option<u32> = None;
     let mut min_value = T::Native::max_value();
