@@ -21,6 +21,7 @@ use ::object_store::{
     aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
     path::Path, ClientOptions, ObjectStore as OSObjectStore,
 };
+use futures::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -208,6 +209,23 @@ impl ObjectStore {
             .chain(output.objects.iter().map(|o| &o.location))
             .map(|s| s.filename().unwrap().to_string())
             .collect())
+    }
+
+    /// Remove a directory recursively.
+    pub async fn rmdir(&self, dir_path: impl Into<Path>) -> Result<()> {
+        let path = dir_path.into();
+        let path = Path::parse(&path)?;
+        let sub_entries = self
+            .inner
+            .list(Some(&path))
+            .await?
+            .map(|m| m.map(|meta| meta.location))
+            .boxed();
+        self.inner
+            .delete_stream(sub_entries)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
     }
 
     /// Check a file exists.
