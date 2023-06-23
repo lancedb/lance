@@ -27,26 +27,47 @@ use arrow_schema::DataType;
 
 use crate::{Error, Result};
 
+pub trait NumericMaxMin {
+    fn max_value() -> Self;
+    fn min_value() -> Self;
+}
+
+macro_rules! impl_numeric_max_min {
+    ($ty:ty) => {
+        impl NumericMaxMin for $ty {
+            fn max_value() -> Self {
+                Self::MAX
+            }
+            fn min_value() -> Self {
+                Self::MIN
+            }
+        }
+    };
+}
+
+impl_numeric_max_min!(f32);
+impl_numeric_max_min!(f64);
+impl_numeric_max_min!(i16);
+impl_numeric_max_min!(u32);
+
 /// Argmax on a [PrimitiveArray].
 ///
 /// Returns the index of the max value in the array.
 pub fn argmax<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
-    T::Native: PartialOrd,
+    T::Native: PartialOrd + NumericMaxMin,
 {
-    array
-        .iter()
-        .enumerate()
-        .max_by(|(_, x), (_, y)| match (x, y) {
-            (None, _) => Ordering::Less,
-            (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => vx.partial_cmp(vy).unwrap_or(Ordering::Greater),
-        })
-        .and_then(|(idx, val)| {
-            // If the value is None or NaN, return None
-            val.and_then(|val| val.partial_cmp(&val))?;
-            Some(idx as u32)
-        })
+    let mut max_idx: Option<u32> = None;
+    let mut max_value = T::Native::min_value();
+    for (idx, value) in array.iter().enumerate() {
+        if let Some(value) = value {
+            if let Some(Ordering::Greater) = value.partial_cmp(&max_value) {
+                max_value = value;
+                max_idx = Some(idx as u32);
+            }
+        }
+    }
+    max_idx
 }
 
 /// Argmin on a [PrimitiveArray].
@@ -54,21 +75,19 @@ where
 /// Returns the index of the min value in the array.
 pub fn argmin<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Option<u32>
 where
-    T::Native: PartialOrd,
+    T::Native: PartialOrd + NumericMaxMin,
 {
-    array
-        .iter()
-        .enumerate()
-        .max_by(|(_, x), (_, y)| match (x, y) {
-            (None, _) => Ordering::Greater,
-            (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => vy.partial_cmp(vx).unwrap_or(Ordering::Greater),
-        })
-        .and_then(|(idx, val)| {
-            // If the value is None or NaN, return None
-            val.and_then(|val| val.partial_cmp(&val))?;
-            Some(idx as u32)
-        })
+    let mut min_idx: Option<u32> = None;
+    let mut min_value = T::Native::max_value();
+    for (idx, value) in array.iter().enumerate() {
+        if let Some(value) = value {
+            if let Some(Ordering::Less) = value.partial_cmp(&min_value) {
+                min_value = value;
+                min_idx = Some(idx as u32);
+            }
+        }
+    }
+    min_idx
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
