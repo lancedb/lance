@@ -409,7 +409,7 @@ impl Planner {
                     .collect::<Result<Vec<_>>>()?;
 
                 Arc::new(InListExpr::new(expr, list, *negated, None))
-            },
+            }
             Expr::Like(expr) => Arc::new(LikeExpr::new(
                 expr.negated,
                 true,
