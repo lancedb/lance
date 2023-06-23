@@ -65,6 +65,15 @@ pub enum DeletionFileType {
     Bitmap,
 }
 
+impl DeletionFileType {
+    pub(crate) fn suffix(&self) -> &str {
+        match self {
+            Self::Array => "arrow",
+            Self::Bitmap => "bin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeletionFile {
     pub read_version: u64,
