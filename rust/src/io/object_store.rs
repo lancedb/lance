@@ -224,9 +224,7 @@ impl ObjectStore {
             .inner
             .list(Some(&path))
             .await?
-            .map(|m| {
-                m.map(|meta| meta.location)
-            })
+            .map(|m| m.map(|meta| meta.location))
             .boxed();
         self.inner
             .delete_stream(sub_entries)
