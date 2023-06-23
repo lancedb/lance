@@ -312,7 +312,7 @@ impl FileFragment {
     /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
     /// fragment with the updated deletion vector. This must be persisted to
     /// the manifest.
-    pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
+    pub async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -321,6 +321,8 @@ impl FileFragment {
         )
         .await?
         .unwrap_or_default();
+
+        let starting_length = deletion_vector.len();
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
@@ -346,6 +348,11 @@ impl FileFragment {
                 futures::future::ready(Ok(()))
             })
             .await?;
+
+        // If we haven't deleted any additional rows, we can return the fragment as-is.
+        if deletion_vector.len() == starting_length {
+            return Ok(Some(self));
+        }
 
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
