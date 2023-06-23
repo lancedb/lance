@@ -44,7 +44,7 @@ fn to_local_path(path: &Path) -> String {
 /// Recursively remove a directory, specified by [`object_store::path::Path`].
 pub(super) fn remove_dir_all(path: &Path) -> Result<()> {
     let local_path = to_local_path(path);
-    std::fs::remove_dir_all(&local_path)?;
+    std::fs::remove_dir_all(local_path)?;
     Ok(())
 }
 
