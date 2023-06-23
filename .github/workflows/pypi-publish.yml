@@ -23,7 +23,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release"
+        args: "--release --strip -- -C target-cpu=haswell -C target-feature=+avx2"
     - uses: ./.github/workflows/upload_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
