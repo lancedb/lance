@@ -45,7 +45,7 @@ chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
-object_store = { version = "0.5.6", features = ["aws_profile", "gcp"] }
+object_store = { version = "0.6.1", features = ["aws", "gcp"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
@@ -103,7 +103,7 @@ dirs = "5.0.0"
 [features]
 cli = ["clap"]
 opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
- 
+
 [[bin]]
 name = "lq"
 required-features = ["cli"]
