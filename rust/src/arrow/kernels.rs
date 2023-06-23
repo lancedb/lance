@@ -37,17 +37,24 @@ where
     array
         .iter()
         .enumerate()
-        .filter(|(_, value)| match value {
-            // Remove None and NaN values
-            Some(v) => v.partial_cmp(&v).is_some(),
-            None => false,
-        })
         .max_by(|(_, x), (_, y)| match (x, y) {
             (None, _) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => vx.partial_cmp(vy).unwrap(),
+            (Some(vx), Some(vy)) => {
+                if let Some(ordering) = vx.partial_cmp(vy) {
+                    ordering
+                } else {
+                    Ordering::Greater
+                }
+            }
         })
-        .map(|(idx, _)| idx as u32)
+        .and_then(|(idx, val)| {
+            // If the value is NaN, return None
+            if let Some(val) = val {
+                val.partial_cmp(&val)?;
+            }
+            Some(idx as u32)
+        })
 }
 
 /// Argmin on a [PrimitiveArray].
@@ -60,17 +67,24 @@ where
     array
         .iter()
         .enumerate()
-        .filter(|(_, value)| match value {
-            // Remove None and NaN values
-            Some(v) => v.partial_cmp(&v).is_some(),
-            None => false,
-        })
         .max_by(|(_, x), (_, y)| match (x, y) {
             (None, _) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(vx), Some(vy)) => vy.partial_cmp(vx).unwrap(),
+            (Some(_), None) => Ordering::Greater,
+            (Some(vx), Some(vy)) => {
+                if let Some(ordering) = vy.partial_cmp(vx) {
+                    ordering
+                } else {
+                    Ordering::Greater
+                }
+            }
         })
-        .map(|(idx, _)| idx as u32)
+        .and_then(|(idx, val)| {
+            // If the value is NaN, return None
+            if let Some(val) = val {
+                val.partial_cmp(&val)?;
+            }
+            Some(idx as u32)
+        })
 }
 
 fn hash_numeric_type<T: ArrowNumericType>(array: &PrimitiveArray<T>) -> Result<UInt64Array>
@@ -144,8 +158,11 @@ mod tests {
         let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, 8.2, 3.5]);
         assert_eq!(argmax(&f), Some(4));
 
-        let f = Float32Array::from(vec![1.0, 5.0, 3.0, 2.0, 20.0, INFINITY, 3.5]);
-        assert_eq!(argmax(&f), Some(5));
+        let f = Float32Array::from(vec![1.0, 5.0, NAN, 3.0, 2.0, 20.0, INFINITY, 3.5]);
+        assert_eq!(argmax(&f), Some(6));
+
+        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(20.0), Some(NAN)]);
+        assert_eq!(argmax(&f), Some(2));
 
         let f = Float32Array::from(vec![NAN, NAN, NAN]);
         assert_eq!(argmax(&f), None);
@@ -168,6 +185,9 @@ mod tests {
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, 20.0, NAN]);
         assert_eq!(argmin(&f), Some(2));
+
+        let f = Float32Array::from_iter(vec![Some(2.0), None, Some(NAN)]);
+        assert_eq!(argmin(&f), Some(0));
 
         let f = Float32Array::from_iter(vec![5.0, 3.0, 2.0, NEG_INFINITY, NAN]);
         assert_eq!(argmin(&f), Some(3));
