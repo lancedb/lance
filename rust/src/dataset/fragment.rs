@@ -348,7 +348,7 @@ impl FileFragment {
                 futures::future::ready(Ok(()))
             })
             .await?;
-        
+
         // If we haven't deleted any additional rows, we can return the fragment as-is.
         if deletion_vector.len() == starting_length {
             return Ok(Some(self));

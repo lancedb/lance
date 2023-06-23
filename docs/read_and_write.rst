@@ -98,6 +98,11 @@ Rows are deleted by marking them as deleted in a separate deletion index. This i
 faster than rewriting the files and also avoids invaliding any indices that point
 to those files. Any subsequent queries will not return the deleted rows.
 
+.. warning::
+  
+  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
+  as they will return the deleted rows. This is fixed in 0.5.0 and later.
+
 Reading Lance Dataset
 ---------------------
 
