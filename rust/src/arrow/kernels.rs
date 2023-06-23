@@ -40,19 +40,11 @@ where
         .max_by(|(_, x), (_, y)| match (x, y) {
             (None, _) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => {
-                if let Some(ordering) = vx.partial_cmp(vy) {
-                    ordering
-                } else {
-                    Ordering::Greater
-                }
-            }
+            (Some(vx), Some(vy)) => vx.partial_cmp(vy).unwrap_or(Ordering::Greater),
         })
         .and_then(|(idx, val)| {
-            // If the value is NaN, return None
-            if let Some(val) = val {
-                val.partial_cmp(&val)?;
-            }
+            // If the value is None or NaN, return None
+            val.and_then(|val| val.partial_cmp(&val))?;
             Some(idx as u32)
         })
 }
@@ -70,19 +62,11 @@ where
         .max_by(|(_, x), (_, y)| match (x, y) {
             (None, _) => Ordering::Greater,
             (Some(_), None) => Ordering::Greater,
-            (Some(vx), Some(vy)) => {
-                if let Some(ordering) = vy.partial_cmp(vx) {
-                    ordering
-                } else {
-                    Ordering::Greater
-                }
-            }
+            (Some(vx), Some(vy)) => vy.partial_cmp(vx).unwrap_or(Ordering::Greater),
         })
         .and_then(|(idx, val)| {
-            // If the value is NaN, return None
-            if let Some(val) = val {
-                val.partial_cmp(&val)?;
-            }
+            // If the value is None or NaN, return None
+            val.and_then(|val| val.partial_cmp(&val))?;
             Some(idx as u32)
         })
 }
