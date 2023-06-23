@@ -23,6 +23,7 @@ jobs:
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: "10"
+        args: "--release --strip -- -C target-cpu=haswell -C target-feature=+avx2"
     - name: Pip install
       working-directory: python
       run: |
