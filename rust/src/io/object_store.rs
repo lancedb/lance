@@ -82,12 +82,28 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
+pub trait WrappingObjectStore: Send + Sync {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Clone, Default)]
+pub struct ObjectStoreParams {
+    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        match Url::parse(uri) {
+        Self::from_uri_and_params(uri, ObjectStoreParams::default()).await
+    }
+
+    /// Parse from a string URI.
+    ///
+    /// Returns the ObjectStore instance and the absolute path to the object.
+    pub async fn from_uri_and_params(uri: &str, params: ObjectStoreParams) -> Result<(Self, Path)> {
+        let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::new_from_path(uri)
@@ -98,7 +114,18 @@ impl ObjectStore {
                 Ok((store, path))
             }
             Err(_) => Self::new_from_path(uri),
-        }
+        }?;
+
+        Ok((
+            Self {
+                inner: params
+                    .object_store_wrapper
+                    .map(|w| w.wrap(object_store.inner.clone()))
+                    .unwrap_or(object_store.inner),
+                ..object_store
+            },
+            base_path,
+        ))
     }
 
     fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
@@ -253,6 +280,7 @@ mod tests {
     use super::*;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
@@ -363,6 +391,59 @@ mod tests {
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[derive(Debug)]
+    struct TestWrapper {
+        called: AtomicBool,
+
+        return_value: Arc<dyn OSObjectStore>,
+    }
+
+    impl WrappingObjectStore for TestWrapper {
+        fn wrap(&self, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+            self.called.store(true, Ordering::Relaxed);
+
+            // return a mocked value so we can check if the final store is the one we expect
+            self.return_value.clone()
+        }
+    }
+
+    impl TestWrapper {
+        fn called(&self) -> bool {
+            self.called.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wrapping_object_store_option_is_used() {
+        // Make a store for the inner store first
+        let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+
+        assert_eq!(Arc::strong_count(&mock_inner_store), 1);
+
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: mock_inner_store.clone(),
+        });
+
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+        };
+
+        // not called yet
+        assert!(!wrapper.called());
+
+        let _ = ObjectStore::from_uri_and_params("memory:///", params)
+            .await
+            .unwrap();
+
+        // called after construction
+        assert!(wrapper.called());
+
+        // hard to compare two trait pointers as the point to vtables
+        // using the ref count as a proxy to make sure that the store is correctly kept
+        assert_eq!(Arc::strong_count(&mock_inner_store), 2);
     }
 
     #[tokio::test]

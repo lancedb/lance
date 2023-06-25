@@ -71,6 +71,7 @@ impl Dataset {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             session: None,
+            store_options: None,
         };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
