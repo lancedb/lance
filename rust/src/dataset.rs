@@ -317,7 +317,8 @@ impl Dataset {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
         } else {
-            return Err(Error::EmptyDataset);
+            warn!("Dataset is empty, proceeding with empty schema");
+            schema = Schema::try_from(&ArrowSchema::empty())?;
         }
 
         // Running checks for the different write modes
@@ -1078,8 +1079,9 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::empty());
-        let result = Dataset::write(&mut reader, test_uri, None).await;
-        assert!(matches!(result.unwrap_err(), Error::EmptyDataset { .. }));
+        let result = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        assert_eq!(result.schema().fields.len(), 0);
+        assert_eq!(result.schema().metadata.len(), 0);
     }
 
     #[tokio::test]
