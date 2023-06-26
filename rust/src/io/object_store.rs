@@ -19,10 +19,14 @@ use std::sync::Arc;
 
 use ::object_store::{
     aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
-    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions,
-    ObjectStore as OSObjectStore,
+    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions, CredentialProvider,
+    ObjectStore as OSObjectStore, Result as ObjectStoreResult,
 };
+use async_trait::async_trait;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_credential_types::provider::ProvideCredentials;
 use futures::{StreamExt, TryStreamExt};
+use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -50,6 +54,24 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+#[derive(Debug)]
+struct AwsCredentialAdapter {
+    pub inner: DefaultCredentialsChain,
+}
+
+#[async_trait]
+impl CredentialProvider for AwsCredentialAdapter {
+    type Credential = ObjectStoreAwsCredential;
+    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        let creds = self.inner.provide_credentials().await.unwrap();
+        Ok(Arc::new(Self::Credential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(|s| s.to_string()),
+        }))
+    }
+}
+
 /// BUild S3 ObjectStore using default credential chain.
 async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
@@ -57,9 +79,18 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     const DEFAULT_REGION: &str = "us-west-2";
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
+
+    let credentials_provider = DefaultCredentialsChain::builder()
+        .region(region_provider.region().await)
+        .build()
+        .await;
+
     Ok(Arc::new(
-        AmazonS3Builder::from_env()
+        AmazonS3Builder::new()
             .with_url(uri)
+            .with_credentials(Arc::new(AwsCredentialAdapter {
+                inner: credentials_provider,
+            }))
             .with_region(
                 region_provider
                     .region()
