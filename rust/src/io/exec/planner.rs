@@ -16,10 +16,13 @@
 
 use std::sync::Arc;
 
-use arrow_cast::DEFAULT_CAST_OPTIONS;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
 use datafusion::{
-    logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator},
+    logical_expr::{
+        col,
+        expr::{InList, ScalarFunction},
+        BinaryExpr, BuiltinScalarFunction, Like, Operator,
+    },
     physical_expr::execution_props::ExecutionProps,
     physical_plan::{
         expressions::{
@@ -186,10 +189,10 @@ impl Planner {
                 .map(|arg| self.parse_function_args(arg).unwrap())
                 .collect::<Vec<_>>();
 
-            return Ok(Expr::ScalarFunction {
+            return Ok(Expr::ScalarFunction(ScalarFunction {
                 fun: BuiltinScalarFunction::RegexpMatch,
                 args: args_vec,
-            });
+            }));
         }
         Err(Error::IO {
             message: format!("function '{}' is not supported", func.name),
@@ -380,18 +383,33 @@ impl Planner {
             Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
             Expr::IsFalse(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::InList {
+            Expr::InList(InList {
                 expr,
                 list,
                 negated,
-            } => Arc::new(InListExpr::new(
-                self.create_physical_expr(expr)?,
-                list.iter()
-                    .map(|e| self.create_physical_expr(e))
-                    .collect::<Result<Vec<_>>>()?,
-                *negated,
-                self.schema.as_ref(),
-            )),
+            }) => {
+                // It's important that all the values in the list are casted to match
+                // the datatype of the column.
+                let expr = self.create_physical_expr(expr)?;
+                let datatype = expr.data_type(self.schema.as_ref())?;
+
+                let list = list
+                    .iter()
+                    .map(|e| {
+                        let e = self.create_physical_expr(e)?;
+                        if e.data_type(self.schema.as_ref())? == datatype {
+                            Ok(e)
+                        } else {
+                            // Cast the value to the column's datatype
+                            let e: Arc<dyn PhysicalExpr> =
+                                Arc::new(CastExpr::new(e, datatype.clone(), None));
+                            Ok(e)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Arc::new(InListExpr::new(expr, list, *negated, None))
+            }
             Expr::Like(expr) => Arc::new(LikeExpr::new(
                 expr.negated,
                 true,
@@ -401,9 +419,9 @@ impl Planner {
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
             Expr::Cast(datafusion::logical_expr::Cast { expr, data_type }) => {
                 let expr = self.create_physical_expr(expr.as_ref())?;
-                Arc::new(CastExpr::new(expr, data_type.clone(), DEFAULT_CAST_OPTIONS))
+                Arc::new(CastExpr::new(expr, data_type.clone(), None))
             }
-            Expr::ScalarFunction { fun, args } => {
+            Expr::ScalarFunction(ScalarFunction { fun, args }) => {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
                     return Err(Error::IO {
                         message: format!("Scalar function '{:?}' is not supported", fun),
@@ -506,12 +524,12 @@ mod tests {
                 )),
                 Arc::new(StructArray::from(vec![
                     (
-                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Field::new("x", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
                             as ArrayRef,
                     ),
                     (
-                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Field::new("y", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values(
                             (0..10).map(|v| (v * 10) as f32),
                         )),

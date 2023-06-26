@@ -1652,8 +1652,8 @@ mod test {
                     schema.clone(),
                     vec![
                         Arc::new(StructArray::from(vec![
-                            (struct_i_field.clone(), struct_i_arr as ArrayRef),
-                            (struct_o_field.clone(), struct_o_arr as ArrayRef),
+                            (Arc::new(struct_i_field.clone()), struct_i_arr as ArrayRef),
+                            (Arc::new(struct_o_field.clone()), struct_o_arr as ArrayRef),
                         ])),
                         Arc::new(StringArray::from_iter_values(
                             (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),

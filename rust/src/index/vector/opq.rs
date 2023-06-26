@@ -32,7 +32,7 @@ use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
 };
-use crate::{arrow::linalg::*, index::Index};
+use crate::{arrow::linalg::matrix::*, arrow::linalg::svd::*, index::Index};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;
@@ -331,7 +331,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
-    use crate::arrow::{linalg::MatrixView, *};
+    use crate::arrow::{linalg::matrix::MatrixView, *};
     use crate::dataset::{Dataset, ROW_ID};
     use crate::index::DatasetIndexExt;
     use crate::index::{

@@ -20,7 +20,7 @@ use arrow_array::UInt32Array;
 use async_trait::async_trait;
 
 use super::{Graph, Vertex};
-use crate::arrow::linalg::MatrixView;
+use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::{DistanceFunc, MetricType};
 use crate::{Error, Result};
 

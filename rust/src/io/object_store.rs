@@ -22,6 +22,7 @@ use ::object_store::{
     local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions,
     ObjectStore as OSObjectStore,
 };
+use futures::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -223,6 +224,28 @@ impl ObjectStore {
             .collect())
     }
 
+    /// Remove a directory recursively.
+    pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> Result<()> {
+        let path = dir_path.into();
+        let path = Path::parse(&path)?;
+
+        if self.is_local() {
+            // Local file system needs to delete directories as well.
+            return super::local::remove_dir_all(&path);
+        }
+        let sub_entries = self
+            .inner
+            .list(Some(&path))
+            .await?
+            .map(|m| m.map(|meta| meta.location))
+            .boxed();
+        self.inner
+            .delete_stream(sub_entries)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
     /// Check a file exists.
     pub async fn exists(&self, path: &Path) -> Result<bool> {
         match self.inner.head(path).await {
@@ -330,6 +353,29 @@ mod tests {
 
         let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path();
+        create_dir_all(path.join("foo").join("bar")).unwrap();
+        create_dir_all(path.join("foo").join("zoo")).unwrap();
+        create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
+        write_to_file(
+            path.join("foo")
+                .join("bar")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
+            "delete",
+        )
+        .unwrap();
+        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
+        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        store.remove_dir_all(base.child("foo")).await.unwrap();
+
+        assert!(!path.join("foo").exists());
     }
 
     #[tokio::test]

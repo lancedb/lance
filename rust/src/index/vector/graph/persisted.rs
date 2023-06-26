@@ -339,7 +339,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        arrow::{linalg::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
+        arrow::{linalg::matrix::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
         dataset::WriteParams,
         index::vector::diskann::row_vertex::RowVertexSerDe,
         index::vector::MetricType,

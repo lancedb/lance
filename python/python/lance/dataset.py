@@ -381,6 +381,26 @@ class LanceDataset(pa.dataset.Dataset):
         right_on: str or None
             The name of the column in data_obj to join on. If None, defaults to
             left_on.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> df = pa.table({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> dataset.to_table().to_pandas()
+           x  y
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
+        >>> dataset.merge(new_df, 'x')
+        >>> dataset.to_table().to_pandas()
+           x  y  z
+        0  1  a  d
+        1  2  b  e
+        2  3  c  f
         """
         if right_on is None:
             right_on = left_on
@@ -388,6 +408,38 @@ class LanceDataset(pa.dataset.Dataset):
         reader = _coerce_reader(data_obj)
 
         self._ds.merge(reader, left_on, right_on)
+
+    def delete(self, predicate: Union[str, pa.compute.Expression]):
+        """
+        Delete rows from the dataset.
+
+        This marks rows as deleted, but does not physically remove them from the
+        files. This keeps the existing indexes still valid.
+
+        Parameters
+        ----------
+        predicate : str or pa.compute.Expression
+            The predicate to use to select rows to delete. May either be a SQL
+            string or a pyarrow Expression.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.delete("a = 1 or b in ('a', 'b')")
+        >>> dataset.to_table()
+        pyarrow.Table
+        a: int64
+        b: string
+        ----
+        a: [[3]]
+        b: [["c"]]
+        """
+        if isinstance(predicate, pa.compute.Expression):
+            predicate = str(predicate)
+        self._ds.delete(predicate)
 
     def versions(self):
         """
@@ -457,6 +509,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
+            Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 

@@ -35,14 +35,15 @@ use futures::{
 use log::info;
 use rand::{rngs::SmallRng, SeedableRng};
 
+#[cfg(feature = "opq")]
+use super::opq::train_opq;
 use super::{
-    opq::train_opq,
     pq::{train_pq, PQBuildParams, ProductQuantizer},
     utils::maybe_sample_training_data,
     MetricType, Query, VectorIndex, INDEX_FILE_NAME,
 };
 use crate::{
-    arrow::{linalg::MatrixView, *},
+    arrow::{linalg::matrix::MatrixView, *},
     dataset::{Dataset, ROW_ID},
     datatypes::Field,
     index::{pb, vector::Transformer, Index},
@@ -513,7 +514,13 @@ fn compute_residual_matrix(
     let mut builder = Float32Builder::with_capacity(data.data().len());
     for i in 0..data.num_rows() {
         let row = data.row(i).unwrap();
-        let part_id = argmin(dist_func(row, centroids.data().values(), dim).as_ref()).unwrap();
+        let dist_array = dist_func(row, centroids.data().values(), dim);
+        let part_id = argmin(dist_array.as_ref()).ok_or_else(|| Error::Index {
+            message: format!(
+                "Ivf::compute_residual: argmin failed. Failed to find minimum of {:?}",
+                dist_array
+            ),
+        })?;
         let centroid = centroids.row(part_id as usize).unwrap();
         if row.len() != centroid.len() {
             return Err(Error::IO {
@@ -568,7 +575,10 @@ pub async fn build_ivf_pq_index(
     ) * 256;
     // TODO: only sample data if training is necessary.
     let mut training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    #[cfg(feature = "opq")]
     let mut transforms: Vec<Box<dyn Transformer>> = vec![];
+    #[cfg(not(feature = "opq"))]
+    let transforms: Vec<Box<dyn Transformer>> = vec![];
 
     // Train IVF partitions.
     let ivf_model = if let Some(centroids) = &ivf_params.centroids {
@@ -585,8 +595,15 @@ pub async fn build_ivf_pq_index(
     } else {
         // Pre-transforms
         if pq_params.use_opq {
-            let opq = train_opq(&training_data, pq_params).await?;
-            transforms.push(Box::new(opq));
+            #[cfg(not(feature = "opq"))]
+            return Err(Error::Index {
+                message: "Feature 'opq' is not installed.".to_string(),
+            });
+            #[cfg(feature = "opq")]
+            {
+                let opq = train_opq(&training_data, pq_params).await?;
+                transforms.push(Box::new(opq));
+            }
         }
 
         // Transform training data if necessary.

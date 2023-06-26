@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use super::Query;
 use crate::{
-    arrow::linalg::MatrixView,
+    arrow::linalg::matrix::MatrixView,
     index::{pb::Transform, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,

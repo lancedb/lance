@@ -186,12 +186,12 @@ mod tests {
                 )),
                 Arc::new(StructArray::from(vec![
                     (
-                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Field::new("x", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
                             as ArrayRef,
                     ),
                     (
-                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Field::new("y", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values(
                             (0..10).map(|v| (v * 10) as f32),
                         )),
