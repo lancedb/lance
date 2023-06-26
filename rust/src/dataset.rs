@@ -45,6 +45,7 @@ use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
@@ -132,6 +133,8 @@ pub struct ReadParams {
     ///
     /// This is useful for sharing the same session across multiple datasets.
     pub session: Option<Arc<Session>>,
+
+    pub store_options: Option<ObjectStoreParams>,
 }
 
 impl ReadParams {
@@ -154,6 +157,7 @@ impl Default for ReadParams {
             block_size: None,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             session: None,
+            store_options: None,
         }
     }
 }
@@ -167,7 +171,11 @@ impl Dataset {
 
     /// Open a dataset with read params.
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
+        let (mut object_store, base_path) = match params.store_options.clone() {
+            Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
+            None => ObjectStore::from_uri(uri).await?,
+        };
+
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
         }
