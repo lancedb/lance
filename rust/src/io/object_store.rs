@@ -18,8 +18,9 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 
 use ::object_store::{
-    aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
-    path::Path, ClientOptions, ObjectStore as OSObjectStore,
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions,
+    ObjectStore as OSObjectStore,
 };
 use futures::{StreamExt, TryStreamExt};
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
@@ -79,6 +80,12 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
             .with_url(uri)
             .with_client_options(ClientOptions::new().with_default_headers(headers))
             .build()?,
+    ))
+}
+
+async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    Ok(Arc::new(
+        MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
     ))
 }
 
@@ -163,6 +170,12 @@ impl ObjectStore {
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
+            "az" => Ok(Self {
+                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
