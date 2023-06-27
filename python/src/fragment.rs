@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::dataset::get_write_params;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
+use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
@@ -78,11 +79,11 @@ impl FileFragment {
     #[pyo3(signature = (filename, schema, fragment_id))]
     fn create_from_file(
         filename: &str,
-        schema: &PyAny,
+        schema: PyArrowType<ArrowSchema>,
         fragment_id: usize,
     ) -> PyResult<FragmentMetadata> {
         let rt = Runtime::new()?;
-        let arrow_schema = ArrowSchema::from_pyarrow(schema)?;
+        let arrow_schema = schema.0;
         let schema = Schema::try_from(&arrow_schema).map_err(|e| {
             PyValueError::new_err(format!(
                 "Failed to convert Arrow schema to Lance schema: {}",
