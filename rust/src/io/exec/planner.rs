@@ -470,7 +470,8 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray,
+        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::logical_expr::{col, lit, Cast};
@@ -854,6 +855,56 @@ mod tests {
                 },
                 _ => panic!("Expected binary expression"),
             }
+        }
+    }
+
+    #[test]
+    fn test_sql_comparison() {
+        // Create a batch with all data types
+        let batch: Vec<(&str, ArrayRef)> = vec![
+            (
+                "timestamp_s",
+                Arc::new(TimestampSecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ms",
+                Arc::new(TimestampMillisecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_us",
+                Arc::new(TimestampMicrosecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ns",
+                Arc::new(TimestampNanosecondArray::from_iter_values(0..10)),
+            ),
+        ];
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+
+        let planner = Planner::new(batch.schema());
+
+        // Each expression is meant to select the final 5 rows
+        let expressions = &[
+            "timestamp_s >= TIMESTAMP '1970-01-01 00:00:05'",
+            "timestamp_ms >= TIMESTAMP '1970-01-01 00:00:00.005'",
+            "timestamp_us >= TIMESTAMP '1970-01-01 00:00:00.000005'",
+            "timestamp_ns >= TIMESTAMP '1970-01-01 00:00:00.000000005'",
+        ];
+
+        let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
+            std::iter::repeat(Some(false))
+                .take(5)
+                .chain(std::iter::repeat(Some(true)).take(5)),
+        ));
+        for expression in expressions {
+            // convert to physical expression
+            let logical_expr = planner.parse_filter(expression).unwrap();
+            let physical_expr = planner.create_physical_expr(&logical_expr).unwrap();
+
+            // Evaluate and assert they have correct results
+            let result = physical_expr.evaluate(&batch).unwrap();
+            let result = result.into_array(batch.num_rows());
+            assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
     }
 }
