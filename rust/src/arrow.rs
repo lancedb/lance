@@ -136,59 +136,50 @@ impl DataTypeExt for DataType {
     }
 }
 
-pub trait GenericListArrayExt<Offset: ArrowNumericType>
+/// Create an [`GenericListArray`] from values and offsets.
+///
+/// ```
+/// use arrow_array::{Int32Array, Int64Array, ListArray};
+/// use arrow_array::types::Int64Type;
+/// use lance::arrow::try_new_generic_list_array;
+///
+/// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
+/// let int_values = Int64Array::from_iter(0..10);
+/// let list_arr = try_new_generic_list_array(int_values, &offsets).unwrap();
+/// assert_eq!(list_arr,
+///     ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+///         Some(vec![Some(0), Some(1)]),
+///         Some(vec![Some(2), Some(3), Some(4), Some(5), Some(6)]),
+///         Some(vec![Some(7), Some(8), Some(9)]),
+/// ]))
+/// ```
+pub fn try_new_generic_list_array<T: Array, Offset: ArrowNumericType>(
+    values: T,
+    offsets: &PrimitiveArray<Offset>,
+) -> Result<GenericListArray<Offset::Native>>
 where
     Offset::Native: OffsetSizeTrait,
 {
-    /// Create an [`GenericListArray`] from values and offsets.
-    ///
-    /// ```
-    /// use arrow_array::{Int32Array, Int64Array, ListArray};
-    /// use arrow_array::types::Int64Type;
-    /// use lance::arrow::GenericListArrayExt;
-    ///
-    /// let offsets = Int32Array::from_iter([0, 2, 7, 10]);
-    /// let int_values = Int64Array::from_iter(0..10);
-    /// let list_arr = ListArray::try_new(int_values, &offsets).unwrap();
-    /// assert_eq!(list_arr,
-    ///     ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
-    ///         Some(vec![Some(0), Some(1)]),
-    ///         Some(vec![Some(2), Some(3), Some(4), Some(5), Some(6)]),
-    ///         Some(vec![Some(7), Some(8), Some(9)]),
-    /// ]))
-    /// ```
-    fn try_new<T: Array>(
-        values: T,
-        offsets: &PrimitiveArray<Offset>,
-    ) -> Result<GenericListArray<Offset::Native>>;
-}
+    let data_type = if Offset::Native::IS_LARGE {
+        DataType::LargeList(Arc::new(Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        )))
+    } else {
+        DataType::List(Arc::new(Field::new(
+            "item",
+            values.data_type().clone(),
+            true,
+        )))
+    };
+    let data = ArrayDataBuilder::new(data_type)
+        .len(offsets.len() - 1)
+        .add_buffer(offsets.into_data().buffers()[0].clone())
+        .add_child_data(values.into_data())
+        .build()?;
 
-impl<Offset: ArrowNumericType> GenericListArrayExt<Offset> for GenericListArray<Offset::Native>
-where
-    Offset::Native: OffsetSizeTrait,
-{
-    fn try_new<T: Array>(values: T, offsets: &PrimitiveArray<Offset>) -> Result<Self> {
-        let data_type = if Offset::Native::IS_LARGE {
-            DataType::LargeList(Arc::new(Field::new(
-                "item",
-                values.data_type().clone(),
-                true,
-            )))
-        } else {
-            DataType::List(Arc::new(Field::new(
-                "item",
-                values.data_type().clone(),
-                true,
-            )))
-        };
-        let data = ArrayDataBuilder::new(data_type)
-            .len(offsets.len() - 1)
-            .add_buffer(offsets.into_data().buffers()[0].clone())
-            .add_child_data(values.into_data())
-            .build()?;
-
-        Ok(Self::from(data))
-    }
+    Ok(GenericListArray::from(data))
 }
 
 pub trait FixedSizeListArrayExt {
@@ -364,7 +355,7 @@ impl RecordBatchExt for RecordBatch {
         Ok(Self::try_new(new_schema, new_columns)?)
     }
 
-    fn merge(&self, other: &RecordBatch) -> Result<RecordBatch> {
+    fn merge(&self, other: &Self) -> Result<Self> {
         if self.num_rows() != other.num_rows() {
             return Err(Error::Arrow {
                 message: format!(
@@ -379,7 +370,7 @@ impl RecordBatchExt for RecordBatch {
         merge(&left_struct_array, &right_struct_array).map(|arr| arr.into())
     }
 
-    fn drop_column(&self, name: &str) -> Result<RecordBatch> {
+    fn drop_column(&self, name: &str) -> Result<Self> {
         let mut fields = vec![];
         let mut columns = vec![];
         for i in 0..self.schema().fields.len() {
@@ -407,9 +398,9 @@ impl RecordBatchExt for RecordBatch {
             .and_then(|arr| get_sub_array(arr, &split[1..]))
     }
 
-    fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch> {
+    fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
-        project(&struct_array, schema.fields()).map(|arr| RecordBatch::from(arr))
+        project(&struct_array, schema.fields()).map(Self::from)
     }
 }
 
@@ -434,11 +425,7 @@ fn project(struct_array: &StructArray, fields: &Fields) -> Result<StructArray> {
         }
     }
     Ok(StructArray::from(
-        fields
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .zip(columns)
-            .collect::<Vec<_>>(),
+        fields.iter().cloned().zip(columns).collect::<Vec<_>>(),
     ))
 }
 
@@ -507,9 +494,10 @@ fn merge(left_struct_array: &StructArray, right_struct_array: &StructArray) -> R
             }
         });
 
-    let zipped: Vec<(Field, ArrayRef)> = fields
+    let zipped: Vec<(FieldRef, ArrayRef)> = fields
         .iter()
         .cloned()
+        .map(Arc::new)
         .zip(columns.iter().cloned())
         .collect::<Vec<_>>();
     StructArray::try_from(zipped).map_err(|e| Error::Arrow {
@@ -552,11 +540,11 @@ mod tests {
             ),
         ]);
         let left_batch = RecordBatch::try_new(
-            Arc::new(left_schema.clone()),
+            Arc::new(left_schema),
             vec![
                 Arc::new(a_array.clone()),
                 Arc::new(StructArray::from(vec![(
-                    Field::new("c", DataType::Int32, true),
+                    Arc::new(Field::new("c", DataType::Int32, true)),
                     Arc::new(c_array.clone()) as ArrayRef,
                 )])),
             ],
@@ -572,11 +560,11 @@ mod tests {
             ),
         ]);
         let right_batch = RecordBatch::try_new(
-            Arc::new(right_schema.clone()),
+            Arc::new(right_schema),
             vec![
                 Arc::new(e_array.clone()),
                 Arc::new(StructArray::from(vec![(
-                    Field::new("d", DataType::Utf8, true),
+                    Arc::new(Field::new("d", DataType::Utf8, true)),
                     Arc::new(d_array.clone()) as ArrayRef,
                 )])) as ArrayRef,
             ],
@@ -599,16 +587,16 @@ mod tests {
             Field::new("e", DataType::Int32, true),
         ]);
         let merged_batch = RecordBatch::try_new(
-            Arc::new(merged_schema.clone()),
+            Arc::new(merged_schema),
             vec![
                 Arc::new(a_array) as ArrayRef,
                 Arc::new(StructArray::from(vec![
                     (
-                        Field::new("c", DataType::Int32, true),
+                        Arc::new(Field::new("c", DataType::Int32, true)),
                         Arc::new(c_array) as ArrayRef,
                     ),
                     (
-                        Field::new("d", DataType::Utf8, true),
+                        Arc::new(Field::new("d", DataType::Utf8, true)),
                         Arc::new(d_array) as ArrayRef,
                     ),
                 ])) as ArrayRef,

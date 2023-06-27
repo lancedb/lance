@@ -165,8 +165,10 @@ mod tests {
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         assert_eq!(object_writer.tell(), 0);
 
-        let mut metadata = Metadata::default();
-        metadata.manifest_position = Some(100);
+        let mut metadata = Metadata {
+            manifest_position: Some(100),
+            ..Default::default()
+        };
         metadata.batch_offsets.extend([1, 2, 3, 4]);
 
         let pos = object_writer.write_struct(&metadata).await.unwrap();

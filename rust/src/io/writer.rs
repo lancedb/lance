@@ -112,11 +112,7 @@ pub struct FileWriter {
 }
 
 impl FileWriter {
-    pub async fn try_new(
-        object_store: &ObjectStore,
-        path: &Path,
-        schema: Schema,
-    ) -> Result<FileWriter> {
+    pub async fn try_new(object_store: &ObjectStore, path: &Path, schema: Schema) -> Result<Self> {
         let object_writer = object_store.create(path).await?;
         Ok(Self {
             object_writer,
@@ -133,12 +129,7 @@ impl FileWriter {
     /// Returns [Err] if the schema does not match with the batch.
     pub async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         // Copy a list of fields to avoid borrow checker error.
-        let fields = self
-            .schema
-            .fields
-            .iter()
-            .map(|f| f.clone())
-            .collect::<Vec<_>>();
+        let fields = self.schema.fields.clone();
         for field in fields.iter() {
             let arrs = batches
                 .iter()
@@ -202,11 +193,9 @@ impl FileWriter {
                 self.write_large_list_array(field, arrs_ref.as_slice())
                     .await
             }
-            _ => {
-                return Err(Error::Schema {
-                    message: format!("FileWriter::write: unsupported data type: {data_type}"),
-                })
-            }
+            _ => Err(Error::Schema {
+                message: format!("FileWriter::write: unsupported data type: {data_type}"),
+            }),
         }
     }
 
@@ -309,7 +298,7 @@ impl FileWriter {
                 .skip(1)
                 .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i32));
-            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1_usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
@@ -344,7 +333,7 @@ impl FileWriter {
                 .skip(1)
                 .map(|b| b.as_usize() - start_offset + last_offset)
                 .for_each(|o| pos_builder.append_value(o as i64));
-            last_offset = pos_builder.values_slice()[pos_builder.len() - 1 as usize] as usize;
+            last_offset = pos_builder.values_slice()[pos_builder.len() - 1_usize] as usize;
         }
 
         let positions: &dyn Array = &pos_builder.finish();
@@ -381,8 +370,7 @@ mod tests {
         types::UInt32Type, BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray,
         DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
         DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array,
-        LargeListArray, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
-        TimestampSecondArray, UInt8Array,
+        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -471,10 +459,7 @@ mod tests {
         ]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let dict_vec = (0..100)
-            .into_iter()
-            .map(|n| ["a", "b", "c"][n % 3])
-            .collect::<Vec<_>>();
+        let dict_vec = (0..100).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
         let fixed_size_list_arr = FixedSizeListArray::try_new(
@@ -490,31 +475,27 @@ mod tests {
         let list_offsets = (0..202).step_by(2).collect();
         let list_values =
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
-        let list_arr = ListArray::try_new(list_values, &list_offsets).unwrap();
+        let list_arr: arrow_array::GenericListArray<i32> =
+            try_new_generic_list_array(list_values, &list_offsets).unwrap();
 
         let large_list_offsets: Int64Array = (0..202).step_by(2).collect();
         let large_list_values =
             StringArray::from((0..200).map(|n| format!("str-{}", n)).collect::<Vec<_>>());
-        let large_list_arr =
-            LargeListArray::try_new(large_list_values, &large_list_offsets).unwrap();
+        let large_list_arr: arrow_array::GenericListArray<i64> =
+            try_new_generic_list_array(large_list_values, &large_list_offsets).unwrap();
 
         let list_dict_offsets = (0..202).step_by(2).collect();
-        let list_dict_vec = (0..200)
-            .into_iter()
-            .map(|n| ["a", "b", "c"][n % 3])
-            .collect::<Vec<_>>();
+        let list_dict_vec = (0..200).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let list_dict_arr: DictionaryArray<UInt32Type> = list_dict_vec.into_iter().collect();
-        let list_dict_arr = ListArray::try_new(list_dict_arr, &list_dict_offsets).unwrap();
+        let list_dict_arr: arrow_array::GenericListArray<i32> =
+            try_new_generic_list_array(list_dict_arr, &list_dict_offsets).unwrap();
 
         let large_list_dict_offsets: Int64Array = (0..202).step_by(2).collect();
-        let large_list_dict_vec = (0..200)
-            .into_iter()
-            .map(|n| ["a", "b", "c"][n % 3])
-            .collect::<Vec<_>>();
+        let large_list_dict_vec = (0..200).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let large_list_dict_arr: DictionaryArray<UInt32Type> =
             large_list_dict_vec.into_iter().collect();
-        let large_list_dict_arr =
-            LargeListArray::try_new(large_list_dict_arr, &large_list_dict_offsets).unwrap();
+        let large_list_dict_arr: arrow_array::GenericListArray<i64> =
+            try_new_generic_list_array(large_list_dict_arr, &large_list_dict_offsets).unwrap();
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(NullArray::new(100)),
@@ -529,27 +510,19 @@ mod tests {
                 (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
             )),
             Arc::new(
-                Decimal128Array::from_iter_values((0..100).into_iter())
+                Decimal128Array::from_iter_values(0..100)
                     .with_precision_and_scale(7, 3)
                     .unwrap(),
             ),
             Arc::new(
-                Decimal256Array::from_iter_values(
-                    (0..100).into_iter().map(|v| i256::from_i128(v as i128)),
-                )
-                .with_precision_and_scale(7, 3)
-                .unwrap(),
+                Decimal256Array::from_iter_values((0..100).map(|v| i256::from_i128(v as i128)))
+                    .with_precision_and_scale(7, 3)
+                    .unwrap(),
             ),
-            Arc::new(DurationSecondArray::from_iter_values((0..100).into_iter())),
-            Arc::new(DurationMillisecondArray::from_iter_values(
-                (0..100).into_iter(),
-            )),
-            Arc::new(DurationMicrosecondArray::from_iter_values(
-                (0..100).into_iter(),
-            )),
-            Arc::new(DurationNanosecondArray::from_iter_values(
-                (0..100).into_iter(),
-            )),
+            Arc::new(DurationSecondArray::from_iter_values(0..100)),
+            Arc::new(DurationMillisecondArray::from_iter_values(0..100)),
+            Arc::new(DurationMicrosecondArray::from_iter_values(0..100)),
+            Arc::new(DurationNanosecondArray::from_iter_values(0..100)),
             Arc::new(dict_arr),
             Arc::new(fixed_size_list_arr),
             Arc::new(fixed_size_binary_arr),
@@ -559,11 +532,11 @@ mod tests {
             Arc::new(large_list_dict_arr),
             Arc::new(StructArray::from(vec![
                 (
-                    ArrowField::new("si", DataType::Int64, true),
+                    Arc::new(ArrowField::new("si", DataType::Int64, true)),
                     Arc::new(Int64Array::from_iter((100..200).collect::<Vec<_>>())) as ArrayRef,
                 ),
                 (
-                    ArrowField::new("sb", DataType::Utf8, true),
+                    Arc::new(ArrowField::new("sb", DataType::Utf8, true)),
                     Arc::new(StringArray::from(
                         (0..100).map(|n| n.to_string()).collect::<Vec<_>>(),
                     )) as ArrayRef,
@@ -593,10 +566,7 @@ mod tests {
         )]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let dict_vec = (0..100)
-            .into_iter()
-            .map(|n| ["a", "b", "c"][n % 3])
-            .collect::<Vec<_>>();
+        let dict_vec = (0..100).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
         let columns: Vec<ArrayRef> = vec![Arc::new(dict_arr)];

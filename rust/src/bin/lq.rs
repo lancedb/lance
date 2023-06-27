@@ -123,7 +123,7 @@ async fn main() -> Result<()> {
             let batch: Vec<RecordBatch> = stream.take(1).try_collect::<Vec<_>>().await.unwrap();
 
             // pretty print the batch
-            let _ = print_batches(&batch)?;
+            print_batches(&batch)?;
 
             Ok(())
         }
@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_index(
     dataset: &Dataset,
     name: &Option<String>,
@@ -186,9 +187,18 @@ async fn create_index(
             });
         }
     };
+    #[cfg(not(feature = "opq"))]
+    let _ = match use_opq {
+        false => (),
+        true => {
+            return Err(Error::Index {
+                message: "Feature 'opq' not installed.".to_string(),
+            });
+        }
+    };
     dataset
         .create_index(
-            &[&col],
+            &[col],
             lance::index::IndexType::Vector,
             name.clone(),
             &VectorIndexParams::ivf_pq(*num_partitions, 8, *num_sub_vectors, use_opq, mt, 100),

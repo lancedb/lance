@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
 import pandas as pd
 import pyarrow as pa
 
-from .lance import _DataFile, _Fragment, _FragmentMetadata
+from .lance import _Fragment
+from .lance import _FragmentMetadata as _FragmentMetadata
+
+if TYPE_CHECKING:
+    from .dataset import LanceDataset, LanceScanner
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -31,6 +35,9 @@ class LanceFragment(pa.dataset.Fragment):
         self._fragment = dataset.get_fragment(fragment_id)
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
+
+    def __repr__(self):
+        return self._fragment.__repr__()
 
     def __reduce__(self):
         from .dataset import LanceDataset
@@ -80,7 +87,8 @@ class LanceFragment(pa.dataset.Fragment):
         data: pa.Table
             The data to write to this fragment.
         schema: pa.Schema, optional
-            The schema of the data. If not specified, the schema will be inferred from the data.
+            The schema of the data. If not specified, the schema will be inferred
+            from the data.
         """
         if isinstance(data, pd.DataFrame):
             reader = pa.Table.from_pandas(data, schema=schema).to_reader()
@@ -167,8 +175,8 @@ class LanceFragment(pa.dataset.Fragment):
         value_func: Callable.
             A function that takes a RecordBatch as input and returns a RecordBatch.
         columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the value_func.
-            Otherwise, all columns will be passed to the value_func.
+            If specified, only the columns in this list will be passed to the
+            value_func. Otherwise, all columns will be passed to the value_func.
 
         Returns
         -------
@@ -183,11 +191,44 @@ class LanceFragment(pa.dataset.Fragment):
             new_value = value_func(batch)
             if not isinstance(new_value, pa.RecordBatch):
                 raise ValueError(
-                    f"value_func must return a Pyarrow RecordBatch, got {type(new_value)}"
+                    f"value_func must return a Pyarrow RecordBatch, "
+                    f"got {type(new_value)}"
                 )
 
             updater.update(new_value)
         return updater.finish()
+
+    def delete(self, predicate: str) -> LanceFragment | None:
+        """Delete rows from this Fragment.
+
+        This will add or update the deletion file of this fragment. It does not
+        modify or delete the data files of this fragment. If no rows are left after
+        the deletion, this method will return None.
+
+        Parameters
+        ----------
+        predicate: str
+            A SQL predicate that specifies the rows to delete.
+
+        Returns
+        -------
+        LanceFragment or None
+            A new fragment containing the new deletion file, or None if no rows left.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tab = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+        >>> dataset = lance.write_dataset(tab, "dataset")
+        >>> frag = dataset.get_fragment(0)
+        >>> frag.delete("a > 1")
+        LanceFileFragment(id=0, data_files=['....lance'], \
+deletion_file='_deletions/0-1-....arrow')
+        >>> frag.delete("a > 0") is None
+        True
+        """
+        self._fragment.delete(predicate)
 
     @property
     def schema(self) -> pa.Schema:
@@ -200,3 +241,12 @@ class LanceFragment(pa.dataset.Fragment):
 
         return self._fragment.data_files()
 
+    def deletion_file(self):
+        """Return the deletion file, if any"""
+        return self._fragment.deletion_file()
+
+    @property
+    def metadata(self) -> _FragmentMetadata:
+        """Return the metadata of this fragment."""
+
+        return self._fragment.metadata()

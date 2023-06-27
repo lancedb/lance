@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -30,7 +29,8 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
-from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .lance import __version__ as __version__
+from .lance import _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -381,6 +381,26 @@ class LanceDataset(pa.dataset.Dataset):
         right_on: str or None
             The name of the column in data_obj to join on. If None, defaults to
             left_on.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> df = pa.table({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> dataset.to_table().to_pandas()
+           x  y
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
+        >>> dataset.merge(new_df, 'x')
+        >>> dataset.to_table().to_pandas()
+           x  y  z
+        0  1  a  d
+        1  2  b  e
+        2  3  c  f
         """
         if right_on is None:
             right_on = left_on
@@ -389,14 +409,47 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
+    def delete(self, predicate: Union[str, pa.compute.Expression]):
+        """
+        Delete rows from the dataset.
+
+        This marks rows as deleted, but does not physically remove them from the
+        files. This keeps the existing indexes still valid.
+
+        Parameters
+        ----------
+        predicate : str or pa.compute.Expression
+            The predicate to use to select rows to delete. May either be a SQL
+            string or a pyarrow Expression.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.delete("a = 1 or b in ('a', 'b')")
+        >>> dataset.to_table()
+        pyarrow.Table
+        a: int64
+        b: string
+        ----
+        a: [[3]]
+        b: [["c"]]
+        """
+        if isinstance(predicate, pa.compute.Expression):
+            predicate = str(predicate)
+        self._ds.delete(predicate)
+
     def versions(self):
         """
         Return all versions in this dataset.
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a separate Version object is
-            # implemented, expose the precise timestamp (ns) to python.
+            # TODO: python datetime supports only microsecond precision. When a
+            # separate Version object is implemented, expose the precise timestamp
+            # (ns) to python.
             ts_nanos = v["timestamp"]
             v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
                 microseconds=(ts_nanos % 1e9) // 1e3
@@ -443,8 +496,8 @@ class LanceDataset(pa.dataset.Dataset):
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
         ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`. Optional.
-            A `num_partitions` x `dimension` array of K-mean centroids for IVF clustering.
-            If not provided, a new Kmean model will be trained.
+            A `num_partitions` x `dimension` array of K-mean centroids for IVF
+            clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         kwargs :
@@ -456,6 +509,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
+            Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
@@ -484,8 +538,10 @@ class LanceDataset(pa.dataset.Dataset):
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
-        * IVF introduced in `Video Google: a text retrieval approach to object matching in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
-        * `Product quantization for nearest neighbor search <https://hal.inria.fr/inria-00514462v2/document>`_
+        * IVF introduced in `Video Google: a text retrieval approach to object matching
+          in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
+        * `Product quantization for nearest neighbor search
+          <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
         # Only support building index for 1 column from the API aspect, however
@@ -504,7 +560,8 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
-                    f"Vector column {c} must have float32 value type, got {field.type.value_type}"
+                    f"Vector column {c} must have float32 value type, "
+                    f"got {field.type.value_type}"
                 )
 
         if not isinstance(metric, str) or metric.lower() not in [
@@ -533,7 +590,8 @@ class LanceDataset(pa.dataset.Dataset):
                         or ivf_centroids.shape[0] != num_partitions
                     ):
                         raise ValueError(
-                            f"Ivf centroids must be 2D array: (clusters, dim), got {ivf_centroids.shape}"
+                            f"Ivf centroids must be 2D array: (clusters, dim), "
+                            f"got {ivf_centroids.shape}"
                         )
                     if ivf_centroids.dtype != np.float32:
                         raise TypeError(
@@ -562,25 +620,8 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 
-        This method allows users to commit a version of dataset in a distributed environment.
-
-        Examples
-        --------
-
-        >>> dataset = lance.dataset("~/sift.lance")
-        >>> fragments = dataset.get_fragments()
-        >>> # Distributed fragment to each worker
-
-        # In worker
-        >>> def my_udf(input: pa.RecordBatch) -> pa.RecordBatch:
-        ...    output = process(input)
-        ...    return output
-
-        >>> new_fragment = fragment.add_column(my_udf, columns=["a", "b"])
-        >>> # send(new_fragment) to one single master node.
-
-        # In master node
-        >>> dataset._create_version_from_fragments(new_schema, [new_fragment1, new_fragment2, ...])
+        This method allows users to commit a version of dataset in a distributed
+        environment.
 
         Parameters
         ----------
@@ -677,7 +718,8 @@ class ScannerBuilder:
                     inner_fragments.append(f._fragment)
                 else:
                     raise TypeError(
-                        f"fragments must be an iterable of LanceFragment. Got {type(f)} instead."
+                        f"fragments must be an iterable of LanceFragment. "
+                        f"Got {type(f)} instead."
                     )
             fragments = inner_fragments
 

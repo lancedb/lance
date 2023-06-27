@@ -123,13 +123,13 @@ impl Dataset {
                     .unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
-                dict.set_item("version", idx.dataset_version.clone())
-                    .unwrap();
+                dict.set_item("version", idx.dataset_version).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -265,11 +265,10 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         self.rt.block_on(async {
-            Ok(self
-                .ds
+            self.ds
                 .count_rows()
                 .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?)
+                .map_err(|err| PyIOError::new_err(err.to_string()))
         })
     }
 
@@ -277,7 +276,7 @@ impl Dataset {
         let projection = self_.ds.schema();
         let batch = self_
             .rt
-            .block_on(async { self_.ds.take(&row_indices, &projection).await })
+            .block_on(async { self_.ds.take(&row_indices, projection).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
     }
@@ -291,6 +290,16 @@ impl Dataset {
         let mut reader: Box<dyn RecordBatchReader> = Box::new(reader.0);
         let mut new_self = self.ds.as_ref().clone();
         let fut = new_self.merge(&mut reader, left_on, right_on);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn delete(&mut self, predicate: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.delete(&predicate);
         self.rt.block_on(
             async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
         )?;
@@ -374,6 +383,12 @@ impl Dataset {
                     };
 
                     if let Some(o) = kwargs.get_item("use_opq") {
+                        #[cfg(not(feature = "opq"))]
+                        if PyAny::downcast::<PyBool>(o)?.extract()? {
+                            return Err(PyValueError::new_err(format!(
+                                "Feature 'opq' is not installed."
+                            )));
+                        }
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
@@ -444,7 +459,7 @@ impl Dataset {
 
     fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {
         if let Some(fragment) = self_.ds.get_fragment(fragment_id) {
-            Ok(Some(FileFragment::new(fragment.clone())))
+            Ok(Some(FileFragment::new(fragment)))
         } else {
             Ok(None)
         }

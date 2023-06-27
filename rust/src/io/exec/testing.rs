@@ -25,7 +25,7 @@ use datafusion::{
 };
 
 #[derive(Debug)]
-pub(crate) struct TestingExec {
+pub struct TestingExec {
     pub(crate) batches: Vec<RecordBatch>,
 }
 

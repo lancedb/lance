@@ -36,6 +36,73 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
 
+Adding new columns
+~~~~~~~~~~~~~~~~~~
+
+New columns can be merged into an existing dataset in using :py:meth:`lance.Dataset.merge`.
+This allows filling in additional columns without having to rewrite the whole dataset.
+
+To use the ``merge`` method, provide a new table that includes the columns you
+want to add, and a column name to use for joining the new data to the existing
+dataset.
+
+For example, imagine we have a dataset of embeddings and ids:
+
+.. testcode::
+
+    import lance
+    import pyarrow as pa
+    import numpy as np
+    table = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "embedding": pa.array([np.array([1, 2, 3]), np.array([4, 5, 6]),
+                              np.array([7, 8, 9])])
+    })
+    dataset = lance.write_dataset(table, "embeddings")
+
+Now if we want to add a column of labels we have generated, we can do so by merging a new table:
+
+.. testcode::
+
+    new_data = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "label": pa.array(["horse", "rabbit", "cat"])
+    })
+    dataset.merge(new_data, "id")
+    dataset.to_table().to_pandas()
+
+.. testoutput::
+
+       id  embedding   label
+    0   1  [1, 2, 3]   horse
+    1   2  [4, 5, 6]  rabbit
+    2   3  [7, 8, 9]     cat
+
+Deleting rows
+~~~~~~~~~~~~~
+
+Lance supports deleting rows from a dataset using a SQL filter. For example, to
+delete Bob's row from the dataset above, one could use:
+
+  .. code-block:: python
+
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.delete("name = 'Bob'")
+
+:py:meth:`lance.LanceDataset.delete` supports the same filters as described in
+:ref:`filter-push-down`.
+
+Rows are deleted by marking them as deleted in a separate deletion index. This is
+faster than rewriting the files and also avoids invaliding any indices that point
+to those files. Any subsequent queries will not return the deleted rows.
+
+.. warning::
+  
+  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
+  as they will return the deleted rows. This is fixed in 0.5.0 and later.
+
 Reading Lance Dataset
 ---------------------
 
@@ -88,6 +155,9 @@ using the :py:meth:`lance.LanceDataset.to_batches` method:
 
 Unsurprisingly, :py:meth:`~lance.LanceDataset.to_batches` takes the same parameters
 as :py:meth:`~lance.LanceDataset.to_table` function.
+
+
+.. _filter-push-down:
 
 Filter push-down
 ~~~~~~~~~~~~~~~~

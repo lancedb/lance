@@ -15,7 +15,8 @@
 //! Lance Dataset
 //!
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::default::Default;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -26,15 +27,18 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use log::warn;
 use object_store::path::Path;
 use uuid::Uuid;
 
+mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
 pub mod scanner;
 pub mod updater;
 mod write;
 
+use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
 use crate::arrow::*;
@@ -237,7 +241,7 @@ impl Dataset {
                     path: uri.clone(),
                     source: box_error(e),
                 },
-                _ => e.into(),
+                _ => e,
             })?;
         // TODO: remove reference to inner.
         let get_result = object_store
@@ -254,6 +258,18 @@ impl Dataset {
         let bytes = get_result.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+
+        if !can_read_dataset(manifest.reader_feature_flags) {
+            let message = format!(
+                "This dataset cannot be read by this version of Lance. \
+                 Please upgrade Lance to read this dataset.\n Flags: {}",
+                manifest.reader_feature_flags
+            );
+            return Err(Error::NotSupported {
+                source: message.into(),
+            });
+        }
+
         manifest
             .schema
             .load_dictionary(object_reader.as_ref())
@@ -309,7 +325,7 @@ impl Dataset {
             && (matches!(params.mode, WriteMode::Append)
                 || matches!(params.mode, WriteMode::Overwrite))
         {
-            eprintln!("Warning: No existing dataset at {uri}, it will be created");
+            warn!("No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
                 ..params
@@ -320,7 +336,7 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Dataset::open(uri).await?)
+            Some(Self::open(uri).await?)
         };
 
         // append + input schema different from existing schema = error
@@ -333,6 +349,19 @@ impl Dataset {
                         new: schema,
                     });
                 }
+            }
+        }
+
+        if let Some(d) = dataset.as_ref() {
+            if !can_write_dataset(d.manifest.writer_feature_flags) {
+                let message = format!(
+                    "This dataset cannot be written by this version of Lance. \
+                    Please upgrade Lance to write to this dataset.\n Flags: {}",
+                    d.manifest.writer_feature_flags
+                );
+                return Err(Error::NotSupported {
+                    source: message.into(),
+                });
             }
         }
 
@@ -416,13 +445,19 @@ impl Dataset {
                 .unwrap_or(1),
             None => 1,
         };
-        manifest.set_timestamp(None);
         // Inherit the index if we're just appending rows
         let indices = match (&dataset, &params.mode) {
             (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
             _ => None,
         };
-        write_manifest_file(&object_store, &base, &mut manifest, indices).await?;
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
 
         Ok(Self {
             object_store: Arc::new(object_store),
@@ -439,7 +474,7 @@ impl Dataset {
         fragments: &[Fragment],
         mode: WriteMode,
     ) -> Result<Self> {
-        let (object_store, base) = ObjectStore::from_uri(&base_uri).await?;
+        let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
         let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
@@ -461,14 +496,16 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
         manifest.version = version;
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        write_manifest_file(&object_store, &base, &mut manifest, Some(indices)).await?;
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
         Ok(Self {
             object_store: Arc::new(object_store),
             base,
@@ -533,12 +570,7 @@ impl Dataset {
         let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
             .then(|f| {
                 let joiner = joiner.clone();
-                let full_schema = new_schema.clone();
-                async move {
-                    f.merge(left_on, &joiner, &full_schema)
-                        .await
-                        .map(|f| f.metadata)
-                }
+                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
             })
             .try_collect::<Vec<_>>()
             .await?;
@@ -546,16 +578,22 @@ impl Dataset {
         // Inherit the index, since we are just adding columns.
         let indices = self.load_indices().await?;
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await
             .map(|m| m.version + 1)
             .unwrap_or(1);
-        manifest.set_timestamp(None);
         manifest.schema = new_schema;
 
-        write_manifest_file(&self.object_store, &self.base, &mut manifest, Some(indices)).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -684,19 +722,21 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows().await?;
         let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-        Ok(self.take(&ids[..], &projection).await?)
+        self.take(&ids[..], projection).await
     }
 
     /// Delete rows based on a predicate.
-    #[allow(dead_code)] // TODO: remove once this is public
-    pub(crate) async fn delete(&mut self, predicate: &str) -> Result<()> {
-        let updated_fragments = stream::iter(self.get_fragments())
+    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+        let mut updated_fragments = stream::iter(self.get_fragments())
             .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
             .buffer_unordered(num_cpus::get())
             // Drop the fragments that were deleted.
             .try_filter_map(|f| futures::future::ready(Ok(f)))
             .try_collect::<Vec<_>>()
             .await?;
+
+        // Maintain the order of fragment IDs.
+        updated_fragments.sort_by_key(|f| f.id);
 
         // Inherit the index, unless we deleted all the fragments.
         let indices = if updated_fragments.is_empty() {
@@ -705,15 +745,21 @@ impl Dataset {
             Some(self.load_indices().await?)
         };
 
-        let mut manifest = Manifest::new(&self.schema(), Arc::new(updated_fragments));
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
         manifest.version = self
             .latest_manifest()
             .await
             .map(|m| m.version + 1)
             .unwrap_or(1);
-        manifest.set_timestamp(None);
 
-        write_manifest_file(&self.object_store, &self.base, &mut manifest, indices).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
 
         self.manifest = Arc::new(manifest);
 
@@ -820,6 +866,54 @@ impl Dataset {
             Ok(vec![])
         }
     }
+
+    pub async fn validate(&self) -> Result<()> {
+        // All fragments have unique ids
+        let id_counts =
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id)
+                .fold(HashMap::new(), |mut acc, id| {
+                    *acc.entry(id).or_insert(0) += 1;
+                    acc
+                });
+        for (id, count) in id_counts {
+            if count > 1 {
+                return Err(Error::corrupt_file(
+                    self.base.clone(),
+                    format!(
+                        "Duplicate fragment id {} found in dataset {:?}",
+                        id, self.base
+                    ),
+                ));
+            }
+        }
+
+        // All fragments have equal lengths
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.validate().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManifestWriteConfig {
+    auto_set_feature_flags: bool,  // default true
+    timestamp: Option<SystemTime>, // default None
+}
+
+impl Default for ManifestWriteConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp: None,
+        }
+    }
 }
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
@@ -829,7 +923,13 @@ pub(crate) async fn write_manifest_file(
     base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
+    config: ManifestWriteConfig,
 ) -> Result<()> {
+    if config.auto_set_feature_flags {
+        apply_feature_flags(manifest);
+    }
+    manifest.set_timestamp(config.timestamp);
+
     let paths = vec![
         manifest_path(base_path, manifest.version),
         latest_manifest_path(base_path),
@@ -897,8 +997,8 @@ mod tests {
                             Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                             Arc::new(
                                 DictionaryArray::try_new(
-                                    &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
-                                    &dict_values,
+                                    UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                    Arc::new(dict_values.clone()),
                                 )
                                 .unwrap(),
                             ),
@@ -911,10 +1011,11 @@ mod tests {
         let expected_batches = batches.batches.clone();
 
         let test_uri = path.to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        write_params.mode = mode;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            mode,
+        };
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
@@ -974,6 +1075,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_manifest() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+
+        // Check it has no flags
+        let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+            .await
+            .unwrap();
+        assert_eq!(manifest.writer_feature_flags, 0);
+        assert_eq!(manifest.reader_feature_flags, 0);
+
+        // Create one with deletions
+        dataset.delete("i < 10").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Check it set the flag
+        let mut manifest =
+            read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+                .await
+                .unwrap();
+        assert_eq!(
+            manifest.writer_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+        assert_eq!(
+            manifest.reader_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+
+        // Write with custom manifest
+        manifest.writer_feature_flags = 5; // Set another flag
+        manifest.reader_feature_flags = 5;
+        write_manifest_file(
+            dataset.object_store(),
+            &dataset.base,
+            &mut manifest,
+            None,
+            ManifestWriteConfig {
+                auto_set_feature_flags: false,
+                timestamp: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Check it rejects reading it
+        let read_result = Dataset::open(test_uri).await;
+        assert!(matches!(read_result, Err(Error::NotSupported { .. })));
+
+        // Check it rejects writing to it.
+        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()]);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let write_result = Dataset::write(
+            &mut batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(matches!(write_result, Err(Error::NotSupported { .. })));
+    }
+
+    #[tokio::test]
     async fn append_dataset() {
         let test_dir = tempdir().unwrap();
 
@@ -989,9 +1173,11 @@ mod tests {
         .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1064,9 +1250,11 @@ mod tests {
         .unwrap()]);
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1144,9 +1332,11 @@ mod tests {
                 .collect(),
         );
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1208,9 +1398,11 @@ mod tests {
                 .collect(),
         );
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1270,9 +1462,11 @@ mod tests {
         );
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
@@ -1281,6 +1475,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(10, dataset.fragments().len());
         assert_eq!(400, dataset.count_rows().await.unwrap());
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]
@@ -1309,6 +1504,7 @@ mod tests {
 
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
@@ -1316,6 +1512,7 @@ mod tests {
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
 
         // Check the version is set correctly
         let indices = dataset.load_indices().await.unwrap();
@@ -1324,8 +1521,10 @@ mod tests {
         assert_eq!(actual, expected);
 
         // Append should inherit index
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Append;
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
         let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
             schema.clone(),
             vec![vectors.clone()],
@@ -1339,10 +1538,13 @@ mod tests {
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
+        dataset.validate().await.unwrap();
 
         // Overwrite should invalidate index
-        let mut write_params = WriteParams::default();
-        write_params.mode = Overwrite;
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
         let batches =
             RecordBatchBuffer::new(vec![
                 RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
@@ -1353,6 +1555,7 @@ mod tests {
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
         assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset.validate().await.unwrap();
     }
 
     async fn create_bad_file() -> Result<Dataset> {
@@ -1418,8 +1621,10 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Append;
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
 
         let mut batches: Box<dyn RecordBatchReader> =
             Box::new(RecordBatchBuffer::from_iter(vec![batch1]));
@@ -1453,6 +1658,7 @@ mod tests {
             Box::new(RecordBatchBuffer::from_iter(vec![right_batch1]));
         let mut dataset = Dataset::open(test_uri).await.unwrap();
         dataset.merge(&mut batches, "i", "i2").await.unwrap();
+        dataset.validate().await.unwrap();
 
         assert_eq!(dataset.version().version, 3);
         assert_eq!(dataset.fragments().len(), 2);
@@ -1498,11 +1704,8 @@ mod tests {
                 DataType::UInt32,
                 false,
             )]));
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(UInt32Array::from_iter_values(range))],
-            )
-            .unwrap()
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
         }
 
         // Write a dataset
@@ -1515,6 +1718,7 @@ mod tests {
 
         // Delete nothing
         dataset.delete("i < 0").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // We should not have any deletion file still
         let fragments = dataset.get_fragments();
@@ -1523,6 +1727,7 @@ mod tests {
 
         // Delete rows
         dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify result:
         // There should be a deletion file in the metadata
@@ -1545,6 +1750,7 @@ mod tests {
 
         // Delete more rows
         dataset.delete("i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify result
         let fragments = dataset.get_fragments();
@@ -1562,6 +1768,7 @@ mod tests {
 
         // Delete full fragment
         dataset.delete("i >= 20").await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Verify fragment is fully gone
         let fragments = dataset.get_fragments();

@@ -21,6 +21,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 
@@ -35,7 +36,7 @@ use crate::{arrow::*, Error};
 /// It uses the `_rowid` to random access on [Dataset] to gather the final results.
 pub struct Take {
     rx: Receiver<Result<RecordBatch>>,
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 
     output_schema: SchemaRef,
 }
@@ -98,7 +99,7 @@ impl Take {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
             output_schema,
         }
     }
@@ -108,7 +109,28 @@ impl Stream for Take {
     type Item = Result<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 
@@ -124,7 +146,7 @@ impl RecordBatchStream for Take {
 /// The rows are identified by the inexplicit row IDs from `input` plan.
 ///
 /// The output schema will be the input schema, merged with extra schemas from the dataset.
-pub(crate) struct TakeExec {
+pub struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
 
@@ -258,7 +280,7 @@ mod tests {
                         value_range.clone().map(|v| v as f32),
                     )),
                     Arc::new(StringArray::from_iter_values(
-                        value_range.clone().map(|v| format!("str-{v}")),
+                        value_range.map(|v| format!("str-{v}")),
                     )),
                 ];
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
@@ -268,8 +290,10 @@ mod tests {
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut params = WriteParams::default();
-        params.max_rows_per_group = 10;
+        let params = WriteParams {
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
         Dataset::write(&mut reader, test_uri, Some(params))
             .await
@@ -292,14 +316,14 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -324,14 +348,14 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             true,
             true,
         ));
-        let take_exec = TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, extra_schema).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -356,13 +380,13 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
-            scan_schema.clone(),
+            scan_schema,
             10,
             10,
             4,
             false,
             true,
         ));
-        assert!(TakeExec::try_new(dataset.clone(), input, extra_schema.clone()).is_err());
+        assert!(TakeExec::try_new(dataset, input, extra_schema).is_err());
     }
 }

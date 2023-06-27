@@ -37,12 +37,12 @@ pub fn norm_l2(vector: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
 
-    pub(crate) mod avx {
+    pub mod avx {
         use crate::linalg::x86_64::avx::*;
         use std::arch::x86_64::*;
 
         #[inline]
-        pub(crate) fn norm_l2_f32(vector: &[f32]) -> f32 {
+        pub fn norm_l2_f32(vector: &[f32]) -> f32 {
             let len = vector.len() / 8 * 8;
             let mut sum = unsafe {
                 let mut sums = _mm256_setzero_ps();
@@ -60,11 +60,11 @@ mod x86_64 {
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    pub(crate) mod neon {
+    pub mod neon {
         use std::arch::aarch64::*;
 
         #[inline]
-        pub(crate) fn norm_l2(vector: &[f32]) -> f32 {
+        pub fn norm_l2(vector: &[f32]) -> f32 {
             let len = vector.len() / 4 * 4;
             let mut sum = unsafe {
                 let buf = [0.0_f32; 4];

@@ -88,9 +88,9 @@ impl<'a> PlainEncoder<'a> {
         let capacity: usize = arrays.iter().map(|a| a.len()).sum();
         let mut builder = BooleanBuilder::with_capacity(capacity);
 
-        for i in 0..arrays.len() {
-            for j in 0..arrays[i].len() {
-                builder.append_value(arrays[i].value(j));
+        for array in arrays {
+            for val in array.iter() {
+                builder.append_value(val.unwrap());
             }
         }
 
@@ -145,7 +145,7 @@ impl<'a> PlainEncoder<'a> {
                     message: format!("Needed a FixedSizeListArray but got {}", array.data_type()),
                 })?;
             let offset = list_array.value_offset(0) as usize;
-            let length = list_array.len() as usize;
+            let length = list_array.len();
             let value_length = list_array.value_length() as usize;
             let value_array = list_array.values().slice(offset, length * value_length);
             value_arrs.push(value_array);
@@ -301,7 +301,7 @@ impl<'a> PlainDecoder<'a> {
                 let start = request.value(0);
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let array_byte_boundray = (start / 8 * 8) as u32;
+                let array_byte_boundray = start / 8 * 8_u32;
                 let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
@@ -359,7 +359,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let arrays = stream::iter(chunked_ranges)
             .map(|cr| async move {
-                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let index_chunk = indices.slice(cr.start, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
 
                 let start = request.value(0);
@@ -479,7 +479,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input: Vec<i64> = Vec::from_iter(1..127 as i64);
+        let input: Vec<i64> = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
@@ -554,7 +554,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input = Vec::from_iter(1..127 as i64);
+        let input = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let list_type =
@@ -576,7 +576,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
+            let values = UInt8Array::from(Vec::from_iter(1..127_u8));
             let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
@@ -591,7 +591,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = Int64Array::from_iter_values(1..=120 as i64);
+            let values = Int64Array::from_iter_values(1..=120_i64);
             let arr =
                 FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
                     .unwrap();
@@ -605,7 +605,7 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from_iter_values(1..=120 as u8);
+            let values = UInt8Array::from_iter_values(1..=120_u8);
             let arr =
                 FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
                     .unwrap();
@@ -659,7 +659,7 @@ mod tests {
         );
 
         assert_eq!(
-            &decoder.get(5..2).await.unwrap(),
+            &decoder.get(5..5).await.unwrap(),
             &new_empty_array(&DataType::Int32)
         );
 
@@ -756,7 +756,7 @@ mod tests {
         for i in 0..10 {
             let data = array.slice(i * 12, 12); // one and half byte
             file_writer
-                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
+                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
                 .await
                 .unwrap();
         }

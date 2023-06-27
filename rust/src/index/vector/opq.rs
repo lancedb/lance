@@ -32,7 +32,7 @@ use crate::io::{
     object_reader::{read_fixed_stride_array, ObjectReader},
     object_writer::ObjectWriter,
 };
-use crate::{arrow::linalg::*, index::Index};
+use crate::{arrow::linalg::matrix::*, arrow::linalg::svd::*, index::Index};
 use crate::{Error, Result};
 
 const OPQ_PQ_INIT_ITERATIONS: usize = 10;
@@ -114,8 +114,8 @@ impl OptimizedProductQuantizer {
         let dim = train.num_columns();
 
         // Train few times to get a better rotation matrix. See Faiss.
-        pq.train(&train, metric_type, 1).await?;
-        let pq_code = pq.transform(&train, metric_type).await?;
+        pq.train(train, metric_type, 1).await?;
+        let pq_code = pq.transform(train, metric_type).await?;
 
         // Reconstruct Y
         let mut builder = Float32Builder::with_capacity(train.num_columns() * train.num_rows());
@@ -147,7 +147,7 @@ pub(crate) async fn train_opq(
     params: &PQBuildParams,
 ) -> Result<OptimizedProductQuantizer> {
     let mut opq = OptimizedProductQuantizer::new(
-        params.num_sub_vectors as usize,
+        params.num_sub_vectors,
         params.num_bits as u32,
         params.metric_type,
         params.max_opq_iters,
@@ -314,7 +314,7 @@ impl TryFrom<&OptimizedProductQuantizer> for Transform {
         let rotation = opq.rotation.as_ref().ok_or(Error::Index {
             message: "OPQ is not trained".to_string(),
         })?;
-        Ok(Transform {
+        Ok(Self {
             position: opq.file_position.unwrap() as u64,
             shape: vec![rotation.num_rows() as u32, rotation.num_columns() as u32],
             r#type: TransformType::Opq.into(),
@@ -331,7 +331,7 @@ mod tests {
     use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchReader, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
-    use crate::arrow::{linalg::MatrixView, *};
+    use crate::arrow::{linalg::matrix::MatrixView, *};
     use crate::dataset::{Dataset, ROW_ID};
     use crate::index::DatasetIndexExt;
     use crate::index::{
@@ -370,8 +370,7 @@ mod tests {
             schema.clone(),
             vec![Arc::new(vectors)],
         )
-        .unwrap()
-        .into()]);
+        .unwrap()]);
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
         Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
             .await
