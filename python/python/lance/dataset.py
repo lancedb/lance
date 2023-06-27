@@ -489,7 +489,7 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
+            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine" or "dot".
             Default is "L2".
         replace : bool
             Replace the existing index if it exists.
@@ -517,7 +517,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         - **r**: out-degree bound
         - **l**: number of levels in the graph.
-        - **alpha**: distance threadhold for the graph.
+        - **alpha**: distance threshold for the graph.
 
         Examples
         --------
@@ -568,6 +568,7 @@ class LanceDataset(pa.dataset.Dataset):
             "l2",
             "cosine",
             "euclidean",
+            "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
