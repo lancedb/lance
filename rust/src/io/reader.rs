@@ -1153,7 +1153,8 @@ mod tests {
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let batch_buffer = crate::arrow::RecordBatchBuffer::new(batches.clone());
+        let batch_buffer =
+            crate::arrow::RecordBatchBuffer::new(batches.clone(), Some(arrow_schema));
         let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(batch_buffer);
         Dataset::write(&mut batch_reader, test_uri, Some(WriteParams::default()))
             .await

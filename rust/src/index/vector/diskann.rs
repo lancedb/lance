@@ -142,11 +142,10 @@ mod tests {
 
         let float_arr = generate_random_array(512 * dimension as usize);
         let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()],
+            Some(schema.clone()),
+        );
 
         let test_uri = test_dir.path().to_str().unwrap();
 

@@ -119,6 +119,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
                 .unwrap()
             })
             .collect(),
+        Some(schema.clone()),
     );
 
     let test_uri = path.to_str().unwrap();

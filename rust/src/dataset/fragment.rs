@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
+use arrow_schema::SchemaRef;
 use futures::future::try_join_all;
 use futures::{join, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
@@ -67,6 +68,7 @@ impl FileFragment {
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
 
+        let arrow_schema: SchemaRef = reader.schema();
         let schema = Schema::try_from(reader.schema().as_ref())?;
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
@@ -75,7 +77,7 @@ impl FileFragment {
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
-        let mut buffer = RecordBatchBuffer::empty();
+        let mut buffer = RecordBatchBuffer::empty(Some(arrow_schema.clone()))?;
 
         for rst in reader {
             let batch = rst?; // TODO: close writer on Error?
@@ -83,7 +85,7 @@ impl FileFragment {
             if buffer.num_rows() >= params.max_rows_per_group {
                 let batches = buffer.finish()?;
                 writer.write(&batches).await?;
-                buffer = RecordBatchBuffer::empty();
+                buffer = RecordBatchBuffer::empty(Some(arrow_schema.clone()))?;
             }
         }
 
@@ -552,6 +554,7 @@ mod tests {
                     .unwrap()
                 })
                 .collect(),
+            Some(schema.clone()),
         );
 
         let write_params = WriteParams {

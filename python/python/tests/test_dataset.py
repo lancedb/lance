@@ -27,6 +27,7 @@ import lance.fragment
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
+import pandas as pd
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
@@ -434,3 +435,37 @@ def test_delete_data(tmp_path: Path):
     dataset.delete(pa_ds.field("a") < 20)
     assert dataset.version == 4
     assert dataset.to_table() == pa.table({"a": range(20, 98), "b": range(20, 98)})
+
+
+def test_create_update_empty_dataset(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+
+    fields = [
+        ("a", pa.string()),
+        ("b", pa.int64()),
+        ("c", pa.float64()),
+    ]
+    df = pd.DataFrame(columns=[name for name, _ in fields])
+    tab = pa.Table.from_pandas(df, schema=pa.schema(fields))
+    dataset = lance.write_dataset(tab, base_dir)
+
+    assert dataset.count_rows() == 0
+    expected_schema = pa.schema(
+        [
+            pa.field("a", pa.string()),
+            pa.field("b", pa.int64()),
+            pa.field("c", pa.float64()),
+        ]
+    )
+    assert dataset.schema == expected_schema
+    assert dataset.to_table() == pa.table(
+        {"a": [], "b": [], "c": []}, schema=expected_schema
+    )
+
+    tab2 = pa.table({"a": ["foo"], "b": [1], "c": [2.0]})
+    dataset = lance.write_dataset(tab2, base_dir, mode="append")
+
+    assert dataset.count_rows() == 1
+    assert dataset.to_table() == pa.table(
+        {"a": ["foo"], "b": [1], "c": [2.0]}, schema=expected_schema
+    )

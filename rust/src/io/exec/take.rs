@@ -286,7 +286,7 @@ mod tests {
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
             })
             .collect();
-        let batches = RecordBatchBuffer::new(expected_batches.clone());
+        let batches = RecordBatchBuffer::new(expected_batches.clone(), Some(schema.clone()));
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();

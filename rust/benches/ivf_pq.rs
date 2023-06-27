@@ -57,6 +57,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
                 .unwrap()
             })
             .collect(),
+        Some(schema.clone()),
     );
 
     let mut write_params = WriteParams::default();

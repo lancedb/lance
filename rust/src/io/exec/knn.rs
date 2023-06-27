@@ -468,6 +468,7 @@ mod tests {
                     .unwrap()
                 })
                 .collect(),
+            Some(schema.clone()),
         );
 
         let test_dir = tempdir().unwrap();

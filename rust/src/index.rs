@@ -217,14 +217,17 @@ mod tests {
             ),
         ]));
         let data = generate_random_array(2048 * DIM as usize);
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
-                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
-            ],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
+                    Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
+                ],
+            )
+            .unwrap()],
+            Some(schema.clone()),
+        );
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();

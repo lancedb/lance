@@ -18,7 +18,7 @@
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// RecordBatchBuffer is a in-memory buffer for multiple [`RecordBatch`]s.
 ///
@@ -26,18 +26,29 @@ use crate::Result;
 #[derive(Debug)]
 pub struct RecordBatchBuffer {
     pub batches: Vec<RecordBatch>,
+    pub schema: Option<SchemaRef>,
     idx: usize,
 }
 
 impl RecordBatchBuffer {
-    pub fn new(batches: Vec<RecordBatch>) -> Self {
-        Self { batches, idx: 0 }
+    pub fn new(batches: Vec<RecordBatch>, schema: Option<SchemaRef>) -> Self {
+        Self {
+            batches,
+            idx: 0,
+            schema,
+        }
     }
 
-    pub fn empty() -> Self {
-        Self {
-            batches: vec![],
-            idx: 0,
+    pub fn empty(schema: Option<SchemaRef>) -> Result<Self> {
+        match schema {
+            Some(schm) => Ok(Self {
+                batches: vec![],
+                idx: 0,
+                schema: Some(schm),
+            }),
+            None => {
+                return Err(Error::EmptyDatasetWithoutSchema {});
+            }
         }
     }
 
@@ -52,7 +63,11 @@ impl RecordBatchBuffer {
 
 impl RecordBatchReader for RecordBatchBuffer {
     fn schema(&self) -> SchemaRef {
-        self.batches[0].schema()
+        if self.batches.len() > 0 {
+            self.batches[0].schema()
+        } else {
+            self.schema.clone().unwrap()
+        }
     }
 }
 
@@ -73,6 +88,6 @@ impl Iterator for RecordBatchBuffer {
 impl FromIterator<RecordBatch> for RecordBatchBuffer {
     fn from_iter<T: IntoIterator<Item = RecordBatch>>(iter: T) -> Self {
         let batches = iter.into_iter().collect::<Vec<_>>();
-        Self::new(batches)
+        Self::new(batches, None)
     }
 }

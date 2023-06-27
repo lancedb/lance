@@ -708,6 +708,7 @@ mod test {
                     .unwrap()
                 })
                 .collect(),
+            Some(schema.clone()),
         );
 
         let test_dir = tempdir().unwrap();
@@ -744,16 +745,19 @@ mod test {
             ArrowField::new("s", DataType::Utf8, true),
         ]));
 
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..100)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..100).map(|v| format!("s-{}", v)),
-                )),
-            ],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..100)),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..100).map(|v| format!("s-{}", v)),
+                    )),
+                ],
+            )
+            .unwrap()],
+            Some(schema.clone()),
+        );
 
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
         let test_dir = tempdir().unwrap();
@@ -836,7 +840,7 @@ mod test {
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
             })
             .collect();
-        let batches = RecordBatchBuffer::new(expected_batches.clone());
+        let batches = RecordBatchBuffer::new(expected_batches.clone(), Some(schema.clone()));
         let params = WriteParams {
             max_rows_per_group: 10,
             ..Default::default()
@@ -880,6 +884,7 @@ mod test {
                     .unwrap()
                 })
                 .collect(),
+            Some(schema.clone()),
         );
 
         let params = WriteParams {
@@ -979,8 +984,10 @@ mod test {
             Arc::new(new_vectors),
         ];
         let schema: Arc<ArrowSchema> = Arc::new(dataset.schema().try_into().unwrap());
-        let new_data =
-            RecordBatchBuffer::new(vec![RecordBatch::try_new(schema, new_data).unwrap()]);
+        let new_data = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(schema.clone(), new_data).unwrap()],
+            Some(schema.clone()),
+        );
         let mut new_data_reader: Box<dyn RecordBatchReader> = Box::new(new_data);
         let dataset = Dataset::write(
             &mut new_data_reader,
@@ -1546,13 +1553,16 @@ mod test {
             true,
         )]));
 
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(LargeStringArray::from_iter_values(
-                (0..10).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeStringArray::from_iter_values(
+                    (0..10).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap()],
+            Some(schema.clone()),
+        );
 
         let write_params = WriteParams::default();
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
@@ -1595,13 +1605,16 @@ mod test {
             true,
         )]));
 
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from_iter_values(
-                (0..20).map(|v| format!("s-{}", v)),
-            ))],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from_iter_values(
+                    (0..20).map(|v| format!("s-{}", v)),
+                ))],
+            )
+            .unwrap()],
+            Some(schema.clone()),
+        );
 
         let write_params = WriteParams::default();
         let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
@@ -1663,7 +1676,7 @@ mod test {
                 .unwrap()
             })
             .collect();
-        let reader = RecordBatchBuffer::new(input_batches.clone());
+        let reader = RecordBatchBuffer::new(input_batches.clone(), Some(schema.clone()));
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -1748,14 +1761,17 @@ mod test {
             let vector_values: Float32Array = (0..32 * 512).map(|v| (v / 32) as f32).collect();
             let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
 
-            let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(0..512)),
-                    Arc::new(vectors),
-                ],
-            )
-            .unwrap()]);
+            let batches = RecordBatchBuffer::new(
+                vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(0..512)),
+                        Arc::new(vectors),
+                    ],
+                )
+                .unwrap()],
+                Some(schema.clone()),
+            );
 
             let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
             let mut dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();

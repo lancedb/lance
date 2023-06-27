@@ -366,11 +366,10 @@ mod tests {
 
         let vectors = Float32Array::from_iter_values((0..32000).map(|x| x as f32));
         let vectors = FixedSizeListArray::try_new(vectors, 64).unwrap();
-        let batch = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(vectors)],
-        )
-        .unwrap()]);
+        let batch = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap()],
+            Some(schema.clone()),
+        );
         let mut reader: Box<dyn RecordBatchReader> = Box::new(batch);
         Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
             .await

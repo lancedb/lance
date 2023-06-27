@@ -406,13 +406,16 @@ mod tests {
             true,
         )]));
         let data = generate_random_array(total * dim);
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(
-                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
-            )],
-        )
-        .unwrap()]);
+        let batches = RecordBatchBuffer::new(
+            vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+                )],
+            )
+            .unwrap()],
+            Some(schema.clone()),
+        );
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
