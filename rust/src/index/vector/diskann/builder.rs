@@ -357,6 +357,7 @@ async fn write_index_file(
             metric_type: match metric_type {
                 MetricType::L2 => pb::VectorMetricType::L2.into(),
                 MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+                MetricType::Dot => pb::VectorMetricType::Dot.into(),
             },
         })),
     };
