@@ -160,11 +160,16 @@ def test_has_index(dataset, tmp_path):
 
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
+
 def test_create_dot_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16, metric="dot"
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="dot",
     )
     assert ann_ds.has_index
 
