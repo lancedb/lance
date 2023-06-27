@@ -95,7 +95,7 @@ impl FileFragment {
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })?;
-        Ok(FragmentMetadata::new(metadata, schema.clone()))
+        Ok(FragmentMetadata::new(metadata, schema))
     }
 
     #[staticmethod]
