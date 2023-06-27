@@ -489,8 +489,8 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine" or "dot".
-            Default is "L2".
+            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine"
+            or "dot" (dot product). Default is "L2".
         replace : bool
             Replace the existing index if it exists.
         num_partitions : int, optional
