@@ -28,7 +28,7 @@ use rand::{distributions::WeightedIndex, Rng};
 
 use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::MetricType;
-use crate::linalg::{cosine::Cosine, l2::L2};
+use crate::linalg::{cosine::Cosine, dot::Dot, l2::L2};
 use crate::Error;
 use crate::Result;
 
@@ -443,6 +443,7 @@ impl KMeans {
                                 let dist = match metric_type {
                                     MetricType::L2 => vector.l2(other),
                                     MetricType::Cosine => vector.cosine(other),
+                                    MetricType::Dot => vector.dot(other),
                                 };
                                 if dist < min {
                                     min = dist;

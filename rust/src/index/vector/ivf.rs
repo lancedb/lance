@@ -245,6 +245,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 metric_type: match idx.metric_type {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+                    MetricType::Dot => pb::VectorMetricType::Dot.into(),
                 },
             })),
         })

@@ -14,8 +14,11 @@
 
 //! Dot product.
 
-use num_traits::real::Real;
 use std::iter::Sum;
+use std::sync::Arc;
+
+use arrow_array::Float32Array;
+use num_traits::real::Real;
 
 #[inline]
 pub fn dot<T: Real + Sum>(from: &[T], to: &[T]) -> T {
@@ -35,4 +38,18 @@ impl Dot for [f32] {
     fn dot(&self, other: &[f32]) -> f32 {
         dot(self, other)
     }
+}
+
+pub fn dot_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Float32Array> {
+    debug_assert_eq!(from.len(), dimension);
+    debug_assert_eq!(to.len() % dimension, 0);
+
+    let dists = unsafe {
+        Float32Array::from_trusted_len_iter(to.chunks_exact(dimension).map(|v| Some(from.dot(v))))
+    };
+    Arc::new(dists)
+}
+
+pub fn dot_distance(from: &[f32], to: &[f32]) -> f32 {
+    from.dot(to)
 }

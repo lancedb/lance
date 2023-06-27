@@ -137,6 +137,9 @@ enum VectorMetricType {
 
   // Cosine Distance
   Cosine = 1;
+
+  // Dot Product
+  Dot = 2;
 }
 
 // Vector Index Metadata

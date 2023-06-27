@@ -57,6 +57,7 @@ use crate::{
     },
     linalg::{
         cosine::{cosine_distance, cosine_distance_batch},
+        dot::{dot_distance, dot_distance_batch},
         l2::{l2_distance, l2_distance_batch},
     },
     Error, Result,
@@ -97,6 +98,7 @@ pub struct Query {
 pub enum MetricType {
     L2,
     Cosine,
+    Dot, // Dot product
 }
 
 type DistanceFunc = dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static;
@@ -108,6 +110,7 @@ impl MetricType {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance_batch),
+            Self::Dot => Arc::new(dot_distance_batch),
         }
     }
 
@@ -116,6 +119,7 @@ impl MetricType {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),
+            Self::Dot => Arc::new(dot_distance),
         }
     }
 }
@@ -128,6 +132,7 @@ impl std::fmt::Display for MetricType {
             match self {
                 Self::L2 => "l2",
                 Self::Cosine => "cosine",
+                Self::Dot => "dot",
             }
         )
     }
@@ -138,6 +143,7 @@ impl From<super::pb::VectorMetricType> for MetricType {
         match proto {
             super::pb::VectorMetricType::L2 => Self::L2,
             super::pb::VectorMetricType::Cosine => Self::Cosine,
+            super::pb::VectorMetricType::Dot => Self::Dot,
         }
     }
 }
@@ -147,6 +153,7 @@ impl From<MetricType> for super::pb::VectorMetricType {
         match mt {
             MetricType::L2 => Self::L2,
             MetricType::Cosine => Self::Cosine,
+            MetricType::Dot => Self::Dot,
         }
     }
 }
@@ -158,6 +165,7 @@ impl TryFrom<&str> for MetricType {
         match s.to_lowercase().as_str() {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
+            "dot" => Ok(Self::Dot),
             _ => Err(Error::Index {
                 message: format!("Metric type '{s}' is not supported"),
             }),
