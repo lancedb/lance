@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use crate::dataset::get_write_params;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
 use arrow::pyarrow::PyArrowType;
@@ -33,6 +32,7 @@ use pyo3::types::{PyBytes, PyDict};
 use std::fmt::Write as _;
 use tokio::runtime::Runtime;
 
+use crate::dataset::get_write_params;
 use crate::updater::Updater;
 use crate::Scanner;
 
