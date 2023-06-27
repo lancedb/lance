@@ -1113,12 +1113,12 @@ mod tests {
             vec![Arc::new(Int32Array::from_iter_values(0..10))],
         )
         .unwrap();
-        
-        // get actual dataset 
+
+        // get actual dataset
         let actual_ds = Dataset::open(test_uri).await.unwrap();
         // confirm schema is same
         let actual_schema = ArrowSchema::from(actual_ds.schema());
-        assert_eq!(&actual_schema, schema.as_ref());        
+        assert_eq!(&actual_schema, schema.as_ref());
         // check num rows is 10
         assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
         // check expected batch is correct
@@ -1138,7 +1138,6 @@ mod tests {
         let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
         let expected_struct_arr: StructArray = expected_batch.into();
         assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
-
     }
 
     #[tokio::test]
