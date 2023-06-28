@@ -507,7 +507,7 @@ mod tests {
     async fn test_train_with_small_dataset() {
         let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
         match KMeans::new(&data, 2, 128, 5).await {
-            Ok(_) => assert!(false, "Should fail to train KMeans"),
+            Ok(_) => panic!("Should fail to train KMeans"),
             Err(e) => {
                 assert!(e.to_string().contains("smaller than"));
             }
