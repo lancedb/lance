@@ -31,7 +31,14 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
         yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
         yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
 
-    lance.write_dataset(producer, "./alice_and_bob.lance")
+
+    schema = pa.schema([
+                pa.field("name", pa.string()),
+                pa.field("age", pa.int32()),
+            ])
+
+    reader = pa.RecordBatchReader.from_batches(schema, producer())
+    lance.write_dataset(reader, "./alice_and_bob.lance")
 
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
