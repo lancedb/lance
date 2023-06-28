@@ -747,10 +747,12 @@ mod tests {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "b",
             DataType::Boolean,
-            false,
+            true,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
 
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         for i in 0..10 {
@@ -764,6 +766,19 @@ mod tests {
 
         let batch = read_file_as_one_batch(&store, &path).await;
         assert_eq!(batch.column_by_name("b").unwrap().as_ref(), &array);
+
+        let array = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        file_writer
+            .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap()])
+            .await
+            .unwrap();
+        file_writer.finish().await.unwrap();
+        let batch = read_file_as_one_batch(&store, &path).await;
+
+        // None default to Some(false), since we don't support null values yet.
+        let expected = BooleanArray::from(vec![Some(true), Some(false), Some(false)]);
+        assert_eq!(batch.column_by_name("b").unwrap().as_ref(), &expected);
     }
 
     #[tokio::test]
