@@ -90,7 +90,7 @@ impl<'a> PlainEncoder<'a> {
 
         for array in arrays {
             for val in array.iter() {
-                builder.append_value(val.unwrap());
+                builder.append_value(val.unwrap_or_default());
             }
         }
 
