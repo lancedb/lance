@@ -148,15 +148,7 @@ async fn kmeans_random_init(
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> Result<KMeans> {
-    let n = data.len() / dimension;
-    if n < k {
-        return Err(Error::Index {
-            message: format!(
-                "KMean: data length {} is less than k ({}) * dimension ({})",
-                n, k, dimension
-            ),
-        });
-    }
+    assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
