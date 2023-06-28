@@ -176,14 +176,19 @@ impl MatrixView {
         }
     }
 
-    /// Dot multiply
-    #[cfg(feature = "opq")]
-    pub fn dot(&self, rhs: &Self) -> Result<Self> {
-        use cblas::{sgemm, Layout, Transpose};
+    // Vector dot multiply
+    fn vec_dot(a1: Vec<f32>, a2: Vec<f32>) -> f32 {
+        return a1.into_iter().zip(a2.into_iter()).map(|(a, b)| a * b).sum();
+    }
 
-        let m = self.num_rows() as i32;
-        let k = self.num_columns() as i32;
-        let n = rhs.num_columns() as i32;
+    /// Dot multiply
+    // #[cfg(feature = "opq")]
+    pub fn dot(&self, rhs: &Self) -> Result<Self> {
+        // use cblas::{sgemm, Layout, Transpose};
+
+        let m = self.num_rows();
+        let k = self.num_columns();
+        let n = rhs.num_columns();
         if self.num_columns() != rhs.num_rows() {
             return Err(Error::Arrow {
                 message: format!(
@@ -195,35 +200,56 @@ impl MatrixView {
 
         let mut c_builder = Float32Builder::with_capacity((m * n) as usize);
         unsafe { c_builder.append_trusted_len_iter((0..n * m).map(|_| 0.0)) }
+        
+        rhs.transpose();
+        let right_binding = rhs.data();
 
-        let (trans_a, lda) = if self.transpose {
-            (Transpose::Ordinary, m)
-        } else {
-            (Transpose::None, k)
-        };
-        let (trans_b, ldb) = if rhs.transpose {
-            (Transpose::Ordinary, k)
-        } else {
-            (Transpose::None, n)
-        };
-        unsafe {
-            sgemm(
-                Layout::RowMajor,
-                trans_a,
-                trans_b,
-                m,
-                n,
-                k,
-                1.0,
-                self.data.values(),
-                lda,
-                rhs.data.values(),
-                ldb,
-                0.0,
-                c_builder.values_slice_mut(),
-                n,
-            )
-        }
+        let mut self_rows = self.data.values().chunks(m);
+        let mut right_cols = right_binding.values().chunks(n);
+   
+        let mut row;
+        let mut col;
+        unsafe { c_builder.append_trusted_len_iter((0..n * m).zip(0..n * m).map(|(i, _)| {
+            if (i % m == 0) {
+                self_rows = self.data.values().chunks(m);
+                let mut col = self_rows.next().expect("Cannot get next row.");
+            }
+            let mut row = self_rows.next().expect("Cannot get next row.");
+            let row = i % m;
+            let col = i / m;
+            let self_v = self_rows.nth(row).expect("Row not in range.").to_vec();
+            let rhs_v = right_cols.nth(col).expect("Col not in range.").to_vec();
+
+            return MatrixView::vec_dot(self_v, rhs_v)
+        })) }
+        // let (trans_a, lda) = if self.transpose {
+        //     (Transpose::Ordinary, m)
+        // } else {
+        //     (Transpose::None, k)
+        // };
+        // let (trans_b, ldb) = if rhs.transpose {
+        //     (Transpose::Ordinary, k)
+        // } else {
+        //     (Transpose::None, n)
+        // };
+        // unsafe {
+        //     sgemm(
+        //         Layout::RowMajor,
+        //         trans_a,
+        //         trans_b,
+        //         m,
+        //         n,
+        //         k,
+        //         1.0,
+        //         self.data.values(),
+        //         lda,
+        //         rhs.data.values(),
+        //         ldb,
+        //         0.0,
+        //         c_builder.values_slice_mut(),
+        //         n,
+        //     )
+        // }
 
         let data = Arc::new(c_builder.finish());
         Ok(Self {
