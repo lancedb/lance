@@ -649,7 +649,7 @@ mod tests {
         for f in dataset.get_fragments() {
             for file in Fragment::from(f.clone()).files {
                 let p = file.path.clone();
-                paths.push(p.to_string())
+                paths.push(p)
             }
         }
 

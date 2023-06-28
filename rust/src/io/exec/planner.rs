@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use arrow_cast::can_cast_types;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
@@ -292,7 +293,6 @@ impl Planner {
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
-        // parse_sql_expr(expr, &self.schema)
         match expr {
             SQLExpr::Identifier(id) => {
                 if id.quote_style == Some('"') {
@@ -376,9 +376,17 @@ impl Planner {
                 let left = self.create_physical_expr(expr.left.as_ref())?;
                 let right = self.create_physical_expr(expr.right.as_ref())?;
                 let left_data_type = left.data_type(&self.schema)?;
+                let right_data_type = right.data_type(&self.schema)?;
                 // Make sure RHS matches the LHS
-                let right = if right.data_type(&self.schema)? != left_data_type {
-                    Arc::new(CastExpr::new(right, left_data_type, None))
+                let right = if right_data_type != left_data_type {
+                    if can_cast_types(&right_data_type, &left_data_type) {
+                        Arc::new(CastExpr::new(right, left_data_type, None))
+                    } else {
+                        return Err(Error::invalid_input(format!(
+                            "Cannot compare {} and {}",
+                            left_data_type, right_data_type
+                        )));
+                    }
                 } else {
                     right
                 };
