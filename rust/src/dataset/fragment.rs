@@ -824,7 +824,6 @@ mod tests {
             .await
             .unwrap();
         let batch = concat_batches(&schema, &batches).unwrap();
-        dbg!(&batch);
 
         let mut row_id: i32 = 0;
         let mut i: usize = 0;
@@ -833,7 +832,6 @@ mod tests {
         while row_id < 200 {
             if deleted_range.contains(&row_id) {
                 row_id += 1;
-                // dbg!(i);
                 continue;
             }
             assert_eq!(array_i.value(i), row_id);
