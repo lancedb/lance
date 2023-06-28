@@ -138,16 +138,17 @@ async fn kmean_plusplus(
     kmeans
 }
 
-/// Randomly initialize kmeans centroids
+/// Randomly initialize kmeans centroids.
+///
+///
 async fn kmeans_random_init(
     data: &Float32Array,
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
-) -> KMeans {
-    assert!(data.len() > k * dimension);
-
+) -> Result<KMeans> {
+    assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
@@ -157,7 +158,7 @@ async fn kmeans_random_init(
     }
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
     kmeans.centroids = Arc::new(builder.finish());
-    kmeans
+    Ok(kmeans)
 }
 
 pub struct KMeanMembership {
@@ -315,12 +316,17 @@ impl KMeans {
         k: usize,
         metric_type: MetricType,
         rng: impl Rng,
-    ) -> Self {
+    ) -> Result<Self> {
         kmeans_random_init(&data.data(), data.num_columns(), k, rng, metric_type).await
     }
 
     /// Train a KMeans model on data with `k` clusters.
-    pub async fn new(data: &Float32Array, dimension: usize, k: usize, max_iters: u32) -> Self {
+    pub async fn new(
+        data: &Float32Array,
+        dimension: usize,
+        k: usize,
+        max_iters: u32,
+    ) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
             metric_type: MetricType::L2,
@@ -329,13 +335,23 @@ impl KMeans {
         Self::new_with_params(data, dimension, k, &params).await
     }
 
-    /// Train a KMeans model with full parameters.
+    /// Train a [`KMeans`] model with full parameters.
     pub async fn new_with_params(
         data: &Float32Array,
         dimension: usize,
         k: usize,
         params: &KMeansParams,
-    ) -> Self {
+    ) -> Result<Self> {
+        let n = data.len() / dimension;
+        if n < k {
+            return Err(Error::Index {
+                message: format!(
+                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
+                    n, k
+                ),
+            });
+        }
+
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
@@ -350,7 +366,7 @@ impl KMeans {
             } else {
                 match params.init {
                     KMeanInit::Random => {
-                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await
+                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await?
                     }
                     KMeanInit::KMeanPlusPlus => {
                         kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
@@ -388,7 +404,7 @@ impl KMeans {
             }
         }
 
-        best_kmeans
+        Ok(best_kmeans)
     }
 
     /// Train for one iteration.
@@ -482,4 +498,19 @@ impl KMeans {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    use arrow_array::Float32Array;
+
+    #[tokio::test]
+    async fn test_train_with_small_dataset() {
+        let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        match KMeans::new(&data, 2, 128, 5).await {
+            Ok(_) => panic!("Should fail to train KMeans"),
+            Err(e) => {
+                assert!(e.to_string().contains("smaller than"));
+            }
+        }
+    }
+}
