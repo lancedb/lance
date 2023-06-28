@@ -24,10 +24,10 @@ from unittest import mock
 
 import lance
 import lance.fragment
+import pandas as pd
 import pandas.testing as tm
 import polars as pl
 import pyarrow as pa
-import pandas as pd
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest

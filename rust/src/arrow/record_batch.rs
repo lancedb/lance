@@ -46,9 +46,7 @@ impl RecordBatchBuffer {
                 idx: 0,
                 schema: Some(schm),
             }),
-            None => {
-                return Err(Error::EmptyDatasetWithoutSchema {});
-            }
+            None => Err(Error::EmptyDatasetWithoutSchema {}),
         }
     }
 
@@ -63,7 +61,7 @@ impl RecordBatchBuffer {
 
 impl RecordBatchReader for RecordBatchBuffer {
     fn schema(&self) -> SchemaRef {
-        if self.batches.len() > 0 {
+        if !self.batches.is_empty() {
             self.batches[0].schema()
         } else {
             self.schema.clone().unwrap()
