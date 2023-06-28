@@ -146,8 +146,6 @@ async fn kmeans_random_init(
     mut rng: impl Rng,
     metric_type: MetricType,
 ) -> KMeans {
-    assert!(data.len() > k * dimension);
-
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
