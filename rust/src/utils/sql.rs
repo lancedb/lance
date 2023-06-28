@@ -14,7 +14,7 @@
 
 //! SQL Parser utility
 
-use sqlparser::{
+use datafusion::sql::sqlparser::{
     ast::{Expr, SetExpr, Statement},
     dialect::{Dialect, GenericDialect},
     parser::Parser,
@@ -51,29 +51,28 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     let sql = format!("SELECT 1 FROM t WHERE {filter}");
 
     let dialect = LanceDialect::new();
+
+    // Hack to allow == as equals
+    // This is used to parse PyArrow expressions from strings.
+    // See: https://github.com/sqlparser-rs/sqlparser-rs/pull/815#issuecomment-1450714278
     let mut tokenizer = Tokenizer::new(&dialect, &sql);
-    let tokens = tokenizer
-        .tokenize()?
-        .iter()
-        .map(|tok| {
-            if tok == &Token::DoubleEq {
-                Token::Eq
-            } else {
-                tok.clone()
-            }
-        })
-        .collect();
-
-    let stmts = Parser::new(&dialect)
-        .with_tokens(tokens)
-        .parse_statements()?;
-
-    if stmts.len() != 1 {
-        return Err(Error::IO {
-            message: format!("Filter is not valid: {filter}"),
-        });
+    let mut tokens = Vec::new();
+    let mut token_iter = tokenizer.tokenize()?.into_iter();
+    let mut prev_token = token_iter.next().unwrap();
+    while let Some(next_token) = token_iter.next() {
+        if let (Token::Eq, Token::Eq) = (&prev_token, &next_token) {
+            continue; // skip second equals
+        }
+        let token = std::mem::replace(&mut prev_token, next_token);
+        tokens.push(token);
     }
-    let selection = if let Statement::Query(query) = &stmts[0] {
+    tokens.push(prev_token);
+
+    let statement = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_statement()?;
+
+    let selection = if let Statement::Query(query) = &statement {
         if let SetExpr::Select(s) = query.body.as_ref() {
             s.selection.as_ref()
         } else {
@@ -92,7 +91,7 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
 mod tests {
     use super::*;
 
-    use sqlparser::ast::{BinaryOperator, Ident, Value};
+    use datafusion::sql::sqlparser::ast::{BinaryOperator, Ident, Value};
 
     #[test]
     fn test_double_equal() {

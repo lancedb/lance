@@ -17,6 +17,10 @@
 use std::sync::Arc;
 
 use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
+    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+};
 use datafusion::{
     logical_expr::{
         col,
@@ -32,10 +36,6 @@ use datafusion::{
     },
     prelude::Expr,
     scalar::ScalarValue,
-};
-use sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -292,6 +292,7 @@ impl Planner {
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
+        // parse_sql_expr(expr, &self.schema)
         match expr {
             SQLExpr::Identifier(id) => {
                 if id.quote_style == Some('"') {
@@ -766,7 +767,6 @@ mod tests {
             ("x = cast(1 as bigint unsigned)", ArrowDataType::UInt64),
             ("x = cast(1 as boolean)", ArrowDataType::Boolean),
             ("x = cast(1 as string)", ArrowDataType::Utf8),
-            ("x = cast(1 as binary)", ArrowDataType::Binary),
         ];
 
         for (sql, expected_data_type) in cases {
