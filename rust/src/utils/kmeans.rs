@@ -354,7 +354,7 @@ impl KMeans {
         if n < k {
             return Err(Error::Index {
                 message: format!(
-                    "KMeans: number of data points ({}) is smaller than k ({})",
+                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
                     n, k
                 ),
             });
