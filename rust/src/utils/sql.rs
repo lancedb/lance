@@ -59,7 +59,7 @@ pub(crate) fn parse_sql_filter(filter: &str) -> Result<Expr> {
     let mut tokens = Vec::new();
     let mut token_iter = tokenizer.tokenize()?.into_iter();
     let mut prev_token = token_iter.next().unwrap();
-    while let Some(next_token) = token_iter.next() {
+    for next_token in token_iter {
         if let (Token::Eq, Token::Eq) = (&prev_token, &next_token) {
             continue; // skip second equals
         }

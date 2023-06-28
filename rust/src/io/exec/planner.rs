@@ -372,11 +372,18 @@ impl Planner {
         Ok(match expr {
             Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
-            Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
-                self.create_physical_expr(expr.left.as_ref())?,
-                expr.op,
-                self.create_physical_expr(expr.right.as_ref())?,
-            )),
+            Expr::BinaryExpr(expr) => {
+                let left = self.create_physical_expr(expr.left.as_ref())?;
+                let right = self.create_physical_expr(expr.right.as_ref())?;
+                let left_data_type = left.data_type(&self.schema)?;
+                // Make sure RHS matches the LHS
+                let right = if right.data_type(&self.schema)? != left_data_type {
+                    Arc::new(CastExpr::new(right, left_data_type, None))
+                } else {
+                    right
+                };
+                Arc::new(BinaryExpr::new(left, expr.op, right))
+            }
             Expr::Negative(expr) => {
                 Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
             }
@@ -876,7 +883,7 @@ mod tests {
             ),
             (
                 "timestamp_ns",
-                Arc::new(TimestampNanosecondArray::from_iter_values(0..10)),
+                Arc::new(TimestampNanosecondArray::from_iter_values(4995..5005)),
             ),
         ];
         let batch = RecordBatch::try_from_iter(batch).unwrap();
@@ -888,7 +895,7 @@ mod tests {
             "timestamp_s >= TIMESTAMP '1970-01-01 00:00:05'",
             "timestamp_ms >= TIMESTAMP '1970-01-01 00:00:00.005'",
             "timestamp_us >= TIMESTAMP '1970-01-01 00:00:00.000005'",
-            "timestamp_ns >= TIMESTAMP '1970-01-01 00:00:00.000000005'",
+            "timestamp_ns >= TIMESTAMP '1970-01-01 00:00:00.000005'",
         ];
 
         let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
