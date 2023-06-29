@@ -219,10 +219,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{Int32Array, StringArray, UInt32Array};
+    use arrow_array::{Int32Array, RecordBatchIterator, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
-
-    use crate::arrow::RecordBatchBuffer;
 
     #[tokio::test]
     async fn test_joiner_collect() {
@@ -231,7 +229,7 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
         ]));
 
-        let batch_buffer: RecordBatchBuffer = (0..5)
+        let batches: Vec<RecordBatch> = (0..5)
             .map(|v| {
                 let values = (v * 10..v * 10 + 10).collect::<Vec<_>>();
                 RecordBatch::try_new(
@@ -246,8 +244,11 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let mut batch_buffer: Box<dyn RecordBatchReader> = Box::new(batch_buffer);
-        let joiner = HashJoiner::try_new(&mut batch_buffer, "i").await.unwrap();
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
+        let joiner = HashJoiner::try_new(&mut batches, "i").await.unwrap();
 
         let indices = Arc::new(Int32Array::from_iter(&[
             Some(15),
@@ -286,17 +287,19 @@ mod tests {
         ]));
 
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
                 Arc::new(StringArray::from(vec!["a", "b"])),
             ],
         )
         .unwrap();
-        let mut batch_buffer: Box<dyn RecordBatchReader> =
-            Box::new(RecordBatchBuffer::from_iter(vec![batch]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![batch].into_iter().map(Ok),
+            schema.clone(),
+        ));
 
-        let joiner = HashJoiner::try_new(&mut batch_buffer, "i").await.unwrap();
+        let joiner = HashJoiner::try_new(&mut batches, "i").await.unwrap();
 
         // Wrong type: was Int32, passing UInt32.
         let indices = Arc::new(UInt32Array::from_iter(&[Some(15)]));

@@ -375,7 +375,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile;
 
@@ -392,23 +392,23 @@ mod tests {
             true,
         )]));
         let data = generate_random_array(n * dim);
-        let batches = RecordBatchBuffer::new(
-            vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(
-                    FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
-                )],
-            )
-            .unwrap()],
-            Some(schema.clone()),
-        );
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+            )],
+        )
+        .unwrap()];
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, uri, Some(write_params))
             .await
             .unwrap();

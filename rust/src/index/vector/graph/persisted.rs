@@ -335,11 +335,11 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{FixedSizeListArray, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatchIterator, RecordBatchReader};
 
     use super::*;
     use crate::{
-        arrow::{linalg::matrix::MatrixView, FixedSizeListArrayExt, RecordBatchBuffer},
+        arrow::{linalg::matrix::MatrixView, FixedSizeListArrayExt},
         dataset::WriteParams,
         index::vector::diskann::row_vertex::RowVertexSerDe,
         index::vector::MetricType,
@@ -406,23 +406,23 @@ mod tests {
             true,
         )]));
         let data = generate_random_array(total * dim);
-        let batches = RecordBatchBuffer::new(
-            vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(
-                    FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
-                )],
-            )
-            .unwrap()],
-            Some(schema.clone()),
-        );
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+            )],
+        )
+        .unwrap()];
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();

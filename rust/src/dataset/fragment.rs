@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
-use arrow_schema::SchemaRef;
 use futures::future::try_join_all;
 use futures::{join, TryFutureExt, TryStreamExt};
 use object_store::path::Path;
@@ -68,7 +67,6 @@ impl FileFragment {
     ) -> Result<Fragment> {
         let params = params.unwrap_or_default();
 
-        let arrow_schema: SchemaRef = reader.schema();
         let schema = Schema::try_from(reader.schema().as_ref())?;
         let (object_store, base_path) = ObjectStore::from_uri(dataset_uri).await?;
         let filename = format!("{}.lance", Uuid::new_v4());
@@ -77,20 +75,20 @@ impl FileFragment {
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
-        let mut buffer = RecordBatchBuffer::empty(Some(arrow_schema.clone()))?;
-
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut num_rows: usize = 0;
         for rst in reader {
-            let batch = rst?; // TODO: close writer on Error?
-            buffer.batches.push(batch);
-            if buffer.num_rows() >= params.max_rows_per_group {
-                let batches = buffer.finish()?;
+            let batch: RecordBatch = rst?; // TODO: close writer on Error?
+            batches.push(batch.clone());
+            num_rows += batch.num_rows();
+            if num_rows >= params.max_rows_per_group {
                 writer.write(&batches).await?;
-                buffer = RecordBatchBuffer::empty(Some(arrow_schema.clone()))?;
+                batches = Vec::new();
+                num_rows = 0;
             }
         }
 
-        if buffer.num_rows() > 0 {
-            let batches = buffer.finish()?;
+        if num_rows > 0 {
             writer.write(&batches).await?;
         };
 
@@ -531,7 +529,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
+    use crate::dataset::WriteParams;
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -539,31 +537,30 @@ mod tests {
             ArrowField::new("s", DataType::Utf8, true),
         ]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..10)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-            Some(schema.clone()),
-        );
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 2,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();

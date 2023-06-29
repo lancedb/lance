@@ -111,7 +111,7 @@ impl DiskANNParams {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile::tempdir;
 
@@ -142,14 +142,14 @@ mod tests {
 
         let float_arr = generate_random_array(512 * dimension as usize);
         let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches = RecordBatchBuffer::new(
-            vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()],
-            Some(schema.clone()),
-        );
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
         // Make sure valid arguments should create index successfully

@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance::{
@@ -41,30 +41,30 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
 
     let num_rows = 1_000_000;
     let batch_size = 10_000;
-    let batches = RecordBatchBuffer::new(
-        (0..(num_rows / batch_size) as i32)
-            .map(|_| {
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(
-                        FixedSizeListArray::try_new(
-                            generate_random_array(batch_size * dim),
-                            dim as i32,
-                        )
-                        .unwrap(),
-                    )],
-                )
-                .unwrap()
-            })
-            .collect(),
-        Some(schema.clone()),
-    );
+    let batches: Vec<RecordBatch> = (0..(num_rows / batch_size) as i32)
+        .map(|_| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    FixedSizeListArray::try_new(
+                        generate_random_array(batch_size * dim),
+                        dim as i32,
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect();
 
     let mut write_params = WriteParams::default();
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;
     write_params.mode = mode;
-    let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+    let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+        batches.into_iter().map(Ok),
+        schema.clone(),
+    ));
     Dataset::write(&mut reader, path.to_str().unwrap(), Some(write_params))
         .await
         .unwrap();
