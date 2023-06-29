@@ -376,7 +376,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         data_obj: Reader-like
             The data to be merged. Acceptable types are:
-            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, Iterator[RecordBatch], or RecordBatchReader
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, 
+            Iterator[RecordBatch], or RecordBatchReader
         left_on: str
             The name of the column in the dataset to join on.
         right_on: str or None
