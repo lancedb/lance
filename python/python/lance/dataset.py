@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
+from typing import get_args
 
 import numpy as np
 import pandas as pd
@@ -362,6 +363,7 @@ class LanceDataset(pa.dataset.Dataset):
         data_obj: ReaderLike,
         left_on: str,
         right_on: Optional[str] = None,
+        schema=None,
     ):
         """
         Merge another dataset into this one.
@@ -375,7 +377,7 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         data_obj: Reader-like
             The data to be merged. Acceptable types are:
-            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, Iterator[RecordBatch], or RecordBatchReader
         left_on: str
             The name of the column in the dataset to join on.
         right_on: str or None
@@ -405,7 +407,7 @@ class LanceDataset(pa.dataset.Dataset):
         if right_on is None:
             right_on = left_on
 
-        reader = _coerce_reader(data_obj)
+        reader = _coerce_reader(data_obj, schema)
 
         self._ds.merge(reader, left_on, right_on)
 
@@ -849,6 +851,7 @@ ReaderLike = Union[
     pa.Table,
     pa.dataset.Dataset,
     pa.dataset.Scanner,
+    Iterator[RecordBatch],
     pa.RecordBatchReader,
 ]
 
@@ -884,7 +887,7 @@ def write_dataset(
         The max number of rows before starting a new group (in the same file)
 
     """
-    reader = _coerce_reader(data_obj)
+    reader = _coerce_reader(data_obj, schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
@@ -909,6 +912,11 @@ def _coerce_reader(
         return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
     elif isinstance(data_obj, pa.dataset.Scanner):
         return data_obj.to_reader()
+    elif isinstance(data_obj, Iterator):
+        if schema != None:
+            return pa.RecordBatchReader.from_batches(schema, data_obj)
+        else:
+            raise ValueError("Must provide schema to write dataset from RecordBatch iterator")
     elif isinstance(data_obj, pa.RecordBatchReader):
         return data_obj
     else:
