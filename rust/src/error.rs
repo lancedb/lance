@@ -31,8 +31,6 @@ pub(crate) fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> Bo
 pub enum Error {
     #[snafu(display("Invalid user input: {source}"))]
     InvalidInput { source: BoxedError },
-    #[snafu(display("Attempt to write empty dataset without schema"))]
-    EmptyDatasetWithoutSchema,
     #[snafu(display("Dataset already exists: {uri}"))]
     DatasetAlreadyExists { uri: String },
     #[snafu(display("Append with different schema: original={original} new={new}"))]
