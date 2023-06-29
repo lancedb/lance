@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
-from typing import get_args
 
 import numpy as np
 import pandas as pd
