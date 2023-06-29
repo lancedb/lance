@@ -912,10 +912,12 @@ def _coerce_reader(
     elif isinstance(data_obj, pa.dataset.Scanner):
         return data_obj.to_reader()
     elif isinstance(data_obj, Iterator):
-        if schema != None:
+        if schema is not None:
             return pa.RecordBatchReader.from_batches(schema, data_obj)
         else:
-            raise ValueError("Must provide schema to write dataset from RecordBatch iterator")
+            raise ValueError(
+                "Must provide schema to write dataset from RecordBatch iterator"
+            )
     elif isinstance(data_obj, pa.RecordBatchReader):
         return data_obj
     else:
