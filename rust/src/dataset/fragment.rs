@@ -520,9 +520,7 @@ impl FragmentReader {
 mod tests {
 
     use arrow_arith::arithmetic::multiply_scalar;
-    use arrow_array::{
-        cast::AsArray, ArrayRef, Int32Array, RecordBatchIterator, RecordBatchReader, StringArray,
-    };
+    use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
@@ -557,11 +555,8 @@ mod tests {
             max_rows_per_group: 2,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema.clone(),
-        ));
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -807,9 +802,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut stream: Box<dyn RecordBatchReader> =
-            Box::new(RecordBatchIterator::new(vec![Ok(to_merge)], schema.clone()));
-        dataset.merge(&mut stream, "i", "i").await.unwrap();
+        let stream = RecordBatchIterator::new(vec![Ok(to_merge)], schema.clone());
+        dataset.merge(stream, "i", "i").await.unwrap();
         dataset.validate().await.unwrap();
 
         // Validate the resulting data

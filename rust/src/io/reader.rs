@@ -689,7 +689,7 @@ mod tests {
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
-        RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
+        StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
@@ -1154,11 +1154,9 @@ mod tests {
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            batches.clone().into_iter().map(Ok),
-            arrow_schema.clone(),
-        ));
-        Dataset::write(&mut batch_reader, test_uri, Some(WriteParams::default()))
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 

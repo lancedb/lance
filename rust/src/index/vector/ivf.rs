@@ -812,7 +812,7 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
-    use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader};
+    use arrow_array::{cast::AsArray, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -840,11 +840,8 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            vec![batch].into_iter().map(Ok),
-            schema.clone(),
-        ));
-        let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let centroids = generate_random_array(2 * DIM);
         let ivf_centroids = FixedSizeListArray::try_new(&centroids, DIM as i32).unwrap();

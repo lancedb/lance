@@ -422,9 +422,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::RecordBatchIterator;
-    use arrow_array::{
-        cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray,
-    };
+    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
@@ -480,11 +478,8 @@ mod tests {
         let vector_arr = batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema.clone(),
-        ));
-        Dataset::write(&mut reader, test_uri, Some(write_params))
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 

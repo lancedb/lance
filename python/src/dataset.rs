@@ -288,9 +288,8 @@ impl Dataset {
         left_on: &str,
         right_on: &str,
     ) -> PyResult<()> {
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(reader.0);
         let mut new_self = self.ds.as_ref().clone();
-        let fut = new_self.merge(&mut reader, left_on, right_on);
+        let fut = new_self.merge(reader.0, left_on, right_on);
         self.rt.block_on(
             async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
         )?;
@@ -509,7 +508,7 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
-        let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+        let batches: Box<dyn RecordBatchReader + Send> = if reader.is_instance_of::<Scanner>()? {
             let scanner: Scanner = reader.extract()?;
             Box::new(
                 scanner
@@ -521,7 +520,7 @@ pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bo
             Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
         };
 
-        LanceDataset::write(&mut batches, uri, params)
+        LanceDataset::write(batches, uri, params)
             .await
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(true)
