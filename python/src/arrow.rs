@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;
 use lance::arrow::bfloat16::BFloat16Array;
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyType};
+use pyo3::{exceptions::PyValueError, prelude::*, pyclass::CompareOp, types::PyType};
 
 #[pyclass]
 pub struct BFloat16(bf16);
@@ -38,8 +38,15 @@ impl BFloat16 {
         Ok(format!("{}", self.0))
     }
 
-    fn __eq__(&self, other: &Self) -> bool {
-        self.0 == other.0
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> bool {
+        match op {
+            CompareOp::Eq => self.0 == other.0,
+            CompareOp::Ge => self.0 >= other.0,
+            CompareOp::Le => self.0 <= other.0,
+            CompareOp::Gt => self.0 > other.0,
+            CompareOp::Lt => self.0 < other.0,
+            CompareOp::Ne => self.0 != other.0,
+        }
     }
 }
 
@@ -50,7 +57,7 @@ const EXPORT_METADATA: [(&str, &str); 2] = [
 
 #[pyfunction]
 pub fn bfloat16_array(values: Vec<Option<f32>>, py: Python<'_>) -> PyResult<PyObject> {
-    let array = BFloat16Array::from_iter(values.into_iter().map(|v| v.map(|v| bf16::from_f32(v))));
+    let array = BFloat16Array::from_iter(values.into_iter().map(|v| v.map(bf16::from_f32)));
 
     // Create a record batch with a single column and an annotated schema
     let field = Field::new("bfloat16", DataType::FixedSizeBinary(2), true).with_metadata(

@@ -132,9 +132,6 @@ impl FromIterator<Option<bf16>> for BFloat16Array {
             len += 1;
         }
 
-        dbg!(&buffer);
-        dbg!(&nulls);
-
         let null_buffer = nulls.finish();
         let num_valid = null_buffer.count_set_bits_offset(0, len);
         let null_buffer = if num_valid == len {

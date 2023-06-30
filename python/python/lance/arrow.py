@@ -14,7 +14,10 @@ class BFloat16Array(pa.ExtensionArray):
 
 class BFloat16Scalar(pa.ExtensionScalar):
     def as_py(self) -> BFloat16 | None:
-        BFloat16.from_bytes(self.value.as_py())
+        if self.value is None:
+            return None
+        else:
+            return BFloat16.from_bytes(self.value.as_py())
 
 
 class BFloat16Type(pa.ExtensionType):
@@ -40,3 +43,6 @@ class BFloat16Type(pa.ExtensionType):
         import pandas as pd
 
         return pd.PeriodDtype(freq=self.freq)
+
+
+pa.register_extension_type(BFloat16Type())
