@@ -16,17 +16,21 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
+use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::datatypes::Schema;
 use lance::format::pb;
 use lance::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance::io::deletion_file_path;
 use prost::Message;
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyBytes, PyDict};
+use std::fmt::Write as _;
+use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -46,8 +50,52 @@ impl FileFragment {
 
 #[pymethods]
 impl FileFragment {
-    fn __repr__(&self) -> String {
-        format!("LanceFileFragment(id={})", self.fragment.id())
+    fn __repr__(&self) -> PyResult<String> {
+        let mut s = String::new();
+        write!(
+            s,
+            "LanceFileFragment(id={}, data_files=[",
+            self.fragment.id()
+        )
+        .unwrap();
+        let file_path = self
+            .fragment
+            .metadata()
+            .files
+            .iter()
+            .map(|f| format!("'{}'", f.path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(s, "{}]", file_path).unwrap();
+        if let Some(deletion) = &self.fragment.metadata().deletion_file {
+            let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
+            write!(s, ", deletion_file='{}'", path).unwrap();
+        }
+        write!(s, ")").unwrap();
+        Ok(s)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (filename, schema, fragment_id))]
+    fn create_from_file(
+        filename: &str,
+        schema: PyArrowType<ArrowSchema>,
+        fragment_id: usize,
+    ) -> PyResult<FragmentMetadata> {
+        let rt = Runtime::new()?;
+        let arrow_schema = schema.0;
+        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })?;
+        let metadata = rt.block_on(async {
+            LanceFragment::create_from_file(filename, &schema, fragment_id)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))
+        })?;
+        Ok(FragmentMetadata::new(metadata, schema))
     }
 
     #[staticmethod]
@@ -90,6 +138,13 @@ impl FileFragment {
 
     fn id(&self) -> usize {
         self.fragment.id()
+    }
+
+    fn metadata(&self) -> FragmentMetadata {
+        FragmentMetadata::new(
+            self.fragment.metadata().clone(),
+            self.fragment.dataset().schema().clone(),
+        )
     }
 
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
@@ -161,6 +216,19 @@ impl FileFragment {
         Ok(Updater::new(inner))
     }
 
+    fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
+        let old_fragment = self.fragment.clone();
+        let rt = tokio::runtime::Runtime::new()?;
+        let updated_fragment = rt
+            .block_on(async { old_fragment.delete(predicate).await })
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        match updated_fragment {
+            Some(frag) => Ok(Some(FileFragment::new(frag))),
+            None => Ok(None),
+        }
+    }
+
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let schema = self_.fragment.dataset().schema();
         let arrow_schema: ArrowSchema = schema.into();
@@ -177,6 +245,12 @@ impl FileFragment {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+
+    fn deletion_file(&self) -> PyResult<Option<String>> {
+        let deletion = self.fragment.metadata().deletion_file.clone();
+        Ok(deletion
+            .map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
     }
 }
 
@@ -295,5 +369,13 @@ impl FragmentMetadata {
             .map(|f| DataFile::new(f.clone()))
             .collect();
         Ok(data_files)
+    }
+
+    fn deletion_file(&self) -> PyResult<Option<String>> {
+        let deletion = self.inner.deletion_file.clone();
+        Ok(
+            deletion
+                .map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()),
+        )
     }
 }

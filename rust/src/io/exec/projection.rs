@@ -23,7 +23,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::{ExecutionPlan, RecordBatchStream, SendableRecordBatchStream};
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -35,7 +35,7 @@ use crate::Result;
 pub struct ProjectionStream {
     rx: Receiver<DataFusionResult<RecordBatch>>,
 
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 
     projection: Arc<ArrowSchema>,
 }
@@ -79,7 +79,7 @@ impl ProjectionStream {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
             projection: schema,
         }
     }
@@ -89,7 +89,28 @@ impl Stream for ProjectionStream {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 

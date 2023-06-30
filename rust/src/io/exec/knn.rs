@@ -25,6 +25,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
+use futures::FutureExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -39,7 +40,7 @@ use crate::{Error, Result};
 pub struct KNNFlatStream {
     rx: Receiver<DataFusionResult<RecordBatch>>,
 
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 }
 
 impl KNNFlatStream {
@@ -76,7 +77,7 @@ impl KNNFlatStream {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
         }
     }
 }
@@ -85,7 +86,28 @@ impl Stream for KNNFlatStream {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 
@@ -214,7 +236,7 @@ impl ExecutionPlan for KNNFlatExec {
 pub struct KNNIndexStream {
     rx: Receiver<datafusion::error::Result<RecordBatch>>,
 
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 }
 
 impl KNNIndexStream {
@@ -257,7 +279,7 @@ impl KNNIndexStream {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
         }
     }
 }
@@ -275,7 +297,28 @@ impl Stream for KNNIndexStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 

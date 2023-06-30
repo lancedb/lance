@@ -71,6 +71,7 @@ impl Dataset {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             session: None,
+            store_options: None,
         };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
@@ -290,6 +291,16 @@ impl Dataset {
         let mut reader: Box<dyn RecordBatchReader> = Box::new(reader.0);
         let mut new_self = self.ds.as_ref().clone();
         let fut = new_self.merge(&mut reader, left_on, right_on);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn delete(&mut self, predicate: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.delete(&predicate);
         self.rt.block_on(
             async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
         )?;

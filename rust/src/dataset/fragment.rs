@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
-use futures::{StreamExt, TryStreamExt};
+use futures::future::try_join_all;
+use futures::{join, TryFutureExt, TryStreamExt};
+use object_store::path::Path;
 use uuid::Uuid;
 
 use super::hash_joiner::HashJoiner;
@@ -29,7 +31,7 @@ use crate::arrow::*;
 use crate::dataset::{Dataset, DATA_DIR};
 use crate::datatypes::Schema;
 use crate::format::Fragment;
-use crate::io::deletion::{read_deletion_file, write_deletion_file};
+use crate::io::deletion::{deletion_file_path, read_deletion_file, write_deletion_file};
 use crate::io::{FileReader, FileWriter, ObjectStore, ReadBatchParams};
 use crate::{Error, Result};
 
@@ -96,6 +98,15 @@ impl FileFragment {
         Ok(fragment)
     }
 
+    pub async fn create_from_file(
+        filename: &str,
+        schema: &Schema,
+        fragment_id: usize,
+    ) -> Result<Fragment> {
+        let fragment = Fragment::with_file(fragment_id as u64, filename, schema);
+        Ok(fragment)
+    }
+
     pub fn dataset(&self) -> &Dataset {
         self.dataset.as_ref()
     }
@@ -153,8 +164,27 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    ///
     pub async fn count_rows(&self) -> Result<usize> {
+        let total_rows = self.fragment_length();
+
+        let deletion_count = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default());
+
+        let (total_rows, deletion_count) =
+            futures::future::try_join(total_rows, deletion_count).await?;
+
+        Ok(total_rows - deletion_count)
+    }
+
+    /// Get the number of physical rows in the fragment. This includes deleted rows.
+    ///
+    /// If there are no deleted rows, this is equal to the number of rows in the
+    /// fragment.
+    pub async fn fragment_length(&self) -> Result<usize> {
         if self.metadata.files.is_empty() {
             return Err(Error::IO {
                 message: format!("Fragment {} does not contain any data", self.id()),
@@ -177,6 +207,70 @@ impl FileFragment {
         Ok(reader.len())
     }
 
+    /// Validate the fragment
+    ///
+    /// Verifies:
+    /// * All data files exist and have the same length
+    /// * Deletion file exists and has rowids in the correct range
+    pub async fn validate(&self) -> Result<()> {
+        let data_file_paths: Vec<Path> = self
+            .metadata
+            .files
+            .iter()
+            .map(|data_file| self.dataset.data_dir().child(data_file.path.as_str()))
+            .collect::<Vec<_>>();
+        let get_lengths = data_file_paths.iter().map(|path| {
+            let reader = FileReader::try_new_with_fragment(
+                &self.dataset.object_store,
+                path,
+                self.id() as u64,
+                None,
+            );
+            reader.map_ok(|r| r.len())
+        });
+        let get_lengths = try_join_all(get_lengths);
+
+        let deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        );
+
+        let (get_lengths, deletion_vector) = join!(get_lengths, deletion_vector);
+
+        let get_lengths = get_lengths?;
+        let expected_length = get_lengths.first().unwrap_or(&0);
+        for (length, path) in get_lengths.iter().zip(data_file_paths.into_iter()) {
+            if length != expected_length {
+                return Err(Error::corrupt_file(
+                    path,
+                    format!(
+                        "data file has incorrect length. Expected: {} Got: {}",
+                        expected_length, length
+                    ),
+                ));
+            }
+        }
+
+        if let Some(deletion_vector) = deletion_vector? {
+            for row_id in deletion_vector {
+                if row_id >= *expected_length as u32 {
+                    let deletion_file_meta = self.metadata.deletion_file.clone().unwrap();
+                    return Err(Error::corrupt_file(
+                        deletion_file_path(
+                            &self.dataset.base,
+                            self.metadata.id,
+                            &deletion_file_meta,
+                        ),
+                        format!("deletion vector contains row id that is out of range. Row id: {} Fragment length: {}", row_id, expected_length),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
         let reader = self.open(projection).await?;
@@ -196,41 +290,28 @@ impl FileFragment {
         if let Some(columns) = columns {
             schema = schema.project(columns)?;
         }
-        let reader = self.open(&schema).await?;
+        let reader = self.open(&schema);
+        let deletion_vector = read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        );
+        let (reader, deletion_vector) = join!(reader, deletion_vector);
+        let reader = reader?;
+        let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Ok(Updater::new(self.clone(), reader))
+        Ok(Updater::new(self.clone(), reader, deletion_vector))
     }
 
-    pub(crate) async fn merge(
-        mut self,
-        join_column: &str,
-        joiner: &HashJoiner,
-        full_schema: &Schema,
-    ) -> Result<Self> {
-        let mut scanner = self.scan();
-        scanner.project(&[join_column])?;
+    pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
+        let mut updater = self.updater(Some(&[join_column])).await?;
 
-        let mut batch_stream = scanner
-            .try_into_stream()
-            .await?
-            .and_then(|batch| joiner.collect(batch.column(0).clone()))
-            .boxed();
-
-        let file_schema = full_schema.project_by_schema(joiner.out_schema().as_ref())?;
-
-        let filename = format!("{}.lance", Uuid::new_v4());
-        let full_path = self.dataset.data_dir().child(filename.clone());
-        let mut writer =
-            FileWriter::try_new(&self.dataset.object_store, &full_path, file_schema.clone())
-                .await?;
-
-        while let Some(batch) = batch_stream.try_next().await? {
-            writer.write(&[batch]).await?;
+        while let Some(batch) = updater.next().await? {
+            let batch = joiner.collect(batch[join_column].clone()).await?;
+            updater.update(batch).await?;
         }
 
-        writer.finish().await?;
-
-        self.metadata.add_file(&filename, &file_schema);
+        self.metadata = updater.finish().await?;
 
         Ok(self)
     }
@@ -240,7 +321,7 @@ impl FileFragment {
     /// If all rows are deleted, returns `Ok(None)`. Otherwise, returns a new
     /// fragment with the updated deletion vector. This must be persisted to
     /// the manifest.
-    pub(crate) async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
+    pub async fn delete(mut self, predicate: &str) -> Result<Option<Self>> {
         // Load existing deletion vector
         let mut deletion_vector = read_deletion_file(
             &self.dataset.base,
@@ -249,6 +330,8 @@ impl FileFragment {
         )
         .await?
         .unwrap_or_default();
+
+        let starting_length = deletion_vector.len();
 
         // scan with predicate and row ids
         let mut scanner = self.scan();
@@ -275,16 +358,23 @@ impl FileFragment {
             })
             .await?;
 
+        // If we haven't deleted any additional rows, we can return the fragment as-is.
+        if deletion_vector.len() == starting_length {
+            return Ok(Some(self));
+        }
+
         // TODO: could we keep the number of rows in memory when we first get
         // the fragment metadata?
-        let num_rows = self.count_rows().await?;
-        if deletion_vector.len() == num_rows && deletion_vector.contains_range(0..num_rows as u32) {
+        let fragment_length = self.fragment_length().await?;
+        if deletion_vector.len() == fragment_length
+            && deletion_vector.contains_range(0..fragment_length as u32)
+        {
             return Ok(None);
-        } else if deletion_vector.len() >= num_rows {
+        } else if deletion_vector.len() >= fragment_length {
             let dv_len = deletion_vector.len();
             let examples: Vec<u32> = deletion_vector
                 .into_iter()
-                .filter(|x| *x >= num_rows as u32)
+                .filter(|x| *x >= fragment_length as u32)
                 .take(5)
                 .collect();
             return Err(Error::Internal {
@@ -292,7 +382,7 @@ impl FileFragment {
                     "Deletion vector includes rows that aren't in the fragment. \
                 Fragment length: {}; Deletion vector length: {}; \
                 Examples: {:?}",
-                    num_rows, dv_len, examples
+                    fragment_length, dv_len, examples
                 ),
             });
         }
@@ -430,8 +520,11 @@ impl FragmentReader {
 mod tests {
 
     use arrow_arith::arithmetic::multiply_scalar;
-    use arrow_array::{cast::AsArray, ArrayRef, Int32Array, RecordBatchReader, StringArray};
+    use arrow_array::{
+        cast::AsArray, ArrayRef, Int32Array, RecordBatchIterator, RecordBatchReader, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_select::concat::concat_batches;
     use futures::TryStreamExt;
     use tempfile::tempdir;
 
@@ -508,8 +601,12 @@ mod tests {
     async fn test_fragment_take() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
-        let fragment = &dataset.get_fragments()[3];
+        let mut dataset = create_dataset(test_uri).await;
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
 
         let batch = fragment
             .take(&[1, 2, 4, 5, 8], dataset.schema())
@@ -519,6 +616,61 @@ mod tests {
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 122, 124, 125, 128])
         );
+
+        dataset.delete("i in (122, 124)").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Cannot get rows 2 and 4 anymore
+        let fragment = dataset
+            .get_fragments()
+            .into_iter()
+            .find(|f| f.id() == 3)
+            .unwrap();
+        assert!(fragment.metadata().deletion_file.is_some());
+        let batch = fragment
+            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .await
+            .unwrap();
+        assert_eq!(
+            batch.column_by_name("i").unwrap().as_ref(),
+            &Int32Array::from(vec![121, 125, 128])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recommit_from_file() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let schema = dataset.schema();
+        let dataset_rows = dataset.count_rows().await.unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for f in dataset.get_fragments() {
+            for file in Fragment::from(f.clone()).files {
+                let p = file.path.clone();
+                paths.push(p);
+            }
+        }
+
+        let mut fragments: Vec<Fragment> = Vec::new();
+        for (idx, path) in paths.iter().enumerate() {
+            let f = FileFragment::create_from_file(path, schema, idx)
+                .await
+                .unwrap();
+            fragments.push(f)
+        }
+
+        let new_dataset = Dataset::commit(
+            test_uri,
+            schema,
+            &fragments,
+            crate::dataset::WriteMode::Create,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
 
     #[tokio::test]
@@ -526,70 +678,166 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
         let dataset = create_dataset(test_uri).await;
-        let fragment = &dataset.get_fragments()[3];
+        let fragment = dataset.get_fragments().pop().unwrap();
 
         assert_eq!(fragment.count_rows().await.unwrap(), 40);
+        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
+
+        let fragment = fragment
+            .delete("i >= 160 and i <= 172")
+            .await
+            .unwrap()
+            .unwrap();
+
+        fragment.validate().await.unwrap();
+
+        assert_eq!(fragment.count_rows().await.unwrap(), 27);
+        assert_eq!(fragment.fragment_length().await.unwrap(), 40);
     }
 
     #[tokio::test]
     async fn test_append_new_columns() {
+        for with_delete in [true, false] {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+            let mut dataset = create_dataset(test_uri).await;
+            dataset.validate().await.unwrap();
+            assert_eq!(dataset.count_rows().await.unwrap(), 200);
+
+            if with_delete {
+                dataset.delete("i >= 15 and i < 20").await.unwrap();
+                dataset.validate().await.unwrap();
+                assert_eq!(dataset.count_rows().await.unwrap(), 195);
+            }
+
+            let fragment = &mut dataset.get_fragment(0).unwrap();
+            let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
+            let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "double_i",
+                DataType::Int32,
+                true,
+            )]));
+            while let Some(batch) = updater.next().await.unwrap() {
+                let input_col = batch.column_by_name("i").unwrap();
+                let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
+                let batch = RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![Arc::new(result_col) as ArrayRef],
+                )
+                .unwrap();
+                updater.update(batch).await.unwrap();
+            }
+            let new_fragment = updater.finish().await.unwrap();
+
+            assert_eq!(new_fragment.files.len(), 2);
+
+            // Scan again
+            let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
+            let before_version = dataset.version().version;
+            let dataset = Dataset::commit(
+                test_uri,
+                &full_schema,
+                &[new_fragment],
+                crate::dataset::WriteMode::Create,
+            )
+            .await
+            .unwrap();
+
+            // We only kept the first fragment of 40 rows
+            assert_eq!(
+                dataset.count_rows().await.unwrap(),
+                if with_delete { 35 } else { 40 }
+            );
+            assert_eq!(dataset.version().version, before_version + 1);
+            dataset.validate().await.unwrap();
+            let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
+
+            let stream = dataset
+                .scan()
+                .project(&["i", "double_i"])
+                .unwrap()
+                .try_into_stream()
+                .await
+                .unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+            assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
+            let max_value_in_batch = if with_delete { 15 } else { 20 };
+            let expected_batch = RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![
+                    ArrowField::new("i", DataType::Int32, true),
+                    ArrowField::new("double_i", DataType::Int32, true),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..max_value_in_batch)),
+                    Arc::new(Int32Array::from_iter_values(
+                        (0..(2 * max_value_in_batch)).step_by(2),
+                    )),
+                ],
+            )
+            .unwrap();
+            assert_eq!(batches[0], expected_batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_fragment() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let dataset = create_dataset(test_uri).await;
+        let mut dataset = create_dataset(test_uri).await;
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 200);
 
-        let fragment = &mut dataset.get_fragments()[0];
-        let mut updater = fragment.updater(Some(&["i"])).await.unwrap();
-        let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "double_i",
-            DataType::Int32,
-            true,
-        )]));
-        while let Some(batch) = updater.next().await.unwrap() {
-            let input_col = batch.column_by_name("i").unwrap();
-            let result_col: Int32Array = multiply_scalar(input_col.as_primitive(), 2).unwrap();
-            let batch =
-                RecordBatch::try_new(new_schema.clone(), vec![Arc::new(result_col) as ArrayRef])
-                    .unwrap();
-            updater.update(batch).await.unwrap();
-        }
-        let new_fragment = updater.finish().await.unwrap();
+        let deleted_range = 15..20;
+        dataset.delete("i >= 15 and i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
+        assert_eq!(dataset.count_rows().await.unwrap(), 195);
 
-        assert_eq!(new_fragment.files.len(), 2);
-
-        // Scan again
-        let full_schema = dataset.schema().merge(new_schema.as_ref()).unwrap();
-        let dataset = Dataset::commit(
-            test_uri,
-            &full_schema,
-            &[new_fragment],
-            crate::dataset::WriteMode::Create,
+        // Create data to merge: merge in double the data
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int32, true),
+            ArrowField::new("double_i", DataType::Int32, true),
+        ]));
+        let to_merge = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..200)),
+                Arc::new(Int32Array::from_iter_values((0..400).step_by(2))),
+            ],
         )
-        .await
         .unwrap();
-        assert_eq!(dataset.version().version, 2);
-        let new_projection = full_schema.project(&["i", "double_i"]).unwrap();
 
-        let stream = dataset
+        let mut stream: Box<dyn RecordBatchReader> =
+            Box::new(RecordBatchIterator::new(vec![Ok(to_merge)], schema.clone()));
+        dataset.merge(&mut stream, "i", "i").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Validate the resulting data
+        let batches = dataset
             .scan()
             .project(&["i", "double_i"])
             .unwrap()
             .try_into_stream()
             .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
             .unwrap();
-        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
 
-        assert_eq!(batches[0].schema().as_ref(), &(&new_projection).into());
-        let expected_batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("i", DataType::Int32, true),
-                ArrowField::new("double_i", DataType::Int32, true),
-            ])),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..20)),
-                Arc::new(Int32Array::from_iter_values((0..40).step_by(2))),
-            ],
-        )
-        .unwrap();
-        assert_eq!(batches[0], expected_batch);
+        let mut row_id: i32 = 0;
+        let mut i: usize = 0;
+        let array_i: &Int32Array = as_primitive_array(&batch["i"]);
+        let array_double_i: &Int32Array = as_primitive_array(&batch["double_i"]);
+        while row_id < 200 {
+            if deleted_range.contains(&row_id) {
+                row_id += 1;
+                continue;
+            }
+            assert_eq!(array_i.value(i), row_id);
+            assert_eq!(array_double_i.value(i), 2 * row_id);
+            row_id += 1;
+            i += 1;
+        }
     }
 }

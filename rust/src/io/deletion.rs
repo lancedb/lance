@@ -43,6 +43,14 @@ impl DeletionVector {
         }
     }
 
+    pub fn contains(&self, i: u32) -> bool {
+        match self {
+            Self::NoDeletions => false,
+            Self::Set(set) => set.contains(&i),
+            Self::Bitmap(bitmap) => bitmap.contains(i),
+        }
+    }
+
     pub fn contains_range(&self, mut range: Range<u32>) -> bool {
         match self {
             Self::NoDeletions => range.is_empty(),
@@ -170,13 +178,13 @@ fn deletion_arrow_schema() -> Arc<Schema> {
 }
 
 /// Get the file path for a deletion file. This is relative to the dataset root.
-fn deletion_file_path(
-    base: &Path,
-    fragment_id: u64,
-    read_version: u64,
-    id: u64,
-    suffix: &str,
-) -> Path {
+pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &DeletionFile) -> Path {
+    let DeletionFile {
+        read_version,
+        id,
+        file_type,
+    } = deletion_file;
+    let suffix = file_type.suffix();
     base.child(DELETION_DIRS)
         .child(format!("{fragment_id}-{read_version}-{id}.{suffix}"))
 }
@@ -185,7 +193,6 @@ fn deletion_file_path(
 ///
 /// Returns the deletion file if one was written. If no deletions were present,
 /// returns `Ok(None)`.
-#[allow(dead_code)] // TODO: remove once used
 pub async fn write_deletion_file(
     base: &Path,
     fragment_id: u64,
@@ -197,7 +204,12 @@ pub async fn write_deletion_file(
         DeletionVector::NoDeletions => Ok(None),
         DeletionVector::Set(set) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(base, fragment_id, read_version, id, "arrow");
+            let deletion_file = DeletionFile {
+                read_version,
+                id,
+                file_type: DeletionFileType::Array,
+            };
+            let path = deletion_file_path(base, fragment_id, &deletion_file);
 
             let array = UInt32Array::from_iter(set.iter().copied());
             let array = Arc::new(array);
@@ -221,26 +233,23 @@ pub async fn write_deletion_file(
 
             object_store.inner.put(&path, out.into()).await?;
 
-            Ok(Some(DeletionFile {
-                read_version,
-                id,
-                file_type: DeletionFileType::Array,
-            }))
+            Ok(Some(deletion_file))
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::thread_rng().gen::<u64>();
-            let path = deletion_file_path(base, fragment_id, read_version, id, "bin");
+            let deletion_file = DeletionFile {
+                read_version,
+                id,
+                file_type: DeletionFileType::Bitmap,
+            };
+            let path = deletion_file_path(base, fragment_id, &deletion_file);
 
             let mut out: Vec<u8> = Vec::new();
             bitmap.serialize_into(&mut out)?;
 
             object_store.inner.put(&path, out.into()).await?;
 
-            Ok(Some(DeletionFile {
-                read_version,
-                id,
-                file_type: DeletionFileType::Bitmap,
-            }))
+            Ok(Some(deletion_file))
         }
     }
 }
@@ -250,7 +259,6 @@ pub async fn write_deletion_file(
 /// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
 ///
 /// Will return an error if the file is present but invalid.
-#[allow(dead_code)] // TODO: remove once used
 pub async fn read_deletion_file(
     base: &Path,
     fragment: &Fragment,
@@ -264,13 +272,7 @@ pub async fn read_deletion_file(
 
     match deletion_file.file_type {
         DeletionFileType::Array => {
-            let path = deletion_file_path(
-                base,
-                fragment.id,
-                deletion_file.read_version,
-                deletion_file.id,
-                "arrow",
-            );
+            let path = deletion_file_path(base, fragment.id, deletion_file);
 
             let data = object_store.inner.get(&path).await?.bytes().await?;
             let data = std::io::Cursor::new(data);
@@ -321,13 +323,7 @@ pub async fn read_deletion_file(
             Ok(Some(DeletionVector::Set(set)))
         }
         DeletionFileType::Bitmap => {
-            let path = deletion_file_path(
-                base,
-                fragment.id,
-                deletion_file.read_version,
-                deletion_file.id,
-                "bin",
-            );
+            let path = deletion_file_path(base, fragment.id, deletion_file);
 
             let data = object_store.inner.get(&path).await?.bytes().await?;
             let reader = data.reader();
@@ -464,7 +460,8 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(&path, fragment_id, read_version, file.id, "arrow");
+        assert_eq!(file.read_version, read_version);
+        let path = deletion_file_path(&path, fragment_id, &file);
         assert_eq!(
             path,
             Path::from(format!("/write/_deletions/21-12-{}.arrow", file.id))
@@ -517,7 +514,8 @@ mod test {
         ));
 
         let file = file.unwrap();
-        let path = deletion_file_path(&path, fragment_id, read_version, file.id, "bin");
+        assert_eq!(file.read_version, read_version);
+        let path = deletion_file_path(&path, fragment_id, &file);
         assert_eq!(
             path,
             Path::from(format!("/bitmap/_deletions/21-12-{}.bin", file.id))
