@@ -1,7 +1,8 @@
 import re
 
-from lance.arrow import BFloat16, BFloat16Array, bfloat16_array
+import pyarrow as pa
 
+from lance.arrow import BFloat16, BFloat16Array, bfloat16_array
 
 def test_bf16_value():
     val = BFloat16(1.124565)
@@ -42,3 +43,18 @@ def test_bf16_repr():
     expected_re = r"""<lance.arrow.BFloat16Array object at 0x[\w\d]+>
 \[1.1015625, None, 3.40625\]"""
     assert re.match(expected_re, repr(arr))
+
+    # TODO: make an issue about the pretty printing not handle extension arrays.
+#     tab = pa.table({"x": arr})
+#     expected_re = r"""pyarrow.Table
+# x: extension<lance.bfloat16<BFloat16Type>>
+# ---
+# x: \[\[1.1015625, None, 3.40625\]\]"""
+#     assert re.match(expected_re, repr(tab))
+
+
+# def test_bf16_pandas():
+#     data = [1.1, None, 3.4]
+#     arr = bfloat16_array(data)
+
+    

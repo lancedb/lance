@@ -244,6 +244,11 @@ impl Field {
                 DataType::Dictionary(other_key, other_value),
             ) if self_key == other_key && self_value == other_value => Ok(self.clone()),
             (DataType::Null, DataType::Null) => Ok(self.clone()),
+            (DataType::FixedSizeBinary(self_width), DataType::FixedSizeBinary(other_width))
+                if self_width == other_width =>
+            {
+                Ok(self.clone())
+            }
             _ => Err(Error::Schema {
                 message: format!(
                     "Attempt to project incompatible fields: {} and {}",
