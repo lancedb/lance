@@ -41,7 +41,6 @@ mod write;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
-// use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
