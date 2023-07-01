@@ -119,7 +119,11 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(
-                    FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128).unwrap(),
+                    FixedSizeListArray::try_new_from_values(
+                        create_float32_array(num_rows * 128),
+                        128,
+                    )
+                    .unwrap(),
                 )],
             )
             .unwrap()

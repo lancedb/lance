@@ -220,8 +220,8 @@ mod tests {
         let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
-                Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
+                Arc::new(FixedSizeListArray::try_new_from_values(&data, DIM).unwrap()),
+                Arc::new(FixedSizeListArray::try_new_from_values(&data, DIM).unwrap()),
             ],
         )
         .unwrap()];

@@ -1004,6 +1004,11 @@ mod tests {
     use futures::stream::TryStreamExt;
     use tempfile::tempdir;
 
+    // Used to validate that futures returned are Send.
+    fn require_send<T: Send>(t: T) -> T {
+        t
+    }
+
     async fn create_file(path: &std::path::Path, mode: WriteMode) {
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
@@ -1171,7 +1176,9 @@ mod tests {
         .unwrap()];
 
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let write_fut = Dataset::write(batches, test_uri, None);
+        let write_fut = require_send(write_fut);
+        let mut dataset = write_fut.await.unwrap();
 
         // Check it has no flags
         let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
@@ -1570,7 +1577,7 @@ mod tests {
 
         let float_arr = generate_random_array(512 * dimension as usize);
         let vectors = Arc::new(
-            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
                 float_arr, dimension,
             )
             .unwrap(),

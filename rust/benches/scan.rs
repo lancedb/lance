@@ -99,7 +99,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
                             .collect::<Vec<_>>(),
                     )),
                     Arc::new(
-                        FixedSizeListArray::try_new(
+                        FixedSizeListArray::try_new_from_values(
                             Float32Array::from_iter_values(
                                 (i * batch_size..(i + 2) * batch_size)
                                     .map(|x| (batch_size + (x - batch_size) / 2) as f32),

@@ -861,7 +861,7 @@ mod test {
         let batches: Vec<RecordBatch> = (0..5)
             .map(|i| {
                 let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
-                let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+                let vectors = FixedSizeListArray::try_new_from_values(&vector_values, 32).unwrap();
                 RecordBatch::try_new(
                     schema.clone(),
                     vec![
@@ -962,7 +962,7 @@ mod test {
         // (0, 0, ...), (1, 1, ...), (2, 2, ...)
         let vector_values: Float32Array =
             (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
-        let new_vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+        let new_vectors = FixedSizeListArray::try_new_from_values(&vector_values, 32).unwrap();
         let new_data: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
             Arc::new(StringArray::from_iter_values(
@@ -1739,7 +1739,7 @@ mod test {
 
             // vectors are [0, 0, 0, ...] [1, 1, 1, ...]
             let vector_values: Float32Array = (0..32 * 512).map(|v| (v / 32) as f32).collect();
-            let vectors = FixedSizeListArray::try_new(&vector_values, 32).unwrap();
+            let vectors = FixedSizeListArray::try_new_from_values(&vector_values, 32).unwrap();
 
             let batches = vec![RecordBatch::try_new(
                 schema.clone(),

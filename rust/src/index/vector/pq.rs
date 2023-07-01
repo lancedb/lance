@@ -471,7 +471,7 @@ impl ProductQuantizer {
         })
         .await??;
 
-        FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
+        FixedSizeListArray::try_new_from_values(values, self.num_sub_vectors as i32)
     }
 
     /// Train [`ProductQuantizer`] using vectors.
@@ -620,8 +620,9 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
             builder.append_slice(&row[start..start + sub_vector_length]);
         }
         let values = builder.finish();
-        let sub_array =
-            Arc::new(FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap());
+        let sub_array = Arc::new(
+            FixedSizeListArray::try_new_from_values(values, sub_vector_length as i32).unwrap(),
+        );
         subarrays.push(sub_array);
     }
     subarrays

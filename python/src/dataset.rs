@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
@@ -508,22 +508,23 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
-        let batches: Box<dyn RecordBatchReader + Send> = if reader.is_instance_of::<Scanner>()? {
+        if reader.is_instance_of::<Scanner>() {
             let scanner: Scanner = reader.extract()?;
-            Box::new(
-                scanner
-                    .to_reader()
-                    .await
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            )
+            let batches = scanner
+                .to_reader()
+                .await
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
         } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-        };
-
-        LanceDataset::write(batches, uri, params)
-            .await
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
+        }
     })
 }
 

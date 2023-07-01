@@ -46,7 +46,7 @@ async fn create_dataset(path: &std::path::Path, dim: usize, mode: WriteMode) {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(
-                    FixedSizeListArray::try_new(
+                    FixedSizeListArray::try_new_from_values(
                         generate_random_array(batch_size * dim),
                         dim as i32,
                     )

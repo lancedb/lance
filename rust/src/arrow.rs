@@ -189,7 +189,7 @@ pub trait FixedSizeListArrayExt {
     /// use lance::arrow::FixedSizeListArrayExt;
     ///
     /// let int_values = Int64Array::from_iter(0..10);
-    /// let fixed_size_list_arr = FixedSizeListArray::try_new(int_values, 2).unwrap();
+    /// let fixed_size_list_arr = FixedSizeListArray::try_new_from_values(int_values, 2).unwrap();
     /// assert_eq!(fixed_size_list_arr,
     ///     FixedSizeListArray::from_iter_primitive::<Int64Type, _, _>(vec![
     ///         Some(vec![Some(0), Some(1)]),
@@ -199,11 +199,11 @@ pub trait FixedSizeListArrayExt {
     ///         Some(vec![Some(8), Some(9)])
     /// ], 2))
     /// ```
-    fn try_new<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
+    fn try_new_from_values<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
-    fn try_new<T: Array>(values: T, list_size: i32) -> Result<Self> {
+    fn try_new_from_values<T: Array>(values: T, list_size: i32) -> Result<Self> {
         let list_type = DataType::FixedSizeList(
             Arc::new(Field::new("item", values.data_type().clone(), true)),
             list_size,
@@ -232,7 +232,7 @@ pub trait FixedSizeBinaryArrayExt {
     /// use lance::arrow::FixedSizeBinaryArrayExt;
     ///
     /// let int_values = UInt8Array::from_iter(0..10);
-    /// let fixed_size_list_arr = FixedSizeBinaryArray::try_new(&int_values, 2).unwrap();
+    /// let fixed_size_list_arr = FixedSizeBinaryArray::try_new_from_values(&int_values, 2).unwrap();
     /// assert_eq!(fixed_size_list_arr,
     ///     FixedSizeBinaryArray::from(vec![
     ///         Some(vec![0, 1].as_slice()),
@@ -242,11 +242,11 @@ pub trait FixedSizeBinaryArrayExt {
     ///         Some(vec![8, 9].as_slice())
     /// ]))
     /// ```
-    fn try_new(values: &UInt8Array, stride: i32) -> Result<FixedSizeBinaryArray>;
+    fn try_new_from_values(values: &UInt8Array, stride: i32) -> Result<FixedSizeBinaryArray>;
 }
 
 impl FixedSizeBinaryArrayExt for FixedSizeBinaryArray {
-    fn try_new(values: &UInt8Array, stride: i32) -> Result<Self> {
+    fn try_new_from_values(values: &UInt8Array, stride: i32) -> Result<Self> {
         let data_type = DataType::FixedSizeBinary(stride);
         let data = ArrayDataBuilder::new(data_type)
             .len(values.len() / stride as usize)

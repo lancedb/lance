@@ -141,7 +141,8 @@ mod tests {
         )]));
 
         let float_arr = generate_random_array(512 * dimension as usize);
-        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
+        let vectors =
+            Arc::new(FixedSizeListArray::try_new_from_values(float_arr, dimension).unwrap());
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
