@@ -421,6 +421,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use arrow_array::RecordBatchIterator;
     use arrow_array::{
         cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray,
     };
@@ -449,26 +450,24 @@ mod tests {
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(
-                                FixedSizeListArray::try_new(generate_random_array(128 * 20), 128)
-                                    .unwrap(),
-                            ),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(
+                            FixedSizeListArray::try_new(generate_random_array(128 * 20), 128)
+                                .unwrap(),
+                        ),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -478,10 +477,13 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
+        let vector_arr = batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();

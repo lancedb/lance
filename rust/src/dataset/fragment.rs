@@ -75,26 +75,35 @@ impl FileFragment {
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
 
         let mut writer = FileWriter::try_new(&object_store, &full_path, schema.clone()).await?;
-        let mut buffer = RecordBatchBuffer::empty();
-
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut num_rows: usize = 0;
         for rst in reader {
-            let batch = rst?; // TODO: close writer on Error?
-            buffer.batches.push(batch);
-            if buffer.num_rows() >= params.max_rows_per_group {
-                let batches = buffer.finish()?;
+            let batch: RecordBatch = rst?; // TODO: close writer on Error?
+            batches.push(batch.clone());
+            num_rows += batch.num_rows();
+            if num_rows >= params.max_rows_per_group {
                 writer.write(&batches).await?;
-                buffer = RecordBatchBuffer::empty();
+                batches = Vec::new();
+                num_rows = 0;
             }
         }
 
-        if buffer.num_rows() > 0 {
-            let batches = buffer.finish()?;
+        if num_rows > 0 {
             writer.write(&batches).await?;
         };
 
         // Params.max_rows_per_file is ignored in this case.
         writer.finish().await?;
 
+        Ok(fragment)
+    }
+
+    pub async fn create_from_file(
+        filename: &str,
+        schema: &Schema,
+        fragment_id: usize,
+    ) -> Result<Fragment> {
+        let fragment = Fragment::with_file(fragment_id as u64, filename, schema);
         Ok(fragment)
     }
 
@@ -520,7 +529,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{arrow::RecordBatchBuffer, dataset::WriteParams};
+    use crate::dataset::WriteParams;
 
     async fn create_dataset(test_uri: &str) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -528,30 +537,30 @@ mod tests {
             ArrowField::new("s", DataType::Utf8, true),
         ]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..10)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..10)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|v| format!("s-{}", v)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 2,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -626,6 +635,42 @@ mod tests {
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])
         );
+    }
+
+    #[tokio::test]
+    async fn test_recommit_from_file() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri).await;
+        let schema = dataset.schema();
+        let dataset_rows = dataset.count_rows().await.unwrap();
+
+        let mut paths: Vec<String> = Vec::new();
+        for f in dataset.get_fragments() {
+            for file in Fragment::from(f.clone()).files {
+                let p = file.path.clone();
+                paths.push(p);
+            }
+        }
+
+        let mut fragments: Vec<Fragment> = Vec::new();
+        for (idx, path) in paths.iter().enumerate() {
+            let f = FileFragment::create_from_file(path, schema, idx)
+                .await
+                .unwrap();
+            fragments.push(f)
+        }
+
+        let new_dataset = Dataset::commit(
+            test_uri,
+            schema,
+            &fragments,
+            crate::dataset::WriteMode::Create,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_dataset.count_rows().await.unwrap(), dataset_rows);
     }
 
     #[tokio::test]
@@ -779,7 +824,6 @@ mod tests {
             .await
             .unwrap();
         let batch = concat_batches(&schema, &batches).unwrap();
-        dbg!(&batch);
 
         let mut row_id: i32 = 0;
         let mut i: usize = 0;
@@ -788,7 +832,6 @@ mod tests {
         while row_id < 200 {
             if deleted_range.contains(&row_id) {
                 row_id += 1;
-                // dbg!(i);
                 continue;
             }
             assert_eq!(array_i.value(i), row_id);

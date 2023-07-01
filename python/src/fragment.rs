@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::PyArrowConvert;
+use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
@@ -29,6 +30,7 @@ use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyBytes, PyDict};
 use std::fmt::Write as _;
+use tokio::runtime::Runtime;
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
@@ -71,6 +73,29 @@ impl FileFragment {
         }
         write!(s, ")").unwrap();
         Ok(s)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (filename, schema, fragment_id))]
+    fn create_from_file(
+        filename: &str,
+        schema: PyArrowType<ArrowSchema>,
+        fragment_id: usize,
+    ) -> PyResult<FragmentMetadata> {
+        let rt = Runtime::new()?;
+        let arrow_schema = schema.0;
+        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
+            PyValueError::new_err(format!(
+                "Failed to convert Arrow schema to Lance schema: {}",
+                e
+            ))
+        })?;
+        let metadata = rt.block_on(async {
+            LanceFragment::create_from_file(filename, &schema, fragment_id)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))
+        })?;
+        Ok(FragmentMetadata::new(metadata, schema))
     }
 
     #[staticmethod]

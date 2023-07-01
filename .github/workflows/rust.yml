@@ -17,6 +17,9 @@ env:
   # "1" means line tables only, which is useful for panic tracebacks.
   RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
+  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
+  # CI builds are faster with incremental disabled.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
@@ -36,12 +39,33 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run cargo fmt
         run: cargo fmt --check
-      - name: Run clippy
-        run: cargo clippy --all-features --tests -- -D warnings
-      - name: Run tests
+      # split everything us so we know what's slow.
+      - name: Build
         run: |
           cargo build --all-features
+      - name: Build test
+        run: |
+          cargo test --all-features --no-run
+      - name: Run tests
+        run: |
           cargo test --all-features
+  clippy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Run clippy
+        run: cargo clippy --all-features --tests -- -D warnings
   mac-build:
     runs-on: macos-12
     timeout-minutes: 30
