@@ -455,8 +455,11 @@ mod tests {
                     vec![
                         Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
                         Arc::new(
-                            FixedSizeListArray::try_new_from_values(generate_random_array(128 * 20), 128)
-                                .unwrap(),
+                            FixedSizeListArray::try_new_from_values(
+                                generate_random_array(128 * 20),
+                                128,
+                            )
+                            .unwrap(),
                         ),
                         Arc::new(StringArray::from_iter_values(
                             (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
