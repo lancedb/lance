@@ -109,8 +109,8 @@ mod x86_64 {
                 let mut xy = _mm256_setzero_ps();
                 let mut y_sq = _mm256_setzero_ps();
                 for i in (0..len).step_by(8) {
-                    let x = _mm256_load_ps(x_vector.as_ptr().add(i));
-                    let y = _mm256_load_ps(y_vector.as_ptr().add(i));
+                    let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
+                    let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
                     xy = _mm256_fmadd_ps(x, y, xy);
                     y_sq = _mm256_fmadd_ps(y, y, y_sq);
                 }
