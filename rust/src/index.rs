@@ -195,7 +195,7 @@ impl DatasetIndexExt for Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -217,18 +217,21 @@ mod tests {
             ),
         ]));
         let data = generate_random_array(2048 * DIM as usize);
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
                 Arc::new(FixedSizeListArray::try_new(&data, DIM).unwrap()),
             ],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);

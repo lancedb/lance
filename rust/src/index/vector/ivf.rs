@@ -812,7 +812,7 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
-    use arrow_array::cast::AsArray;
+    use arrow_array::{cast::AsArray, RecordBatchIterator, RecordBatchReader};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -835,13 +835,15 @@ mod tests {
             true,
         )]));
         let array = Arc::new(FixedSizeListArray::try_new(&vectors, DIM as i32).unwrap());
-        let batch = RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut batches: Box<dyn arrow_array::RecordBatchReader> =
-            Box::new(RecordBatchBuffer::new(vec![batch]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![batch].into_iter().map(Ok),
+            schema.clone(),
+        ));
         let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
         let centroids = generate_random_array(2 * DIM);

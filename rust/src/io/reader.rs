@@ -683,6 +683,7 @@ mod tests {
     use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::types::Int32Type;
+    use arrow_array::RecordBatchIterator;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
@@ -1153,8 +1154,10 @@ mod tests {
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let batch_buffer = crate::arrow::RecordBatchBuffer::new(batches.clone());
-        let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(batch_buffer);
+        let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.clone().into_iter().map(Ok),
+            arrow_schema.clone(),
+        ));
         Dataset::write(&mut batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();

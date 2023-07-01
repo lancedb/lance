@@ -41,7 +41,6 @@ mod write;
 use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
-use crate::arrow::*;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
@@ -305,20 +304,16 @@ impl Dataset {
         let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        // Read schema for the input batches
+        let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
         let mut peekable = batches.peekable();
-        let mut schema: Schema;
         if let Some(batch) = peekable.peek() {
             if let Ok(b) = batch {
-                schema = Schema::try_from(b.schema().as_ref())?;
                 schema.set_dictionary(b)?;
-                schema.validate()?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
-        } else {
-            return Err(Error::EmptyDataset);
         }
+        schema.validate()?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -399,11 +394,13 @@ impl Dataset {
         };
 
         let mut writer = None;
-        let mut buffer = RecordBatchBuffer::empty();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut num_rows: usize = 0;
         for batch_result in peekable {
-            let batch = batch_result?;
-            buffer.batches.push(batch);
-            if buffer.num_rows() >= params.max_rows_per_group {
+            let batch: RecordBatch = batch_result?;
+            batches.push(batch.clone());
+            num_rows += batch.num_rows();
+            if num_rows >= params.max_rows_per_group {
                 // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
                     writer = {
@@ -415,9 +412,9 @@ impl Dataset {
                     }
                 };
 
-                let batches = buffer.finish()?;
                 writer.as_mut().unwrap().write(&batches).await?;
-                buffer = RecordBatchBuffer::empty();
+                batches = Vec::new();
+                num_rows = 0;
             }
             if let Some(w) = writer.as_mut() {
                 if w.len() >= params.max_rows_per_file {
@@ -426,7 +423,7 @@ impl Dataset {
                 }
             }
         }
-        if buffer.num_rows() > 0 {
+        if num_rows > 0 {
             if writer.is_none() {
                 writer = {
                     let file_path = format!("{}.lance", Uuid::new_v4());
@@ -435,7 +432,6 @@ impl Dataset {
                     Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                 }
             };
-            let batches = buffer.finish()?;
             writer.as_mut().unwrap().write(&batches).await?;
         }
         if let Some(w) = writer.as_mut() {
@@ -966,8 +962,10 @@ async fn write_manifest_file_to_path(
 mod tests {
     use std::collections::HashSet;
     use std::ops::Range;
+    use std::vec;
 
     use super::*;
+    use crate::arrow::FixedSizeListArrayExt;
     use crate::index::vector::MetricType;
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
@@ -977,9 +975,9 @@ mod tests {
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
-        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+        DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
-    use arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float32Array, RecordBatchIterator, UInt32Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -996,27 +994,25 @@ mod tests {
             ),
         ]));
         let dict_values = StringArray::from_iter_values(["a", "b", "c", "d", "e"]);
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(
-                                DictionaryArray::try_new(
-                                    UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
-                                    Arc::new(dict_values.clone()),
-                                )
-                                .unwrap(),
-                            ),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
-        let expected_batches = batches.batches.clone();
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(
+                            DictionaryArray::try_new(
+                                UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                Arc::new(dict_values.clone()),
+                            )
+                            .unwrap(),
+                        ),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let expected_batches = batches.clone();
 
         let test_uri = path.to_str().unwrap();
         let write_params = WriteParams {
@@ -1024,7 +1020,10 @@ mod tests {
             max_rows_per_group: 10,
             mode,
         };
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1074,12 +1073,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_empty_dataset() {
+    async fn test_create_and_fill_empty_dataset() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::empty());
-        let result = Dataset::write(&mut reader, test_uri, None).await;
-        assert!(matches!(result.unwrap_err(), Error::EmptyDataset { .. }));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![].into_iter().map(Ok),
+            schema.clone(),
+        ));
+        // check schema of reader and original is same
+        assert_eq!(schema.as_ref(), reader.schema().as_ref());
+        let result = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        // check dataset empty
+        assert_eq!(result.count_rows().await.unwrap(), 0);
+
+        // append rows to dataset
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap()];
+        write_params.mode = WriteMode::Append;
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
+        Dataset::write(&mut batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+
+        // get actual dataset
+        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        // confirm schema is same
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
+        assert_eq!(&actual_schema, schema.as_ref());
+        // check num rows is 10
+        assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        // check expected batch is correct
+        let actual_batches = actual_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        // sort
+        let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
+        let idx_arr = actual_batch.column_by_name("i").unwrap();
+        let sorted_indices = sort_to_indices(idx_arr, None, None).unwrap();
+        let struct_arr: StructArray = actual_batch.into();
+        let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
+        let expected_struct_arr: StructArray = expected_batch.into();
+        assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
     }
 
     #[tokio::test]
@@ -1092,12 +1153,16 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        .unwrap()];
+
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
         // Check it has no flags
@@ -1146,12 +1211,15 @@ mod tests {
         assert!(matches!(read_result, Err(Error::NotSupported { .. })));
 
         // Check it rejects writing to it.
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        .unwrap()];
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let write_result = Dataset::write(
             &mut batches,
             test_uri,
@@ -1174,11 +1242,11 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
         let mut write_params = WriteParams {
@@ -1186,18 +1254,24 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(20..40))],
         )
-        .unwrap()]);
+        .unwrap()];
         write_params.mode = WriteMode::Append;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1251,11 +1325,11 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
         let mut write_params = WriteParams {
@@ -1263,7 +1337,10 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1273,15 +1350,18 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let new_batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let new_batches = vec![RecordBatch::try_new(
             new_schema.clone(),
             vec![Arc::new(StringArray::from_iter_values(
                 (20..40).map(|v| v.to_string()),
             ))],
         )
-        .unwrap()]);
+        .unwrap()];
         write_params.mode = WriteMode::Overwrite;
-        let mut new_batch_reader: Box<dyn RecordBatchReader> = Box::new(new_batches);
+        let mut new_batch_reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            new_batches.into_iter().map(Ok),
+            new_schema.clone(),
+        ));
         Dataset::write(&mut new_batch_reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1323,29 +1403,30 @@ mod tests {
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, false),
         ]));
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1389,29 +1470,30 @@ mod tests {
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, false),
         ]));
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1457,17 +1539,15 @@ mod tests {
             false,
         )]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let test_uri = test_dir.path().to_str().unwrap();
         let write_params = WriteParams {
@@ -1475,7 +1555,10 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1501,16 +1584,21 @@ mod tests {
         )]));
 
         let float_arr = generate_random_array(512 * dimension as usize);
-        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new(
+                float_arr, dimension,
+            )
+            .unwrap(),
+        );
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
+
         let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
         dataset.validate().await.unwrap();
 
@@ -1533,12 +1621,11 @@ mod tests {
             mode: WriteMode::Append,
             ..Default::default()
         };
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
             schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        ));
         let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1553,11 +1640,11 @@ mod tests {
             mode: WriteMode::Overwrite,
             ..Default::default()
         };
-        let batches =
-            RecordBatchBuffer::new(vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
-            ]);
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1575,19 +1662,20 @@ mod tests {
             false,
         )]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
+        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            batches.into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut reader, test_uri, None).await
     }
 
@@ -1618,7 +1706,7 @@ mod tests {
         )
         .unwrap();
         let batch2 = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(Int32Array::from(vec![3, 2])),
                 Arc::new(Float32Array::from(vec![3.0, 4.0])),
@@ -1634,14 +1722,18 @@ mod tests {
             ..Default::default()
         };
 
-        let mut batches: Box<dyn RecordBatchReader> =
-            Box::new(RecordBatchBuffer::from_iter(vec![batch1]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![batch1].into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let mut batches: Box<dyn RecordBatchReader> =
-            Box::new(RecordBatchBuffer::from_iter(vec![batch2]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![batch2].into_iter().map(Ok),
+            schema.clone(),
+        ));
         Dataset::write(&mut batches, test_uri, Some(write_params))
             .await
             .unwrap();
@@ -1662,8 +1754,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut batches: Box<dyn RecordBatchReader> =
-            Box::new(RecordBatchBuffer::from_iter(vec![right_batch1]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![right_batch1].into_iter().map(Ok),
+            right_schema.clone(),
+        ));
         let mut dataset = Dataset::open(test_uri).await.unwrap();
         dataset.merge(&mut batches, "i", "i2").await.unwrap();
         dataset.validate().await.unwrap();
@@ -1715,13 +1809,20 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
                 .unwrap()
         }
-
         // Write a dataset
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
         let data = sequence_data(0..100);
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::new(vec![data]));
+        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+            vec![data].into_iter().map(Ok),
+            schema.clone(),
+        ));
         let mut dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
 
         // Delete nothing
