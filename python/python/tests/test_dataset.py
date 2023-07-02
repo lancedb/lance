@@ -59,6 +59,47 @@ def test_dataset_append(tmp_path: Path):
     with pytest.raises(OSError):
         lance.write_dataset(table2, base_dir, mode="append")
 
+def test_dataset_from_record_batch_iterator(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    
+    test_pylist = [{"colA": "Alice", "colB": 20}, {"colA": "Blob", "colB": 30}]
+
+    # split into two batches
+    batches = [pa.RecordBatch.from_pylist([test_pylist[0]]), pa.RecordBatch.from_pylist([test_pylist[1]])]
+
+    # define schema
+    schema = pa.schema([
+            pa.field("colA", pa.string()),
+            pa.field("colB", pa.int64()),
+        ])
+    
+    # write dataset with iterator
+    lance.write_dataset(iter(batches), base_dir, schema)
+    dataset = lance.dataset(base_dir)
+
+    # After combined into one batch, make sure it is the same as original pylist
+    assert list(dataset.to_batches())[0].to_pylist() == test_pylist
+
+def test_dataset_from_record_batch_list(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    
+    test_pylist = [{"colA": "Alice", "colB": 20}, {"colA": "Blob", "colB": 30}]
+
+    # split into two batches
+    batches = [pa.RecordBatch.from_pylist([test_pylist[0]]), pa.RecordBatch.from_pylist([test_pylist[1]])]
+
+    # define schema
+    schema = pa.schema([
+            pa.field("colA", pa.string()),
+            pa.field("colB", pa.int64()),
+        ])
+    
+    # write dataset with list
+    lance.write_dataset(batches, base_dir, schema)
+    dataset = lance.dataset(base_dir)
+
+    # After combined into one batch, make sure it is the same as original pylist
+    assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])

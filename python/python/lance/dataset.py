@@ -851,7 +851,7 @@ ReaderLike = Union[
     pa.Table,
     pa.dataset.Dataset,
     pa.dataset.Scanner,
-    Iterator[RecordBatch],
+    Iterable[RecordBatch],
     pa.RecordBatchReader,
 ]
 
@@ -912,14 +912,15 @@ def _coerce_reader(
         return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
     elif isinstance(data_obj, pa.dataset.Scanner):
         return data_obj.to_reader()
-    elif isinstance(data_obj, Iterator):
+    elif isinstance(data_obj, pa.RecordBatchReader):
+        return data_obj
+    # for other iterables, assume they are of type Iterable[RecordBatch]
+    elif isinstance(data_obj, Iterable):
         if schema is not None:
             return pa.RecordBatchReader.from_batches(schema, data_obj)
         else:
             raise ValueError(
-                "Must provide schema to write dataset from RecordBatch iterator"
+                "Must provide schema to write dataset from RecordBatch iterable"
             )
-    elif isinstance(data_obj, pa.RecordBatchReader):
-        return data_obj
     else:
-        raise TypeError(f"Unknown data_obj type {type(data_obj)}")
+        raise TypeError(f"Unknown data type {type(data_obj)}. Please check https://lancedb.github.io/lance/read_and_write.html to see a list of supported types.")
