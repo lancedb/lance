@@ -4,7 +4,7 @@ breathe
 cython
 pandas
 piccolo-theme
-duckdb>=0.6,<0.7
+duckdb>=0.8
 jupyterlab
 fastai
 xmltodict
