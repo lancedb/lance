@@ -33,7 +33,7 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
 
     schema = pa.schema([
             pa.field("name", pa.string()),
-            pa.field("age", pa.int32()),
+            pa.field("age", pa.int64()),
         ])
 
     lance.write_dataset(reader, "./alice_and_bob.lance", schema)
