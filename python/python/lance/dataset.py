@@ -956,4 +956,9 @@ def _coerce_reader(
                 "Must provide schema to write dataset from RecordBatch iterable"
             )
     else:
-        raise TypeError(f"Unknown data type {type(data_obj)}. Please check https://lancedb.github.io/lance/read_and_write.html to see a list of supported types.")
+        raise TypeError(
+            f"Unknown data type {type(data_obj)}. "
+            "Please check "
+            "https://lancedb.github.io/lance/read_and_write.html "
+            "to see supported types."
+        )
