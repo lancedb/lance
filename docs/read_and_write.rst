@@ -83,6 +83,30 @@ Now if we want to add a column of labels we have generated, we can do so by merg
     1   2  [4, 5, 6]  rabbit
     2   3  [7, 8, 9]     cat
 
+Deleting rows
+~~~~~~~~~~~~~
+
+Lance supports deleting rows from a dataset using a SQL filter. For example, to
+delete Bob's row from the dataset above, one could use:
+
+  .. code-block:: python
+
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.delete("name = 'Bob'")
+
+:py:meth:`lance.LanceDataset.delete` supports the same filters as described in
+:ref:`filter-push-down`.
+
+Rows are deleted by marking them as deleted in a separate deletion index. This is
+faster than rewriting the files and also avoids invaliding any indices that point
+to those files. Any subsequent queries will not return the deleted rows.
+
+.. warning::
+  
+  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
+  as they will return the deleted rows. This is fixed in 0.5.0 and later.
 
 Reading Lance Dataset
 ---------------------
@@ -136,6 +160,9 @@ using the :py:meth:`lance.LanceDataset.to_batches` method:
 
 Unsurprisingly, :py:meth:`~lance.LanceDataset.to_batches` takes the same parameters
 as :py:meth:`~lance.LanceDataset.to_table` function.
+
+
+.. _filter-push-down:
 
 Filter push-down
 ~~~~~~~~~~~~~~~~

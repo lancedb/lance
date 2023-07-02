@@ -18,9 +18,15 @@ use std::path::Path as StdPath;
 use std::sync::Arc;
 
 use ::object_store::{
-    aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
-    path::Path, ClientOptions, ObjectStore as OSObjectStore,
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions, CredentialProvider,
+    ObjectStore as OSObjectStore, Result as ObjectStoreResult,
 };
+use async_trait::async_trait;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_credential_types::provider::ProvideCredentials;
+use futures::{StreamExt, TryStreamExt};
+use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
 use url::Url;
@@ -48,6 +54,24 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
+#[derive(Debug)]
+struct AwsCredentialAdapter {
+    pub inner: DefaultCredentialsChain,
+}
+
+#[async_trait]
+impl CredentialProvider for AwsCredentialAdapter {
+    type Credential = ObjectStoreAwsCredential;
+    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        let creds = self.inner.provide_credentials().await.unwrap();
+        Ok(Arc::new(Self::Credential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(|s| s.to_string()),
+        }))
+    }
+}
+
 /// BUild S3 ObjectStore using default credential chain.
 async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
@@ -55,9 +79,18 @@ async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     const DEFAULT_REGION: &str = "us-west-2";
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
+
+    let credentials_provider = DefaultCredentialsChain::builder()
+        .region(region_provider.region().await)
+        .build()
+        .await;
+
     Ok(Arc::new(
-        AmazonS3Builder::from_env()
+        AmazonS3Builder::new()
             .with_url(uri)
+            .with_credentials(Arc::new(AwsCredentialAdapter {
+                inner: credentials_provider,
+            }))
             .with_region(
                 region_provider
                     .region()
@@ -81,12 +114,34 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
+async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    Ok(Arc::new(
+        MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
+    ))
+}
+
+pub trait WrappingObjectStore: Send + Sync {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Clone, Default)]
+pub struct ObjectStoreParams {
+    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        match Url::parse(uri) {
+        Self::from_uri_and_params(uri, ObjectStoreParams::default()).await
+    }
+
+    /// Parse from a string URI.
+    ///
+    /// Returns the ObjectStore instance and the absolute path to the object.
+    pub async fn from_uri_and_params(uri: &str, params: ObjectStoreParams) -> Result<(Self, Path)> {
+        let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::new_from_path(uri)
@@ -97,7 +152,18 @@ impl ObjectStore {
                 Ok((store, path))
             }
             Err(_) => Self::new_from_path(uri),
-        }
+        }?;
+
+        Ok((
+            Self {
+                inner: params
+                    .object_store_wrapper
+                    .map(|w| w.wrap(object_store.inner.clone()))
+                    .unwrap_or(object_store.inner),
+                ..object_store
+            },
+            base_path,
+        ))
     }
 
     fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
@@ -135,6 +201,12 @@ impl ObjectStore {
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
+            "az" => Ok(Self {
+                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
@@ -210,6 +282,28 @@ impl ObjectStore {
             .collect())
     }
 
+    /// Remove a directory recursively.
+    pub async fn remove_dir_all(&self, dir_path: impl Into<Path>) -> Result<()> {
+        let path = dir_path.into();
+        let path = Path::parse(&path)?;
+
+        if self.is_local() {
+            // Local file system needs to delete directories as well.
+            return super::local::remove_dir_all(&path);
+        }
+        let sub_entries = self
+            .inner
+            .list(Some(&path))
+            .await?
+            .map(|m| m.map(|meta| meta.location))
+            .boxed();
+        self.inner
+            .delete_stream(sub_entries)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
     /// Check a file exists.
     pub async fn exists(&self, path: &Path) -> Result<bool> {
         match self.inner.head(path).await {
@@ -230,6 +324,7 @@ mod tests {
     use super::*;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
@@ -317,6 +412,82 @@ mod tests {
 
         let sub_dirs = store.read_dir(base.child("foo")).await.unwrap();
         assert_eq!(sub_dirs, vec!["bar", "zoo", "test_file"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path();
+        create_dir_all(path.join("foo").join("bar")).unwrap();
+        create_dir_all(path.join("foo").join("zoo")).unwrap();
+        create_dir_all(path.join("foo").join("zoo").join("abc")).unwrap();
+        write_to_file(
+            path.join("foo")
+                .join("bar")
+                .join("test_file")
+                .to_str()
+                .unwrap(),
+            "delete",
+        )
+        .unwrap();
+        write_to_file(path.join("foo").join("top").to_str().unwrap(), "delete_top").unwrap();
+        let (store, base) = ObjectStore::from_uri(path.to_str().unwrap()).await.unwrap();
+        store.remove_dir_all(base.child("foo")).await.unwrap();
+
+        assert!(!path.join("foo").exists());
+    }
+
+    #[derive(Debug)]
+    struct TestWrapper {
+        called: AtomicBool,
+
+        return_value: Arc<dyn OSObjectStore>,
+    }
+
+    impl WrappingObjectStore for TestWrapper {
+        fn wrap(&self, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+            self.called.store(true, Ordering::Relaxed);
+
+            // return a mocked value so we can check if the final store is the one we expect
+            self.return_value.clone()
+        }
+    }
+
+    impl TestWrapper {
+        fn called(&self) -> bool {
+            self.called.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wrapping_object_store_option_is_used() {
+        // Make a store for the inner store first
+        let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+
+        assert_eq!(Arc::strong_count(&mock_inner_store), 1);
+
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: mock_inner_store.clone(),
+        });
+
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+        };
+
+        // not called yet
+        assert!(!wrapper.called());
+
+        let _ = ObjectStore::from_uri_and_params("memory:///", params)
+            .await
+            .unwrap();
+
+        // called after construction
+        assert!(wrapper.called());
+
+        // hard to compare two trait pointers as the point to vtables
+        // using the ref count as a proxy to make sure that the store is correctly kept
+        assert_eq!(Arc::strong_count(&mock_inner_store), 2);
     }
 
     #[tokio::test]

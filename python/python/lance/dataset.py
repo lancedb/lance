@@ -411,6 +411,38 @@ class LanceDataset(pa.dataset.Dataset):
 
         self._ds.merge(reader, left_on, right_on)
 
+    def delete(self, predicate: Union[str, pa.compute.Expression]):
+        """
+        Delete rows from the dataset.
+
+        This marks rows as deleted, but does not physically remove them from the
+        files. This keeps the existing indexes still valid.
+
+        Parameters
+        ----------
+        predicate : str or pa.compute.Expression
+            The predicate to use to select rows to delete. May either be a SQL
+            string or a pyarrow Expression.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.delete("a = 1 or b in ('a', 'b')")
+        >>> dataset.to_table()
+        pyarrow.Table
+        a: int64
+        b: string
+        ----
+        a: [[3]]
+        b: [["c"]]
+        """
+        if isinstance(predicate, pa.compute.Expression):
+            predicate = str(predicate)
+        self._ds.delete(predicate)
+
     def versions(self):
         """
         Return all versions in this dataset.
@@ -459,8 +491,8 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
-            Default is "L2".
+            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine"
+            or "dot" (dot product). Default is "L2".
         replace : bool
             Replace the existing index if it exists.
         num_partitions : int, optional
@@ -487,7 +519,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         - **r**: out-degree bound
         - **l**: number of levels in the graph.
-        - **alpha**: distance threadhold for the graph.
+        - **alpha**: distance threshold for the graph.
 
         Examples
         --------
@@ -538,6 +570,7 @@ class LanceDataset(pa.dataset.Dataset):
             "l2",
             "cosine",
             "euclidean",
+            "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()

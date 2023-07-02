@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.4.21"
+version = "0.5.2"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
@@ -45,7 +45,7 @@ chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
-object_store = { version = "0.5.6", features = ["aws_profile", "gcp"] }
+object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
 aws-credential-types = "0.54.1"
@@ -62,7 +62,6 @@ path-absolutize = "3.0.14"
 shellexpand = "3.0.0"
 arrow = { version = "40.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
-sqlparser-lance = "0.32.0"
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion = { version = "26.0.0", default-features = false, features = ["regex_expressions"] }
 faiss = { version = "0.11.0", features = ["gpu"], optional = true }
@@ -103,7 +102,7 @@ dirs = "5.0.0"
 [features]
 cli = ["clap"]
 opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
- 
+
 [[bin]]
 name = "lq"
 required-features = ["cli"]

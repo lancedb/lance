@@ -32,6 +32,22 @@ use object_store::path::Path;
 use super::object_reader::ObjectReader;
 use crate::{Error, Result};
 
+/// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
+fn to_local_path(path: &Path) -> String {
+    if cfg!(windows) {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+/// Recursively remove a directory, specified by [`object_store::path::Path`].
+pub(super) fn remove_dir_all(path: &Path) -> Result<()> {
+    let local_path = to_local_path(path);
+    std::fs::remove_dir_all(local_path)?;
+    Ok(())
+}
+
 /// [ObjectReader] for local file system.
 pub struct LocalObjectReader {
     /// File handler.
@@ -47,11 +63,7 @@ pub struct LocalObjectReader {
 impl LocalObjectReader {
     /// Open a local object reader, with default prefetch size.
     pub fn open(path: &Path, block_size: usize) -> Result<Box<dyn ObjectReader>> {
-        let local_path = if cfg!(windows) {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
+        let local_path = to_local_path(path);
         let file = File::open(local_path).map_err(|e| match e.kind() {
             ErrorKind::NotFound => Error::NotFound {
                 uri: path.to_string(),
