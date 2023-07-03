@@ -22,8 +22,10 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  build:
-    runs-on: ubuntu-22.04
+  linux-build:
+    runs-on:
+      group: large-runners
+      labels: ubuntu-22.04-4core
     timeout-minutes: 30
     defaults:
       run:
