@@ -409,7 +409,7 @@ mod tests {
         let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(
-                FixedSizeListArray::try_new_from_values(&data, dim as i32).unwrap(),
+                FixedSizeListArray::try_new_from_values(data, dim as i32).unwrap(),
             )],
         )
         .unwrap()];

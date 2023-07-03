@@ -199,21 +199,18 @@ pub trait FixedSizeListArrayExt {
     ///         Some(vec![Some(8), Some(9)])
     /// ], 2))
     /// ```
-    fn try_new_from_values<T: Array>(values: T, list_size: i32) -> Result<FixedSizeListArray>;
+    fn try_new_from_values<T: Array + 'static>(
+        values: T,
+        list_size: i32,
+    ) -> Result<FixedSizeListArray>;
 }
 
 impl FixedSizeListArrayExt for FixedSizeListArray {
-    fn try_new_from_values<T: Array>(values: T, list_size: i32) -> Result<Self> {
-        let list_type = DataType::FixedSizeList(
-            Arc::new(Field::new("item", values.data_type().clone(), true)),
-            list_size,
-        );
-        let data = ArrayDataBuilder::new(list_type)
-            .len(values.len() / list_size as usize)
-            .add_child_data(values.into_data())
-            .build()?;
+    fn try_new_from_values<T: Array + 'static>(values: T, list_size: i32) -> Result<Self> {
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let values = Arc::new(values);
 
-        Ok(Self::from(data))
+        Ok(Self::try_new(field, list_size, values, None)?)
     }
 }
 

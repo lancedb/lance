@@ -835,8 +835,7 @@ mod tests {
             ),
             true,
         )]));
-        let array =
-            Arc::new(FixedSizeListArray::try_new_from_values(&vectors, DIM as i32).unwrap());
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let test_dir = tempdir().unwrap();
@@ -846,8 +845,7 @@ mod tests {
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let centroids = generate_random_array(2 * DIM);
-        let ivf_centroids =
-            FixedSizeListArray::try_new_from_values(&centroids, DIM as i32).unwrap();
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
 
         let codebook = Arc::new(generate_random_array(256 * DIM));

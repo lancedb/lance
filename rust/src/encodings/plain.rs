@@ -806,7 +806,7 @@ mod tests {
         let path = Path::from("/shared_slice");
 
         let array = Int32Array::from_iter_values(0..1600);
-        let fixed_size_list = FixedSizeListArray::try_new_from_values(&array, 16).unwrap();
+        let fixed_size_list = FixedSizeListArray::try_new_from_values(array, 16).unwrap();
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "fl",
             fixed_size_list.data_type().clone(),
