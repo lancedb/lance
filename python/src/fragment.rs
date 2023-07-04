@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::PyArrowConvert;
 use arrow::pyarrow::PyArrowType;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::fragment::FileFragment as LanceFragment;
@@ -108,7 +108,7 @@ impl FileFragment {
     ) -> PyResult<FragmentMetadata> {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+            let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>() {
                 let scanner: Scanner = reader.extract()?;
                 Box::new(
                     scanner

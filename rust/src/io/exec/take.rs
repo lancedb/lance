@@ -257,9 +257,7 @@ impl ExecutionPlan for TakeExec {
 mod tests {
     use super::*;
 
-    use arrow_array::{
-        ArrayRef, Float32Array, Int32Array, RecordBatchIterator, RecordBatchReader, StringArray,
-    };
+    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field};
     use tempfile::tempdir;
 
@@ -295,11 +293,9 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            expected_batches.clone().into_iter().map(Ok),
-            schema.clone(),
-        ));
-        Dataset::write(&mut reader, test_uri, Some(params))
+        let reader =
+            RecordBatchIterator::new(expected_batches.clone().into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, test_uri, Some(params))
             .await
             .unwrap();
 

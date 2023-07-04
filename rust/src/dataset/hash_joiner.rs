@@ -49,9 +49,10 @@ impl HashJoiner {
     /// Create a new `HashJoiner`, building the hash index.
     ///
     /// Will run in parallel over batches using all available cores.
-    pub async fn try_new(reader: &mut Box<dyn RecordBatchReader>, on: &str) -> Result<Self> {
+    pub async fn try_new(reader: Box<dyn RecordBatchReader + Send>, on: &str) -> Result<Self> {
         // Check column exist
-        reader.schema().field_with_name(on)?;
+        let schema = reader.schema();
+        schema.field_with_name(on)?;
 
         // Hold all data in memory for simple implementation. Can do external sort later.
         let batches = reader.collect::<std::result::Result<Vec<RecordBatch>, _>>()?;
@@ -62,8 +63,6 @@ impl HashJoiner {
         };
 
         let map = DashMap::new();
-
-        let schema = reader.schema();
 
         let keep_indices: Vec<usize> = schema
             .fields()
@@ -244,11 +243,11 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+        let batches: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
             batches.into_iter().map(Ok),
             schema.clone(),
         ));
-        let joiner = HashJoiner::try_new(&mut batches, "i").await.unwrap();
+        let joiner = HashJoiner::try_new(batches, "i").await.unwrap();
 
         let indices = Arc::new(Int32Array::from_iter(&[
             Some(15),
@@ -294,12 +293,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
+        let batches: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
             vec![batch].into_iter().map(Ok),
             schema.clone(),
         ));
 
-        let joiner = HashJoiner::try_new(&mut batches, "i").await.unwrap();
+        let joiner = HashJoiner::try_new(batches, "i").await.unwrap();
 
         // Wrong type: was Int32, passing UInt32.
         let indices = Arc::new(UInt32Array::from_iter(&[Some(15)]));

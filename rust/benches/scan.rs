@@ -99,7 +99,7 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
                             .collect::<Vec<_>>(),
                     )),
                     Arc::new(
-                        FixedSizeListArray::try_new(
+                        FixedSizeListArray::try_new_from_values(
                             Float32Array::from_iter_values(
                                 (i * batch_size..(i + 2) * batch_size)
                                     .map(|x| (batch_size + (x - batch_size) / 2) as f32),
@@ -124,11 +124,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;
     write_params.mode = mode;
-    let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-        batches.into_iter().map(Ok),
-        schema.clone(),
-    ));
-    Dataset::write(&mut reader, test_uri, Some(write_params))
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
 }

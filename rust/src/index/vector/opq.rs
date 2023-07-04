@@ -328,9 +328,7 @@ mod tests {
 
     use approx::assert_relative_eq;
     use arrow::compute::{max, min};
-    use arrow_array::{
-        FixedSizeListArray, Float32Array, RecordBatchIterator, RecordBatchReader, UInt64Array,
-    };
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatchIterator, UInt64Array};
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 
     use crate::arrow::{linalg::matrix::MatrixView, *};
@@ -367,13 +365,10 @@ mod tests {
         )]));
 
         let vectors = Float32Array::from_iter_values((0..32000).map(|x| x as f32));
-        let vectors = FixedSizeListArray::try_new(vectors, 64).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(vectors, 64).unwrap();
         let batches = vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap()];
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema.clone(),
-        ));
-        Dataset::write(&mut reader, tmp_dir.path().to_str().unwrap(), None)
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, tmp_dir.path().to_str().unwrap(), None)
             .await
             .unwrap();
 
