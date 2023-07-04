@@ -193,7 +193,6 @@ pub fn deletion_file_path(base: &Path, fragment_id: u64, deletion_file: &Deletio
 ///
 /// Returns the deletion file if one was written. If no deletions were present,
 /// returns `Ok(None)`.
-#[allow(dead_code)] // TODO: remove once used
 pub async fn write_deletion_file(
     base: &Path,
     fragment_id: u64,
@@ -260,16 +259,13 @@ pub async fn write_deletion_file(
 /// Returns the deletion vector if one was present. Otherwise returns `Ok(None)`.
 ///
 /// Will return an error if the file is present but invalid.
-#[allow(dead_code)] // TODO: remove once used
 pub async fn read_deletion_file(
     base: &Path,
     fragment: &Fragment,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionVector>> {
-    let deletion_file = if let Some(file) = &fragment.deletion_file {
-        file
-    } else {
-        return Ok(None);
+    let Some(deletion_file) = &fragment.deletion_file else {
+        return Ok(None)
     };
 
     match deletion_file.file_type {

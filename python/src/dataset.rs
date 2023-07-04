@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::arrow::as_fixed_size_list_array;
@@ -71,6 +71,7 @@ impl Dataset {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             session: None,
+            store_options: None,
         };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
@@ -287,9 +288,18 @@ impl Dataset {
         left_on: &str,
         right_on: &str,
     ) -> PyResult<()> {
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(reader.0);
         let mut new_self = self.ds.as_ref().clone();
-        let fut = new_self.merge(&mut reader, left_on, right_on);
+        let fut = new_self.merge(reader.0, left_on, right_on);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn delete(&mut self, predicate: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.delete(&predicate);
         self.rt.block_on(
             async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
         )?;
@@ -498,22 +508,23 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
-        let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+        if reader.is_instance_of::<Scanner>() {
             let scanner: Scanner = reader.extract()?;
-            Box::new(
-                scanner
-                    .to_reader()
-                    .await
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            )
+            let batches = scanner
+                .to_reader()
+                .await
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
         } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-        };
-
-        LanceDataset::write(&mut batches, uri, params)
-            .await
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
+        }
     })
 }
 

@@ -14,16 +14,24 @@
 
 //! Wraps [ObjectStore](object_store::ObjectStore)
 
+use std::collections::HashMap;
 use std::path::Path as StdPath;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use ::object_store::{
-    aws::AmazonS3Builder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory,
-    path::Path, ClientOptions, ObjectStore as OSObjectStore,
+    aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder,
+    local::LocalFileSystem, memory::InMemory, path::Path, ClientOptions, CredentialProvider,
+    ObjectStore as OSObjectStore, Result as ObjectStoreResult,
 };
+use async_trait::async_trait;
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_credential_types::provider::ProvideCredentials;
 use futures::{StreamExt, TryStreamExt};
+use object_store::aws::AwsCredential as ObjectStoreAwsCredential;
 use reqwest::header::{HeaderMap, CACHE_CONTROL};
 use shellexpand::tilde;
+use tokio::sync::RwLock;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -49,16 +57,102 @@ impl std::fmt::Display for ObjectStore {
     }
 }
 
-/// BUild S3 ObjectStore using default credential chain.
-async fn build_s3_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
+#[derive(Debug)]
+struct AwsCredentialAdapter {
+    pub inner: Arc<dyn ProvideCredentials>,
+
+    // RefCell can't be shared accross threads, so we use HashMap
+    cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
+
+    // The amount of time before expiry to refresh credentials
+    credentials_refresh_offset: Duration,
+}
+
+impl AwsCredentialAdapter {
+    fn new(provider: Arc<dyn ProvideCredentials>, credentials_refresh_offset: Duration) -> Self {
+        Self {
+            inner: provider,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            credentials_refresh_offset,
+        }
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for AwsCredentialAdapter {
+    type Credential = ObjectStoreAwsCredential;
+
+    async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+        let cached_creds = {
+            let cache_value = self.cache.read().await.get(AWS_CREDS_CACHE_KEY).cloned();
+            let expired = cache_value
+                .clone()
+                .map(|cred| {
+                    cred.expiry()
+                        .map(|exp| {
+                            exp.checked_sub(self.credentials_refresh_offset)
+                                .expect("this time should always be valid")
+                                < SystemTime::now()
+                        })
+                        // no expiry is never expire
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true); // no cred is the same as expired;
+            if expired {
+                None
+            } else {
+                cache_value.clone()
+            }
+        };
+
+        if let Some(creds) = cached_creds {
+            Ok(Arc::new(Self::Credential {
+                key_id: creds.access_key_id().to_string(),
+                secret_key: creds.secret_access_key().to_string(),
+                token: creds.session_token().map(|s| s.to_string()),
+            }))
+        } else {
+            let refreshed_creds = Arc::new(self.inner.provide_credentials().await.unwrap());
+
+            self.cache
+                .write()
+                .await
+                .insert(AWS_CREDS_CACHE_KEY.to_string(), refreshed_creds.clone());
+
+            Ok(Arc::new(Self::Credential {
+                key_id: refreshed_creds.access_key_id().to_string(),
+                secret_key: refreshed_creds.secret_access_key().to_string(),
+                token: refreshed_creds.session_token().map(|s| s.to_string()),
+            }))
+        }
+    }
+}
+
+/// Build S3 ObjectStore using default credential chain.
+/// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
+async fn build_s3_object_store(
+    uri: &str,
+    credentials_refresh_offset: Duration,
+) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
 
     const DEFAULT_REGION: &str = "us-west-2";
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
+
+    let credentials_provider = DefaultCredentialsChain::builder()
+        .region(region_provider.region().await)
+        .build()
+        .await;
+
     Ok(Arc::new(
-        AmazonS3Builder::from_env()
+        AmazonS3Builder::new()
             .with_url(uri)
+            .with_credentials(Arc::new(AwsCredentialAdapter::new(
+                Arc::new(credentials_provider),
+                credentials_refresh_offset,
+            )))
             .with_region(
                 region_provider
                     .region()
@@ -82,23 +176,69 @@ async fn build_gcs_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
+async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
+    Ok(Arc::new(
+        MicrosoftAzureBuilder::from_env().with_url(uri).build()?,
+    ))
+}
+
+pub trait WrappingObjectStore: Send + Sync {
+    fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
+}
+
+#[derive(Clone)]
+pub struct ObjectStoreParams {
+    pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+
+    pub s3_credentials_refresh_offset: Duration,
+}
+
+// Need this for setting a non-zero default duration
+impl Default for ObjectStoreParams {
+    fn default() -> Self {
+        Self {
+            object_store_wrapper: None,
+            s3_credentials_refresh_offset: Duration::from_secs(60),
+        }
+    }
+}
+
 impl ObjectStore {
     /// Parse from a string URI.
     ///
     /// Returns the ObjectStore instance and the absolute path to the object.
     pub async fn from_uri(uri: &str) -> Result<(Self, Path)> {
-        match Url::parse(uri) {
+        Self::from_uri_and_params(uri, ObjectStoreParams::default()).await
+    }
+
+    /// Parse from a string URI.
+    ///
+    /// Returns the ObjectStore instance and the absolute path to the object.
+    pub async fn from_uri_and_params(uri: &str, params: ObjectStoreParams) -> Result<(Self, Path)> {
+        let (object_store, base_path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
                 Self::new_from_path(uri)
             }
             Ok(url) => {
-                let store = Self::new_from_url(url.clone()).await?;
+                let store =
+                    Self::new_from_url(url.clone(), params.s3_credentials_refresh_offset).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
             Err(_) => Self::new_from_path(uri),
-        }
+        }?;
+
+        Ok((
+            Self {
+                inner: params
+                    .object_store_wrapper
+                    .map(|w| w.wrap(object_store.inner.clone()))
+                    .unwrap_or(object_store.inner),
+                ..object_store
+            },
+            base_path,
+        ))
     }
 
     fn new_from_path(str_path: &str) -> Result<(Self, Path)> {
@@ -125,10 +265,14 @@ impl ObjectStore {
         ))
     }
 
-    async fn new_from_url(url: Url) -> Result<Self> {
+    async fn new_from_url(url: Url, s3_credential_refresh_offset: Duration) -> Result<Self> {
         match url.scheme() {
             "s3" => Ok(Self {
-                inner: build_s3_object_store(url.to_string().as_str()).await?,
+                inner: build_s3_object_store(
+                    url.to_string().as_str(),
+                    s3_credential_refresh_offset,
+                )
+                .await?,
                 scheme: String::from("s3"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
@@ -136,6 +280,12 @@ impl ObjectStore {
             "gs" => Ok(Self {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
+                base_path: Path::from(url.path()),
+                block_size: 64 * 1024,
+            }),
+            "az" => Ok(Self {
+                inner: build_azure_object_store(url.to_string().as_str()).await?,
+                scheme: String::from("az"),
                 base_path: Path::from(url.path()),
                 block_size: 64 * 1024,
             }),
@@ -253,6 +403,7 @@ mod tests {
     use super::*;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Write test content to file.
     fn write_to_file(path_str: &str, contents: &str) -> std::io::Result<()> {
@@ -363,6 +514,60 @@ mod tests {
         store.remove_dir_all(base.child("foo")).await.unwrap();
 
         assert!(!path.join("foo").exists());
+    }
+
+    #[derive(Debug)]
+    struct TestWrapper {
+        called: AtomicBool,
+
+        return_value: Arc<dyn OSObjectStore>,
+    }
+
+    impl WrappingObjectStore for TestWrapper {
+        fn wrap(&self, _original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+            self.called.store(true, Ordering::Relaxed);
+
+            // return a mocked value so we can check if the final store is the one we expect
+            self.return_value.clone()
+        }
+    }
+
+    impl TestWrapper {
+        fn called(&self) -> bool {
+            self.called.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wrapping_object_store_option_is_used() {
+        // Make a store for the inner store first
+        let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+
+        assert_eq!(Arc::strong_count(&mock_inner_store), 1);
+
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: mock_inner_store.clone(),
+        });
+
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..ObjectStoreParams::default()
+        };
+
+        // not called yet
+        assert!(!wrapper.called());
+
+        let _ = ObjectStore::from_uri_and_params("memory:///", params)
+            .await
+            .unwrap();
+
+        // called after construction
+        assert!(wrapper.called());
+
+        // hard to compare two trait pointers as the point to vtables
+        // using the ref count as a proxy to make sure that the store is correctly kept
+        assert_eq!(Arc::strong_count(&mock_inner_store), 2);
     }
 
     #[tokio::test]

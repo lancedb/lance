@@ -17,53 +17,22 @@ A `Lance Dataset` is organized in a directory.
 
 A ``Manifest`` file includes the metadata to describe a version of the dataset.
 
-.. code-block:: protobuf
-
-    // Manifest is a global section shared between all the files.
-    message Manifest {
-        // All fields of the dataset, including the nested fields.
-        repeated Field fields = 1;
-
-        // Fragments of the dataset.
-        repeated DataFragment fragments = 2;
-
-        // Snapshot version number.
-        uint64 version = 3;
-
-        // The file position of the version auxiliary data.
-        //  * It is not inheritable between versions.
-        //  * It is not loaded by default during query.
-        uint64 version_aux_data = 4;
-
-        // Schema metadata.
-        map<string, bytes> metadata = 5;
-
-        // If presented, the file position of the index metadata.
-        optional uint64 index_section = 6;
-    }
+.. literalinclude:: ../protos/format.proto
+   :language: protobuf
+   :linenos:
+   :start-at: // Manifest is
+   :end-at: } // Manifest
 
 ``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
-where each ``DataFile`` can contain several columns in the chunk of data.
+where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
+``DeletionFile``, which is explained in a later section.
 
-.. code-block:: protobuf
+.. literalinclude:: ../protos/format.proto
+   :language: protobuf
+   :linenos:
+   :start-at: // Data fragment
+   :end-at: } // DataFile
 
-    // Data fragment. A fragment is a set of files which represent the
-    // different columns of the same rows.
-    // If column exists in the schema, but the related file does not exist,
-    // treat this column as nulls.
-    message DataFragment {
-        // Unique ID of each DataFragment
-        uint64 id = 1;
-
-        repeated DataFile files = 2;
-    }
-
-    message DataFile {
-        // Relative path to the root.
-        string path = 1;
-        // The ids of the fields/columns in this file
-        repeated int32 fields = 2;
-    }
 
 File Structure
 --------------
@@ -74,30 +43,11 @@ Each ``.lance`` file is the container for the actual data.
 
 At the tail of the file, a `Metadata` protobuf block is used to describe the structure of the data file.
 
-.. code-block:: protobuf
-
-    message Metadata {
-        uint64 manifest_position = 1;
-
-        // Logical offsets of each chunk group, i.e., number of the rows in each
-        // chunk.
-        repeated int32 batch_offsets = 2;
-
-        // The file position that page table is stored.
-        //
-        // A page table is a matrix of N x N x 2, where N = num_fields, and M =
-        // num_batches. Each cell in the table is a pair of <position:uint64,
-        // length:uint64> of the page. Both position and length are uint64 values. The
-        // <position, length> of all the pages in the same column are then
-        // contiguously stored.
-        //
-        // For example, for the column 5 and batch 4, we have:
-        // ```text
-        //   position = page_table[5][4][0];
-        //   length = page_table[5][4][1];
-        // ```
-        uint64 page_table_position = 3;
-    }
+.. literalinclude:: ../protos/format.proto
+   :language: protobuf
+   :linenos:
+   :start-at: message Metadata {
+   :end-at: } // Metadata
 
 Optionally, a ``Manifest`` block can be stored after the ``Metadata`` block, to make the lance file self-describable.
 
@@ -115,7 +65,15 @@ In the end of the file, a ``Footer`` is written to indicate the closure of a fil
     |   Magic number "LANC"          |
     +--------------------------------+
 
+Feature Flags
+-------------
 
+As the file format and dataset evolve, new feature flags are added to the
+format. There are two separate fields for checking for feature flags, depending
+on whether you are trying to read or write the table. Readers should check the
+``reader_feature_flags`` to see if there are any flag it is not aware of. Writers 
+should check ``writer_feature_flags``. If either sees a flag they don't know, they
+should return an "unsupported" error on any read or write operation.
 
 Encodings
 ---------
@@ -169,3 +127,50 @@ While adding columns is done by adding new ``DataFile`` of the new columns to ea
 Finally, ``Overwrite`` a dataset can be done by resetting the ``Fragment`` list of the ``Manifest``.
 
 .. image:: schema_evolution.png
+
+
+Deletion
+--------
+
+Rows can be marked deleted by adding a deletion file next to the data in the
+``_deletions`` folder. These files contain the indices of rows that have between
+deleted for some fragment. For a given version of the dataset, each fragment can
+have up to one deletion file. Fragments that have no deleted rows have no deletion
+file.
+
+Readers should filter out row ids contained in these deletion files during a 
+scan or ANN search.
+
+Deletion files come in two flavors:
+
+1. Arrow files: which store a column with a flat vector of indices
+2. Roaring bitmaps: which store the indices as compressed bitmaps.
+
+`Roaring Bitmaps`_ are used for larger deletion sets, while Arrow files are used for
+small ones. This is because Roaring Bitmaps are known to be inefficient for small
+sets.
+
+
+.. _`Roaring Bitmaps`: https://roaringbitmap.org/
+
+The filenames of deletion files are structured like:
+
+.. code-block::
+
+    _deletions/{fragment_id}-{read_version}-{random_id}.{arrow|bin}
+
+Where ``fragment_id`` is the fragment the file corresponds to, ``read_version`` is
+the version of the dataset that it was created off of (usually one less than the
+version it was committed to), and ``random_id`` is a random i64 used to avoid
+collisions. The suffix is determined by the file type (``.arrow`` for Arrow file,
+``.bin`` for roaring bitmap).
+
+.. literalinclude:: ../protos/format.proto
+   :language: protobuf
+   :linenos:
+   :start-at: // Deletion File
+   :end-at: } // DeletionFile
+
+Deletes can be materialized by re-writing data files with the deleted rows 
+removed. However, this invalidates row indices and thus the ANN indices, which
+can be expensive to recompute.

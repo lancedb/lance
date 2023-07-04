@@ -37,6 +37,7 @@ mod writer;
 use crate::format::{ProtoStruct, INDEX_MAGIC, MAGIC};
 
 pub use self::object_store::ObjectStore;
+pub use deletion::deletion_file_path;
 pub use reader::read_manifest;
 pub use reader::FileReader;
 pub use stream::RecordBatchStream;

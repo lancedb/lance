@@ -16,7 +16,12 @@
 
 use std::sync::Arc;
 
+use arrow_cast::can_cast_types;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
+    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+};
 use datafusion::{
     logical_expr::{
         col,
@@ -32,10 +37,6 @@ use datafusion::{
     },
     prelude::Expr,
     scalar::ScalarValue,
-};
-use sqlparser::ast::{
-    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -371,11 +372,26 @@ impl Planner {
         Ok(match expr {
             Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
-            Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
-                self.create_physical_expr(expr.left.as_ref())?,
-                expr.op,
-                self.create_physical_expr(expr.right.as_ref())?,
-            )),
+            Expr::BinaryExpr(expr) => {
+                let left = self.create_physical_expr(expr.left.as_ref())?;
+                let right = self.create_physical_expr(expr.right.as_ref())?;
+                let left_data_type = left.data_type(&self.schema)?;
+                let right_data_type = right.data_type(&self.schema)?;
+                // Make sure RHS matches the LHS
+                let right = if right_data_type != left_data_type {
+                    if can_cast_types(&right_data_type, &left_data_type) {
+                        Arc::new(CastExpr::new(right, left_data_type, None))
+                    } else {
+                        return Err(Error::invalid_input(format!(
+                            "Cannot compare {} and {}",
+                            left_data_type, right_data_type
+                        )));
+                    }
+                } else {
+                    right
+                };
+                Arc::new(BinaryExpr::new(left, expr.op, right))
+            }
             Expr::Negative(expr) => {
                 Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
             }
@@ -470,7 +486,8 @@ mod tests {
 
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray,
+        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
     use datafusion::logical_expr::{col, lit, Cast};
@@ -765,7 +782,6 @@ mod tests {
             ("x = cast(1 as bigint unsigned)", ArrowDataType::UInt64),
             ("x = cast(1 as boolean)", ArrowDataType::Boolean),
             ("x = cast(1 as string)", ArrowDataType::Utf8),
-            ("x = cast(1 as binary)", ArrowDataType::Binary),
         ];
 
         for (sql, expected_data_type) in cases {
@@ -854,6 +870,56 @@ mod tests {
                 },
                 _ => panic!("Expected binary expression"),
             }
+        }
+    }
+
+    #[test]
+    fn test_sql_comparison() {
+        // Create a batch with all data types
+        let batch: Vec<(&str, ArrayRef)> = vec![
+            (
+                "timestamp_s",
+                Arc::new(TimestampSecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ms",
+                Arc::new(TimestampMillisecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_us",
+                Arc::new(TimestampMicrosecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ns",
+                Arc::new(TimestampNanosecondArray::from_iter_values(4995..5005)),
+            ),
+        ];
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+
+        let planner = Planner::new(batch.schema());
+
+        // Each expression is meant to select the final 5 rows
+        let expressions = &[
+            "timestamp_s >= TIMESTAMP '1970-01-01 00:00:05'",
+            "timestamp_ms >= TIMESTAMP '1970-01-01 00:00:00.005'",
+            "timestamp_us >= TIMESTAMP '1970-01-01 00:00:00.000005'",
+            "timestamp_ns >= TIMESTAMP '1970-01-01 00:00:00.000005'",
+        ];
+
+        let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
+            std::iter::repeat(Some(false))
+                .take(5)
+                .chain(std::iter::repeat(Some(true)).take(5)),
+        ));
+        for expression in expressions {
+            // convert to physical expression
+            let logical_expr = planner.parse_filter(expression).unwrap();
+            let physical_expr = planner.create_physical_expr(&logical_expr).unwrap();
+
+            // Evaluate and assert they have correct results
+            let result = physical_expr.evaluate(&batch).unwrap();
+            let result = result.into_array(batch.num_rows());
+            assert_eq!(&expected, &result, "unexpected result for {}", expression);
         }
     }
 }

@@ -245,6 +245,7 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
                 metric_type: match idx.metric_type {
                     MetricType::L2 => pb::VectorMetricType::L2.into(),
                     MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+                    MetricType::Dot => pb::VectorMetricType::Dot.into(),
                 },
             })),
         })
@@ -360,7 +361,8 @@ impl Ivf {
         }
 
         let part_ids = part_id_builder.finish();
-        let residuals = FixedSizeListArray::try_new(residual_builder.finish(), dim as i32)?;
+        let residuals =
+            FixedSizeListArray::try_new_from_values(residual_builder.finish(), dim as i32)?;
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(PARTITION_ID_COLUMN, DataType::UInt32, false),
             ArrowField::new(
@@ -404,7 +406,7 @@ impl TryFrom<&pb::Ivf> for Ivf {
     fn try_from(proto: &pb::Ivf) -> Result<Self> {
         let f32_centroids = Float32Array::from(proto.centroids.clone());
         let dimension = f32_centroids.len() / proto.offsets.len();
-        let centroids = Arc::new(FixedSizeListArray::try_new(
+        let centroids = Arc::new(FixedSizeListArray::try_new_from_values(
             f32_centroids,
             dimension as i32,
         )?);
@@ -801,7 +803,7 @@ async fn train_ivf_model(
         metric_type,
     )
     .await?;
-    Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new(
+    Ok(Ivf::new(Arc::new(FixedSizeListArray::try_new_from_values(
         centroids,
         data.num_columns() as i32,
     )?)))
@@ -811,7 +813,7 @@ async fn train_ivf_model(
 mod tests {
     use super::*;
 
-    use arrow_array::cast::AsArray;
+    use arrow_array::{cast::AsArray, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -833,18 +835,17 @@ mod tests {
             ),
             true,
         )]));
-        let array = Arc::new(FixedSizeListArray::try_new(&vectors, DIM as i32).unwrap());
-        let batch = RecordBatch::try_new(schema, vec![array.clone()]).unwrap();
+        let array = Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap());
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut batches: Box<dyn arrow_array::RecordBatchReader> =
-            Box::new(RecordBatchBuffer::new(vec![batch]));
-        let dataset = Dataset::write(&mut batches, test_uri, None).await.unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
 
         let centroids = generate_random_array(2 * DIM);
-        let ivf_centroids = FixedSizeListArray::try_new(&centroids, DIM as i32).unwrap();
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
         let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
 
         let codebook = Arc::new(generate_random_array(256 * DIM));

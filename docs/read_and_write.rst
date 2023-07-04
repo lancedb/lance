@@ -31,7 +31,12 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
         yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
         yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
 
-    lance.write_dataset(producer, "./alice_and_bob.lance")
+    schema = pa.schema([
+            pa.field("name", pa.string()),
+            pa.field("age", pa.int64()),
+        ])
+
+    lance.write_dataset(reader, "./alice_and_bob.lance", schema)
 
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
@@ -78,6 +83,30 @@ Now if we want to add a column of labels we have generated, we can do so by merg
     1   2  [4, 5, 6]  rabbit
     2   3  [7, 8, 9]     cat
 
+Deleting rows
+~~~~~~~~~~~~~
+
+Lance supports deleting rows from a dataset using a SQL filter. For example, to
+delete Bob's row from the dataset above, one could use:
+
+  .. code-block:: python
+
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.delete("name = 'Bob'")
+
+:py:meth:`lance.LanceDataset.delete` supports the same filters as described in
+:ref:`filter-push-down`.
+
+Rows are deleted by marking them as deleted in a separate deletion index. This is
+faster than rewriting the files and also avoids invaliding any indices that point
+to those files. Any subsequent queries will not return the deleted rows.
+
+.. warning::
+  
+  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
+  as they will return the deleted rows. This is fixed in 0.5.0 and later.
 
 Reading Lance Dataset
 ---------------------
@@ -131,6 +160,9 @@ using the :py:meth:`lance.LanceDataset.to_batches` method:
 
 Unsurprisingly, :py:meth:`~lance.LanceDataset.to_batches` takes the same parameters
 as :py:meth:`~lance.LanceDataset.to_table` function.
+
+
+.. _filter-push-down:
 
 Filter push-down
 ~~~~~~~~~~~~~~~~
