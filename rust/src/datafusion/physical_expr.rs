@@ -96,6 +96,12 @@ impl PhysicalExpr for Column {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         todo!()
     }
+
+    fn dyn_hash(&self, state: &mut dyn std::hash::Hasher) {
+        use std::hash::Hash;
+        let mut s = state;
+        self.hash(&mut s);
+    }
 }
 
 struct ColumnVisitor {

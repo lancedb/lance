@@ -119,7 +119,11 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
             RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(
-                    FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128).unwrap(),
+                    FixedSizeListArray::try_new_from_values(
+                        create_float32_array(num_rows * 128),
+                        128,
+                    )
+                    .unwrap(),
                 )],
             )
             .unwrap()
@@ -132,11 +136,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;
     write_params.mode = mode;
-    let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-        batches.into_iter().map(Ok),
-        schema.clone(),
-    ));
-    let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     let mut ivf_params = IvfBuildParams::default();

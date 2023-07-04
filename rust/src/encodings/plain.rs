@@ -216,8 +216,18 @@ impl<'a> PlainDecoder<'a> {
 
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
+
+        // booleans are bitpacked, so we need an offset to provide the exact
+        // requested range.
+        let offset = if self.data_type == &DataType::Boolean {
+            start % 8
+        } else {
+            0
+        };
+
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
             .len(end - start)
+            .offset(offset)
             .null_count(0)
             .add_buffer(buf)
             .build()?;
@@ -248,7 +258,9 @@ impl<'a> PlainDecoder<'a> {
         let item_array = item_decoder
             .get(start * list_size as usize..end * list_size as usize)
             .await?;
-        Ok(Arc::new(FixedSizeListArray::try_new(item_array, list_size)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+            item_array, list_size,
+        )?) as ArrayRef)
     }
 
     async fn decode_fixed_size_binary(
@@ -272,7 +284,7 @@ impl<'a> PlainDecoder<'a> {
             .ok_or_else(|| Error::Schema {
                 message: "Could not cast to UInt8Array for FixedSizeBinary".to_string(),
             })?;
-        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeBinaryArray::try_new_from_values(values, stride)?) as ArrayRef)
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
@@ -296,13 +308,16 @@ impl<'a> PlainDecoder<'a> {
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
+                // request contains the array indices we are retrieving in this chunk.
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
 
+                // Get the starting index
                 let start = request.value(0);
+                // Final index is the last value
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let array_byte_boundray = start / 8 * 8_u32;
-                let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
+
+                let shifted_indices = subtract_scalar(request, start)?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
             .buffered(num_cpus::get())
@@ -563,7 +578,7 @@ mod tests {
 
             for _ in 0..10 {
                 let items = make_array_(&t.clone(), &buffer).await;
-                let arr = FixedSizeListArray::try_new(items, 3).unwrap();
+                let arr = FixedSizeListArray::try_new_from_values(items, 3).unwrap();
                 arrs.push(Arc::new(arr) as ArrayRef);
             }
             test_round_trip(arrs.as_slice(), list_type).await;
@@ -577,7 +592,7 @@ mod tests {
 
         for _ in 0..10 {
             let values = UInt8Array::from(Vec::from_iter(1..127_u8));
-            let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
+            let arr = FixedSizeBinaryArray::try_new_from_values(&values, 3).unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -592,9 +607,11 @@ mod tests {
 
         for _ in 0..10 {
             let values = Int64Array::from_iter_values(1..=120_i64);
-            let arr =
-                FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
-                    .unwrap();
+            let arr = FixedSizeListArray::try_new_from_values(
+                FixedSizeListArray::try_new_from_values(values, 2).unwrap(),
+                2,
+            )
+            .unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -606,9 +623,11 @@ mod tests {
 
         for _ in 0..10 {
             let values = UInt8Array::from_iter_values(1..=120_u8);
-            let arr =
-                FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
-                    .unwrap();
+            let arr = FixedSizeListArray::try_new_from_values(
+                FixedSizeBinaryArray::try_new_from_values(&values, 2).unwrap(),
+                2,
+            )
+            .unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -787,7 +806,7 @@ mod tests {
         let path = Path::from("/shared_slice");
 
         let array = Int32Array::from_iter_values(0..1600);
-        let fixed_size_list = FixedSizeListArray::try_new(&array, 16).unwrap();
+        let fixed_size_list = FixedSizeListArray::try_new_from_values(array, 16).unwrap();
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "fl",
             fixed_size_list.data_type().clone(),
@@ -832,15 +851,19 @@ mod tests {
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        dbg!(&batch);
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.take(&[2, 4, 5, 8, 20], &schema).await.unwrap();
+        let actual = reader
+            .take(&[2, 4, 5, 8, 63, 64, 65], &schema)
+            .await
+            .unwrap();
 
         assert_eq!(
             actual.column_by_name("b").unwrap().as_ref(),
-            &BooleanArray::from(vec![false, false, true, false, true])
+            &BooleanArray::from(vec![false, false, true, false, false, false, true])
         );
     }
 

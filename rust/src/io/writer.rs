@@ -462,7 +462,7 @@ mod tests {
         let dict_vec = (0..100).map(|n| ["a", "b", "c"][n % 3]).collect::<Vec<_>>();
         let dict_arr: DictionaryArray<UInt32Type> = dict_vec.into_iter().collect();
 
-        let fixed_size_list_arr = FixedSizeListArray::try_new(
+        let fixed_size_list_arr = FixedSizeListArray::try_new_from_values(
             Float32Array::from_iter((0..1600).map(|n| n as f32).collect::<Vec<_>>()),
             16,
         )
@@ -470,7 +470,8 @@ mod tests {
 
         let binary_data: [u8; 800] = [123; 800];
         let fixed_size_binary_arr =
-            FixedSizeBinaryArray::try_new(&UInt8Array::from_iter(binary_data), 8).unwrap();
+            FixedSizeBinaryArray::try_new_from_values(&UInt8Array::from_iter(binary_data), 8)
+                .unwrap();
 
         let list_offsets = (0..202).step_by(2).collect();
         let list_values =

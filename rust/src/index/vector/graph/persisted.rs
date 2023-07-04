@@ -335,7 +335,7 @@ pub async fn write_graph<V: Vertex + Clone + Sync + Send>(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{FixedSizeListArray, RecordBatchIterator, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatchIterator};
 
     use super::*;
     use crate::{
@@ -409,7 +409,7 @@ mod tests {
         let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(
-                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+                FixedSizeListArray::try_new_from_values(data, dim as i32).unwrap(),
             )],
         )
         .unwrap()];
@@ -419,11 +419,8 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(RecordBatchIterator::new(
-            batches.into_iter().map(Ok),
-            schema.clone(),
-        ));
-        let dataset = Dataset::write(&mut batches, test_uri, Some(write_params))
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
