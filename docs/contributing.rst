@@ -53,7 +53,7 @@ To run the rust linters:
 .. code-block::
 
     cargo fmt --all
-    cargo clippy --all-features --tests -- -D warnings
+    cargo clippy --all-features --tests
 
 Repo Structure
 --------------
