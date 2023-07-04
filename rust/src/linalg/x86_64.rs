@@ -17,7 +17,7 @@
 pub(super) mod avx {
 
     #[inline]
-    pub(crate) unsafe fn add_f32_register(x: std::arch::x86_64::__m256) -> f32 {
+    pub unsafe fn add_f32_register(x: std::arch::x86_64::__m256) -> f32 {
         use std::arch::x86_64::*;
 
         let mut sums = x;

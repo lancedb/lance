@@ -61,7 +61,7 @@ impl L2 for [f32] {
         {
             // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
             use aarch64::neon::l2_f32;
-            return l2_f32(self, other);
+            l2_f32(self, other)
         }
 
         // Fallback on x86_64 without AVX2 / FMA, or other platforms.
@@ -74,7 +74,7 @@ impl L2 for Float32Array {
     type Output = f32;
 
     #[inline]
-    fn l2(&self, other: &Float32Array) -> f32 {
+    fn l2(&self, other: &Self) -> f32 {
         self.values().l2(other.values())
     }
 }
@@ -104,11 +104,11 @@ pub fn l2_distance_batch(from: &[f32], to: &[f32], dimension: usize) -> Arc<Floa
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
-    pub(crate) mod avx {
+    pub mod avx {
         use super::super::l2_scalar;
 
         #[inline]
-        pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             unsafe {
                 use std::arch::x86_64::*;
                 debug_assert_eq!(from.len(), to.len());
@@ -156,7 +156,7 @@ mod aarch64 {
         const STEP_SIZE: usize = UNROLL_FACTOR * INSTRUCTION_WIDTH;
 
         #[inline]
-        pub(crate) fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
+        pub fn l2_f32(from: &[f32], to: &[f32]) -> f32 {
             unsafe {
                 let len_aligned_to_unroll = from.len() / STEP_SIZE * STEP_SIZE;
                 let buf = [0.0_f32; 4];
@@ -318,6 +318,6 @@ mod tests {
         .into();
 
         let d = l2_distance_batch(q.values(), values.values(), 32);
-        assert_relative_eq!(0.31935785197341404, d.value(0));
+        assert_relative_eq!(0.319_357_84, d.value(0));
     }
 }

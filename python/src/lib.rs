@@ -18,6 +18,9 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
+use std::env;
+
+use env_logger::Env;
 use pyo3::prelude::*;
 
 pub(crate) mod dataset;
@@ -36,6 +39,11 @@ pub use scanner::Scanner;
 
 #[pymodule]
 fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
+    let env = Env::new()
+        .filter("LANCE_LOG")
+        .write_style("LANCE_LOG_STYLE");
+    env_logger::init_from_env(env);
+
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<FileFragment>()?;

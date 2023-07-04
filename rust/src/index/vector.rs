@@ -26,6 +26,7 @@ pub mod flat;
 mod graph;
 pub mod ivf;
 mod kmeans;
+#[cfg(feature = "opq")]
 pub mod opq;
 pub mod pq;
 mod traits;
@@ -37,6 +38,8 @@ use self::{
 };
 
 use super::{pb, IndexParams};
+#[cfg(feature = "opq")]
+use crate::index::vector::opq::{OPQIndex, OptimizedProductQuantizer};
 use crate::{
     dataset::Dataset,
     index::{
@@ -44,16 +47,17 @@ use crate::{
         vector::{
             diskann::{DiskANNIndex, DiskANNParams},
             ivf::Ivf,
-            opq::{OPQIndex, OptimizedProductQuantizer},
             pq::ProductQuantizer,
         },
     },
     io::{
+        deletion::LruDeletionVectorStore,
         object_reader::{read_message, ObjectReader},
         read_message_from_buf, read_metadata_offset,
     },
     linalg::{
         cosine::{cosine_distance, cosine_distance_batch},
+        dot::{dot_distance, dot_distance_batch},
         l2::{l2_distance, l2_distance_batch},
     },
     Error, Result,
@@ -94,24 +98,28 @@ pub struct Query {
 pub enum MetricType {
     L2,
     Cosine,
+    Dot, // Dot product
 }
+
+type DistanceFunc = dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static;
+type BatchDistanceFunc = dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static;
 
 impl MetricType {
     /// Compute the distance from one vector to a batch of vectors.
-    pub fn batch_func(
-        &self,
-    ) -> Arc<dyn Fn(&[f32], &[f32], usize) -> Arc<Float32Array> + Send + Sync + 'static> {
+    pub fn batch_func(&self) -> Arc<BatchDistanceFunc> {
         match self {
             Self::L2 => Arc::new(l2_distance_batch),
             Self::Cosine => Arc::new(cosine_distance_batch),
+            Self::Dot => Arc::new(dot_distance_batch),
         }
     }
 
     /// Returns the distance function between two vectors.
-    pub fn func(&self) -> Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync + 'static> {
+    pub fn func(&self) -> Arc<DistanceFunc> {
         match self {
             Self::L2 => Arc::new(l2_distance),
             Self::Cosine => Arc::new(cosine_distance),
+            Self::Dot => Arc::new(dot_distance),
         }
     }
 }
@@ -124,6 +132,7 @@ impl std::fmt::Display for MetricType {
             match self {
                 Self::L2 => "l2",
                 Self::Cosine => "cosine",
+                Self::Dot => "dot",
             }
         )
     }
@@ -134,6 +143,7 @@ impl From<super::pb::VectorMetricType> for MetricType {
         match proto {
             super::pb::VectorMetricType::L2 => Self::L2,
             super::pb::VectorMetricType::Cosine => Self::Cosine,
+            super::pb::VectorMetricType::Dot => Self::Dot,
         }
     }
 }
@@ -143,6 +153,7 @@ impl From<MetricType> for super::pb::VectorMetricType {
         match mt {
             MetricType::L2 => Self::L2,
             MetricType::Cosine => Self::Cosine,
+            MetricType::Dot => Self::Dot,
         }
     }
 }
@@ -154,6 +165,7 @@ impl TryFrom<&str> for MetricType {
         match s.to_lowercase().as_str() {
             "l2" | "euclidean" => Ok(Self::L2),
             "cosine" => Ok(Self::Cosine),
+            "dot" => Ok(Self::Dot),
             _ => Err(Error::Index {
                 message: format!("Metric type '{s}' is not supported"),
             }),
@@ -199,13 +211,15 @@ impl VectorIndexParams {
         let mut stages: Vec<StageParams> = vec![];
         stages.push(StageParams::Ivf(IvfBuildParams::new(num_partitions)));
 
-        let mut pq_params = PQBuildParams::default();
-        pq_params.num_bits = num_bits as usize;
-        pq_params.num_sub_vectors = num_sub_vectors as usize;
-        pq_params.use_opq = use_opq;
-        pq_params.metric_type = metric_type;
-        pq_params.max_iters = max_iterations;
-        pq_params.max_opq_iters = max_iterations;
+        let pq_params = PQBuildParams {
+            num_bits: num_bits as usize,
+            num_sub_vectors,
+            use_opq,
+            metric_type,
+            max_iters: max_iterations,
+            max_opq_iters: max_iterations,
+            ..Default::default()
+        };
         stages.push(StageParams::PQ(pq_params));
 
         Self {
@@ -214,6 +228,7 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
         metric_type: MetricType,
         ivf: IvfBuildParams,
@@ -291,8 +306,8 @@ pub(crate) async fn build_vector_index(
         build_ivf_pq_index(
             dataset,
             column,
-            &name,
-            &uuid,
+            name,
+            uuid,
             params.metric_type,
             ivf_params,
             pq_params,
@@ -360,9 +375,7 @@ pub(crate) async fn open_index(
         return Err(Error::Index{message:"Invalid protobuf for VectorIndex metadata".to_string()});
     };
 
-    let vec_idx = match idx_impl {
-        pb::index::Implementation::VectorIndex(vi) => vi,
-    };
+    let pb::index::Implementation::VectorIndex(vec_idx) = idx_impl;
 
     let metric_type = pb::VectorMetricType::from_i32(vec_idx.metric_type)
         .ok_or(Error::Index {
@@ -371,14 +384,24 @@ pub(crate) async fn open_index(
         .into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
+
+    let deletion_cache = Arc::new(LruDeletionVectorStore::new(
+        Arc::new(dataset.object_store().clone()),
+        object_store.base_path().clone(),
+        dataset.manifest.clone(),
+        100_usize,
+    ));
+
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
+            #[allow(unused_variables)]
             Some(Stage::Transform(tf)) => {
                 if last_stage.is_none() {
                     return Err(Error::Index {
                         message: format!("Invalid vector index stages: {:?}", vec_idx.stages),
                     });
                 }
+                #[cfg(feature = "opq")]
                 match tf.r#type() {
                     pb::TransformType::Opq => {
                         let opq = OptimizedProductQuantizer::load(
@@ -421,7 +444,11 @@ pub(crate) async fn open_index(
                     });
                 };
                 let pq = Arc::new(ProductQuantizer::try_from(pq_proto).unwrap());
-                last_stage = Some(Arc::new(PQIndex::new(pq, metric_type)));
+                last_stage = Some(Arc::new(PQIndex::new(
+                    pq,
+                    metric_type,
+                    deletion_cache.clone(),
+                )));
             }
             Some(Stage::Diskann(diskann_proto)) => {
                 if last_stage.is_some() {
@@ -433,8 +460,15 @@ pub(crate) async fn open_index(
                     });
                 };
                 let graph_path = index_dir.child(diskann_proto.filename.as_str());
-                let diskann =
-                    Arc::new(DiskANNIndex::try_new(dataset.clone(), column, &graph_path).await?);
+                let diskann = Arc::new(
+                    DiskANNIndex::try_new(
+                        dataset.clone(),
+                        column,
+                        &graph_path,
+                        deletion_cache.clone(),
+                    )
+                    .await?,
+                );
                 last_stage = Some(diskann);
             }
             _ => {}

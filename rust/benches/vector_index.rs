@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow_array::RecordBatchIterator;
 use arrow_array::{
     cast::as_primitive_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchReader,
 };
@@ -26,7 +27,7 @@ use pprof::criterion::{Output, PProfProfiler};
 use rand::{self, Rng};
 use std::sync::Arc;
 
-use lance::arrow::{FixedSizeListArrayExt, RecordBatchBuffer};
+use lance::arrow::FixedSizeListArrayExt;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::ivf::IvfBuildParams;
 use lance::index::vector::pq::PQBuildParams;
@@ -74,7 +75,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();
-                assert!(results.len() >= 1);
+                assert!(!results.is_empty());
             })
         },
     );
@@ -95,7 +96,7 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
                     .try_collect::<Vec<_>>()
                     .await
                     .unwrap();
-                assert!(results.len() >= 1);
+                assert!(!results.is_empty());
             })
         },
     );
@@ -113,20 +114,21 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
 
     let num_rows = 100_000;
     let batch_size = 10000;
-    let batches = RecordBatchBuffer::new(
-        (0..(num_rows / batch_size) as i32)
-            .map(|_| {
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(
-                        FixedSizeListArray::try_new(create_float32_array(num_rows * 128), 128)
-                            .unwrap(),
-                    )],
-                )
-                .unwrap()
-            })
-            .collect(),
-    );
+    let batches: Vec<RecordBatch> = (0..(num_rows / batch_size))
+        .map(|_| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        create_float32_array(num_rows * 128),
+                        128,
+                    )
+                    .unwrap(),
+                )],
+            )
+            .unwrap()
+        })
+        .collect();
 
     let test_uri = path.to_str().unwrap();
     std::fs::remove_dir_all(test_uri).map_or_else(|_| println!("{} not exists", test_uri), |_| {});
@@ -134,8 +136,8 @@ async fn create_file(path: &std::path::Path, mode: WriteMode) {
     write_params.max_rows_per_file = num_rows as usize;
     write_params.max_rows_per_group = batch_size as usize;
     write_params.mode = mode;
-    let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-    let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let dataset = Dataset::write(reader, test_uri, Some(write_params))
         .await
         .unwrap();
     let mut ivf_params = IvfBuildParams::default();
@@ -174,6 +176,7 @@ criterion_group!(
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_ivf_pq_index);
+
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(

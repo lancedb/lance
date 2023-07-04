@@ -15,6 +15,7 @@
 //! Extends logical expression.
 
 use arrow_schema::DataType;
+use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BuiltinScalarFunction, Operator};
 use datafusion::scalar::ScalarValue;
 use datafusion::{logical_expr::BinaryExpr, prelude::*};
@@ -36,35 +37,23 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
             DataType::UInt64 => Ok(Expr::Literal(ScalarValue::UInt64(v.map(|v| v as u64)))),
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(v.map(|v| v as f64)))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Float64(v)) => match data_type {
             DataType::Float32 => Ok(Expr::Literal(ScalarValue::Float32(v.map(|v| v as f32)))),
             DataType::Float64 => Ok(Expr::Literal(ScalarValue::Float64(*v))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Utf8(v)) => match data_type {
             DataType::Utf8 => Ok(expr.clone()),
             DataType::LargeUtf8 => Ok(Expr::Literal(ScalarValue::LargeUtf8(v.clone()))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!(
-                        "DataType '{data_type:?}' does not match to the value: {expr}"
-                    ),
-                });
-            }
+            _ => Err(Error::IO {
+                message: format!("DataType '{data_type:?}' does not match to the value: {expr}"),
+            }),
         },
         Expr::Literal(ScalarValue::Boolean(_)) | Expr::Literal(ScalarValue::Null) => {
             Ok(expr.clone())
@@ -96,22 +85,38 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
-                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                    Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
                         right: Box::new(resolve_value(right.as_ref(), &field.data_type())?),
-                    }));
+                    }))
                 }
                 (Expr::Literal(_), Expr::Column(l)) => {
                     let Some(field) = schema.field(&l.flat_name()) else {
                         return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
                     };
-                    return Ok(Expr::BinaryExpr(BinaryExpr {
+                    Ok(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(resolve_value(right.as_ref(), &field.data_type())?),
                         op: *op,
                         right: right.clone(),
-                    }));
+                    }))
                 }
+                // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
+                (Expr::Column(l), Expr::BinaryExpr(r)) => {
+                    let Some(field) = schema.field(&l.flat_name()) else {
+                        return Err(Error::IO{message: format!("Column {} does not exist in the dataset.", l.flat_name())})
+                    };
+                    Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                            left: coerce_expr(&r.left, &field.data_type()).map(Box::new)?,
+                            op: r.op,
+                            right: coerce_expr(&r.right, &field.data_type()).map(Box::new)?,
+                        })),
+                    }))
+                }
+
                 _ => Ok(expr.clone()),
             }
         }
@@ -119,6 +124,24 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             // Passthrough
             Ok(expr.clone())
         }
+    }
+}
+
+/// Coerce expression of literals to column type.
+///
+/// Parameters
+///
+/// - *expr*: a datafusion logical expression
+/// - *dtype*: a lance data type
+pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Ok(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(coerce_expr(left, dtype)?),
+            op: *op,
+            right: Box::new(coerce_expr(right, dtype)?),
+        })),
+        Expr::Literal(l) => Ok(resolve_value(&Expr::Literal(l.clone()), dtype)?),
+        _ => Ok(expr.clone()),
     }
 }
 
@@ -131,10 +154,10 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Result<Expr> {
     match expr {
         // TODO: consider making this dispatch more generic, i.e. fun.output_type -> coerce
         // instead of hardcoding coerce method for each function
-        Expr::ScalarFunction {
+        Expr::ScalarFunction(ScalarFunction {
             fun: BuiltinScalarFunction::RegexpMatch,
             args: _,
-        } => Ok(Expr::IsNotNull(Box::new(expr.to_owned()))),
+        }) => Ok(Expr::IsNotNull(Box::new(expr))),
 
         _ => Ok(expr),
     }
@@ -163,7 +186,39 @@ mod tests {
                     &Expr::Literal(ScalarValue::LargeUtf8(Some("a".to_string())))
                 )
             }
-            _ => assert!(false, "Expected BinaryExpr"),
+            _ => unreachable!("Expected BinaryExpr"),
         };
+    }
+
+    #[test]
+    fn test_resolve_binary_expr_on_right() {
+        let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float64, false)]);
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column("a".to_string().into())),
+            op: Operator::Eq,
+            right: Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(Expr::Literal(ScalarValue::Int64(Some(2)))),
+                op: Operator::Minus,
+                right: Box::new(Expr::Literal(ScalarValue::Int64(Some(-1)))),
+            })),
+        });
+        let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
+
+        match resolved {
+            Expr::BinaryExpr(be) => match be.right.as_ref() {
+                Expr::BinaryExpr(r_be) => {
+                    assert_eq!(
+                        r_be.left.as_ref(),
+                        &Expr::Literal(ScalarValue::Float64(Some(2.0)))
+                    );
+                    assert_eq!(
+                        r_be.right.as_ref(),
+                        &Expr::Literal(ScalarValue::Float64(Some(-1.0)))
+                    );
+                }
+                _ => panic!("Expected BinaryExpr"),
+            },
+            _ => panic!("Expected BinaryExpr"),
+        }
     }
 }

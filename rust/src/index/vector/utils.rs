@@ -18,12 +18,12 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
 
-use crate::arrow::{linalg::MatrixView, *};
+use crate::arrow::{linalg::matrix::MatrixView, *};
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
 /// Maybe sample training data from dataset, specified by column name.
-pub(crate) async fn maybe_sample_training_data(
+pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,

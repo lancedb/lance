@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::Float32Type;
 use arrow_arith::aggregate::min;
+use arrow_array::builder::UInt64Builder;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, Array, ArrayRef, FixedSizeListArray,
     Float32Array, RecordBatch, UInt64Array, UInt8Array,
@@ -29,11 +31,12 @@ use futures::{stream, StreamExt, TryStreamExt};
 use rand::SeedableRng;
 
 use super::{MetricType, Query, VectorIndex};
-use crate::arrow::linalg::MatrixView;
+use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::Index;
 use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
+use crate::io::deletion::LruDeletionVectorStore;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
 use crate::{Error, Result};
@@ -63,6 +66,9 @@ pub struct PQIndex {
 
     /// Metric type.
     metric_type: MetricType,
+
+    /// Deletion vector cache.
+    deletion_lookup_cache: Arc<LruDeletionVectorStore>,
 }
 
 impl std::fmt::Debug for PQIndex {
@@ -77,7 +83,11 @@ impl std::fmt::Debug for PQIndex {
 
 impl PQIndex {
     /// Load a PQ index (page) from the disk.
-    pub(crate) fn new(pq: Arc<ProductQuantizer>, metric_type: MetricType) -> Self {
+    pub(crate) fn new(
+        pq: Arc<ProductQuantizer>,
+        metric_type: MetricType,
+        deletion_cache: Arc<LruDeletionVectorStore>,
+    ) -> Self {
         Self {
             nbits: pq.num_bits,
             num_sub_vectors: pq.num_sub_vectors,
@@ -86,6 +96,7 @@ impl PQIndex {
             row_ids: None,
             pq,
             metric_type,
+            deletion_lookup_cache: deletion_cache,
         }
     }
 
@@ -257,14 +268,26 @@ impl VectorIndex for PQIndex {
         let row_ids =
             read_fixed_stride_array(reader, &DataType::UInt64, row_id_offset, length, ..).await?;
 
+        let mut filtered_row_id_builder = UInt64Builder::new();
+        let deletion_checker = self.deletion_lookup_cache.as_ref();
+        // TODO: consider a more optimized way of reading
+        // group by frag_id and check per frag in one go
+        for row_id in as_primitive_array::<UInt64Type>(row_ids.as_ref()) {
+            let row = row_id.expect("Found null row id.");
+            if !deletion_checker.is_deleted(row).await? {
+                filtered_row_id_builder.append_value(row);
+            }
+        }
+
         Ok(Arc::new(Self {
             nbits: self.pq.num_bits,
             num_sub_vectors: self.pq.num_sub_vectors,
             dimension: self.pq.dimension,
             code: Some(Arc::new(as_primitive_array(&pq_code).clone())),
-            row_ids: Some(Arc::new(as_primitive_array(&row_ids).clone())),
+            row_ids: Some(Arc::new(filtered_row_id_builder.finish())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
+            deletion_lookup_cache: self.deletion_lookup_cache.clone(),
         }))
     }
 }
@@ -316,6 +339,22 @@ impl ProductQuantizer {
         }
     }
 
+    /// Create a [`ProductQuantizer`] with pre-trained codebook.
+    pub fn new_with_codebook(
+        m: usize,
+        nbits: u32,
+        dimension: usize,
+        codebook: Arc<Float32Array>,
+    ) -> Self {
+        assert!(nbits == 8, "nbits can only be 8");
+        Self {
+            num_bits: nbits,
+            num_sub_vectors: m,
+            dimension,
+            codebook: Some(codebook),
+        }
+    }
+
     pub fn num_centroids(num_bits: u32) -> usize {
         2_usize.pow(num_bits)
     }
@@ -330,9 +369,7 @@ impl ProductQuantizer {
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
     pub fn centroids(&self, sub_vector_idx: usize) -> Option<Arc<Float32Array>> {
         assert!(sub_vector_idx < self.num_sub_vectors);
-        if self.codebook.is_none() {
-            return None;
-        };
+        self.codebook.as_ref()?;
 
         let num_centroids = Self::num_centroids(self.num_bits);
         let sub_vector_width = self.dimension / self.num_sub_vectors;
@@ -430,11 +467,11 @@ impl ProductQuantizer {
                     builder[i * num_sub_vectors + sub_idx] = code as u8;
                 }
             }
-            Ok::<UInt8Array, Error>(UInt8Array::from_iter_values(builder))
+            Ok::<UInt8Array, Error>(UInt8Array::from(builder))
         })
         .await??;
 
-        FixedSizeListArray::try_new(values, self.num_sub_vectors as i32)
+        FixedSizeListArray::try_new_from_values(values, self.num_sub_vectors as i32)
     }
 
     /// Train [`ProductQuantizer`] using vectors.
@@ -550,6 +587,7 @@ impl From<&pb::Pq> for ProductQuantizer {
     }
 }
 
+#[allow(clippy::fallible_impl_from)]
 impl From<&ProductQuantizer> for pb::Pq {
     fn from(pq: &ProductQuantizer) -> Self {
         Self {
@@ -582,8 +620,9 @@ fn divide_to_subvectors(data: &MatrixView, m: usize) -> Vec<Arc<FixedSizeListArr
             builder.append_slice(&row[start..start + sub_vector_length]);
         }
         let values = builder.finish();
-        let sub_array =
-            Arc::new(FixedSizeListArray::try_new(values, sub_vector_length as i32).unwrap());
+        let sub_array = Arc::new(
+            FixedSizeListArray::try_new_from_values(values, sub_vector_length as i32).unwrap(),
+        );
         subarrays.push(sub_array);
     }
     subarrays
@@ -609,6 +648,9 @@ pub struct PQBuildParams {
 
     /// Max number of iterations to train OPQ, if `use_opq` is true.
     pub max_opq_iters: usize,
+
+    /// User provided codebook.
+    pub codebook: Option<Arc<Float32Array>>,
 }
 
 impl Default for PQBuildParams {
@@ -620,6 +662,30 @@ impl Default for PQBuildParams {
             use_opq: false,
             max_iters: 50,
             max_opq_iters: 50,
+            codebook: None,
+        }
+    }
+}
+
+impl PQBuildParams {
+    pub fn new(num_sub_vectors: usize, num_bits: usize) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_codebook(
+        num_sub_vectors: usize,
+        num_bits: usize,
+        codebook: Arc<Float32Array>,
+    ) -> Self {
+        Self {
+            num_sub_vectors,
+            num_bits,
+            codebook: Some(codebook),
+            ..Default::default()
         }
     }
 }

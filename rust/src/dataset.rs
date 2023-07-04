@@ -15,7 +15,8 @@
 //! Lance Dataset
 //!
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::default::Default;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -26,31 +27,38 @@ use arrow_schema::Schema as ArrowSchema;
 use arrow_select::{concat::concat_batches, take::take};
 use chrono::prelude::*;
 use futures::stream::{self, StreamExt, TryStreamExt};
+use log::warn;
 use object_store::path::Path;
 use uuid::Uuid;
 
+mod feature_flags;
 pub mod fragment;
+mod hash_joiner;
 pub mod scanner;
 pub mod updater;
 mod write;
 
+use self::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 use self::fragment::FileFragment;
 use self::scanner::Scanner;
-use crate::arrow::*;
 use crate::datatypes::Schema;
+use crate::error::box_error;
 use crate::format::{pb, Fragment, Index, Manifest};
+use crate::io::object_store::ObjectStoreParams;
 use crate::io::{
     object_reader::{read_message, read_struct},
     read_manifest, read_metadata_offset, write_manifest, FileWriter, ObjectStore,
 };
 use crate::session::Session;
 use crate::{Error, Result};
+use hash_joiner::HashJoiner;
 pub use scanner::ROW_ID;
 pub use write::*;
 
 const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const INDICES_DIR: &str = "_indices";
+pub(crate) const DELETION_DIRS: &str = "_deletions";
 const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 
@@ -90,13 +98,11 @@ impl From<&Manifest> for Version {
 /// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
 async fn new_file_writer(
     object_store: &ObjectStore,
+    base_dir: &Path,
     data_file_path: &str,
     schema: &Schema,
 ) -> Result<FileWriter> {
-    let full_path = object_store
-        .base_path()
-        .child(DATA_DIR)
-        .child(data_file_path);
+    let full_path = base_dir.child(DATA_DIR).child(data_file_path);
     FileWriter::try_new(object_store, &full_path, schema.clone()).await
 }
 
@@ -126,6 +132,8 @@ pub struct ReadParams {
     ///
     /// This is useful for sharing the same session across multiple datasets.
     pub session: Option<Arc<Session>>,
+
+    pub store_options: Option<ObjectStoreParams>,
 }
 
 impl ReadParams {
@@ -148,6 +156,7 @@ impl Default for ReadParams {
             block_size: None,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
             session: None,
+            store_options: None,
         }
     }
 }
@@ -161,12 +170,15 @@ impl Dataset {
 
     /// Open a dataset with read params.
     pub async fn open_with_params(uri: &str, params: &ReadParams) -> Result<Self> {
-        let mut object_store = ObjectStore::new(uri).await?;
+        let (mut object_store, base_path) = match params.store_options.clone() {
+            Some(store_options) => ObjectStore::from_uri_and_params(uri, store_options).await?,
+            None => ObjectStore::from_uri(uri).await?,
+        };
+
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
         }
 
-        let base_path = object_store.base_path().clone();
         let latest_manifest_path = latest_manifest_path(&base_path);
 
         let session = if let Some(session) = params.session.as_ref() {
@@ -195,14 +207,12 @@ impl Dataset {
         version: u64,
         params: &ReadParams,
     ) -> Result<Self> {
-        let mut object_store = ObjectStore::new(uri).await?;
+        let (mut object_store, base_path) = ObjectStore::from_uri(uri).await?;
         if let Some(block_size) = params.block_size {
             object_store.set_block_size(block_size);
         };
 
-        let base_path = object_store.base_path().clone();
         let manifest_file = manifest_path(&base_path, version);
-
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
@@ -213,7 +223,7 @@ impl Dataset {
 
     /// Check out the specified version of this dataset
     pub async fn checkout_version(&self, version: u64) -> Result<Self> {
-        let base_path = self.object_store.base_path().clone();
+        let base_path = self.base.clone();
         let manifest_file = manifest_path(&base_path, version);
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -230,7 +240,17 @@ impl Dataset {
         manifest_path: &Path,
         session: Arc<Session>,
     ) -> Result<Self> {
-        let object_reader = object_store.open(manifest_path).await?;
+        let object_reader = object_store
+            .open(manifest_path)
+            .await
+            .map_err(|e| match &e {
+                Error::NotFound { uri } => Error::DatasetNotFound {
+                    path: uri.clone(),
+                    source: box_error(e),
+                },
+                _ => e,
+            })?;
+        // TODO: remove reference to inner.
         let get_result = object_store
             .inner
             .get(manifest_path)
@@ -245,6 +265,18 @@ impl Dataset {
         let bytes = get_result.bytes().await?;
         let offset = read_metadata_offset(&bytes)?;
         let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+
+        if !can_read_dataset(manifest.reader_feature_flags) {
+            let message = format!(
+                "This dataset cannot be read by this version of Lance. \
+                 Please upgrade Lance to read this dataset.\n Flags: {}",
+                manifest.reader_feature_flags
+            );
+            return Err(Error::NotSupported {
+                source: message.into(),
+            });
+        }
+
         manifest
             .schema
             .load_dictionary(object_reader.as_ref())
@@ -257,35 +289,28 @@ impl Dataset {
         })
     }
 
-    /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
-    ///
-    /// Returns the newly created [`Dataset`]. Returns [Error] if the dataset already exists.
-    pub async fn write(
-        batches: &mut Box<dyn RecordBatchReader>,
+    pub async fn write_impl(
+        batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(uri).await?);
+        let (object_store, base) = ObjectStore::from_uri(uri).await?;
         let mut params = params.unwrap_or_default();
 
         // Read expected manifest path for the dataset
-        let latest_manifest_path = latest_manifest_path(object_store.base_path());
+        let latest_manifest_path = latest_manifest_path(&base);
         let flag_dataset_exists = object_store.exists(&latest_manifest_path).await?;
 
-        // Read schema for the input batches
+        let mut schema: Schema = Schema::try_from(batches.schema().as_ref())?;
         let mut peekable = batches.peekable();
-        let mut schema: Schema;
         if let Some(batch) = peekable.peek() {
             if let Ok(b) = batch {
-                schema = Schema::try_from(b.schema().as_ref())?;
                 schema.set_dictionary(b)?;
-                schema.validate()?;
             } else {
                 return Err(Error::from(batch.as_ref().unwrap_err()));
             }
-        } else {
-            return Err(Error::EmptyDataset);
         }
+        schema.validate()?;
 
         // Running checks for the different write modes
         // create + dataset already exists = error
@@ -300,7 +325,7 @@ impl Dataset {
             && (matches!(params.mode, WriteMode::Append)
                 || matches!(params.mode, WriteMode::Overwrite))
         {
-            eprintln!("Warning: No existing dataset at {uri}, it will be created");
+            warn!("No existing dataset at {uri}, it will be created");
             params = WriteParams {
                 mode: WriteMode::Create,
                 ..params
@@ -311,7 +336,7 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Dataset::open(uri).await?)
+            Some(Self::open(uri).await?)
         };
 
         // append + input schema different from existing schema = error
@@ -324,6 +349,19 @@ impl Dataset {
                         new: schema,
                     });
                 }
+            }
+        }
+
+        if let Some(d) = dataset.as_ref() {
+            if !can_write_dataset(d.manifest.writer_feature_flags) {
+                let message = format!(
+                    "This dataset cannot be written by this version of Lance. \
+                Please upgrade Lance to write to this dataset.\n Flags: {}",
+                    d.manifest.writer_feature_flags
+                );
+                return Err(Error::NotSupported {
+                    source: message.into(),
+                });
             }
         }
 
@@ -353,11 +391,13 @@ impl Dataset {
         };
 
         let mut writer = None;
-        let mut buffer = RecordBatchBuffer::empty();
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut num_rows: usize = 0;
         for batch_result in peekable {
-            let batch = batch_result?;
-            buffer.batches.push(batch);
-            if buffer.num_rows() >= params.max_rows_per_group {
+            let batch: RecordBatch = batch_result?;
+            batches.push(batch.clone());
+            num_rows += batch.num_rows();
+            if num_rows >= params.max_rows_per_group {
                 // TODO: the max rows per group boundary is not accurately calculated yet.
                 if writer.is_none() {
                     writer = {
@@ -365,13 +405,13 @@ impl Dataset {
                         let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                         fragments.push(fragment);
                         fragment_id += 1;
-                        Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                        Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                     }
                 };
 
-                let batches = buffer.finish()?;
                 writer.as_mut().unwrap().write(&batches).await?;
-                buffer = RecordBatchBuffer::empty();
+                batches = Vec::new();
+                num_rows = 0;
             }
             if let Some(w) = writer.as_mut() {
                 if w.len() >= params.max_rows_per_file {
@@ -380,16 +420,15 @@ impl Dataset {
                 }
             }
         }
-        if buffer.num_rows() > 0 {
+        if num_rows > 0 {
             if writer.is_none() {
                 writer = {
                     let file_path = format!("{}.lance", Uuid::new_v4());
                     let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
                     fragments.push(fragment);
-                    Some(new_file_writer(&object_store, &file_path, &schema).await?)
+                    Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
                 }
             };
-            let batches = buffer.finish()?;
             writer.as_mut().unwrap().write(&batches).await?;
         }
         if let Some(w) = writer.as_mut() {
@@ -408,29 +447,39 @@ impl Dataset {
             None => 1,
         };
         // Inherit the index if we're just appending rows
-        let indices = if matches!(params.mode, WriteMode::Append) {
-            if let Some(d) = dataset.as_ref() {
-                Some(d.load_indices().await?)
-            } else {
-                None
-            }
-        } else {
-            None
+        let indices = match (&dataset, &params.mode) {
+            (Some(d), WriteMode::Append) => Some(d.load_indices().await?),
+            _ => None,
         };
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
-        write_manifest_file(&object_store, &mut manifest, indices).await?;
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
 
-        let base = object_store.base_path().clone();
         Ok(Self {
-            object_store,
-            base: base.into(),
+            object_store: Arc::new(object_store),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
+    }
+
+    /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
+    ///
+    /// Returns the newly created [`Dataset`]. Returns [Error] if the dataset already exists.
+    pub async fn write(
+        batches: impl RecordBatchReader + Send + 'static,
+        uri: &str,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        // Box it so we don't monomorphize for every one. We take the generic
+        // parameter for API ergonomics.
+        let batches = Box::new(batches);
+        Self::write_impl(batches, uri, params).await
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
@@ -440,8 +489,8 @@ impl Dataset {
         fragments: &[Fragment],
         mode: WriteMode,
     ) -> Result<Self> {
-        let object_store = Arc::new(ObjectStore::new(&base_uri).await?);
-        let latest_manifest = latest_manifest_path(object_store.base_path());
+        let (object_store, base) = ObjectStore::from_uri(base_uri).await?;
+        let latest_manifest = latest_manifest_path(&base);
         let mut indices = vec![];
         let mut version = 1;
         let schema = if object_store.exists(&latest_manifest).await? {
@@ -462,24 +511,119 @@ impl Dataset {
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments.to_vec()));
         manifest.version = version;
-        let duration_since_epoch = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let timestamp_nanos = duration_since_epoch.as_nanos(); // u128
-        manifest.timestamp_nanos = timestamp_nanos;
 
         // Preserve indices.
-        write_manifest_file(&object_store, &mut manifest, Some(indices)).await?;
-        let base = object_store.base_path().clone();
-
+        write_manifest_file(
+            &object_store,
+            &base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
         Ok(Self {
-            object_store,
-            base: base.into(),
+            object_store: Arc::new(object_store),
+            base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),
         })
     }
 
+    /// Merge this dataset with another arrow Table / Dataset, and returns a new version of dataset.
+    ///
+    /// Parameters:
+    ///
+    /// - `stream`: the stream of [`RecordBatch`] to merge.
+    /// - `left_on`: the column name to join on the left side (self).
+    /// - `right_on`: the column name to join on the right side (stream).
+    ///
+    /// Returns: a new version of dataset.
+    ///
+    /// It performs a left-join on the two datasets.
+    pub async fn merge_impl(
+        &mut self,
+        stream: Box<dyn RecordBatchReader + Send>,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        // Sanity check.
+        if self.schema().field(left_on).is_none() {
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the left side dataset",
+                left_on
+            )));
+        };
+        let right_schema = stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(format!(
+                "Column {} does not exist in the right side dataset",
+                right_on
+            )));
+        };
+        for field in right_schema.fields() {
+            if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
+                continue;
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(Error::invalid_input(format!(
+                    "Column {} exists in both sides of the dataset",
+                    field.name()
+                )));
+            }
+        }
+
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
+        let new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+
+        // Write new data file to each fragment. Parallelism is done over columns,
+        // so no parallelism done at this level.
+        let updated_fragments: Vec<Fragment> = stream::iter(self.get_fragments())
+            .then(|f| {
+                let joiner = joiner.clone();
+                async move { f.merge(left_on, &joiner).await.map(|f| f.metadata) }
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Inherit the index, since we are just adding columns.
+        let indices = self.load_indices().await?;
+
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+        manifest.schema = new_schema;
+
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
+    pub async fn merge(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+    ) -> Result<()> {
+        let stream = Box::new(stream);
+        self.merge_impl(stream, left_on, right_on).await
+    }
     /// Create a Scanner to scan the dataset.
     pub fn scan(&self) -> Scanner {
         Scanner::new(Arc::new(self.clone()))
@@ -602,7 +746,48 @@ impl Dataset {
         use rand::seq::IteratorRandom;
         let num_rows = self.count_rows().await?;
         let ids = (0..num_rows).choose_multiple(&mut rand::thread_rng(), n);
-        Ok(self.take(&ids[..], &projection).await?)
+        self.take(&ids[..], projection).await
+    }
+
+    /// Delete rows based on a predicate.
+    pub async fn delete(&mut self, predicate: &str) -> Result<()> {
+        let mut updated_fragments = stream::iter(self.get_fragments())
+            .map(|f| async move { f.delete(predicate).await.map(|f| f.map(|f| f.metadata)) })
+            .buffer_unordered(num_cpus::get())
+            // Drop the fragments that were deleted.
+            .try_filter_map(|f| futures::future::ready(Ok(f)))
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Maintain the order of fragment IDs.
+        updated_fragments.sort_by_key(|f| f.id);
+
+        // Inherit the index, unless we deleted all the fragments.
+        let indices = if updated_fragments.is_empty() {
+            None
+        } else {
+            Some(self.load_indices().await?)
+        };
+
+        let mut manifest = Manifest::new(self.schema(), Arc::new(updated_fragments));
+        manifest.version = self
+            .latest_manifest()
+            .await
+            .map(|m| m.version + 1)
+            .unwrap_or(1);
+
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut manifest,
+            indices,
+            Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
     }
 
     pub(crate) fn object_store(&self) -> &ObjectStore {
@@ -705,18 +890,73 @@ impl Dataset {
             Ok(vec![])
         }
     }
+
+    pub async fn validate(&self) -> Result<()> {
+        // All fragments have unique ids
+        let id_counts =
+            self.manifest
+                .fragments
+                .iter()
+                .map(|f| f.id)
+                .fold(HashMap::new(), |mut acc, id| {
+                    *acc.entry(id).or_insert(0) += 1;
+                    acc
+                });
+        for (id, count) in id_counts {
+            if count > 1 {
+                return Err(Error::corrupt_file(
+                    self.base.clone(),
+                    format!(
+                        "Duplicate fragment id {} found in dataset {:?}",
+                        id, self.base
+                    ),
+                ));
+            }
+        }
+
+        // All fragments have equal lengths
+        futures::stream::iter(self.get_fragments())
+            .map(|f| async move { f.validate().await })
+            .buffer_unordered(num_cpus::get() * 4)
+            .try_collect::<Vec<()>>()
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ManifestWriteConfig {
+    auto_set_feature_flags: bool,  // default true
+    timestamp: Option<SystemTime>, // default None
+}
+
+impl Default for ManifestWriteConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp: None,
+        }
+    }
 }
 
 /// Finish writing the manifest file, and commit the changes by linking the latest manifest file
 /// to this version.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
+    base_path: &Path,
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
+    config: ManifestWriteConfig,
 ) -> Result<()> {
+    if config.auto_set_feature_flags {
+        apply_feature_flags(manifest);
+    }
+    manifest.set_timestamp(config.timestamp);
+
     let paths = vec![
-        manifest_path(object_store.base_path(), manifest.version),
-        latest_manifest_path(object_store.base_path()),
+        manifest_path(base_path, manifest.version),
+        latest_manifest_path(base_path),
     ];
 
     for p in paths {
@@ -740,22 +980,34 @@ async fn write_manifest_file_to_path(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::ops::Range;
+    use std::vec;
+
     use super::*;
+    use crate::arrow::FixedSizeListArrayExt;
     use crate::index::vector::MetricType;
     use crate::index::IndexType;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt};
+    use crate::io::deletion::read_deletion_file;
     use crate::{datatypes::Schema, utils::testing::generate_random_array};
 
     use crate::dataset::WriteMode::Overwrite;
     use arrow_array::{
         cast::{as_string_array, as_struct_array},
-        DictionaryArray, FixedSizeListArray, Int32Array, RecordBatch, StringArray, UInt16Array,
+        DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
+    use arrow_array::{Float32Array, RecordBatchIterator, UInt32Array};
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
     use futures::stream::TryStreamExt;
     use tempfile::tempdir;
+
+    // Used to validate that futures returned are Send.
+    fn require_send<T: Send>(t: T) -> T {
+        t
+    }
 
     async fn create_file(path: &std::path::Path, mode: WriteMode) {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -767,35 +1019,34 @@ mod tests {
             ),
         ]));
         let dict_values = StringArray::from_iter_values(["a", "b", "c", "d", "e"]);
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(
-                                DictionaryArray::try_new(
-                                    &UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
-                                    &dict_values,
-                                )
-                                .unwrap(),
-                            ),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
-        let expected_batches = batches.batches.clone();
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(
+                            DictionaryArray::try_new(
+                                UInt16Array::from_iter_values((0_u16..20_u16).map(|v| v % 5)),
+                                Arc::new(dict_values.clone()),
+                            )
+                            .unwrap(),
+                        ),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let expected_batches = batches.clone();
 
         let test_uri = path.to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        write_params.mode = mode;
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut reader, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            mode,
+        };
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -844,12 +1095,154 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_empty_dataset() {
+    async fn test_create_and_fill_empty_dataset() {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(RecordBatchBuffer::empty());
-        let result = Dataset::write(&mut reader, test_uri, None).await;
-        assert!(matches!(result.unwrap_err(), Error::EmptyDataset { .. }));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let reader = RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone());
+        // check schema of reader and original is same
+        assert_eq!(schema.as_ref(), reader.schema().as_ref());
+        let result = Dataset::write(reader, test_uri, None).await.unwrap();
+        // check dataset empty
+        assert_eq!(result.count_rows().await.unwrap(), 0);
+
+        // append rows to dataset
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap()];
+        write_params.mode = WriteMode::Append;
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let expected_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+
+        // get actual dataset
+        let actual_ds = Dataset::open(test_uri).await.unwrap();
+        // confirm schema is same
+        let actual_schema = ArrowSchema::from(actual_ds.schema());
+        assert_eq!(&actual_schema, schema.as_ref());
+        // check num rows is 10
+        assert_eq!(actual_ds.count_rows().await.unwrap(), 10);
+        // check expected batch is correct
+        let actual_batches = actual_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        // sort
+        let actual_batch = concat_batches(&schema, &actual_batches).unwrap();
+        let idx_arr = actual_batch.column_by_name("i").unwrap();
+        let sorted_indices = sort_to_indices(idx_arr, None, None).unwrap();
+        let struct_arr: StructArray = actual_batch.into();
+        let sorted_arr = take(&struct_arr, &sorted_indices, None).unwrap();
+        let expected_struct_arr: StructArray = expected_batch.into();
+        assert_eq!(&expected_struct_arr, as_struct_array(sorted_arr.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn test_write_manifest() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()];
+
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let write_fut = Dataset::write(batches, test_uri, None);
+        let write_fut = require_send(write_fut);
+        let mut dataset = write_fut.await.unwrap();
+
+        // Check it has no flags
+        let manifest = read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+            .await
+            .unwrap();
+        assert_eq!(manifest.writer_feature_flags, 0);
+        assert_eq!(manifest.reader_feature_flags, 0);
+
+        // Create one with deletions
+        dataset.delete("i < 10").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Check it set the flag
+        let mut manifest =
+            read_manifest(dataset.object_store(), &latest_manifest_path(&dataset.base))
+                .await
+                .unwrap();
+        assert_eq!(
+            manifest.writer_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+        assert_eq!(
+            manifest.reader_feature_flags,
+            feature_flags::FLAG_DELETION_FILES
+        );
+
+        // Write with custom manifest
+        manifest.writer_feature_flags = 5; // Set another flag
+        manifest.reader_feature_flags = 5;
+        write_manifest_file(
+            dataset.object_store(),
+            &dataset.base,
+            &mut manifest,
+            None,
+            ManifestWriteConfig {
+                auto_set_feature_flags: false,
+                timestamp: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Check it rejects reading it
+        let read_result = Dataset::open(test_uri).await;
+        assert!(matches!(read_result, Err(Error::NotSupported { .. })));
+
+        // Check it rejects writing to it.
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap()];
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let write_result = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+        assert!(matches!(write_result, Err(Error::NotSupported { .. })));
     }
 
     #[tokio::test]
@@ -861,29 +1254,31 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(20..40))],
         )
-        .unwrap()]);
+        .unwrap()];
         write_params.mode = WriteMode::Append;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -936,18 +1331,20 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from_iter_values(0..20))],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -956,16 +1353,17 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        let new_batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let new_batches = vec![RecordBatch::try_new(
             new_schema.clone(),
             vec![Arc::new(StringArray::from_iter_values(
                 (20..40).map(|v| v.to_string()),
             ))],
         )
-        .unwrap()]);
+        .unwrap()];
         write_params.mode = WriteMode::Overwrite;
-        let mut new_batch_reader: Box<dyn RecordBatchReader> = Box::new(new_batches);
-        Dataset::write(&mut new_batch_reader, test_uri, Some(write_params))
+        let new_batch_reader =
+            RecordBatchIterator::new(new_batches.into_iter().map(Ok), new_schema.clone());
+        Dataset::write(new_batch_reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1006,28 +1404,28 @@ mod tests {
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, false),
         ]));
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1070,28 +1468,28 @@ mod tests {
             Field::new("i", DataType::Int32, false),
             Field::new("s", DataType::Utf8, false),
         ]));
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("str-{i}")),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -1136,30 +1534,31 @@ mod tests {
             false,
         )]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
             .await
             .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(10, dataset.fragments().len());
         assert_eq!(400, dataset.count_rows().await.unwrap());
+        dataset.validate().await.unwrap();
     }
 
     #[tokio::test]
@@ -1177,17 +1576,20 @@ mod tests {
         )]));
 
         let float_arr = generate_random_array(512 * dimension as usize);
-        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
+        let vectors = Arc::new(
+            <arrow_array::FixedSizeListArray as FixedSizeListArrayExt>::try_new_from_values(
+                float_arr, dimension,
+            )
+            .unwrap(),
+        );
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params = VectorIndexParams::ivf_pq(10, 8, 2, false, MetricType::L2, 50);
@@ -1195,6 +1597,7 @@ mod tests {
             .create_index(&["embeddings"], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
 
         // Check the version is set correctly
         let indices = dataset.load_indices().await.unwrap();
@@ -1203,35 +1606,34 @@ mod tests {
         assert_eq!(actual, expected);
 
         // Append should inherit index
-        let mut write_params = WriteParams::default();
-        write_params.mode = WriteMode::Append;
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
         let indices = dataset.load_indices().await.unwrap();
         let actual = indices.first().unwrap().dataset_version;
         let expected = dataset.manifest.version - 1;
         assert_eq!(actual, expected);
+        dataset.validate().await.unwrap();
 
         // Overwrite should invalidate index
-        let mut write_params = WriteParams::default();
-        write_params.mode = Overwrite;
-        let batches =
-            RecordBatchBuffer::new(vec![
-                RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()
-            ]);
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        let dataset = Dataset::write(&mut reader, test_uri, Some(write_params))
+        let write_params = WriteParams {
+            mode: WriteMode::Overwrite,
+            ..Default::default()
+        };
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors]).unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
         assert!(dataset.manifest.index_section.is_none());
         assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset.validate().await.unwrap();
     }
 
     async fn create_bad_file() -> Result<Dataset> {
@@ -1243,20 +1645,18 @@ mod tests {
             false,
         )]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20))],
+                )
+                .unwrap()
+            })
+            .collect();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut reader, test_uri, None).await
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, test_uri, None).await
     }
 
     #[tokio::test]
@@ -1269,5 +1669,187 @@ mod tests {
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_merge() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("x", DataType::Float32, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2])),
+                Arc::new(Float32Array::from(vec![3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new(vec![batch1].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch2].into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let right_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("i2", DataType::Int32, false),
+            Field::new("y", DataType::Utf8, true),
+        ]));
+        let right_batch1 = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let batches =
+            RecordBatchIterator::new(vec![right_batch1].into_iter().map(Ok), right_schema.clone());
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        dataset.merge(batches, "i", "i2").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.fragments().len(), 2);
+        assert_eq!(dataset.fragments()[0].files.len(), 2);
+        assert_eq!(dataset.fragments()[1].files.len(), 2);
+
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+        let expected = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("i", DataType::Int32, false),
+                Field::new("x", DataType::Float32, false),
+                Field::new("y", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 2])),
+                Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some("b"),
+                ])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        fn sequence_data(range: Range<u32>) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "i",
+                DataType::UInt32,
+                false,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(UInt32Array::from_iter_values(range))])
+                .unwrap()
+        }
+        // Write a dataset
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let data = sequence_data(0..100);
+        let batches = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        // Delete nothing
+        dataset.delete("i < 0").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // We should not have any deletion file still
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_none());
+
+        // Delete rows
+        dataset.delete("i < 10 OR i >= 90").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Verify result:
+        // There should be a deletion file in the metadata
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+
+        // The deletion file should contain 20 rows
+        let store = dataset.object_store().clone();
+        let path = Path::from_filesystem_path(test_uri).unwrap();
+        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 20);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..10).chain(90..100).collect::<HashSet<_>>()
+        );
+
+        // Delete more rows
+        dataset.delete("i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Verify result
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].metadata.deletion_file.is_some());
+        let deletion_vector = read_deletion_file(&path, &fragments[0].metadata, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deletion_vector.len(), 30);
+        assert_eq!(
+            deletion_vector.into_iter().collect::<HashSet<_>>(),
+            (0..20).chain(90..100).collect::<HashSet<_>>()
+        );
+
+        // Delete full fragment
+        dataset.delete("i >= 20").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Verify fragment is fully gone
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 0);
     }
 }

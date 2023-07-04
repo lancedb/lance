@@ -1,26 +1,33 @@
 [package]
 name = "pylance"
-version = "0.4.18"
+version = "0.5.3"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 rust-version = "1.65"
+exclude = ["python/lance/conftest.py"]
 
 [lib]
 name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow-array = "37.0"
-arrow-data = "37.0"
-arrow-schema = "37.0"
+arrow = { version = "42.0.0", features = ["pyarrow"] }
+arrow-array = "42.0"
+arrow-data = "42.0"
+arrow-schema = "42.0"
 chrono = "0.4.23"
-tokio = { version = "1.23", features = ["rt-multi-thread"] }
+env_logger = "0.10"
 futures = "0.3"
-pyo3 = { version = "0.18.1", features = ["extension-module", "abi3-py38"] }
-arrow = { version = "37.0.0", features = ["pyarrow"] }
-lance = { path = "../rust"}
-uuid = "1.3.0"
+lance = { path = "../rust" }
+log = "0.4"
 prost = "0.11"
+pyo3 = { version = "0.19", features = ["extension-module", "abi3-py38"] }
+tokio = { version = "1.23", features = ["rt-multi-thread"] }
+uuid = "1.3.0"
 
 [build-dependencies]
 prost-build = "0.11"
+
+[features]
+default = ["opq"]
+opq = ["lance/opq"]

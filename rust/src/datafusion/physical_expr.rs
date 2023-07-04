@@ -96,6 +96,12 @@ impl PhysicalExpr for Column {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         todo!()
     }
+
+    fn dyn_hash(&self, state: &mut dyn std::hash::Hasher) {
+        use std::hash::Hash;
+        let mut s = state;
+        self.hash(&mut s);
+    }
 }
 
 struct ColumnVisitor {
@@ -108,9 +114,9 @@ impl ColumnVisitor {
     }
 
     fn visit(&mut self, expr: &dyn PhysicalExpr) {
-        expr.as_any()
-            .downcast_ref::<Column>()
-            .map(|c| self.columns.push(c.name.clone()));
+        if let Some(c) = expr.as_any().downcast_ref::<Column>() {
+            self.columns.push(c.name.clone())
+        }
 
         expr.children().iter().for_each(|e| self.visit(e.as_ref()))
     }
@@ -148,18 +154,18 @@ mod tests {
 
         let column = Column::new("i".to_string());
         assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Int32);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+        assert!(!column.nullable(schema.as_ref()).unwrap());
 
         let column = Column::new("s".to_string());
         assert_eq!(column.data_type(schema.as_ref()).unwrap(), DataType::Utf8);
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), true);
+        assert!(column.nullable(schema.as_ref()).unwrap());
 
         let column = Column::new("st.x".to_string());
         assert_eq!(
             column.data_type(schema.as_ref()).unwrap(),
             DataType::Float32
         );
-        assert_eq!(column.nullable(schema.as_ref()).unwrap(), false);
+        assert!(!column.nullable(schema.as_ref()).unwrap());
     }
 
     #[test]
@@ -178,7 +184,7 @@ mod tests {
         ]));
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(
@@ -186,12 +192,12 @@ mod tests {
                 )),
                 Arc::new(StructArray::from(vec![
                     (
-                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Field::new("x", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
                             as ArrayRef,
                     ),
                     (
-                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Field::new("y", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values(
                             (0..10).map(|v| (v * 10) as f32),
                         )),

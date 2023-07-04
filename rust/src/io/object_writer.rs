@@ -136,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write() {
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
 
         let mut object_writer = ObjectWriter::new(&store, &Path::from("/foo"))
             .await
@@ -159,14 +159,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_proto_structs() {
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         assert_eq!(object_writer.tell(), 0);
 
-        let mut metadata = Metadata::default();
-        metadata.manifest_position = Some(100);
+        let mut metadata = Metadata {
+            manifest_position: Some(100),
+            ..Default::default()
+        };
         metadata.batch_offsets.extend([1, 2, 3, 4]);
 
         let pos = object_writer.write_struct(&metadata).await.unwrap();

@@ -11,11 +11,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-import os
-import platform
 import random
 import string
 import time
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -83,7 +82,7 @@ def run(ds, q=None, assert_func=None):
                     nearest={
                         "column": "vector",
                         "q": q,
-                        "k": 10,
+                        "k": 15,
                         "nprobes": 1,
                         "refine_factor": rf,
                     },
@@ -96,7 +95,7 @@ def run(ds, q=None, assert_func=None):
                     inmem = pa.dataset.dataset(rs)
                     assert len(inmem.to_table(filter=filter_)) == len(rs)
                 else:
-                    assert len(rs) == 10
+                    assert len(rs) == 15
                     scores = rs["score"].to_numpy()
                     assert (scores.max() - scores.min()) > 1e-6
                     if assert_func is not None:
@@ -118,7 +117,7 @@ def test_ann_append(tmp_path):
     dataset = dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
     )
-    new_data = create_table(nvec=100)
+    new_data = create_table(nvec=10)
     dataset = lance.write_dataset(new_data, dataset.uri, mode="append")
     q = new_data["vector"][0].as_py()
 
@@ -160,3 +159,34 @@ def test_has_index(dataset, tmp_path):
     assert ann_ds.has_index
 
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_create_dot_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="dot",
+    )
+    assert ann_ds.has_index
+
+
+def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
+    centroids = np.random.randn(5, 128).astype(np.float32)  # IVF5
+    dataset.create_index(
+        ["vector"],
+        index_type="IVF_PQ",
+        ivf_centroids=centroids,
+        num_partitions=5,
+        num_sub_vectors=8,
+    )
+
+    q = np.random.randn(128)
+    actual = dataset.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": q, "k": 10, "use_index": False},
+    )["id"].to_numpy()
+    assert len(actual) == 10

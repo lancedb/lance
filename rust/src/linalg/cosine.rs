@@ -45,7 +45,7 @@ impl Cosine for [f32] {
     fn cosine_fast(&self, x_norm: Self::Output, other: &Self) -> Self::Output {
         #[cfg(target_arch = "aarch64")]
         {
-            return aarch64::neon::cosine_f32(self, other, x_norm);
+            aarch64::neon::cosine_f32(self, other, x_norm)
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -97,11 +97,11 @@ mod x86_64 {
     use super::dot;
     use super::norm_l2;
 
-    pub(crate) mod avx {
+    pub mod avx {
         use super::*;
 
         #[inline]
-        pub(crate) fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
+        pub fn cosine_f32(x_vector: &[f32], y_vector: &[f32], x_norm: f32) -> f32 {
             unsafe {
                 use crate::linalg::x86_64::avx::add_f32_register;
 
@@ -109,8 +109,8 @@ mod x86_64 {
                 let mut xy = _mm256_setzero_ps();
                 let mut y_sq = _mm256_setzero_ps();
                 for i in (0..len).step_by(8) {
-                    let x = _mm256_load_ps(x_vector.as_ptr().add(i));
-                    let y = _mm256_load_ps(y_vector.as_ptr().add(i));
+                    let x = _mm256_loadu_ps(x_vector.as_ptr().add(i));
+                    let y = _mm256_loadu_ps(y_vector.as_ptr().add(i));
                     xy = _mm256_fmadd_ps(x, y, xy);
                     y_sq = _mm256_fmadd_ps(y, y, y_sq);
                 }
@@ -132,22 +132,48 @@ mod aarch64 {
     use super::dot;
     use super::norm_l2;
 
-    pub(crate) mod neon {
+    pub mod neon {
         use super::*;
 
         #[inline]
-        pub(crate) fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
+        pub fn cosine_f32(x: &[f32], y: &[f32], x_norm: f32) -> f32 {
             unsafe {
-                let len = x.len() / 4 * 4;
+                let len = x.len() / 16 * 16;
                 let buf = [0.0_f32; 4];
                 let mut xy = vld1q_f32(buf.as_ptr());
                 let mut y_sq = xy;
-                for i in (0..len).step_by(4) {
+
+                let mut xy1 = vld1q_f32(buf.as_ptr());
+                let mut y_sq1 = xy1;
+
+                let mut xy2 = vld1q_f32(buf.as_ptr());
+                let mut y_sq2 = xy2;
+
+                let mut xy3 = vld1q_f32(buf.as_ptr());
+                let mut y_sq3 = xy3;
+                for i in (0..len).step_by(16) {
                     let left = vld1q_f32(x.as_ptr().add(i));
                     let right = vld1q_f32(y.as_ptr().add(i));
                     xy = vfmaq_f32(xy, left, right);
                     y_sq = vfmaq_f32(y_sq, right, right);
+
+                    let left1 = vld1q_f32(x.as_ptr().add(i + 4));
+                    let right1 = vld1q_f32(y.as_ptr().add(i + 4));
+                    xy1 = vfmaq_f32(xy1, left1, right1);
+                    y_sq1 = vfmaq_f32(y_sq1, right1, right1);
+
+                    let left2 = vld1q_f32(x.as_ptr().add(i + 8));
+                    let right2 = vld1q_f32(y.as_ptr().add(i + 8));
+                    xy2 = vfmaq_f32(xy2, left2, right2);
+                    y_sq2 = vfmaq_f32(y_sq2, right2, right2);
+
+                    let left3 = vld1q_f32(x.as_ptr().add(i + 12));
+                    let right3 = vld1q_f32(y.as_ptr().add(i + 12));
+                    xy3 = vfmaq_f32(xy3, left3, right3);
+                    y_sq3 = vfmaq_f32(y_sq3, right3, right3);
                 }
+                xy = vaddq_f32(vaddq_f32(xy, xy3), vaddq_f32(xy1, xy2));
+                y_sq = vaddq_f32(vaddq_f32(y_sq, y_sq3), vaddq_f32(y_sq1, y_sq2));
                 // handle remaining elements
                 let mut dotprod = vaddvq_f32(xy);
                 dotprod += dot(&x[len..], &y[len..]);
@@ -171,19 +197,19 @@ mod tests {
         let y: Float32Array = (100..108).map(|v| v as f32).collect();
         let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from scipy.spatial.distance.cosine
-        assert_relative_eq!(d.value(0), 1.0 - 0.90095701);
+        assert_relative_eq!(d.value(0), 1.0 - 0.900_957);
 
         let x = Float32Array::from_iter_values([3.0, 45.0, 7.0, 2.0, 5.0, 20.0, 13.0, 12.0]);
         let y = Float32Array::from_iter_values([2.0, 54.0, 13.0, 15.0, 22.0, 34.0, 50.0, 1.0]);
         let d = cosine_distance_batch(x.values(), y.values(), 8);
         // from sklearn.metrics.pairwise import cosine_similarity
-        assert_relative_eq!(d.value(0), 1.0 - 0.8735806510613104);
+        assert_relative_eq!(d.value(0), 1.0 - 0.873_580_63);
     }
 
     #[test]
     fn test_cosine_not_aligned() {
-        let x: Float32Array = vec![16 as f32, 32 as f32].into();
-        let y: Float32Array = vec![1 as f32, 2 as f32, 4 as f32, 8 as f32].into();
+        let x: Float32Array = vec![16_f32, 32_f32].into();
+        let y: Float32Array = vec![1_f32, 2_f32, 4_f32, 8_f32].into();
         let d = cosine_distance_batch(x.values(), y.values(), 2);
         assert_relative_eq!(d.value(0), 0.0);
         assert_relative_eq!(d.value(1), 0.0);

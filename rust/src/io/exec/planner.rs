@@ -16,20 +16,27 @@
 
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_cast::can_cast_types;
+use arrow_schema::{DataType as ArrowDataType, SchemaRef, TimeUnit};
+use datafusion::sql::sqlparser::ast::{
+    BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr, Function,
+    FunctionArg, FunctionArgExpr, Ident, TimezoneInfo, UnaryOperator, Value,
+};
 use datafusion::{
-    logical_expr::{col, BinaryExpr, BuiltinScalarFunction, Like, Operator},
+    logical_expr::{
+        col,
+        expr::{InList, ScalarFunction},
+        BinaryExpr, BuiltinScalarFunction, Like, Operator,
+    },
     physical_expr::execution_props::ExecutionProps,
     physical_plan::{
-        expressions::{InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr},
+        expressions::{
+            CastExpr, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
+        },
         functions, PhysicalExpr,
     },
     prelude::Expr,
     scalar::ScalarValue,
-};
-use sqlparser::ast::{
-    BinaryOperator, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr, Ident, UnaryOperator,
-    Value,
 };
 
 use crate::datafusion::logical_expr::coerce_filter_type_to_boolean;
@@ -92,6 +99,26 @@ impl Planner {
             UnaryOperator::Not | UnaryOperator::PGBitwiseNot => {
                 Expr::Not(Box::new(self.parse_sql_expr(expr)?))
             }
+
+            UnaryOperator::Minus => {
+                use datafusion::logical_expr::lit;
+                match expr {
+                    SQLExpr::Value(Value::Number(n, _)) => match n.parse::<i64>() {
+                        Ok(n) => lit(-n),
+                        Err(_) => lit(-n
+                            .parse::<f64>()
+                            .map_err(|_e| {
+                                Error::IO{
+                                    message: format!("negative operator can be only applied to integer and float operands, got: {n}")
+                                }
+                            })?),
+                    },
+                    _ => {
+                        Expr::Negative(Box::new(self.parse_sql_expr(expr)?))
+                    }
+                }
+            }
+
             _ => {
                 return Err(Error::IO {
                     message: format!("Unary operator '{:?}' is not supported", op),
@@ -163,14 +190,106 @@ impl Planner {
                 .map(|arg| self.parse_function_args(arg).unwrap())
                 .collect::<Vec<_>>();
 
-            return Ok(Expr::ScalarFunction {
+            return Ok(Expr::ScalarFunction(ScalarFunction {
                 fun: BuiltinScalarFunction::RegexpMatch,
                 args: args_vec,
-            });
+            }));
         }
         Err(Error::IO {
             message: format!("function '{}' is not supported", func.name),
         })
+    }
+
+    fn parse_type(&self, data_type: &SQLDataType) -> Result<ArrowDataType> {
+        const SUPPORTED_TYPES: [&str; 13] = [
+            "int [unsigned]",
+            "tinyint [unsigned]",
+            "smallint [unsigned]",
+            "bigint [unsigned]",
+            "float",
+            "double",
+            "string",
+            "binary",
+            "date",
+            "timestamp(precision)",
+            "datetime(precision)",
+            "decimal(precision,scale)",
+            "boolean",
+        ];
+        match data_type {
+            SQLDataType::String => Ok(ArrowDataType::Utf8),
+            SQLDataType::Binary(_) => Ok(ArrowDataType::Binary),
+            SQLDataType::Float(_) => Ok(ArrowDataType::Float32),
+            SQLDataType::Double => Ok(ArrowDataType::Float64),
+            SQLDataType::Boolean => Ok(ArrowDataType::Boolean),
+            SQLDataType::TinyInt(_) => Ok(ArrowDataType::Int8),
+            SQLDataType::SmallInt(_) => Ok(ArrowDataType::Int16),
+            SQLDataType::Int(_) | SQLDataType::Integer(_) => Ok(ArrowDataType::Int32),
+            SQLDataType::BigInt(_) => Ok(ArrowDataType::Int64),
+            SQLDataType::UnsignedTinyInt(_) => Ok(ArrowDataType::UInt8),
+            SQLDataType::UnsignedSmallInt(_) => Ok(ArrowDataType::UInt16),
+            SQLDataType::UnsignedInt(_) | SQLDataType::UnsignedInteger(_) => {
+                Ok(ArrowDataType::UInt32)
+            }
+            SQLDataType::UnsignedBigInt(_) => Ok(ArrowDataType::UInt64),
+            SQLDataType::Date => Ok(ArrowDataType::Date32),
+            SQLDataType::Timestamp(resolution, tz) => {
+                match tz {
+                    TimezoneInfo::None => {}
+                    _ => {
+                        return Err(Error::IO {
+                            message: "Timezone not supported in timestamp".to_string(),
+                        })
+                    }
+                };
+                let time_unit = match resolution {
+                    // Default to microsecond to match PyArrow
+                    None => TimeUnit::Microsecond,
+                    Some(0) => TimeUnit::Second,
+                    Some(3) => TimeUnit::Millisecond,
+                    Some(6) => TimeUnit::Microsecond,
+                    Some(9) => TimeUnit::Nanosecond,
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!("Unsupported datetime resolution: {:?}", resolution),
+                        })
+                    }
+                };
+                Ok(ArrowDataType::Timestamp(time_unit, None))
+            }
+            SQLDataType::Datetime(resolution) => {
+                let time_unit = match resolution {
+                    None => TimeUnit::Microsecond,
+                    Some(0) => TimeUnit::Second,
+                    Some(3) => TimeUnit::Millisecond,
+                    Some(6) => TimeUnit::Microsecond,
+                    Some(9) => TimeUnit::Nanosecond,
+                    _ => {
+                        return Err(Error::IO {
+                            message: format!("Unsupported datetime resolution: {:?}", resolution),
+                        })
+                    }
+                };
+                Ok(ArrowDataType::Timestamp(time_unit, None))
+            }
+            SQLDataType::Decimal(number_info) => match number_info {
+                ExactNumberInfo::PrecisionAndScale(precision, scale) => {
+                    Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
+                }
+                _ => Err(Error::IO {
+                    message: format!(
+                        "Must provide precision and scale for decimal: {:?}",
+                        number_info
+                    ),
+                }),
+            },
+            _ => Err(Error::IO {
+                message: format!(
+                    "Unsupported data type: {:?}. Supported types: {:?}",
+                    data_type, SUPPORTED_TYPES
+                ),
+            }),
+        }
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
@@ -186,6 +305,13 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(value),
+            // For example, DATE '2020-01-01'
+            SQLExpr::TypedString { data_type, value } => {
+                Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value.clone())))),
+                    data_type: self.parse_type(data_type)?,
+                }))
+            }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(_) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsTrue(expr) => Ok(Expr::IsTrue(Box::new(self.parse_sql_expr(expr)?))),
@@ -217,11 +343,13 @@ impl Planner {
                 Box::new(self.parse_sql_expr(pattern)?),
                 *escape_char,
             ))),
-            _ => {
-                return Err(Error::IO {
-                    message: format!("Expression '{expr}' is not supported as filter in lance"),
-                })
-            }
+            SQLExpr::Cast { expr, data_type } => Ok(Expr::Cast(datafusion::logical_expr::Cast {
+                expr: Box::new(self.parse_sql_expr(expr)?),
+                data_type: self.parse_type(data_type)?,
+            })),
+            _ => Err(Error::IO {
+                message: format!("Expression '{expr}' is not supported as filter in lance"),
+            }),
         }
     }
 
@@ -239,32 +367,65 @@ impl Planner {
     /// Create the [`PhysicalExpr`] from a logical [`Expr`]
     pub fn create_physical_expr(&self, expr: &Expr) -> Result<Arc<dyn PhysicalExpr>> {
         use crate::datafusion::physical_expr::Column;
-        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::physical_expr::expressions::{BinaryExpr, NegativeExpr};
 
         Ok(match expr {
             Expr::Column(c) => Arc::new(Column::new(c.flat_name())),
             Expr::Literal(v) => Arc::new(Literal::new(v.clone())),
-            Expr::BinaryExpr(expr) => Arc::new(BinaryExpr::new(
-                self.create_physical_expr(expr.left.as_ref())?,
-                expr.op,
-                self.create_physical_expr(expr.right.as_ref())?,
-            )),
+            Expr::BinaryExpr(expr) => {
+                let left = self.create_physical_expr(expr.left.as_ref())?;
+                let right = self.create_physical_expr(expr.right.as_ref())?;
+                let left_data_type = left.data_type(&self.schema)?;
+                let right_data_type = right.data_type(&self.schema)?;
+                // Make sure RHS matches the LHS
+                let right = if right_data_type != left_data_type {
+                    if can_cast_types(&right_data_type, &left_data_type) {
+                        Arc::new(CastExpr::new(right, left_data_type, None))
+                    } else {
+                        return Err(Error::invalid_input(format!(
+                            "Cannot compare {} and {}",
+                            left_data_type, right_data_type
+                        )));
+                    }
+                } else {
+                    right
+                };
+                Arc::new(BinaryExpr::new(left, expr.op, right))
+            }
+            Expr::Negative(expr) => {
+                Arc::new(NegativeExpr::new(self.create_physical_expr(expr.as_ref())?))
+            }
             Expr::IsNotNull(expr) => Arc::new(IsNotNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsNull(expr) => Arc::new(IsNullExpr::new(self.create_physical_expr(expr)?)),
             Expr::IsTrue(expr) => self.create_physical_expr(expr)?,
             Expr::IsFalse(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::InList {
+            Expr::InList(InList {
                 expr,
                 list,
                 negated,
-            } => Arc::new(InListExpr::new(
-                self.create_physical_expr(expr)?,
-                list.iter()
-                    .map(|e| self.create_physical_expr(e))
-                    .collect::<Result<Vec<_>>>()?,
-                *negated,
-                self.schema.as_ref(),
-            )),
+            }) => {
+                // It's important that all the values in the list are casted to match
+                // the datatype of the column.
+                let expr = self.create_physical_expr(expr)?;
+                let datatype = expr.data_type(self.schema.as_ref())?;
+
+                let list = list
+                    .iter()
+                    .map(|e| {
+                        let e = self.create_physical_expr(e)?;
+                        if e.data_type(self.schema.as_ref())? == datatype {
+                            Ok(e)
+                        } else {
+                            // Cast the value to the column's datatype
+                            let e: Arc<dyn PhysicalExpr> =
+                                Arc::new(CastExpr::new(e, datatype.clone(), None));
+                            Ok(e)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                Arc::new(InListExpr::new(expr, list, *negated, None))
+            }
             Expr::Like(expr) => Arc::new(LikeExpr::new(
                 expr.negated,
                 true,
@@ -272,7 +433,11 @@ impl Planner {
                 self.create_physical_expr(expr.pattern.as_ref())?,
             )),
             Expr::Not(expr) => Arc::new(NotExpr::new(self.create_physical_expr(expr)?)),
-            Expr::ScalarFunction { fun, args } => {
+            Expr::Cast(datafusion::logical_expr::Cast { expr, data_type }) => {
+                let expr = self.create_physical_expr(expr.as_ref())?;
+                Arc::new(CastExpr::new(expr, data_type.clone(), None))
+            }
+            Expr::ScalarFunction(ScalarFunction { fun, args }) => {
                 if fun != &BuiltinScalarFunction::RegexpMatch {
                     return Err(Error::IO {
                         message: format!("Scalar function '{:?}' is not supported", fun),
@@ -320,10 +485,12 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
+        ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Field, Fields, Schema};
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{col, lit, Cast};
 
     #[test]
     fn test_parse_filter_simple() {
@@ -366,7 +533,7 @@ mod tests {
         println!("Physical expr: {:#?}", physical_expr);
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(StringArray::from_iter_values(
@@ -374,12 +541,12 @@ mod tests {
                 )),
                 Arc::new(StructArray::from(vec![
                     (
-                        Field::new("x", DataType::Float32, false),
+                        Arc::new(Field::new("x", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values((0..10).map(|v| v as f32)))
                             as ArrayRef,
                     ),
                     (
-                        Field::new("y", DataType::Float32, false),
+                        Arc::new(Field::new("y", DataType::Float32, false)),
                         Arc::new(Float32Array::from_iter_values(
                             (0..10).map(|v| (v * 10) as f32),
                         )),
@@ -398,6 +565,36 @@ mod tests {
     }
 
     #[test]
+    fn test_negative_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = col("x")
+            .gt(lit(-3_i64))
+            .and(col("x").lt(-(lit(-5_i64) + lit(3_i64))));
+
+        let expr = planner.parse_filter("x > -3 AND x < -(-5 + 3)").unwrap();
+
+        assert_eq!(expr, expected);
+
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(-5..5)) as ArrayRef],
+        )
+        .unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, false, false, false
+            ])
+        );
+    }
+
+    #[test]
     fn test_sql_like() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
 
@@ -410,7 +607,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -438,7 +635,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -466,7 +663,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter_values(
                 (0..10).map(|v| format!("str-{}", v)),
             ))],
@@ -493,7 +690,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(StringArray::from_iter((0..10).map(|v| {
                 if v % 3 == 0 {
                     Some(format!("str-{}", v))
@@ -532,7 +729,7 @@ mod tests {
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![Arc::new(BooleanArray::from_iter(
                 (0..10).map(|v| Some(v % 3 == 0)),
             ))],
@@ -545,5 +742,184 @@ mod tests {
                 false, true, true, false, true, true, false, true, true, false
             ])
         );
+    }
+
+    #[test]
+    fn test_sql_cast() {
+        let cases = &[
+            (
+                "x = cast('2021-01-01 00:00:00' as timestamp)",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00' as timestamp(0))",
+                ArrowDataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00.123' as timestamp(9))",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "x = cast('2021-01-01 00:00:00.123' as datetime(9))",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            ("x = cast('2021-01-01' as date)", ArrowDataType::Date32),
+            (
+                "x = cast('1.238' as decimal(9,3))",
+                ArrowDataType::Decimal128(9, 3),
+            ),
+            ("x = cast(1 as float)", ArrowDataType::Float32),
+            ("x = cast(1 as double)", ArrowDataType::Float64),
+            ("x = cast(1 as tinyint)", ArrowDataType::Int8),
+            ("x = cast(1 as smallint)", ArrowDataType::Int16),
+            ("x = cast(1 as int)", ArrowDataType::Int32),
+            ("x = cast(1 as integer)", ArrowDataType::Int32),
+            ("x = cast(1 as bigint)", ArrowDataType::Int64),
+            ("x = cast(1 as tinyint unsigned)", ArrowDataType::UInt8),
+            ("x = cast(1 as smallint unsigned)", ArrowDataType::UInt16),
+            ("x = cast(1 as int unsigned)", ArrowDataType::UInt32),
+            ("x = cast(1 as integer unsigned)", ArrowDataType::UInt32),
+            ("x = cast(1 as bigint unsigned)", ArrowDataType::UInt64),
+            ("x = cast(1 as boolean)", ArrowDataType::Boolean),
+            ("x = cast(1 as string)", ArrowDataType::Utf8),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+
+            // Get the thing after 'cast(` but before ' as'.
+            let expected_value_str = sql
+                .split("cast(")
+                .nth(1)
+                .unwrap()
+                .split(" as")
+                .next()
+                .unwrap();
+            // Remove any quote marks
+            let expected_value_str = expected_value_str.trim_matches('\'');
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Cast(Cast { expr, data_type }) => {
+                        match expr.as_ref() {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                                assert_eq!(value_str, expected_value_str);
+                            }
+                            Expr::Literal(ScalarValue::Int64(Some(value))) => {
+                                assert_eq!(*value, 1);
+                            }
+                            _ => panic!("Expected cast to be applied to literal"),
+                        }
+                        assert_eq!(data_type, expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_literals() {
+        let cases = &[
+            (
+                "x = timestamp '2021-01-01 00:00:00'",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "x = timestamp(0) '2021-01-01 00:00:00'",
+                ArrowDataType::Timestamp(TimeUnit::Second, None),
+            ),
+            (
+                "x = timestamp(9) '2021-01-01 00:00:00.123'",
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            ("x = date '2021-01-01'", ArrowDataType::Date32),
+            ("x = decimal(9,3) '1.238'", ArrowDataType::Decimal128(9, 3)),
+        ];
+
+        for (sql, expected_data_type) in cases {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "x",
+                expected_data_type.clone(),
+                true,
+            )]));
+            let planner = Planner::new(schema.clone());
+            let expr = planner.parse_filter(sql).unwrap();
+
+            let expected_value_str = sql.split('\'').nth(1).unwrap();
+
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
+                    Expr::Cast(Cast { expr, data_type }) => {
+                        match expr.as_ref() {
+                            Expr::Literal(ScalarValue::Utf8(Some(value_str))) => {
+                                assert_eq!(value_str, expected_value_str);
+                            }
+                            _ => panic!("Expected cast to be applied to literal"),
+                        }
+                        assert_eq!(data_type, expected_data_type);
+                    }
+                    _ => panic!("Expected right to be a cast"),
+                },
+                _ => panic!("Expected binary expression"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sql_comparison() {
+        // Create a batch with all data types
+        let batch: Vec<(&str, ArrayRef)> = vec![
+            (
+                "timestamp_s",
+                Arc::new(TimestampSecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ms",
+                Arc::new(TimestampMillisecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_us",
+                Arc::new(TimestampMicrosecondArray::from_iter_values(0..10)),
+            ),
+            (
+                "timestamp_ns",
+                Arc::new(TimestampNanosecondArray::from_iter_values(4995..5005)),
+            ),
+        ];
+        let batch = RecordBatch::try_from_iter(batch).unwrap();
+
+        let planner = Planner::new(batch.schema());
+
+        // Each expression is meant to select the final 5 rows
+        let expressions = &[
+            "timestamp_s >= TIMESTAMP '1970-01-01 00:00:05'",
+            "timestamp_ms >= TIMESTAMP '1970-01-01 00:00:00.005'",
+            "timestamp_us >= TIMESTAMP '1970-01-01 00:00:00.000005'",
+            "timestamp_ns >= TIMESTAMP '1970-01-01 00:00:00.000005'",
+        ];
+
+        let expected: ArrayRef = Arc::new(BooleanArray::from_iter(
+            std::iter::repeat(Some(false))
+                .take(5)
+                .chain(std::iter::repeat(Some(true)).take(5)),
+        ));
+        for expression in expressions {
+            // convert to physical expression
+            let logical_expr = planner.parse_filter(expression).unwrap();
+            let physical_expr = planner.create_physical_expr(&logical_expr).unwrap();
+
+            // Evaluate and assert they have correct results
+            let result = physical_expr.evaluate(&batch).unwrap();
+            let result = result.into_array(batch.num_rows());
+            assert_eq!(&expected, &result, "unexpected result for {}", expression);
+        }
     }
 }

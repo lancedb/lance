@@ -24,7 +24,7 @@ use rand::distributions::Uniform;
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::arrow::{linalg::MatrixView, *};
+use crate::arrow::{linalg::matrix::MatrixView, *};
 use crate::dataset::{Dataset, ROW_ID};
 use crate::index::pb;
 use crate::index::vector::diskann::row_vertex::RowVertexSerDe;
@@ -40,7 +40,7 @@ use crate::{Error, Result};
 use super::row_vertex::RowVertex;
 use super::search::greedy_search;
 
-pub(crate) async fn build_diskann_index(
+pub async fn build_diskann_index(
     dataset: &Dataset,
     column: &str,
     name: &str,
@@ -79,8 +79,9 @@ pub(crate) async fn build_diskann_index(
     let filename = "diskann_graph.lance";
     let graph_file = index_dir.child(filename);
 
-    let mut write_params = WriteGraphParams::default();
-    write_params.batch_size = 2048 * 10;
+    let write_params = WriteGraphParams {
+        batch_size: 2048 * 10,
+    };
     let serde = RowVertexSerDe {};
 
     write_graph(
@@ -318,6 +319,7 @@ async fn index_once<V: Vertex + Clone + Sync + Send>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_index_file(
     dataset: &Dataset,
     column: &str,
@@ -355,6 +357,7 @@ async fn write_index_file(
             metric_type: match metric_type {
                 MetricType::L2 => pb::VectorMetricType::L2.into(),
                 MetricType::Cosine => pb::VectorMetricType::Cosine.into(),
+                MetricType::Dot => pb::VectorMetricType::Dot.into(),
             },
         })),
     };
@@ -372,7 +375,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile;
 
@@ -389,19 +392,21 @@ mod tests {
             true,
         )]));
         let data = generate_random_array(n * dim);
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches = vec![RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(
-                FixedSizeListArray::try_new(&data, dim as i32).unwrap(),
+                FixedSizeListArray::try_new_from_values(data, dim as i32).unwrap(),
             )],
         )
-        .unwrap()]);
+        .unwrap()];
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let mut batches: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut batches, uri, Some(write_params))
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, uri, Some(write_params))
             .await
             .unwrap();
 

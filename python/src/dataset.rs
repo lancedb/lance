@@ -17,9 +17,10 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatchReader};
+use arrow_array::{Float32Array, RecordBatch};
 use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
+use lance::arrow::as_fixed_size_list_array;
 use lance::dataset::fragment::FileFragment as LanceFileFragment;
 use lance::dataset::ReadParams;
 use lance::datatypes::Schema;
@@ -70,6 +71,7 @@ impl Dataset {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
             session: None,
+            store_options: None,
         };
         let dataset = rt.block_on(async {
             if let Some(ver) = version {
@@ -122,13 +124,13 @@ impl Dataset {
                     .unwrap();
                 dict.set_item("uuid", idx.uuid.to_string()).unwrap();
                 dict.set_item("fields", field_names).unwrap();
-                dict.set_item("version", idx.dataset_version.clone())
-                    .unwrap();
+                dict.set_item("version", idx.dataset_version).unwrap();
                 dict.to_object(py)
             })
             .collect::<Vec<_>>())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -264,11 +266,10 @@ impl Dataset {
 
     fn count_rows(&self) -> PyResult<usize> {
         self.rt.block_on(async {
-            Ok(self
-                .ds
+            self.ds
                 .count_rows()
                 .await
-                .map_err(|err| PyIOError::new_err(err.to_string()))?)
+                .map_err(|err| PyIOError::new_err(err.to_string()))
         })
     }
 
@@ -276,9 +277,34 @@ impl Dataset {
         let projection = self_.ds.schema();
         let batch = self_
             .rt
-            .block_on(async { self_.ds.take(&row_indices, &projection).await })
+            .block_on(async { self_.ds.take(&row_indices, projection).await })
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
+    }
+
+    fn merge(
+        &mut self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: &str,
+        right_on: &str,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.merge(reader.0, left_on, right_on);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn delete(&mut self, predicate: String) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let fut = new_self.delete(&predicate);
+        self.rt.block_on(
+            async move { fut.await.map_err(|err| PyIOError::new_err(err.to_string())) },
+        )?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<PyObject>> {
@@ -357,11 +383,28 @@ impl Dataset {
                     };
 
                     if let Some(o) = kwargs.get_item("use_opq") {
+                        #[cfg(not(feature = "opq"))]
+                        if PyAny::downcast::<PyBool>(o)?.extract()? {
+                            return Err(PyValueError::new_err(format!(
+                                "Feature 'opq' is not installed."
+                            )));
+                        }
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
 
                     if let Some(o) = kwargs.get_item("max_opq_iterations") {
                         pq_params.max_opq_iters = PyAny::downcast::<PyInt>(o)?.extract()?
+                    };
+
+                    if let Some(c) = kwargs.get_item("ivf_centroids") {
+                        let batch = RecordBatch::from_pyarrow(c)?;
+                        if "_ivf_centroids" != batch.schema().field(0).name() {
+                            return Err(PyValueError::new_err(
+                                "Expected '_ivf_centroids' as the first column name.",
+                            ));
+                        }
+                        let centroids = as_fixed_size_list_array(batch.column(0));
+                        ivf_params.centroids = Some(Arc::new(centroids.clone()))
                     };
                 }
                 VectorIndexParams::with_ivf_pq_params(m_type, ivf_params, pq_params)
@@ -416,7 +459,7 @@ impl Dataset {
 
     fn get_fragment(self_: PyRef<'_, Self>, fragment_id: usize) -> PyResult<Option<FileFragment>> {
         if let Some(fragment) = self_.ds.get_fragment(fragment_id) {
-            Ok(Some(FileFragment::new(fragment.clone())))
+            Ok(Some(FileFragment::new(fragment)))
         } else {
             Ok(None)
         }
@@ -465,22 +508,23 @@ impl Dataset {
 pub fn write_dataset(reader: &PyAny, uri: &str, options: &PyDict) -> PyResult<bool> {
     let params = get_write_params(options)?;
     Runtime::new()?.block_on(async move {
-        let mut batches: Box<dyn RecordBatchReader> = if reader.is_instance_of::<Scanner>()? {
+        if reader.is_instance_of::<Scanner>() {
             let scanner: Scanner = reader.extract()?;
-            Box::new(
-                scanner
-                    .to_reader()
-                    .await
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            )
+            let batches = scanner
+                .to_reader()
+                .await
+                .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
         } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?)
-        };
-
-        LanceDataset::write(&mut batches, uri, params)
-            .await
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(true)
+            let batches = ArrowArrayStreamReader::from_pyarrow(reader)?;
+            LanceDataset::write(batches, uri, params)
+                .await
+                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            Ok(true)
+        }
     })
 }
 

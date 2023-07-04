@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-///! DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node
+/// DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node
 ///
 /// Modified from diskann paper. The vector store is backed by the `lance` dataset.
 mod builder;
@@ -111,7 +111,7 @@ impl DiskANNParams {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use tempfile::tempdir;
 
@@ -141,17 +141,14 @@ mod tests {
         )]));
 
         let float_arr = generate_random_array(512 * dimension as usize);
-        let vectors = Arc::new(FixedSizeListArray::try_new(float_arr, dimension).unwrap());
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
-            schema.clone(),
-            vec![vectors.clone()],
-        )
-        .unwrap()]);
+        let vectors =
+            Arc::new(FixedSizeListArray::try_new_from_values(float_arr, dimension).unwrap());
+        let batches = vec![RecordBatch::try_new(schema.clone(), vec![vectors.clone()]).unwrap()];
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         // Make sure valid arguments should create index successfully
         let params =

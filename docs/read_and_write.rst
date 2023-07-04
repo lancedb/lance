@@ -31,10 +31,82 @@ also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` e
         yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
         yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
 
-    lance.write_dataset(producer, "./alice_and_bob.lance")
+    schema = pa.schema([
+            pa.field("name", pa.string()),
+            pa.field("age", pa.int64()),
+        ])
+
+    lance.write_dataset(reader, "./alice_and_bob.lance", schema)
 
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
+
+Adding new columns
+~~~~~~~~~~~~~~~~~~
+
+New columns can be merged into an existing dataset in using :py:meth:`lance.Dataset.merge`.
+This allows filling in additional columns without having to rewrite the whole dataset.
+
+To use the ``merge`` method, provide a new table that includes the columns you
+want to add, and a column name to use for joining the new data to the existing
+dataset.
+
+For example, imagine we have a dataset of embeddings and ids:
+
+.. testcode::
+
+    import lance
+    import pyarrow as pa
+    import numpy as np
+    table = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "embedding": pa.array([np.array([1, 2, 3]), np.array([4, 5, 6]),
+                              np.array([7, 8, 9])])
+    })
+    dataset = lance.write_dataset(table, "embeddings")
+
+Now if we want to add a column of labels we have generated, we can do so by merging a new table:
+
+.. testcode::
+
+    new_data = pa.table({
+       "id": pa.array([1, 2, 3]),
+       "label": pa.array(["horse", "rabbit", "cat"])
+    })
+    dataset.merge(new_data, "id")
+    dataset.to_table().to_pandas()
+
+.. testoutput::
+
+       id  embedding   label
+    0   1  [1, 2, 3]   horse
+    1   2  [4, 5, 6]  rabbit
+    2   3  [7, 8, 9]     cat
+
+Deleting rows
+~~~~~~~~~~~~~
+
+Lance supports deleting rows from a dataset using a SQL filter. For example, to
+delete Bob's row from the dataset above, one could use:
+
+  .. code-block:: python
+
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.delete("name = 'Bob'")
+
+:py:meth:`lance.LanceDataset.delete` supports the same filters as described in
+:ref:`filter-push-down`.
+
+Rows are deleted by marking them as deleted in a separate deletion index. This is
+faster than rewriting the files and also avoids invaliding any indices that point
+to those files. Any subsequent queries will not return the deleted rows.
+
+.. warning::
+  
+  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
+  as they will return the deleted rows. This is fixed in 0.5.0 and later.
 
 Reading Lance Dataset
 ---------------------
@@ -89,6 +161,9 @@ using the :py:meth:`lance.LanceDataset.to_batches` method:
 Unsurprisingly, :py:meth:`~lance.LanceDataset.to_batches` takes the same parameters
 as :py:meth:`~lance.LanceDataset.to_table` function.
 
+
+.. _filter-push-down:
+
 Filter push-down
 ~~~~~~~~~~~~~~~~
 
@@ -103,6 +178,9 @@ Currently, Lance supports a growing list of expressions.
 * ``IS NULL``, ``IS NOT NULL``
 * ``IS TRUE``, ``IS NOT TRUE``, ``IS FALSE``, ``IS NOT FALSE``
 * ``IN``
+* ``LIKE``, ``NOT LIKE``
+* ``regexp_match(column, pattern)``
+* ``CAST``
 
 For example, the following filter string is acceptable:
 
@@ -111,11 +189,82 @@ For example, the following filter string is acceptable:
     ((label IN [10, 20]) AND (note.email IS NOT NULL))
         OR NOT note.created
 
- .. warning::
+If your column name contains special characters or is a `SQL Keyword <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>`_,
+you can use backtick (`````) to escape it. For nested fields, each segment of the
+path must be wrapped in backticks. 
 
-    Currently limitation: it does not support filter on columns that are
-    `SQL Keywords <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>_`.
-    We are working on a resolution. For now please rename the column for filter predicates to work
+  .. code-block:: SQL
+
+    `CUBE` = 10 AND `column name with space` IS NOT NULL
+      AND `nested with space`.`inner with space` < 2
+
+.. warning::
+
+  Field names containing periods (``.``) are not supported.
+
+Literals for dates, timestamps, and decimals can be written by writing the string
+value after the type name. For example
+
+  .. code-block:: SQL
+
+    date_col = date '2021-01-01'
+    and timestamp_col = timestamp '2021-01-01 00:00:00'
+    and decimal_col = decimal(8,3) '1.000'
+
+For timestamp columns, the precision can be specified as a number in the type
+parameter. Microsecond precision (6) is the default.
+
+.. list-table::
+    :widths: 30 40
+    :header-rows: 1
+
+    * - SQL
+      - Time unit
+    * - ``timestamp(0)``
+      - Seconds
+    * - ``timestamp(3)``
+      - Milliseconds
+    * - ``timestamp(6)``
+      - Microseconds
+    * - ``timestamp(9)``
+      - Nanoseconds
+
+Lance internally stores data in Arrow format. The mapping from SQL types to Arrow
+is:
+
+.. list-table::
+    :widths: 30 40
+    :header-rows: 1
+
+    * - SQL type
+      - Arrow type
+    * - ``boolean``
+      - ``Boolean``
+    * - ``tinyint`` / ``tinyint unsigned``
+      - ``Int8`` / ``UInt8``
+    * - ``smallint`` / ``smallint unsigned``
+      - ``Int16`` / ``UInt16``
+    * - ``int`` or ``integer`` / ``int unsigned`` or ``integer unsigned``
+      - ``Int32`` / ``UInt32``
+    * - ``bigint`` / ``bigint unsigned``
+      - ``Int64`` / ``UInt64``
+    * - ``float``
+      - ``Float32``
+    * - ``double``
+      - ``Float64``
+    * - ``decimal(precision, scale)``
+      - ``Decimal128``
+    * - ``date``
+      - ``Date32``
+    * - ``timestamp``
+      - ``Timestamp`` (1)
+    * - ``string``
+      - ``Utf8``
+    * - ``binary``
+      - ``Binary``
+
+(1) See precision mapping in previous table.
+
 
 Random read
 ~~~~~~~~~~~

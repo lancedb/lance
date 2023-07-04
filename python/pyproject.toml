@@ -52,3 +52,6 @@ tests = [
     "duckdb",
     "polars[pyarrow,pandas]",
 ]
+
+[tool.isort]
+profile = "black"

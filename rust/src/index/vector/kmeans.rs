@@ -27,6 +27,7 @@ use crate::{
 };
 
 /// Train KMeans model and returns the centroids of each cluster.
+#[allow(clippy::too_many_arguments)]
 pub async fn train_kmeans(
     array: &Float32Array,
     centroids: Option<Arc<Float32Array>>,
@@ -71,6 +72,6 @@ pub async fn train_kmeans(
         redos,
         ..Default::default()
     };
-    let model = KMeans::new_with_params(&data, dimension, k, &params).await;
+    let model = KMeans::new_with_params(&data, dimension, k, &params).await?;
     Ok(model.centroids.as_ref().clone())
 }

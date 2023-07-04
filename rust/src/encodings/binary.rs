@@ -34,6 +34,7 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use arrow_select::{concat::concat, take::take};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
 
@@ -148,7 +149,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// use lance::encodings::binary::BinaryDecoder;
     ///
     /// async {
-    ///     let object_store = ObjectStore::new(":memory:").await.unwrap();
+    ///     let object_store = ObjectStore::memory();
     ///     let path = Path::from("/data.lance");
     ///     let reader = object_store.open(&path).await.unwrap();
     ///     let string_decoder = BinaryDecoder::<Utf8Type>::new(reader.as_ref(), 100, 1024, true);
@@ -204,7 +205,11 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
             .into_data()
         };
 
-        let bytes = self.reader.get_range(start as usize..end as usize).await?;
+        let bytes: Bytes = if start >= end {
+            Bytes::new()
+        } else {
+            self.reader.get_range(start as usize..end as usize).await?
+        };
 
         let mut data_builder = ArrayDataBuilder::new(T::DATA_TYPE)
             .len(range.len())
@@ -405,7 +410,7 @@ mod tests {
         path: &Path,
         arr: &[&GenericStringArray<O>],
     ) -> Result<usize> {
-        let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let mut object_writer = ObjectWriter::new(store, path).await.unwrap();
         // Write some garbage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);

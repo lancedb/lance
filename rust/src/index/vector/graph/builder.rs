@@ -20,13 +20,13 @@ use arrow_array::UInt32Array;
 use async_trait::async_trait;
 
 use super::{Graph, Vertex};
-use crate::arrow::linalg::MatrixView;
-use crate::index::vector::MetricType;
+use crate::arrow::linalg::matrix::MatrixView;
+use crate::index::vector::{DistanceFunc, MetricType};
 use crate::{Error, Result};
 
 /// A graph node to hold the vertex data and its neighbors.
 #[derive(Debug)]
-pub(crate) struct Node<V: Vertex> {
+pub struct Node<V: Vertex> {
     /// The vertex metadata. will be serialized into fixed size binary in the persisted graph.
     pub(crate) vertex: V,
 
@@ -38,7 +38,7 @@ pub(crate) struct Node<V: Vertex> {
 /// A Graph that allows dynamically build graph to be persisted later.
 ///
 /// It requires all vertices to be of the same size.
-pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
+pub struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     pub(crate) nodes: Vec<Node<V>>,
 
     /// Hold all vectors in memory for fast access at the moment.
@@ -48,10 +48,10 @@ pub(crate) struct GraphBuilder<V: Vertex + Clone + Sync + Send> {
     metric_type: MetricType,
 
     /// Distance function.
-    distance_func: Arc<dyn Fn(&[f32], &[f32]) -> f32 + Send + Sync>,
+    distance_func: Arc<DistanceFunc>,
 }
 
-impl<'a, V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
+impl<V: Vertex + Clone + Sync + Send> GraphBuilder<V> {
     pub fn new(vertices: &[V], data: MatrixView, metric_type: MetricType) -> Self {
         Self {
             nodes: vertices

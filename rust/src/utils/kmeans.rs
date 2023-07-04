@@ -12,23 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::min;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_arith::arithmetic::{add, divide_scalar};
 use arrow_array::{
     builder::Float32Builder, cast::as_primitive_array, new_empty_array, Array, Float32Array,
 };
 use arrow_schema::DataType;
 use arrow_select::concat::concat;
 use futures::stream::{self, repeat_with, StreamExt, TryStreamExt};
+use log::{info, warn};
 use rand::prelude::*;
 use rand::{distributions::WeightedIndex, Rng};
 
-use crate::arrow::linalg::MatrixView;
+use crate::arrow::linalg::matrix::MatrixView;
 use crate::index::vector::MetricType;
+use crate::linalg::{cosine::Cosine, dot::Dot, l2::L2};
+use crate::Error;
 use crate::Result;
-use crate::{arrow::*, Error};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq, Eq)]
@@ -136,16 +138,17 @@ async fn kmean_plusplus(
     kmeans
 }
 
-/// Randomly initialize kmeans centroids
+/// Randomly initialize kmeans centroids.
+///
+///
 async fn kmeans_random_init(
     data: &Float32Array,
     dimension: usize,
     k: usize,
     mut rng: impl Rng,
     metric_type: MetricType,
-) -> KMeans {
-    assert!(data.len() > k * dimension);
-
+) -> Result<KMeans> {
+    assert!(data.len() >= k * dimension);
     let chosen = (0..data.len() / dimension)
         .choose_multiple(&mut rng, k)
         .to_vec();
@@ -155,7 +158,7 @@ async fn kmeans_random_init(
     }
     let mut kmeans = KMeans::empty(k, dimension, metric_type);
     kmeans.centroids = Arc::new(builder.finish());
-    kmeans
+    Ok(kmeans)
 }
 
 pub struct KMeanMembership {
@@ -186,13 +189,12 @@ impl KMeanMembership {
     async fn to_kmeans(&self) -> Result<KMeans> {
         let dimension = self.dimension;
         let cluster_ids = Arc::new(self.cluster_ids.clone());
-        let data = self.data.clone();
 
         // New centroids for each cluster
         let means = stream::iter(0..self.k)
             .zip(repeat_with(|| {
                 (
-                    data.clone(),
+                    self.data.clone(),
                     cluster_ids.clone(),
                     self.centroids.clone(),
                 )
@@ -200,28 +202,33 @@ impl KMeanMembership {
             .map(
                 |(cluster, (data, cluster_ids, prev_centroids))| async move {
                     tokio::task::spawn_blocking(move || {
-                        let mut sum = Float32Array::from_iter_values(
-                            (0..dimension).map(|_| 0.0).collect::<Vec<_>>(),
-                        );
+                        let mut sum = vec![0.0; dimension];
+                        let data = data.values();
                         let mut total = 0.0;
+                        // Eager group-by cluster id.
                         for i in 0..cluster_ids.len() {
                             if cluster_ids[i] as usize == cluster {
-                                sum =
-                                    add(&sum, &data.slice(i * dimension, dimension)).unwrap();
+                                // TODO: use simd ADD
+                                for j in 0..dimension {
+                                    sum[j] += data[i * dimension + j];
+                                }
                                 total += 1.0;
                             };
                         }
                         if total > 0.0 {
-                            divide_scalar(&sum, total).unwrap()
+                            let s = Float32Array::from(
+                                sum
+                            );
+                            s.unary_mut(|x| x / total).unwrap()
                         } else {
-                            eprintln!("Warning: KMean: cluster {cluster} has no value, does not change centroids.");
+                            warn!("Warning: KMean: cluster {} has no value, does not change centroids.", cluster);
                             prev_centroids.slice(cluster * dimension, dimension)
                         }
                     })
                     .await
                 },
             )
-            .buffered(16)
+            .buffered(num_cpus::get())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -309,12 +316,17 @@ impl KMeans {
         k: usize,
         metric_type: MetricType,
         rng: impl Rng,
-    ) -> Self {
+    ) -> Result<Self> {
         kmeans_random_init(&data.data(), data.num_columns(), k, rng, metric_type).await
     }
 
     /// Train a KMeans model on data with `k` clusters.
-    pub async fn new(data: &Float32Array, dimension: usize, k: usize, max_iters: u32) -> Self {
+    pub async fn new(
+        data: &Float32Array,
+        dimension: usize,
+        k: usize,
+        max_iters: u32,
+    ) -> Result<Self> {
         let params = KMeansParams {
             max_iters,
             metric_type: MetricType::L2,
@@ -323,13 +335,23 @@ impl KMeans {
         Self::new_with_params(data, dimension, k, &params).await
     }
 
-    /// Train a KMeans model with full parameters.
+    /// Train a [`KMeans`] model with full parameters.
     pub async fn new_with_params(
         data: &Float32Array,
         dimension: usize,
         k: usize,
         params: &KMeansParams,
-    ) -> Self {
+    ) -> Result<Self> {
+        let n = data.len() / dimension;
+        if n < k {
+            return Err(Error::Index {
+                message: format!(
+                    "KMeans: training does not have sufficient data points: n({}) is smaller than k({})",
+                    n, k
+                ),
+            });
+        }
+
         // TODO: refactor kmeans to work with reference instead of Arc?
         let data = Arc::new(data.clone());
         let mut best_kmeans = Self::empty(k, dimension, params.metric_type);
@@ -337,14 +359,14 @@ impl KMeans {
 
         let rng = rand::rngs::SmallRng::from_entropy();
         let mat = MatrixView::new(data.clone(), dimension);
-        for _ in 1..=params.redos {
+        for redo in 1..=params.redos {
             let mut kmeans = if let Some(centroids) = params.centroids.as_ref() {
                 // Use existing centroids.
-                KMeans::with_centroids(centroids.clone(), k, dimension, params.metric_type)
+                Self::with_centroids(centroids.clone(), k, dimension, params.metric_type)
             } else {
                 match params.init {
                     KMeanInit::Random => {
-                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await
+                        Self::init_random(&mat, k, params.metric_type, rng.clone()).await?
                     }
                     KMeanInit::KMeanPlusPlus => {
                         kmean_plusplus(data.clone(), dimension, k, rng.clone(), params.metric_type)
@@ -355,12 +377,22 @@ impl KMeans {
 
             let mut dist_sum: f32 = f32::MAX;
             let mut stddev: f32 = f32::MAX;
-            for _ in 1..=params.max_iters {
+            for i in 1..=params.max_iters {
+                if i % 10 == 0 {
+                    info!(
+                        "KMeans training: iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
+                };
                 let last_membership = kmeans.train_once(&mat).await;
                 let last_dist_sum = last_membership.distance_sum();
                 stddev = last_membership.hist_stddev();
                 kmeans = last_membership.to_kmeans().await.unwrap();
                 if (dist_sum - last_dist_sum).abs() / last_dist_sum < params.tolerance {
+                    info!(
+                        "KMeans training: converged at iteration {} / {}, redo={}",
+                        i, params.max_iters, redo
+                    );
                     break;
                 }
                 dist_sum = last_dist_sum;
@@ -372,7 +404,7 @@ impl KMeans {
             }
         }
 
-        best_kmeans
+        Ok(best_kmeans)
     }
 
     /// Train for one iteration.
@@ -403,23 +435,40 @@ impl KMeans {
         let dimension = self.dimension;
         let n = data.len() / self.dimension;
         let metric_type = self.metric_type;
-        let cluster_with_distances = stream::iter(0..n)
+        const CHUNK_SIZE: usize = 1024;
+        let cluster_with_distances = stream::iter((0..n).step_by(CHUNK_SIZE))
             // make tiles of input data to split between threads.
-            .chunks(1024)
             .zip(repeat_with(|| (data.clone(), self.centroids.clone())))
-            .map(|(indices, (data, centroids))| async move {
+            .map(|(start_idx, (data, centroids))| async move {
                 let data = tokio::task::spawn_blocking(move || {
-                    let dist = metric_type.batch_func();
-                    let mut results = vec![];
-                    for idx in indices {
-                        let value_arr = data.slice(idx * dimension, dimension);
-                        let vector: &Float32Array = as_primitive_array(&value_arr);
-                        let distances = dist(vector.values(), centroids.values(), dimension);
-                        let cluster_id = argmin(distances.as_ref()).unwrap();
-                        let distance = distances.value(cluster_id as usize);
-                        results.push((cluster_id, distance))
-                    }
-                    results
+                    let array = data.values();
+                    let centroids_array = centroids.values();
+
+                    (start_idx..min(start_idx + CHUNK_SIZE, n))
+                        .map(|idx| {
+                            let vector = &array[idx * dimension..(idx + 1) * dimension];
+                            let mut min = std::f32::MAX;
+                            let mut min_idx = 0;
+                            for (idx, other) in centroids_array.chunks_exact(dimension).enumerate()
+                            {
+                                // We've found about 40% performance improvement by using static dispatch instead
+                                // of dynamic dispatch.
+                                //
+                                // NOTE: Please make sure run benchmark when changing the following code.
+                                // `RUSTFLAGS="-C target-cpu=native" cargo bench --bench ivf_pq`
+                                let dist = match metric_type {
+                                    MetricType::L2 => vector.l2(other),
+                                    MetricType::Cosine => vector.cosine(other),
+                                    MetricType::Dot => vector.dot(other),
+                                };
+                                if dist < min {
+                                    min = dist;
+                                    min_idx = idx;
+                                }
+                            }
+                            (min_idx as u32, min)
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .await?;
                 Ok::<Vec<_>, Error>(data)
@@ -449,4 +498,19 @@ impl KMeans {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    use arrow_array::Float32Array;
+
+    #[tokio::test]
+    async fn test_train_with_small_dataset() {
+        let data = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0]);
+        match KMeans::new(&data, 2, 128, 5).await {
+            Ok(_) => panic!("Should fail to train KMeans"),
+            Err(e) => {
+                assert!(e.to_string().contains("smaller than"));
+            }
+        }
+    }
+}

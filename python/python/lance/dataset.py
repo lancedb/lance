@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -30,7 +29,8 @@ from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .fragment import LanceFragment
-from .lance import __version__, _Dataset, _Scanner, _write_dataset
+from .lance import __version__ as __version__
+from .lance import _Dataset, _Scanner, _write_dataset
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -357,14 +357,101 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
+    def merge(
+        self,
+        data_obj: ReaderLike,
+        left_on: str,
+        right_on: Optional[str] = None,
+        schema=None,
+    ):
+        """
+        Merge another dataset into this one.
+
+        Performs a left join, where the dataset is the left side and data_obj
+        is the right side. Rows existing in the dataset but not on the left will
+        be filled with null values, unless Lance doesn't support null values for
+        some types, in which case an error will be raised.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be merged. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+        left_on: str
+            The name of the column in the dataset to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to
+            left_on.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> df = pa.table({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> dataset.to_table().to_pandas()
+           x  y
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
+        >>> dataset.merge(new_df, 'x')
+        >>> dataset.to_table().to_pandas()
+           x  y  z
+        0  1  a  d
+        1  2  b  e
+        2  3  c  f
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+
+        self._ds.merge(reader, left_on, right_on)
+
+    def delete(self, predicate: Union[str, pa.compute.Expression]):
+        """
+        Delete rows from the dataset.
+
+        This marks rows as deleted, but does not physically remove them from the
+        files. This keeps the existing indexes still valid.
+
+        Parameters
+        ----------
+        predicate : str or pa.compute.Expression
+            The predicate to use to select rows to delete. May either be a SQL
+            string or a pyarrow Expression.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.delete("a = 1 or b in ('a', 'b')")
+        >>> dataset.to_table()
+        pyarrow.Table
+        a: int64
+        b: string
+        ----
+        a: [[3]]
+        b: [["c"]]
+        """
+        if isinstance(predicate, pa.compute.Expression):
+            predicate = str(predicate)
+        self._ds.delete(predicate)
+
     def versions(self):
         """
         Return all versions in this dataset.
         """
         versions = self._ds.versions()
         for v in versions:
-            # TODO: python datetime supports only microsecond precision. When a separate Version object is
-            # implemented, expose the precise timestamp (ns) to python.
+            # TODO: python datetime supports only microsecond precision. When a
+            # separate Version object is implemented, expose the precise timestamp
+            # (ns) to python.
             ts_nanos = v["timestamp"]
             v["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
                 microseconds=(ts_nanos % 1e9) // 1e3
@@ -385,6 +472,9 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         metric: str = "L2",
         replace: bool = False,
+        num_partitions: Optional[int] = None,
+        ivf_centroids: Optional[Union[np.ndarray, pa.FixedSizeListArray]] = None,
+        num_sub_vectors: Optional[int] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -401,28 +491,35 @@ class LanceDataset(pa.dataset.Dataset):
             The index name. If not provided, it will be generated from the
             column name.
         metric : str
-            The distance metric type, i.e., "L2" (alias to "euclidean") and "cosine".
-            Default is "L2".
+            The distance metric type, i.e., "L2" (alias to "euclidean"), "cosine"
+            or "dot" (dot product). Default is "L2".
         replace : bool
             Replace the existing index if it exists.
+        num_partitions : int, optional
+            The number of partitions of IVF (Inverted File Index).
+        ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`. Optional.
+            A `num_partitions` x `dimension` array of K-mean centroids for IVF
+            clustering. If not provided, a new Kmean model will be trained.
+        num_sub_vectors : int, optional
+            The number of sub-vectors for PQ (Product Quantization).
         kwargs :
             Parameters passed to the index building process.
 
-
         If `index_type` is "IVF_PQ", then the following parameters are required:
-
-        - **num_partitions**: the number of partitions of IVF (Inverted File Index).
-        - **num_sub_vectors**: the number of sub-vectors used in Product Quantization.
+        - **num_partitions**
+        - **num_sub_vectors**
 
         Optional parameters for "IVF_PQ":
         - **use_opq**: whether to use OPQ (Optimized Product Quantization).
+            Must have feature 'opq' enabled in Rust.
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
+        - **ivf_centroids**: K-mean centroids for IVF clustering.
 
         If `index_type` is "DISKANN", then the following parameters are optional:
 
         - **r**: out-degree bound
         - **l**: number of levels in the graph.
-        - **alpha**: distance threadhold for the graph.
+        - **alpha**: distance threshold for the graph.
 
         Examples
         --------
@@ -443,8 +540,10 @@ class LanceDataset(pa.dataset.Dataset):
         References
         ----------
         * `Faiss Index <https://github.com/facebookresearch/faiss/wiki/Faiss-indexes>`_
-        * IVF introduced in `Video Google: a text retrieval approach to object matching in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
-        * `Product quantization for nearest neighbor search <https://hal.inria.fr/inria-00514462v2/document>`_
+        * IVF introduced in `Video Google: a text retrieval approach to object matching
+          in videos <https://ieeexplore.ieee.org/abstract/document/1238663>`_
+        * `Product quantization for nearest neighbor search
+          <https://hal.inria.fr/inria-00514462v2/document>`_
 
         """
         # Only support building index for 1 column from the API aspect, however
@@ -463,13 +562,15 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             if not pa.types.is_float32(field.type.value_type):
                 raise TypeError(
-                    f"Vector column {c} must have float32 value type, got {field.type.value_type}"
+                    f"Vector column {c} must have float32 value type, "
+                    f"got {field.type.value_type}"
                 )
 
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
             "euclidean",
+            "dot",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
         index_type = index_type.upper()
@@ -478,12 +579,38 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Only IVF_PQ or DiskANN index_types supported. Got {index_type}"
             )
         if index_type == "IVF_PQ":
-            if "num_partitions" not in kwargs or "num_sub_vectors" not in kwargs:
+            if num_partitions is None or num_sub_vectors is None:
                 raise ValueError(
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
+            kwargs["num_partitions"] = num_partitions
+            kwargs["num_sub_vectors"] = num_sub_vectors
+            if ivf_centroids is not None:
+                # User provided IVF centroids
+                if isinstance(ivf_centroids, np.ndarray):
+                    if (
+                        len(ivf_centroids.shape) != 2
+                        or ivf_centroids.shape[0] != num_partitions
+                    ):
+                        raise ValueError(
+                            f"Ivf centroids must be 2D array: (clusters, dim), "
+                            f"got {ivf_centroids.shape}"
+                        )
+                    if ivf_centroids.dtype != np.float32:
+                        raise TypeError(
+                            f"IVF centroids must be float32, got {ivf_centroids.dtype}"
+                        )
+                    dim = ivf_centroids.shape[1]
+                    values = pa.array(ivf_centroids.reshape(-1), type=pa.float32())
+                    ivf_centroids = pa.FixedSizeListArray.from_arrays(values, dim)
+                # Convert it to RecordBatch because Rust side only accepts RecordBatch.
+                ivf_centroids_batch = pa.RecordBatch.from_arrays(
+                    [ivf_centroids], ["_ivf_centroids"]
+                )
+                kwargs["ivf_centroids"] = ivf_centroids_batch
 
         kwargs["replace"] = replace
+
         self._ds.create_index(column, index_type, name, metric, kwargs)
         return LanceDataset(self.uri)
 
@@ -496,25 +623,8 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> LanceDataset:
         """Create a new version of dataset with collected fragments.
 
-        This method allows users to commit a version of dataset in a distributed environment.
-
-        Examples
-        --------
-
-        >>> dataset = lance.dataset("~/sift.lance")
-        >>> fragments = dataset.get_fragments()
-        >>> # Distributed fragment to each worker
-
-        # In worker
-        >>> def my_udf(input: pa.RecordBatch) -> pa.RecordBatch:
-        ...    output = process(input)
-        ...    return output
-
-        >>> new_fragment = fragment.add_column(my_udf, columns=["a", "b"])
-        >>> # send(new_fragment) to one single master node.
-
-        # In master node
-        >>> dataset._create_version_from_fragments(new_schema, [new_fragment1, new_fragment2, ...])
+        This method allows users to commit a version of dataset in a distributed
+        environment.
 
         Parameters
         ----------
@@ -611,7 +721,8 @@ class ScannerBuilder:
                     inner_fragments.append(f._fragment)
                 else:
                     raise TypeError(
-                        f"fragments must be an iterable of LanceFragment. Got {type(f)} instead."
+                        f"fragments must be an iterable of LanceFragment. "
+                        f"Got {type(f)} instead."
                     )
             fragments = inner_fragments
 
@@ -773,6 +884,7 @@ ReaderLike = Union[
     pa.Table,
     pa.dataset.Dataset,
     pa.dataset.Scanner,
+    Iterable[RecordBatch],
     pa.RecordBatchReader,
 ]
 
@@ -808,18 +920,7 @@ def write_dataset(
         The max number of rows before starting a new group (in the same file)
 
     """
-    if isinstance(data_obj, pd.DataFrame):
-        reader = pa.Table.from_pandas(data_obj, schema=schema).to_reader()
-    elif isinstance(data_obj, pa.Table):
-        reader = data_obj.to_reader()
-    elif isinstance(data_obj, pa.dataset.Dataset):
-        reader = pa.dataset.Scanner.from_dataset(data_obj).to_reader()
-    elif isinstance(data_obj, pa.dataset.Scanner):
-        reader = data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatchReader):
-        reader = data_obj
-    else:
-        raise TypeError(f"Unknown data_obj type {type(data_obj)}")
+    reader = _coerce_reader(data_obj, schema)
     # TODO add support for passing in LanceDataset and LanceScanner here
 
     params = {
@@ -831,3 +932,33 @@ def write_dataset(
     uri = os.fspath(uri) if isinstance(uri, Path) else uri
     _write_dataset(reader, uri, params)
     return LanceDataset(uri)
+
+
+def _coerce_reader(
+    data_obj: ReaderLike, schema: Optional[pa.Schema] = None
+) -> pa.RecordBatchReader:
+    if isinstance(data_obj, pd.DataFrame):
+        return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
+    elif isinstance(data_obj, pa.Table):
+        return data_obj.to_reader()
+    elif isinstance(data_obj, pa.dataset.Dataset):
+        return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
+    elif isinstance(data_obj, pa.dataset.Scanner):
+        return data_obj.to_reader()
+    elif isinstance(data_obj, pa.RecordBatchReader):
+        return data_obj
+    # for other iterables, assume they are of type Iterable[RecordBatch]
+    elif isinstance(data_obj, Iterable):
+        if schema is not None:
+            return pa.RecordBatchReader.from_batches(schema, data_obj)
+        else:
+            raise ValueError(
+                "Must provide schema to write dataset from RecordBatch iterable"
+            )
+    else:
+        raise TypeError(
+            f"Unknown data type {type(data_obj)}. "
+            "Please check "
+            "https://lancedb.github.io/lance/read_and_write.html "
+            "to see supported types."
+        )

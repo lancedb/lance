@@ -26,6 +26,7 @@ The key features of Lance include:
    ./read_and_write
    File Format <./format>
    API References <./api/api>
+   Contributor Guide <./contributing>
 
 
 Indices and tables

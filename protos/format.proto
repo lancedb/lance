@@ -72,7 +72,27 @@ message Manifest {
 
   // Optional version tag
   string tag = 8;
-}
+
+  // Feature flags for readers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // read the table. If a reader does not recognize a flag that is set, it
+  // should not attempt to read the dataset.
+  //
+  // Known flags:
+  // * 1: deletion files are present
+  uint64 reader_feature_flags = 9;
+
+  // Feature flags for writers.
+  //
+  // A bitmap of flags that indicate which features are required to be able to
+  // write to the dataset. if a writer does not recognize a flag that is set, it
+  // should not attempt to write to the dataset.
+  //
+  // The flags are the same as for reader_feature_flags, although they will not
+  // always apply to both.
+  uint64 writer_feature_flags = 10;
+} // Manifest
 
 // Auxiliary Data attached to a version.
 // Only load on-demand.
@@ -121,7 +141,7 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   repeated int32 fields = 2;
-}
+} // DataFile
 
 // Deletion File
 // 
@@ -148,7 +168,7 @@ message DeletionFile {
   // An opaque id used to differentiate this file from others written by concurrent
   // writers.
   uint64 id = 3;
-}
+} // DeletionFile
 
 // Metadata of one Lance file.
 message Metadata {
@@ -174,7 +194,7 @@ message Metadata {
   //   length = page_table[5][4][1];
   // ```
   uint64 page_table_position = 3;
-}
+} // Metadata
 
 // Supported encodings.
 enum Encoding {

@@ -25,6 +25,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use futures::stream::Stream;
+use futures::FutureExt;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 
@@ -39,14 +40,14 @@ use crate::{Error, Result};
 pub struct KNNFlatStream {
     rx: Receiver<DataFusionResult<RecordBatch>>,
 
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 }
 
 impl KNNFlatStream {
     /// Construct a [`KNNFlatStream`] node.
     pub(crate) fn new(child: SendableRecordBatchStream, query: &Query) -> Self {
         let stream = DatasetRecordBatchStream::new(child);
-        KNNFlatStream::from_stream(stream, query)
+        Self::from_stream(stream, query)
     }
 
     fn from_stream(stream: impl RecordBatchStream, query: &Query) -> Self {
@@ -76,7 +77,7 @@ impl KNNFlatStream {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
         }
     }
 }
@@ -85,7 +86,28 @@ impl Stream for KNNFlatStream {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 
@@ -93,7 +115,7 @@ impl DFRecordBatchStream for KNNFlatStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("score", DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 }
@@ -162,7 +184,7 @@ impl ExecutionPlan for KNNFlatExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
-        if !input_schema.field_with_name(SCORE_COL).is_ok() {
+        if input_schema.field_with_name(SCORE_COL).is_err() {
             fields.push(Arc::new(Field::new(SCORE_COL, DataType::Float32, false)));
         }
 
@@ -204,7 +226,7 @@ impl ExecutionPlan for KNNFlatExec {
 
     fn statistics(&self) -> Statistics {
         Statistics {
-            num_rows: Some(self.query.k as usize),
+            num_rows: Some(self.query.k),
             ..Default::default()
         }
     }
@@ -214,7 +236,7 @@ impl ExecutionPlan for KNNFlatExec {
 pub struct KNNIndexStream {
     rx: Receiver<datafusion::error::Result<RecordBatch>>,
 
-    _bg_thread: JoinHandle<()>,
+    bg_thread: Option<JoinHandle<()>>,
 }
 
 impl KNNIndexStream {
@@ -257,7 +279,7 @@ impl KNNIndexStream {
 
         Self {
             rx,
-            _bg_thread: bg_thread,
+            bg_thread: Some(bg_thread),
         }
     }
 }
@@ -266,7 +288,7 @@ impl DFRecordBatchStream for KNNIndexStream {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(SCORE_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 }
@@ -275,7 +297,28 @@ impl Stream for KNNIndexStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).rx.poll_recv(cx)
+        let this = Pin::into_inner(self);
+        // We need to check the JoinHandle to make sure the thread hasn't panicked.
+        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
+            match bg_thread.poll_unpin(cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(join_error)) => {
+                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
+                        "ExecNode(Projection): thread panicked: {}",
+                        join_error
+                    )))));
+                }
+                Poll::Pending => false,
+            }
+        } else {
+            false
+        };
+        if bg_thread_completed {
+            // Need to take it, since we aren't allowed to poll if again after.
+            this.bg_thread.take();
+        }
+        // this.rx.
+        this.rx.poll_recv(cx)
     }
 }
 
@@ -328,7 +371,7 @@ impl ExecutionPlan for KNNIndexExec {
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(SCORE_COL, DataType::Float32, false),
-            Field::new(ROW_ID, DataType::UInt16, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
         ]))
     }
 
@@ -378,9 +421,8 @@ mod tests {
 
     use std::sync::Arc;
 
-    use arrow_array::{
-        cast::as_primitive_array, FixedSizeListArray, Int32Array, RecordBatchReader, StringArray,
-    };
+    use arrow_array::RecordBatchIterator;
+    use arrow_array::{cast::as_primitive_array, FixedSizeListArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use tempfile::tempdir;
@@ -406,38 +448,41 @@ mod tests {
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
 
-        let batches = RecordBatchBuffer::new(
-            (0..20)
-                .map(|i| {
-                    RecordBatch::try_new(
-                        schema.clone(),
-                        vec![
-                            Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
-                            Arc::new(
-                                FixedSizeListArray::try_new(generate_random_array(128 * 20), 128)
-                                    .unwrap(),
-                            ),
-                            Arc::new(StringArray::from_iter_values(
-                                (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
-                            )),
-                        ],
-                    )
-                    .unwrap()
-                })
-                .collect(),
-        );
+        let batches: Vec<RecordBatch> = (0..20)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(i * 20..(i + 1) * 20)),
+                        Arc::new(
+                            FixedSizeListArray::try_new_from_values(
+                                generate_random_array(128 * 20),
+                                128,
+                            )
+                            .unwrap(),
+                        ),
+                        Arc::new(StringArray::from_iter_values(
+                            (i * 20..(i + 1) * 20).map(|i| format!("s3://bucket/file-{}", i)),
+                        )),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let mut write_params = WriteParams::default();
-        write_params.max_rows_per_file = 40;
-        write_params.max_rows_per_group = 10;
-        let vector_arr = batches.batches[0].column_by_name("vector").unwrap();
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let vector_arr = batches[0].column_by_name("vector").unwrap();
         let q = as_fixed_size_list_array(&vector_arr).value(5);
 
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        Dataset::write(&mut reader, test_uri, Some(write_params))
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(reader, test_uri, Some(write_params))
             .await
             .unwrap();
 
@@ -489,7 +534,7 @@ mod tests {
             ),
             ArrowField::new("uri", DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::new_empty(schema.clone());
+        let batch = RecordBatch::new_empty(schema);
 
         let query = Query {
             column: "vector".to_string(),
@@ -501,7 +546,7 @@ mod tests {
             use_index: false,
         };
 
-        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch.into()]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
         let idx = KNNFlatExec::try_new(input, query).unwrap();
         assert_eq!(
             idx.schema().as_ref(),

@@ -29,8 +29,8 @@ pub(crate) fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> Bo
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("Attempt to write empty record batches"))]
-    EmptyDataset,
+    #[snafu(display("Invalid user input: {source}"))]
+    InvalidInput { source: BoxedError },
     #[snafu(display("Dataset already exists: {uri}"))]
     DatasetAlreadyExists { uri: String },
     #[snafu(display("Append with different schema: original={original} new={new}"))]
@@ -43,10 +43,16 @@ pub enum Error {
         source: BoxedError,
         // TODO: add backtrace?
     },
+    #[snafu(display("Not supported: {source}"))]
+    NotSupported { source: BoxedError },
+    #[snafu(display("Encountered internal error. Please file a bug report at https://github.com/lancedb/lance/issues. {message}"))]
+    Internal { message: String },
     #[snafu(display("LanceError(Arrow): {message}"))]
     Arrow { message: String },
     #[snafu(display("LanceError(Schema): {message}"))]
     Schema { message: String },
+    #[snafu(display("Not found: {uri}"))]
+    NotFound { uri: String },
     #[snafu(display("LanceError(IO): {message}"))]
     IO { message: String },
     #[snafu(display("LanceError(Index): {message}"))]
@@ -60,6 +66,13 @@ impl Error {
         let message: String = message.into();
         Self::CorruptFile {
             path,
+            source: message.into(),
+        }
+    }
+
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        let message: String = message.into();
+        Self::InvalidInput {
             source: message.into(),
         }
     }
@@ -144,16 +157,16 @@ impl From<Error> for ArrowError {
     }
 }
 
-impl From<sqlparser::parser::ParserError> for Error {
-    fn from(e: sqlparser::parser::ParserError) -> Self {
+impl From<datafusion::sql::sqlparser::parser::ParserError> for Error {
+    fn from(e: datafusion::sql::sqlparser::parser::ParserError) -> Self {
         Self::IO {
             message: e.to_string(),
         }
     }
 }
 
-impl From<sqlparser::tokenizer::TokenizerError> for Error {
-    fn from(e: sqlparser::tokenizer::TokenizerError) -> Self {
+impl From<datafusion::sql::sqlparser::tokenizer::TokenizerError> for Error {
+    fn from(e: datafusion::sql::sqlparser::tokenizer::TokenizerError) -> Self {
         Self::IO {
             message: e.to_string(),
         }

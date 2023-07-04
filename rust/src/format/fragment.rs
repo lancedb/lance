@@ -1,19 +1,16 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2023 Lance Developers.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 use std::collections::BTreeSet;
 
@@ -68,6 +65,15 @@ pub enum DeletionFileType {
     Bitmap,
 }
 
+impl DeletionFileType {
+    pub(crate) fn suffix(&self) -> &str {
+        match self {
+            Self::Array => "arrow",
+            Self::Bitmap => "bin",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeletionFile {
     pub read_version: u64,
@@ -75,6 +81,8 @@ pub struct DeletionFile {
     pub file_type: DeletionFileType,
 }
 
+// TODO: should we convert this to TryFrom and surface the error?
+#[allow(clippy::fallible_impl_from)]
 impl From<&pb::DeletionFile> for DeletionFile {
     fn from(value: &pb::DeletionFile) -> Self {
         let file_type = match value.file_type {
@@ -191,7 +199,7 @@ mod tests {
             ArrowField::new("bool", DataType::Boolean, true),
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let fragment = Fragment::with_file(123, &path, &schema);
+        let fragment = Fragment::with_file(123, path, &schema);
 
         assert_eq!(123, fragment.id);
         assert_eq!(fragment.field_ids(), [0, 1, 2, 3]);

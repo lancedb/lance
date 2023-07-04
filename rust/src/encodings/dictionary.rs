@@ -169,8 +169,11 @@ impl<'a> DictionaryDecoder<'a> {
         &self,
         index_array: ArrayRef,
     ) -> Result<ArrayRef> {
-        let keys: &PrimitiveArray<T> = as_primitive_array(index_array.as_ref());
-        Ok(Arc::new(DictionaryArray::try_new(keys, &self.value_arr)?))
+        let keys: PrimitiveArray<T> = as_primitive_array(index_array.as_ref()).clone();
+        Ok(Arc::new(DictionaryArray::try_new(
+            keys,
+            self.value_arr.clone(),
+        )?))
     }
 }
 
@@ -219,22 +222,25 @@ mod tests {
         let value_array: StringArray = vec![Some("a"), Some("b"), Some("c"), Some("d")]
             .into_iter()
             .collect();
+        let value_array_ref = Arc::new(value_array) as ArrayRef;
 
         let keys1: PrimitiveArray<T> = vec![T::Native::from_usize(0), T::Native::from_usize(1)]
             .into_iter()
             .collect();
-        let arr1: DictionaryArray<T> = DictionaryArray::try_new(&keys1, &value_array).unwrap();
+        let arr1: DictionaryArray<T> =
+            DictionaryArray::try_new(keys1, value_array_ref.clone()).unwrap();
 
         let keys2: PrimitiveArray<T> = vec![T::Native::from_usize(1), T::Native::from_usize(3)]
             .into_iter()
             .collect();
-        let arr2: DictionaryArray<T> = DictionaryArray::try_new(&keys2, &value_array).unwrap();
+        let arr2: DictionaryArray<T> =
+            DictionaryArray::try_new(keys2, value_array_ref.clone()).unwrap();
 
         let keys1_ref = arr1.keys() as &dyn Array;
         let keys2_ref = arr2.keys() as &dyn Array;
         let arrs: Vec<&dyn Array> = vec![keys1_ref, keys2_ref];
 
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
 
         let pos;
@@ -251,7 +257,7 @@ mod tests {
             pos,
             arr1.len() + arr2.len(),
             arr1.data_type(),
-            Arc::new(value_array),
+            value_array_ref.clone(),
         );
 
         let decoded_data = decoder.decode().await.unwrap();

@@ -35,6 +35,7 @@ use crate::{
         },
         Index,
     },
+    io::deletion::LruDeletionVectorStore,
     Result,
 };
 use crate::{
@@ -50,7 +51,7 @@ use crate::{
 };
 
 /// DiskANN search state.
-pub(crate) struct SearchState {
+pub struct SearchState {
     /// Visited vertices.
     pub visited: HashSet<usize>,
 
@@ -142,7 +143,7 @@ impl SearchState {
 /// - query: The query vector.
 /// - k: The number of nearest neighbors to return.
 /// - search_size: Search list size, L in the paper.
-pub(crate) async fn greedy_search(
+pub async fn greedy_search(
     graph: &(dyn Graph + Send + Sync),
     start: usize,
     query: &[f32],
@@ -175,6 +176,8 @@ pub(crate) async fn greedy_search(
 
 pub struct DiskANNIndex {
     graph: PersistedGraph<RowVertex>,
+
+    deletion_cache: Arc<LruDeletionVectorStore>,
 }
 
 impl std::fmt::Debug for DiskANNIndex {
@@ -190,12 +193,16 @@ impl DiskANNIndex {
         dataset: Arc<Dataset>,
         index_column: &str,
         graph_path: &Path,
+        deletion_cache: Arc<LruDeletionVectorStore>,
     ) -> Result<Self> {
         let params = GraphReadParams::default();
         let serde = Arc::new(RowVertexSerDe::new());
         let graph =
             PersistedGraph::try_new(dataset, index_column, graph_path, params, serde).await?;
-        Ok(Self { graph })
+        Ok(Self {
+            graph,
+            deletion_cache,
+        })
     }
 }
 
@@ -214,18 +221,22 @@ impl VectorIndex for DiskANNIndex {
             Field::new(SCORE_COL, DataType::Float32, false),
         ]));
 
-        let row_ids: UInt64Array = state
-            .candidates
+        let mut candidates = Vec::with_capacity(query.k);
+        for (score, row) in state.candidates {
+            if candidates.len() == query.k {
+                break;
+            }
+            if !self.deletion_cache.as_ref().is_deleted(row as u64).await? {
+                candidates.push((score, row));
+            }
+        }
+
+        let row_ids: UInt64Array = candidates
             .iter()
             .take(query.k)
             .map(|(_, id)| *id as u64)
             .collect();
-        let scores: Float32Array = state
-            .candidates
-            .iter()
-            .take(query.k)
-            .map(|(d, _)| **d)
-            .collect();
+        let scores: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
 
         let batch = RecordBatch::try_new(
             schema,

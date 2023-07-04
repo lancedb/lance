@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use super::Query;
 use crate::{
-    arrow::linalg::MatrixView,
+    arrow::linalg::matrix::MatrixView,
     index::{pb::Transform, Index},
     io::{object_reader::ObjectReader, object_writer::ObjectWriter},
     Result,
@@ -30,6 +30,7 @@ use crate::{
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
 #[async_trait]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///

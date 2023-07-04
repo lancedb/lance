@@ -23,12 +23,13 @@ use arrow::datatypes::{Int32Type, Int64Type};
 use arrow_arith::arithmetic::subtract_scalar;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{
-    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, GenericListArray, NullArray, OffsetSizeTrait,
-    PrimitiveArray, RecordBatch, StructArray, UInt32Array, UInt64Array,
+    ArrayRef, ArrowNativeTypeOp, ArrowNumericType, NullArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::ArrowNativeType;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema};
 use arrow_select::concat::{concat, concat_batches};
+use arrow_select::filter::filter_record_batch;
 use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
@@ -37,6 +38,7 @@ use futures::StreamExt;
 use object_store::path::Path;
 use prost::Message;
 
+use super::deletion::{read_deletion_file, DeletionVector};
 use super::ReadBatchParams;
 use crate::arrow::*;
 use crate::encodings::{dictionary::DictionaryDecoder, AsyncIndex};
@@ -138,6 +140,9 @@ pub struct FileReader {
     /// If set true, returns the row ID from the dataset alongside with the
     /// actual data.
     with_row_id: bool,
+
+    // deletion vector indicating which rows are deleting in the fragment
+    deletion_vector: Option<DeletionVector>,
 }
 
 impl std::fmt::Debug for FileReader {
@@ -158,7 +163,7 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
-    ) -> Result<FileReader> {
+    ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
         let file_size = object_reader.size().await?;
@@ -178,15 +183,24 @@ impl FileReader {
             read_struct_from_buf(&tail_bytes.slice(offset..))?
         };
 
-        let (projection, num_columns) = if let Some(m) = manifest {
-            (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
+        // m is either
+        // a ref if passed in as Some(&manifest), or
+        // a value we read in the else block
+        // since we don't want to clone the manifest and force everything into a value
+        // we need this m variable here so the else block has a place to store the read
+        // manifest value. If we declare this var in the else block, it won't live long
+        // enough and the returned ref will be invalid.
+        let mut m: Manifest;
+        let manifest = if let Some(m) = manifest {
+            m
         } else {
-            let mut m: Manifest =
-                read_struct(object_reader.as_ref(), metadata.manifest_position.unwrap()).await?;
+            m = read_struct(object_reader.as_ref(), metadata.manifest_position.unwrap()).await?;
             m.schema.load_dictionary(object_reader.as_ref()).await?;
-
-            (m.schema.clone(), m.schema.max_field_id().unwrap() + 1)
+            &m
         };
+
+        let projection = manifest.schema.clone();
+        let num_columns = manifest.schema.max_field_id().unwrap() + 1;
         let page_table = PageTable::load(
             object_reader.as_ref(),
             metadata.page_table_position,
@@ -195,18 +209,31 @@ impl FileReader {
         )
         .await?;
 
-        Ok(Self {
+        // read the fragment metadata so we can handle deletion
+        let fragment = manifest
+            .fragments
+            .iter()
+            .find(|frag| frag.id == fragment_id)
+            .map(|f| f.to_owned());
+
+        let deletion_vector = match &fragment {
+            Some(frag) => read_deletion_file(object_store.base_path(), frag, object_store).await,
+            None => Ok(None),
+        };
+
+        deletion_vector.map(|deletion_vector| Self {
             object_reader: object_reader.into(),
             metadata,
             projection: Some(projection),
             page_table,
             fragment_id,
             with_row_id: false,
+            deletion_vector,
         })
     }
 
     /// Open one Lance data file for read.
-    pub async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<FileReader> {
+    pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         Self::try_new_with_fragment(object_store, path, 0, None).await
     }
 
@@ -248,7 +275,15 @@ impl FileReader {
         params: impl Into<ReadBatchParams>,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        read_batch(self, &params.into(), projection, batch_id, self.with_row_id).await
+        read_batch(
+            self,
+            &params.into(),
+            projection,
+            batch_id,
+            self.with_row_id,
+            self.deletion_vector.as_ref(),
+        )
+        .await
     }
 
     /// Read a range of records into one batch.
@@ -301,13 +336,19 @@ async fn read_batch(
     schema: &Schema,
     batch_id: i32,
     with_row_id: bool,
+    deletion_vector: Option<&DeletionVector>,
 ) -> Result<RecordBatch> {
     let arrs = stream::iter(&schema.fields)
         .then(|f| async move { read_array(reader, f, batch_id, params).await })
         .try_collect::<Vec<_>>()
         .await?;
+
+    let should_fetch_row_id =
+        with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));
+
     let mut batch = RecordBatch::try_new(Arc::new(schema.into()), arrs)?;
-    if with_row_id {
+
+    let row_ids = if should_fetch_row_id {
         let ids_in_batch: Vec<i32> = match params {
             ReadBatchParams::Indices(indices) => {
                 indices.values().iter().map(|v| *v as i32).collect()
@@ -325,17 +366,33 @@ async fn read_batch(
             .ok_or_else(|| Error::IO {
                 message: format!("batch {batch_id} does not exist"),
             })?;
-        let row_id_arr = Arc::new(UInt64Array::from_iter_values(
-            ids_in_batch
-                .iter()
-                .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset)),
-        ));
+        let row_ids: Vec<u64> = ids_in_batch
+            .iter()
+            .map(|o| compute_row_id(reader.fragment_id, *o + batch_offset))
+            .collect();
+
+        Some(row_ids)
+    } else {
+        None
+    };
+
+    if with_row_id {
+        let row_id_arr = Arc::new(UInt64Array::from(row_ids.clone().unwrap()));
         batch = batch.try_with_column(
             ArrowField::new("_rowid", DataType::UInt64, false),
             row_id_arr,
         )?;
     }
-    Ok(batch)
+
+    // TODO: This is a minor cop out. Pushing deletion vector in to the decoders is hard
+    // so I'm going to just leave deletion filter at this layer for now.
+    // We should push this down futurther when we get to statistics-based predicate pushdown
+    let deletion_mask = deletion_vector.and_then(|v| v.build_predicate(row_ids.unwrap().iter()));
+
+    match deletion_mask {
+        None => Ok(batch),
+        Some(mask) => Ok(filter_record_batch(&batch, &mask)?),
+    }
 }
 
 #[async_recursion]
@@ -500,10 +557,10 @@ async fn read_struct_array(
     params: &ReadBatchParams,
 ) -> Result<ArrayRef> {
     // TODO: use tokio to make the reads in parallel.
-    let mut sub_arrays = vec![];
+    let mut sub_arrays: Vec<(FieldRef, ArrayRef)> = vec![];
     for child in field.children.as_slice() {
         let arr = read_array(reader, child, batch_id, params).await?;
-        sub_arrays.push((child.into(), arr));
+        sub_arrays.push((Arc::new(child.into()), arr));
     }
 
     Ok(Arc::new(StructArray::from(sub_arrays)))
@@ -555,7 +612,8 @@ where
     }
     let all_values = concat(value_refs.as_slice())?;
     let offset_arr = offsets_builder.finish();
-    Ok(Arc::new(GenericListArray::try_new(all_values, &offset_arr)?) as ArrayRef)
+    let arr = try_new_generic_list_array(all_values, &offset_arr)?;
+    Ok(Arc::new(arr) as ArrayRef)
 }
 
 async fn read_list_array<T: ArrowNumericType>(
@@ -609,7 +667,8 @@ where
     let start_position = positions.value(0);
     let offset_arr = subtract_scalar(positions, start_position)?;
     let value_arrs = read_array(reader, &field.children[0], batch_id, &value_params).await?;
-    Ok(Arc::new(GenericListArray::try_new(value_arrs, &offset_arr)?) as ArrayRef)
+    let arr = try_new_generic_list_array(value_arrs, &offset_arr)?;
+    Ok(Arc::new(arr) as ArrayRef)
 }
 
 #[cfg(test)]
@@ -617,18 +676,24 @@ mod tests {
     use super::*;
 
     use crate::dataset::{Dataset, WriteParams};
+    use crate::format::Fragment;
+    use crate::io::deletion::write_deletion_file;
+    use crate::io::deletion::DeletionVector;
+    use crate::io::ObjectStore;
     use arrow::array::LargeListBuilder;
     use arrow_array::builder::StringDictionaryBuilder;
     use arrow_array::types::Int32Type;
+    use arrow_array::RecordBatchIterator;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder, StringBuilder},
         cast::{as_primitive_array, as_string_array, as_struct_array},
         types::UInt8Type,
         Array, DictionaryArray, Float32Array, Int64Array, LargeListArray, ListArray, NullArray,
-        RecordBatchReader, StringArray, StructArray, UInt32Array, UInt8Array,
+        StringArray, StructArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use rand::{distributions::Alphanumeric, Rng};
+    use roaring::RoaringBitmap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
 
@@ -672,7 +737,7 @@ mod tests {
             let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
             let row_ids_col = &batch["_rowid"];
             // Do the same computation as `compute_row_id`.
-            let start_pos = (fragment << 32) as u64 + 10 * b as u64;
+            let start_pos = (fragment << 32) + 10 * b as u64;
 
             assert_eq!(
                 &UInt64Array::from_iter_values(start_pos..start_pos + 10),
@@ -700,6 +765,7 @@ mod tests {
 
         // Write 10 batches.
         let values = StringArray::from_iter_values(["a", "b", "c", "d", "e", "f", "g"]);
+        let values_ref = Arc::new(values);
         let mut batches = vec![];
         for batch_id in 0..10 {
             let value_range: Range<i64> = batch_id * 10..batch_id * 10 + 10;
@@ -712,12 +778,9 @@ mod tests {
                     value_range.clone().map(|n| n as f32).collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from_iter_values(
-                    value_range
-                        .clone()
-                        .map(|n| format!("str-{}", n))
-                        .collect::<Vec<_>>(),
+                    value_range.clone().map(|n| format!("str-{}", n)),
                 )),
-                Arc::new(DictionaryArray::<UInt8Type>::try_new(&keys, &values).unwrap()),
+                Arc::new(DictionaryArray::<UInt8Type>::try_new(keys, values_ref.clone()).unwrap()),
             ];
             batches.push(RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap());
         }
@@ -747,11 +810,124 @@ mod tests {
                     Arc::new(StringArray::from_iter_values([
                         "str-1", "str-15", "str-20", "str-25", "str-30", "str-48", "str-90"
                     ])),
-                    Arc::new(DictionaryArray::try_new(&dict_keys, &values).unwrap()),
+                    Arc::new(DictionaryArray::try_new(dict_keys, values_ref.clone()).unwrap()),
                 ]
             )
             .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn read_with_delete() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
+
+        // Write 10 batches.
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        for batch_id in 0..10 {
+            let value_range = batch_id * 10..batch_id * 10 + 10;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(value_range.clone())),
+                Arc::new(Float32Array::from_iter(value_range.map(|n| n as f32))),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+            file_writer.write(&[batch]).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let fragment = 123;
+
+        // delete even rows
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
+        let deletion_file = write_deletion_file(&Path::from("/foo"), fragment, 0, &dv, &store)
+            .await
+            .unwrap();
+
+        let mut frag_struct = Fragment::new(fragment);
+        frag_struct.deletion_file = deletion_file;
+
+        let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
+
+        let mut reader =
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+                .await
+                .unwrap();
+        reader.with_row_id(true);
+
+        for b in 0..10 {
+            let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
+            let row_ids_col = &batch["_rowid"];
+            // Do the same computation as `compute_row_id`.
+            let start_pos = (fragment << 32) + 10 * b as u64;
+
+            assert_eq!(
+                &UInt64Array::from_iter_values((start_pos..start_pos + 10).filter(|i| i % 2 == 1)),
+                as_primitive_array(row_ids_col)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_with_delete_without_row_id() {
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("i", DataType::Int64, true),
+            ArrowField::new("f", DataType::Float32, false),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let (store, path) = ObjectStore::from_uri("memory:///foo").await.unwrap();
+
+        // Write 10 batches.
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
+        for batch_id in 0..10 {
+            let value_range = batch_id * 10..batch_id * 10 + 10;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(value_range.clone())),
+                Arc::new(Float32Array::from_iter(value_range.map(|n| n as f32))),
+            ];
+            let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns).unwrap();
+            file_writer.write(&[batch]).await.unwrap();
+        }
+        file_writer.finish().await.unwrap();
+
+        let fragment = 123;
+
+        // delete even rows
+        let dv = DeletionVector::Bitmap(RoaringBitmap::from_iter((0..100).filter(|x| x % 2 == 0)));
+        let deletion_file = write_deletion_file(&Path::from("/foo"), fragment, 0, &dv, &store)
+            .await
+            .unwrap();
+
+        let mut frag_struct = Fragment::new(fragment);
+        frag_struct.deletion_file = deletion_file;
+
+        let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
+
+        let mut reader =
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+                .await
+                .unwrap();
+        reader.with_row_id(false);
+
+        for b in 0..10 {
+            let batch = reader.read_batch(b, .., reader.schema()).await.unwrap();
+            // if we didn't request rowid we should not get it back
+            assert!(!batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .any(|name| name == "_rowid"))
+        }
     }
 
     async fn test_write_null_string_in_struct(field_nullable: bool) {
@@ -772,7 +948,7 @@ mod tests {
 
         let string_arr = Arc::new(StringArray::from_iter([Some("a"), Some(""), Some("b")]));
         let struct_arr = Arc::new(StructArray::from(vec![(
-            ArrowField::new("str", DataType::Utf8, field_nullable),
+            Arc::new(ArrowField::new("str", DataType::Utf8, field_nullable)),
             string_arr.clone() as ArrayRef,
         )]));
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
@@ -854,14 +1030,14 @@ mod tests {
             DataType::Struct(subfields) => subfields
                 .iter()
                 .zip(expected_columns)
-                .map(|(f, d)| (f.as_ref().clone(), d))
+                .map(|(f, d)| (f.clone(), d))
                 .collect::<Vec<_>>(),
             _ => panic!("unexpected field"),
         };
 
         let expected_struct_array = StructArray::from(expected_struct);
         let expected_batch = RecordBatch::from(&StructArray::from(vec![(
-            arrow_schema.fields[0].as_ref().clone(),
+            Arc::new(arrow_schema.fields[0].as_ref().clone()),
             Arc::new(expected_struct_array) as ArrayRef,
         )]));
 
@@ -914,27 +1090,27 @@ mod tests {
         }
         Arc::new(StructArray::from(vec![
             (
-                ArrowField::new(
+                Arc::new(ArrowField::new(
                     "li",
                     DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     true,
-                ),
+                )),
                 Arc::new(li_builder.finish()) as ArrayRef,
             ),
             (
-                ArrowField::new(
+                Arc::new(ArrowField::new(
                     "ls",
                     DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
                     true,
-                ),
+                )),
                 Arc::new(ls_builder.finish()) as ArrayRef,
             ),
             (
-                ArrowField::new(
+                Arc::new(ArrowField::new(
                     "ll",
                     DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
                     false,
-                ),
+                )),
                 Arc::new(large_list_builder.finish()) as ArrayRef,
             ),
         ]))
@@ -963,11 +1139,11 @@ mod tests {
             dict_builder.append("d").unwrap();
 
             let struct_array = Arc::new(StructArray::from(vec![(
-                ArrowField::new(
+                Arc::new(ArrowField::new(
                     "d",
                     DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                     true,
-                ),
+                )),
                 Arc::new(dict_builder.finish()) as ArrayRef,
             )]));
 
@@ -978,9 +1154,9 @@ mod tests {
 
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let batch_buffer = crate::arrow::RecordBatchBuffer::new(batches.clone());
-        let mut batch_reader: Box<dyn RecordBatchReader> = Box::new(batch_buffer);
-        Dataset::write(&mut batch_reader, test_uri, Some(WriteParams::default()))
+        let batch_reader =
+            RecordBatchIterator::new(batches.clone().into_iter().map(Ok), arrow_schema.clone());
+        Dataset::write(batch_reader, test_uri, Some(WriteParams::default()))
             .await
             .unwrap();
 
@@ -1033,10 +1209,9 @@ mod tests {
             field: &Field,
             params: ReadBatchParams,
         ) -> ArrayRef {
-            let arr = read_array(reader, field, 0, &params)
+            read_array(reader, field, 0, &params)
                 .await
-                .expect("Error reading back the null array from file");
-            arr
+                .expect("Error reading back the null array from file") as _
         }
 
         let arr = read_array_w_params(&reader, &schema.fields[1], ReadBatchParams::RangeFull).await;
@@ -1171,13 +1346,13 @@ mod tests {
         let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(1), Some(2)]),
             Some(vec![Some(3), Some(4)]),
-            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..2_000).map(Some).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
         let large_list_array = LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(10), Some(11)]),
             Some(vec![Some(12), Some(13)]),
-            Some((0..2_000).map(|n| Some(n)).collect::<Vec<_>>()),
+            Some((0..2_000).map(Some).collect::<Vec<_>>()),
         ])
         .slice(1, 1);
 

@@ -71,7 +71,7 @@ impl Scanner {
             unsafe {
                 export_reader_into_raw(Box::new(reader), stream_ptr);
                 match ArrowArrayStreamReader::from_raw(stream_ptr) {
-                    Ok(reader) => reader.to_pyarrow(self_.py()),
+                    Ok(reader) => reader.into_pyarrow(self_.py()),
                     Err(err) => Err(ioerror(self_.py(), err.to_string())),
                 }
             }

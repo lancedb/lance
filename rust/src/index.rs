@@ -56,7 +56,7 @@ pub enum IndexType {
 impl fmt::Display for IndexType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            IndexType::Vector => write!(f, "Vector"),
+            Self::Vector => write!(f, "Vector"),
         }
     }
 }
@@ -153,14 +153,8 @@ impl DatasetIndexExt for Dataset {
                         message: "Vector index type must take a VectorIndexParams".to_string(),
                     })?;
 
-                build_vector_index(
-                    self,
-                    column,
-                    &index_name,
-                    &index_id.to_string(),
-                    &vec_params,
-                )
-                .await?;
+                build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
+                    .await?;
             }
         }
 
@@ -175,11 +169,18 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| idx.name != index_name)
-            .map(|i| i.clone())
+            .cloned()
             .collect::<Vec<_>>();
         indices.push(new_idx);
 
-        write_manifest_file(&self.object_store, &mut new_manifest, Some(indices)).await?;
+        write_manifest_file(
+            &self.object_store,
+            &self.base,
+            &mut new_manifest,
+            Some(indices),
+            Default::default(),
+        )
+        .await?;
 
         Ok(Self {
             object_store: self.object_store.clone(),
@@ -194,7 +195,7 @@ impl DatasetIndexExt for Dataset {
 mod tests {
     use super::*;
 
-    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchReader};
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use tempfile::tempdir;
 
@@ -216,19 +217,19 @@ mod tests {
             ),
         ]));
         let data = generate_random_array(2048 * DIM as usize);
-        let batches = RecordBatchBuffer::new(vec![RecordBatch::try_new(
+        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
-                Arc::new(FixedSizeListArray::try_new(&data, DIM as i32).unwrap()),
+                Arc::new(FixedSizeListArray::try_new_from_values(data.clone(), DIM).unwrap()),
+                Arc::new(FixedSizeListArray::try_new_from_values(data, DIM).unwrap()),
             ],
         )
-        .unwrap()]);
+        .unwrap()];
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let mut reader: Box<dyn RecordBatchReader> = Box::new(batches);
-        let dataset = Dataset::write(&mut reader, test_uri, None).await.unwrap();
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let params = VectorIndexParams::ivf_pq(2, 8, 2, false, MetricType::L2, 2);
         let dataset = dataset

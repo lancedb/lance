@@ -88,9 +88,9 @@ impl<'a> PlainEncoder<'a> {
         let capacity: usize = arrays.iter().map(|a| a.len()).sum();
         let mut builder = BooleanBuilder::with_capacity(capacity);
 
-        for i in 0..arrays.len() {
-            for j in 0..arrays[i].len() {
-                builder.append_value(arrays[i].value(j));
+        for array in arrays {
+            for val in array.iter() {
+                builder.append_value(val.unwrap_or_default());
             }
         }
 
@@ -145,7 +145,7 @@ impl<'a> PlainEncoder<'a> {
                     message: format!("Needed a FixedSizeListArray but got {}", array.data_type()),
                 })?;
             let offset = list_array.value_offset(0) as usize;
-            let length = list_array.len() as usize;
+            let length = list_array.len();
             let value_length = list_array.value_length() as usize;
             let value_array = list_array.values().slice(offset, length * value_length);
             value_arrs.push(value_array);
@@ -216,8 +216,18 @@ impl<'a> PlainDecoder<'a> {
 
         let data = self.reader.get_range(range).await?;
         let buf: Buffer = data.into();
+
+        // booleans are bitpacked, so we need an offset to provide the exact
+        // requested range.
+        let offset = if self.data_type == &DataType::Boolean {
+            start % 8
+        } else {
+            0
+        };
+
         let array_data = ArrayDataBuilder::new(self.data_type.clone())
             .len(end - start)
+            .offset(offset)
             .null_count(0)
             .add_buffer(buf)
             .build()?;
@@ -248,7 +258,9 @@ impl<'a> PlainDecoder<'a> {
         let item_array = item_decoder
             .get(start * list_size as usize..end * list_size as usize)
             .await?;
-        Ok(Arc::new(FixedSizeListArray::try_new(item_array, list_size)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeListArray::try_new_from_values(
+            item_array, list_size,
+        )?) as ArrayRef)
     }
 
     async fn decode_fixed_size_binary(
@@ -272,7 +284,7 @@ impl<'a> PlainDecoder<'a> {
             .ok_or_else(|| Error::Schema {
                 message: "Could not cast to UInt8Array for FixedSizeBinary".to_string(),
             })?;
-        Ok(Arc::new(FixedSizeBinaryArray::try_new(values, stride)?) as ArrayRef)
+        Ok(Arc::new(FixedSizeBinaryArray::try_new_from_values(values, stride)?) as ArrayRef)
     }
 
     async fn take_boolean(&self, indices: &UInt32Array) -> Result<ArrayRef> {
@@ -296,13 +308,16 @@ impl<'a> PlainDecoder<'a> {
         let arrays = stream::iter(chunk_ranges)
             .map(|cr| async move {
                 let index_chunk = indices.slice(cr.start as usize, cr.len());
+                // request contains the array indices we are retrieving in this chunk.
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
 
+                // Get the starting index
                 let start = request.value(0);
+                // Final index is the last value
                 let end = request.value(request.len() - 1);
                 let array = self.get(start as usize..end as usize + 1).await?;
-                let array_byte_boundray = (start / 8 * 8) as u32;
-                let shifted_indices = subtract_scalar(request, array_byte_boundray)?;
+
+                let shifted_indices = subtract_scalar(request, start)?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
             .buffered(num_cpus::get())
@@ -359,7 +374,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
 
         let arrays = stream::iter(chunked_ranges)
             .map(|cr| async move {
-                let index_chunk = indices.slice(cr.start as usize, cr.len());
+                let index_chunk = indices.slice(cr.start, cr.len());
                 let request: &UInt32Array = as_primitive_array(&index_chunk);
 
                 let start = request.value(0);
@@ -479,7 +494,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input: Vec<i64> = Vec::from_iter(1..127 as i64);
+        let input: Vec<i64> = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let mut arrs: Vec<ArrayRef> = Vec::new();
@@ -504,7 +519,7 @@ mod tests {
     }
 
     async fn test_round_trip(expected: &[ArrayRef], data_type: DataType) {
-        let store = ObjectStore::new(":memory:").await.unwrap();
+        let store = ObjectStore::memory();
         let path = Path::from("/foo");
         let mut object_writer = ObjectWriter::new(&store, &path).await.unwrap();
         let mut encoder = PlainEncoder::new(&mut object_writer, &data_type);
@@ -554,7 +569,7 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        let input = Vec::from_iter(1..127 as i64);
+        let input = Vec::from_iter(1..127_i64);
         for t in int_types {
             let buffer = Buffer::from_slice_ref(input.as_slice());
             let list_type =
@@ -563,7 +578,7 @@ mod tests {
 
             for _ in 0..10 {
                 let items = make_array_(&t.clone(), &buffer).await;
-                let arr = FixedSizeListArray::try_new(items, 3).unwrap();
+                let arr = FixedSizeListArray::try_new_from_values(items, 3).unwrap();
                 arrs.push(Arc::new(arr) as ArrayRef);
             }
             test_round_trip(arrs.as_slice(), list_type).await;
@@ -576,8 +591,8 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from(Vec::from_iter(1..127 as u8));
-            let arr = FixedSizeBinaryArray::try_new(&values, 3).unwrap();
+            let values = UInt8Array::from(Vec::from_iter(1..127_u8));
+            let arr = FixedSizeBinaryArray::try_new_from_values(&values, 3).unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -591,10 +606,12 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = Int64Array::from_iter_values(1..=120 as i64);
-            let arr =
-                FixedSizeListArray::try_new(FixedSizeListArray::try_new(values, 2).unwrap(), 2)
-                    .unwrap();
+            let values = Int64Array::from_iter_values(1..=120_i64);
+            let arr = FixedSizeListArray::try_new_from_values(
+                FixedSizeListArray::try_new_from_values(values, 2).unwrap(),
+                2,
+            )
+            .unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -605,10 +622,12 @@ mod tests {
         let mut arrs: Vec<ArrayRef> = Vec::new();
 
         for _ in 0..10 {
-            let values = UInt8Array::from_iter_values(1..=120 as u8);
-            let arr =
-                FixedSizeListArray::try_new(FixedSizeBinaryArray::try_new(&values, 2).unwrap(), 2)
-                    .unwrap();
+            let values = UInt8Array::from_iter_values(1..=120_u8);
+            let arr = FixedSizeListArray::try_new_from_values(
+                FixedSizeBinaryArray::try_new_from_values(&values, 2).unwrap(),
+                2,
+            )
+            .unwrap();
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
@@ -659,7 +678,7 @@ mod tests {
         );
 
         assert_eq!(
-            &decoder.get(5..2).await.unwrap(),
+            &decoder.get(5..5).await.unwrap(),
             &new_empty_array(&DataType::Int32)
         );
 
@@ -747,16 +766,18 @@ mod tests {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "b",
             DataType::Boolean,
-            false,
+            true,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        let mut file_writer = FileWriter::try_new(&store, &path, schema.clone())
+            .await
+            .unwrap();
 
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         for i in 0..10 {
             let data = array.slice(i * 12, 12); // one and half byte
             file_writer
-                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![data]).unwrap()])
+                .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(data)]).unwrap()])
                 .await
                 .unwrap();
         }
@@ -764,6 +785,19 @@ mod tests {
 
         let batch = read_file_as_one_batch(&store, &path).await;
         assert_eq!(batch.column_by_name("b").unwrap().as_ref(), &array);
+
+        let array = BooleanArray::from(vec![Some(true), Some(false), None]);
+        let mut file_writer = FileWriter::try_new(&store, &path, schema).await.unwrap();
+        file_writer
+            .write(&[RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array)]).unwrap()])
+            .await
+            .unwrap();
+        file_writer.finish().await.unwrap();
+        let batch = read_file_as_one_batch(&store, &path).await;
+
+        // None default to Some(false), since we don't support null values yet.
+        let expected = BooleanArray::from(vec![Some(true), Some(false), Some(false)]);
+        assert_eq!(batch.column_by_name("b").unwrap().as_ref(), &expected);
     }
 
     #[tokio::test]
@@ -772,7 +806,7 @@ mod tests {
         let path = Path::from("/shared_slice");
 
         let array = Int32Array::from_iter_values(0..1600);
-        let fixed_size_list = FixedSizeListArray::try_new(&array, 16).unwrap();
+        let fixed_size_list = FixedSizeListArray::try_new_from_values(array, 16).unwrap();
         let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
             "fl",
             fixed_size_list.data_type().clone(),
@@ -817,15 +851,19 @@ mod tests {
         let array = BooleanArray::from((0..120).map(|v| v % 5 == 0).collect::<Vec<_>>());
         let batch =
             RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(array.clone())]).unwrap();
+        dbg!(&batch);
         file_writer.write(&[batch]).await.unwrap();
         file_writer.finish().await.unwrap();
 
         let reader = FileReader::try_new(&store, &path).await.unwrap();
-        let actual = reader.take(&[2, 4, 5, 8, 20], &schema).await.unwrap();
+        let actual = reader
+            .take(&[2, 4, 5, 8, 63, 64, 65], &schema)
+            .await
+            .unwrap();
 
         assert_eq!(
             actual.column_by_name("b").unwrap().as_ref(),
-            &BooleanArray::from(vec![false, false, true, false, true])
+            &BooleanArray::from(vec![false, false, true, false, false, false, true])
         );
     }
 
