@@ -264,10 +264,8 @@ pub async fn read_deletion_file(
     fragment: &Fragment,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionVector>> {
-    let deletion_file = if let Some(file) = &fragment.deletion_file {
-        file
-    } else {
-        return Ok(None);
+    let Some(deletion_file) = &fragment.deletion_file else {
+        return Ok(None)
     };
 
     match deletion_file.file_type {
