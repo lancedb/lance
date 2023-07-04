@@ -13,7 +13,7 @@ Getting Started
 
 1. Join our Discord and say hi
 2. Setup your development environment
-3. Pick an issue to work on
+3. Pick an issue to work on. See https://github.com/lancedb/lance/contribute for good first issues.
 4. Have fun!
 
 Development Environment
