@@ -43,7 +43,7 @@ jobs:
     - name: Create tag
       working-directory: rust
       run: |
-        export TAG="v$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version')"
+        export TAG="v$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version' | xargs echo)"
         git tag $TAG
     - name: Push new version and tag
       if: ${{ inputs.dry_run }} == "false"
