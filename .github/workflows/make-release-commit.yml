@@ -41,14 +41,15 @@ jobs:
       with:
         part: ${{ inputs.part }}
     - name: Create tag
+      working-directory: rust
       run: |
-        export TAG="v$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version')"
+        export TAG="v$(cargo metadata --no-deps --format-version 1 | jq '.packages[0].version' | xargs echo)"
         git tag $TAG
     - name: Push new version and tag
       if: ${{ inputs.dry_run }} == "false"
       uses: ad-m/github-push-action@master
       with:
-        github_token: ${{ secrets.RELEASE_TOKEN }}
+        github_token: ${{ secrets.LANCE_RELEASE_TOKEN }}
         branch: main
         tags: true
 
