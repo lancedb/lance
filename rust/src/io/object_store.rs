@@ -331,7 +331,7 @@ impl ObjectStore {
 
     /// Open a file for path.
     ///
-    /// The [path] is absolute path.
+    /// The `path` is an absolute path.
     pub async fn open(&self, path: &Path) -> Result<Box<dyn ObjectReader>> {
         match self.scheme.as_str() {
             "file" => LocalObjectReader::open(path, self.block_size),

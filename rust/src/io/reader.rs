@@ -232,6 +232,15 @@ impl FileReader {
         })
     }
 
+    /// Open one Lance DataFile to read.
+    ///
+    /// Parameters
+    /// * `uri` - The URI of the Lance file.
+    pub async fn open(uri: &str) -> Result<Self> {
+        let (object_store, path) = ObjectStore::from_uri(uri).await?;
+        Self::try_new(&object_store, &path).await
+    }
+
     /// Open one Lance data file for read.
     pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         Self::try_new_with_fragment(object_store, path, 0, None).await

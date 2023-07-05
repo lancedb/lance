@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! I/O utilities.
+//! I/O utilities, i.e., [`FileReader`] and [`FileWriter`] for each individual file.
 
 use std::io::{Error, ErrorKind, Result};
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
