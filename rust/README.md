@@ -33,7 +33,7 @@ let mut reader = RecordBatchIterator::new(
     batches.into_iter().map(Ok),
     schema,
 );
-Dataset::write(&mut reader, test_uri, Some(write_params)).await?;
+Dataset::write(reader, test_uri, Some(write_params)).await?;
 ```
 
 ### Read
