@@ -45,7 +45,7 @@
 //! let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
 //!
 //! # rt.block_on(async {
-//!     Dataset::write(reader, "/tmp/test.lance", None).await.unwrap();
+//! Dataset::write(reader, "/tmp/test.lance", None).await.unwrap();
 //! # })
 //! ```
 //!
@@ -56,8 +56,8 @@
 //! # use lance::Dataset;
 //! # let rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
-//!     let dataset = Dataset::open("/tmp/test.lance").await.unwrap();
-//!     println!("Total records: {}", dataset.count_rows().await.unwrap());
+//! let dataset = Dataset::open("/tmp/test.lance").await.unwrap();
+//! println!("Total records: {}", dataset.count_rows().await.unwrap());
 //! # });
 //! ```
 
