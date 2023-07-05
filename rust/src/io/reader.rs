@@ -238,6 +238,7 @@ impl FileReader {
     /// * `uri` - The URI of the Lance file.
     pub async fn open(uri: &str) -> Result<Self> {
         let (object_store, path) = ObjectStore::from_uri(uri).await?;
+        println!("path: {:?}", path);
         Self::try_new(&object_store, &path).await
     }
 
@@ -1383,6 +1384,13 @@ mod tests {
         let reader = FileReader::try_new(&store, &path).await.unwrap();
         let actual_batch = reader.read_batch(0, .., reader.schema()).await.unwrap();
         assert_eq!(batch, actual_batch);
+    }
+
+    #[tokio::test]
+    async fn test_open_reader() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new("i", DataType::Int64, false)]));
+        let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(0..100))];
+        let batch = RecordBatch::try_new(schema, columns).unwrap();
     }
 
     #[tokio::test]

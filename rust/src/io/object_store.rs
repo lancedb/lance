@@ -465,6 +465,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_open_file() {
+        
+    }
+
+    #[tokio::test]
     async fn test_tilde_expansion() {
         let uri = "~/foo.lance";
         write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
