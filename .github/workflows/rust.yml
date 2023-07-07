@@ -75,10 +75,10 @@ jobs:
           cargo build --no-default-features
       - name: Build test
         run: |
-          cargo test --no-default-features --no-run
+          cargo test --no-run
       - name: Run tests
         run: |
-          cargo test --no-default-features
+          cargo test
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
