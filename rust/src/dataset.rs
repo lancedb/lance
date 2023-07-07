@@ -15,6 +15,7 @@
 //! Lance Dataset
 //!
 
+
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::sync::Arc;
