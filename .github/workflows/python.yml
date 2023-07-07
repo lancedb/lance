@@ -64,13 +64,37 @@ jobs:
       run: |
         source venv/bin/activate
         pytest --doctest-modules python/lance
-    
+
   linux:
     timeout-minutes: 45
     strategy:
       matrix:
         python-minor-version: [ "8", "9", "10", "11" ]
     runs-on: "ubuntu-22.04"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.${{ matrix.python-minor-version }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
+    - uses: ./.github/workflows/build_linux_wheel
+    - uses: ./.github/workflows/run_tests
+  linux-arm:
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-minor-version: [ "8", "9", "10", "11" ]
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
     defaults:
       run:
         shell: bash
