@@ -66,6 +66,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
       - name: Run cargo fmt
         run: cargo fmt --check
       # split everything us so we know what's slow.
