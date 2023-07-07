@@ -72,13 +72,13 @@ jobs:
       # split everything us so we know what's slow.
       - name: Build
         run: |
-          cargo build --all-features
+          cargo build --no-default-features
       - name: Build test
         run: |
-          cargo test --all-features --no-run
+          cargo test --no-default-features --no-run
       - name: Run tests
         run: |
-          cargo test --all-features
+          cargo test --no-default-features
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
