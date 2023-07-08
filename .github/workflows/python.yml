@@ -93,7 +93,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: ["11"]
+        python-minor-version: [ "8", "9", "10", "11" ]
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     defaults:
       run:
