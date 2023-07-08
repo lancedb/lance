@@ -93,7 +93,7 @@ jobs:
     timeout-minutes: 45
     strategy:
       matrix:
-        python-minor-version: "11"
+        python-minor-version: ["11"]
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     defaults:
       run:
@@ -112,7 +112,7 @@ jobs:
       with:
         workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
-      inputs:
+      with:
         arm-build: true
     - uses: ./.github/workflows/run_tests
   mac:
