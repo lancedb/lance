@@ -20,7 +20,7 @@ runs:
     - name: CONFIRM ARM BUILD
       shell: bash
       run: |
-        echo "ARM BUILD: ${{ inputs.arm-build }}"
+        echo "ARM BUILD: ${{ !inputs.arm-build }}"
     - name: Build manylinux image
       if: ${{ inputs.arm-build }}
       shell: bash
@@ -28,7 +28,7 @@ runs:
       run: |
         docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014 tools/
     - name: Build manylinux image (arm)
-      if: ${{ !inputs.arm-build }}
+      if: ${{ inputs.arm-build }}
       shell: bash
       working-directory: python
       run: |
