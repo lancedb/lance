@@ -28,7 +28,7 @@ runs:
       shell: bash
       working-directory: python
       run: |
-        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014-arm64 tools/
+        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014-aarch64 tools/
     - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
