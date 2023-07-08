@@ -17,6 +17,8 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: CONFIRM ARM BUILD
+      run: echo "ARM BUILD: ${{ inputs.arm-build }}"
     - name: Build manylinux image
       if: ${{ inputs.arm-build }}
       shell: bash

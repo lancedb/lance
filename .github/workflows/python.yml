@@ -118,7 +118,7 @@ jobs:
         workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
       with:
-        arm-build: true
+        arm-build: "true"
     - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
