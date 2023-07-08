@@ -18,13 +18,13 @@ runs:
   using: "composite"
   steps:
     - name: Build manylinux image
-      if: ${{ !inputs.arm-build }}
+      if: ${{ inputs.arm-build }}
       shell: bash
       working-directory: python
       run: |
         docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014 tools/
     - name: Build manylinux image (arm)
-      if: ${{ inputs.arm-build }}
+      if: ${{ !inputs.arm-build }}
       shell: bash
       working-directory: python
       run: |
