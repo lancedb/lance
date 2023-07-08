@@ -34,7 +34,7 @@ jobs:
     strategy:
       matrix:
         python-minor-version: [ "8"]
-    runs-on:
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
     steps:
     - uses: actions/checkout@v3
       with:

@@ -9,14 +9,34 @@ inputs:
     description: "--release"
     required: false
     default: ""
+  arm-build:
+    description: "Build for arm64 instead of x86_64"
+    required: false
+    default: 'false'
+    type: boolean
 runs:
   using: "composite"
+  if: ${{ !inputs.arm-build }}
   steps:
     - name: Build manylinux image
       shell: bash
       working-directory: python
       run: |
         docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014 tools/
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        args: ${{ inputs.args }}
+        working-directory: python
+        container: pylance_manylinux
+  if: ${{ inputs.arm-build }}
+  steps:
+    - name: Build manylinux image
+      shell: bash
+      working-directory: python
+      run: |
+        docker build -t pylance_manylinux -f tools/Dockerfile.manylinux2014-arm64 tools/
     - name: Build wheel
       uses: PyO3/maturin-action@v1
       with:
