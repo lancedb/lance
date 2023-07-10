@@ -13,7 +13,8 @@ A `Lance Dataset` is organized in a directory.
         latest.manifest -- The manifest file for the latest version.
         _versions/*.manifest -- Manifest file for each dataset version.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
-
+        _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
+          that have been deleted.
 
 A ``Manifest`` file includes the metadata to describe a version of the dataset.
 
@@ -74,6 +75,60 @@ on whether you are trying to read or write the table. Readers should check the
 ``reader_feature_flags`` to see if there are any flag it is not aware of. Writers 
 should check ``writer_feature_flags``. If either sees a flag they don't know, they
 should return an "unsupported" error on any read or write operation.
+
+Fields
+------
+
+Fields represent the metadata for a column. This includes the name, data type,
+id, nullability, and encoding.
+
+Fields are listed in depth first order, and can be one of (1) parent (struct),
+(2) repeated (list/array), or (3) leaf (primitive). For example, the schema:
+
+.. code-block::
+
+    a: i32
+    b: struct {
+        c: list<i32>
+        d: i32
+    }
+
+Would be represented as the following field list:
+
+.. list-table::
+   :widths: 20 20 20 20 25
+   :header-rows: 1
+
+   * - name
+     - id
+     - type
+     - parent_id
+     - logical_type
+   * - ``a``
+     - 1
+     - LEAF
+     - 0
+     - ``"int32"``
+   * - ``b``
+     - 2
+     - PARENT
+     - 0
+     - ``"struct"``
+   * - ``b.c``
+     - 3
+     - REPEATED
+     - 2
+     - ``"list"``
+   * - ``b.c``
+     - 4
+     - LEAF
+     - 3
+     - ``"int32"``
+   * - ``b.d``
+     - 5
+     - LEAF
+     - 2
+     - ``"int32"``
 
 Encodings
 ---------

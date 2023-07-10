@@ -140,6 +140,9 @@ message DataFile {
   // Relative path to the root.
   string path = 1;
   // The ids of the fields/columns in this file.
+  //
+  // This must be equal in length to the number of columns in the file. The order
+  // of the ids determines the mapping from field id to column position.
   repeated int32 fields = 2;
 } // DataFile
 
@@ -182,7 +185,7 @@ message Metadata {
 
   // The file position that page table is stored.
   //
-  // A page table is a matrix of N x N x 2, where N = num_fields, and M =
+  // A page table is a matrix of N x M x 2, where N = num_fields, and M =
   // num_batches. Each cell in the table is a pair of <position:int64,
   // length:int64> of the page. Both position and length are int64 values. The
   // <position, length> of all the pages in the same column are then
@@ -239,6 +242,32 @@ message Field {
   int32 parent_id = 4;
 
   // Logical types, support parameterized Arrow Type.
+  //
+  // PARENT types will always have logical type "struct".
+  //
+  // REPEATED types may have logical types:
+  // * "list"
+  // * "large_list"
+  // * "list.struct"
+  // * "large_list.struct"
+  // The final two are used if the list values are structs, and therefore the
+  // field is both implicitly REPEATED and PARENT.
+  //
+  // LEAF types may have logical types:
+  // * "null"
+  // * "bool"
+  // * "int8" / "uint8"
+  // * "int16" / "uint16"
+  // * "int32" / "uint32"
+  // * "int64" / "uint64"
+  // * "halffloat" / "float" / "double"
+  // * "string" / "large_string"
+  // * "binary" / "large_binary"
+  // * "date32:day"
+  // * "date64:ms"
+  // * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"
+  // * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is "s", "ms", "us", "ns"
+  // * "dict:{value_type}:{index_type}:false"
   string logical_type = 5;
   // If this field is nullable.
   bool nullable = 6;
