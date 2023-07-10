@@ -26,7 +26,7 @@ jobs:
     runs-on:
       group: large-runners
       labels: ubuntu-22.04-4core
-    timeout-minutes: 31
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: ./rust
@@ -52,7 +52,7 @@ jobs:
         run: |
           cargo test --all-features
   linux-arm:
-    runs-on: buildjet-16vcpu-ubuntu-2204-arm
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
     timeout-minutes: 30
     defaults:
       run:
@@ -78,7 +78,7 @@ jobs:
           cargo test --no-run
       - name: Run tests
         run: |
-          cargo test
+          cargo test --jobs 2
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30

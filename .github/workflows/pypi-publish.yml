@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        python-minor-version: [ "8"]
+        python-minor-version: [ "8" ]
     runs-on: "ubuntu-22.04"
     steps:
     - uses: actions/checkout@v3
@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       matrix:
-        python-minor-version: [ "11" ]
+        python-minor-version: [ "8" ]
     runs-on: buildjet-4vcpu-ubuntu-2204-arm
     steps:
     - uses: actions/checkout@v3
