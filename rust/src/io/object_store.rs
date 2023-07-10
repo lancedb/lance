@@ -341,6 +341,10 @@ impl ObjectStore {
         &self.base_path
     }
 
+    pub fn uri(&self) -> String {
+        format!("{}://{}", self.scheme, self.base_path)
+    }
+
     /// Open a file for path.
     ///
     /// The [path] is absolute path.

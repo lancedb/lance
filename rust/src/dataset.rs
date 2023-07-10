@@ -291,10 +291,10 @@ impl Dataset {
 
     pub async fn write_impl(
         batches: Box<dyn RecordBatchReader + Send>,
-        uri: &str,
+        object_store: ObjectStore,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        let (object_store, base) = ObjectStore::from_uri(uri).await?;
+        let base = object_store.base_path().to_owned();
         let mut params = params.unwrap_or_default();
 
         // Read expected manifest path for the dataset
@@ -316,7 +316,7 @@ impl Dataset {
         // create + dataset already exists = error
         if flag_dataset_exists && matches!(params.mode, WriteMode::Create) {
             return Err(Error::DatasetAlreadyExists {
-                uri: uri.to_owned(),
+                uri: object_store.uri(),
             });
         }
 
@@ -325,7 +325,10 @@ impl Dataset {
             && (matches!(params.mode, WriteMode::Append)
                 || matches!(params.mode, WriteMode::Overwrite))
         {
-            warn!("No existing dataset at {uri}, it will be created");
+            warn!(
+                "No existing dataset at {}, it will be created",
+                object_store.uri()
+            );
             params = WriteParams {
                 mode: WriteMode::Create,
                 ..params
@@ -336,7 +339,7 @@ impl Dataset {
         let dataset = if matches!(params.mode, WriteMode::Create) {
             None
         } else {
-            Some(Self::open(uri).await?)
+            Some(Self::open(&object_store.uri()).await?)
         };
 
         // append + input schema different from existing schema = error
@@ -479,7 +482,8 @@ impl Dataset {
         // Box it so we don't monomorphize for every one. We take the generic
         // parameter for API ergonomics.
         let batches = Box::new(batches);
-        Self::write_impl(batches, uri, params).await
+        let (object_store, _) = ObjectStore::from_uri(uri).await?;
+        Self::write_impl(batches, object_store, params).await
     }
 
     /// Create a new version of [`Dataset`] from a collection of fragments.
