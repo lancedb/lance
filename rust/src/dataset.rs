@@ -1116,8 +1116,15 @@ mod tests {
             max_rows_per_group: 10,
             ..Default::default()
         };
+        // We should be able to append even if the metadata doesn't exactly match.
+        let schema_with_meta = Arc::new(
+            schema
+                .as_ref()
+                .clone()
+                .with_metadata([("key".to_string(), "value".to_string())].into()),
+        );
         let batches = vec![RecordBatch::try_new(
-            schema.clone(),
+            schema_with_meta,
             vec![Arc::new(Int32Array::from_iter_values(0..10))],
         )
         .unwrap()];

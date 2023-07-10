@@ -27,7 +27,7 @@ use crate::arrow::*;
 use crate::{format::pb, io::object_reader::ObjectReader, Error, Result};
 
 /// Lance Schema.
-#[derive(Default, Debug, PartialEq, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct Schema {
     /// Top-level fields in the dataset.
     pub fields: Vec<Field>,
@@ -263,6 +263,12 @@ impl Schema {
         };
         schema.set_field_id();
         Ok(schema)
+    }
+}
+
+impl PartialEq for Schema {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
     }
 }
 
