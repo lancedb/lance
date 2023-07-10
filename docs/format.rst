@@ -51,7 +51,7 @@ where each ``DataFile`` can contain several columns in the chunk of data. It als
 Fragment manifest format
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-The fragment manifest is a Lance file, where each row is a fragment. The schema
+The fragment manifest is a Lance file, where each row is a fragment. The minimal schema
 is:
 
 .. code-block::
@@ -64,6 +64,11 @@ is:
         file_type: dictionary<u8, string>
         read_version: u64
         id: u64
+
+The fragment manifest may include additional fields, such as:
+
+.. code-block::
+
     num_deleted_rows: u64
     stats: struct
         num_values: i64
@@ -77,7 +82,13 @@ is:
             min_value: <field_N_data_type>
             max_value: <field_N_data_type>
 
-.. note::
+These fields are non-nullable, except for ``deletion_file.file_type``. If the
+fragment does not have a deletion file, then ``file_type`` will be null. In those
+rows, ``deletion_file.read_version`` and ``deletion_file.id`` may be arbitrary
+values.
+
+
+.. warning::
 
     Extra fields may be present in the manifest. They should be ignored if they
     are not understood.
@@ -306,8 +317,56 @@ can be expensive to recompute.
 Fields
 ------
 
-* what data does a field contain?
-* How are IDs assigned?
+Fields represent the metadata for a column. This includes the name, data type,
+id, nullability, and encoding.
+
+Fields are listed in depth first order, and can be one of (1) parent (struct),
+(2) repeated (list/array), or (3) leaf (primitive). For example, the schema:
+
+.. code-block::
+
+    a: i32
+    b: struct {
+        c: list<i32>
+        d: i32
+    }
+
+Would be represented as the following field list:
+
+.. list-table::
+   :widths: 20 20 20 20 25
+   :header-rows: 1
+
+   * - name
+     - id
+     - type
+     - parent_id
+     - logical_type
+   * - ``a``
+     - 1
+     - LEAF
+     - 0
+     - ``"int32"``
+   * - ``b``
+     - 2
+     - PARENT
+     - 0
+     - ``"struct"``
+   * - ``b.c``
+     - 3
+     - REPEATED
+     - 2
+     - ``"list"``
+   * - ``b.c``
+     - 4
+     - LEAF
+     - 3
+     - ``"int32"``
+   * - ``b.d``
+     - 5
+     - LEAF
+     - 2
+     - ``"int32"``
 
 
 Statistics
@@ -400,9 +459,8 @@ Sometimes, users may not wish to collect statistics on all columns. This might b
 especially true for column that are large binary blobs.
 
 There is a field called ``statistics_columns`` that tracks which field ids to
-collect statistics for.
-
-.. TODO: what if new fields are added? 
+collect statistics for going forward. This field is optional, and if it is not
+set then statistics should be collected for all columns, if possible.
 
 Partitioning
 ------------

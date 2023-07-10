@@ -110,8 +110,15 @@ message Manifest {
   // External manifests are Lance files that contain all metadata about the
   // fragments. Each row represents a single fragment.
   //
-  // The schema of the file includes:
+  // The schema of the file includes, at minimum:
   // * fragment_id: u32
+  // * data_files: struct
+  //   * path: string
+  //   * fields: list<u32>
+  // * deletion_file: struct
+  //   * file_type: dictionary<u8, string>
+  //   * read_version: u64
+  //   * id: u64
   repeated string external_manifest_paths = 12;
 } // Manifest
 
@@ -221,10 +228,23 @@ message Metadata {
   // ```
   uint64 page_table_position = 3;
 
-  // All fields in the statistics
-  repeated Field stats_fields = 4;
+  // The schema of the statistics.
+  //
+  // This might be empty, meaning there are no statistics. It also might not 
+  // contain statistics for every field.
+  repeated Field stats_schema = 4;
 
 	// The file position of the statistics page table
+  //
+  // The page table is a matrix of N x 2, where N = num_stats_fields. This is
+  // the same layout as the main page table, except there is always only one
+  // batch.
+  //
+  // For example, to get the stats column 5, we have:
+  // ```text
+  //   position = stats_page_table[5][0];
+  //   length = stats_page_table[5][1];
+  // ```
 	uint64 stats_page_table_position = 5;
 } // Metadata
 
