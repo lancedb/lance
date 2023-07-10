@@ -134,6 +134,7 @@ impl CredentialProvider for AwsCredentialAdapter {
 async fn build_s3_object_store(
     uri: &str,
     credentials_refresh_offset: Duration,
+    credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
 ) -> Result<Arc<dyn OSObjectStore>> {
     use aws_config::meta::region::RegionProviderChain;
 
@@ -141,18 +142,25 @@ async fn build_s3_object_store(
 
     let region_provider = RegionProviderChain::default_provider().or_else(DEFAULT_REGION);
 
-    let credentials_provider = DefaultCredentialsChain::builder()
-        .region(region_provider.region().await)
-        .build()
-        .await;
+    let creds = match credentials {
+        Some(creds) => creds,
+        None => {
+            let credentials_provider = DefaultCredentialsChain::builder()
+                .region(region_provider.region().await)
+                .build()
+                .await;
+
+            Arc::new(AwsCredentialAdapter::new(
+                Arc::new(credentials_provider),
+                credentials_refresh_offset,
+            ))
+        }
+    };
 
     Ok(Arc::new(
         AmazonS3Builder::new()
             .with_url(uri)
-            .with_credentials(Arc::new(AwsCredentialAdapter::new(
-                Arc::new(credentials_provider),
-                credentials_refresh_offset,
-            )))
+            .with_credentials(creds)
             .with_region(
                 region_provider
                     .region()
@@ -191,6 +199,9 @@ pub struct ObjectStoreParams {
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 
     pub s3_credentials_refresh_offset: Duration,
+
+    // Custom AWS Credentials
+    pub aws_credentials: Option<Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>>,
 }
 
 // Need this for setting a non-zero default duration
@@ -199,6 +210,7 @@ impl Default for ObjectStoreParams {
         Self {
             object_store_wrapper: None,
             s3_credentials_refresh_offset: Duration::from_secs(60),
+            aws_credentials: None,
         }
     }
 }
@@ -221,8 +233,7 @@ impl ObjectStore {
                 Self::new_from_path(uri)
             }
             Ok(url) => {
-                let store =
-                    Self::new_from_url(url.clone(), params.s3_credentials_refresh_offset).await?;
+                let store = Self::new_from_url(url.clone(), &params).await?;
                 let path = Path::from(url.path());
                 Ok((store, path))
             }
@@ -265,12 +276,13 @@ impl ObjectStore {
         ))
     }
 
-    async fn new_from_url(url: Url, s3_credential_refresh_offset: Duration) -> Result<Self> {
+    async fn new_from_url(url: Url, params: &ObjectStoreParams) -> Result<Self> {
         match url.scheme() {
             "s3" => Ok(Self {
                 inner: build_s3_object_store(
                     url.to_string().as_str(),
-                    s3_credential_refresh_offset,
+                    params.s3_credentials_refresh_offset,
+                    params.aws_credentials.clone(),
                 )
                 .await?,
                 scheme: String::from("s3"),
@@ -568,6 +580,54 @@ mod tests {
         // hard to compare two trait pointers as the point to vtables
         // using the ref count as a proxy to make sure that the store is correctly kept
         assert_eq!(Arc::strong_count(&mock_inner_store), 2);
+    }
+
+    #[derive(Debug, Default)]
+    struct MockAwsCredentialsProvider {
+        called: AtomicBool,
+    }
+
+    #[async_trait]
+    impl CredentialProvider for MockAwsCredentialsProvider {
+        type Credential = ObjectStoreAwsCredential;
+
+        async fn get_credential(&self) -> ObjectStoreResult<Arc<Self::Credential>> {
+            self.called.store(true, Ordering::Relaxed);
+            Ok(Arc::new(Self::Credential {
+                key_id: "".to_string(),
+                secret_key: "".to_string(),
+                token: None,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_injected_aws_creds_option_is_used() {
+        let mock_provider = Arc::new(MockAwsCredentialsProvider::default());
+
+        let params = ObjectStoreParams {
+            aws_credentials: Some(mock_provider.clone()
+                as Arc<dyn CredentialProvider<Credential = ObjectStoreAwsCredential>>),
+            ..ObjectStoreParams::default()
+        };
+
+        // Not called yet
+        assert!(!mock_provider.called.load(Ordering::Relaxed));
+
+        let (store, _) = ObjectStore::from_uri_and_params("s3://not-a-bucket", params)
+            .await
+            .unwrap();
+
+        // fails, but we don't care
+        let _ = store
+            .open(&Path::parse("/").unwrap())
+            .await
+            .unwrap()
+            .get_range(0..1)
+            .await;
+
+        // Not called yet
+        assert!(mock_provider.called.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
