@@ -70,13 +70,6 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       - name: Run cargo fmt
         run: cargo fmt --check
-      # split everything us so we know what's slow.
-      - name: Build
-        run: |
-          cargo build --no-default-features
-      - name: Build test
-        run: |
-          cargo test --no-run
       - name: Run tests
         run: |
           cargo test -- --test-threads 1
