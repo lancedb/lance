@@ -243,3 +243,121 @@ collisions. The suffix is determined by the file type (``.arrow`` for Arrow file
 Deletes can be materialized by re-writing data files with the deleted rows 
 removed. However, this invalidates row indices and thus the ANN indices, which
 can be expensive to recompute.
+
+
+Fields
+------
+
+* what data does a field contain?
+* How are IDs assigned?
+
+
+Statistics
+----------
+
+Statistics are stored for both the page-level (within a Lance file) and
+fragment-level (within the manifest). The statistics can be used to determine
+which fragments or pages can be skipped within a query. The null count, lower
+bound (min), and upper bound (max) are stored.
+
+Statistics themselves are stored in Lance's columnar format, which allows for
+selectively reading only relevant stats columns.
+
+Statistic values
+~~~~~~~~~~~~~~~~
+
+Three types of statistics are stored: null count, min value, max value. The min
+and max values are stored as their native data types in arrays.
+
+There are special behavior for different data types to account for nulls:
+
+For integer-based data types (including signed and unsigned integers, dates,
+and timestamps), if the min and max are unknown (all values are null), then the
+minimum/maximum representable values should be used instead.
+
+For float data types, if the min and max are unknown, then use ``-Inf`` and ``+Inf``,
+respectively. ``NaN`` values should be ignored for the purpose of min and max
+statistics. If the max value is zero (negative or positive), the max value
+should be recorded as ``+0.0``. Likewise, if the min value is zero (positive
+or negative), it should be recorded as ``-0.0``.
+
+For binary data types, if the min or max are unknown or unrepresentable, then use
+null value. Binary data type bounds can also be truncated. For example, an array
+containing just the value ``"abcd"`` could have a truncated min of
+``"abc"`` and max of ``"abd"``. If there is no truncated value greater than the
+maximum value, then instead use null for the maximum.
+
+.. warn::
+
+    The ``min`` and ``max`` values are not guaranteed to be within the array;
+    they are simply upper and lower bounds. Two common cases where they are not
+    contained in the array is if the min or max original value was deleted and
+    when binary data is truncated. Therefore, statistic should not be used to
+    compute queries such as ``SELECT max(col) FROM table``, except to identify
+    which pages and files definitely do not contain the min or max value.
+
+Page-level statistics format
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Page-level statistics are stored as separate arrays within the Lance file. Each
+array is only one page long. The page offsets are stored in an array just like
+the data page table. The offset to the statistics page offsets is stored in the
+metadata.
+
+The schema for the statistics is:
+
+.. code-block::
+
+    num_values: i64
+    <field_id_1>: struct
+        null_count: i64
+        min_value: <field_1_data_type>
+        max_value: <field_1_data_type>
+    ...
+    <field_id_N>: struct
+        null_count: i64
+        min_value: <field_N_data_type>
+        max_value: <field_N_data_type>
+
+
+File-level statistics format
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+File-level statistics are stored within the external manifest file. The statistics
+are stored under the ``stats`` column, as a struct with the same schema as the 
+page-level statistics.
+
+.. note::
+
+    Since the external manifest file is itself a Lance file, it will have
+    page-level statistics about the file-level statistics within it. For manifest
+    with a high number of files, those page-level statistics can be used to prune
+    fragments based on some predicate, reducing the amount of IO required when 
+    reading the fragment list.
+
+Controlling statistics collection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sometimes, users may not wish to collect statistics on all columns. This might be
+especially true for column that are large binary blobs.
+
+There is a field called ``statistics_columns`` that tracks which field ids to
+collect statistics for.
+
+.. TODO: what if new fields are added? 
+
+Partitioning
+------------
+
+Other table formats support explicit partitioning, splitting up files based on
+column values (such as Hive-style partitioning) or transformations of them
+(such as Apache Iceberg's "hidden partitioning").
+
+Lance uses implicit partitioning. Data files and fragments may be written with
+arbitrary splits and clustering, but no special metadata is recorded. Instead,
+the partition values are encoded automatically in the fragment-level statistics.
+
+What partitioning and clustering schemes are supported is entirely up to writers.
+All that is needed to read any partitioning scheme is the file-level statistics,
+so any partitioning scheme (even totally custom ones) are compatible with all
+readers that support reading file-level statistics.
