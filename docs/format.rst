@@ -24,6 +24,9 @@ A ``Manifest`` file includes the metadata to describe a version of the dataset.
    :start-at: // Manifest is
    :end-at: } // Manifest
 
+Fragments
+~~~~~~~~~
+
 ``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
 where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
 ``DeletionFile``, which is explained in a later section.
@@ -34,6 +37,17 @@ where each ``DataFile`` can contain several columns in the chunk of data. It als
    :start-at: // Data fragment
    :end-at: } // DataFile
 
+
+The overall structure of a fragment is shown below. One or more data files store
+the columns of a fragment. New columns can be added to a fragment by adding new
+data files. The deletion file (if present), stores the rows that have been
+deleted from the fragment.
+
+.. image:: _static/fragment_structure.png
+
+Every row has a unique id, which is an u64 that is composed of two u32s: the
+fragment id and the local row id. The local row id is just the index of the
+row in the data files.
 
 File Structure
 --------------
