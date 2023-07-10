@@ -52,7 +52,7 @@ jobs:
         run: |
           cargo test --all-features
   linux-arm:
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    runs-on: buildjet-16vcpu-ubuntu-2204-arm
     timeout-minutes: 30
     defaults:
       run:
