@@ -12,11 +12,26 @@ A `Lance Dataset` is organized in a directory.
         data/*.lance  -- Data directory
         latest.manifest -- The manifest file for the latest version.
         _versions/*.manifest -- Manifest file for each dataset version.
+        _fragment_manifests/*.lance -- Lance files containing data file metadata.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
         _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
           that have been deleted.
 
+.. image:: _static/format_overview.png
+
 A ``Manifest`` file includes the metadata to describe a version of the dataset.
+The manifest file references one or more fragment manifests. The fragment manifests
+are Lance files where each row is a fragment, and contains the path, metadata,
+and statistics for those fragments.
+
+A fragment is a collection of rows. It is made up of multiple Lance files,
+which collectively contain all the columns in the fragment. It also may contain
+a deletion file, which houses the row ids of deleted rows.
+
+Manifest format
+~~~~~~~~~~~~~~~
+
+The manifest file format is defined by a protobuf message:
 
 .. literalinclude:: ../protos/format.proto
    :language: protobuf
@@ -24,12 +39,55 @@ A ``Manifest`` file includes the metadata to describe a version of the dataset.
    :start-at: // Manifest is
    :end-at: } // Manifest
 
+
 Fragments
 ~~~~~~~~~
 
 ``DataFragment`` represents a chunk of data in the dataset. Itself includes one or more ``DataFile``,
 where each ``DataFile`` can contain several columns in the chunk of data. It also may include a 
 ``DeletionFile``, which is explained in a later section.
+
+
+Fragment manifest format
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The fragment manifest is a Lance file, where each row is a fragment. The schema
+is:
+
+.. code-block::
+
+    id: u32
+    data_files: struct
+        path: string
+        fields: list<u32>
+    deletion_file: struct
+        file_type: dictionary<u8, string>
+        read_version: u64
+        id: u64
+    num_deleted_rows: u64
+    stats: struct
+        num_values: i64
+        <field_id_1>: struct
+            null_count: i64
+            min_value: <field_1_data_type>
+            max_value: <field_1_data_type>
+        ...
+        <field_id_N>: struct
+            null_count: i64
+            min_value: <field_N_data_type>
+            max_value: <field_N_data_type>
+
+.. note::
+
+    Extra fields may be present in the manifest. They should be ignored if they
+    are not understood.
+
+Inline fragments
+~~~~~~~~~~~~~~~~
+
+Tables may also have their fragments represented inline in the manifest file,
+under the ``fragments`` field, if the "external manifests" feature flag is
+turned off. The ``DataFragment`` protobuf message represents a single fragment.
 
 .. literalinclude:: ../protos/format.proto
    :language: protobuf
@@ -287,7 +345,7 @@ containing just the value ``"abcd"`` could have a truncated min of
 ``"abc"`` and max of ``"abd"``. If there is no truncated value greater than the
 maximum value, then instead use null for the maximum.
 
-.. warn::
+.. warning::
 
     The ``min`` and ``max`` values are not guaranteed to be within the array;
     they are simply upper and lower bounds. Two common cases where they are not
