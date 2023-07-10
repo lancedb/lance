@@ -64,7 +64,7 @@ jobs:
       run: |
         source venv/bin/activate
         pytest --doctest-modules python/lance
-    
+
   linux:
     timeout-minutes: 45
     strategy:
@@ -88,6 +88,37 @@ jobs:
       with:
         workspaces: python
     - uses: ./.github/workflows/build_linux_wheel
+    - uses: ./.github/workflows/run_tests
+  linux-arm:
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-minor-version: [ "11" ]
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
+    defaults:
+      run:
+        shell: bash
+        working-directory: python
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+        lfs: true
+    - name: Set up Python
+      run: |
+        sudo apt update
+        sudo apt install wget software-properties-common
+        sudo add-apt-repository ppa:deadsnakes/ppa
+        sudo apt install python3.${{ matrix.python-minor-version }}
+        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
+        sudo apt install python3-pip
+        sudo apt install python3.${{ matrix.python-minor-version }}-distutils
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: python
+    - uses: ./.github/workflows/build_linux_wheel
+      with:
+        arm-build: "true"
     - uses: ./.github/workflows/run_tests
   mac:
     timeout-minutes: 45
