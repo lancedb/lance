@@ -14,8 +14,6 @@ A `Lance Dataset` is organized in a directory.
         _versions/*.manifest -- Manifest file for each dataset version.
         _fragment_manifests/*.lance -- Lance files containing data file metadata.
         _indices/{UUID-*}/index.idx -- Secondary index, each index per directory.
-        _deletions/*.{arrow,bin} -- Deletion files, which contain ids of rows
-          that have been deleted.
 
 .. image:: _static/format_overview.png
 
@@ -312,62 +310,6 @@ collisions. The suffix is determined by the file type (``.arrow`` for Arrow file
 Deletes can be materialized by re-writing data files with the deleted rows 
 removed. However, this invalidates row indices and thus the ANN indices, which
 can be expensive to recompute.
-
-
-Fields
-------
-
-Fields represent the metadata for a column. This includes the name, data type,
-id, nullability, and encoding.
-
-Fields are listed in depth first order, and can be one of (1) parent (struct),
-(2) repeated (list/array), or (3) leaf (primitive). For example, the schema:
-
-.. code-block::
-
-    a: i32
-    b: struct {
-        c: list<i32>
-        d: i32
-    }
-
-Would be represented as the following field list:
-
-.. list-table::
-   :widths: 20 20 20 20 25
-   :header-rows: 1
-
-   * - name
-     - id
-     - type
-     - parent_id
-     - logical_type
-   * - ``a``
-     - 1
-     - LEAF
-     - 0
-     - ``"int32"``
-   * - ``b``
-     - 2
-     - PARENT
-     - 0
-     - ``"struct"``
-   * - ``b.c``
-     - 3
-     - REPEATED
-     - 2
-     - ``"list"``
-   * - ``b.c``
-     - 4
-     - LEAF
-     - 3
-     - ``"int32"``
-   * - ``b.d``
-     - 5
-     - LEAF
-     - 2
-     - ``"int32"``
-
 
 Statistics
 ----------

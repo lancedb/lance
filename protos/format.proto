@@ -215,7 +215,7 @@ message Metadata {
 
   // The file position that page table is stored.
   //
-  // A page table is a matrix of N x M x 2, where N = num_fields, and M =
+  // A page table is a matrix of N x N x 2, where N = num_fields, and M =
   // num_batches. Each cell in the table is a pair of <position:int64,
   // length:int64> of the page. Both position and length are int64 values. The
   // <position, length> of all the pages in the same column are then
