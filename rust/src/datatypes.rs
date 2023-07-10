@@ -283,13 +283,22 @@ impl TryFrom<&LogicalType> for DataType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Dictionary {
     pub(crate) offset: usize,
 
     pub(crate) length: usize,
 
     pub(crate) values: Option<ArrayRef>,
+}
+
+impl PartialEq for Dictionary {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.values, &other.values) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl From<&pb::Dictionary> for Dictionary {
