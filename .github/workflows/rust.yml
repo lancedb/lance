@@ -78,7 +78,7 @@ jobs:
           cargo test --no-run
       - name: Run tests
         run: |
-          cargo test --jobs 2
+          cargo test --jobs 1
   clippy:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
