@@ -41,7 +41,7 @@ pub(crate) trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// Schema::new(vec![
     ///   Field::new("_rowid", DataType::UInt64, false),
-    ///   Field::new("score", DataType::Float32, false),
+    ///   Field::new("_distance", DataType::Float32, false),
     /// ]);
     /// ```
     ///

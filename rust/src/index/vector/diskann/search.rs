@@ -31,7 +31,7 @@ use crate::{
     index::{
         vector::{
             graph::{GraphReadParams, PersistedGraph},
-            SCORE_COL,
+            DIST_COL,
         },
         Index,
     },
@@ -218,7 +218,7 @@ impl VectorIndex for DiskANNIndex {
         let state = greedy_search(&self.graph, 0, query.key.values(), query.k, query.k * 2).await?;
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
-            Field::new(SCORE_COL, DataType::Float32, false),
+            Field::new(DIST_COL, DataType::Float32, false),
         ]));
 
         let mut candidates = Vec::with_capacity(query.k);

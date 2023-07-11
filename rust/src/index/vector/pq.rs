@@ -35,7 +35,7 @@ use crate::arrow::linalg::matrix::MatrixView;
 use crate::arrow::*;
 use crate::dataset::ROW_ID;
 use crate::index::Index;
-use crate::index::{pb, vector::kmeans::train_kmeans, vector::SCORE_COL};
+use crate::index::{pb, vector::kmeans::train_kmeans, vector::DIST_COL};
 use crate::io::deletion::LruDeletionVectorStore;
 use crate::io::object_reader::{read_fixed_stride_array, ObjectReader};
 use crate::linalg::{l2::l2_distance_batch, norm_l2::norm_l2};
@@ -243,7 +243,7 @@ impl VectorIndex for PQIndex {
         let row_ids = take(row_ids.as_ref(), &indices, None)?;
 
         let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(SCORE_COL, DataType::Float32, false),
+            ArrowField::new(DIST_COL, DataType::Float32, false),
             ArrowField::new(ROW_ID, DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(schema, vec![scores, row_ids])?)

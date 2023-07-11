@@ -149,13 +149,13 @@ impl VectorIndex for IVFIndex {
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
-        let score_col = batch.column_by_name("score").ok_or_else(|| Error::IO {
-            message: format!("score column does not exist in batch: {}", batch.schema()),
+        let dist_col = batch.column_by_name("_distance").ok_or_else(|| Error::IO {
+            message: format!("_distance column does not exist in batch: {}", batch.schema()),
         })?;
 
         // TODO: Use a heap sort to get the top-k.
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-        let selection = sort_to_indices(score_col, None, Some(limit))?;
+        let selection = sort_to_indices(dist_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);
         let taken_scores = take(&struct_arr, &selection, None)?;
         Ok(as_struct_array(&taken_scores).into())

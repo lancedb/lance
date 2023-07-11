@@ -24,7 +24,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use futures::future;
 use futures::stream::{repeat_with, Stream, StreamExt, TryStreamExt};
 
-use super::{Query, SCORE_COL};
+use super::{Query, DIST_COL};
 use crate::arrow::*;
 use crate::{Error, Result};
 
@@ -41,9 +41,9 @@ pub async fn flat_search(
         .map(|(batch, mt)| async move {
             let k = query.key.clone();
             let mut batch = batch?;
-            if batch.column_by_name(SCORE_COL).is_some() {
+            if batch.column_by_name(DIST_COL).is_some() {
                 // Ignore the score calculated from inner vector index.
-                batch = batch.drop_column(SCORE_COL)?;
+                batch = batch.drop_column(DIST_COL)?;
             }
             let vectors = batch
                 .column_by_name(&query.column)
@@ -64,7 +64,7 @@ pub async fn flat_search(
             // TODO: use heap
             let indices = sort_to_indices(&scores, None, Some(query.k))?;
             let batch_with_score = batch
-                .try_with_column(ArrowField::new(SCORE_COL, DataType::Float32, false), scores)?;
+                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, false), scores)?;
             let struct_arr = StructArray::from(batch_with_score);
             let selected_arr = take(&struct_arr, &indices, None)?;
             Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
@@ -73,7 +73,7 @@ pub async fn flat_search(
         .try_collect::<Vec<_>>()
         .await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
-    let scores = batch.column_by_name(SCORE_COL).unwrap();
+    let scores = batch.column_by_name(DIST_COL).unwrap();
     let indices = sort_to_indices(scores, None, Some(query.k))?;
 
     let struct_arr = StructArray::from(batch);
