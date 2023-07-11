@@ -190,11 +190,11 @@ async fn build_azure_object_store(uri: &str) -> Result<Arc<dyn OSObjectStore>> {
     ))
 }
 
-pub trait WrappingObjectStore: Send + Sync {
+pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     fn wrap(&self, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ObjectStoreParams {
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
 

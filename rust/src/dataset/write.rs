@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::io::object_store::ObjectStoreParams;
+
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteMode {
@@ -27,7 +29,7 @@ pub enum WriteMode {
 }
 
 /// Dataset Write Parameters
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WriteParams {
     /// Max number of records per file.
     pub max_rows_per_file: usize,
@@ -37,6 +39,8 @@ pub struct WriteParams {
 
     /// Write mode
     pub mode: WriteMode,
+
+    pub store_params: Option<ObjectStoreParams>,
 }
 
 impl Default for WriteParams {
@@ -45,6 +49,7 @@ impl Default for WriteParams {
             max_rows_per_file: 1024 * 1024, // 1 million
             max_rows_per_group: 1024,
             mode: WriteMode::Create,
+            store_params: None,
         }
     }
 }
