@@ -1287,7 +1287,7 @@ mod test {
             Dataset::write(reader, test_uri, Some(params)).await
         };
 
-        write_batch(batch1.clone()).await.unwrap();
+        write_batch.clone()(batch1.clone()).await.unwrap();
         write_batch(batch2.clone()).await.unwrap();
 
         let dataset = Arc::new(Dataset::open(test_uri).await.unwrap());
