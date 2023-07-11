@@ -43,25 +43,28 @@ class BFloat16Type(pa.ExtensionType):
         import pandas as pd
 
         return pd.PeriodDtype(freq=self.freq)
-    
+
+
 pa.register_extension_type(BFloat16Type())
 
 try:
-    import pandas.api.extensions
-    from pandas.api.extensions import register_extension_dtype, ExtensionDtype, ExtensionArray
+    from pandas.api.extensions import (
+        ExtensionArray,
+        ExtensionDtype,
+        register_extension_dtype,
+    )
 except ImportError:
     pass
 else:
     # Define Pandas and register Pandas extensions
     @register_extension_dtype
     class PandasBFloat16Type(ExtensionDtype):
-        kind = 'f'
+        kind = "f"
         na_value = None
-        name = 'lance.bfloat16'
+        name = "lance.bfloat16"
         names = None
         type = BFloat16
-    
+
     class PandasBFloat16Array(ExtensionArray):
         # TODO
         pass
-

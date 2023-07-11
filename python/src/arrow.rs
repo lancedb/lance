@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::pyarrow::PyArrowConvert;
+use arrow::pyarrow::ToPyArrow;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use half::bf16;

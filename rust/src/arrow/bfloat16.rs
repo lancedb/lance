@@ -91,11 +91,6 @@ impl Array for BFloat16Array {
         self.inner.as_any()
     }
 
-    fn data(&self) -> &arrow::array::ArrayData {
-        #[allow(deprecated)]
-        self.inner.data()
-    }
-
     fn to_data(&self) -> arrow_data::ArrayData {
         self.inner.to_data()
     }
@@ -111,6 +106,30 @@ impl Array for BFloat16Array {
 
     fn nulls(&self) -> Option<&arrow_buffer::NullBuffer> {
         self.inner.nulls()
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.inner.data_type()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn offset(&self) -> usize {
+        self.inner.offset()
+    }
+
+    fn get_array_memory_size(&self) -> usize {
+        self.inner.get_array_memory_size()
+    }
+
+    fn get_buffer_memory_size(&self) -> usize {
+        self.inner.get_buffer_memory_size()
     }
 }
 
@@ -133,11 +152,11 @@ impl FromIterator<Option<bf16>> for BFloat16Array {
         }
 
         let null_buffer = nulls.finish();
-        let num_valid = null_buffer.count_set_bits_offset(0, len);
+        let num_valid = null_buffer.count_set_bits();
         let null_buffer = if num_valid == len {
             None
         } else {
-            Some(null_buffer)
+            Some(null_buffer.into_inner())
         };
 
         let array_data = ArrayData::builder(DataType::FixedSizeBinary(2))

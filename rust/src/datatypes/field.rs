@@ -514,7 +514,11 @@ impl TryFrom<&ArrowField> for Field {
                 DataType::List(_) | DataType::LargeList(_) => Some(Encoding::Plain),
                 _ => None,
             },
-            extension_name: "".to_string(),
+            extension_name: field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|name| name.to_owned())
+                .unwrap_or_else(|| "".to_string()),
             nullable: field.is_nullable(),
             children,
             dictionary: None,
@@ -532,7 +536,20 @@ impl TryFrom<ArrowField> for Field {
 
 impl From<&Field> for ArrowField {
     fn from(field: &Field) -> Self {
-        Self::new(&field.name, field.data_type(), field.nullable)
+        let out = Self::new(&field.name, field.data_type(), field.nullable);
+
+        if !field.extension_name.is_empty() {
+            out.with_metadata(
+                vec![(
+                    "ARROW:extension:name".to_string(),
+                    field.extension_name.clone(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        } else {
+            out
+        }
     }
 }
 
