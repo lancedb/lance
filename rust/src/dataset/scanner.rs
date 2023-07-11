@@ -1425,7 +1425,10 @@ mod test {
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec", "i"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["_distance", "_rowid", "vec", "i"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields
@@ -1509,7 +1512,10 @@ mod test {
 
         let take = &filter.children()[0];
         let take = take.as_any().downcast_ref::<TakeExec>().unwrap();
-        assert_eq!(take.schema().field_names(), ["_distance", "_rowid", "vec", "i"]);
+        assert_eq!(
+            take.schema().field_names(),
+            ["_distance", "_rowid", "vec", "i"]
+        );
         assert_eq!(
             take.extra_schema
                 .fields

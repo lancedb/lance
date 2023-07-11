@@ -222,12 +222,12 @@ impl VectorIndex for DiskANNIndex {
         ]));
 
         let mut candidates = Vec::with_capacity(query.k);
-        for (score, row) in state.candidates {
+        for (distance, row) in state.candidates {
             if candidates.len() == query.k {
                 break;
             }
             if !self.deletion_cache.as_ref().is_deleted(row as u64).await? {
-                candidates.push((score, row));
+                candidates.push((distance, row));
             }
         }
 
@@ -236,11 +236,14 @@ impl VectorIndex for DiskANNIndex {
             .take(query.k)
             .map(|(_, id)| *id as u64)
             .collect();
-        let scores: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
+        let distances: Float32Array = candidates.iter().take(query.k).map(|(d, _)| **d).collect();
 
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(row_ids) as ArrayRef, Arc::new(scores) as ArrayRef],
+            vec![
+                Arc::new(row_ids) as ArrayRef,
+                Arc::new(distances) as ArrayRef,
+            ],
         )?;
         Ok(batch)
     }

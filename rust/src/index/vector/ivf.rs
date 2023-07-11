@@ -150,15 +150,18 @@ impl VectorIndex for IVFIndex {
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
         let dist_col = batch.column_by_name("_distance").ok_or_else(|| Error::IO {
-            message: format!("_distance column does not exist in batch: {}", batch.schema()),
+            message: format!(
+                "_distance column does not exist in batch: {}",
+                batch.schema()
+            ),
         })?;
 
         // TODO: Use a heap sort to get the top-k.
         let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
         let selection = sort_to_indices(dist_col, None, Some(limit))?;
         let struct_arr = StructArray::from(batch);
-        let taken_scores = take(&struct_arr, &selection, None)?;
-        Ok(as_struct_array(&taken_scores).into())
+        let taken_distances = take(&struct_arr, &selection, None)?;
+        Ok(as_struct_array(&taken_distances).into())
     }
 
     fn is_loadable(&self) -> bool {

@@ -59,7 +59,7 @@ impl KNNFlatStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute distances: {e}"
                     ))))
                     .await
                     .expect("KNNFlat failed to send message");
@@ -180,7 +180,7 @@ impl ExecutionPlan for KNNFlatExec {
         self
     }
 
-    /// Flat KNN inherits the schema from input node, and add one score column.
+    /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         let input_schema = self.input.schema();
         let mut fields = input_schema.fields().to_vec();
@@ -261,7 +261,7 @@ impl KNNIndexStream {
                 Ok(b) => b,
                 Err(e) => {
                     tx.send(Err(datafusion::error::DataFusionError::Execution(format!(
-                        "Failed to compute scores: {e}"
+                        "Failed to compute distances: {e}"
                     ))))
                     .await
                     .expect("KNNIndex failed to send message");

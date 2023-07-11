@@ -42,7 +42,7 @@ pub async fn flat_search(
             let k = query.key.clone();
             let mut batch = batch?;
             if batch.column_by_name(DIST_COL).is_some() {
-                // Ignore the score calculated from inner vector index.
+                // Ignore the distance calculated from inner vector index.
                 batch = batch.drop_column(DIST_COL)?;
             }
             let vectors = batch
@@ -52,7 +52,7 @@ pub async fn flat_search(
                 })?
                 .clone();
             let flatten_vectors = as_fixed_size_list_array(vectors.as_ref()).values().clone();
-            let scores = tokio::task::spawn_blocking(move || {
+            let distances = tokio::task::spawn_blocking(move || {
                 mt.batch_func()(
                     k.values(),
                     as_primitive_array::<Float32Type>(flatten_vectors.as_ref()).values(),
@@ -62,10 +62,12 @@ pub async fn flat_search(
             .await? as ArrayRef;
 
             // TODO: use heap
-            let indices = sort_to_indices(&scores, None, Some(query.k))?;
-            let batch_with_score = batch
-                .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, false), scores)?;
-            let struct_arr = StructArray::from(batch_with_score);
+            let indices = sort_to_indices(&distances, None, Some(query.k))?;
+            let batch_with_distance = batch.try_with_column(
+                ArrowField::new(DIST_COL, DataType::Float32, false),
+                distances,
+            )?;
+            let struct_arr = StructArray::from(batch_with_distance);
             let selected_arr = take(&struct_arr, &indices, None)?;
             Ok::<RecordBatch, Error>(as_struct_array(&selected_arr).into())
         })
@@ -73,8 +75,8 @@ pub async fn flat_search(
         .try_collect::<Vec<_>>()
         .await?;
     let batch = concat_batches(&batches[0].schema(), &batches)?;
-    let scores = batch.column_by_name(DIST_COL).unwrap();
-    let indices = sort_to_indices(scores, None, Some(query.k))?;
+    let distances = batch.column_by_name(DIST_COL).unwrap();
+    let indices = sort_to_indices(distances, None, Some(query.k))?;
 
     let struct_arr = StructArray::from(batch);
     let selected_arr = take(&struct_arr, &indices, None)?;
