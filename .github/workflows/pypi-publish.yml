@@ -1,8 +1,11 @@
 name: Build and upload python wheels
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
+  # release:
+  #   types: [published]
 
 jobs:
   linux:
@@ -41,9 +44,14 @@ jobs:
         fetch-depth: 0
         lfs: true
     - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: 3.${{ matrix.python-minor-version }}
+      run: |
+        sudo apt update
+        sudo apt install wget software-properties-common
+        sudo add-apt-repository ppa:deadsnakes/ppa
+        sudo apt install python3.${{ matrix.python-minor-version }}
+        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
+        sudo apt install python3-pip
+        sudo apt install python3.${{ matrix.python-minor-version }}-distutils
     - uses: ./.github/workflows/build_linux_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
