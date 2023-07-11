@@ -1,11 +1,8 @@
 name: Build and upload python wheels
 
 on:
-  push:
-    branches:
-      - main
-  #  release:
-  #   types: [published]
+  release:
+    types: [published]
 
 jobs:
   linux:
@@ -27,11 +24,11 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release"
-    # - uses: ./.github/workflows/upload_wheel
-    #   with:
-    #     python-minor-version: ${{ matrix.python-minor-version }}
-    #     token: ${{ secrets.PYPI_TOKEN }}
-    #     repo: "pypi"
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        python-minor-version: ${{ matrix.python-minor-version }}
+        token: ${{ secrets.PYPI_TOKEN }}
+        repo: "pypi"
   linux-arm:
     timeout-minutes: 60
     strategy:
@@ -56,11 +53,12 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release"
-    # - uses: ./.github/workflows/upload_wheel
-    #   with:
-    #     python-minor-version: ${{ matrix.python-minor-version }}
-    #     token: ${{ secrets.PYPI_TOKEN }}
-    #     repo: "pypi"
+        arm-build: "true"
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        python-minor-version: ${{ matrix.python-minor-version }}
+        token: ${{ secrets.PYPI_TOKEN }}
+        repo: "pypi"
   mac:
     timeout-minutes: 60
     runs-on: "macos-12"
@@ -84,11 +82,11 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip --target ${{ matrix.target }}"
-    # - uses: ./.github/workflows/upload_wheel
-    #   with:
-    #     python-minor-version: ${{ matrix.python-minor-version }}
-    #     token: ${{ secrets.PYPI_TOKEN }}
-    #     repo: "pypi"
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        python-minor-version: ${{ matrix.python-minor-version }}
+        token: ${{ secrets.PYPI_TOKEN }}
+        repo: "pypi"
   windows:
     timeout-minutes: 60
     runs-on: windows-latest
@@ -110,8 +108,8 @@ jobs:
           python-minor-version: ${{ matrix.python-minor-version }}
           args: "--release"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
-      # - uses: ./.github/workflows/upload_wheel
-      #   with:
-      #     python-minor-version: ${{ matrix.python-minor-version }}
-      #     token: ${{ secrets.PYPI_TOKEN }}
-      #     repo: "pypi"
+      - uses: ./.github/workflows/upload_wheel
+        with:
+          python-minor-version: ${{ matrix.python-minor-version }}
+          token: ${{ secrets.PYPI_TOKEN }}
+          repo: "pypi"
