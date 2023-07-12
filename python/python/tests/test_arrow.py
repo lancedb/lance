@@ -1,7 +1,8 @@
 import re
 
 import pandas as pd
-from lance.arrow import BFloat16, BFloat16Array, bfloat16_array
+import pyarrow as pa
+from lance.arrow import BFloat16, BFloat16Array, PandasBFloat16Array, bfloat16_array
 
 
 def test_bf16_value():
@@ -63,5 +64,30 @@ def test_bf16_pandas():
     assert arr_pandas[1] is None
     assert arr_pandas[2] == BFloat16(3.4)
 
+    # Can instantiate with dtype string
     series = pd.Series(arr_pandas, dtype="lance.bfloat16")
     pd.testing.assert_series_equal(arr_pandas, series)
+
+    # Can roundtrip to Arrow
+    arr_arrow = pa.array(arr_pandas)
+    assert isinstance(arr_arrow, BFloat16Array)
+    assert arr == arr_arrow
+
+    pd.testing.assert_series_equal(arr_arrow.to_pandas(), arr_pandas)
+
+
+def test_bf16_numpy():
+    import numpy as np
+    from ml_dtypes import bfloat16
+
+    data = [1.1, 2.1, 3.4]
+    arr = bfloat16_array(data)
+    arr_numpy = arr.to_numpy()
+
+    expected = np.array(data, dtype=bfloat16)
+
+    np.testing.assert_array_equal(arr_numpy, expected)
+
+    # Can roundtrip to Pandas
+    arr_pandas = PandasBFloat16Array.from_numpy(arr_numpy)
+    np.testing.assert_array_equal(arr_pandas.to_numpy(), expected)

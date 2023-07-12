@@ -13,6 +13,18 @@ class BFloat16Array(pa.ExtensionArray):
             repr(self.to_pylist()),
         )
 
+    def to_numpy(self, zero_copy_only=False):
+        if self.null_count > 0:
+            raise ValueError("Cannot convert null values to numpy")
+
+        import numpy as np
+        from ml_dtypes import bfloat16
+
+        buffer = self.storage.buffers()[1].to_pybytes()
+        array = np.frombuffer(buffer, dtype=bfloat16)
+
+        return array
+
 
 class BFloat16Scalar(pa.ExtensionScalar):
     def as_py(self) -> BFloat16 | None:
@@ -110,3 +122,15 @@ else:
 
         def isna(self):
             return self.data.is_null().to_numpy(zero_copy_only=False)
+
+        def to_numpy(self, *args, **kwargs):
+            return self.data.to_numpy()
+
+        def __arrow_array__(self, type=None):
+            return self.data
+
+        @classmethod
+        def from_numpy(cls, array):
+            data = pa.py_buffer(array.tobytes())
+            inner = pa.Array.from_buffers(BFloat16Type(), len(array), [None, data])
+            return cls(inner)
