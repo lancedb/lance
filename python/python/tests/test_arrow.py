@@ -45,7 +45,8 @@ def test_bf16_repr():
 \[1.1015625, None, 3.40625\]"""
     assert re.match(expected_re, repr(arr))
 
-    # TODO: make an issue about the pretty printing not handle extension arrays.
+    # TODO: uncomment tests once fixed upstream.
+    # https://github.com/apache/arrow/issues/36648
 
 
 #     tab = pa.table({"x": arr})

@@ -197,8 +197,11 @@ def sample_data_all_types():
     nrows = 10
     return pa.table(
         {
+            # TODO: add remaining types
             "str": pa.array([str(i) for i in range(nrows)]),
-            # 'float16': pa.array([1.0 + i / 10 for i in range(nrows)], pa.float16()),
+            "float16": pa.array(
+                [np.float16(1.0 + i / 10) for i in range(nrows)], pa.float16()
+            ),
             "bfloat16": lance.arrow.bfloat16_array(
                 [1.0 + i / 10 for i in range(nrows)]
             ),
