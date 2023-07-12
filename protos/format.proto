@@ -144,9 +144,9 @@ message DataFile {
 } // DataFile
 
 // Deletion File
-// 
+//
 // The path of the deletion file is constructed as:
-//   <root>/_deletions/{fragment_id}-{read_version}-{id}.{extension}
+//   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
 // where {extension} is `.arrow` or `.bin` depending on the type of deletion.
 message DeletionFile {
   // Type of deletion file, which varies depending on what is the most efficient

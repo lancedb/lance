@@ -1,7 +1,5 @@
 # Rust Implementation of Lance Data Format
 
-> :warning: **Under heavy development**
-
 <div align="center">
 <p align="center">
 
@@ -25,15 +23,14 @@ cargo install lance
 Suppose `batches` is an Arrow `Vec<RecordBatch>` and schema is Arrow `SchemaRef`:
 
 ```rust
-use ::lance::dataset::WriteParams;
-use ::lance::dataset::Dataset;
+use lance::{dataset::WriteParams, Dataset};
 
-let mut write_params = WriteParams::default();
+let write_params = WriteParams::default();
 let mut reader = RecordBatchIterator::new(
     batches.into_iter().map(Ok),
-    schema,
+    schema
 );
-Dataset::write(reader, test_uri, Some(write_params)).await?;
+Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
 ```
 
 ### Read
