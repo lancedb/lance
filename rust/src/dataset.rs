@@ -289,7 +289,7 @@ impl Dataset {
         })
     }
 
-    pub async fn write_impl(
+    async fn write_impl(
         batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
         params: Option<WriteParams>,
