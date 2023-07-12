@@ -1,3 +1,5 @@
+from typing import Union
+
 import pyarrow as pa
 
 from .lance import BFloat16
@@ -40,9 +42,7 @@ class BFloat16Type(pa.ExtensionType):
         return BFloat16Scalar
 
     def to_pandas_dtype(self):
-        import pandas as pd
-
-        return pd.PeriodDtype(freq=self.freq)
+        return PandasBFloat16Type()
 
 
 pa.register_extension_type(BFloat16Type())
@@ -64,7 +64,49 @@ else:
         name = "lance.bfloat16"
         names = None
         type = BFloat16
+        _is_numeric = True
+
+        def __from_arrow__(
+            self, array: Union[pa.Array, pa.ChunkedArray]
+        ) -> ExtensionArray:
+            return PandasBFloat16Array(array)
+
+        def construct_array_type(self):
+            return PandasBFloat16Array
+
+        @classmethod
+        def construct_from_string(cls, string):
+            if string == "lance.bfloat16":
+                return cls()
+            else:
+                raise TypeError(f"Cannot construct a '{cls.__name__}' from '{string}'")
 
     class PandasBFloat16Array(ExtensionArray):
-        # TODO
-        pass
+        dtype = PandasBFloat16Type()
+
+        def __init__(self, data):
+            self.data = data
+
+        @classmethod
+        def _from_sequence(
+            cls, scalars, *, dtype: PandasBFloat16Type, copy: bool = False
+        ):
+            return PandasBFloat16Array(bfloat16_array(scalars))
+
+        def __getitem__(self, item):
+            import numpy as np
+
+            if isinstance(item, int):
+                return self.data[item].as_py()
+            elif isinstance(item, slice):
+                return PandasBFloat16Array(self.data[item])
+            elif isinstance(item, np.ndarray) and item.dtype == bool:
+                return PandasBFloat16Array(self.data.filter(pa.array(item)))
+            else:
+                raise NotImplementedError()
+
+        def __len__(self):
+            return len(self.data)
+
+        def isna(self):
+            return self.data.is_null().to_numpy(zero_copy_only=False)

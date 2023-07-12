@@ -1,5 +1,6 @@
 import re
 
+import pandas as pd
 from lance.arrow import BFloat16, BFloat16Array, bfloat16_array
 
 
@@ -54,6 +55,13 @@ def test_bf16_repr():
 #     assert re.match(expected_re, repr(tab))
 
 
-# def test_bf16_pandas():
-#     data = [1.1, None, 3.4]
-#     arr = bfloat16_array(data)
+def test_bf16_pandas():
+    data = [1.1, None, 3.4]
+    arr = bfloat16_array(data)
+    arr_pandas = arr.to_pandas()
+    assert arr_pandas[0] == BFloat16(1.1)
+    assert arr_pandas[1] is None
+    assert arr_pandas[2] == BFloat16(3.4)
+
+    series = pd.Series(arr_pandas, dtype="lance.bfloat16")
+    pd.testing.assert_series_equal(arr_pandas, series)
