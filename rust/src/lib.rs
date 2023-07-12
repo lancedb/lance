@@ -31,14 +31,15 @@
 //! # let mut rt = Runtime::new().unwrap();
 //! # rt.block_on(async {
 //! #
-//! # let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
-//! # let batches = vec![RecordBatch::new_empty(schema.clone())];
 //! # let test_dir = tempfile::tempdir().unwrap();
 //! # let uri = test_dir.path().to_str().unwrap().to_string();
-//! let write_params = WriteParams::default();
+//! let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
+//! let batches = vec![RecordBatch::new_empty(schema.clone())];
 //! let reader = RecordBatchIterator::new(
 //!     batches.into_iter().map(Ok), schema
 //! );
+//!
+//! let write_params = WriteParams::default();
 //! Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
 //! # })
 //! ```
