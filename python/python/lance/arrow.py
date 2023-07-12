@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Optional, Union
 
 import pyarrow as pa
 
@@ -27,7 +27,7 @@ class BFloat16Array(pa.ExtensionArray):
 
 
 class BFloat16Scalar(pa.ExtensionScalar):
-    def as_py(self) -> BFloat16 | None:
+    def as_py(self) -> Optional[BFloat16]:
         if self.value is None:
             return None
         else:
