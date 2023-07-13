@@ -127,5 +127,5 @@ jobs:
           echo "$HOME\protoc\bin" >> $env:GITHUB_PATH
       - name: Run tests
         run: |
-          cargo build --no-default-features
-          cargo test --no-default-features
+          cargo build
+          cargo test
