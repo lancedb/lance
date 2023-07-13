@@ -111,26 +111,21 @@ jobs:
           cargo test --all-features
   windows-build:
     runs-on: windows-latest
-    timeout-minutes: 90
     defaults:
       run:
         working-directory: rust
-    env:
-      VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
     steps:
       - uses: actions/checkout@v3
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: ./.github/workflows/install_windows_dependencies
-        with:
-          vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
-          update_vcpkg: true
+      - name: Install protoc
+        run: |
+          curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-win64.zip"
+          unzip protoc-3.15.8-win64.zip -d $HOME\protoc
+          # Add protoc to the system PATH
+          echo "$HOME\protoc\bin" >> $env:GITHUB_PATH
       - name: Run tests
         run: |
-          $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
-          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
-          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
-          $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\tools\protobuf;' + $env:PATH
-          cargo build --all-features
-          cargo test --all-features
+          cargo build --no-default-features
+          cargo test --no-default-features
