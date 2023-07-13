@@ -9,58 +9,22 @@ inputs:
     description: "--release"
     required: false
     default: ""
-  vcpkg_token:
-    description: "Token to use to publish / lookup vcpkg packages"
-    required: true
 runs:
   using: "composite"
   steps:
-    - name: 'Setup vcpkg cache'
-      env:
-        VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
-      shell: 'bash'
-      run: |
-        `vcpkg fetch nuget | tail -n 1` \
-          sources add \
-          -source "https://nuget.pkg.github.com/eto-ai/index.json" \
-          -storepasswordincleartext \
-          -name "GitHub" \
-          -username "eto-ai" \
-          -password "${{ inputs.vcpkg_token }}"
-        `vcpkg fetch nuget | tail -n 1` \
-          setapikey "${{ inputs.vcpkg_token }}" \
-          -source "https://nuget.pkg.github.com/eto.ai/index.json"
-    - name: Setup Dependencies with vcpkg
-      env:
-        VCPKG_BINARY_SOURCES: 'clear;nuget,GitHub,readwrite'
+    - name: Install protoc
       shell: powershell
       run: |
-        vcpkg install openblas --triplet x64-windows-static-md
-        vcpkg install lapack --triplet x64-windows-static-md
-    - name: Install Protoc v21.12
-      working-directory: C:\
-      run: |
-        New-Item -Path 'C:\protoc' -ItemType Directory
-        Set-Location C:\protoc
-        Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
-        7z x protoc.zip
-        Add-Content $env:GITHUB_PATH "C:\protoc\bin"
-      shell: powershell
+        curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-win64.zip"
+        unzip protoc-3.15.8-win64.zip -d $HOME\protoc
+        # Add protoc to the system PATH
+        echo "$HOME\protoc\bin" >> $env:GITHUB_PATH
     - name: Build wheel
-      env:
-        VCPKG_ROOT: C:\vcpkg
       uses: PyO3/maturin-action@v1
       with:
         command: build
         args: ${{ inputs.args }}
         working-directory: python
-    - name: Add DLLs to wheel
-      working-directory: python
-      run: |
-        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows\bin;' + $env:PATH
-        $env:PATH = $env:VCPKG_INSTALLATION_ROOT + '\installed\x64-windows-static-md\bin;' + $env:PATH
-        pip install delvewheel
-        delvewheel repair --wheel-dir target\wheels $(ls target/wheels/*.whl)
       shell: powershell
     - uses: actions/upload-artifact@v3
       with:
