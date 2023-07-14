@@ -73,7 +73,6 @@ num-traits = "0.2"
 ordered-float = "3.6.0"
 snafu = "0.7.4"
 log = "0"
-half = "=2.2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
