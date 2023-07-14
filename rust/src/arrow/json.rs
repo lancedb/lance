@@ -57,9 +57,9 @@ impl TryFrom<DataType> for JsonDataType {
             DataType::UInt16 => Self::new("uint16"),
             DataType::UInt32 => Self::new("uint32"),
             DataType::UInt64 => Self::new("uint64"),
-            DataType::Float16 => todo!(),
-            DataType::Float32 => todo!(),
-            DataType::Float64 => todo!(),
+            DataType::Float16 => Self::new("float16"),
+            DataType::Float32 => Self::new("float32"),
+            DataType::Float64 => Self::new("float64"),
             DataType::Timestamp(_, _) => todo!(),
             DataType::Date32 => todo!(),
             DataType::Date64 => todo!(),
@@ -128,6 +128,10 @@ mod test {
         assert_eq!(
             serde_json::to_string(&JsonDataType::try_new(DataType::Int32).unwrap()).unwrap(),
             r#"{"type":"int32"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&JsonDataType::try_new(DataType::UInt64).unwrap()).unwrap(),
+            r#"{"type":"uint64"}"#
         );
         assert_eq!(
             serde_json::to_string(&JsonDataType::try_new(DataType::Boolean).unwrap()).unwrap(),
