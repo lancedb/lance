@@ -20,6 +20,9 @@
 
 use std::env;
 
+use ::lance::arrow::json::ArrowJsonExt;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow_schema::Schema;
 use env_logger::Env;
 use pyo3::prelude::*;
 
@@ -50,6 +53,27 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<DataFile>()?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
+    m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[pyfunction(name = "_schema_to_json")]
+fn schema_to_json(py_schema: &PyAny) -> PyResult<String> {
+    let schema = Schema::from_pyarrow(py_schema)?;
+    schema.to_json().map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("Failed to convert schema to json: {}", e))
+    })
+}
+
+#[pyfunction(name = "_json_to_schema")]
+fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
+    let schema = Schema::from_json(json).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Failed to convert json to schema: {}, json={}",
+            e, json
+        ))
+    })?;
+    schema.to_pyarrow(py)
 }
