@@ -28,6 +28,8 @@ struct JsonDataType {
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     fields: Option<Vec<JsonField>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    length: Option<usize>,
 }
 
 impl JsonDataType {
@@ -39,6 +41,7 @@ impl JsonDataType {
         Self {
             type_: type_name.to_string(),
             fields: None,
+            length: None,
         }
     }
 }
@@ -69,9 +72,29 @@ impl TryFrom<&DataType> for JsonDataType {
             | DataType::Date64
             | DataType::Time32(_)
             | DataType::Time64(_)
-            | DataType::Timestamp(_, _) => {
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+            | DataType::Dictionary(_, _) => {
                 let logical_type: LogicalType = dt.try_into()?;
                 (logical_type.to_string(), None)
+            }
+
+            DataType::List(f) => {
+                let fields = vec![JsonField::try_from(f.as_ref())?];
+                ("list".to_string(), Some(fields))
+            }
+            DataType::LargeList(f) => {
+                let fields = vec![JsonField::try_from(f.as_ref())?];
+                ("large_list".to_string(), Some(fields))
+            }
+            DataType::FixedSizeList(f, len) => {
+                let fields = vec![JsonField::try_from(f.as_ref())?];
+                return Ok(Self {
+                    type_: "fixed_size_list".to_string(),
+                    fields: Some(fields),
+                    length: Some(*len as usize),
+                });
             }
             DataType::Struct(fields) => {
                 let fields = fields
@@ -90,6 +113,7 @@ impl TryFrom<&DataType> for JsonDataType {
         Ok(Self {
             type_: type_name,
             fields,
+            length: None,
         })
     }
 }
@@ -141,6 +165,9 @@ impl ArrowJsonExt for Schema {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    use std::sync::Arc;
+
     use arrow_schema::TimeUnit;
     use serde_json;
 
@@ -177,6 +204,19 @@ mod test {
         assert_primitive_types(DataType::Date32, "date32:day");
         assert_primitive_types(DataType::Date64, "date64:ms");
         assert_primitive_types(DataType::Time32(TimeUnit::Second), "time32:s");
+    }
+
+    #[test]
+    fn test_complex_types_to_json() {
+        assert_type_json_str(
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
+            r#"{"type":"list","fields":[{"name":"item","type":{"type":"float"},"nullable":false}]}"#,
+        );
+
+        assert_type_json_str(
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 32),
+            r#"{"type":"fixed_size_list","fields":[{"name":"item","type":{"type":"float"},"nullable":false}],"length":32}"#,
+        );
 
         assert_type_json_str(
             DataType::Struct(
