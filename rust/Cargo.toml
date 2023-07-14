@@ -45,6 +45,7 @@ chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
+half = { "version" = "2.2.1", default-features = false }
 object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
