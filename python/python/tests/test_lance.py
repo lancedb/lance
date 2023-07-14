@@ -155,3 +155,37 @@ def _create_dataset(uri):
     arr = pa.FixedSizeListArray.from_arrays(values, 32)
     tbl = pa.Table.from_arrays([arr], schema=schema)
     return lance.write_dataset(tbl, uri)
+
+
+def test_schema_to_json():
+    schema = pa.schema(
+        [
+            pa.field("embedding", pa.list_(pa.float32(), 32), False),
+            pa.field("id", pa.int64(), True),
+        ]
+    )
+    json_schema = lance.schema_to_json(schema)
+    assert json_schema == {
+        "fields": [
+            {
+                "name": "embedding",
+                "nullable": False,
+                "type": {
+                    "type": "fixed_size_list",
+                    "fields": [
+                        {"name": "item", "nullable": True, "type": {"type": "float"}}
+                    ],
+                    "length": 32,
+                },
+            },
+            {
+                "name": "id",
+                "type": {
+                    "type": "int64",
+                },
+                "nullable": True,
+            },
+        ],
+    }
+    actual_schema = lance.json_to_schema(json_schema)
+    assert actual_schema == schema
