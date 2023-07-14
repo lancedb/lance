@@ -128,7 +128,7 @@ impl TryFrom<&JsonDataType> for DataType {
             "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
             | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
             | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
-                let logical_type: LogicalType = value.type_.as_str().into();
+                let logical_type: LogicalType = type_name.into();
                 (&logical_type).try_into()
             }
             dt if dt.starts_with("time32:")
