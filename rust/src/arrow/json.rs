@@ -15,6 +15,7 @@
 //! Serialization and deserialization of Arrow Schema to JSON.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,64 @@ impl TryFrom<&DataType> for JsonDataType {
     }
 }
 
+impl TryFrom<&JsonDataType> for DataType {
+    type Error = Error;
+
+    fn try_from(value: &JsonDataType) -> Result<Self> {
+        let type_name = value.type_.as_str();
+        match type_name {
+            "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
+            | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
+            | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
+                let logical_type: LogicalType = value.type_.as_str().into();
+                (&logical_type).try_into()
+            }
+            dt if dt.starts_with("time32:")
+                || dt.starts_with("time64:")
+                || dt.starts_with("timestamp:")
+                || dt.starts_with("duration:")
+                || dt.starts_with("dict:") =>
+            {
+                let logical_type: LogicalType = dt.into();
+                (&logical_type).try_into()
+            }
+            "list" | "large_list" | "fixed_size_list" | "struct" => {
+                let fields = value
+                    .fields
+                    .as_ref()
+                    .ok_or_else(|| Error::Arrow {
+                        message: "Json conversion: List type requires a field".to_string(),
+                    })?
+                    .iter()
+                    .map(Field::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+
+                match type_name {
+                    "list" => Ok(DataType::List(Arc::new(fields[0].clone()))),
+                    "large_list" => Ok(DataType::LargeList(Arc::new(fields[0].clone()))),
+                    "fixed_size_list" => {
+                        let length = value.length.ok_or_else(|| Error::Arrow {
+                            message: "Json conversion: FixedSizeList type requires a length"
+                                .to_string(),
+                        })?;
+                        Ok(DataType::FixedSizeList(
+                            Arc::new(fields[0].clone()),
+                            length as i32,
+                        ))
+                    }
+                    "struct" => Ok(DataType::Struct(fields.into())),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                return Err(Error::Arrow {
+                    message: format!("Json conversion: Unsupported type: {value:?}"),
+                })
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonField {
     name: String,
@@ -137,6 +196,15 @@ impl TryFrom<&Field> for JsonField {
             nullable: field.is_nullable(),
             type_: data_type,
         })
+    }
+}
+
+impl TryFrom<&JsonField> for Field {
+    type Error = Error;
+
+    fn try_from(value: &JsonField) -> Result<Self> {
+        let data_type = DataType::try_from(&value.type_)?;
+        Ok(Field::new(&value.name, data_type, value.nullable))
     }
 }
 
@@ -168,10 +236,31 @@ impl TryFrom<&Schema> for JsonSchema {
     }
 }
 
-pub trait ArrowJsonExt {
+impl TryFrom<JsonSchema> for Schema {
+    type Error = Error;
+
+    fn try_from(json_schema: JsonSchema) -> Result<Self> {
+        let fields = json_schema
+            .fields
+            .iter()
+            .map(Field::try_from)
+            .collect::<Result<Vec<_>>>()?;
+
+        let metadata = if let Some(metadata) = json_schema.metadata {
+            metadata
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Self::new_with_metadata(fields, metadata))
+    }
+}
+
+/// Conversion between Arrow [Schema] and JSON representation (string).
+pub trait ArrowJsonExt: Sized {
     fn to_json(&self) -> Result<String>;
 
-    fn from_json(json: &str) -> Self;
+    fn from_json(json: &str) -> Result<Self>;
 }
 
 impl ArrowJsonExt for Schema {
@@ -180,8 +269,9 @@ impl ArrowJsonExt for Schema {
         Ok(serde_json::to_string(&json_schema)?)
     }
 
-    fn from_json(json: &str) -> Self {
-        todo!()
+    fn from_json(json: &str) -> Result<Self> {
+        let json_schema: JsonSchema = serde_json::from_str(json)?;
+        json_schema.try_into()
     }
 }
 
@@ -313,8 +403,10 @@ mod test {
                 false,
             ),
         ]);
+
+        let json_str = schema.to_json().unwrap();
         assert_eq!(
-            serde_json::from_str::<Value>(&schema.to_json().unwrap()).unwrap(),
+            serde_json::from_str::<Value>(&json_str).unwrap(),
             json!({
                 "fields": [
                     {
@@ -350,5 +442,8 @@ mod test {
                 ]
             })
         );
+
+        let actual = Schema::from_json(&json_str).unwrap();
+        assert_eq!(schema, actual);
     }
 }
