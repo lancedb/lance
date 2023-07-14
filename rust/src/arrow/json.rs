@@ -152,24 +152,24 @@ impl TryFrom<&JsonDataType> for DataType {
                     .collect::<Result<Vec<_>>>()?;
 
                 match type_name {
-                    "list" => Ok(DataType::List(Arc::new(fields[0].clone()))),
-                    "large_list" => Ok(DataType::LargeList(Arc::new(fields[0].clone()))),
+                    "list" => Ok(Self::List(Arc::new(fields[0].clone()))),
+                    "large_list" => Ok(Self::LargeList(Arc::new(fields[0].clone()))),
                     "fixed_size_list" => {
                         let length = value.length.ok_or_else(|| Error::Arrow {
                             message: "Json conversion: FixedSizeList type requires a length"
                                 .to_string(),
                         })?;
-                        Ok(DataType::FixedSizeList(
+                        Ok(Self::FixedSizeList(
                             Arc::new(fields[0].clone()),
                             length as i32,
                         ))
                     }
-                    "struct" => Ok(DataType::Struct(fields.into())),
+                    "struct" => Ok(Self::Struct(fields.into())),
                     _ => unreachable!(),
                 }
             }
             _ => {
-                return Err(Error::Arrow {
+                Err(Error::Arrow {
                     message: format!("Json conversion: Unsupported type: {value:?}"),
                 })
             }
@@ -204,7 +204,7 @@ impl TryFrom<&JsonField> for Field {
 
     fn try_from(value: &JsonField) -> Result<Self> {
         let data_type = DataType::try_from(&value.type_)?;
-        Ok(Field::new(&value.name, data_type, value.nullable))
+        Ok(Self::new(&value.name, data_type, value.nullable))
     }
 }
 
