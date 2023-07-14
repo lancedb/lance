@@ -20,8 +20,8 @@ import pandas as pd
 
 from .dataset import LanceDataset, LanceScanner, __version__, write_dataset
 from .fragment import _FragmentMetadata
+from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
-from .schema import schema_to_json, json_to_schema
 
 __all__ = [
     "LanceDataset",
