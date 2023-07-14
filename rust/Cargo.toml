@@ -1,6 +1,6 @@
 [package]
 name = "lance"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 authors = ["Lance Devs <dev@eto.ai>"]
 description = "A columnar data format that is 100x faster than Parquet for random access."
@@ -45,6 +45,7 @@ chrono = "0.4.23"
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
 dashmap = "5"
+half = { "version" = "2.2.1", default-features = false }
 object_store = { version = "0.6.1", features = ["aws", "gcp", "azure"] }
 reqwest = { version = "0.11.16" }
 aws-config = "0.54"
@@ -86,10 +87,7 @@ openblas-src = { version = "0.10.8", default-features= false, features = ["stati
 pprof = { version = "0.11", features = ["flamegraph", "criterion"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-openblas-src = { version = "0.10.8", default-features= false, features = ["system"]}
-
-[target.'cfg(target_os= "windows")'.build-dependencies]
-vcpkg = "0.2"
+openblas-src = { version = "0.10.8", default-features= false, features = ["system"], optional = true}
 
 [build-dependencies]
 prost-build = "0.11"

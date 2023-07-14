@@ -157,6 +157,4 @@ jobs:
         with:
           workspaces: python
       - uses: ./.github/workflows/build_windows_wheel
-        with:
-          vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/run_tests
