@@ -22,6 +22,14 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use crate::error::{Error, Result};
 
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Arrow {
+            message: e.to_string(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonDataType {
     #[serde(rename = "type")]
@@ -35,14 +43,6 @@ struct JsonDataType {
 impl JsonDataType {
     fn try_new(dt: &DataType) -> Result<Self> {
         dt.try_into()
-    }
-
-    fn new(type_name: &str) -> Self {
-        Self {
-            type_: type_name.to_string(),
-            fields: None,
-            length: None,
-        }
     }
 }
 
@@ -143,18 +143,41 @@ impl TryFrom<&Field> for JsonField {
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonSchema {
     fields: Vec<JsonField>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<HashMap<String, String>>,
 }
 
+/// Convert Schema to JSON representation.
+impl TryFrom<&Schema> for JsonSchema {
+    type Error = Error;
+
+    fn try_from(schema: &Schema) -> Result<Self> {
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|f| JsonField::try_from(f.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let metadata = if schema.metadata.is_empty() {
+            None
+        } else {
+            Some(schema.metadata.clone())
+        };
+        Ok(Self { fields, metadata })
+    }
+}
+
 pub trait ArrowJsonExt {
-    fn to_json(&self) -> String;
+    fn to_json(&self) -> Result<String>;
 
     fn from_json(json: &str) -> Self;
 }
 
 impl ArrowJsonExt for Schema {
-    fn to_json(&self) -> String {
-        todo!()
+    fn to_json(&self) -> Result<String> {
+        let json_schema = JsonSchema::try_from(self)?;
+        Ok(serde_json::to_string(&json_schema)?)
     }
 
     fn from_json(json: &str) -> Self {
@@ -170,16 +193,20 @@ mod test {
 
     use arrow_schema::TimeUnit;
     use serde_json;
+    use serde_json::{json, Value};
 
-    fn assert_type_json_str(dt: DataType, type_str: &str) {
+    fn assert_type_json_str(dt: DataType, val: Value) {
         assert_eq!(
-            serde_json::to_string(&JsonDataType::try_new(&dt).unwrap()).unwrap(),
-            type_str
+            serde_json::from_str::<Value>(
+                &serde_json::to_string(&JsonDataType::try_new(&dt).unwrap()).unwrap()
+            )
+            .unwrap(),
+            val
         );
     }
 
     fn assert_primitive_types(dt: DataType, type_name: &str) {
-        assert_type_json_str(dt, &format!("{{\"type\":\"{}\"}}", type_name));
+        assert_type_json_str(dt, json!({"type": type_name}));
     }
 
     #[test]
@@ -210,12 +237,39 @@ mod test {
     fn test_complex_types_to_json() {
         assert_type_json_str(
             DataType::List(Arc::new(Field::new("item", DataType::Float32, false))),
-            r#"{"type":"list","fields":[{"name":"item","type":{"type":"float"},"nullable":false}]}"#,
+            json!(
+                {
+                    "type": "list",
+                    "fields": [
+                        {
+                            "name": "item",
+                            "type": {
+                                "type": "float"
+                            },
+                            "nullable": false
+                        }
+                    ]
+                }
+            ),
         );
 
         assert_type_json_str(
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 32),
-            r#"{"type":"fixed_size_list","fields":[{"name":"item","type":{"type":"float"},"nullable":false}],"length":32}"#,
+            json!(
+                {
+                    "type": "fixed_size_list",
+                    "fields": [
+                        {
+                            "name": "item",
+                            "type": {
+                                "type": "float"
+                            },
+                            "nullable": false
+                        }
+                    ],
+                    "length": 32
+                }
+            ),
         );
 
         assert_type_json_str(
@@ -226,11 +280,75 @@ mod test {
                 ]
                 .into(),
             ),
-            &(r#"{"type":"struct","fields":[{"name":"a","type":{"type":"date32:day"},"nullable":false}"#.to_owned()
-                + r#",{"name":"b","type":{"type":"int32"},"nullable":true}]}"#),
+            json!({
+                "type": "struct",
+                "fields": [
+                    {
+                        "name": "a",
+                        "type": {
+                            "type": "date32:day"
+                        },
+                        "nullable": false
+                    },
+                    {
+                        "name": "b",
+                        "type": {
+                            "type": "int32"
+                        },
+                        "nullable": true
+                    }
+                ]
+            }),
         );
     }
 
     #[test]
-    fn test_schema_to_json() {}
+    fn test_schema_to_json() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Date32, false),
+            Field::new("b", DataType::Int32, true),
+            Field::new(
+                "s",
+                DataType::Struct(vec![Field::new("str", DataType::Utf8, false)].into()),
+                false,
+            ),
+        ]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&schema.to_json().unwrap()).unwrap(),
+            json!({
+                "fields": [
+                    {
+                        "name": "a",
+                        "type": {
+                            "type": "date32:day"
+                        },
+                        "nullable": false
+                    },
+                    {
+                        "name": "b",
+                        "type": {
+                            "type": "int32"
+                        },
+                        "nullable": true
+                    },
+                    {
+                        "name": "s",
+                        "type": {
+                            "type": "struct",
+                            "fields": [
+                                {
+                                    "name": "str",
+                                    "type": {
+                                        "type": "string"
+                                    },
+                                    "nullable": false
+                                }
+                            ]
+                        },
+                        "nullable": false
+                    },
+                ]
+            })
+        );
+    }
 }
