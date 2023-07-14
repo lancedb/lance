@@ -51,6 +51,7 @@ tests = [
     "pytest",
     "duckdb",
     "polars[pyarrow,pandas]",
+    "ml_dtypes",
 ]
 
 [tool.isort]

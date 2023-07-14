@@ -25,6 +25,7 @@ The key features of Lance include:
    Quickstart <./notebooks/quickstart>
    ./read_and_write
    File Format <./format>
+   Arrays <./arrays>
    API References <./api/api>
    Contributor Guide <./contributing>
 
