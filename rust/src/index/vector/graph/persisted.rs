@@ -168,7 +168,7 @@ impl<V: Vertex + Debug> PersistedGraph<V> {
         let mut vertices = vec![];
         for vertex_bytes in array.iter() {
             let mut vertex = self.serde.deserialize(vertex_bytes.unwrap())?;
-            let mut row_vector = vertex.as_any_mut().downcast_mut::<RowVertex>().unwrap();
+            let row_vector = vertex.as_any_mut().downcast_mut::<RowVertex>().unwrap();
             let batch = self
                 .dataset
                 .take_rows(&[row_vector.row_id], &self.vector_column_projection)
