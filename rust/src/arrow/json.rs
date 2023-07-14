@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
+use crate::datatypes::LogicalType;
 use crate::error::{Error, Result};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -30,7 +31,7 @@ struct JsonDataType {
 }
 
 impl JsonDataType {
-    fn try_new(dt: DataType) -> Result<Self> {
+    fn try_new(dt: &DataType) -> Result<Self> {
         dt.try_into()
     }
 
@@ -42,58 +43,77 @@ impl JsonDataType {
     }
 }
 
-impl TryFrom<DataType> for JsonDataType {
+impl TryFrom<&DataType> for JsonDataType {
     type Error = Error;
 
-    fn try_from(dt: DataType) -> Result<Self> {
-        let json_type = match dt {
-            DataType::Null => Self::new("null"),
-            DataType::Boolean => Self::new("boolean"),
-            DataType::Int8 => Self::new("int8"),
-            DataType::Int16 => Self::new("int16"),
-            DataType::Int32 => Self::new("int32"),
-            DataType::Int64 => Self::new("int64"),
-            DataType::UInt8 => Self::new("uint8"),
-            DataType::UInt16 => Self::new("uint16"),
-            DataType::UInt32 => Self::new("uint32"),
-            DataType::UInt64 => Self::new("uint64"),
-            DataType::Float16 => Self::new("float16"),
-            DataType::Float32 => Self::new("float32"),
-            DataType::Float64 => Self::new("float64"),
-            DataType::Timestamp(_, _) => todo!(),
-            DataType::Date32 => todo!(),
-            DataType::Date64 => todo!(),
-            DataType::Time32(_) => todo!(),
-            DataType::Time64(_) => todo!(),
-            DataType::Duration(_) => todo!(),
-            DataType::Interval(_) => todo!(),
-            DataType::Binary => todo!(),
-            DataType::FixedSizeBinary(_) => todo!(),
-            DataType::LargeBinary => todo!(),
-            DataType::Utf8 => Self::new("string"),
-            DataType::LargeUtf8 => Self::new("large_string"),
-            DataType::List(_) => todo!(),
-            DataType::FixedSizeList(_, _) => todo!(),
-            DataType::LargeList(_) => todo!(),
-            DataType::Struct(_) => todo!(),
-            DataType::Union(_, _) => todo!(),
-            DataType::Dictionary(_, _) => todo!(),
-            DataType::Decimal128(_, _) => todo!(),
-            DataType::Decimal256(_, _) => todo!(),
-            DataType::Map(_, _) => todo!(),
-            DataType::RunEndEncoded(_, _) => todo!(),
+    fn try_from(dt: &DataType) -> Result<Self> {
+        let (type_name, fields) = match dt {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::LargeUtf8
+            | DataType::LargeBinary
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _) => {
+                let logical_type: LogicalType = dt.try_into()?;
+                (logical_type.to_string(), None)
+            }
+            DataType::Struct(fields) => {
+                let fields = fields
+                    .iter()
+                    .map(|f| JsonField::try_from(f.as_ref()))
+                    .collect::<Result<Vec<_>>>()?;
+                ("struct".to_string(), Some(fields))
+            }
+            _ => {
+                return Err(Error::Arrow {
+                    message: format!("Json conversion: Unsupported type: {dt}"),
+                })
+            }
         };
-        Ok(json_type)
+
+        Ok(Self {
+            type_: type_name,
+            fields,
+        })
     }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct JsonField {
     name: String,
+    #[serde(rename = "type")]
+    type_: JsonDataType,
     nullable: bool,
-    data_type: JsonDataType,
-    children: Option<Vec<JsonField>>,
-    metadata: Option<HashMap<String, String>>,
+}
+
+impl TryFrom<&Field> for JsonField {
+    type Error = Error;
+
+    fn try_from(field: &Field) -> Result<Self> {
+        let data_type = JsonDataType::try_new(field.data_type())?;
+
+        Ok(Self {
+            name: field.name().to_string(),
+            nullable: field.is_nullable(),
+            type_: data_type,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -121,21 +141,53 @@ impl ArrowJsonExt for Schema {
 #[cfg(test)]
 mod test {
     use super::*;
+    use arrow_schema::TimeUnit;
     use serde_json;
+
+    fn assert_type_json_str(dt: DataType, type_str: &str) {
+        assert_eq!(
+            serde_json::to_string(&JsonDataType::try_new(&dt).unwrap()).unwrap(),
+            type_str
+        );
+    }
+
+    fn assert_primitive_types(dt: DataType, type_name: &str) {
+        assert_type_json_str(dt, &format!("{{\"type\":\"{}\"}}", type_name));
+    }
 
     #[test]
     fn test_data_type_to_json() {
-        assert_eq!(
-            serde_json::to_string(&JsonDataType::try_new(DataType::Int32).unwrap()).unwrap(),
-            r#"{"type":"int32"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&JsonDataType::try_new(DataType::UInt64).unwrap()).unwrap(),
-            r#"{"type":"uint64"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&JsonDataType::try_new(DataType::Boolean).unwrap()).unwrap(),
-            r#"{"type":"boolean"}"#
+        assert_primitive_types(DataType::Null, "null");
+        assert_primitive_types(DataType::Boolean, "bool");
+        assert_primitive_types(DataType::Int8, "int8");
+        assert_primitive_types(DataType::Int16, "int16");
+        assert_primitive_types(DataType::Int32, "int32");
+        assert_primitive_types(DataType::Int64, "int64");
+        assert_primitive_types(DataType::UInt8, "uint8");
+        assert_primitive_types(DataType::UInt16, "uint16");
+        assert_primitive_types(DataType::UInt32, "uint32");
+        assert_primitive_types(DataType::UInt64, "uint64");
+        assert_primitive_types(DataType::Float16, "halffloat");
+        assert_primitive_types(DataType::Float32, "float");
+        assert_primitive_types(DataType::Float64, "double");
+        assert_primitive_types(DataType::Utf8, "string");
+        assert_primitive_types(DataType::LargeUtf8, "large_string");
+        assert_primitive_types(DataType::Binary, "binary");
+        assert_primitive_types(DataType::LargeBinary, "large_binary");
+        assert_primitive_types(DataType::Date32, "date32:day");
+        assert_primitive_types(DataType::Date64, "date64:ms");
+        assert_primitive_types(DataType::Time32(TimeUnit::Second), "time32:s");
+
+        assert_type_json_str(
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Date32, false),
+                    Field::new("b", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            &(r#"{"type":"struct","fields":[{"name":"a","type":{"type":"date32:day"},"nullable":false}"#.to_owned()
+                + r#",{"name":"b","type":{"type":"int32"},"nullable":true}]}"#),
         );
     }
 
