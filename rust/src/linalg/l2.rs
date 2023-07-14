@@ -57,7 +57,7 @@ impl L2 for [f32] {
             }
         }
 
-        #[cfg(any(target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         {
             // Neon is the lowest aarch64 CPU requirement (available in all Apple Silicon / Arm V7+).
             use aarch64::neon::l2_f32;
