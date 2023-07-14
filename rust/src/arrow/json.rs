@@ -296,7 +296,7 @@ mod test {
     }
 
     fn assert_primitive_types(dt: DataType, type_name: &str) {
-        assert_type_json_str(dt, json!({"type": type_name}));
+        assert_type_json_str(dt, json!({ "type": type_name }));
     }
 
     #[test]
