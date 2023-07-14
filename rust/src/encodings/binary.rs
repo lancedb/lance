@@ -217,18 +217,14 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         if self.nullable {
             let mut null_count = 0;
             let mut null_buf = MutableBuffer::new_null(self.length);
-            slice
-                .values()
-                .windows(2)
-                .enumerate()
-                .for_each(|(idx, w)| {
-                    if w[0] == w[1] {
-                        bit_util::unset_bit(null_buf.as_mut(), idx);
-                        null_count += 1;
-                    } else {
-                        bit_util::set_bit(null_buf.as_mut(), idx);
-                    }
-                });
+            slice.values().windows(2).enumerate().for_each(|(idx, w)| {
+                if w[0] == w[1] {
+                    bit_util::unset_bit(null_buf.as_mut(), idx);
+                    null_count += 1;
+                } else {
+                    bit_util::set_bit(null_buf.as_mut(), idx);
+                }
+            });
             data_builder = data_builder
                 .null_count(null_count)
                 .null_bit_buffer(Some(null_buf.into()));
