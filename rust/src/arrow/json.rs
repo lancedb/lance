@@ -168,11 +168,9 @@ impl TryFrom<&JsonDataType> for DataType {
                     _ => unreachable!(),
                 }
             }
-            _ => {
-                Err(Error::Arrow {
-                    message: format!("Json conversion: Unsupported type: {value:?}"),
-                })
-            }
+            _ => Err(Error::Arrow {
+                message: format!("Json conversion: Unsupported type: {value:?}"),
+            }),
         }
     }
 }
