@@ -32,9 +32,9 @@ use crate::error::{Error, Result};
 pub use kernels::*;
 pub mod schema;
 pub use schema::*;
+pub mod bfloat16;
 #[cfg(feature = "json")]
 pub mod json;
-pub mod bfloat16;
 
 pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as (Large)Utf8 and (Large)Binary.

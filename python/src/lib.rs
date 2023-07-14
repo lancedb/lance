@@ -20,8 +20,8 @@
 
 use std::env;
 
+use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use ::lance::arrow::json::ArrowJsonExt;
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_schema::Schema;
 use env_logger::Env;
 use pyo3::prelude::*;
