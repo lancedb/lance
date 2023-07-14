@@ -106,7 +106,7 @@ jobs:
       - uses: ./.github/workflows/build_windows_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
-          args: "-no-default-features --release"
+          args: "--no-default-features --release"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
       - uses: ./.github/workflows/upload_wheel
         with:
