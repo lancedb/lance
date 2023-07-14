@@ -280,3 +280,41 @@ The ability to achieve fast random access to individual rows plays a crucial rol
 such as random sampling and shuffling in ML training.
 Additionally, it empowers users to construct secondary indices,
 enabling swift execution of queries for enhanced performance.
+
+
+Table Maintenance
+-----------------
+
+Some operations over time will cause a Lance dataset to have a poor layout. For
+example, many small appends will lead to a large number of small fragments. Or
+deleting many rows will lead to slower queries due to the need to filter out
+deleted rows.
+
+To address this, Lance provides methods for optimizing and vacuuming datasets.
+
+Rewrite data files
+~~~~~~~~~~~~~~~~~~
+
+Data files can be rewritten so there are fewer files. When passing a
+``target_file_size`` to :py:meth:`lance.LanceDataset.optimize`, Lance will
+skip any files that are already above that file size, and rewrite others. Files
+will be merged according to their fragment ids, so the inherent ordering of the
+data will be preserved.
+
+.. code-block:: python
+
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.optimize.compact(target_file_size=1024 * 1024 * 1024)
+
+During compaction, Lance will also remove deleted rows. Rewritten fragments will
+not have deletion files.
+
+When files are rewritten, the original row ids are invalidated. This means the
+affected files are no longer part of any ANN index if they were before. Because
+of this, it's recommended to rewrite files before building indices.
+
+
+Deleting table versions
+~~~~~~~~~~~~~~~~~~~~~~~
