@@ -50,6 +50,7 @@ use crate::RT;
 use self::commit::PyCommitLock;
 
 pub mod commit;
+pub mod optimize;
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;

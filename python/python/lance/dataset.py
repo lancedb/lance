@@ -27,11 +27,13 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Union
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
+from lance.optimize import Compaction
 from pyarrow import RecordBatch, Schema
 from pyarrow._compute import Expression
 
 from .commit import CommitLock
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Dataset, _Operation, _Scanner, _write_dataset
 
@@ -845,6 +847,10 @@ class LanceOperation:
         def _to_inner(self):
             return _Operation.restore(self.version)
 
+    @property
+    def optimize(self) -> "DatasetOptimizer":
+        return DatasetOptimizer(self)
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -1079,6 +1085,65 @@ class LanceScanner(pa.dataset.Scanner):
 
         """
         return self._scanner.count_rows()
+
+
+class DatasetOptimizer:
+    def __init__(self, dataset: LanceDataset):
+        self._dataset = dataset
+
+    def compact_files(
+        self,
+        *,
+        target_rows_per_fragment: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        materialize_deletions: bool = True,
+        materialize_deletions_threshold: float = 0.1,
+        num_threads: Optional[int] = None,
+    ) -> CompactionMetrics:
+        """Compacts small files in the dataset, reducing total number of files.
+
+        This does a few things:
+         * Removes deleted rows from fragments
+         * Removes dropped columns from fragments
+         * Merges small fragments into larger ones
+
+        This method tries to preserve the insertion order of rows in the dataset.
+
+        Parameters
+        ----------
+        target_rows_per_fragment: int, default 1024*1024
+            The target number of rows per fragment. This is the number of rows
+            that will be in each fragment after compaction.
+        max_rows_per_group: int, default 1024
+            Max number of rows per group. This does not affect which fragments
+            need compaction, but does affect how they are re-written if selected.
+        materialize_deletions: bool, default True
+            Whether to compact fragments with soft deleted rows so they are no
+            longer present in the file.
+        materialize_deletions_threshold: float, default 0.1
+            The fraction of original rows that are soft deleted in a fragment
+            before the fragment is a candidate for compaction.
+        num_threads: int, optional
+            The number of threads to use when performing compaction. If not
+            specified, defaults to the number of cores on the machine.
+
+        Returns
+        -------
+        CompactionMetrics
+            Metrics about the compaction process
+
+        See Also
+        --------
+        lance.optimize.Compaction
+        """
+        opts = dict(
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            materialize_deletions=materialize_deletions,
+            materialize_deletions_threshold=materialize_deletions_threshold,
+            num_threads=num_threads,
+        )
+        return Compaction.execute(self._dataset, opts)
 
 
 def write_dataset(

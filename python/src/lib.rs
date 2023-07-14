@@ -23,11 +23,11 @@ use std::sync::Arc;
 
 use ::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use ::arrow::pyarrow::PyArrowType;
-use ::arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use ::arrow_schema::Schema as ArrowSchema;
 use ::lance::arrow::json::ArrowJsonExt;
 use arrow_array::{RecordBatch, RecordBatchIterator};
-use arrow_schema::{ArrowError, Schema};
+use arrow_schema::ArrowError;
+use dataset::optimize::{PyCompaction, PyCompactionMetrics, PyCompactionTask, PyRewriteResult};
 use env_logger::Env;
 use futures::StreamExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -78,6 +78,10 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<KMeans>()?;
+    m.add_class::<PyCompactionTask>()?;
+    m.add_class::<PyCompaction>()?;
+    m.add_class::<PyRewriteResult>()?;
+    m.add_class::<PyCompactionMetrics>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
@@ -90,22 +94,21 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
 }
 
 #[pyfunction(name = "_schema_to_json")]
-fn schema_to_json(py_schema: &PyAny) -> PyResult<String> {
-    let schema = Schema::from_pyarrow(py_schema)?;
-    schema.to_json().map_err(|e| {
+fn schema_to_json(schema: PyArrowType<ArrowSchema>) -> PyResult<String> {
+    schema.0.to_json().map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("Failed to convert schema to json: {}", e))
     })
 }
 
 #[pyfunction(name = "_json_to_schema")]
-fn json_to_schema(py: Python<'_>, json: &str) -> PyResult<PyObject> {
-    let schema = Schema::from_json(json).map_err(|e| {
+fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
+    let schema = ArrowSchema::from_json(json).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "Failed to convert json to schema: {}, json={}",
             e, json
         ))
     })?;
-    schema.to_pyarrow(py)
+    Ok(schema.into())
 }
 
 /// Infer schema from tfrecord file
