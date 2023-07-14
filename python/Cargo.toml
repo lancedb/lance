@@ -18,7 +18,7 @@ arrow-schema = "42.0"
 chrono = "0.4.23"
 env_logger = "0.10"
 futures = "0.3"
-lance = { path = "../rust" }
+lance = { path = "../rust", features = ["json"] }
 log = "0.4"
 prost = "0.11"
 pyo3 = { version = "0.19", features = ["extension-module", "abi3-py38"] }

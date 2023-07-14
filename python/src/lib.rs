@@ -20,8 +20,11 @@
 
 use std::env;
 
+use arrow::pyarrow::FromPyArrow;
+use arrow_schema::Schema;
 use env_logger::Env;
 use pyo3::prelude::*;
+use ::lance::json::*;
 
 pub(crate) mod dataset;
 pub(crate) mod errors;
@@ -52,4 +55,9 @@ fn lance(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
+}
+
+#[pyfunction(name = "_schema_to_json")]
+fn schema_to_json(py_schema: &PyAny) -> PyResult<String> {
+    let schema = Schema::from_pyarrow(py_schema)?;
 }
