@@ -289,7 +289,7 @@ impl Dataset {
         })
     }
 
-    pub async fn write_impl(
+    async fn write_impl(
         batches: Box<dyn RecordBatchReader + Send>,
         uri: &str,
         params: Option<WriteParams>,
@@ -545,7 +545,7 @@ impl Dataset {
     /// Returns: a new version of dataset.
     ///
     /// It performs a left-join on the two datasets.
-    pub async fn merge_impl(
+    async fn merge_impl(
         &mut self,
         stream: Box<dyn RecordBatchReader + Send>,
         left_on: &str,
