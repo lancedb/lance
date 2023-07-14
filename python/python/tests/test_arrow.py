@@ -92,3 +92,8 @@ def test_bf16_numpy():
     # Can roundtrip to Pandas
     arr_pandas = PandasBFloat16Array.from_numpy(arr_numpy)
     np.testing.assert_array_equal(arr_pandas.to_numpy(), expected)
+
+    # Can roundtrip to Arrow
+    arr_arrow = BFloat16Array.from_numpy(arr_numpy)
+    assert arr == arr_arrow
+    np.testing.assert_array_equal(arr_arrow.to_numpy(), expected)
