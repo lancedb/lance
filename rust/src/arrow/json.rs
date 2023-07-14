@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use arrow_schema::{Schema, Field, DataType};
+use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -53,10 +53,10 @@ impl TryFrom<DataType> for JsonDataType {
             DataType::Int16 => Self::new("int16"),
             DataType::Int32 => Self::new("int32"),
             DataType::Int64 => Self::new("int64"),
-            DataType::UInt8 => todo!(),
-            DataType::UInt16 => todo!(),
-            DataType::UInt32 => todo!(),
-            DataType::UInt64 => todo!(),
+            DataType::UInt8 => Self::new("uint8"),
+            DataType::UInt16 => Self::new("uint16"),
+            DataType::UInt32 => Self::new("uint32"),
+            DataType::UInt64 => Self::new("uint64"),
             DataType::Float16 => todo!(),
             DataType::Float32 => todo!(),
             DataType::Float64 => todo!(),
@@ -70,8 +70,8 @@ impl TryFrom<DataType> for JsonDataType {
             DataType::Binary => todo!(),
             DataType::FixedSizeBinary(_) => todo!(),
             DataType::LargeBinary => todo!(),
-            DataType::Utf8 => todo!(),
-            DataType::LargeUtf8 => todo!(),
+            DataType::Utf8 => Self::new("string"),
+            DataType::LargeUtf8 => Self::new("large_string"),
             DataType::List(_) => todo!(),
             DataType::FixedSizeList(_, _) => todo!(),
             DataType::LargeList(_) => todo!(),
@@ -125,11 +125,16 @@ mod test {
 
     #[test]
     fn test_data_type_to_json() {
-        assert_eq!(serde_json::to_string(&JsonDataType::try_new(DataType::Int32).unwrap()).unwrap(), r#"{"type":"int32"}"#)
+        assert_eq!(
+            serde_json::to_string(&JsonDataType::try_new(DataType::Int32).unwrap()).unwrap(),
+            r#"{"type":"int32"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&JsonDataType::try_new(DataType::Boolean).unwrap()).unwrap(),
+            r#"{"type":"boolean"}"#
+        );
     }
 
     #[test]
-    fn test_schema_to_json() {
-
-    }
+    fn test_schema_to_json() {}
 }
