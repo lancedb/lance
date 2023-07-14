@@ -473,7 +473,9 @@ impl Dataset {
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
     ///
-    /// Returns the newly created [`Dataset`]. Returns [Error] if the dataset already exists.
+    /// Returns the newly created [`Dataset`].
+    /// Or Returns [Error] if the dataset already exists.
+    ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
         uri: &str,

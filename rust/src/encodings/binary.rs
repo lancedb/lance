@@ -15,7 +15,6 @@
 //! Var-length binary encoding.
 //!
 
-use std::borrow::Borrow;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 use std::sync::Arc;
@@ -194,12 +193,11 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         let end = positions.value(range.end);
 
         let slice = positions.slice(range.start, range.len() + 1);
-        let position_slice: &Int64Array = as_primitive_array(slice.borrow());
         let offset_data = if T::Offset::IS_LARGE {
-            subtract_scalar(position_slice, start)?.into_data()
+            subtract_scalar(&slice, start)?.into_data()
         } else {
             cast(
-                &(Arc::new(subtract_scalar::<Int64Type>(position_slice, start)?) as ArrayRef),
+                &(Arc::new(subtract_scalar(&slice, start)?) as ArrayRef),
                 &DataType::Int32,
             )?
             .into_data()
@@ -219,18 +217,14 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
         if self.nullable {
             let mut null_count = 0;
             let mut null_buf = MutableBuffer::new_null(self.length);
-            position_slice
-                .values()
-                .windows(2)
-                .enumerate()
-                .for_each(|(idx, w)| {
-                    if w[0] == w[1] {
-                        bit_util::unset_bit(null_buf.as_mut(), idx);
-                        null_count += 1;
-                    } else {
-                        bit_util::set_bit(null_buf.as_mut(), idx);
-                    }
-                });
+            slice.values().windows(2).enumerate().for_each(|(idx, w)| {
+                if w[0] == w[1] {
+                    bit_util::unset_bit(null_buf.as_mut(), idx);
+                    null_count += 1;
+                } else {
+                    bit_util::set_bit(null_buf.as_mut(), idx);
+                }
+            });
             data_builder = data_builder
                 .null_count(null_count)
                 .null_bit_buffer(Some(null_buf.into()));
