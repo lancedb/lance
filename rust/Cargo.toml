@@ -65,7 +65,6 @@ arrow = { version = "42.0.0", features = ["prettyprint"] }
 num_cpus = "1.0"
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion = { version = "27.0.0", default-features = false, features = ["regex_expressions"] }
-faiss = { version = "0.11.0", features = ["gpu"], optional = true }
 lapack = { version = "0.19.0", optional = true }
 cblas =  { version = "0.4.0", optional = true }
 lru_time_cache = "0.11"
@@ -73,6 +72,8 @@ num-traits = "0.2"
 ordered-float = "3.6.0"
 snafu = "0.7.4"
 log = "0"
+serde_json = { version = "1", optional = true }
+serde = { version = "^1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
@@ -100,6 +101,7 @@ dirs = "5.0.0"
 [features]
 cli = ["clap"]
 opq = ["cblas", "lapack", "openblas-src", "accelerate-src"]
+json = ["serde_json", "serde"]
 
 [[bin]]
 name = "lq"
