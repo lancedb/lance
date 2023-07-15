@@ -8,7 +8,7 @@ inputs:
   args:
     description: "--release"
     required: false
-    default: "--no-default-features"
+    default: ""
 runs:
   using: "composite"
   steps:
