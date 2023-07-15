@@ -33,7 +33,6 @@ pub use kernels::*;
 pub mod schema;
 pub use schema::*;
 pub mod bfloat16;
-#[cfg(feature = "json")]
 pub mod json;
 
 pub trait DataTypeExt {
