@@ -385,9 +385,9 @@ impl Dataset {
                     if let Some(o) = kwargs.get_item("use_opq") {
                         #[cfg(not(feature = "opq"))]
                         if PyAny::downcast::<PyBool>(o)?.extract()? {
-                            return Err(PyValueError::new_err(format!(
-                                "Feature 'opq' is not installed."
-                            )));
+                            return Err(PyValueError::new_err(
+                                "Feature 'opq' is not installed.".to_string(),
+                            ));
                         }
                         pq_params.use_opq = PyAny::downcast::<PyBool>(o)?.extract()?
                     };
