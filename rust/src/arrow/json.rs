@@ -206,8 +206,9 @@ impl TryFrom<&JsonField> for Field {
     }
 }
 
+/// JSON representation of a Apache Arrow [Schema].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonSchema {
+pub struct JsonSchema {
     fields: Vec<JsonField>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
