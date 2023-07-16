@@ -239,14 +239,22 @@ impl TryFrom<JsonSchema> for Schema {
     type Error = Error;
 
     fn try_from(json_schema: JsonSchema) -> Result<Self> {
+        Self::try_from(&json_schema)
+    }
+}
+
+impl TryFrom<&JsonSchema> for Schema {
+    type Error = Error;
+
+    fn try_from(json_schema: &JsonSchema) -> Result<Self> {
         let fields = json_schema
             .fields
             .iter()
             .map(Field::try_from)
             .collect::<Result<Vec<_>>>()?;
 
-        let metadata = if let Some(metadata) = json_schema.metadata {
-            metadata
+        let metadata = if let Some(metadata) = &json_schema.metadata {
+            metadata.clone()
         } else {
             HashMap::new()
         };
