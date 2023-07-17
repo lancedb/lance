@@ -1002,7 +1002,9 @@ mod tests {
         cast::{as_string_array, as_struct_array},
         DictionaryArray, Int32Array, RecordBatch, StringArray, UInt16Array,
     };
-    use arrow_array::{Float32Array, RecordBatchIterator, UInt32Array};
+    use arrow_array::{
+        Float32Array, Int8Array, Int8DictionaryArray, RecordBatchIterator, UInt32Array,
+    };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use arrow_select::take::take;
@@ -1333,6 +1335,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..2).collect::<Vec<_>>()
         )
+    }
+
+    #[tokio::test]
+    async fn append_dictionary() {
+        // We store the dictionary as part of the schema, so we check that the
+        // dictionary is consistent between appends.
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "x",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let dictionary = Arc::new(StringArray::from(vec!["a", "b"]));
+        let indices = Int8Array::from(vec![0, 1, 0]);
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary.clone()).unwrap(),
+            )],
+        )
+        .unwrap()];
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        // create a new one with same dictionary
+        let indices = Int8Array::from(vec![1, 0, 1]);
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
+            )],
+        )
+        .unwrap()];
+
+        // Write to dataset (successful)
+        write_params.mode = WriteMode::Append;
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        // Create a new one with *different* dictionary
+        let dictionary = Arc::new(StringArray::from(vec!["d", "c"]));
+        let indices = Int8Array::from(vec![1, 0, 1]);
+        let batches = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                Int8DictionaryArray::try_new(indices, dictionary).unwrap(),
+            )],
+        )
+        .unwrap()];
+
+        // Try write to dataset (fail)
+        let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let result = Dataset::write(batches, test_uri, Some(write_params)).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

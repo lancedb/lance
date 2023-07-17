@@ -436,7 +436,7 @@ impl Field {
                             read_binary_array(
                                 reader,
                                 value_type.as_ref(),
-                                false,
+                                true, // Empty values are null
                                 dict_info.offset,
                                 dict_info.length,
                                 ..,
@@ -482,9 +482,15 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Field(id={}, name={}, type={})",
+            "Field(id={}, name={}, type={}",
             self.id, self.name, self.logical_type.0,
-        )
+        )?;
+
+        if let Some(dictionary) = &self.dictionary {
+            write!(f, ", dictionary={:?}", dictionary)?;
+        }
+
+        write!(f, ")")
     }
 }
 
