@@ -91,25 +91,27 @@ class LanceDataset(pa.dataset.Dataset):
         columns: list of str, default None
             List of column names to be fetched.
             All columns if None or unspecified.
-        filter : pa.compute.Expression or str
-            Expression or str that is a valid SQL where clause.
-            Currently only >, <, >=, <=, ==, !=, |, & are supported.
-            is_null, is_valid, ~, and others are not yet supported.
-            Specifying these will result in an expression parsing error
+        filter: pa.compute.Expression or str
+            Expression or str that is a valid SQL where clause. See
+            `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
+            for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors.
+            Get the rows corresponding to the K most similar vectors. Example:
 
-            Example: `{
-                "column": <embedding col name>,
-                "q": <query vector as pa.Float32Array>,
-                "k": 10,
-                "nprobes": 1,
-                "refine_factor": 1
-            }`
+            .. code-block:: python
+
+                {
+                    "column": <embedding col name>,
+                    "q": <query vector as pa.Float32Array>,
+                    "k": 10,
+                    "nprobes": 1,
+                    "refine_factor": 1
+                }
+
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -130,17 +132,17 @@ class LanceDataset(pa.dataset.Dataset):
         2. The results are filtered afterwards.
 
         For debugging ANN results, you can choose to not use the index
-        even if present by specifying `use_index=False`. For example,
+        even if present by specifying ``use_index=False``. For example,
         the following will always return exact KNN results:
 
-        ```
-        dataset.to_table(nearest={
-            "column": "vector",
-            "k": 10,
-            "q": <query vector>,
-            "use_index": False
-        }
-        ```
+        .. code-block:: python
+
+            dataset.to_table(nearest={
+                "column": "vector",
+                "k": 10,
+                "q": <query vector>,
+                "use_index": False
+            }
 
         """
         return (
@@ -183,24 +185,27 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             All columns if None or unspecified.
         filter : pa.compute.Expression or str
-            Expression or str that is a valid SQL where clause.
-            Currently only >, <, >=, <=, ==, !=, |, & are supported.
-            is_null, is_valid, ~, and others are not yet supported.
-            Specifying these will result in an expression parsing error
+            Expression or str that is a valid SQL where clause. See
+            `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
+            for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
         offset: int, default None
             Fetch starting with this row. 0 if None or unspecified.
         nearest: dict, default None
-            Get the rows corresponding to the K most similar vectors.
-                Example: {
-                  "column": <embedding col name>,
-                  "q": <query vector as pa.Float32Array>,
-                  "k": 10,
-                  "metric": "cosine",
-                  "nprobes": 1,
-                  "refine_factor": 1
+            Get the rows corresponding to the K most similar vectors. Example:
+
+            .. code-block:: python
+
+                {
+                    "column": <embedding col name>,
+                    "q": <query vector as pa.Float32Array>,
+                    "k": 10,
+                    "metric": "cosine",
+                    "nprobes": 1,
+                    "refine_factor": 1
                 }
+
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -272,7 +277,7 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         **kwargs : dict, optional
-            Arguments for `Scanner.from_dataset`.
+            Arguments for ``Scanner.from_dataset``.
 
         Returns
         -------
@@ -479,14 +484,14 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> LanceDataset:
         """Create index on column.
 
-        ***Experimental API***
+        **Experimental API**
 
         Parameters
         ----------
         column : str
             The column to be indexed.
         index_type : str
-            The type of the index. Only "``IVF_PQ``" is supported now.
+            The type of the index. Only ``"IVF_PQ"`` is supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -497,15 +502,15 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : `np.ndarray` or `pyarrow.FixedSizeListArray`. Optional.
-            A `num_partitions` x `dimension` array of K-mean centroids for IVF
+        ivf_centroids : ``np.ndarray`` or ``pyarrow.FixedSizeListArray``. Optional.
+            A ``num_partitions x dimension`` array of K-mean centroids for IVF
             clustering. If not provided, a new Kmean model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
         kwargs :
             Parameters passed to the index building process.
 
-        If `index_type` is "IVF_PQ", then the following parameters are required:
+        If ``index_type`` is "IVF_PQ", then the following parameters are required:
         - **num_partitions**
         - **num_sub_vectors**
 
@@ -515,7 +520,7 @@ class LanceDataset(pa.dataset.Dataset):
         - **max_opq_iterations**: the maximum number of iterations for training OPQ.
         - **ivf_centroids**: K-mean centroids for IVF clustering.
 
-        If `index_type` is "DISKANN", then the following parameters are optional:
+        If ``index_type`` is "DISKANN", then the following parameters are optional:
 
         - **r**: out-degree bound
         - **l**: number of levels in the graph.
