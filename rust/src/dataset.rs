@@ -1365,7 +1365,7 @@ mod tests {
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
@@ -1382,7 +1382,7 @@ mod tests {
         // Write to dataset (successful)
         write_params.mode = WriteMode::Append;
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        Dataset::write(batches, test_uri, Some(write_params))
+        Dataset::write(batches, test_uri, Some(write_params.clone()))
             .await
             .unwrap();
 
