@@ -141,9 +141,10 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   //
-  // This must be equal in length to the number of columns in the file.
-  // The order of the ids determines the mapping from field id to column
-  // position.
+  // IDs are assigned based on position in the file, offset by the max existing
+  // field id in the table (if any already). So when a fragment is first created
+  // with one file of N columns, the field ids will be 1, 2, ..., N. If a second,
+  // fragment is created with M columns, the field ids will be N+1, N+2, ..., N+M.
   repeated int32 fields = 2;
 } // DataFile
 
@@ -238,6 +239,8 @@ message Field {
   // Fully qualified name.
   string name = 2;
   /// Field Id.
+  ///
+  /// See the comment in `DataFile.fields` for how field ids are assigned.
   int32 id = 3;
   /// Parent Field ID. If not set, this is a top-level column.
   int32 parent_id = 4;
