@@ -158,7 +158,7 @@ async fn build_s3_object_store(
     };
 
     Ok(Arc::new(
-        AmazonS3Builder::new()
+        AmazonS3Builder::from_env() // from_env to capture AWS_ENDPOINT env var
             .with_url(uri)
             .with_credentials(creds)
             .with_region(
