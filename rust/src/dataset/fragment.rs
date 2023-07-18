@@ -167,17 +167,22 @@ impl FileFragment {
     pub async fn count_rows(&self) -> Result<usize> {
         let total_rows = self.fragment_length();
 
-        let deletion_count = read_deletion_file(
-            &self.dataset.base,
-            &self.metadata,
-            self.dataset.object_store(),
-        )
-        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default());
+        let deletion_count = self.count_deletions();
 
         let (total_rows, deletion_count) =
             futures::future::try_join(total_rows, deletion_count).await?;
 
         Ok(total_rows - deletion_count)
+    }
+
+    pub(crate) async fn count_deletions(&self) -> Result<usize> {
+        read_deletion_file(
+            &self.dataset.base,
+            &self.metadata,
+            self.dataset.object_store(),
+        )
+        .map_ok(|v| v.map(|v| v.len()).unwrap_or_default())
+        .await
     }
 
     /// Get the number of physical rows in the fragment. This includes deleted rows.

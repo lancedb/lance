@@ -34,6 +34,7 @@ use uuid::Uuid;
 mod feature_flags;
 pub mod fragment;
 mod hash_joiner;
+pub mod optimize;
 pub mod scanner;
 pub mod updater;
 mod write;
@@ -93,17 +94,6 @@ impl From<&Manifest> for Version {
             metadata: BTreeMap::default(),
         }
     }
-}
-
-/// Create a new [FileWriter] with the related `data_file_path` under `<DATA_DIR>`.
-async fn new_file_writer(
-    object_store: &ObjectStore,
-    base_dir: &Path,
-    data_file_path: &str,
-    schema: &Schema,
-) -> Result<FileWriter> {
-    let full_path = base_dir.child(DATA_DIR).child(data_file_path);
-    FileWriter::try_new(object_store, &full_path, schema.clone()).await
 }
 
 /// Get the manifest file path for a version.
@@ -393,52 +383,22 @@ impl Dataset {
             vec![]
         };
 
-        let mut writer = None;
-        let mut batches: Vec<RecordBatch> = Vec::new();
-        let mut num_rows: usize = 0;
-        for batch_result in peekable {
-            let batch: RecordBatch = batch_result?;
-            batches.push(batch.clone());
-            num_rows += batch.num_rows();
-            if num_rows >= params.max_rows_per_group {
-                // TODO: the max rows per group boundary is not accurately calculated yet.
-                if writer.is_none() {
-                    writer = {
-                        let file_path = format!("{}.lance", Uuid::new_v4());
-                        let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                        fragments.push(fragment);
-                        fragment_id += 1;
-                        Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
-                    }
-                };
+        let object_store = Arc::new(object_store);
+        let mut new_fragments = write_fragments(
+            object_store.clone(),
+            &base,
+            &schema,
+            Box::new(peekable),
+            params.clone(),
+        )
+        .await?;
 
-                writer.as_mut().unwrap().write(&batches).await?;
-                batches = Vec::new();
-                num_rows = 0;
-            }
-            if let Some(w) = writer.as_mut() {
-                if w.len() >= params.max_rows_per_file {
-                    w.finish().await?;
-                    writer = None;
-                }
-            }
+        // Assign IDs
+        for mut fragment in &mut new_fragments {
+            fragment_id += 1;
+            fragment.id = fragment_id;
         }
-        if num_rows > 0 {
-            if writer.is_none() {
-                writer = {
-                    let file_path = format!("{}.lance", Uuid::new_v4());
-                    let fragment = Fragment::with_file(fragment_id, &file_path, &schema);
-                    fragments.push(fragment);
-                    Some(new_file_writer(&object_store, &base, &file_path, &schema).await?)
-                }
-            };
-            writer.as_mut().unwrap().write(&batches).await?;
-        }
-        if let Some(w) = writer.as_mut() {
-            // Drop the last writer.
-            w.finish().await?;
-            drop(writer);
-        };
+        fragments.extend(new_fragments);
 
         let mut manifest = Manifest::new(&schema, Arc::new(fragments));
         manifest.version = match dataset.as_ref() {
@@ -464,7 +424,7 @@ impl Dataset {
         .await?;
 
         Ok(Self {
-            object_store: Arc::new(object_store),
+            object_store: object_store,
             base,
             manifest: Arc::new(manifest.clone()),
             session: Arc::new(Session::default()),

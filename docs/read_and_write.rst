@@ -314,7 +314,3 @@ not have deletion files.
 When files are rewritten, the original row ids are invalidated. This means the
 affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before building indices.
-
-
-Deleting table versions
-~~~~~~~~~~~~~~~~~~~~~~~
