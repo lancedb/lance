@@ -65,8 +65,8 @@ jobs:
           workspaces: rust
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+          sudo apt -qq update
+          sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
       - name: Run cargo fmt
         run: cargo fmt --check
