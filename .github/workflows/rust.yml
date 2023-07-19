@@ -1,4 +1,4 @@
-name: Build and run Rust tests
+name: Rust
 on:
   push:
     branches:
@@ -38,8 +38,8 @@ jobs:
           workspaces: rust
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev
+          sudo apt -qq update
+          sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
       - name: Run cargo fmt
         run: cargo fmt --check
       # split everything us so we know what's slow.
@@ -145,11 +145,13 @@ jobs:
           workspaces: rust
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+          sudo apt -qq update
+          sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
           cargo install cargo-codspeed
       - name: Build the benchmark target(s)
         run: cargo codspeed build
+      - name: CPU info
+        run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v1
         with:
