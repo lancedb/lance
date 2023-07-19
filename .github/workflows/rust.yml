@@ -132,3 +132,26 @@ jobs:
         run: |
           cargo build
           cargo test
+  benchmarks:
+    runs-on: ubuntu-22.04-4core
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ./rust
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev pkg-config
+          cargo install cargo-codspeed
+      - name: Build the benchmark target(s)
+        run: cargo codspeed build
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v1
+        with:
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          run: cargo codspeed run

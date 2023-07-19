@@ -98,6 +98,7 @@ criterion = { version = "0.4", features = ["async", "async_tokio"] }
 tempfile = "3.3.0"
 approx = "0.5.1"
 dirs = "5.0.0"
+codspeed-criterion-compat = "1.1.0"
 
 [features]
 cli = ["clap"]
