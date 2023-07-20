@@ -12,7 +12,7 @@ jobs:
     runs-on:
       group: large-runners
       labels: ubuntu-22.04-8core
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: ./rust
