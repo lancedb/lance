@@ -1,15 +1,13 @@
 name: Run benchmarks
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
     paths:
       - .github/workflows/benchmarks.yml
 
 jobs:
   rust:
-    runs-on: ubuntu-22.04-8core
+    runs-on: ubuntu-22.04-16core
     timeout-minutes: 60
     defaults:
       run:
