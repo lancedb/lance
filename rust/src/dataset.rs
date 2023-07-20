@@ -61,6 +61,7 @@ const INDICES_DIR: &str = "_indices";
 pub(crate) const DELETION_DIRS: &str = "_deletions";
 const DATA_DIR: &str = "data";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
+pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset
 #[derive(Debug, Clone)]
@@ -128,6 +129,10 @@ pub struct ReadParams {
     ///
     pub index_cache_size: usize,
 
+    /// Metadata cache size for the fragment metadata. If it is zero, metadata
+    /// cache is disabled.
+    pub metadata_cache_size: usize,
+
     /// If present, dataset will use this shared [`Session`] instead creating a new one.
     ///
     /// This is useful for sharing the same session across multiple datasets.
@@ -143,6 +148,12 @@ impl ReadParams {
         self
     }
 
+    /// Set the cache size for the file metadata. Set to zero to disable this cache.
+    pub fn metadata_cache_size(&mut self, cache_size: usize) -> &mut Self {
+        self.metadata_cache_size = cache_size;
+        self
+    }
+
     /// Set a shared session for the datasets.
     pub fn session(&mut self, session: Arc<Session>) -> &mut Self {
         self.session = Some(session);
@@ -155,6 +166,7 @@ impl Default for ReadParams {
         Self {
             block_size: None,
             index_cache_size: DEFAULT_INDEX_CACHE_SIZE,
+            metadata_cache_size: DEFAULT_METADATA_CACHE_SIZE,
             session: None,
             store_options: None,
         }
@@ -184,7 +196,10 @@ impl Dataset {
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
-            Arc::new(Session::new(params.index_cache_size))
+            Arc::new(Session::new(
+                params.index_cache_size,
+                params.metadata_cache_size,
+            ))
         };
         Self::checkout_manifest(
             Arc::new(object_store),
@@ -216,7 +231,10 @@ impl Dataset {
         let session = if let Some(session) = params.session.as_ref() {
             session.clone()
         } else {
-            Arc::new(Session::new(params.index_cache_size))
+            Arc::new(Session::new(
+                params.index_cache_size,
+                params.metadata_cache_size,
+            ))
         };
         Self::checkout_manifest(Arc::new(object_store), base_path, &manifest_file, session).await
     }

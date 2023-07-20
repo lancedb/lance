@@ -47,6 +47,7 @@ use crate::format::Manifest;
 use crate::format::{pb, Metadata, PageTable};
 use crate::io::object_reader::{read_fixed_stride_array, read_struct, ObjectReader};
 use crate::io::{read_metadata_offset, read_struct_from_buf};
+use crate::session::Session;
 use crate::{
     datatypes::{Field, Schema},
     format::PageInfo,
@@ -129,7 +130,7 @@ fn compute_row_id(fragment_id: u64, offset: i32) -> u64 {
 /// It reads arrow data from one data file.
 pub struct FileReader {
     object_reader: Arc<dyn ObjectReader>,
-    metadata: Metadata,
+    metadata: Arc<Metadata>,
     page_table: PageTable,
     projection: Option<Schema>,
 
@@ -163,24 +164,44 @@ impl FileReader {
         path: &Path,
         fragment_id: u64,
         manifest: Option<&Manifest>,
+        session: Option<&Session>,
     ) -> Result<Self> {
         let object_reader = object_store.open(path).await?;
 
-        let file_size = object_reader.size().await?;
-        let begin = if file_size < object_store.block_size() {
-            0
+        let cached_metadata = if let Some(session) = session {
+            session.file_metadata_cache.get(path)
         } else {
-            file_size - object_store.block_size()
+            None
         };
-        let tail_bytes = object_reader.get_range(begin..file_size).await?;
-        let metadata_pos = read_metadata_offset(&tail_bytes)?;
-
-        let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
-            // We have not read the metadata bytes yet.
-            read_struct(object_reader.as_ref(), metadata_pos).await?
+        let metadata = if let Some(m) = cached_metadata {
+            m
         } else {
-            let offset = tail_bytes.len() - (file_size - metadata_pos);
-            read_struct_from_buf(&tail_bytes.slice(offset..))?
+            let file_size = object_reader.size().await?;
+            let begin = if file_size < object_store.block_size() {
+                0
+            } else {
+                file_size - object_store.block_size()
+            };
+            let tail_bytes = object_reader.get_range(begin..file_size).await?;
+            let metadata_pos = read_metadata_offset(&tail_bytes)?;
+
+            let metadata: Metadata = if metadata_pos < file_size - tail_bytes.len() {
+                // We have not read the metadata bytes yet.
+                read_struct(object_reader.as_ref(), metadata_pos).await?
+            } else {
+                let offset = tail_bytes.len() - (file_size - metadata_pos);
+                read_struct_from_buf(&tail_bytes.slice(offset..))?
+            };
+
+            let metadata = Arc::new(metadata);
+
+            if let Some(session) = session {
+                session
+                    .file_metadata_cache
+                    .insert(path.clone(), metadata.clone());
+            }
+
+            metadata
         };
 
         // m is either
@@ -234,7 +255,7 @@ impl FileReader {
 
     /// Open one Lance data file for read.
     pub(crate) async fn try_new(object_store: &ObjectStore, path: &Path) -> Result<Self> {
-        Self::try_new_with_fragment(object_store, path, 0, None).await
+        Self::try_new_with_fragment(object_store, path, 0, None, None).await
     }
 
     /// Instruct the FileReader to return meta row id column.
@@ -731,7 +752,7 @@ mod tests {
         file_writer.finish().await.unwrap();
 
         let fragment = 123;
-        let mut reader = FileReader::try_new_with_fragment(&store, &path, fragment, None)
+        let mut reader = FileReader::try_new_with_fragment(&store, &path, fragment, None, None)
             .await
             .unwrap();
         reader.with_row_id(true);
@@ -859,7 +880,7 @@ mod tests {
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
-            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
                 .await
                 .unwrap();
         reader.with_row_id(true);
@@ -916,7 +937,7 @@ mod tests {
         let manifest = Manifest::new(&schema, Arc::new(vec![frag_struct]));
 
         let mut reader =
-            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest))
+            FileReader::try_new_with_fragment(&store, &path, fragment, Some(&manifest), None)
                 .await
                 .unwrap();
         reader.with_row_id(false);

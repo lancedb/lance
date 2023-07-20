@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::min;
+use std::{backtrace::Backtrace, cmp::min};
 
 use std::ops::Range;
 
@@ -94,6 +94,11 @@ impl ObjectReader for CloudObjectReader {
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
         info!("get_range: {:?} from {:?}", range, self.path);
+
+        if range.start == 359937346 && range.end == 360002882 {
+            let bt = Backtrace::capture();
+            info!("suspicious get_range: {:?}", bt);
+        }
         let start_time = std::time::Instant::now();
         let res = self
             .object_store
@@ -116,6 +121,7 @@ pub(crate) async fn read_message<M: Message + Default>(
     reader: &dyn ObjectReader,
     pos: usize,
 ) -> Result<M> {
+    info!("reading message");
     let file_size = reader.size().await?;
     if pos > file_size {
         return Err(Error::IO {

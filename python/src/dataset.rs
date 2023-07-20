@@ -46,6 +46,7 @@ use lance::index::{
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
+const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
@@ -65,11 +66,13 @@ impl Dataset {
         version: Option<u64>,
         block_size: Option<usize>,
         index_cache_size: Option<usize>,
+        metadata_cache_size: Option<usize>,
     ) -> PyResult<Self> {
         let rt = Runtime::new()?;
         let params = ReadParams {
             block_size,
             index_cache_size: index_cache_size.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
+            metadata_cache_size: metadata_cache_size.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
             session: None,
             store_options: None,
         };

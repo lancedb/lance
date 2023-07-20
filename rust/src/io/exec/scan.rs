@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
 use futures::stream::Stream;
 use futures::{stream, Future};
 use futures::{StreamExt, TryStreamExt};
+use log::info;
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
 use crate::dataset::{Dataset, ROW_ID};
@@ -64,6 +65,7 @@ fn scan_batches(
         let reader = reader2.clone();
         // The Ok here is only here because try_flatten_unordered wants both the
         // outer *and* inner stream to be TryStream.
+        info!("Reading batch {} range {:?}", batch_id, range);
         Ok(async move {
             reader
                 .read_batch(batch_id, range)
@@ -120,6 +122,7 @@ impl LanceStream {
         let inner_stream = if scan_in_order {
             stream::iter(file_fragments)
                 .then(move |file_fragment| {
+                    info!("Opening file fragment: {:?}", file_fragment);
                     open_file(file_fragment, project_schema.clone(), with_row_id)
                 })
                 .map_ok(move |reader| scan_batches(reader, read_size))

@@ -143,6 +143,7 @@ impl FileFragment {
                     &path,
                     self.id() as u64,
                     Some(self.dataset.manifest.as_ref()),
+                    Some(self.dataset.session.as_ref()),
                 )
                 .await?;
                 let initialized_schema = reader.schema().project_by_schema(&schema_per_file)?;
@@ -201,6 +202,7 @@ impl FileFragment {
             &path,
             self.id() as u64,
             None,
+            Some(self.dataset.session.as_ref()),
         )
         .await?;
 
@@ -225,6 +227,7 @@ impl FileFragment {
                 path,
                 self.id() as u64,
                 None,
+                Some(self.dataset.session.as_ref()),
             );
             reader.map_ok(|r| r.len())
         });
