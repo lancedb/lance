@@ -5,7 +5,7 @@ on:
     paths:
       - .github/workflows/benchmarks.yml
   schedule:
-    - cron: '20 6,12,18 * * *'
+    - cron: '20 6 * * *'
 
 jobs:
   rust:
