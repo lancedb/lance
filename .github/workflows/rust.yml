@@ -156,4 +156,5 @@ jobs:
         uses: CodSpeedHQ/action@v1
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
+          working-directory: rust
           run: cargo codspeed run
