@@ -154,7 +154,7 @@ jobs:
         run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v1
+        working-directory: rust
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
-          working-directory: rust
           run: cargo codspeed run
