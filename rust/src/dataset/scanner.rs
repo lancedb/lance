@@ -30,6 +30,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::*;
 use futures::stream::{Stream, StreamExt};
+use log::debug;
 
 use super::Dataset;
 use crate::datafusion::physical_expr::column_names_in_expr;
@@ -448,6 +449,8 @@ impl Scanner {
             plan = self.take(plan, &remaining_schema)?;
         }
         plan = Arc::new(ProjectionExec::try_new(plan, output_schema)?);
+
+        debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
     }
