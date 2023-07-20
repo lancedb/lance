@@ -293,7 +293,7 @@ impl ObjectStore {
                 inner: build_gcs_object_store(url.to_string().as_str()).await?,
                 scheme: String::from("gs"),
                 base_path: Path::from(url.path()),
-                block_size: 256 * 1024,
+                block_size: 1024 * 1024,
             }),
             "az" => Ok(Self {
                 inner: build_azure_object_store(url.to_string().as_str()).await?,

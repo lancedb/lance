@@ -34,7 +34,7 @@ use async_recursion::async_recursion;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{self, TryStreamExt};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use prost::Message;
 
@@ -338,10 +338,13 @@ async fn read_batch(
     with_row_id: bool,
     deletion_vector: Option<&DeletionVector>,
 ) -> Result<RecordBatch> {
+    // We box this because otherwise we get a higher-order lifetime error.
     let arrs = stream::iter(&schema.fields)
-        .then(|f| async move { read_array(reader, f, batch_id, params).await })
+        .map(|f| read_array(reader, f, batch_id, params))
+        .buffered(num_cpus::get() * 4)
         .try_collect::<Vec<_>>()
-        .await?;
+        .boxed();
+    let arrs = arrs.await?;
 
     let should_fetch_row_id =
         with_row_id || !matches!(deletion_vector, None | Some(DeletionVector::NoDeletions));

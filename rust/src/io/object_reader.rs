@@ -27,7 +27,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
-use log::debug;
+use log::info;
 use object_store::path::Path;
 use prost::Message;
 
@@ -93,11 +93,20 @@ impl ObjectReader for CloudObjectReader {
     }
 
     async fn get_range(&self, range: Range<usize>) -> Result<Bytes> {
-        debug!("get_range: {:?} from {:?}", range, self.path);
+        info!("get_range: {:?} from {:?}", range, self.path);
         let start_time = std::time::Instant::now();
-        let res = self.object_store.inner.get_range(&self.path, range.clone()).await?;
+        let res = self
+            .object_store
+            .inner
+            .get_range(&self.path, range.clone())
+            .await?;
         let end_time = std::time::Instant::now();
-        debug!("completed get_range: {:?} from {:?} in {:?}", range, self.path, end_time - start_time);
+        info!(
+            "completed get_range: {:?} from {:?} in {:?}",
+            range,
+            self.path,
+            end_time - start_time
+        );
         Ok(res)
     }
 }
