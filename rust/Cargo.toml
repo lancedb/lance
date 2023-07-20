@@ -145,3 +145,4 @@ codegen-units = 1
 opt-level = 3
 debug = true
 strip = false
+lto = "thin"
