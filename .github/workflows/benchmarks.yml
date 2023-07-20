@@ -28,9 +28,9 @@ jobs:
         run: cargo codspeed build
       - name: CPU info
         run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
-      - name: Run benchmarks
-        uses: CodSpeedHQ/action@v1
-        with:
-          token: ${{ secrets.CODSPEED_TOKEN }}
-          working-directory: rust
-          run: cargo codspeed run
+      # - name: Run benchmarks
+      #   uses: CodSpeedHQ/action@v1
+      #   with:
+      #     token: ${{ secrets.CODSPEED_TOKEN }}
+      #     working-directory: rust
+      #     run: cargo codspeed run
