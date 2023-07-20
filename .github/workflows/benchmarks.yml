@@ -7,7 +7,9 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-22.04-8core
+    runs-on:
+      group: large-runners
+      labels: ubuntu-22.04-8core
     timeout-minutes: 60
     defaults:
       run:
