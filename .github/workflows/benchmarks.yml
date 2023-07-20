@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - .github/workflows/benchmarks.yml
+  schedule:
+    - cron: '20 6,12,18 * * *'
 
 jobs:
   rust:
@@ -33,4 +35,4 @@ jobs:
         with:
           token: ${{ secrets.CODSPEED_TOKEN }}
           working-directory: rust
-          run: cargo codspeed run
+          run: cargo codspeed run l2 argmin cosine vector_index

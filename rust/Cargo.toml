@@ -120,10 +120,9 @@ harness = false
 name = "vector_index"
 harness = false
 
-# TODO: ivf_pq runs too long on CI
-# [[bench]]
-# name = "ivf_pq"
-# harness = false
+[[bench]]
+name = "ivf_pq"
+harness = false
 
 [[bench]]
 name = "kmeans"
