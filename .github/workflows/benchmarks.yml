@@ -27,7 +27,7 @@ jobs:
           sudo apt install -y -qq protobuf-compiler libssl-dev pkg-config
           cargo install cargo-codspeed
       - name: Build the benchmark target(s)
-        run: cargo codspeed build
+        run: cargo codspeed build l2 argmin cosine vector_index
       - name: CPU info
         run: cat /proc/cpuinfo | grep -E 'model name|flags' | head -n 2
       - name: Run benchmarks
